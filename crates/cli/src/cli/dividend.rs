@@ -13,6 +13,7 @@ use std::io::Write;
 use async_trait::async_trait;
 
 use st0x_config::Ctx;
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
 use super::{TokenizationNetwork, rebalancing, trading, wrapper};
@@ -32,6 +33,7 @@ trait DividendBumpOperations: Sync {
         stdout: &mut Writer,
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
         ctx: &Ctx,
     ) -> anyhow::Result<()>;
 
@@ -40,6 +42,7 @@ trait DividendBumpOperations: Sync {
         stdout: &mut Writer,
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
         ctx: &Ctx,
     ) -> anyhow::Result<()>;
 }
@@ -63,6 +66,7 @@ impl DividendBumpOperations for LiveDividendBumpOperations {
         stdout: &mut Writer,
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
         ctx: &Ctx,
     ) -> anyhow::Result<()> {
         rebalancing::alpaca_tokenize_command(
@@ -70,7 +74,7 @@ impl DividendBumpOperations for LiveDividendBumpOperations {
             symbol,
             quantity.inner(),
             None,
-            TokenizationNetwork::Base,
+            network,
             None,
             ctx,
         )
@@ -82,9 +86,10 @@ impl DividendBumpOperations for LiveDividendBumpOperations {
         stdout: &mut Writer,
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
         ctx: &Ctx,
     ) -> anyhow::Result<()> {
-        wrapper::donate_equity_command(stdout, symbol, quantity, ctx).await
+        wrapper::donate_equity_command(stdout, symbol, quantity, network, ctx).await
     }
 }
 
@@ -92,19 +97,30 @@ pub(super) async fn dividend_bump_command<Writer: Write + Send>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
+    network: TokenizationNetwork,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    dividend_bump_with_operations(stdout, symbol, quantity, ctx, &LiveDividendBumpOperations).await
+    dividend_bump_with_operations(
+        stdout,
+        symbol,
+        quantity,
+        network,
+        ctx,
+        &LiveDividendBumpOperations,
+    )
+    .await
 }
 
 async fn dividend_bump_with_operations<Writer: Write + Send, Operations: DividendBumpOperations>(
     stdout: &mut Writer,
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
+    network: TokenizationNetwork,
     ctx: &Ctx,
     operations: &Operations,
 ) -> anyhow::Result<()> {
-    writeln!(stdout, "Dividend NAV bump: {quantity} {symbol}")?;
+    let chain = Chain::from(network);
+    writeln!(stdout, "Dividend NAV bump: {quantity} {symbol} on {chain}")?;
 
     writeln!(
         stdout,
@@ -119,7 +135,7 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
         "Step 2/3: tokenizing {filled_quantity} {symbol} onchain"
     )?;
     operations
-        .tokenize(stdout, symbol.clone(), filled_quantity, ctx)
+        .tokenize(stdout, symbol.clone(), filled_quantity, network, ctx)
         .await?;
 
     writeln!(
@@ -127,7 +143,7 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
         "Step 3/3: donating {filled_quantity} {symbol} into the wrapper"
     )?;
     operations
-        .donate(stdout, symbol, filled_quantity, ctx)
+        .donate(stdout, symbol, filled_quantity, network, ctx)
         .await?;
 
     writeln!(stdout, "✅ Dividend NAV bump completed")?;
@@ -157,8 +173,8 @@ mod tests {
 
     struct RecordingDividendBumpOperations {
         filled_quantity: Positive<FractionalShares>,
-        tokenized_quantities: Mutex<Vec<Positive<FractionalShares>>>,
-        donated_quantities: Mutex<Vec<Positive<FractionalShares>>>,
+        tokenized: Mutex<Vec<(Positive<FractionalShares>, TokenizationNetwork)>>,
+        donated: Mutex<Vec<(Positive<FractionalShares>, TokenizationNetwork)>>,
     }
 
     #[async_trait]
@@ -178,9 +194,10 @@ mod tests {
             _stdout: &mut Writer,
             _symbol: Symbol,
             quantity: Positive<FractionalShares>,
+            network: TokenizationNetwork,
             _ctx: &Ctx,
         ) -> anyhow::Result<()> {
-            self.tokenized_quantities.lock().unwrap().push(quantity);
+            self.tokenized.lock().unwrap().push((quantity, network));
             Ok(())
         }
 
@@ -189,9 +206,10 @@ mod tests {
             _stdout: &mut Writer,
             _symbol: Symbol,
             quantity: Positive<FractionalShares>,
+            network: TokenizationNetwork,
             _ctx: &Ctx,
         ) -> anyhow::Result<()> {
-            self.donated_quantities.lock().unwrap().push(quantity);
+            self.donated.lock().unwrap().push((quantity, network));
             Ok(())
         }
     }
@@ -259,15 +277,16 @@ mod tests {
             &mut stdout,
             Symbol::new("COIN").unwrap(),
             positive_shares("10"),
+            TokenizationNetwork::Base,
             &ctx,
         )
         .await
         .unwrap_err();
 
         assert!(
-            error.to_string().contains(
-                "equity COIN is not configured in [chains.<name>.trading.assets.equities]"
-            ),
+            error
+                .to_string()
+                .contains("equity COIN is not configured in [chains.base.trading.assets.equities]"),
             "tokenize must fail on the unconfigured symbol, got: {error}"
         );
 
@@ -291,8 +310,8 @@ mod tests {
         let ctx = dry_run_ctx();
         let operations = RecordingDividendBumpOperations {
             filled_quantity: positive_shares("0.0041"),
-            tokenized_quantities: Mutex::new(Vec::new()),
-            donated_quantities: Mutex::new(Vec::new()),
+            tokenized: Mutex::new(Vec::new()),
+            donated: Mutex::new(Vec::new()),
         };
         let mut stdout = Vec::new();
 
@@ -300,6 +319,7 @@ mod tests {
             &mut stdout,
             Symbol::new("AAPL").unwrap(),
             positive_shares("0.004115451077565126"),
+            TokenizationNetwork::Base,
             &ctx,
             &operations,
         )
@@ -307,15 +327,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            *operations.tokenized_quantities.lock().unwrap(),
-            vec![positive_shares("0.0041")]
+            *operations.tokenized.lock().unwrap(),
+            vec![(positive_shares("0.0041"), TokenizationNetwork::Base)]
         );
         assert_eq!(
-            *operations.donated_quantities.lock().unwrap(),
-            vec![positive_shares("0.0041")]
+            *operations.donated.lock().unwrap(),
+            vec![(positive_shares("0.0041"), TokenizationNetwork::Base)]
         );
         let output = String::from_utf8(stdout).unwrap();
         assert!(output.contains("Step 2/3: tokenizing 0.0041 AAPL onchain"));
         assert!(output.contains("Step 3/3: donating 0.0041 AAPL into the wrapper"));
+    }
+
+    /// The tokenize and donate steps must land on the same chain the bump
+    /// was asked for: tokens minted on one chain cannot be donated on another.
+    #[tokio::test]
+    async fn dividend_bump_tokenizes_and_donates_on_the_selected_network() {
+        let ctx = dry_run_ctx();
+        let operations = RecordingDividendBumpOperations {
+            filled_quantity: positive_shares("2"),
+            tokenized: Mutex::new(Vec::new()),
+            donated: Mutex::new(Vec::new()),
+        };
+        let mut stdout = Vec::new();
+
+        dividend_bump_with_operations(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("2"),
+            TokenizationNetwork::Ethereum,
+            &ctx,
+            &operations,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *operations.tokenized.lock().unwrap(),
+            vec![(positive_shares("2"), TokenizationNetwork::Ethereum)]
+        );
+        assert_eq!(
+            *operations.donated.lock().unwrap(),
+            vec![(positive_shares("2"), TokenizationNetwork::Ethereum)]
+        );
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("on ethereum"),
+            "the bump must name its chain, got: {output}"
+        );
     }
 }

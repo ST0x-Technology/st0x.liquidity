@@ -368,6 +368,14 @@ pub enum Commands {
         /// Alpaca redemption wallet (overrides the tokenization config section)
         #[arg(long = "redemption-wallet")]
         redemption_wallet: Option<Address>,
+        /// Chain the mint lands on or the redemption leaves from: selects the
+        /// wallet, the `[chains.<name>.trading]` table and its redemption
+        /// wallet. Only the primary chain is accepted until the aggregates
+        /// record their chain: the server's recovery would resume another
+        /// chain's transfer with the primary's services. A resumed mint
+        /// (`--issuer-request-id`) must be given the network it started on
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Wrap tokenized equity into wrapped ERC-4626 vault shares
@@ -421,6 +429,11 @@ pub enum Commands {
         /// Number of tokenized shares to donate into the wrapper (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
+        /// Chain of the wrapper: selects the wallet and the
+        /// `[chains.<name>.trading]` asset table; a chain without that table
+        /// is refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Apply a dividend NAV bump in one step: buy the equity, tokenize it, and
@@ -437,6 +450,11 @@ pub enum Commands {
         /// Number of shares to buy, tokenize, and donate (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
+        /// Chain to tokenize on and donate into: selects the wallet and the
+        /// `[chains.<name>.trading]` asset table; a chain without that table
+        /// is refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
@@ -599,6 +617,12 @@ pub enum Commands {
         /// Vault ID
         #[arg(short = 'v', long = "vault-id")]
         vault_id: B256,
+
+        /// Chain of the vault: selects the wallet and the
+        /// `[chains.<name>.trading]` orderbook; a chain without that table is
+        /// refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Withdraw tokens from a Raindex vault
@@ -617,6 +641,12 @@ pub enum Commands {
         /// Vault ID
         #[arg(short = 'v', long = "vault-id")]
         vault_id: B256,
+
+        /// Chain of the vault: selects the wallet and the
+        /// `[chains.<name>.trading]` orderbook; a chain without that table is
+        /// refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Withdraw USDC from the configured Raindex cash vault
@@ -628,6 +658,12 @@ pub enum Commands {
         /// Amount of USDC to withdraw
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
+
+        /// Chain of the cash vault: its canonical USDC and its
+        /// `[chains.<name>.trading.assets.cash]` vault; a chain with no pinned
+        /// USDC is refused
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Bridge USDC via CCTP (full flow: burn -> attestation -> mint)
@@ -649,9 +685,10 @@ pub enum Commands {
     ///
     /// Use this to investigate approval behavior or when switching orderbook addresses.
     ResetAllowance {
-        /// Chain where to reset allowance
-        #[arg(long = "chain")]
-        chain: CctpChain,
+        /// Chain whose USDC allowance to reset: its wallet, canonical USDC
+        /// and `[chains.<name>.trading]` orderbook
+        #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
+        network: TokenizationNetwork,
     },
 
     /// Request tokenization of shares via Alpaca (isolated test command)
@@ -674,8 +711,9 @@ pub enum Commands {
         /// value and the wallet used to observe token arrival)
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
-        /// Tokenized equity (tStock) address override. Required for
-        /// non-base networks -- `[chains.<name>.trading.assets.equities]` holds Base addresses
+        /// Tokenized equity (tStock) address override. Required for a
+        /// network with no `[chains.<name>.trading]` table, whose assets
+        /// otherwise resolve the address
         #[arg(long = "token")]
         token: Option<Address>,
     },
@@ -991,6 +1029,7 @@ enum SimpleCommand {
         quantity: FractionalShares,
         issuer_request_id: Option<Uuid>,
         redemption_wallet: Option<Address>,
+        network: TokenizationNetwork,
     },
     WrapEquity {
         symbol: Symbol,
@@ -1007,6 +1046,7 @@ enum SimpleCommand {
     DonateEquity {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
     },
     AlpacaDeposit {
         amount: Usdc,
@@ -1039,14 +1079,17 @@ enum SimpleCommand {
         amount: Float,
         token: Address,
         vault_id: B256,
+        network: TokenizationNetwork,
     },
     VaultWithdraw {
         amount: Float,
         token: Address,
         vault_id: B256,
+        network: TokenizationNetwork,
     },
     VaultWithdrawUsdc {
         amount: Usdc,
+        network: TokenizationNetwork,
     },
     OrderStatus {
         order_id: String,
@@ -1135,7 +1178,7 @@ enum ProviderCommand {
         source_chain: CctpChain,
     },
     ResetAllowance {
-        chain: CctpChain,
+        network: TokenizationNetwork,
     },
     AlpacaTokenize {
         symbol: Symbol,
@@ -1154,6 +1197,7 @@ enum ProviderCommand {
     DividendBump {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+        network: TokenizationNetwork,
     },
     AlpacaTokenizationRequests,
 }
@@ -1258,12 +1302,14 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             quantity,
             issuer_request_id,
             redemption_wallet,
+            network,
         } => CommandRoute::Simple(SimpleCommand::TransferEquity {
             direction,
             symbol,
             quantity,
             issuer_request_id,
             redemption_wallet,
+            network,
         }),
         Commands::WrapEquity {
             symbol,
@@ -1287,9 +1333,15 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             network,
             registry,
         }),
-        Commands::DonateEquity { symbol, quantity } => {
-            CommandRoute::Simple(SimpleCommand::DonateEquity { symbol, quantity })
-        }
+        Commands::DonateEquity {
+            symbol,
+            quantity,
+            network,
+        } => CommandRoute::Simple(SimpleCommand::DonateEquity {
+            symbol,
+            quantity,
+            network,
+        }),
         Commands::AlpacaDeposit { amount } => {
             CommandRoute::Simple(SimpleCommand::AlpacaDeposit { amount })
         }
@@ -1334,28 +1386,32 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             amount,
             token,
             vault_id,
+            network,
         } => CommandRoute::Simple(SimpleCommand::VaultDeposit {
             amount,
             token,
             vault_id,
+            network,
         }),
         Commands::VaultWithdraw {
             amount,
             token,
             vault_id,
+            network,
         } => CommandRoute::Simple(SimpleCommand::VaultWithdraw {
             amount,
             token,
             vault_id,
+            network,
         }),
-        Commands::VaultWithdrawUsdc { amount } => {
-            CommandRoute::Simple(SimpleCommand::VaultWithdrawUsdc { amount })
+        Commands::VaultWithdrawUsdc { amount, network } => {
+            CommandRoute::Simple(SimpleCommand::VaultWithdrawUsdc { amount, network })
         }
         Commands::CctpBridge { amount, all, from } => {
             CommandRoute::Provider(ProviderCommand::CctpBridge { amount, all, from })
         }
-        Commands::ResetAllowance { chain } => {
-            CommandRoute::Provider(ProviderCommand::ResetAllowance { chain })
+        Commands::ResetAllowance { network } => {
+            CommandRoute::Provider(ProviderCommand::ResetAllowance { network })
         }
         Commands::AlpacaTokenize {
             symbol,
@@ -1383,9 +1439,15 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
             network,
             registry,
         }),
-        Commands::DividendBump { symbol, quantity } => {
-            CommandRoute::Provider(ProviderCommand::DividendBump { symbol, quantity })
-        }
+        Commands::DividendBump {
+            symbol,
+            quantity,
+            network,
+        } => CommandRoute::Provider(ProviderCommand::DividendBump {
+            symbol,
+            quantity,
+            network,
+        }),
         Commands::OrderStatus { order_id } => {
             CommandRoute::Simple(SimpleCommand::OrderStatus { order_id })
         }
@@ -1551,18 +1613,17 @@ async fn run_simple_command<W: Write>(
             quantity,
             issuer_request_id,
             redemption_wallet,
+            network,
         } => {
-            rebalancing::transfer_equity_command(
-                stdout,
+            let transfer = rebalancing::TransferEquity {
                 direction,
-                &symbol,
+                symbol,
                 quantity,
                 issuer_request_id,
                 redemption_wallet,
-                ctx,
-                pool,
-            )
-            .await
+                network,
+            };
+            rebalancing::transfer_equity_command(stdout, transfer, ctx, pool).await
         }
         SimpleCommand::WrapEquity {
             symbol,
@@ -1576,9 +1637,11 @@ async fn run_simple_command<W: Write>(
             network,
             registry,
         } => wrapper::unwrap_equity_command(stdout, symbol, quantity, network, registry, ctx).await,
-        SimpleCommand::DonateEquity { symbol, quantity } => {
-            wrapper::donate_equity_command(stdout, symbol, quantity, ctx).await
-        }
+        SimpleCommand::DonateEquity {
+            symbol,
+            quantity,
+            network,
+        } => wrapper::donate_equity_command(stdout, symbol, quantity, network, ctx).await,
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(stdout, amount, ctx)
                 .await
@@ -1618,11 +1681,13 @@ async fn run_simple_command<W: Write>(
             amount,
             token,
             vault_id,
+            network,
         } => {
             let deposit = vault::Deposit {
                 amount,
                 token,
                 vault_id,
+                network,
             };
             vault::vault_deposit_command(stdout, deposit, ctx).await
         }
@@ -1630,16 +1695,18 @@ async fn run_simple_command<W: Write>(
             amount,
             token,
             vault_id,
+            network,
         } => {
             let withdraw = vault::Withdraw {
                 amount,
                 token,
                 vault_id,
+                network,
             };
             vault::vault_withdraw_command(stdout, withdraw, ctx).await
         }
-        SimpleCommand::VaultWithdrawUsdc { amount } => {
-            vault::vault_withdraw_usdc_command(stdout, amount, ctx).await
+        SimpleCommand::VaultWithdrawUsdc { amount, network } => {
+            vault::vault_withdraw_usdc_command(stdout, amount, network, ctx).await
         }
         SimpleCommand::OrderStatus { order_id } => {
             trading::order_status_command(stdout, &order_id, ctx, pool).await
@@ -1976,8 +2043,8 @@ async fn run_provider_command<W: Write + Send>(
             burn_tx,
             source_chain,
         } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, ctx).await,
-        ProviderCommand::ResetAllowance { chain } => {
-            cctp::reset_allowance_command::<OpenChainErrorRegistry, _>(stdout, chain, ctx).await
+        ProviderCommand::ResetAllowance { network } => {
+            cctp::reset_allowance_command::<OpenChainErrorRegistry, _>(stdout, network, ctx).await
         }
         ProviderCommand::AlpacaTokenize {
             symbol,
@@ -2009,9 +2076,11 @@ async fn run_provider_command<W: Write + Send>(
             )
             .await
         }
-        ProviderCommand::DividendBump { symbol, quantity } => {
-            dividend::dividend_bump_command(stdout, symbol, quantity, ctx).await
-        }
+        ProviderCommand::DividendBump {
+            symbol,
+            quantity,
+            network,
+        } => dividend::dividend_bump_command(stdout, symbol, quantity, network, ctx).await,
         ProviderCommand::AlpacaTokenizationRequests => {
             rebalancing::alpaca_tokenization_requests_command(stdout, ctx).await
         }
@@ -2215,16 +2284,138 @@ mod tests {
     }
 
     #[test]
+    fn transfer_equity_parses_network() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer-equity",
+            "-d",
+            "to-raindex",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
+            "--network",
+            "ethereum",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::TransferEquity { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected transfer-equity command, got: {other:?}"),
+        }
+    }
+
+    /// `reset-allowance` selects its chain with `--network` like every other
+    /// chain-touching command; the old `--chain` spelling is gone.
+    #[test]
+    fn reset_allowance_parses_network_and_rejects_chain() {
+        let cli =
+            Cli::try_parse_from(["st0x-cli", "reset-allowance", "--network", "ethereum"]).unwrap();
+        match cli.command {
+            Commands::ResetAllowance { network } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected reset-allowance command, got: {other:?}"),
+        }
+
+        let error = Cli::try_parse_from(["st0x-cli", "reset-allowance", "--chain", "ethereum"])
+            .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// The vault commands take the same `--network` flag as every other
+    /// chain-touching command, defaulting to Base.
+    #[test]
+    fn vault_commands_parse_network_and_default_to_base() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "vault-deposit",
+            "-a",
+            "1",
+            "-t",
+            "0x9876543210987654321098765432109876543210",
+            "-v",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "--network",
+            "ethereum",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::VaultDeposit { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected vault-deposit command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["st0x-cli", "vault-withdraw-usdc", "-a", "100"]).unwrap();
+        match cli.command {
+            Commands::VaultWithdrawUsdc { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Base);
+            }
+            other => panic!("expected vault-withdraw-usdc command, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn dividend_bump_command_parses_symbol_and_quantity() {
         let cli =
             Cli::try_parse_from(["st0x-cli", "dividend-bump", "-s", "COIN", "-q", "10.5"]).unwrap();
 
         match cli.command {
-            Commands::DividendBump { symbol, quantity } => {
+            Commands::DividendBump {
+                symbol,
+                quantity,
+                network,
+            } => {
                 assert_eq!(symbol, Symbol::new("COIN").unwrap());
                 assert_eq!(quantity, positive_shares("10.5"));
+                assert_eq!(network, TokenizationNetwork::Base);
             }
             other => panic!("expected dividend-bump command, got: {other:?}"),
+        }
+    }
+
+    /// The dividend flow selects its chain like every other chain-touching
+    /// command: both the one-shot bump and the standalone donate take
+    /// `--network`.
+    #[test]
+    fn dividend_flow_parses_network() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "dividend-bump",
+            "-s",
+            "COIN",
+            "-q",
+            "1",
+            "--network",
+            "ethereum",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::DividendBump { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected dividend-bump command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "donate-equity",
+            "-s",
+            "COIN",
+            "-q",
+            "1",
+            "--network",
+            "ethereum",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::DonateEquity { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Ethereum);
+            }
+            other => panic!("expected donate-equity command, got: {other:?}"),
         }
     }
 

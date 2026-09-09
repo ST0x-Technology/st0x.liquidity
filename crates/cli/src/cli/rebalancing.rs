@@ -13,7 +13,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_config::{BrokerCtx, Ctx, OnchainWalletCtx};
+use st0x_config::{BrokerCtx, Ctx, OnchainWalletCtx, TradingChain};
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{
     Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM, Wallet,
@@ -58,20 +58,72 @@ use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpr
 use super::wrapper::{WrapContext, wrap_context};
 use super::{AuditReason, TokenizationNetwork, TransferDirection, TransferType};
 
+/// One `transfer-equity` invocation.
+pub(super) struct TransferEquity {
+    pub(super) direction: TransferDirection,
+    pub(super) symbol: Symbol,
+    pub(super) quantity: FractionalShares,
+    pub(super) issuer_request_id: Option<Uuid>,
+    pub(super) redemption_wallet: Option<Address>,
+    pub(super) network: TokenizationNetwork,
+}
+
+/// The command an operator pastes to resume an interrupted mint. It names the
+/// network because the mint aggregate records no chain: without the flag the
+/// resume would run on the CLI's default, Base.
+fn mint_resume_command(
+    symbol: &Symbol,
+    quantity: &FractionalShares,
+    network: TokenizationNetwork,
+    issuer_request_id: &IssuerRequestId,
+) -> String {
+    format!(
+        "transfer-equity --direction to-raindex --symbol {symbol} --quantity {quantity} \
+         --issuer-request-id {issuer_request_id} --network {}",
+        Chain::from(network).as_str()
+    )
+}
+
 struct EquityTransferCliServices {
     transfer: CrossVenueEquityTransfer,
     wallet: Address,
+    vault_registry: VaultRegistryId,
 }
 
-fn gas_readiness(ctx: &Ctx, wallet_ctx: &OnchainWalletCtx) -> anyhow::Result<Arc<GasReadiness>> {
+/// Gas readiness for the USDC corridor (Base and Ethereum).
+fn usdc_gas_readiness(
+    ctx: &Ctx,
+    wallet_ctx: &OnchainWalletCtx,
+) -> anyhow::Result<Arc<GasReadiness>> {
     let alerts = ctx
         .alerts
         .as_ref()
         .context("rebalancing transfer requires [alerts] gas thresholds")?;
-    let base_wallet = wallet_ctx.base_wallet();
-    let ethereum_wallet = wallet_ctx.ethereum_wallet();
 
-    GasReadiness::from_wallets(alerts, base_wallet, ethereum_wallet)
+    GasReadiness::from_wallets(
+        alerts,
+        wallet_ctx.base_wallet(),
+        wallet_ctx.ethereum_wallet(),
+    )
+}
+
+/// Gas readiness for an equity transfer on the selected chain: its wallet is
+/// checked against its own `[alerts.low_balance_thresholds]` entry, refused
+/// by name when the chain has none.
+fn gas_readiness(ctx: &Ctx, equity: &TradingChainContext<'_>) -> anyhow::Result<Arc<GasReadiness>> {
+    let alerts = ctx
+        .alerts
+        .as_ref()
+        .context("rebalancing transfer requires [alerts] gas thresholds")?;
+    let wallet_ctx = ctx.wallet()?;
+
+    GasReadiness::for_equity_chain(
+        alerts,
+        equity.chain,
+        &equity.wallet,
+        wallet_ctx.base_wallet(),
+        wallet_ctx.ethereum_wallet(),
+    )
 }
 
 /// Resolves the redemption wallet address from CLI flag or config.
@@ -108,8 +160,55 @@ pub(super) fn tokenization_network_context(
     (wallet.clone(), chain)
 }
 
+/// The chain an operator command acts on: its signing wallet and its
+/// `[chains.<name>.trading]` table (orderbook, inventory, vault owner, assets).
+pub(super) struct TradingChainContext<'ctx> {
+    pub(super) chain: Chain,
+    pub(super) wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    pub(super) trading: &'ctx TradingChain,
+}
+
+/// Resolves the selected network's wallet and trading table.
+///
+/// A chain with no trading table is refused by name: a vault operation needs
+/// that chain's orderbook, and the primary's addresses mean nothing there.
+/// The config check runs before the wallet is required, so a misnamed chain
+/// fails without a `[wallet]` section.
+pub(super) fn trading_chain_context(
+    ctx: &Ctx,
+    network: TokenizationNetwork,
+) -> anyhow::Result<TradingChainContext<'_>> {
+    let chain = Chain::from(network);
+    let Some(trading) = ctx.chains.watch(chain) else {
+        anyhow::bail!(
+            "{chain} has no [chains.{chain}.trading] table: vault operations need \
+             that chain's orderbook, and the primary's addresses do not apply there"
+        );
+    };
+
+    let (wallet, chain) = tokenization_network_context(ctx.wallet()?, network);
+
+    Ok(TradingChainContext {
+        chain,
+        wallet,
+        trading,
+    })
+}
+
+/// The canonical USDC on the selected chain, refused by name where this build
+/// pins none: another chain's address would approve or withdraw nothing.
+pub(super) fn chain_usdc(chain: Chain) -> anyhow::Result<Address> {
+    chain
+        .usdc()
+        .with_context(|| format!("no canonical USDC is pinned for {chain} in this build"))
+}
+
+/// Builds the mint/redemption saga on the selected chain: its wallet signs,
+/// its trading table supplies the orderbook, vault owner and asset map, and
+/// its issuer redemption wallet receives redeemed tokens.
 async fn build_equity_transfer_services(
     redemption_wallet_flag: Option<Address>,
+    network: TokenizationNetwork,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<EquityTransferCliServices> {
@@ -117,19 +216,22 @@ async fn build_equity_transfer_services(
         anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
     };
 
-    let redemption_wallet =
-        resolve_redemption_wallet(redemption_wallet_flag, TokenizationNetwork::Base, ctx)?;
-    let wallet_ctx = ctx.wallet()?;
-    let wallet = wallet_ctx.base_wallet().address();
-    let gas_readiness = gas_readiness(ctx, wallet_ctx)?;
-    let base_caller = wallet_ctx.base_wallet().clone();
+    let context = trading_chain_context(ctx, network)?;
+    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
+    let gas_readiness = gas_readiness(ctx, &context)?;
+    let TradingChainContext {
+        chain,
+        wallet: caller,
+        trading,
+    } = context;
+    let wallet = caller.address();
 
     let tokenization_service: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         alpaca_auth.account_id,
         alpaca_auth.auth.clone(),
-        base_caller.clone(),
-        Chain::Base,
+        caller.clone(),
+        chain,
         Some(redemption_wallet),
     )?);
 
@@ -139,22 +241,19 @@ async fn build_equity_transfer_services(
             .await?;
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
-        base_caller.clone(),
-        to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols),
+        caller.clone(),
+        to_wrapped_equities(&trading.assets.equities.symbols),
     ));
 
+    let vault_registry = VaultRegistryId::new(chain, trading.orderbook, trading.vault_owner);
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
         vault_registry_projection,
-        VaultRegistryId::new(
-            ctx.chains.primary().chain,
-            ctx.chains.primary().orderbook,
-            ctx.vault_owner(),
-        ),
+        vault_registry.clone(),
     ));
 
     let raindex = Arc::new(RaindexService::new(
-        base_caller,
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
+        caller,
+        st0x_hedge::operator::onchain::raindex_contracts(trading),
         wallet,
     ));
 
@@ -195,7 +294,11 @@ async fn build_equity_transfer_services(
     )
     .with_gas_readiness(gas_readiness);
 
-    Ok(EquityTransferCliServices { transfer, wallet })
+    Ok(EquityTransferCliServices {
+        transfer,
+        wallet,
+        vault_registry,
+    })
 }
 
 /// Refuses an orchestrator-mode CLI mint before any aggregate is created.
@@ -226,14 +329,29 @@ async fn ensure_vault_direct_mint(
 
 pub(super) async fn transfer_equity_command<Writer: Write>(
     stdout: &mut Writer,
-    direction: TransferDirection,
-    symbol: &Symbol,
-    quantity: FractionalShares,
-    issuer_request_id: Option<Uuid>,
-    redemption_wallet_flag: Option<Address>,
+    transfer: TransferEquity,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
+    let TransferEquity {
+        direction,
+        symbol,
+        quantity,
+        issuer_request_id,
+        redemption_wallet,
+        network,
+    } = transfer;
+    let chain = Chain::from(network);
+    let primary = ctx.chains.primary().chain;
+    if chain != primary {
+        anyhow::bail!(
+            "transfer-equity on {chain} is refused until mint and redemption records carry \
+             their chain: the server's startup recovery resumes every interrupted transfer \
+             with the primary chain's ({primary}) services. Fund {chain} with alpaca-tokenize, \
+             wrap-equity and vault-deposit --network {chain} instead"
+        );
+    }
+
     let direction_str = match direction {
         TransferDirection::ToRaindex => "Alpaca → Raindex (mint)",
         TransferDirection::ToAlpaca => "Raindex → Alpaca (redeem)",
@@ -242,8 +360,11 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     writeln!(stdout, "🔄 Transferring equity: {direction_str}")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
+    writeln!(stdout, "   Chain: {}", Chain::from(network))?;
 
-    let cli_services = build_equity_transfer_services(redemption_wallet_flag, ctx, pool).await?;
+    let cli_services =
+        build_equity_transfer_services(redemption_wallet, network, ctx, pool).await?;
+    writeln!(stdout, "   Vault registry: {}", cli_services.vault_registry)?;
     let equity_transfer = cli_services.transfer;
 
     match direction {
@@ -253,7 +374,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
                 ctx.issuance.api_key.header_value(),
             )
             .context("failed to build the issuance client for the vault-mode check")?;
-            ensure_vault_direct_mint(&issuance, symbol).await?;
+            ensure_vault_direct_mint(&issuance, &symbol).await?;
 
             writeln!(stdout, "   Creating mint request...")?;
             writeln!(stdout, "   Receiving Wallet: {}", cli_services.wallet)?;
@@ -267,15 +388,14 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
                 writeln!(stdout, "Equity mint issuer_request_id: {issuer_request_id}")?;
                 writeln!(
                     stdout,
-                    "   If this is interrupted, resume with:\n   \
-                     transfer-equity --direction to-raindex --symbol {symbol} \
-                     --quantity {quantity} --issuer-request-id {issuer_request_id}"
+                    "   If this is interrupted, resume with:\n   {}",
+                    mint_resume_command(&symbol, &quantity, network, &issuer_request_id)
                 )?;
                 stdout.flush()?;
             }
 
             equity_transfer
-                .resume_equity_to_market_making(&issuer_request_id, symbol, quantity)
+                .resume_equity_to_market_making(&issuer_request_id, &symbol, quantity)
                 .await?;
 
             writeln!(stdout, "✅ Mint completed successfully")?;
@@ -286,7 +406,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
             let aggregate_id = RedemptionAggregateId::generate();
             equity_transfer
-                .resume_equity_to_hedging(&aggregate_id, symbol, quantity)
+                .resume_equity_to_hedging(&aggregate_id, &symbol, quantity)
                 .await?;
 
             writeln!(stdout, "✅ Redemption completed successfully")?;
@@ -614,7 +734,7 @@ async fn run_usdc_transfer<Writer: Write>(
     ));
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let gas_readiness = gas_readiness(ctx, wallet_ctx)?;
+    let gas_readiness = usdc_gas_readiness(ctx, wallet_ctx)?;
 
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
@@ -1133,9 +1253,9 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
 }
 
 /// Resolves the tokenized-equity (tStock) address for a tokenization
-/// command: an explicit `--token` override wins; otherwise the Base address
-/// comes from `[chains.<name>.trading.assets.equities]`. Non-base networks have no config source,
-/// so they require the override.
+/// command: an explicit `--token` override wins; otherwise the selected
+/// chain's `[chains.<name>.trading.assets.equities]` entry. A chain with no
+/// trading table has no config source, so it requires the override.
 fn resolve_tokenization_token(
     token_override: Option<Address>,
     network: TokenizationNetwork,
@@ -1146,26 +1266,19 @@ fn resolve_tokenization_token(
         return Ok(address);
     }
 
-    match network {
-        TokenizationNetwork::Base => ctx
-            .chains
-            .primary()
-            .assets
-            .tokenized_equity(symbol)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "equity {symbol} is not configured in [chains.<name>.trading.assets.equities]"
-                )
-            }),
-        TokenizationNetwork::Ethereum => Err(anyhow::anyhow!(
-            "pass --token with the Ethereum tStock address for {symbol}: \
-             [chains.base.trading.assets.equities] holds Base addresses only"
-        )),
-        TokenizationNetwork::HyperEvm => Err(anyhow::anyhow!(
-            "pass --token with the HyperEVM tStock address for {symbol}: \
-             [chains.base.trading.assets.equities] holds Base addresses only"
-        )),
-    }
+    let chain = Chain::from(network);
+    let Some(trading) = ctx.chains.watch(chain) else {
+        anyhow::bail!(
+            "pass --token with the {chain} tStock address for {symbol}: \
+             no [chains.{chain}.trading] table lists it"
+        );
+    };
+
+    trading.assets.tokenized_equity(symbol).ok_or_else(|| {
+        anyhow::anyhow!(
+            "equity {symbol} is not configured in [chains.{chain}.trading.assets.equities]"
+        )
+    })
 }
 
 /// Isolated tokenization command - calls Alpaca tokenization API directly.
@@ -1721,9 +1834,11 @@ mod tests {
     use alloy::primitives::{Address, B256, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
+    use std::collections::BTreeMap;
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
+    use st0x_config::AlertsCtx;
     use st0x_config::ChainRegistry;
     use st0x_config::CtxError;
     use st0x_config::ExecutionThreshold;
@@ -2339,11 +2454,14 @@ mod tests {
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
             &mut stdout,
-            TransferDirection::ToRaindex,
-            &symbol,
-            quantity,
-            None,
-            None,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol,
+                quantity,
+                issuer_request_id: None,
+                redemption_wallet: None,
+                network: TokenizationNetwork::Base,
+            },
             &ctx,
             &pool,
         )
@@ -2358,7 +2476,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_equity_requires_tokenization_config() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        // The trading table is now resolved first, and resolving it needs a
+        // wallet, so the missing redemption wallet is what refuses only once
+        // a wallet exists.
+        ctx.wallet = Some(OnchainWalletCtx::stub());
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());
@@ -2366,11 +2488,14 @@ mod tests {
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
             &mut stdout,
-            TransferDirection::ToRaindex,
-            &symbol,
-            quantity,
-            None,
-            None,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol,
+                quantity,
+                issuer_request_id: None,
+                redemption_wallet: None,
+                network: TokenizationNetwork::Base,
+            },
             &ctx,
             &pool,
         )
@@ -2893,6 +3018,259 @@ mod tests {
             tokenization_network_context(&wallet_ctx, TokenizationNetwork::HyperEvm);
         assert_eq!(hyperevm_wallet.address(), hyperevm_address);
         assert_eq!(hyperevm_chain, Chain::HyperEvm);
+    }
+
+    const ETHEREUM_ORDERBOOK: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+    /// A Base primary with an Ethereum secondary and the stub wallets, so a
+    /// command that resolves the wrong chain observes Base's addresses.
+    fn create_ctx_watching_ethereum() -> Ctx {
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.wallet = Some(OnchainWalletCtx::stub());
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ETHEREUM_ORDERBOOK)
+                .call(),
+        );
+        ctx
+    }
+
+    /// The selected network yields its own wallet and its own trading table,
+    /// never the primary's.
+    #[test]
+    fn trading_chain_context_resolves_the_selected_chains_wallet_and_trading_table() {
+        let ctx = create_ctx_watching_ethereum();
+        let base_orderbook = ctx.chains.primary().orderbook;
+
+        let ethereum = trading_chain_context(&ctx, TokenizationNetwork::Ethereum).unwrap();
+        assert_eq!(ethereum.chain, Chain::Ethereum);
+        assert_eq!(
+            ethereum.wallet.address(),
+            ctx.wallet().unwrap().ethereum_wallet().address()
+        );
+        assert_eq!(ethereum.trading.orderbook, ETHEREUM_ORDERBOOK);
+
+        let base = trading_chain_context(&ctx, TokenizationNetwork::Base).unwrap();
+        assert_eq!(base.chain, Chain::Base);
+        assert_eq!(
+            base.wallet.address(),
+            ctx.wallet().unwrap().base_wallet().address()
+        );
+        assert_eq!(base.trading.orderbook, base_orderbook);
+    }
+
+    /// A chain with no `[chains.<name>.trading]` table has no orderbook to
+    /// act on; the refusal names the chain and the table, before the wallet
+    /// is required.
+    #[test]
+    fn trading_chain_context_refuses_a_network_without_a_trading_table() {
+        let ctx = create_ctx_without_rebalancing();
+
+        let Err(error) = trading_chain_context(&ctx, TokenizationNetwork::Ethereum) else {
+            panic!("a chain without a trading table must be refused");
+        };
+        let error = error.to_string();
+
+        assert!(
+            error.contains("[chains.ethereum.trading]"),
+            "expected the missing trading table named, got: {error}"
+        );
+    }
+
+    /// USDC differs per chain: the pinned contracts resolve, an unpinned
+    /// chain is refused by name rather than served another chain's address.
+    #[test]
+    fn chain_usdc_refuses_a_chain_without_a_pinned_contract() {
+        assert_eq!(chain_usdc(Chain::Base).unwrap(), USDC_BASE);
+        assert_eq!(chain_usdc(Chain::Ethereum).unwrap(), USDC_ETHEREUM);
+
+        let error = chain_usdc(Chain::HyperEvm).unwrap_err().to_string();
+        assert!(
+            error.contains("hyperevm"),
+            "expected the unpinned chain named, got: {error}"
+        );
+    }
+
+    const ETHEREUM_VAULT_OWNER: Address = address!("0xe0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0");
+    const ETHEREUM_REDEMPTION_WALLET: Address =
+        address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    /// Alpaca broker, stub wallets, gas thresholds for the corridor chains and
+    /// an Ethereum secondary with its own orderbook, vault owner and
+    /// redemption wallet: everything a service build needs short of a live RPC.
+    fn create_alpaca_ctx_watching_ethereum() -> Ctx {
+        let mut ctx = create_alpaca_ctx_with_rebalancing(None);
+        ctx.wallet = Some(OnchainWalletCtx::stub());
+        ctx.alerts = Some(AlertsCtx::for_test(
+            BTreeMap::from([
+                (Chain::Base, U256::from(1_u64)),
+                (Chain::Ethereum, U256::from(1_u64)),
+            ]),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ETHEREUM_ORDERBOOK)
+                .vault_owner(ETHEREUM_VAULT_OWNER)
+                .redemption_wallet(ETHEREUM_REDEMPTION_WALLET)
+                .call(),
+        );
+        ctx
+    }
+
+    /// `--network ethereum` builds the transfer on Ethereum's wallet and binds
+    /// its vault lookup to Ethereum's registry (chain, orderbook, vault
+    /// owner), never the primary's.
+    /// The resume hint an interrupted mint prints must carry the network: the
+    /// mint aggregate records no chain, so a hint without it would resume an
+    /// Ethereum mint on the CLI's default, Base.
+    #[test]
+    fn mint_resume_command_names_the_selected_network() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(float!(10));
+        let issuer_request_id = IssuerRequestId::generate();
+
+        let command = mint_resume_command(
+            &symbol,
+            &quantity,
+            TokenizationNetwork::Ethereum,
+            &issuer_request_id,
+        );
+
+        assert_eq!(
+            command,
+            format!(
+                "transfer-equity --direction to-raindex --symbol AAPL --quantity {quantity} \
+                 --issuer-request-id {issuer_request_id} --network ethereum"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_equity_services_are_built_on_the_selected_chain() {
+        let ctx = create_alpaca_ctx_watching_ethereum();
+        let pool = setup_test_db().await;
+
+        let services =
+            build_equity_transfer_services(None, TokenizationNetwork::Ethereum, &ctx, &pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            services.wallet,
+            ctx.wallet().unwrap().ethereum_wallet().address()
+        );
+        assert_eq!(
+            services.vault_registry,
+            VaultRegistryId::new(Chain::Ethereum, ETHEREUM_ORDERBOOK, ETHEREUM_VAULT_OWNER)
+        );
+    }
+
+    /// A network with no trading table cannot host a transfer. The redemption
+    /// wallet is passed by flag so the trading table is what refuses.
+    #[tokio::test]
+    async fn transfer_equity_services_refuse_a_network_without_a_trading_table() {
+        let mut ctx = create_alpaca_ctx_with_rebalancing(None);
+        ctx.wallet = Some(OnchainWalletCtx::stub());
+        let pool = setup_test_db().await;
+
+        let Err(error) = build_equity_transfer_services(
+            Some(ETHEREUM_REDEMPTION_WALLET),
+            TokenizationNetwork::Ethereum,
+            &ctx,
+            &pool,
+        )
+        .await
+        else {
+            panic!("a network without a trading table must be refused");
+        };
+        let error = error.to_string();
+
+        assert!(
+            error.contains("[chains.ethereum.trading]"),
+            "expected the missing trading table named, got: {error}"
+        );
+    }
+
+    /// With no `--redemption-wallet`, the missing trading table is still what
+    /// the operator hears about: the redemption wallet lives inside that same
+    /// table, so reporting it first would send the operator after a flag that
+    /// cannot fix the real gap.
+    #[tokio::test]
+    async fn transfer_equity_services_name_the_trading_table_before_the_redemption_wallet() {
+        let mut ctx = create_alpaca_ctx_with_rebalancing(None);
+        ctx.wallet = Some(OnchainWalletCtx::stub());
+        let pool = setup_test_db().await;
+
+        let Err(error) =
+            build_equity_transfer_services(None, TokenizationNetwork::Ethereum, &ctx, &pool).await
+        else {
+            panic!("a network without a trading table must be refused");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "ethereum has no [chains.ethereum.trading] table: vault operations need that \
+             chain's orderbook, and the primary's addresses do not apply there"
+        );
+    }
+
+    /// The mint and redemption aggregates record no chain, and the server's
+    /// startup recovery resumes every interrupted transfer with the primary
+    /// chain's services. A transfer written for another chain would be
+    /// continued on the wrong network after a restart, so it is refused
+    /// before anything reaches the shared database.
+    #[tokio::test]
+    async fn transfer_equity_refuses_a_non_primary_network_until_records_carry_their_chain() {
+        let ctx = create_alpaca_ctx_watching_ethereum();
+        let pool = setup_test_db().await;
+
+        let mut stdout = Vec::new();
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+                issuer_request_id: None,
+                redemption_wallet: None,
+                network: TokenizationNetwork::Ethereum,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("ethereum") && error.contains("primary") && error.contains("base"),
+            "expected the refusal to name the chain and the primary, got: {error}"
+        );
+    }
+
+    /// The gas check runs on the selected chain's wallet against that chain's
+    /// `[alerts.low_balance_thresholds]` entry; a chain without one is refused
+    /// by name instead of skipping the check.
+    #[test]
+    fn gas_readiness_refuses_a_chain_without_a_low_balance_threshold() {
+        let mut ctx = create_alpaca_ctx_watching_ethereum();
+        ctx.chains
+            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
+        let hyperevm = trading_chain_context(&ctx, TokenizationNetwork::HyperEvm).unwrap();
+
+        let error = gas_readiness(&ctx, &hyperevm)
+            .err()
+            .expect("a chain without a gas threshold must be refused")
+            .to_string();
+
+        assert!(
+            error.contains("hyperevm") && error.contains("low_balance_thresholds"),
+            "expected the missing threshold named by chain, got: {error}"
+        );
     }
 
     async fn seed_to_withdrawal_complete(
@@ -3993,9 +4371,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains(
-                "equity COIN is not configured in [chains.<name>.trading.assets.equities]"
-            ),
+            error
+                .to_string()
+                .contains("equity COIN is not configured in [chains.base.trading.assets.equities]"),
             "an unconfigured symbol must fail before any network call, got: {error}"
         );
     }
@@ -4195,6 +4573,78 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved, token);
+    }
+
+    fn equity_asset(tokenized_equity: Address) -> ChainEquityAsset {
+        ChainEquityAsset {
+            tokenized_equity,
+            tokenized_equity_derivative: Address::ZERO,
+            vault_ids: Vec::new(),
+            trading: OperationMode::Enabled,
+            rebalancing: OperationMode::Disabled,
+            wrapped_equity_recovery: OperationMode::Disabled,
+            operational_limit: None,
+        }
+    }
+
+    /// Each chain's trading table lists its own tStock addresses, so a mint
+    /// on Ethereum resolves Ethereum's entry without a pasted `--token`, and
+    /// never Base's.
+    #[test]
+    fn tokenization_token_resolves_from_the_selected_chains_trading_table() {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let symbol = Symbol::new("RKLB").unwrap();
+        let base_token = address!("0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b");
+        let ethereum_token = address!("0xED0c085d92C262FB46937CB0B3C9763Af7fCCf30");
+        ctx.chains
+            .primary_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(symbol.clone(), equity_asset(base_token));
+        let mut ethereum_equities = ChainEquities::default();
+        ethereum_equities
+            .symbols
+            .insert(symbol.clone(), equity_asset(ethereum_token));
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .assets(ChainAssets {
+                    equities: ethereum_equities,
+                    cash: None,
+                })
+                .call(),
+        );
+
+        assert_eq!(
+            resolve_tokenization_token(None, TokenizationNetwork::Ethereum, &symbol, &ctx).unwrap(),
+            ethereum_token
+        );
+        assert_eq!(
+            resolve_tokenization_token(None, TokenizationNetwork::Base, &symbol, &ctx).unwrap(),
+            base_token
+        );
+    }
+
+    /// Without a trading table for the chain there is no config source, so
+    /// the operator must paste the address.
+    #[test]
+    fn tokenization_token_requires_an_override_without_a_trading_table() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+
+        let error = resolve_tokenization_token(
+            None,
+            TokenizationNetwork::Ethereum,
+            &Symbol::new("RKLB").unwrap(),
+            &ctx,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("--token") && error.contains("[chains.ethereum.trading]"),
+            "expected the override asked for by chain, got: {error}"
+        );
     }
 
     fn redemption_services() -> EquityTransferServices {

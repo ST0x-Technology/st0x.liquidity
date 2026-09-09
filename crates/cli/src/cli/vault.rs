@@ -7,21 +7,26 @@ use std::io::Write;
 use thiserror::Error;
 
 use st0x_config::Ctx;
-use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, USDC_BASE};
+use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
+
+use super::TokenizationNetwork;
+use super::rebalancing::{TradingChainContext, chain_usdc, trading_chain_context};
 
 pub(super) struct Deposit {
     pub(super) amount: Float,
     pub(super) token: Address,
     pub(super) vault_id: B256,
+    pub(super) network: TokenizationNetwork,
 }
 
 pub(super) struct Withdraw {
     pub(super) amount: Float,
     pub(super) token: Address,
     pub(super) vault_id: B256,
+    pub(super) network: TokenizationNetwork,
 }
 
 #[derive(Debug, Error)]
@@ -50,6 +55,27 @@ async fn get_token_decimals<E: Evm>(evm: &E, token: Address) -> anyhow::Result<u
         .with_context(|| format!("failed to read decimals() for token {token}"))
 }
 
+/// Prints the selected chain and its orderbook facts so the operator can
+/// verify them before the transaction is submitted.
+fn print_chain_context<Writer: Write>(
+    stdout: &mut Writer,
+    context: &TradingChainContext<'_>,
+    wallet_label: &str,
+) -> anyhow::Result<()> {
+    let TradingChainContext {
+        chain,
+        wallet,
+        trading,
+    } = context;
+
+    writeln!(stdout, "   Chain: {chain}")?;
+    writeln!(stdout, "   {wallet_label}: {}", wallet.address())?;
+    writeln!(stdout, "   Inventory: {}", trading.inventory_address())?;
+    writeln!(stdout, "   Orderbook: {}", trading.orderbook)?;
+
+    Ok(())
+}
+
 pub(super) async fn vault_deposit_command<Writer: Write>(
     stdout: &mut Writer,
     deposit: Deposit,
@@ -59,6 +85,7 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
         amount,
         token,
         vault_id,
+        network,
     } = deposit;
     writeln!(stdout, "Depositing tokens to Raindex vault")?;
     writeln!(stdout, "   Amount: {}", format_float_with_fallback(&amount))?;
@@ -68,25 +95,16 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
         return Err(VaultCliError::NegativeAmount(amount).into());
     }
 
-    let wallet_ctx = ctx.wallet()?;
-    let sender_address = wallet_ctx.base_wallet().address();
-
-    writeln!(stdout, "   Sender wallet: {sender_address}")?;
-    writeln!(
-        stdout,
-        "   Inventory: {}",
-        ctx.chains.primary().inventory_address()
-    )?;
-    writeln!(stdout, "   Orderbook: {}", ctx.chains.primary().orderbook)?;
+    let context = trading_chain_context(ctx, network)?;
+    print_chain_context(stdout, &context, "Sender wallet")?;
+    let raindex_service = RaindexService::new(
+        context.wallet.clone(),
+        st0x_hedge::operator::onchain::raindex_contracts(context.trading),
+        context.wallet.address(),
+    );
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let raindex_service = RaindexService::new(
-        wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
-        sender_address,
-    );
-
-    let token_decimals = get_token_decimals(wallet_ctx.base_wallet(), token).await?;
+    let token_decimals = get_token_decimals(&context.wallet, token).await?;
     writeln!(stdout, "   Decimals: {token_decimals}")?;
     let amount_u256 = float_to_u256(amount, token_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -116,6 +134,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         amount,
         token,
         vault_id,
+        network,
     } = withdraw;
 
     writeln!(stdout, "Withdrawing tokens from Raindex vault")?;
@@ -126,25 +145,16 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         return Err(VaultCliError::NegativeAmount(amount).into());
     }
 
-    let wallet_ctx = ctx.wallet()?;
-    let sender_address = wallet_ctx.base_wallet().address();
-
-    writeln!(stdout, "   Recipient wallet: {sender_address}")?;
-    writeln!(
-        stdout,
-        "   Inventory: {}",
-        ctx.chains.primary().inventory_address()
-    )?;
-    writeln!(stdout, "   Orderbook: {}", ctx.chains.primary().orderbook)?;
+    let context = trading_chain_context(ctx, network)?;
+    print_chain_context(stdout, &context, "Recipient wallet")?;
+    let raindex_service = RaindexService::new(
+        context.wallet.clone(),
+        st0x_hedge::operator::onchain::raindex_contracts(context.trading),
+        context.wallet.address(),
+    );
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let raindex_service = RaindexService::new(
-        wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
-        sender_address,
-    );
-
-    let token_decimals = get_token_decimals(wallet_ctx.base_wallet(), token).await?;
+    let token_decimals = get_token_decimals(&context.wallet, token).await?;
     writeln!(stdout, "   Decimals: {token_decimals}")?;
     let amount_u256 = float_to_u256(amount, token_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -160,22 +170,27 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     Ok(())
 }
 
+/// Withdraws USDC from the selected chain's configured cash vault: that
+/// chain's canonical USDC and the first `vault_ids` entry of its
+/// `[chains.<name>.trading.assets.cash]` table.
 pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     stdout: &mut Writer,
     amount: st0x_finance::Usdc,
+    network: TokenizationNetwork,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    ctx.wallet()?;
+    let TradingChainContext { chain, trading, .. } = trading_chain_context(ctx, network)?;
+    let token = chain_usdc(chain)?;
 
-    let cash = ctx.chains.primary().assets.cash.as_ref().ok_or_else(|| {
+    let cash = trading.assets.cash.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
-            "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+            "vault_ids in [chains.{chain}.trading.assets.cash] is required but not configured"
         )
     })?;
 
     let vault_id = cash.vault_ids.first().copied().ok_or_else(|| {
         anyhow::anyhow!(
-            "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+            "vault_ids in [chains.{chain}.trading.assets.cash] is required but not configured"
         )
     })?;
 
@@ -189,8 +204,9 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
 
     let withdraw = Withdraw {
         amount: amount.into(),
-        token: USDC_BASE,
+        token,
         vault_id,
+        network,
     };
 
     vault_withdraw_command(stdout, withdraw, ctx).await
@@ -213,7 +229,7 @@ mod tests {
     };
     use st0x_config::{InventoryMode, TradingChain};
     use st0x_evm::IERC20::decimalsCall;
-    use st0x_evm::ReadOnlyEvm;
+    use st0x_evm::{Chain, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
 
@@ -350,6 +366,7 @@ mod tests {
             amount,
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
+            network: TokenizationNetwork::Base,
         };
         let result = vault_deposit_command(&mut stdout, deposit, &ctx).await;
 
@@ -367,6 +384,7 @@ mod tests {
             amount: float!(100),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
+            network: TokenizationNetwork::Base,
         };
 
         let mut stdout = Vec::new();
@@ -388,6 +406,7 @@ mod tests {
             amount: float!(500.5),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
+            network: TokenizationNetwork::Base,
         };
         vault_deposit_command(&mut stdout, deposit, &ctx)
             .await
@@ -407,6 +426,7 @@ mod tests {
             amount: float!(250.25),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
+            network: TokenizationNetwork::Base,
         };
 
         let mut stdout = Vec::new();
@@ -503,6 +523,7 @@ mod tests {
             amount: float!(-1),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
+            network: TokenizationNetwork::Base,
         };
 
         let mut stdout = Vec::new();
@@ -521,6 +542,7 @@ mod tests {
             amount: float!(-1),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
+            network: TokenizationNetwork::Base,
         };
 
         let mut stdout = Vec::new();
@@ -542,14 +564,15 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = vault_withdraw_usdc_command(&mut stdout, amount, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err_msg =
+            vault_withdraw_usdc_command(&mut stdout, amount, TokenizationNetwork::Base, &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
 
         assert!(
             err_msg.contains(
-                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+                "vault_ids in [chains.base.trading.assets.cash] is required but not configured"
             ),
             "Expected vault_id missing error, got: {err_msg}"
         );
@@ -560,11 +583,15 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let err_msg =
-            vault_withdraw_usdc_command(&mut stdout, amount, &create_ctx_without_rebalancing())
-                .await
-                .unwrap_err()
-                .to_string();
+        let err_msg = vault_withdraw_usdc_command(
+            &mut stdout,
+            amount,
+            TokenizationNetwork::Base,
+            &create_ctx_without_rebalancing(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert!(
             err_msg.contains("configured [wallet] section"),
@@ -578,14 +605,15 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = vault_withdraw_usdc_command(&mut stdout, amount, &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err_msg =
+            vault_withdraw_usdc_command(&mut stdout, amount, TokenizationNetwork::Base, &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
 
         assert!(
             err_msg.contains(
-                "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
+                "vault_ids in [chains.base.trading.assets.cash] is required but not configured"
             ),
             "Expected vault_id missing error, got: {err_msg}"
         );
@@ -601,7 +629,8 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let result = vault_withdraw_usdc_command(&mut stdout, amount, &ctx).await;
+        let result =
+            vault_withdraw_usdc_command(&mut stdout, amount, TokenizationNetwork::Base, &ctx).await;
 
         // The vault lookup succeeds but the raindex service call will fail
         // because we're using stub wallets. The important thing is we got
@@ -615,6 +644,191 @@ mod tests {
         assert!(
             output.contains(&USDC_BASE.to_string()),
             "Expected USDC token in output, got: {output}"
+        );
+    }
+
+    const ETHEREUM_ORDERBOOK: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    const ETHEREUM_INVENTORY: Address = address!("0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1");
+    const ETHEREUM_CASH_VAULT_ID: B256 =
+        b256!("00000000000000000000000000000000000000000000000000000000000000e7");
+
+    /// Base primary plus an Ethereum secondary with its own orderbook,
+    /// inventory and cash table, on the stub wallets: a command resolving the
+    /// wrong chain prints Base's addresses.
+    fn create_ctx_watching_ethereum(cash: Option<ChainCashAsset>) -> Ctx {
+        let mut ctx = create_ctx_with_rebalancing(None);
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ETHEREUM_ORDERBOOK)
+                .inventory(InventoryMode::Managed {
+                    inventory: ETHEREUM_INVENTORY,
+                })
+                .assets(ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash,
+                })
+                .call(),
+        );
+        ctx
+    }
+
+    fn assert_prints_ethereum_not_base(output: &str, ctx: &Ctx, wallet_line: &str) {
+        let ethereum_wallet = ctx.wallet().unwrap().ethereum_wallet().address();
+        let base = ctx.chains.primary();
+
+        assert!(output.contains("Chain: ethereum"), "got: {output}");
+        assert!(
+            output.contains(&format!("{wallet_line}: {ethereum_wallet}")),
+            "expected Ethereum's wallet, got: {output}"
+        );
+        assert!(
+            output.contains(&format!("Orderbook: {ETHEREUM_ORDERBOOK}")),
+            "expected Ethereum's orderbook, got: {output}"
+        );
+        assert!(
+            output.contains(&format!("Inventory: {ETHEREUM_INVENTORY}")),
+            "expected Ethereum's inventory, got: {output}"
+        );
+        assert!(
+            !output.contains(&base.orderbook.to_string())
+                && !output.contains(&base.inventory_address().to_string()),
+            "Base's addresses must not appear, got: {output}"
+        );
+    }
+
+    /// `--network ethereum` deposits through Ethereum's wallet, orderbook and
+    /// inventory; the stub wallet stops the run at the decimals read.
+    #[tokio::test]
+    async fn vault_deposit_on_ethereum_prints_that_chains_addresses() {
+        let ctx = create_ctx_watching_ethereum(None);
+        let deposit = Deposit {
+            amount: float!(1),
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            network: TokenizationNetwork::Ethereum,
+        };
+
+        let mut stdout = Vec::new();
+        vault_deposit_command(&mut stdout, deposit, &ctx)
+            .await
+            .unwrap_err();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert_prints_ethereum_not_base(&output, &ctx, "Sender wallet");
+    }
+
+    #[tokio::test]
+    async fn vault_withdraw_on_ethereum_prints_that_chains_addresses() {
+        let ctx = create_ctx_watching_ethereum(None);
+        let withdraw = Withdraw {
+            amount: float!(1),
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            network: TokenizationNetwork::Ethereum,
+        };
+
+        let mut stdout = Vec::new();
+        vault_withdraw_command(&mut stdout, withdraw, &ctx)
+            .await
+            .unwrap_err();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert_prints_ethereum_not_base(&output, &ctx, "Recipient wallet");
+    }
+
+    /// A network without a trading table has no orderbook to deposit into;
+    /// the primary's is never substituted.
+    #[tokio::test]
+    async fn vault_deposit_refuses_a_network_without_a_trading_table() {
+        let ctx = create_ctx_with_rebalancing(None);
+        let deposit = Deposit {
+            amount: float!(1),
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            network: TokenizationNetwork::Ethereum,
+        };
+
+        let mut stdout = Vec::new();
+        let err_msg = vault_deposit_command(&mut stdout, deposit, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err_msg.contains("[chains.ethereum.trading]"),
+            "expected the missing trading table named, got: {err_msg}"
+        );
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            !output.contains(&ctx.chains.primary().orderbook.to_string()),
+            "Base's orderbook must not be printed, got: {output}"
+        );
+    }
+
+    /// The USDC withdrawal on Ethereum targets Ethereum's canonical USDC and
+    /// Ethereum's cash vault; the primary has no cash table here, so a lookup
+    /// against it would have failed instead.
+    #[tokio::test]
+    async fn withdraw_usdc_on_ethereum_uses_ethereum_usdc_and_that_chains_cash_vault() {
+        let ctx = create_ctx_watching_ethereum(Some(ChainCashAsset {
+            vault_ids: vec![ETHEREUM_CASH_VAULT_ID],
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        }));
+        let amount = Usdc::new(float!(100));
+
+        let mut stdout = Vec::new();
+        vault_withdraw_usdc_command(&mut stdout, amount, TokenizationNetwork::Ethereum, &ctx)
+            .await
+            .unwrap_err();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains(&format!("Token: {USDC_ETHEREUM}")),
+            "expected Ethereum's USDC, got: {output}"
+        );
+        assert!(
+            output.contains(&format!("Vault ID: {ETHEREUM_CASH_VAULT_ID}")),
+            "expected Ethereum's cash vault, got: {output}"
+        );
+        assert!(
+            !output.contains(&USDC_BASE.to_string()),
+            "Base's USDC must not appear, got: {output}"
+        );
+        assert_prints_ethereum_not_base(&output, &ctx, "Recipient wallet");
+    }
+
+    /// No USDC is pinned for HyperEVM: the withdrawal is refused by name
+    /// rather than sent against another chain's contract.
+    #[tokio::test]
+    async fn withdraw_usdc_refuses_a_chain_without_a_pinned_usdc() {
+        let mut ctx = create_ctx_with_rebalancing(None);
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::HyperEvm)
+                .assets(ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash: Some(ChainCashAsset {
+                        vault_ids: vec![TEST_VAULT_ID],
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
+                })
+                .call(),
+        );
+        let amount = Usdc::new(float!(100));
+
+        let mut stdout = Vec::new();
+        let err_msg =
+            vault_withdraw_usdc_command(&mut stdout, amount, TokenizationNetwork::HyperEvm, &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+
+        assert!(
+            err_msg.contains("hyperevm") && err_msg.contains("USDC"),
+            "expected the unpinned chain named, got: {err_msg}"
         );
     }
 
