@@ -2631,8 +2631,7 @@ async fn process_transaction(
         )
     })?;
 
-    let provider =
-        ProviderBuilder::new().connect_http(state.ctx.chains.primary().rpc_url.clone());
+    let provider = ProviderBuilder::new().connect_http(state.ctx.chains.primary().rpc_url.clone());
     let cache = SymbolCache::default();
 
     let outcome = process_tx::process_tx(

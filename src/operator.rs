@@ -2358,7 +2358,6 @@ pub mod process_tx {
                 offchain_order: offchain_order_store,
                 order_placer,
                 execution_threshold: ExecutionThreshold::whole_share(),
-                assets: ChainAssets::default(),
                 counter_trade_submission_lock: Arc::new(Mutex::new(())),
                 close_flatten_policy:
                     crate::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900)
@@ -2401,6 +2400,7 @@ pub mod process_tx {
                 &trade_event,
                 onchain_trade,
                 &cqrs,
+                &ChainAssets::default(),
                 true,
             )
             .await
@@ -3487,23 +3487,18 @@ pub mod process_tx {
             let pool = setup_test_db().await;
 
             let mut ctx = create_base_test_ctx();
-            ctx.chains
-                .sole_trading_mut()
-                .assets
-                .equities
-                .symbols
-                .insert(
-                    Symbol::new("AAPL").unwrap(),
-                    ChainEquityAsset {
-                        tokenized_equity: Address::ZERO,
-                        tokenized_equity_derivative: Address::ZERO,
-                        vault_ids: vec![],
-                        trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
-                        wrapped_equity_recovery: OperationMode::Disabled,
-                        operational_limit: None,
-                    },
-                );
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                Symbol::new("AAPL").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
 
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
 
