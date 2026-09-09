@@ -216,8 +216,8 @@ async fn build_equity_transfer_services(
         anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
     };
 
-    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
     let context = trading_chain_context(ctx, network)?;
+    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
     let gas_readiness = gas_readiness(ctx, &context)?;
     let TradingChainContext {
         chain,
