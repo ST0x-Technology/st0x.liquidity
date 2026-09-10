@@ -17,9 +17,10 @@ use tracing::{Level, info, warn};
 use url::Url;
 
 use st0x_evm::Chain;
+#[cfg(any(test, feature = "test-support"))]
+use st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS;
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth,
-    DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Positive, SupportedExecutor,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth, SupportedExecutor,
     Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
@@ -41,10 +42,6 @@ use crate::{
 /// Alpaca minimum execution threshold: $2.
 static ALPACA_MIN_DOLLARS: LazyLock<Usdc> = LazyLock::new(|| Usdc::new(float!(2)));
 
-/// Dry-run minimum execution threshold: 1 share.
-static DRY_RUN_MIN_SHARES: LazyLock<Positive<FractionalShares>> = LazyLock::new(|| {
-    Positive::new(FractionalShares::new(float!(1))).unwrap_or_else(|_| unreachable!())
-});
 const MIN_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 1;
 const MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS: u64 =
     chrono::TimeDelta::MAX.num_seconds().unsigned_abs();
@@ -480,7 +477,6 @@ struct BrokerConfig {
 enum BrokerKind {
     AlpacaBrokerApi,
     AlpacaBrokerApiKms,
-    DryRun,
 }
 
 impl BrokerKind {
@@ -489,7 +485,6 @@ impl BrokerKind {
         match self {
             Self::AlpacaBrokerApi => "alpaca-broker-api",
             Self::AlpacaBrokerApiKms => "alpaca-broker-api-kms",
-            Self::DryRun => "dry-run",
         }
     }
 }
@@ -595,8 +590,8 @@ impl BrokerConfig {
     /// to this value at the close, so it must be at least the base or the ramp
     /// would run backwards (ADR 0019). The caller supplies the effective
     /// runtime base from [`BrokerCtx::counter_trade_slippage_bps`], not the raw
-    /// configured field: DryRun uses the executor default, so validating against
-    /// the configured value would admit an inverted ramp.
+    /// configured field, so the validation always sees the value the runtime
+    /// actually uses.
     fn close_flatten_cross_max_bps(&self, ramp_base_bps: u16) -> Result<u16, CtxError> {
         let configured = self
             .close_flatten_cross_max_bps
@@ -678,7 +673,6 @@ enum BrokerSecrets {
         account_id: AlpacaAccountId,
         mode: Option<AlpacaBrokerApiMode>,
     },
-    DryRun,
 }
 
 /// Combined runtime context for the server. Assembled from plaintext config,
@@ -783,32 +777,25 @@ pub struct Ctx {
 #[derive(Clone)]
 pub enum BrokerCtx {
     AlpacaBrokerApi(AlpacaBrokerApiCtx),
-    DryRun,
 }
 
 impl BrokerCtx {
     pub fn to_supported_executor(&self) -> SupportedExecutor {
-        match self {
-            Self::AlpacaBrokerApi(_) => SupportedExecutor::AlpacaBrokerApi,
-            Self::DryRun => SupportedExecutor::DryRun,
-        }
+        let Self::AlpacaBrokerApi(_) = self;
+        SupportedExecutor::AlpacaBrokerApi
     }
 
     /// Returns the slippage band the runtime uses as the base of extended-hours
     /// counter-trade pricing.
     #[must_use]
     pub fn counter_trade_slippage_bps(&self) -> u16 {
-        match self {
-            Self::AlpacaBrokerApi(ctx) => ctx.counter_trade_slippage_bps,
-            Self::DryRun => DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        }
+        let Self::AlpacaBrokerApi(ctx) = self;
+        ctx.counter_trade_slippage_bps
     }
 
     fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
-        match self {
-            Self::AlpacaBrokerApi(_) => Ok(ExecutionThreshold::dollar_value(*ALPACA_MIN_DOLLARS)?),
-            Self::DryRun => Ok(ExecutionThreshold::shares(*DRY_RUN_MIN_SHARES)),
-        }
+        let Self::AlpacaBrokerApi(_) = self;
+        Ok(ExecutionThreshold::dollar_value(*ALPACA_MIN_DOLLARS)?)
     }
 }
 
@@ -862,21 +849,18 @@ impl SecretsBrokerParts {
     /// when the table is already in its end-state shape (legacy tag +
     /// credential pair only).
     ///
-    /// For the keyless and dry-run brokers the table itself is the
-    /// deprecated artifact: their identity's home is the config file and
-    /// they have no credentials, so even a tag-only `type = "dry-run"`
-    /// table must go.
+    /// For the keyless broker the table itself is the deprecated artifact:
+    /// its identity's home is the config file and it has no credentials, so
+    /// even a tag-only table must go.
     fn deprecation_notice(&self) -> Option<StartupNotice> {
         match self.kind {
-            BrokerKind::AlpacaBrokerApiKms | BrokerKind::DryRun => {
-                Some(StartupNotice::warning(format!(
-                    "the secrets file's [broker] table (type = \"{kind}\") is deprecated: \
+            BrokerKind::AlpacaBrokerApiKms => Some(StartupNotice::warning(format!(
+                "the secrets file's [broker] table (type = \"{kind}\") is deprecated: \
                      this broker type has no credentials, so declare its identity in the \
                      config file's [broker] section and remove the table from the secrets \
                      file (removed next release)",
-                    kind = self.kind.as_str(),
-                )))
-            }
+                kind = self.kind.as_str(),
+            ))),
             BrokerKind::AlpacaBrokerApi => {
                 let seen: Vec<&str> = [
                     ("account_id", self.account_id.is_some()),
@@ -931,14 +915,6 @@ impl From<BrokerSecrets> for SecretsBrokerParts {
                 account_id: Some(account_id),
                 client_id: Some(client_id),
                 kms_key_version: Some(kms_key_version),
-                credentials: None,
-            },
-            BrokerSecrets::DryRun => Self {
-                kind: BrokerKind::DryRun,
-                mode: None,
-                account_id: None,
-                client_id: None,
-                kms_key_version: None,
                 credentials: None,
             },
         }
@@ -1074,28 +1050,6 @@ fn resolve_broker(
     // newly added identity field fails to compile until each broker type
     // decides whether to require, allow, or refuse it.
     match kind {
-        BrokerKind::DryRun => {
-            let ResolvedIdentity {
-                mode,
-                account_id,
-                client_id,
-                kms_key_version,
-                credentials,
-            } = identity;
-
-            refuse_broker_fields_not_for_kind(
-                kind,
-                &[
-                    ("mode", mode.is_some()),
-                    ("account_id", account_id.is_some()),
-                    ("client_id", client_id.is_some()),
-                    ("kms_key_version", kms_key_version.is_some()),
-                    ("api_key/api_secret", credentials.is_some()),
-                ],
-            )?;
-
-            Ok(BrokerCtx::DryRun)
-        }
         BrokerKind::AlpacaBrokerApi => {
             let ResolvedIdentity {
                 mode,
@@ -1182,7 +1136,6 @@ impl std::fmt::Debug for BrokerCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlpacaBrokerApi(ctx) => f.debug_tuple("AlpacaBrokerApi").field(ctx).finish(),
-            Self::DryRun => write!(f, "DryRun"),
         }
     }
 }
@@ -1756,24 +1709,15 @@ fn parse_and_validate(
         !config.assets.equities.symbols.is_empty(),
     )?;
 
-    // Execution threshold is determined by broker capabilities:
-    // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
-    //   for slippage, fees, and price discrepancies that could push fills below $1.
-    // - DryRun uses shares threshold for testing
+    // Execution threshold is determined by broker capabilities: Alpaca
+    // requires $1 minimum for fractional trading. We use $2 to provide buffer
+    // for slippage, fees, and price discrepancies that could push fills
+    // below $1.
     let execution_threshold = broker.execution_threshold()?;
 
     let chains = ChainRegistry::new(&config.chains, secrets.chains)?;
     let (wallet_inputs, wallet_meta) =
         validate_wallet_inputs(config.wallet, secrets.wallet, &chains, config_path)?;
-
-    // Everything else `[rebalancing]` demands is a config-only rule and lives
-    // in `validate_config`; only the broker type it requires needs the
-    // secrets file. Checked before the missing-section error so a retired
-    // dry-run config fails with the retirement message directly, not with a
-    // prompt to add a [rebalancing] section that dry-run can never satisfy.
-    let BrokerCtx::AlpacaBrokerApi(_) = &broker else {
-        return Err(RebalancingCtxError::NotAlpacaBroker.into());
-    };
 
     let Some(rebalancing_config) = config.rebalancing else {
         return Err(CtxError::MissingRebalancing);
@@ -1788,14 +1732,13 @@ fn parse_and_validate(
         close_flatten_reprice_timeout_secs,
         close_flatten_window_secs: extended_hours_close_flatten_window_secs,
         close_flatten_cross_max_bps,
-    } = extended_hours_broker_windows(&broker, config.broker.as_ref(), &config.assets)?;
+    } = extended_hours_broker_windows(&broker, config.broker.as_ref())?;
 
     // Whether the beneficiary is REQUIRED is the one travel-rule question the
     // config cannot answer alone; `validate_config` already checked the value
     // itself.
     let broker_requires_travel_rule = match &broker {
         BrokerCtx::AlpacaBrokerApi(_) => true,
-        BrokerCtx::DryRun => false,
     };
 
     if broker_requires_travel_rule && travel_rule.is_none() {
@@ -1870,32 +1813,13 @@ struct ExtendedHoursBrokerWindows {
 }
 
 /// Resolves both extended-hours windows, requiring validated config values
-/// whenever they can actually be consulted at runtime: always for Alpaca,
-/// and for DryRun whenever any asset has extended hours enabled. The dry-run
-/// broker is retired at config validation, so the DryRun arm is reachable
-/// only from hand-built test contexts -- it keeps the same strictness so
-/// those tests exercise the real rules (the reprice sweep and close-flatten
-/// policy consult these windows on every `CheckPositions` tick, and neither
-/// may silently default to 0 while extended hours is live).
+/// because they are consulted at runtime: the reprice sweep and the
+/// close-flatten policy consult these windows on every `CheckPositions`
+/// tick, so neither may silently default to 0 while extended hours is live.
 fn extended_hours_broker_windows(
     broker: &BrokerCtx,
     broker_config: Option<&BrokerConfig>,
-    assets: &HedgingAssets,
 ) -> Result<ExtendedHoursBrokerWindows, CtxError> {
-    let requires_configured_windows = match broker {
-        BrokerCtx::AlpacaBrokerApi(_) => true,
-        BrokerCtx::DryRun => assets.any_extended_hours_enabled(),
-    };
-
-    if !requires_configured_windows {
-        return Ok(ExtendedHoursBrokerWindows {
-            reprice_timeout_secs: None,
-            close_flatten_reprice_timeout_secs: 0,
-            close_flatten_window_secs: 0,
-            close_flatten_cross_max_bps: broker.counter_trade_slippage_bps(),
-        });
-    }
-
     let broker_config = broker_config.ok_or(CtxError::MissingExtendedHoursRepriceTimeout)?;
 
     Ok(ExtendedHoursBrokerWindows {
@@ -2477,8 +2401,7 @@ pub enum CtxError {
     MissingCounterTradeSlippageBps,
     #[error(
         "[broker] close_flatten_cross_max_bps is required when using Alpaca \
-         Broker API, or when using DryRun with extended-hours counter-trading \
-         enabled for any asset"
+         Broker API"
     )]
     MissingCloseFlattenCrossMaxBps,
     #[error(
@@ -2489,8 +2412,7 @@ pub enum CtxError {
     CloseFlattenCrossMaxBpsOutOfRange { configured: u16, min: u16, max: u16 },
     #[error(
         "[broker] extended_hours_reprice_timeout_secs is required when using \
-         Alpaca Broker API, or when using DryRun with extended-hours \
-         counter-trading enabled for any asset"
+         Alpaca Broker API"
     )]
     MissingExtendedHoursRepriceTimeout,
     #[error(
@@ -2500,8 +2422,7 @@ pub enum CtxError {
     ExtendedHoursRepriceTimeoutOutOfRange { configured: u64, max: u64 },
     #[error(
         "[broker] close_flatten_reprice_timeout_secs is required when using \
-         Alpaca Broker API, or when using DryRun with extended-hours \
-         counter-trading enabled for any asset"
+         Alpaca Broker API"
     )]
     MissingCloseFlattenRepriceTimeout,
     #[error(
@@ -2511,8 +2432,7 @@ pub enum CtxError {
     CloseFlattenRepriceTimeoutOutOfRange { configured: u64, max: u64 },
     #[error(
         "[broker] extended_hours_close_flatten_window_secs is required when \
-         using Alpaca Broker API, or when using DryRun with extended-hours \
-         counter-trading enabled for any asset"
+         using Alpaca Broker API"
     )]
     MissingExtendedHoursCloseFlattenWindow,
     #[error(
@@ -2805,6 +2725,39 @@ pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
     Box::new(ctx)
 }
 
+/// Broker fixture for test contexts: Alpaca with dummy credentials.
+///
+/// The mode is an unreachable local sentinel (`http://127.0.0.1:0`), never
+/// a real Alpaca endpoint: a test that constructs a real executor from this
+/// fixture by mistake fails instantly and locally instead of sending its
+/// dummy credentials to the sandbox over the network. Tests that need a
+/// working executor override the mode with a mock server's URL (see the
+/// hedge crate's `mock_alpaca_broker_ctx`).
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn test_alpaca_broker_ctx() -> BrokerCtx {
+    #[derive(serde::Deserialize)]
+    struct TestAccountId {
+        account_id: AlpacaAccountId,
+    }
+
+    let TestAccountId { account_id } =
+        toml::from_str(r#"account_id = "904837e3-3b76-47ec-b432-046db621571b""#)
+            .unwrap_or_else(|_| unreachable!("hardcoded UUID literal is valid"));
+
+    BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+        auth: AlpacaBrokerAuth::Basic {
+            api_key: "test-key".to_owned(),
+            api_secret: "test-secret".to_owned(),
+        },
+        account_id,
+        mode: Some(AlpacaBrokerApiMode::Mock("http://127.0.0.1:0".to_owned())),
+        asset_cache_ttl: std::time::Duration::from_secs(3600),
+        time_in_force: TimeInForce::default(),
+        counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+    })
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
     Ctx {
@@ -2837,7 +2790,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         extended_hours_close_flatten_window_secs: 900,
         close_flatten_cross_max_bps: 400,
         apalis_finished_job_cleanup_interval_secs: 3600,
-        broker: BrokerCtx::DryRun,
+        broker: test_alpaca_broker_ctx(),
         telemetry: None,
         alerts: None,
         startup_notices: Vec::new(),
@@ -2860,10 +2813,10 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address};
+    use st0x_finance::Positive;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
     use st0x_float_macro::float;
 
     use super::*;
@@ -2904,7 +2857,7 @@ mod tests {
             .rpc_url(url::Url::parse("http://localhost:8545").unwrap())
             .orderbook(address!("0x2222222222222222222222222222222222222222"))
             .deployment_block(1)
-            .broker(BrokerCtx::DryRun)
+            .broker(test_alpaca_broker_ctx())
             .order_owner(order_owner)
             .assets(crate::ChainAssets::default())
             .call()
@@ -2924,7 +2877,7 @@ mod tests {
             .rpc_url(url::Url::parse("http://localhost:8545").unwrap())
             .orderbook(address!("0x2222222222222222222222222222222222222222"))
             .deployment_block(1)
-            .broker(BrokerCtx::DryRun)
+            .broker(test_alpaca_broker_ctx())
             .order_owner(order_owner)
             .assets(crate::ChainAssets::default())
             .inventory_mode(InventoryMode::Managed { inventory })
@@ -3101,7 +3054,7 @@ mod tests {
                 "[chains.hyperevm]\n            lifecycle = \"active\"",
             ),
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
         let message = error.to_string();
@@ -3135,7 +3088,10 @@ mod tests {
             rpc_url = "http://localhost:8545"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -3164,7 +3120,7 @@ mod tests {
                 .replace("lifecycle = \"active\"", "lifecycle = \"disabled\"")
                 .replace("lifecycle = \"observe-only\"", "lifecycle = \"disabled\""),
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
 
@@ -3225,7 +3181,7 @@ mod tests {
             extended_hours_counter_trading = "disabled"
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
         let source = std::error::Error::source(&error)
@@ -3273,6 +3229,16 @@ mod tests {
             [chains.hyperevm]
             lifecycle = "observe-only"
             required_confirmations = 1
+
+            [broker]
+            counter_trade_slippage_bps = 100
+            close_flatten_cross_max_bps = 400
+            extended_hours_reprice_timeout_secs = 300
+            close_flatten_reprice_timeout_secs = 60
+            extended_hours_close_flatten_window_secs = 900
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
 
             [wallet]
             kind = "private-key"
@@ -3461,19 +3427,6 @@ mod tests {
             [issuance]
             base_url = "http://issuance.test:8000"
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
-        "#,
-        )
-        .unwrap();
-        file
-    }
-
-    fn dry_run_pricing_secrets_toml() -> NamedTempFile {
-        let mut file = dry_run_secrets_toml();
-        file.write_all(
-            br#"
-
-            [pricing]
-            api_key = "pricing-oracle-test-key"
         "#,
         )
         .unwrap();
@@ -3669,13 +3622,7 @@ mod tests {
         let ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        assert!(matches!(ctx.broker, BrokerCtx::DryRun));
-
-        // MockExecutorCtx implements TryIntoExecutor, which produces a
-        // MockExecutor via the Executor trait's associated Ctx type.
-        // The type annotation verifies the correct executor type is
-        // produced; .unwrap() verifies construction succeeds.
-        let _: MockExecutor = MockExecutorCtx.try_into_executor().await.unwrap();
+        assert!(matches!(ctx.broker, BrokerCtx::AlpacaBrokerApi(_)));
     }
 
     #[tokio::test]
@@ -3713,7 +3660,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4100,7 +4047,10 @@ mod tests {
 
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -4197,9 +4147,9 @@ mod tests {
         );
     }
 
-    /// Pins the dry-run broker retirement: dry-run secrets cannot produce a
-    /// parseable configuration, and the error points at the replacement
-    /// workflow for local testing.
+    /// Pins the dry-run broker retirement: `type = "dry-run"` is not a
+    /// representable broker, so the secrets file fails at parse with the
+    /// serde unknown-variant error naming the supported broker.
     #[tokio::test]
     async fn dry_run_broker_is_retired() {
         let config = minimal_config_toml();
@@ -4209,19 +4159,18 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            matches!(
-                error,
-                CtxError::Rebalancing(ref boxed)
-                    if matches!(**boxed, RebalancingCtxError::NotAlpacaBroker)
-            ),
-            "expected NotAlpacaBroker, got: {error:?}"
-        );
+        let CtxError::SecretsToml { source, .. } = error else {
+            panic!(
+                "expected the secrets parse to reject the retired dry-run \
+                 broker as an unknown variant, got: {error:?}"
+            );
+        };
 
-        let message = error.to_string();
+        let message = source.to_string();
         assert!(
-            message.contains("retired") && message.contains("nix run .#simulate"),
-            "the error must mention the retirement and the simulate app, got: {message}"
+            message.contains("alpaca-broker-api"),
+            "the parse error must name the supported broker variant, \
+             got: {message}"
         );
     }
 
@@ -4245,7 +4194,7 @@ mod tests {
             &String::from_utf8_lossy(minimal_config_toml_bytes())
                 .replace("            log_level = \"debug\"\n", ""),
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -4262,7 +4211,7 @@ mod tests {
                 "            log_level = \"debug\"\n            log_dir = \"/tmp/logs\"\n",
             ),
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -4279,7 +4228,7 @@ mod tests {
                 "            log_level = \"debug\"\n            file_log_level = \"info\"\n",
             ),
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -4343,7 +4292,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4398,7 +4347,7 @@ mod tests {
             required_confirmations = 1
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4466,7 +4415,7 @@ mod tests {
             primary = true
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4523,7 +4472,7 @@ mod tests {
             required_confirmations = 1
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4579,7 +4528,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4635,7 +4584,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4701,7 +4650,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4760,7 +4709,7 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4838,7 +4787,7 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
@@ -4912,7 +4861,7 @@ mod tests {
                 address = "0x0000000000000000000000000000000000000001"
             "#
             ));
-            let secrets = dry_run_secrets_toml();
+            let secrets = alpaca_secrets_toml();
             let error = Ctx::load_files(config.path(), secrets.path())
                 .await
                 .unwrap_err();
@@ -5433,9 +5382,7 @@ mod tests {
             .await
             .unwrap();
 
-        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker else {
-            panic!("expected the Alpaca broker, got DryRun");
-        };
+        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker;
         assert_eq!(
             alpaca.account_id,
             "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
@@ -5472,9 +5419,7 @@ mod tests {
             .await
             .unwrap();
 
-        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker else {
-            panic!("expected the Alpaca broker, got DryRun");
-        };
+        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker;
         assert!(
             matches!(
                 alpaca.auth,
@@ -5502,9 +5447,7 @@ mod tests {
             .await
             .unwrap();
 
-        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker else {
-            panic!("expected the Alpaca broker, got DryRun");
-        };
+        let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker;
         assert_eq!(
             alpaca.account_id,
             "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
@@ -5552,7 +5495,7 @@ mod tests {
 
     #[tokio::test]
     async fn conflicting_broker_type_is_refused() {
-        let config = broker_identity_config_toml(r#"type = "dry-run""#);
+        let config = broker_identity_config_toml(r#"type = "alpaca-broker-api-kms""#);
         let secrets = alpaca_secrets_toml();
 
         let error = Ctx::load_files(config.path(), secrets.path())
@@ -5580,11 +5523,12 @@ mod tests {
         );
     }
 
-    /// A dry-run identity in the config file alone still resolves without
-    /// broker secrets -- the failure is the retirement gate, not a
-    /// missing-identity or missing-credentials error.
+    /// The config-file half of the dry-run removal: `type = "dry-run"` in
+    /// the config's `[broker]` section is no longer a known kind, so the
+    /// config fails to parse (the secrets-file half is pinned by
+    /// `dry_run_broker_is_retired`).
     #[tokio::test]
-    async fn dry_run_broker_from_config_alone_is_refused_as_retired() {
+    async fn dry_run_broker_kind_in_config_no_longer_parses() {
         let config = broker_identity_config_toml(r#"type = "dry-run""#);
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
@@ -5593,12 +5537,13 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(
-                error,
-                CtxError::Rebalancing(ref boxed)
-                    if matches!(**boxed, RebalancingCtxError::NotAlpacaBroker)
-            ),
-            "expected the dry-run retirement error, got: {error}"
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected a config parse error for the removed dry-run kind, got: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to parse config"),
+            "the error must surface as a config parse failure, got: {message}"
         );
     }
 
@@ -5608,10 +5553,11 @@ mod tests {
     #[tokio::test]
     async fn broker_field_not_applicable_to_kind_is_refused() {
         let config = broker_identity_config_toml(
-            r#"type = "dry-run"
-            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef""#,
+            r#"type = "alpaca-broker-api"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            client_id = "CKEXAMPLE""#,
         );
-        let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
+        let secrets = secrets_only_secrets_toml(CREDENTIALS_ONLY_BROKER, API_KEY_ONLY_ISSUANCE);
 
         let error = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -5621,11 +5567,11 @@ mod tests {
             matches!(
                 error,
                 CtxError::BrokerFieldNotForKind {
-                    field: "account_id",
-                    kind: "dry-run"
+                    field: "client_id",
+                    kind: "alpaca-broker-api"
                 }
             ),
-            "expected BrokerFieldNotForKind for account_id, got: {error}"
+            "expected BrokerFieldNotForKind for client_id, got: {error}"
         );
     }
 
@@ -6738,17 +6684,6 @@ mod tests {
         }
     }
 
-    /// The DryRun broker arm of `execution_threshold` is still live code
-    /// (dry-run is retired at config validation, not physically removed),
-    /// so the threshold is asserted on the broker ctx directly.
-    #[test]
-    fn default_execution_threshold_is_one_share_for_dry_run() {
-        assert_eq!(
-            BrokerCtx::DryRun.execution_threshold().unwrap(),
-            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(1))).unwrap())
-        );
-    }
-
     #[tokio::test]
     async fn alpaca_broker_api_requires_counter_trade_slippage_config() {
         let config = toml_file(
@@ -7458,9 +7393,7 @@ mod tests {
 
         assert_eq!(parts.broker.counter_trade_slippage_bps(), 9999);
 
-        let BrokerCtx::AlpacaBrokerApi(broker) = &parts.broker else {
-            panic!("expected AlpacaBrokerApi broker");
-        };
+        let BrokerCtx::AlpacaBrokerApi(broker) = &parts.broker;
 
         assert_eq!(broker.counter_trade_slippage_bps, 9999);
     }
@@ -7583,7 +7516,10 @@ mod tests {
 
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -7618,7 +7554,10 @@ mod tests {
 
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -7839,7 +7778,7 @@ mod tests {
 
     #[test]
     fn config_error_kind_rebalancing() {
-        let err = CtxError::Rebalancing(Box::new(RebalancingCtxError::NotAlpacaBroker));
+        let err = CtxError::Rebalancing(Box::new(RebalancingCtxError::ZeroTransferTimeout));
         assert_eq!(err.kind(), "rebalancing configuration error");
     }
 
@@ -8512,7 +8451,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let err = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -8565,7 +8504,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let err = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -8627,7 +8566,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let err = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -8679,7 +8618,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let err = Ctx::load_files(config.path(), secrets.path())
             .await
@@ -8707,7 +8646,10 @@ mod tests {
             extra_secret = "surprise"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#,
         );
 
@@ -8737,7 +8679,10 @@ mod tests {
             extra_secret = "surprise"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#,
         );
 
@@ -8798,7 +8743,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let config_path = config.path().to_path_buf();
         let err = Ctx::load_files(&config_path, secrets.path())
@@ -8848,7 +8793,6 @@ mod tests {
     #[test]
     fn broker_type_tag_uses_kebab_case() {
         let variants = [
-            ("dry-run", "DryRun"),
             ("alpaca-broker-api", "AlpacaBrokerApi"),
             ("alpaca-broker-api-kms", "AlpacaBrokerApiKms"),
         ];
@@ -8871,8 +8815,7 @@ mod tests {
                 "#,
             );
 
-            // Only dry-run parses without extra fields;
-            // alpaca broker needs credentials but the tag itself
+            // The alpaca broker needs credentials, but the tag itself
             // must be accepted before field validation runs.
             let result = toml::from_str::<Secrets>(&toml_str);
             match result {
@@ -8907,7 +8850,10 @@ mod tests {
             rpc_url = "http://localhost:8545"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#;
 
         let secrets = toml::from_str::<Secrets>(per_chain).unwrap();
@@ -8922,7 +8868,10 @@ mod tests {
             rpc_url = "http://localhost:8545"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#;
 
         let Err(error) = toml::from_str::<Secrets>(flat) else {
@@ -9001,6 +8950,16 @@ mod tests {
             error.to_string().contains("failed to parse config"),
             "must surface as a config parse error: {error}"
         );
+    }
+
+    /// The broker fixture must never resolve to a real Alpaca endpoint: a
+    /// test that constructs a real executor from it by mistake has to fail
+    /// instantly and locally instead of sending dummy credentials to the
+    /// sandbox over the network.
+    #[test]
+    fn test_alpaca_broker_ctx_points_at_unreachable_local_sentinel() {
+        let BrokerCtx::AlpacaBrokerApi(alpaca) = test_alpaca_broker_ctx();
+        assert_eq!(alpaca.base_url(), "http://127.0.0.1:0");
     }
 
     /// Requires the `wallet-private-key` feature: `load_files` constructs a
@@ -9451,7 +9410,7 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
         "#,
         );
-        let secrets = dry_run_pricing_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
         assert!(
@@ -9536,179 +9495,6 @@ mod tests {
         Ctx::validate_files(config.path(), secrets.path()).unwrap();
     }
 
-    /// Assets fixture with extended hours enabled for one symbol, so the
-    /// DryRun arm of `extended_hours_broker_windows` requires configured
-    /// windows. The dry-run broker is retired at config validation, but its
-    /// window resolution is still live code, so these tests exercise the
-    /// private functions directly instead of going through `Ctx::load_files`.
-    fn extended_hours_assets_config() -> HedgingAssets {
-        toml::from_str(
-            r#"
-            [equities]
-            retired_symbols = []
-
-            [equities.AAPL]
-            extended_hours_counter_trading = "enabled"
-        "#,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn dry_run_broker_requires_extended_hours_reprice_timeout_when_extended_hours_enabled() {
-        let Err(error) = extended_hours_broker_windows(
-            &BrokerCtx::DryRun,
-            None,
-            &extended_hours_assets_config(),
-        ) else {
-            panic!("expected MissingExtendedHoursRepriceTimeout, got Ok windows");
-        };
-
-        assert!(
-            matches!(error, CtxError::MissingExtendedHoursRepriceTimeout),
-            "Expected MissingExtendedHoursRepriceTimeout for DryRun broker with extended \
-             hours enabled and no configured timeout, got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn dry_run_broker_honors_configured_extended_hours_reprice_timeout() {
-        let broker_config = BrokerConfig {
-            kind: Some(BrokerKind::DryRun),
-            mode: None,
-            account_id: None,
-            client_id: None,
-            kms_key_version: None,
-            counter_trade_slippage_bps: None,
-            extended_hours_reprice_timeout_secs: Some(300),
-            close_flatten_reprice_timeout_secs: Some(60),
-            extended_hours_close_flatten_window_secs: Some(900),
-            travel_rule: None,
-            close_flatten_cross_max_bps: Some(400),
-        };
-
-        let windows = extended_hours_broker_windows(
-            &BrokerCtx::DryRun,
-            Some(&broker_config),
-            &extended_hours_assets_config(),
-        )
-        .unwrap();
-
-        assert_eq!(windows.reprice_timeout_secs, NonZeroU64::new(300));
-        assert_eq!(windows.close_flatten_reprice_timeout_secs, 60);
-        assert_eq!(windows.close_flatten_window_secs, 900);
-    }
-
-    /// A DryRun ceiling equal to a configured base still runs the ramp
-    /// backwards, because DryRun builds the ramp from the executor default
-    /// instead of the configured value.
-    #[test]
-    fn dry_run_close_flatten_cross_max_bps_below_the_executor_default_is_rejected() {
-        let broker_config = BrokerConfig {
-            kind: Some(BrokerKind::DryRun),
-            mode: None,
-            account_id: None,
-            client_id: None,
-            kms_key_version: None,
-            counter_trade_slippage_bps: Some(50),
-            extended_hours_reprice_timeout_secs: Some(300),
-            close_flatten_reprice_timeout_secs: Some(60),
-            extended_hours_close_flatten_window_secs: Some(900),
-            travel_rule: None,
-            close_flatten_cross_max_bps: Some(50),
-        };
-
-        let Err(err) = extended_hours_broker_windows(
-            &BrokerCtx::DryRun,
-            Some(&broker_config),
-            &extended_hours_assets_config(),
-        ) else {
-            panic!("expected CloseFlattenCrossMaxBpsOutOfRange, got Ok windows");
-        };
-        let message = err.to_string();
-
-        let CtxError::CloseFlattenCrossMaxBpsOutOfRange {
-            configured,
-            min,
-            max,
-        } = err
-        else {
-            panic!("expected CloseFlattenCrossMaxBpsOutOfRange, got: {err:?}");
-        };
-        assert_eq!(
-            (configured, min, max),
-            (50, DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, 9_999)
-        );
-        assert!(message.contains("minimum is the effective runtime counter-trade slippage base"));
-    }
-
-    /// The mirror case: a ceiling at the executor default is accepted even
-    /// though the configured base sits below it, since the configured base is
-    /// dead weight under DryRun.
-    #[test]
-    fn dry_run_close_flatten_cross_max_bps_accepts_the_executor_default_as_its_floor() {
-        let broker_config = BrokerConfig {
-            kind: Some(BrokerKind::DryRun),
-            mode: None,
-            account_id: None,
-            client_id: None,
-            kms_key_version: None,
-            counter_trade_slippage_bps: Some(50),
-            extended_hours_reprice_timeout_secs: Some(300),
-            close_flatten_reprice_timeout_secs: Some(60),
-            extended_hours_close_flatten_window_secs: Some(900),
-            travel_rule: None,
-            close_flatten_cross_max_bps: Some(DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS),
-        };
-
-        let windows = extended_hours_broker_windows(
-            &BrokerCtx::DryRun,
-            Some(&broker_config),
-            &extended_hours_assets_config(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            windows.close_flatten_cross_max_bps,
-            DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS
-        );
-        assert_eq!(
-            BrokerCtx::DryRun.counter_trade_slippage_bps(),
-            DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS
-        );
-    }
-
-    #[test]
-    fn dry_run_broker_requires_extended_hours_close_flatten_window_when_extended_hours_enabled() {
-        let broker_config = BrokerConfig {
-            kind: Some(BrokerKind::DryRun),
-            mode: None,
-            account_id: None,
-            client_id: None,
-            kms_key_version: None,
-            counter_trade_slippage_bps: None,
-            extended_hours_reprice_timeout_secs: Some(300),
-            close_flatten_reprice_timeout_secs: Some(60),
-            extended_hours_close_flatten_window_secs: None,
-            travel_rule: None,
-            close_flatten_cross_max_bps: None,
-        };
-
-        let Err(error) = extended_hours_broker_windows(
-            &BrokerCtx::DryRun,
-            Some(&broker_config),
-            &extended_hours_assets_config(),
-        ) else {
-            panic!("expected MissingExtendedHoursCloseFlattenWindow, got Ok windows");
-        };
-
-        assert!(
-            matches!(error, CtxError::MissingExtendedHoursCloseFlattenWindow),
-            "Expected MissingExtendedHoursCloseFlattenWindow for DryRun broker with \
-             extended hours enabled and no configured close-flatten window, got: {error:?}"
-        );
-    }
-
     #[test]
     fn validate_files_rejects_invalid_config_toml() {
         let config = toml_file(
@@ -9744,7 +9530,7 @@ mod tests {
 
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
         assert!(
@@ -9770,7 +9556,10 @@ mod tests {
             extra_secret = "surprise"
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#,
         );
 
@@ -9844,7 +9633,10 @@ mod tests {
 
 
             [broker]
-            type = "dry-run"
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
         "#,
         );
 
@@ -10156,7 +9948,7 @@ mod tests {
             address = "0x0000000000000000000000000000000000000001"
         "#,
         );
-        let secrets = dry_run_secrets_toml();
+        let secrets = alpaca_secrets_toml();
 
         let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
         assert!(

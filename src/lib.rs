@@ -27,7 +27,6 @@ use tracing_subscriber::Layer;
 
 use st0x_config::{BrokerCtx, Ctx};
 use st0x_dto::Statement;
-use st0x_execution::MockExecutorCtx;
 
 use crate::conductor::{ConductorStartupTokens, DatabasePools, SupervisorStartupTokens};
 use crate::trading::offchain::hedge::HedgeJobQueue;
@@ -766,37 +765,20 @@ async fn run_conductor_session(
     startup_tokens: ConductorStartupTokens,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
-    let result = match ctx.broker.clone() {
-        BrokerCtx::DryRun => {
-            info!(target: "startup", "Initializing test executor for dry-run mode");
-            let pools = pools.clone();
-            Box::pin(conductor::Conductor::run(
-                MockExecutorCtx,
-                ctx,
-                pools,
-                server,
-                shutdown_token,
-                startup_tokens,
-                #[cfg(any(test, feature = "test-support"))]
-                failure_injector,
-            ))
-            .await
-        }
-        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
-            info!(target: "startup", "Initializing Alpaca Broker API executor");
-            Box::pin(conductor::Conductor::run(
-                alpaca_auth,
-                ctx,
-                pools,
-                server,
-                shutdown_token,
-                startup_tokens,
-                #[cfg(any(test, feature = "test-support"))]
-                failure_injector,
-            ))
-            .await
-        }
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = ctx.broker.clone();
+
+    info!(target: "startup", "Initializing Alpaca Broker API executor");
+    let result = Box::pin(conductor::Conductor::run(
+        alpaca_auth,
+        ctx,
+        pools,
+        server,
+        shutdown_token,
+        startup_tokens,
+        #[cfg(any(test, feature = "test-support"))]
+        failure_injector,
+    ))
+    .await;
 
     match result {
         Ok(()) => {
@@ -817,6 +799,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use st0x_config::create_test_ctx_with_order_owner;
+    use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
 
     use super::*;
 
@@ -1246,6 +1229,14 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
+        // Executor init runs before the RPC probe; point it at an in-process
+        // mock so the probe failure under test is what actually surfaces.
+        let broker_mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx(broker_mock.base_url());
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         // Port 1 refuses connections immediately, so the startup RPC probe
         // fails fast rather than hanging on a retry loop.
@@ -1280,7 +1271,11 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        ctx.chains.primary_mut().rpc_url = "http://127.0.0.1:1".parse().unwrap();
+        // Executor init runs before the RPC probe, so an unreachable broker
+        // fails there -- a distinct failure path from the unreachable-RPC
+        // test above, proving executor-init errors propagate too. Port 1
+        // refuses connections immediately.
+        ctx.broker = crate::test_utils::mock_alpaca_broker_ctx("http://127.0.0.1:1".to_owned());
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let error = Box::pin(run_conductor_session(
             ctx,
@@ -1302,8 +1297,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("RPC endpoint at startup"),
-            "expected startup RPC probe failure, got: {error:#}"
+            format!("{error:#}").contains("HTTP client error"),
+            "expected executor-init broker connection failure, got: {error:#}"
         );
     }
 

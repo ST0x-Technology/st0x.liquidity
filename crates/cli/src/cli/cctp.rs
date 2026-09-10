@@ -243,7 +243,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{BrokerCtx, CtxError, LogFormat, LogLevel};
+    use st0x_config::{CtxError, LogFormat, LogLevel};
     use st0x_config::{InventoryMode, TradingChain};
     use st0x_evm::Chain;
     use st0x_evm::OpenChainErrorRegistry;
@@ -281,7 +281,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
-            broker: BrokerCtx::DryRun,
+            broker: st0x_config::test_alpaca_broker_ctx(),
             telemetry: None,
             alerts: None,
             startup_notices: Vec::new(),

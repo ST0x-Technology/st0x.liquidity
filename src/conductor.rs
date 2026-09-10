@@ -39,7 +39,7 @@ use url::Url;
 use st0x_config::{
     BrokerCtx, ChainAssets, Ctx, CtxError, ExecutionThreshold, HedgingAssets, InventoryMode,
     IssuanceStatusCtx, OnchainWalletCtx, OperationMode, OrchestratorAddresses, RebalancingCtx,
-    RebalancingCtxError, TradingChain,
+    TradingChain,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -1747,9 +1747,7 @@ fn build_chain_tokenizations(
     ctx: &Ctx,
     wallet_ctx: &OnchainWalletCtx,
 ) -> anyhow::Result<WatchedChainTokenizations> {
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("tokenization requires Alpaca Broker API configuration");
-    };
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     ctx.chains
         .watched()
@@ -2650,16 +2648,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     Box::pin(async move {
         info!("Initializing rebalancing infrastructure");
 
-        // The parse layer already rejects a `[rebalancing]` section without
-        // an Alpaca broker (`RebalancingCtxError::NotAlpacaBroker`), so the
-        // DryRun arm is reachable only from a hand-built ctx (e.g. in a
-        // unit test) and surfaces the same typed error instead of a panic.
-        let alpaca_auth = match &deps.ctx.broker {
-            BrokerCtx::AlpacaBrokerApi(alpaca_auth) => alpaca_auth,
-            BrokerCtx::DryRun => {
-                return Err(CtxError::from(RebalancingCtxError::NotAlpacaBroker).into());
-            }
-        };
+        let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker;
 
         let primary_chain = deps.ctx.chains.primary().chain;
         confirm_equity_transfer_paths_support(primary_chain)?;

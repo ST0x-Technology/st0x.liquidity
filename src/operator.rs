@@ -453,7 +453,8 @@ pub mod bindings {
 #[cfg(feature = "test-support")]
 pub mod test_utils {
     pub use crate::test_utils::{
-        OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, try_positive_shares,
-        try_rebalancing_enabled_equities, try_setup_test_db, try_setup_test_pools,
+        OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, mock_alpaca_broker_ctx,
+        try_positive_shares, try_rebalancing_enabled_equities, try_setup_test_db,
+        try_setup_test_pools,
     };
 }

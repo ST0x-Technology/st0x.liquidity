@@ -155,6 +155,7 @@ mod tests {
     use std::sync::Mutex;
 
     use alloy::primitives::{Address, address};
+    use rain_math_float::Float;
 
     use st0x_config::ChainRegistry;
     use st0x_config::HedgingAssets;
@@ -162,7 +163,8 @@ mod tests {
     use st0x_config::{
         BrokerCtx, ExecutionThreshold, InventoryMode, LogFormat, LogLevel, TradingChain,
     };
-    use st0x_hedge::operator::test_utils::try_positive_shares;
+    use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
+    use st0x_hedge::operator::test_utils::{mock_alpaca_broker_ctx, try_positive_shares};
 
     use super::*;
 
@@ -213,7 +215,7 @@ mod tests {
         }
     }
 
-    fn dry_run_ctx() -> Ctx {
+    fn test_ctx(broker: BrokerCtx) -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -243,7 +245,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
             apalis_finished_job_cleanup_interval_secs: 3600,
-            broker: BrokerCtx::DryRun,
+            broker,
             telemetry: None,
             alerts: None,
             startup_notices: Vec::new(),
@@ -264,12 +266,20 @@ mod tests {
     }
 
     /// The bump must run buy -> tokenize -> donate in order and stop at the first
-    /// failing step. With a DryRun broker the mock buy fills, but tokenization
-    /// fails because the symbol is not configured, so the donate step must never
+    /// failing step. The mock broker fills the buy, but tokenization fails
+    /// because the symbol is not configured, so the donate step must never
     /// run and the error must propagate to the caller.
     #[tokio::test]
     async fn dividend_bump_stops_after_buy_when_tokenize_fails() {
-        let ctx = dry_run_ctx();
+        let broker_mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(
+                Symbol::new("COIN").unwrap(),
+                Float::parse("100".to_string()).unwrap(),
+            )])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        let ctx = test_ctx(mock_alpaca_broker_ctx(broker_mock.base_url()));
         let mut stdout = Vec::new();
 
         let error = dividend_bump_command(
@@ -306,7 +316,9 @@ mod tests {
 
     #[tokio::test]
     async fn dividend_bump_tokenizes_and_donates_the_broker_filled_quantity() {
-        let ctx = dry_run_ctx();
+        // The recording operations never touch the broker, so the plain
+        // mode-less Alpaca fixture suffices (no mock server needed).
+        let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
         let operations = RecordingDividendBumpOperations {
             filled_quantity: positive_shares("0.0041"),
             tokenized: Mutex::new(Vec::new()),
@@ -342,7 +354,7 @@ mod tests {
     /// was asked for: tokens minted on one chain cannot be donated on another.
     #[tokio::test]
     async fn dividend_bump_tokenizes_and_donates_on_the_selected_network() {
-        let ctx = dry_run_ctx();
+        let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
         let operations = RecordingDividendBumpOperations {
             filled_quantity: positive_shares("2"),
             tokenized: Mutex::new(Vec::new()),
