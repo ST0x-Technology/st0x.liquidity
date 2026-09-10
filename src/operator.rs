@@ -4329,6 +4329,12 @@ pub mod vault_registry {
     pub use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 }
 
+pub mod view_rebuild {
+    pub use crate::view_rebuild::{
+        RebuildScope, RebuildableView, ViewRebuildError, ViewRebuilt, rebuild_view,
+    };
+}
+
 #[cfg(feature = "test-support")]
 pub mod bindings {
     pub use crate::bindings::IRaindexV6;

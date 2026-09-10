@@ -16,8 +16,8 @@ use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrappedEquity;
 
 use super::usdc::{
-    CrossVenueCashTransfer, MarketMakingUsdcEndpoints, RecheckUsdcDeposit, ResumeAlpacaToBase,
-    ResumeBaseToAlpaca, UsdcSettlementParams,
+    CrossVenueCashTransfer, MarketMakingUsdcEndpoints, RecheckUsdcDeposit, RecoverCctpMint,
+    ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcSettlementParams,
 };
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::native_gas::GasReadiness;
@@ -61,6 +61,9 @@ pub(crate) struct UsdcTransferResumeHandles {
     /// Operator `transfer recheck` entry point for a failed USDC deposit,
     /// published on the recovery handle rather than a job ctx.
     pub(crate) recheck_deposit: Arc<dyn RecheckUsdcDeposit>,
+    /// Operator `cctp complete-mint` entry point, published on the recovery
+    /// handle rather than a job ctx.
+    pub(crate) recover_cctp_mint: Arc<dyn RecoverCctpMint>,
 }
 
 #[derive(Clone)]
@@ -174,6 +177,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
 
         let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
         let recheck_deposit: Arc<dyn RecheckUsdcDeposit> = usdc.clone();
+        let recover_cctp_mint: Arc<dyn RecoverCctpMint> = usdc.clone();
         let resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase> = usdc;
 
         info!(target: "rebalance", "Rebalancing infrastructure initialized");
@@ -182,6 +186,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
             resume_base_to_alpaca,
             resume_alpaca_to_base,
             recheck_deposit,
+            recover_cctp_mint,
         }
     }
 }
@@ -524,6 +529,7 @@ mod tests {
             resume_base_to_alpaca: _,
             resume_alpaca_to_base: _,
             recheck_deposit: _,
+            recover_cctp_mint: _,
         } = services.into_usdc_transfer_handles(
             Address::random(),
             RaindexVaultId(B256::ZERO),
