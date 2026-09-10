@@ -35,7 +35,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
@@ -575,11 +575,12 @@ pub enum MintError {
     /// mint stays `MintAccepted`; the resume path retries the check.
     #[error("Vault-mode check failed: {0}")]
     VaultModeCheck(#[from] VaultModeCheckError),
-    /// `vault_mode` reads orchestrator but the symbol has no
-    /// `[assets.equities.<symbol>] tokenized_equity` config entry to bind
-    /// the authorization to.
-    #[error("No tokenized-equity address configured for {symbol}")]
-    UnknownTokenizedEquity { symbol: Symbol },
+    /// `vault_mode` reads orchestrator but the record's chain lists no
+    /// `[chains.<name>.trading.assets.equities.<symbol>] tokenized_equity`
+    /// to bind the authorization to. Never resolved through another
+    /// chain's table: the same symbol is a different contract there.
+    #[error("No tokenized-equity address configured for {symbol} on {chain}")]
+    UnknownTokenizedEquity { chain: Chain, symbol: Symbol },
     /// Enqueueing the authorization delivery job failed -- a local SQLite
     /// write. The signed authorization is already persisted on the
     /// aggregate, so the resume path re-enqueues without re-signing.
@@ -819,16 +820,14 @@ pub(crate) enum ConfiguredMintAuthorization {
 }
 
 /// Everything the mint saga needs to produce and deliver a MintAuthV1
-/// recipient authorization for orchestrator-mode assets (RAI-1243).
+/// recipient authorization for orchestrator-mode assets (RAI-1243). The
+/// `token` the MintAuth binds is not here: it comes from the record chain's
+/// own [`ChainEquityServices::equities`] table.
 pub(crate) struct MintAuthorizationWiring {
     /// Reads each asset's `vault_mode` from issuance -- the single source
     /// of truth for which assets need an authorization; the bot keeps no
     /// asset-mode list of its own.
     pub(crate) vault_mode_reader: Arc<dyn VaultModeReader>,
-    /// Tokenized-equity ERC-20 per symbol, from
-    /// `[assets.equities.<SYM>] tokenized_equity` config -- the `token`
-    /// the EIP-712 MintAuth binds.
-    pub(crate) token_addresses: HashMap<Symbol, Address>,
     /// Delivery job queue; enqueued idempotently per issuer request id.
     pub(crate) delivery_queue: DeliverMintAuthorizationJobQueue,
 }
@@ -863,6 +862,7 @@ impl CrossVenueEquityTransfer {
     async fn ensure_mint_authorization(
         &self,
         issuer_request_id: &IssuerRequestId,
+        chain: Chain,
         symbol: &Symbol,
     ) -> Result<(), MintError> {
         let wiring = match &self.mint_authorization {
@@ -890,11 +890,20 @@ impl CrossVenueEquityTransfer {
         match wiring.vault_mode_reader.vault_mode(symbol).await? {
             VaultModeTag::VaultDirect => Ok(()),
             VaultModeTag::Orchestrator => {
-                let token = wiring.token_addresses.get(symbol).copied().ok_or_else(|| {
-                    MintError::UnknownTokenizedEquity {
+                // The MintAuth names the tokenized equity as deployed on the
+                // record's chain; the primary's table would bind the wrong
+                // contract wherever the addresses differ.
+                let token = self
+                    .services
+                    .for_chain(chain)?
+                    .equities
+                    .symbols
+                    .get(symbol)
+                    .map(|equity| equity.tokenized_equity)
+                    .ok_or_else(|| MintError::UnknownTokenizedEquity {
+                        chain,
                         symbol: symbol.clone(),
-                    }
-                })?;
+                    })?;
 
                 self.mint_store
                     .send(
@@ -1303,14 +1312,14 @@ impl CrossVenueEquityTransfer {
     ) -> Result<(), MintError> {
         loop {
             match self.load_mint_entity(issuer_request_id).await? {
-                TokenizedEquityMint::MintAccepted { symbol, .. } => {
+                TokenizedEquityMint::MintAccepted { symbol, chain, .. } => {
                     info!(%issuer_request_id, "Resuming accepted mint");
                     // Idempotent: signing no-ops once an authorization
                     // exists and the delivery enqueue is keyed on the
                     // issuer request id, so a resumed orchestrator-mode
                     // mint re-delivers its PERSISTED authorization rather
                     // than minting a fresh nonce.
-                    self.ensure_mint_authorization(issuer_request_id, &symbol)
+                    self.ensure_mint_authorization(issuer_request_id, chain, &symbol)
                         .await?;
                     self.mint_store
                         .send(issuer_request_id, TokenizedEquityMintCommand::Poll)
@@ -2241,7 +2250,7 @@ impl CrossVenueEquityTransfer {
         // and on its way to issuance BEFORE polling: issuance will not mint
         // (and the poll cannot complete) until the authorization arrives.
         // Still pre-receipt -- a failure here leaves the mint resumable.
-        self.ensure_mint_authorization(issuer_request_id, symbol)
+        self.ensure_mint_authorization(issuer_request_id, chain, symbol)
             .await
             .map_err(MintTransferError::PreReceipt)?;
 
@@ -2347,7 +2356,7 @@ mod tests {
     use chrono::Utc;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::broadcast;
@@ -4039,8 +4048,8 @@ mod tests {
         authorization_wired_transfer(services, mode).await
     }
 
-    /// Wires mint authorization onto `services` the way the conductor does:
-    /// the token map is the primary (Base) entry's equity table.
+    /// Wires mint authorization onto `services`: a stubbed vault-mode
+    /// reader and a real (in-memory) delivery queue.
     async fn authorization_wired_transfer(
         services: EquityTransferServices,
         mode: VaultModeTag,
@@ -4053,18 +4062,10 @@ mod tests {
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), services.clone()));
 
-        let token_addresses = services.chains[&Chain::Base]
-            .equities
-            .symbols
-            .iter()
-            .map(|(symbol, equity)| (symbol.clone(), equity.tokenized_equity))
-            .collect();
-
         let transfer =
             CrossVenueEquityTransfer::new(services.clone(), mint_store, redemption_store)
                 .with_mint_authorization(MintAuthorizationWiring {
                     vault_mode_reader: Arc::new(StubVaultModeReader(mode)),
-                    token_addresses,
                     delivery_queue: DeliverMintAuthorizationJobQueue::new(&apalis_pool),
                 });
 
@@ -4263,7 +4264,7 @@ mod tests {
         assert_eq!(count_delivery_jobs(&apalis_pool).await, 1);
 
         transfer
-            .ensure_mint_authorization(&id, &symbol)
+            .ensure_mint_authorization(&id, Chain::Base, &symbol)
             .await
             .unwrap();
 
@@ -4313,28 +4314,28 @@ mod tests {
         assert_eq!(count_delivery_jobs(&apalis_pool).await, 0);
     }
 
-    /// An orchestrator-mode asset with no `[assets.equities.<SYM>]`
-    /// tokenized-equity entry cannot bind the EIP-712 MintAuth to a token:
-    /// the mint must fail with the exact variant, never proceed
-    /// unauthorized.
+    /// An orchestrator-mode asset its chain does not list under
+    /// `[chains.<name>.trading.assets.equities]` cannot bind the EIP-712
+    /// MintAuth to a token: the mint must fail naming the chain and symbol,
+    /// never proceed unauthorized.
     #[tokio::test]
     async fn orchestrator_asset_without_token_address_fails_before_signing() {
         let (transfer, pool, apalis_pool) =
             create_authorization_wired_transfer(VaultModeTag::Orchestrator).await;
 
-        // TSLA is absent from the helper's AAPL-only token map.
+        // TSLA is absent from the helper's AAPL-only Base equity table.
         let tsla = Symbol::new("TSLA").unwrap();
         let error = transfer
-            .ensure_mint_authorization(&issuer_request_id("ISS-NO-TOKEN"), &tsla)
+            .ensure_mint_authorization(&issuer_request_id("ISS-NO-TOKEN"), Chain::Base, &tsla)
             .await
             .unwrap_err();
 
         assert!(
             matches!(
-                error,
-                MintError::UnknownTokenizedEquity { symbol } if symbol == tsla
+                &error,
+                MintError::UnknownTokenizedEquity { chain: Chain::Base, symbol } if *symbol == tsla
             ),
-            "expected UnknownTokenizedEquity for the unmapped symbol"
+            "expected UnknownTokenizedEquity naming Base and TSLA, got {error:?}"
         );
         assert_eq!(
             count_events(&pool, "TokenizedEquityMintEvent::MintAuthorizationSigned").await,
@@ -4381,7 +4382,7 @@ mod tests {
         submit_requested_mint(&transfer, &id).await;
 
         transfer
-            .ensure_mint_authorization(&id, &symbol)
+            .ensure_mint_authorization(&id, Chain::Base, &symbol)
             .await
             .unwrap();
 

@@ -1730,9 +1730,6 @@ struct ChainTokenization<Signer: Wallet> {
     tokenizer: Arc<dyn Tokenizer>,
     wrapper: Arc<WrapperService<Signer>>,
     mint_authorizer: ConfiguredMintAuthorizer,
-    /// Every configured equity's underlying token on this chain: the table
-    /// the mint saga resolves a symbol through before signing.
-    token_addresses: HashMap<Symbol, Address>,
 }
 
 /// Every watched chain's [`ChainTokenization`] on the wallets `[wallet]`
@@ -1770,14 +1767,6 @@ fn build_chain_tokenizations(
                 chain,
                 wallet.clone(),
             );
-            let token_addresses = watched
-                .assets
-                .equities
-                .symbols
-                .iter()
-                .map(|(symbol, equity)| (symbol.clone(), equity.tokenized_equity))
-                .collect();
-
             Ok((
                 chain,
                 ChainTokenization {
@@ -1786,7 +1775,6 @@ fn build_chain_tokenizations(
                     tokenizer,
                     wrapper,
                     mint_authorizer,
-                    token_addresses,
                 },
             ))
         })
@@ -1888,7 +1876,7 @@ async fn run_startup_maintenance(ctx: &Ctx, pool: &SqlitePool) -> anyhow::Result
 struct MintAuthorizationInfra {
     /// Delivery job queue, shared by the saga's enqueue and the worker.
     queue: DeliverMintAuthorizationJobQueue,
-    /// The saga-side bundle: vault-mode reads, token map, delivery enqueue.
+    /// The saga-side bundle: vault-mode reads and delivery enqueue.
     wiring: MintAuthorizationWiring,
     /// The shared issuance client, handed on to the delivery job.
     issuance_client: Arc<IssuanceClient>,
@@ -1924,10 +1912,9 @@ fn build_mint_authorizer<Signer: Wallet + 'static>(
     }
 }
 
-/// Builds [`MintAuthorizationInfra`] around the primary chain's token table:
-/// the MintAuth an orchestrator-mode mint binds names the tokenized equity,
-/// which the saga still resolves through the primary's map. The per-chain
-/// authorizers live on each [`ChainEquityServices`] entry instead, all
+/// Builds [`MintAuthorizationInfra`], the chain-independent half of mint
+/// authorization: the per-chain authorizers and the tokenized-equity table
+/// the MintAuth binds live on each [`ChainEquityServices`] entry, all
 /// sharing the one delivery queue built here. The issuance client is the one
 /// the tokenization preflight already read vault modes through.
 ///
@@ -1936,10 +1923,9 @@ fn build_mint_authorizer<Signer: Wallet + 'static>(
 /// authorization, unlike resume jobs, which startup re-derives). A failed
 /// sweep fails startup -- an unrepaired orphan would read as a live
 /// delivery and suppress resume.
-async fn build_mint_authorization_infra<Signer: Wallet>(
+async fn build_mint_authorization_infra(
     issuance_client: Arc<IssuanceClient>,
     apalis_pool: &apalis_sqlite::SqlitePool,
-    primary: &ChainTokenization<Signer>,
 ) -> anyhow::Result<MintAuthorizationInfra> {
     let queue = DeliverMintAuthorizationJobQueue::new(apalis_pool);
 
@@ -1963,7 +1949,6 @@ async fn build_mint_authorization_infra<Signer: Wallet>(
     Ok(MintAuthorizationInfra {
         wiring: MintAuthorizationWiring {
             vault_mode_reader: issuance_client.clone(),
-            token_addresses: primary.token_addresses.clone(),
             delivery_queue: queue.clone(),
         },
         queue,
@@ -2843,7 +2828,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let wrapper = primary.wrapper.clone();
 
         let mint_authorization =
-            build_mint_authorization_infra(issuance_client, &deps.apalis_pool, primary).await?;
+            build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
 
         let WatchedEquityServices {
             chains: chain_services,
@@ -15442,20 +15427,12 @@ mod tests {
             base.wallet.address(),
             address!("0x0000000000000000000000000000000000000ba5")
         );
-        assert_eq!(
-            base.token_addresses,
-            HashMap::from([(Symbol::new("AAPL").unwrap(), Address::repeat_byte(0xa5))])
-        );
 
         let ethereum = &tokenizations[&Chain::Ethereum];
         assert_eq!(ethereum.chain, Chain::Ethereum);
         assert_eq!(
             ethereum.wallet.address(),
             address!("0x0000000000000000000000000000000000000e78")
-        );
-        assert_eq!(
-            ethereum.token_addresses,
-            HashMap::from([(Symbol::new("TSLA").unwrap(), Address::repeat_byte(0xe5))])
         );
     }
 
