@@ -15610,7 +15610,6 @@ mod tests {
                         mint_authorizer: ConfiguredMintAuthorizer::Enabled(Arc::new(
                             MockMintAuthorizer,
                         )),
-                        token_addresses: HashMap::new(),
                     }),
                 },
             ),
