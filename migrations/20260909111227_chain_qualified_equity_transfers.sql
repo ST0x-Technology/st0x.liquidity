@@ -19,18 +19,7 @@ UPDATE events
    AND json_extract(payload, '$.VaultWithdrawPending') IS NOT NULL
    AND json_extract(payload, '$.VaultWithdrawPending.chain') IS NULL;
 
--- Snapshots hold the serialized state, whose variant key is the state the
--- aggregate had reached. Only a snapshot still in its genesis state matches
--- the same key; every other one is discarded by the SCHEMA_VERSION 5 -> 6
--- bump and rebuilt from the events above.
-UPDATE snapshots
-   SET payload = json_set(payload, '$.MintRequested.chain', 'base')
- WHERE aggregate_type = 'TokenizedEquityMint'
-   AND json_extract(payload, '$.MintRequested') IS NOT NULL
-   AND json_extract(payload, '$.MintRequested.chain') IS NULL;
-
-UPDATE snapshots
-   SET payload = json_set(payload, '$.VaultWithdrawPending.chain', 'base')
- WHERE aggregate_type = 'EquityRedemption'
-   AND json_extract(payload, '$.VaultWithdrawPending') IS NOT NULL
-   AND json_extract(payload, '$.VaultWithdrawPending.chain') IS NULL;
+-- Snapshots need no patch: `EquityRedemption::SCHEMA_VERSION` went 5 -> 6
+-- and `TokenizedEquityMint::SCHEMA_VERSION` 6 -> 7, and the event-sorcery
+-- reconciler deletes every snapshot of an aggregate whose stored version
+-- differs, whatever state it holds, then rebuilds it from the patched events.
