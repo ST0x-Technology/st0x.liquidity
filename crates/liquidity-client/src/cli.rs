@@ -120,6 +120,15 @@ pub(crate) enum Debug {
         #[arg(long)]
         reason: String,
     },
+    /// Mark a pre-burn USDC rebalance failed so the guard can be released.
+    /// Refuses post-burn states; verify on-chain that no burn landed first.
+    FailUsdcTransfer {
+        /// USDC rebalance id.
+        id: String,
+        /// Free text audit reason, persisted on the event.
+        #[arg(long)]
+        reason: String,
+    },
     /// Recover stuck position state.
     #[command(subcommand)]
     Position(Position),

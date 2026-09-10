@@ -559,7 +559,12 @@ the direction:
   releases the guard; a restart re-latches it until then.
 
 **Stop the bot before running this command** to eliminate the race where the bot
-advances the transfer to `Bridging` between the preflight and the send.
+advances the transfer to `Bridging` between the preflight and the send. The same
+operation is available against the live bot as
+`POST /liquidity-write/transfers/usdc/{id}/fail` (client:
+`st0x-liquidity-client debug fail-usdc-transfer <id> --reason ...`); it runs
+under the resume lock with the USDC driver quiesced, so the bot does not need to
+be stopped. Its `guardHeld` response field reports the direction split above.
 
 `WithdrawalComplete` is unconditionally pre-burn: no CCTP burn has been
 broadcast yet, but the source withdrawal has completed in either direction. The
