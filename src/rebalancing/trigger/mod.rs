@@ -1656,7 +1656,7 @@ impl RebalancingService {
         let mut inventory = self.inventory.write().await;
         *inventory = inventory
             .clone()
-            .clear_equity_inflight(&tracking.symbol, Venue::MarketMaking, now)?
+            .clear_equity_inflight_at(&tracking.symbol, tracking.chain, Venue::MarketMaking, now)?
             .clear_active_redemption(&tracking.symbol);
         drop(inventory);
 
