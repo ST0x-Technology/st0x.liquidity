@@ -5272,6 +5272,11 @@ impl RebalancingService {
     /// between, which would let recovery's `set_inflight` (a replace, not an
     /// add) clobber its in-flight. A slot still owned by `id` itself is not a
     /// conflict -- that is the stale state recovery reconciles.
+    ///
+    /// The rebuild holds `mint_event_sync` throughout, so a terminal `on_mint`
+    /// cannot remove the tracking or clear the guard it just established --
+    /// which would leave the later `ProviderCompletionRecovered` with nothing
+    /// to complete.
     pub(crate) async fn rebuild_mint_tracking_for_recovery(
         &self,
         id: &IssuerRequestId,
@@ -5285,6 +5290,9 @@ impl RebalancingService {
             warn!(target: "rebalance", id = %id, "rebuild_mint_tracking_for_recovery called on non-failed mint; skipping");
             return Ok(RecoveryClaim::Claimed(RecoveryRollback::TrackingOnly));
         };
+
+        // Terminal reactors must finish before recovery reuses their ownership.
+        let _event_sync_guard = self.mint_event_sync.lock().await;
 
         let quantity = FractionalShares::new(*quantity);
 
