@@ -23,8 +23,8 @@ pub use manager::{
     verify_deposit_send_superseded,
 };
 pub(crate) use manager::{
-    RecheckUsdcDeposit, RestorePreparedDepositSends, RestoredDepositSends, UsdcRecheckError,
-    u256_to_usdc,
+    CctpMintRecoveryError, RecheckUsdcDeposit, RecoverCctpMint, RestorePreparedDepositSends,
+    RestoredDepositSends, UsdcRecheckError, u256_to_usdc,
 };
 
 use std::time::Duration;
