@@ -2072,6 +2072,22 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The watched secondaries whose vaults are managed but never read: the
+/// inventory poller runs on the primary chain alone, so nothing keeps these
+/// chains' slots current. Sorted by [`ChainRegistry::watched`]'s own order so
+/// the startup warnings come out deterministically.
+fn unpolled_managed_secondaries(ctx: &Ctx) -> Vec<Chain> {
+    ctx.chains
+        .watched()
+        .filter(|watched| watched.chain != ctx.chains.primary().chain)
+        .filter(|watched| match watched.inventory {
+            InventoryMode::Legacy => false,
+            InventoryMode::Managed { .. } => true,
+        })
+        .map(|watched| watched.chain)
+        .collect()
+}
+
 /// Every startup smoke check, in one place, all read-only. `/health` reports
 /// healthy only after these pass AND every run loop has acknowledged the
 /// startup barrier, so a deploy probe cannot see a 200 from a bot that failed
@@ -2128,9 +2144,22 @@ where
             })? {
             CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
         }
+
+        confirm_configured_asset_responds(chain_provider, watched).await?;
     }
 
-    let trading_chain = ctx.chains.primary();
+    // Not a refusal: a prefunded secondary is a valid rollout state, and
+    // refusing would block it. The operator tops these vaults up by hand
+    // and reads their balances offchain until per-chain polling lands.
+    for chain in unpolled_managed_secondaries(ctx) {
+        warn!(
+            target: "startup",
+            %chain,
+            "This chain's vault inventory is not polled: inventory polling runs on the \
+             primary chain only, so the chain's balances must be funded and watched by \
+             hand"
+        );
+    }
 
     confirm_transport_chain_ids(ctx).await?;
 
@@ -2141,22 +2170,24 @@ where
         .context("broker API round-trip failed at startup")?;
     info!(target: "startup", market_open, "Confirmed the broker API answers");
 
-    confirm_configured_asset_responds(provider, trading_chain).await
+    Ok(())
 }
 
 /// Startup read-path canary: one configured equity's token contract must
-/// answer a `decimals()` view call on the trading chain.
+/// answer a `decimals()` view call on the chain it is configured for.
 ///
 /// Proves the configured address is a live contract on the endpoint the
 /// registry entry names -- config, RPC transport, and ABI decoding exercised
-/// in one read, before any funds-adjacent work starts. Read-only and
-/// cold-start-safe: a chain with no configured equities is the normal
-/// bring-up state and skips with a log instead of failing.
+/// in one read, before any funds-adjacent work starts. Runs per watched
+/// chain: a secondary's addresses are as mistypeable as the primary's, and
+/// its fills need the token as much. Read-only and cold-start-safe: a chain
+/// with no configured equities is the normal bring-up state and skips with a
+/// log instead of failing.
 async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
     provider: &P,
-    trading_chain: &TradingChain,
+    watched: &TradingChain,
 ) -> anyhow::Result<()> {
-    let Some((symbol, asset)) = trading_chain
+    let Some((symbol, asset)) = watched
         .assets
         .equities
         .symbols
@@ -2165,8 +2196,8 @@ async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
     else {
         info!(
             target: "startup",
-            chain = %trading_chain.chain,
-            "No equities configured on the trading chain; skipping the asset read canary"
+            chain = %watched.chain,
+            "No equities configured on this chain; skipping the asset read canary"
         );
         return Ok(());
     };
@@ -2180,18 +2211,18 @@ async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
                 "startup read canary failed: [chains.{chain}] equity {symbol} at \
                  {token} did not answer decimals() -- wrong address, wrong chain, \
                  or a broken endpoint",
-                chain = trading_chain.chain,
+                chain = watched.chain,
                 token = asset.tokenized_equity,
             )
         })?;
 
     info!(
         target: "startup",
-        chain = %trading_chain.chain,
+        chain = %watched.chain,
         %symbol,
         token = %asset.tokenized_equity,
         decimals,
-        "Confirmed a configured asset responds on the trading chain"
+        "Confirmed a configured asset responds on its chain"
     );
 
     Ok(())
@@ -5271,6 +5302,134 @@ mod tests {
             logs_contain("skipping the asset read canary"),
             "the skip branch must announce itself rather than pass silently"
         );
+    }
+
+    /// Queues the RPC responses one watched chain's startup probes read, in
+    /// order: the chain tip, the chain id, then a null cutoff block (a cold
+    /// endpoint, which startup allows through).
+    fn watched_chain_asserter(chain: Chain) -> Asserter {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(100u64));
+        asserter.push_success(&format!("0x{:x}", chain.chain_id()));
+        asserter.push_success(&serde_json::Value::Null);
+        asserter
+    }
+
+    /// The read canary belongs to every watched chain, not just the primary:
+    /// a secondary's mistyped token address is exactly the config error the
+    /// canary exists to catch, and a bot that starts anyway only discovers it
+    /// when the first fill on that chain needs the token.
+    #[tokio::test]
+    async fn asset_canary_runs_on_every_watched_chain() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        *ctx.chains.primary_mut() = trading_chain_with_equity(
+            "AAPL",
+            address!("0x1111111111111111111111111111111111111111"),
+        );
+        let mut secondary = trading_chain_with_equity(
+            "MSFT",
+            address!("0x2222222222222222222222222222222222222222"),
+        );
+        secondary.chain = Chain::Ethereum;
+        ctx.chains.insert_secondary(secondary);
+
+        let primary_asserter = watched_chain_asserter(Chain::Base);
+        primary_asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &18u8,
+            ),
+        );
+        let provider = ProviderBuilder::new().connect_mocked_client(primary_asserter);
+
+        // The secondary's configured token answers nothing: a dead address,
+        // a wrong-chain endpoint or a broken RPC all surface this way.
+        let secondary_asserter = watched_chain_asserter(Chain::Ethereum);
+        secondary_asserter.push_failure_msg("connection reset by peer");
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(secondary_asserter),
+        )]);
+
+        let error = startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("did not answer decimals()"),
+            "the error must name the canary read: {message}"
+        );
+        assert!(
+            message.contains("MSFT") && message.contains("ethereum"),
+            "the error must name the secondary chain and its symbol: {message}"
+        );
+    }
+
+    /// Inventory polling runs on the primary chain only, so a managed
+    /// secondary's vaults are nobody's job until per-chain polling lands.
+    /// Startup must say so out loud rather than let the operator read an
+    /// inventory view that silently omits that chain.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn startup_warns_about_an_unpolled_managed_secondary() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
+            inventory: Address::repeat_byte(0xAA),
+        };
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .inventory(InventoryMode::Managed {
+                    inventory: Address::repeat_byte(0xBB),
+                })
+                .call(),
+        );
+
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(watched_chain_asserter(Chain::Base));
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(watched_chain_asserter(Chain::Ethereum)),
+        )]);
+
+        startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            logs_contain("vault inventory is not polled"),
+            "an unpolled managed secondary must be warned about at startup"
+        );
+        assert!(
+            logs_contain("chain=ethereum"),
+            "the warning must name the chain the operator has to manage by hand"
+        );
+    }
+
+    /// The warning is owed by a managed secondary alone: the primary is
+    /// polled, and a legacy chain has no managed vaults to be missed.
+    #[test]
+    fn unpolled_managed_secondaries_selects_only_managed_non_primary_chains() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
+            inventory: Address::repeat_byte(0xAA),
+        };
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .inventory(InventoryMode::Managed {
+                    inventory: Address::repeat_byte(0xBB),
+                })
+                .call(),
+        );
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::HyperEvm)
+                .inventory(InventoryMode::Legacy)
+                .call(),
+        );
+
+        assert_eq!(unpolled_managed_secondaries(&ctx), vec![Chain::Ethereum]);
     }
 
     /// The durable double-hedge guard keys on the full chain-qualified fill

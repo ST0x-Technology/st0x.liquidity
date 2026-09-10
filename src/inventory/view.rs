@@ -1348,6 +1348,29 @@ impl InventoryView {
             .map(VenueBalance::inflight)
     }
 
+    /// The market-making equity available in an explicit chain's slot.
+    /// [`Self::equity_available`] resolves the trading chain, so a test
+    /// covering a secondary chain reads through here instead.
+    #[cfg(test)]
+    pub(crate) fn onchain_equity_available_at(
+        &self,
+        symbol: &Symbol,
+        chain: Chain,
+    ) -> Option<FractionalShares> {
+        self.equities
+            .get(symbol)?
+            .get_venue(Venue::MarketMaking, chain)
+            .map(VenueBalance::available)
+    }
+
+    /// The market-making USDC available in an explicit chain's slot.
+    #[cfg(test)]
+    pub(crate) fn onchain_usdc_available_at(&self, chain: Chain) -> Option<Usdc> {
+        self.usdc
+            .get_venue(Venue::MarketMaking, chain)
+            .map(VenueBalance::available)
+    }
+
     /// Returns the USDC available balance at the given venue.
     pub(crate) fn usdc_available(&self, venue: Venue) -> Option<Usdc> {
         match venue {
@@ -1472,9 +1495,9 @@ impl InventoryView {
     }
 
     /// Like [`Self::update_equity`], addressed to an explicit chain's slot:
-    /// snapshot application routes by the event's own chain rather than the
-    /// trading chain.
-    fn update_equity_at(
+    /// snapshot application and fill deltas route by the event's own chain
+    /// rather than the trading chain.
+    pub(crate) fn update_equity_at(
         self,
         symbol: &Symbol,
         chain: Chain,
@@ -1534,7 +1557,7 @@ impl InventoryView {
     }
 
     /// Like [`Self::update_usdc`], addressed to an explicit chain's slot.
-    fn update_usdc_at(
+    pub(crate) fn update_usdc_at(
         self,
         chain: Chain,
         update: impl FnOnce(Inventory<Usdc>, Chain) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
@@ -1724,6 +1747,21 @@ impl InventoryView {
         self.onchain_usdc_snapshot_block_watermark
             .get(&chain)
             .is_some_and(|watermark| block_number <= *watermark)
+    }
+
+    /// Whether an onchain snapshot has seeded `chain`'s MarketMaking equity
+    /// slot for `symbol`. A fill on an unseeded slot waits for the chain's
+    /// first snapshot, which already contains it (ADR 0018).
+    pub(crate) fn onchain_equity_slot_seeded(&self, symbol: &Symbol, chain: Chain) -> bool {
+        self.equities
+            .get(symbol)
+            .and_then(|equity| equity.get_venue(Venue::MarketMaking, chain))
+            .is_some()
+    }
+
+    /// Whether an onchain snapshot has seeded `chain`'s MarketMaking USDC slot.
+    pub(crate) fn onchain_usdc_slot_seeded(&self, chain: Chain) -> bool {
+        self.usdc.get_venue(Venue::MarketMaking, chain).is_some()
     }
 
     /// Marks a symbol as having an open offchain order, so offchain equity

@@ -2416,40 +2416,77 @@ impl Reactor for RebalancingService {
                         // Each delta leg yields to a pinned onchain snapshot
                         // that provably already contains it: a vaultBalance2
                         // read at block N includes every fill at a block <= N
-                        // (ADR 0018). Checked and applied under one write
+                        // (ADR 0018). The same reasoning covers a secondary
+                        // chain's slot no snapshot has seeded yet (a watched
+                        // secondary is not polled): its first snapshot
+                        // contains the fill, so the leg waits rather than
+                        // debiting an empty slot or inventing one that holds
+                        // only the delta. The primary chain is different: its
+                        // unseeded slot is the normal cold state, the fill
+                        // creates it and the primary's poll reconciles it
+                        // shortly after. Checked and applied under one write
                         // lock so no snapshot can advance the watermark in
-                        // between. An absorbed leg is normal operation under
-                        // load, not an error -- the poll simply observed the
-                        // fill before this event arrived.
-                        {
+                        // between. A skipped leg is normal operation, not an
+                        // error.
+                        let trading_chain = {
                             let mut inventory = self.inventory.write().await;
-                            let apply_equity_leg = !inventory
+                            let trading_chain = inventory.trading_chain();
+                            let on_primary = trade_id.chain == trading_chain;
+                            let equity_slot_seeded =
+                                inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
+                            let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
+                            let equity_absorbed = inventory
                                 .onchain_fill_absorbed_by_equity_snapshot(&symbol, trade_id.chain, *block_number);
-                            let apply_usdc_leg =
-                                !inventory.onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
+                            let usdc_absorbed =
+                                inventory.onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
 
-                            if !apply_equity_leg || !apply_usdc_leg {
+                            if !on_primary && (!equity_slot_seeded || !usdc_slot_seeded) {
+                                info!(
+                                    target: "rebalance",
+                                    %symbol,
+                                    chain = %trade_id.chain,
+                                    equity_slot_seeded,
+                                    usdc_slot_seeded,
+                                    "Skipping onchain fill delta leg(s) on a \
+                                     secondary chain slot no onchain snapshot \
+                                     has seeded yet; the chain's first snapshot \
+                                     contains the fill"
+                                );
+                            }
+
+                            if equity_absorbed || usdc_absorbed {
                                 info!(
                                     target: "rebalance",
                                     %symbol,
                                     ?block_number,
-                                    apply_equity_leg,
-                                    apply_usdc_leg,
+                                    equity_absorbed,
+                                    usdc_absorbed,
                                     "Skipping onchain fill delta leg(s) already \
                                      absorbed by a pinned onchain snapshot"
                                 );
                             }
 
+                            let apply_equity_leg =
+                                (on_primary || equity_slot_seeded) && !equity_absorbed;
+                            let apply_usdc_leg = (on_primary || usdc_slot_seeded) && !usdc_absorbed;
+
+                            // Chain-addressed: inventory is not fungible
+                            // across chains, so a fill credits and debits the
+                            // slots of the chain it filled on. Routing it
+                            // through the venue-addressed writers would move
+                            // the trading chain's balances instead.
                             let mut updated = inventory.clone();
                             if apply_equity_leg {
-                                updated = updated.update_equity(
+                                updated = updated.update_equity_at(
                                     &symbol,
+                                    trade_id.chain,
                                     Inventory::available(Venue::MarketMaking, equity_op, *amount),
                                     timestamp,
                                 )?;
                             }
                             if apply_usdc_leg {
-                                updated = updated.update_usdc(
+                                updated = updated.update_usdc_at(
+                                    trade_id.chain,
                                     Inventory::available(
                                         Venue::MarketMaking,
                                         equity_op.inverse(),
@@ -2459,10 +2496,18 @@ impl Reactor for RebalancingService {
                                 )?;
                             }
                             *inventory = updated;
+                            trading_chain
+                        };
+
+                        // Only the trading chain rebalances: a secondary is
+                        // prefunded and holds its own inventory, so its fill
+                        // must not schedule work against the trading chain's
+                        // balances.
+                        if trade_id.chain == trading_chain {
+                            self.equity_scheduler.enqueue_check(symbol).await;
+                            self.usdc_scheduler.enqueue_check().await;
                         }
 
-                        self.equity_scheduler.enqueue_check(symbol).await;
-                        self.usdc_scheduler.enqueue_check().await;
                         return Ok(());
                     }
                     OffChainOrderFilled {
@@ -8616,6 +8661,26 @@ mod tests {
         }
     }
 
+    fn make_onchain_fill_on_chain(
+        amount: FractionalShares,
+        direction: Direction,
+        chain: Chain,
+    ) -> PositionEvent {
+        PositionEvent::OnChainOrderFilled {
+            trade_id: TradeId {
+                chain,
+                tx_hash: TxHash::random(),
+                log_index: 0,
+            },
+            amount,
+            direction,
+            price_usdc: float!(150),
+            block_timestamp: Utc::now(),
+            block_number: None,
+            seen_at: Utc::now(),
+        }
+    }
+
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         make_offchain_fill_at(shares_filled, direction, Utc::now())
     }
@@ -8784,6 +8849,28 @@ mod tests {
         .fetch_one(service.transfer_equity_to_market_making_queue.pool())
         .await
         .expect("count pending TransferEquityToMarketMaking jobs")
+    }
+
+    /// Counts pending `EquityRebalancingCheck` rows: the deferred rebalancing
+    /// work an inventory change asks the schedulers for.
+    async fn count_pending_equity_check_jobs(service: &RebalancingService) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<EquityRebalancingCheck>())
+        .fetch_one(service.equity_scheduler.queue().pool())
+        .await
+        .expect("count pending EquityRebalancingCheck jobs")
+    }
+
+    async fn count_pending_usdc_check_jobs(service: &RebalancingService) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<UsdcRebalancingCheck>())
+        .fetch_one(service.usdc_scheduler.queue().pool())
+        .await
+        .expect("count pending UsdcRebalancingCheck jobs")
     }
 
     /// Drains every pending equity mint row from the service's Jobs table and
@@ -10535,6 +10622,182 @@ mod tests {
             .unwrap();
 
         assert_eq!(onchain_usdc, usdc(11500));
+    }
+
+    /// A fill on a watched secondary chain belongs to that chain: it moves
+    /// the secondary's own inventory slot, leaves the primary's untouched,
+    /// and asks for no rebalancing (secondaries are prefunded, with
+    /// rebalancing disabled on every asset).
+    #[tokio::test]
+    async fn secondary_chain_fill_stays_on_its_own_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Ethereum,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Ethereum,
+                    usdc_balance: usdc(5000),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        // Ethereum buy of 10 shares at $150.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::Ethereum),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(50)),
+            "an Ethereum fill must not move the primary chain's equity slot"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(10000)),
+            "an Ethereum fill must not move the primary chain's USDC slot"
+        );
+        assert_eq!(
+            inventory.onchain_equity_available_at(&symbol, Chain::Ethereum),
+            Some(shares(30)),
+            "the fill's equity leg belongs to the chain it filled on"
+        );
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Ethereum),
+            Some(usdc(3500)),
+            "the fill's cash leg belongs to the chain it filled on"
+        );
+        drop(inventory);
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            0,
+            "a secondary chain's fill must not schedule the primary's equity rebalancing"
+        );
+        assert_eq!(
+            count_pending_usdc_check_jobs(&trigger).await,
+            0,
+            "a secondary chain's fill must not schedule the primary's USDC rebalancing"
+        );
+    }
+
+    /// A watched secondary chain is not polled, so no snapshot has seeded its
+    /// slots. Debiting an unseeded slot would fail and crediting one would
+    /// invent a balance holding only the delta; the chain's first snapshot
+    /// contains the fill anyway (ADR 0018), so both legs wait for it.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn fill_on_an_unsnapshotted_chain_is_skipped_until_a_snapshot_seeds_it() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::Ethereum),
+            )
+            .await
+            .expect("a fill on an unsnapshotted chain must be skipped, not fail");
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(50)),
+            "an Ethereum fill must not move the primary chain's equity slot"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(10000)),
+            "an Ethereum fill must not move the primary chain's USDC slot"
+        );
+        assert_eq!(
+            inventory.onchain_equity_available_at(&symbol, Chain::Ethereum),
+            None,
+            "the delta must not invent an equity slot the poller never seeded"
+        );
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Ethereum),
+            None,
+            "the delta must not invent a USDC slot the poller never seeded"
+        );
+        drop(inventory);
+
+        assert!(logs_contain("no onchain snapshot has seeded"));
+        assert_eq!(count_pending_equity_check_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 0);
+    }
+
+    #[tokio::test]
+    async fn primary_chain_fill_schedules_rebalancing_checks() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::Base),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(60)),
+            "the primary chain's fill applies to its own slot"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(8500)),
+            "the primary chain's fill applies its cash leg"
+        );
+        drop(inventory);
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            1,
+            "the primary chain's fill must schedule an equity rebalancing check"
+        );
+        assert_eq!(
+            count_pending_usdc_check_jobs(&trigger).await,
+            1,
+            "the primary chain's fill must schedule a USDC rebalancing check"
+        );
     }
 
     /// The RAI-1500 race, closed by ADR 0018: a pinned onchain snapshot at
