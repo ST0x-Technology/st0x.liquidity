@@ -43,18 +43,18 @@ pub mod equity_redemption {
 
 /// Recovery operations shared by the operator CLI and end-to-end tests.
 pub mod equity_transfer {
-    use sqlx::SqlitePool;
     use std::time::Duration;
 
     use st0x_config::Ctx;
-    use st0x_event_sorcery::{AggregateError, load_entity, send_command};
+    use st0x_event_sorcery::{SendError, Store};
     use st0x_tokenization::IssuerRequestId;
 
     use crate::equity_redemption::{
         DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
     };
-    use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
+
+    const OPERATOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// The equity-transfer aggregate targeted by an operator recovery.
     #[derive(Debug, Clone, Copy)]
@@ -76,22 +76,63 @@ pub mod equity_transfer {
         Usdc,
     }
 
+    /// A force-failure request with no auditable explanation.
+    #[derive(Debug, thiserror::Error)]
+    #[error("--reason must not be blank; it is persisted as the audit record")]
+    pub(crate) struct InvalidFailureReason;
+
+    /// Errors returned while force-failing an equity transfer in the running
+    /// bot.
+    #[derive(Debug, thiserror::Error)]
+    pub(crate) enum FailTransferError {
+        #[error(transparent)]
+        InvalidReason(#[from] InvalidFailureReason),
+        #[error("invalid mint id")]
+        InvalidMintId(#[source] uuid::Error),
+        #[error("invalid redemption id")]
+        InvalidRedemptionId(#[source] uuid::Error),
+        #[error("mint aggregate not found: {0}")]
+        MintNotFound(IssuerRequestId),
+        #[error("redemption aggregate not found: {0}")]
+        RedemptionNotFound(RedemptionAggregateId),
+        #[error("mint {0} already completed")]
+        MintAlreadyCompleted(IssuerRequestId),
+        #[error("mint {0} already failed")]
+        MintAlreadyFailed(IssuerRequestId),
+        #[error("mint {0} already reconciled")]
+        MintAlreadyReconciled(IssuerRequestId),
+        #[error("redemption {0} already completed")]
+        RedemptionAlreadyCompleted(RedemptionAggregateId),
+        #[error("redemption {0} already failed")]
+        RedemptionAlreadyFailed(RedemptionAggregateId),
+        #[error("redemption {0} already reconciled")]
+        RedemptionAlreadyReconciled(RedemptionAggregateId),
+        #[error("mint store operation failed")]
+        MintStore(#[source] Box<SendError<TokenizedEquityMint>>),
+        #[error("redemption store operation failed")]
+        RedemptionStore(#[source] Box<SendError<EquityRedemption>>),
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     fn stale_state_context<Failure: std::error::Error + Send + Sync + 'static>(
         kind: &str,
         id: &str,
-        error: AggregateError<Failure>,
+        error: st0x_event_sorcery::AggregateError<Failure>,
     ) -> anyhow::Error {
         match error {
-            rejection @ (AggregateError::UserError(_) | AggregateError::AggregateConflict) => {
+            rejection @ (st0x_event_sorcery::AggregateError::UserError(_)
+            | st0x_event_sorcery::AggregateError::AggregateConflict) => {
                 anyhow::Error::new(rejection).context(format!(
                     "{kind} {id} rejected the failure command. The state may have \
-                     advanced since it was read (is the bot driving this aggregate \
-                     concurrently?) -- re-run to see the current state."
+                 advanced since it was read (is the bot driving this aggregate \
+                 concurrently?) -- re-run to see the current state."
                 ))
             }
-            infrastructure @ (AggregateError::DatabaseConnectionError(_)
-            | AggregateError::DeserializationError(_)
-            | AggregateError::UnexpectedError(_)) => anyhow::Error::new(infrastructure),
+            infrastructure @ (st0x_event_sorcery::AggregateError::DatabaseConnectionError(_)
+            | st0x_event_sorcery::AggregateError::DeserializationError(_)
+            | st0x_event_sorcery::AggregateError::UnexpectedError(_)) => {
+                anyhow::Error::new(infrastructure)
+            }
         }
     }
 
@@ -100,110 +141,248 @@ pub mod equity_transfer {
     pub fn stale_state_context_for_test<Failure: std::error::Error + Send + Sync + 'static>(
         kind: &str,
         id: &str,
-        error: AggregateError<Failure>,
+        error: st0x_event_sorcery::AggregateError<Failure>,
     ) -> anyhow::Error {
         stale_state_context(kind, id, error)
     }
 
-    /// Marks a stuck mint or redemption aggregate as failed.
-    pub async fn fail_transfer(
-        pool: &SqlitePool,
+    pub(crate) fn validate_failure_reason(reason: &str) -> Result<(), InvalidFailureReason> {
+        if reason.trim().is_empty() {
+            return Err(InvalidFailureReason);
+        }
+
+        Ok(())
+    }
+
+    fn mint_failure_command(
+        entity: &TokenizedEquityMint,
+        id: &IssuerRequestId,
+        reason: &str,
+    ) -> Result<TokenizedEquityMintCommand, FailTransferError> {
+        match entity {
+            TokenizedEquityMint::MintRequested { .. }
+            | TokenizedEquityMint::MintAccepted { .. } => {
+                Ok(TokenizedEquityMintCommand::FailAcceptance {
+                    reason: reason.to_string(),
+                })
+            }
+            TokenizedEquityMint::TokensReceived { .. }
+            | TokenizedEquityMint::WrapSubmitted { .. } => {
+                Ok(TokenizedEquityMintCommand::FailWrapping {
+                    reason: reason.to_string(),
+                })
+            }
+            TokenizedEquityMint::TokensWrapped { .. }
+            | TokenizedEquityMint::VaultDepositSubmitted { .. } => {
+                Ok(TokenizedEquityMintCommand::FailRaindexDeposit {
+                    reason: reason.to_string(),
+                })
+            }
+            TokenizedEquityMint::DepositedIntoRaindex { .. } => {
+                Err(FailTransferError::MintAlreadyCompleted(id.clone()))
+            }
+            TokenizedEquityMint::Failed { .. } => {
+                Err(FailTransferError::MintAlreadyFailed(id.clone()))
+            }
+            TokenizedEquityMint::Reconciled { .. } => {
+                Err(FailTransferError::MintAlreadyReconciled(id.clone()))
+            }
+        }
+    }
+
+    fn redemption_failure_command(
+        entity: &EquityRedemption,
+        id: &RedemptionAggregateId,
+        reason: &str,
+    ) -> Result<EquityRedemptionCommand, FailTransferError> {
+        match entity {
+            EquityRedemption::VaultWithdrawPending { .. }
+            | EquityRedemption::VaultWithdrawSubmitted { .. }
+            | EquityRedemption::WithdrawnFromRaindex { .. }
+            | EquityRedemption::UnwrapPending { .. }
+            | EquityRedemption::UnwrapSubmitted { .. }
+            | EquityRedemption::TokensUnwrapped { .. }
+            | EquityRedemption::SendPending { .. } => Ok(EquityRedemptionCommand::FailTransfer {
+                reason: reason.to_string(),
+            }),
+            EquityRedemption::TokensSent { .. } => Ok(EquityRedemptionCommand::FailDetection {
+                failure: DetectionFailure::Operator {
+                    reason: reason.to_string(),
+                },
+            }),
+            EquityRedemption::Pending { .. } => Ok(EquityRedemptionCommand::RejectRedemption {
+                reason: reason.to_string(),
+            }),
+            EquityRedemption::Completed { .. } => {
+                Err(FailTransferError::RedemptionAlreadyCompleted(id.clone()))
+            }
+            EquityRedemption::Failed { .. } => {
+                Err(FailTransferError::RedemptionAlreadyFailed(id.clone()))
+            }
+            EquityRedemption::Reconciled { .. } => {
+                Err(FailTransferError::RedemptionAlreadyReconciled(id.clone()))
+            }
+        }
+    }
+
+    /// Marks a stuck mint or redemption aggregate as failed through the
+    /// conductor-owned stores, ensuring the live reactors observe the event.
+    pub(crate) async fn fail_transfer_in_process(
+        mint_store: &Store<TokenizedEquityMint>,
+        redemption_store: &Store<EquityRedemption>,
+        transfer_kind: EquityTransferKind,
+        id: &str,
+        reason: &str,
+    ) -> Result<(), FailTransferError> {
+        validate_failure_reason(reason)?;
+
+        match transfer_kind {
+            EquityTransferKind::Mint => {
+                let mint_id: IssuerRequestId =
+                    id.parse().map_err(FailTransferError::InvalidMintId)?;
+                let entity = mint_store
+                    .load(&mint_id)
+                    .await
+                    .map_err(|error| FailTransferError::MintStore(Box::new(error)))?
+                    .ok_or_else(|| FailTransferError::MintNotFound(mint_id.clone()))?;
+                let command = mint_failure_command(&entity, &mint_id, reason)?;
+
+                mint_store
+                    .send(&mint_id, command)
+                    .await
+                    .map_err(|error| FailTransferError::MintStore(Box::new(error)))?;
+            }
+            EquityTransferKind::Redemption => {
+                let redemption_id: RedemptionAggregateId =
+                    id.parse().map_err(FailTransferError::InvalidRedemptionId)?;
+                let entity = redemption_store
+                    .load(&redemption_id)
+                    .await
+                    .map_err(|error| FailTransferError::RedemptionStore(Box::new(error)))?
+                    .ok_or_else(|| FailTransferError::RedemptionNotFound(redemption_id.clone()))?;
+                let command = redemption_failure_command(&entity, &redemption_id, reason)?;
+
+                redemption_store
+                    .send(&redemption_id, command)
+                    .await
+                    .map_err(|error| FailTransferError::RedemptionStore(Box::new(error)))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Test-fixture helper for persisting a forced failure before the server
+    /// starts. Production operator commands must use [`fail_transfer`] so the
+    /// running bot observes the event.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fail_transfer_in_database(
+        pool: &sqlx::SqlitePool,
         transfer_kind: EquityTransferKind,
         id: &str,
         reason: &str,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !reason.trim().is_empty(),
-            "--reason must not be blank; it is persisted as the audit record"
-        );
+        validate_failure_reason(reason)?;
 
-        let services = EquityTransferServices::panicking();
-
+        let services = crate::rebalancing::equity::EquityTransferServices::panicking();
         match transfer_kind {
             EquityTransferKind::Mint => {
                 let mint_id: IssuerRequestId = id
                     .parse()
                     .map_err(|error| anyhow::anyhow!("Invalid mint id {id:?}: {error}"))?;
-                let entity = load_entity::<TokenizedEquityMint>(pool, &mint_id)
+                let entity = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &mint_id)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("Mint aggregate not found: {id}"))?;
-                let command = match entity {
-                    TokenizedEquityMint::MintRequested { .. }
-                    | TokenizedEquityMint::MintAccepted { .. } => {
-                        TokenizedEquityMintCommand::FailAcceptance {
-                            reason: reason.to_string(),
-                        }
-                    }
-                    TokenizedEquityMint::TokensReceived { .. }
-                    | TokenizedEquityMint::WrapSubmitted { .. } => {
-                        TokenizedEquityMintCommand::FailWrapping {
-                            reason: reason.to_string(),
-                        }
-                    }
-                    TokenizedEquityMint::TokensWrapped { .. }
-                    | TokenizedEquityMint::VaultDepositSubmitted { .. } => {
-                        TokenizedEquityMintCommand::FailRaindexDeposit {
-                            reason: reason.to_string(),
-                        }
-                    }
-                    TokenizedEquityMint::DepositedIntoRaindex { .. } => {
-                        anyhow::bail!("Mint {id} already completed (DepositedIntoRaindex)");
-                    }
-                    TokenizedEquityMint::Failed { .. } => {
-                        anyhow::bail!("Mint {id} already failed");
-                    }
-                    TokenizedEquityMint::Reconciled { .. } => {
-                        anyhow::bail!("Mint {id} already reconciled");
-                    }
-                };
+                let command = mint_failure_command(&entity, &mint_id, reason)?;
 
-                send_command::<TokenizedEquityMint>(pool, &mint_id, command, services)
-                    .await
-                    .map_err(|error| stale_state_context("Mint", id, error))?;
+                st0x_event_sorcery::send_command::<TokenizedEquityMint>(
+                    pool, &mint_id, command, services,
+                )
+                .await
+                .map_err(|error| stale_state_context("Mint", id, error))?;
             }
             EquityTransferKind::Redemption => {
                 let redemption_id: RedemptionAggregateId = id
                     .parse()
                     .map_err(|error| anyhow::anyhow!("Invalid redemption ID: {error}"))?;
-                let entity = load_entity::<EquityRedemption>(pool, &redemption_id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("Redemption aggregate not found: {id}"))?;
-                let command = match entity {
-                    EquityRedemption::VaultWithdrawPending { .. }
-                    | EquityRedemption::VaultWithdrawSubmitted { .. }
-                    | EquityRedemption::WithdrawnFromRaindex { .. }
-                    | EquityRedemption::UnwrapPending { .. }
-                    | EquityRedemption::UnwrapSubmitted { .. }
-                    | EquityRedemption::TokensUnwrapped { .. }
-                    | EquityRedemption::SendPending { .. } => {
-                        EquityRedemptionCommand::FailTransfer {
-                            reason: reason.to_string(),
-                        }
-                    }
-                    EquityRedemption::TokensSent { .. } => EquityRedemptionCommand::FailDetection {
-                        failure: DetectionFailure::Operator {
-                            reason: reason.to_string(),
-                        },
-                    },
-                    EquityRedemption::Pending { .. } => EquityRedemptionCommand::RejectRedemption {
-                        reason: reason.to_string(),
-                    },
-                    EquityRedemption::Completed { .. } => {
-                        anyhow::bail!("Redemption {id} already completed");
-                    }
-                    EquityRedemption::Failed { .. } => {
-                        anyhow::bail!("Redemption {id} already failed");
-                    }
-                    EquityRedemption::Reconciled { .. } => {
-                        anyhow::bail!("Redemption {id} already reconciled");
-                    }
-                };
+                let entity =
+                    st0x_event_sorcery::load_entity::<EquityRedemption>(pool, &redemption_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("Redemption aggregate not found: {id}"))?;
+                let command = redemption_failure_command(&entity, &redemption_id, reason)?;
 
-                send_command::<EquityRedemption>(pool, &redemption_id, command, services)
-                    .await
-                    .map_err(|error| stale_state_context("Redemption", id, error))?;
+                st0x_event_sorcery::send_command::<EquityRedemption>(
+                    pool,
+                    &redemption_id,
+                    command,
+                    services,
+                )
+                .await
+                .map_err(|error| stale_state_context("Redemption", id, error))?;
             }
         }
+
+        Ok(())
+    }
+
+    /// Returns the loopback server endpoint used to force-fail a transfer.
+    pub fn fail_url(ctx: &Ctx, transfer_kind: EquityTransferKind, id: &str) -> String {
+        let kind = match transfer_kind {
+            EquityTransferKind::Mint => "equity_mint",
+            EquityTransferKind::Redemption => "equity_redemption",
+        };
+
+        format!(
+            "http://127.0.0.1:{}/transfers/fail/{kind}/{id}",
+            ctx.server_port
+        )
+    }
+
+    async fn post_operator_request(
+        url: &str,
+        operation: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<String> {
+        let client = reqwest::Client::builder()
+            .timeout(OPERATOR_REQUEST_TIMEOUT)
+            .build()?;
+        let request = client.post(url);
+        let response = match body {
+            Some(body) => request.json(body),
+            None => request,
+        }
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_connect() {
+                anyhow::Error::new(error)
+                    .context(format!("could not reach the bot at {url}; is it running?"))
+            } else {
+                anyhow::Error::new(error)
+            }
+        })?;
+        let status = response.status();
+        let response_body = response.text().await?;
+
+        if !status.is_success() {
+            anyhow::bail!("{operation} failed ({status}): {response_body}");
+        }
+
+        Ok(response_body)
+    }
+
+    /// Requests an operator-forced failure from the running bot.
+    pub async fn fail_transfer(
+        ctx: &Ctx,
+        transfer_kind: EquityTransferKind,
+        id: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        validate_failure_reason(reason)?;
+
+        let url = fail_url(ctx, transfer_kind, id);
+        let body = serde_json::json!({ "reason": reason });
+        post_operator_request(&url, "transfer fail", Some(&body)).await?;
 
         Ok(())
     }
@@ -229,23 +408,7 @@ pub mod equity_transfer {
         id: &str,
     ) -> anyhow::Result<String> {
         let url = recheck_url(ctx, transfer_kind, id);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        let response = client.post(url.as_str()).send().await.map_err(|error| {
-            if error.is_connect() {
-                anyhow::Error::new(error)
-                    .context(format!("could not reach the bot at {url}; is it running?"))
-            } else {
-                anyhow::Error::new(error)
-            }
-        })?;
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            anyhow::bail!("transfer recheck failed ({status}): {body}");
-        }
+        let body = post_operator_request(&url, "transfer recheck", None).await?;
 
         Ok(serde_json::from_str::<serde_json::Value>(&body)
             .ok()
@@ -260,18 +423,12 @@ pub mod equity_transfer {
 
     #[cfg(test)]
     mod tests {
-        use sqlx::SqlitePool;
+        use super::validate_failure_reason;
 
-        use super::{EquityTransferKind, fail_transfer};
-
-        #[tokio::test]
-        async fn fail_transfer_rejects_blank_audit_reasons_before_dispatch() {
-            let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
-
+        #[test]
+        fn fail_transfer_rejects_blank_audit_reasons_before_dispatch() {
             for reason in ["", " ", "\t\n"] {
-                let error = fail_transfer(&pool, EquityTransferKind::Mint, "unused", reason)
-                    .await
-                    .unwrap_err();
+                let error = validate_failure_reason(reason).unwrap_err();
 
                 assert_eq!(
                     error.to_string(),

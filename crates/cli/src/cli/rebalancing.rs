@@ -1615,12 +1615,11 @@ fn format_tokenization_request<Writer: Write>(
 
 /// Manually fail a stuck mint or redemption transfer aggregate.
 ///
-/// Loads the aggregate from the event store, determines its current state,
-/// and sends the appropriate failure command. Rejects if the aggregate is
-/// already in a terminal state.
+/// Routes the command through the running bot so the failure event reaches the
+/// live inventory and transfer-tracking reactors.
 pub(crate) async fn fail_transfer_command<W: Write>(
     stdout: &mut W,
-    pool: &SqlitePool,
+    ctx: &Ctx,
     transfer_type: TransferType,
     id: &str,
     reason: &AuditReason,
@@ -1631,7 +1630,7 @@ pub(crate) async fn fail_transfer_command<W: Write>(
             st0x_hedge::operator::equity_transfer::EquityTransferKind::Redemption
         }
     };
-    st0x_hedge::operator::equity_transfer::fail_transfer(pool, transfer_kind, id, reason.as_ref())
+    st0x_hedge::operator::equity_transfer::fail_transfer(ctx, transfer_kind, id, reason.as_ref())
         .await?;
 
     match transfer_type {
@@ -1652,6 +1651,39 @@ fn stale_state_context<Failure: std::error::Error + Send + Sync + 'static>(
     error: st0x_event_sorcery::AggregateError<Failure>,
 ) -> anyhow::Error {
     st0x_hedge::operator::equity_transfer::stale_state_context_for_test(kind, id, error)
+}
+
+#[cfg(test)]
+async fn fail_transfer_fixture_command<W: Write>(
+    stdout: &mut W,
+    pool: &SqlitePool,
+    transfer_type: TransferType,
+    id: &str,
+    reason: &AuditReason,
+) -> anyhow::Result<()> {
+    let transfer_kind = match transfer_type {
+        TransferType::Mint => st0x_hedge::operator::equity_transfer::EquityTransferKind::Mint,
+        TransferType::Redemption => {
+            st0x_hedge::operator::equity_transfer::EquityTransferKind::Redemption
+        }
+    };
+    st0x_hedge::operator::equity_transfer::fail_transfer_in_database(
+        pool,
+        transfer_kind,
+        id,
+        reason.as_ref(),
+    )
+    .await?;
+
+    match transfer_type {
+        TransferType::Mint => writeln!(stdout, "Mint {id} marked as failed")?,
+        TransferType::Redemption => writeln!(
+            stdout,
+            "Redemption {id} marked as failed (reason: {reason})"
+        )?,
+    }
+
+    Ok(())
 }
 
 /// Wraps a reqwest send error: a connection failure gets actionable operator
@@ -2117,6 +2149,53 @@ mod tests {
             output.contains(&format!("transfer resume --kind usdc --id {id}")),
             "the recovery command must print; got: {output}"
         );
+    }
+
+    /// `transfer fail` must send both the exact equity kind path and the
+    /// operator's audit reason to the running bot.
+    #[tokio::test]
+    async fn fail_transfer_posts_to_running_bot() {
+        for (transfer_type, kind, expected_output) in [
+            (
+                TransferType::Mint,
+                "equity_mint",
+                "Mint some-id marked as failed\n",
+            ),
+            (
+                TransferType::Redemption,
+                "equity_redemption",
+                "Redemption some-id marked as failed (reason: provider incident 42)\n",
+            ),
+        ] {
+            let server = httpmock::MockServer::start_async().await;
+            let mock = server
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::POST)
+                        .path(format!("/transfers/fail/{kind}/some-id"))
+                        .json_body(serde_json::json!({
+                            "reason": "provider incident 42"
+                        }));
+                    then.status(204);
+                })
+                .await;
+            let mut ctx = create_base_test_ctx();
+            ctx.server_port = server.port();
+
+            let mut stdout = Vec::new();
+            fail_transfer_command(
+                &mut stdout,
+                &ctx,
+                transfer_type,
+                "some-id",
+                &"provider incident 42".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+            mock.assert_async().await;
+            let output = String::from_utf8(stdout).unwrap();
+            assert_eq!(output, expected_output);
+        }
     }
 
     /// `transfer recheck` against a mocked bot endpoint: each CLI variant must
@@ -4823,7 +4902,7 @@ mod tests {
         seed_redemption_to_tokens_sent(&pool, &id).await;
 
         let mut stdout = Vec::new();
-        fail_transfer_command(
+        fail_transfer_fixture_command(
             &mut stdout,
             &pool,
             TransferType::Redemption,
@@ -4875,7 +4954,7 @@ mod tests {
         .await;
 
         let mut stdout = Vec::new();
-        fail_transfer_command(
+        fail_transfer_fixture_command(
             &mut stdout,
             &pool,
             TransferType::Redemption,
@@ -4917,7 +4996,7 @@ mod tests {
         seed_redemption_to_withdrawn(&pool, &id).await;
 
         let mut stdout = Vec::new();
-        fail_transfer_command(
+        fail_transfer_fixture_command(
             &mut stdout,
             &pool,
             TransferType::Redemption,
@@ -4968,7 +5047,7 @@ mod tests {
         send_redemption_command(&pool, &id, EquityRedemptionCommand::Complete).await;
 
         let mut stdout = Vec::new();
-        let result = fail_transfer_command(
+        let result = fail_transfer_fixture_command(
             &mut stdout,
             &pool,
             TransferType::Redemption,
@@ -5223,7 +5302,7 @@ mod tests {
         .await;
 
         let mut stdout = Vec::new();
-        let result = fail_transfer_command(
+        let result = fail_transfer_fixture_command(
             &mut stdout,
             &pool,
             TransferType::Mint,
@@ -5268,7 +5347,7 @@ mod tests {
         );
 
         let mut stdout = Vec::new();
-        fail_transfer_command(
+        fail_transfer_fixture_command(
             &mut stdout,
             &pool,
             TransferType::Mint,
@@ -5417,7 +5496,7 @@ mod tests {
         seed_redemption_to_reconciled(&pool, &id).await;
 
         let mut stdout = Vec::new();
-        let result = fail_transfer_command(
+        let result = fail_transfer_fixture_command(
             &mut stdout,
             &pool,
             TransferType::Redemption,
@@ -5451,7 +5530,7 @@ mod tests {
         .await;
 
         let mut stdout = Vec::new();
-        let result = fail_transfer_command(
+        let result = fail_transfer_fixture_command(
             &mut stdout,
             &pool,
             TransferType::Redemption,

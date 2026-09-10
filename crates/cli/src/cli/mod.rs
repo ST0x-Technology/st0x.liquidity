@@ -940,8 +940,9 @@ pub enum TransferCommand {
     ///
     /// Marks a transfer aggregate as failed, transitioning it to a terminal state.
     /// Use when a transfer is permanently stuck and needs operator intervention.
-    /// Operates directly on the local CQRS state; does not require the running
-    /// bot, but the bot must not be concurrently driving the same id.
+    /// Delegates to the running bot so the failure updates live inventory and
+    /// transfer tracking. Requires the bot to be running and serving its API on
+    /// the configured `server_port`.
     Fail {
         /// Transfer type: "mint" or "redemption"
         #[arg(short = 'k', long = "kind", alias = "type", short_alias = 't')]
@@ -1831,7 +1832,7 @@ async fn run_transfer_command<W: Write>(
             reason,
         } => {
             let result =
-                rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await;
+                rebalancing::fail_transfer_command(stdout, ctx, transfer_type, &id, &reason).await;
             finish_with_log_query_url(stdout, ctx, &id, result)
         }
         TransferRecoveryCommand::RecheckTransfer { transfer_type, id } => {
