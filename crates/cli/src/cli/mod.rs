@@ -2112,7 +2112,9 @@ mod tests {
     use alloy::primitives::{Address, TxHash, address};
     use chrono::Utc;
     use clap::{CommandFactory, Parser};
+    use std::collections::BTreeMap;
 
+    use st0x_config::ChainEquities;
     use st0x_config::ChainRegistry;
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
@@ -2128,9 +2130,10 @@ mod tests {
 
     use super::*;
     use st0x_hedge::operator::mint_authorization::ConfiguredMintAuthorizer;
+    use st0x_hedge::operator::native_gas::ConfiguredGasReadiness;
     use st0x_hedge::operator::offchain::order::OffchainOrderEvent;
     use st0x_hedge::operator::onchain::mock::MockRaindex;
-    use st0x_hedge::operator::rebalancing::equity::EquityTransferServices;
+    use st0x_hedge::operator::rebalancing::equity::{ChainEquityServices, EquityTransferServices};
     use st0x_hedge::operator::test_utils::{try_positive_shares, try_setup_test_db};
     use st0x_hedge::operator::tokenized_equity_mint::{
         TokenizedEquityMint, TokenizedEquityMintCommand,
@@ -3285,12 +3288,20 @@ mod tests {
         // `MintRequested` and `MintAccepted`.
         let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .build(EquityTransferServices {
-                raindex: Arc::new(MockRaindex::new()),
-                vault_lookup: Arc::new(MockVaultLookup::new()),
-                tokenizer: Arc::new(MockTokenizer::new()),
-                wrapper: Arc::new(MockWrapper::new()),
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainEquityServices {
+                        wallet: Address::ZERO,
+                        raindex: Arc::new(MockRaindex::new()),
+                        vault_lookup: Arc::new(MockVaultLookup::new()),
+                        tokenizer: Arc::new(MockTokenizer::new()),
+                        wrapper: Arc::new(MockWrapper::new()),
+                        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                        gas_readiness: ConfiguredGasReadiness::Unwired,
+                        equities: ChainEquities::default(),
+                    },
+                )]),
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
             })
             .await
             .unwrap();

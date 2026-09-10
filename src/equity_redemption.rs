@@ -82,7 +82,9 @@ use crate::bot_gas::{
     BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
     RecordBotGasReceiptCost,
 };
-use crate::rebalancing::equity::EquityTransferServices;
+use crate::rebalancing::equity::{
+    ChainEquityServices, ChainServicesMissing, EquityTransferServices,
+};
 
 /// Our tokenized equity tokens use 18 decimals.
 const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
@@ -128,6 +130,9 @@ pub fn redemption_aggregate_id(label: &str) -> RedemptionAggregateId {
 /// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub enum EquityRedemptionError {
+    /// The record names a chain no services were wired for.
+    #[error(transparent)]
+    ChainServicesMissing(#[from] ChainServicesMissing),
     /// Raindex vault lookup failed for the given token
     #[error("Token {0} not found in Raindex vault registry")]
     RaindexVaultNotFound(Address),
@@ -1145,7 +1150,7 @@ impl EquityRedemption {
     /// The chain this redemption runs on. Every service the saga uses --
     /// raindex, wrapper, tokenizer -- is resolved from it, so a resume reads
     /// the chain off the aggregate instead of assuming the primary.
-    pub(crate) fn chain(&self) -> Chain {
+    pub fn chain(&self) -> Chain {
         match self {
             Self::VaultWithdrawPending { chain, .. }
             | Self::VaultWithdrawSubmitted { chain, .. }
@@ -2244,7 +2249,8 @@ impl EquityRedemption {
                 wrapped_amount,
                 ..
             } => {
-                let vault_id = match services.vault_lookup.vault_id_for_token(*token).await {
+                let chain_services = services.for_chain(self.chain())?;
+                let vault_id = match chain_services.vault_lookup.vault_id_for_token(*token).await {
                     Ok(id) => id,
                     Err(error) => {
                         warn!(target: "rebalance", %error, %token, "Vault lookup failed");
@@ -2254,7 +2260,7 @@ impl EquityRedemption {
 
                 info!(target: "rebalance", ?vault_id, %token, %wrapped_amount, "Submitting Raindex vault withdrawal");
 
-                let tx_hash = match services
+                let tx_hash = match chain_services
                     .raindex
                     .submit_withdraw(*token, vault_id, *wrapped_amount, TOKENIZED_EQUITY_DECIMALS)
                     .await
@@ -2303,7 +2309,8 @@ impl EquityRedemption {
                 tx_hash,
                 ..
             } => {
-                let receipt = services
+                let chain_services = services.for_chain(self.chain())?;
+                let receipt = chain_services
                     .raindex
                     .confirm_tx_receipt(*tx_hash)
                     .await
@@ -2315,12 +2322,13 @@ impl EquityRedemption {
                 let raindex_withdraw_block = receipt
                     .block_number
                     .ok_or(EquityRedemptionError::MissingWithdrawBlock { tx_hash: *tx_hash })?;
-                let recipient = services.wrapper.owner();
+                let recipient = chain_services.wrapper.owner();
                 let actual_wrapped_amount =
                     actual_withdrawn_amount_from_receipt(&receipt, *token, recipient)?;
 
                 enqueue_bot_gas_cost(
                     &services.bot_gas_enqueuer,
+                    self.chain(),
                     *tx_hash,
                     BotGasOperationCategory::VaultWithdraw,
                     symbol.clone(),
@@ -2382,15 +2390,16 @@ impl EquityRedemption {
                 // the withdrawal may simulate the unwrap against a stale
                 // wrapped-token balance. `raindex_withdraw_block` is None for
                 // pre-fix aggregates; skip the wait for backward-compatibility.
+                let chain_services = services.for_chain(self.chain())?;
                 if let Some(block) = raindex_withdraw_block {
-                    services
+                    chain_services
                         .wrapper
                         .wait_for_block(*block)
                         .await
                         .map_err(|error| node_sync_failed(*block, &error))?;
                 }
-                let owner = services.wrapper.owner();
-                let unwrap_tx_hash = services
+                let owner = chain_services.wrapper.owner();
+                let unwrap_tx_hash = chain_services
                     .wrapper
                     .submit_unwrap(*token, *wrapped_amount, owner, owner)
                     .await
@@ -2431,7 +2440,8 @@ impl EquityRedemption {
                 unwrap_tx_hash,
                 ..
             } => {
-                let configured = services
+                let chain_services = services.for_chain(self.chain())?;
+                let configured = chain_services
                     .wrapper
                     .lookup_underlying(symbol)
                     .inspect_err(|error| {
@@ -2442,7 +2452,7 @@ impl EquityRedemption {
                         error_message: error.to_string(),
                     })?;
 
-                let unwrap_confirmation = services
+                let unwrap_confirmation = chain_services
                     .wrapper
                     .confirm_unwrap(*token, *unwrap_tx_hash)
                     .await
@@ -2482,6 +2492,7 @@ impl EquityRedemption {
 
                 enqueue_bot_gas_cost(
                     &services.bot_gas_enqueuer,
+                    self.chain(),
                     *unwrap_tx_hash,
                     BotGasOperationCategory::Unwrap,
                     symbol.clone(),
@@ -2541,16 +2552,17 @@ impl EquityRedemption {
                 unwrap_block,
                 ..
             } => {
+                let chain_services = services.for_chain(self.chain())?;
                 let token = match underlying_token {
                     UnwrappedProvenance::Attested { attested } => *attested,
                     UnwrappedProvenance::Legacy(recorded) => {
-                        reattest_legacy_underlying(services, symbol, *recorded).await?
+                        reattest_legacy_underlying(chain_services, symbol, *recorded).await?
                     }
                 };
                 let amount = *unwrapped_amount;
 
                 let Some(redemption_wallet) =
-                    Tokenizer::redemption_wallet(services.tokenizer.as_ref())
+                    Tokenizer::redemption_wallet(chain_services.tokenizer.as_ref())
                 else {
                     warn!(target: "rebalance", %symbol, "Redemption wallet not configured");
                     return Ok(vec![TransferFailed {
@@ -2572,7 +2584,7 @@ impl EquityRedemption {
                 // persisted before this field was added; in that case the
                 // wait is skipped for backward-compatibility.
                 if let Some(block) = unwrap_block {
-                    services
+                    chain_services
                         .tokenizer
                         .wait_for_block(*block)
                         .await
@@ -2581,8 +2593,12 @@ impl EquityRedemption {
 
                 info!(target: "rebalance", %token, %amount, "Sending unwrapped tokens for redemption");
 
-                match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
-                    .await
+                match Tokenizer::send_for_redemption(
+                    chain_services.tokenizer.as_ref(),
+                    token,
+                    amount,
+                )
+                .await
                 {
                     Ok(redemption_tx) => {
                         // Persist the non-idempotent transfer hash first. The transfer
@@ -3004,7 +3020,7 @@ fn node_sync_failed(required_block: u64, error: &WrapperError) -> EquityRedempti
 /// send: the vault's `asset()` must be the recorded address, otherwise the
 /// record predates the check and its token is not trusted.
 async fn reattest_legacy_underlying(
-    services: &EquityTransferServices,
+    services: &ChainEquityServices,
     symbol: &Symbol,
     recorded: Address,
 ) -> Result<UnwrappedToken, EquityRedemptionError> {
@@ -3055,16 +3071,18 @@ fn node_sync_failed_from_evm(required_block: u64, error: &EvmError) -> EquityRed
 }
 
 /// Enqueues bot-gas cost recording for a confirmed redemption tx (vault
-/// withdraw, unwrap, or wallet transfer, always on Base). See ADR 0017.
+/// withdraw, unwrap, or wallet transfer) on the chain the redemption ran
+/// on. See ADR 0017.
 async fn enqueue_bot_gas_cost(
     enqueuer: &BotGasReceiptCostEnqueuer,
+    chain: Chain,
     tx_hash: TxHash,
     category: BotGasOperationCategory,
     symbol: Symbol,
 ) -> Result<(), EquityRedemptionError> {
     enqueuer
-        .enqueue(RecordBotGasReceiptCost::for_base_tx(
-            tx_hash, category, symbol,
+        .enqueue(RecordBotGasReceiptCost::for_transfer_tx(
+            chain, tx_hash, category, symbol,
         ))
         .await
         .map_err(|error| BotGasEnqueueFailure::from_queue_push_error(tx_hash, &error).into())
@@ -3077,6 +3095,7 @@ mod tests {
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::primitives::{B256, Bloom, Bytes, Log as PrimitiveLog, LogData};
     use alloy::rpc::types::Log;
+    use st0x_config::ChainEquities;
     use st0x_dto::EquityRedemptionStatus;
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
     use st0x_evm::NODE_SYNC_MAX_ATTEMPTS;
@@ -3085,9 +3104,11 @@ mod tests {
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::tokenization_request_id;
     use st0x_wrapper::MockWrapper;
+    use std::collections::BTreeMap;
 
     use super::*;
     use crate::mint_authorization::ConfiguredMintAuthorizer;
+    use crate::native_gas::ConfiguredGasReadiness;
     use crate::onchain::mock::{ConfirmTxBehavior, MockRaindex};
     use crate::vault_lookup::MockVaultLookup;
 
@@ -3097,12 +3118,20 @@ mod tests {
 
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         }
     }
 
@@ -3658,12 +3687,20 @@ mod tests {
 
         let tokenizer = Arc::new(MockTokenizer::new());
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: tokenizer.clone(),
-            wrapper: Arc::new(MockWrapper::new().with_tokenized_shares(underlying_token)),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: tokenizer.clone(),
+                    wrapper: Arc::new(MockWrapper::new().with_tokenized_shares(underlying_token)),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -3801,16 +3838,24 @@ mod tests {
         let recorded = Address::random();
         let tokenizer = Arc::new(MockTokenizer::new());
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: tokenizer.clone(),
-            wrapper: Arc::new(
-                MockWrapper::new()
-                    .with_tokenized_shares(configured)
-                    .attesting_unwrapped_token(configured),
-            ),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: tokenizer.clone(),
+                    wrapper: Arc::new(
+                        MockWrapper::new()
+                            .with_tokenized_shares(configured)
+                            .attesting_unwrapped_token(configured),
+                    ),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let error = TestHarness::<EquityRedemption>::with(services)
@@ -3843,16 +3888,24 @@ mod tests {
     async fn send_tokens_reattests_a_legacy_underlying_before_sending() {
         let configured = Address::random();
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(
-                MockWrapper::new()
-                    .with_tokenized_shares(configured)
-                    .attesting_unwrapped_token(configured),
-            ),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(
+                        MockWrapper::new()
+                            .with_tokenized_shares(configured)
+                            .attesting_unwrapped_token(configured),
+                    ),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let events = TestHarness::<EquityRedemption>::with(services)
@@ -3878,12 +3931,20 @@ mod tests {
     #[tokio::test]
     async fn send_tokens_persists_tokens_sent_before_gas_accounting() {
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let underlying_token = UnwrappedProvenance::Attested {
@@ -3922,12 +3983,22 @@ mod tests {
         let actual_amount = U256::from(33_681_456_848_531_939_569_u128);
 
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(actual_amount)),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(
+                        MockRaindex::new().with_withdraw_actual_amount(actual_amount),
+                    ),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("partial-withdraw");
@@ -3973,12 +4044,22 @@ mod tests {
         let actual_amount = U256::from(33_681_456_848_531_939_569_u128);
 
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(actual_amount)),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(
+                        MockRaindex::new().with_withdraw_actual_amount(actual_amount),
+                    ),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("unwrap-partial-withdraw");
@@ -4035,12 +4116,20 @@ mod tests {
     #[tokio::test]
     async fn confirm_withdraw_fails_without_matching_receipt_transfer() {
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(U256::ZERO)),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(U256::ZERO)),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("missing-withdraw-transfer");
@@ -4090,15 +4179,23 @@ mod tests {
     #[tokio::test]
     async fn confirm_withdraw_fails_when_receipt_has_no_block_number() {
         let services = EquityTransferServices {
-            raindex: Arc::new(
-                MockRaindex::new()
-                    .with_confirm_behavior(ConfirmTxBehavior::SucceedWithoutBlockNumber),
-            ),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(
+                        MockRaindex::new()
+                            .with_confirm_behavior(ConfirmTxBehavior::SucceedWithoutBlockNumber),
+                    ),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let store = TestStore::<EquityRedemption>::new(services);
         let id = redemption_aggregate_id("no-block-number");
@@ -4573,12 +4670,20 @@ mod tests {
     #[tokio::test]
     async fn send_tokens_with_failure_emits_transfer_failed() {
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new().with_send_failure()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new().with_send_failure()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -4643,12 +4748,20 @@ mod tests {
     #[tokio::test]
     async fn send_tokens_without_redemption_wallet_emits_transfer_failed() {
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new().with_no_redemption_wallet()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new().with_no_redemption_wallet()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -4713,12 +4826,20 @@ mod tests {
     #[tokio::test]
     async fn unwrap_failure_returns_unwrap_failed_error() {
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::failing_unwrap()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::failing_unwrap()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         // UnwrapTokens is now pure (emits UnwrapPending).
@@ -4747,16 +4868,24 @@ mod tests {
         let configured = Address::random();
         let delivered = Address::random();
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(
-                MockWrapper::new()
-                    .with_tokenized_shares(configured)
-                    .attesting_unwrapped_token(delivered),
-            ),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(
+                        MockWrapper::new()
+                            .with_tokenized_shares(configured)
+                            .attesting_unwrapped_token(delivered),
+                    ),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
@@ -4821,12 +4950,20 @@ mod tests {
     #[tokio::test]
     async fn underlying_lookup_failure_returns_underlying_lookup_failed_error() {
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::failing_lookup()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::failing_lookup()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         // UnwrapTokens now emits UnwrapSubmitted (no lookup yet).
@@ -5898,12 +6035,20 @@ mod tests {
         let mock_tokenizer = Arc::new(MockTokenizer::new());
 
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: mock_tokenizer.clone(),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: mock_tokenizer.clone(),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let events = TestHarness::<EquityRedemption>::with(services)
@@ -5955,12 +6100,20 @@ mod tests {
         let mock_tokenizer = Arc::new(MockTokenizer::new());
 
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: mock_tokenizer.clone(),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: mock_tokenizer.clone(),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let events = TestHarness::<EquityRedemption>::with(services)
@@ -6009,12 +6162,20 @@ mod tests {
         let required_block = 42u64;
 
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new().failing_wait_for_block()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new().failing_wait_for_block()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let error = TestHarness::<EquityRedemption>::with(services)
@@ -6057,12 +6218,20 @@ mod tests {
         let mock_wrapper = Arc::new(MockWrapper::new());
 
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: mock_wrapper.clone(),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: mock_wrapper.clone(),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let token = Address::ZERO;
@@ -6108,12 +6277,20 @@ mod tests {
         let mock_wrapper = Arc::new(MockWrapper::new());
 
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: mock_wrapper.clone(),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: mock_wrapper.clone(),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let token = Address::ZERO;
@@ -6163,12 +6340,20 @@ mod tests {
         let required_block = 42u64;
 
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(mock_vault_lookup()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::failing_wait_for_block()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::failing_wait_for_block()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let error = TestHarness::<EquityRedemption>::with(services)

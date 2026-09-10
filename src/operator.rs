@@ -297,7 +297,7 @@ pub mod mint_authorization {
 }
 
 pub mod native_gas {
-    pub use crate::native_gas::GasReadiness;
+    pub use crate::native_gas::{ConfiguredGasReadiness, GasReadiness};
 }
 
 pub mod offchain {
@@ -377,7 +377,9 @@ pub mod rebalancing {
     pub use crate::rebalancing::to_wrapped_equities;
 
     pub mod equity {
-        pub use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+        pub use crate::rebalancing::equity::{
+            ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
+        };
     }
 
     pub mod usdc {

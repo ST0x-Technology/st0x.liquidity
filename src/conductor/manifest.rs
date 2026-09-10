@@ -174,6 +174,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::broadcast;
 
+    use st0x_config::ChainEquities;
     use st0x_config::{ChainAssets, ExecutionThreshold};
     use st0x_dto::Statement;
     use st0x_event_sorcery::test_store;
@@ -191,8 +192,10 @@ mod tests {
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Operator, Venue,
     };
     use crate::mint_authorization::ConfiguredMintAuthorizer;
+    use crate::native_gas::ConfiguredGasReadiness;
     use crate::onchain::mock::MockRaindex;
     use crate::position::{PositionCommand, TradeId};
+    use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::TransferEquityToMarketMaking;
     use crate::rebalancing::{
         RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
@@ -200,6 +203,7 @@ mod tests {
     use crate::test_utils::{rebalancing_enabled_equities, setup_test_pools};
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
+    use st0x_wrapper::Wrapper;
 
     fn test_trigger_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
@@ -237,13 +241,19 @@ mod tests {
         let rebalancing_service = Arc::new(RebalancingService::new(
             test_trigger_config(),
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: Address::ZERO,
-                owner: Address::ZERO,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: Address::ZERO,
+                    owner: Address::ZERO,
+                },
+            )]),
             inventory.clone(),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -268,12 +278,20 @@ mod tests {
         );
 
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let frameworks = manifest.build(pool, services).await.unwrap();
@@ -308,13 +326,19 @@ mod tests {
         let rebalancing_service = Arc::new(RebalancingService::new(
             test_trigger_config(),
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: Address::ZERO,
-                owner: Address::ZERO,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: Address::ZERO,
+                    owner: Address::ZERO,
+                },
+            )]),
             inventory.clone(),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -337,12 +361,20 @@ mod tests {
             )))),
         );
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let built = manifest.build(pool, services).await.unwrap();
 
@@ -449,13 +481,19 @@ mod tests {
         let rebalancing_service = Arc::new(RebalancingService::new(
             test_trigger_config(),
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook,
-                owner,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook,
+                    owner,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -478,12 +516,20 @@ mod tests {
             )))),
         );
         let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
         let built = manifest.build(pool.clone(), services).await.unwrap();
 

@@ -25,10 +25,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use st0x_config::ChainEquities;
 use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
 use st0x_evm::{Chain, IERC20};
 use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Network, Symbol};
@@ -47,9 +48,10 @@ use st0x_wrapper::{
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::mint_authorization::ConfiguredMintAuthorizer;
+use crate::native_gas::ConfiguredGasReadiness;
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
-use crate::rebalancing::equity::EquityTransferServices;
+use crate::rebalancing::equity::{ChainEquityServices, EquityTransferServices};
 use crate::tokenized_equity_mint::{
     TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
@@ -258,7 +260,9 @@ pub async fn seed_simulated_mint_history(
     // Mint's happy path never calls `redemption_wallet`/`send_for_redemption`;
     // the address and day are meaningful only to
     // `seed_simulated_equity_redemption_history`'s use of this same fixture.
-    services.tokenizer = Arc::new(FixtureTokenizer::new(Address::ZERO, 0));
+    for chain_services in services.chains.values_mut() {
+        chain_services.tokenizer = Arc::new(FixtureTokenizer::new(Address::ZERO, 0));
+    }
 
     let (mint, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
         .with(Arc::new(RetryOnBusy {
@@ -1067,17 +1071,25 @@ pub async fn seed_simulated_equity_redemption_history(
         let unwrap_block = withdraw_block + 5;
 
         let services = EquityTransferServices {
-            raindex: Arc::new(FixtureRaindex::new(owner, withdraw_block, day)),
-            vault_lookup: Arc::new(FixtureVaultLookup::new(vault_id)),
-            tokenizer: Arc::new(FixtureTokenizer::new(redemption_wallet, day)),
-            wrapper: Arc::new(FixtureWrapper::new(
-                owner,
-                underlying_token,
-                unwrap_block,
-                day,
-            )),
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(FixtureRaindex::new(owner, withdraw_block, day)),
+                    vault_lookup: Arc::new(FixtureVaultLookup::new(vault_id)),
+                    tokenizer: Arc::new(FixtureTokenizer::new(redemption_wallet, day)),
+                    wrapper: Arc::new(FixtureWrapper::new(
+                        owner,
+                        underlying_token,
+                        unwrap_block,
+                        day,
+                    )),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
         };
 
         let (redemption, _redemption_projection) =

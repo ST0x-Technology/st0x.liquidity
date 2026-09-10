@@ -367,6 +367,7 @@ async fn notify_swallowing_failure(ctx: &DeliverMintAuthorizationCtx, message: &
 mod tests {
     use alloy::primitives::Address;
     use httpmock::MockServer;
+    use st0x_config::ChainEquities;
     use st0x_event_sorcery::test_store;
     use st0x_evm::Chain;
     use st0x_execution::Symbol;
@@ -375,6 +376,7 @@ mod tests {
     use st0x_tokenization::issuer_request_id;
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_wrapper::{MockWrapper, Wrapper};
+    use std::collections::BTreeMap;
 
     use super::*;
     use crate::alerts::CapturingNotifier;
@@ -383,7 +385,9 @@ mod tests {
     use crate::mint_authorization::{
         ConfiguredMintAuthorizer, MockMintAuthorizer, StubMintAuthorizationDeliverer,
     };
+    use crate::native_gas::ConfiguredGasReadiness;
     use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::vault_lookup::MockVaultLookup;
 
@@ -399,12 +403,22 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
 
         let services = EquityTransferServices {
-            raindex,
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper,
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex,
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper,
+                    mint_authorizer: ConfiguredMintAuthorizer::Enabled(Arc::new(
+                        MockMintAuthorizer,
+                    )),
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer)),
         };
         let mint_store = Arc::new(test_store(pool, services));
         let notifier = Arc::new(CapturingNotifier::default());

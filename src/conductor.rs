@@ -37,9 +37,9 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use st0x_config::{
-    BrokerCtx, ChainAssets, Ctx, CtxError, ExecutionThreshold, HedgingAssets, InventoryMode,
-    IssuanceStatusCtx, OnchainWalletCtx, OperationMode, OrchestratorAddresses, RebalancingCtx,
-    TradingChain,
+    AlertsCtx, BrokerCtx, ChainAssets, Ctx, CtxError, ExecutionThreshold, HedgingAssets,
+    InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode, OrchestratorAddresses,
+    RebalancingCtx, TradingChain,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -77,7 +77,7 @@ use crate::inventory::{BroadcastingInventory, Inventory, InventorySnapshot, Poll
 use crate::mint_authorization::{
     ConfiguredMintAuthorizer, MintAuthorizationService, VaultModeReader,
 };
-use crate::native_gas::GasReadiness;
+use crate::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
     PollOrderStatus, PollOrderStatusJobQueue, TerminalPositionFinalization,
@@ -110,11 +110,11 @@ use crate::position::{
 };
 use crate::position_check::{HedgeScanSkipReason, record_scan_skip};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, DeliverMintAuthorizationCtx, DeliverMintAuthorizationJobQueue,
-    EquityTransferServices, MintAuthorizationWiring, ResumeTokenizationAggregate,
-    ResumeTokenizationCtx, ResumeTokenizationJobQueue, ResumeTokenizationTarget,
-    TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToMarketMaking,
-    TransferEquityToMarketMakingCtx,
+    ChainEquityServices, CrossVenueEquityTransfer, DeliverMintAuthorizationCtx,
+    DeliverMintAuthorizationJobQueue, EquityTransferServices, MintAuthorizationWiring,
+    ResumeTokenizationAggregate, ResumeTokenizationCtx, ResumeTokenizationJobQueue,
+    ResumeTokenizationTarget, TransferEquityToHedging, TransferEquityToHedgingCtx,
+    TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
 };
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
@@ -1886,9 +1886,6 @@ async fn run_startup_maintenance(ctx: &Ctx, pool: &SqlitePool) -> anyhow::Result
 /// Mint-authorization infrastructure for orchestrator-mode mints
 /// (RAI-1243), built once per conductor start.
 struct MintAuthorizationInfra {
-    /// Signs `MintAuthV1` inside the mint aggregate's command handler.
-    /// `Disabled` without an `[orchestrator]` config section.
-    authorizer: ConfiguredMintAuthorizer,
     /// Delivery job queue, shared by the saga's enqueue and the worker.
     queue: DeliverMintAuthorizationJobQueue,
     /// The saga-side bundle: vault-mode reads, token map, delivery enqueue.
@@ -1927,11 +1924,12 @@ fn build_mint_authorizer<Signer: Wallet + 'static>(
     }
 }
 
-/// Builds [`MintAuthorizationInfra`] around the primary chain's services:
-/// every mint the bot requests today lands there, so the saga signs with
-/// that chain's authorizer and resolves tokens through its table. The
-/// issuance client is the one the tokenization preflight already read vault
-/// modes through.
+/// Builds [`MintAuthorizationInfra`] around the primary chain's token table:
+/// the MintAuth an orchestrator-mode mint binds names the tokenized equity,
+/// which the saga still resolves through the primary's map. The per-chain
+/// authorizers live on each [`ChainEquityServices`] entry instead, all
+/// sharing the one delivery queue built here. The issuance client is the one
+/// the tokenization preflight already read vault modes through.
 ///
 /// Also runs the queue's orphan sweep for delivery rows a crash caught
 /// mid-run; pending rows stay queued (still-valid work for the persisted
@@ -1963,7 +1961,6 @@ async fn build_mint_authorization_infra<Signer: Wallet>(
     }
 
     Ok(MintAuthorizationInfra {
-        authorizer: primary.mint_authorizer.clone(),
         wiring: MintAuthorizationWiring {
             vault_mode_reader: issuance_client.clone(),
             token_addresses: primary.token_addresses.clone(),
@@ -2020,13 +2017,13 @@ async fn wire_transfer_admission_guards(
 /// Builds the rebalancing [`RaindexService`]: writes settle through the shared
 /// inventory, `market_maker_wallet` signs and appears as the operator.
 fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
-    base_wallet: &Signer,
-    ctx: &Ctx,
+    wallet: &Signer,
+    trading: &TradingChain,
     market_maker_wallet: Address,
 ) -> Arc<RaindexService<Signer>> {
     Arc::new(RaindexService::new(
-        base_wallet.clone(),
-        crate::onchain::raindex_contracts(ctx.chains.primary()),
+        wallet.clone(),
+        crate::onchain::raindex_contracts(trading),
         market_maker_wallet,
     ))
 }
@@ -2578,53 +2575,70 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
     .map_err(Into::into)
 }
 
+/// The vault-registry lookup for one watched chain. Every id is qualified by
+/// its chain: a vault id means nothing on another network's orderbook.
 fn build_rebalancing_vault_lookup(
-    ctx: &Ctx,
+    chain: &TradingChain,
+    vault_owner: Address,
     projection: Arc<Projection<VaultRegistry>>,
 ) -> (VaultRegistryId, Arc<dyn VaultLookup>) {
-    // The (orderbook, vault-owner) pair keys both the vault-registry lookup
-    // and the rebalancing service's registry reads.
-    let registry_id = VaultRegistryId {
-        chain: ctx.chains.primary().chain,
-        orderbook: ctx.chains.primary().orderbook,
-        owner: ctx.vault_owner(),
-    };
+    let registry_id = VaultRegistryId::new(chain.chain, chain.orderbook, vault_owner);
     let lookup = Arc::new(VaultRegistryLookup::new(projection, registry_id.clone()));
 
     (registry_id, lookup)
 }
 
-/// Why the rebalancing infrastructure refuses to start on a primary chain.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum EquityTransferPathsUnsupported {
-    /// The equity gas-readiness leg (`GasReadiness::from_wallets`) and the
-    /// receipt-cost jobs (`RecordBotGasReceiptCost::for_base_tx`) read Base.
-    /// On another primary they would check a wallet the transfers never use
-    /// and send the transfer hashes to the wrong RPC.
-    #[error(
-        "[chains.{primary}] is the primary chain, but equity transfers still check gas and \
-         record receipt costs on Base; a non-Base primary is refused until those paths take \
-         the chain"
-    )]
-    NonBasePrimary { primary: Chain },
+/// One chain's inputs to the equity gas-readiness map: what it lists, and
+/// which wallet signs its transfers.
+struct EquityGasChain<'chain, Signer: Wallet> {
+    chain: Chain,
+    assets: &'chain ChainAssets,
+    wallet: &'chain Signer,
 }
 
-/// The equity mint and redemption paths are bound to Base in two places
-/// that the per-chain service map does not reach yet; refuse any other
-/// primary instead of letting those checks pass against the wrong wallet.
-fn confirm_equity_transfer_paths_support(
-    primary: Chain,
-) -> Result<(), EquityTransferPathsUnsupported> {
-    match primary {
-        Chain::Base => Ok(()),
-        Chain::Ethereum | Chain::HyperEvm => {
-            Err(EquityTransferPathsUnsupported::NonBasePrimary { primary })
-        }
-    }
+/// One [`GasReadiness`] per chain an equity transfer can run on: every
+/// watched chain with at least one rebalancing-enabled equity, each checking
+/// that chain's own signing wallet.
+///
+/// Such a chain without an `[alerts.low_balance_thresholds]` entry refuses
+/// startup by name rather than admitting transfers against a balance nothing
+/// checks. A chain that rebalances nothing gets no entry at all, so its
+/// `Unwired` readiness refuses a transfer there fail-closed.
+fn build_equity_gas_readiness<Signer: Wallet>(
+    alerts: &AlertsCtx,
+    chains: &[EquityGasChain<'_, Signer>],
+    base_wallet: &Signer,
+    ethereum_wallet: &Signer,
+) -> anyhow::Result<BTreeMap<Chain, ConfiguredGasReadiness>> {
+    chains
+        .iter()
+        .filter(|entry| {
+            entry
+                .assets
+                .equities
+                .symbols
+                .values()
+                .any(|equity| equity.rebalancing == OperationMode::Enabled)
+        })
+        .map(|entry| {
+            let readiness = GasReadiness::for_equity_chain(
+                alerts,
+                entry.chain,
+                entry.wallet,
+                base_wallet,
+                ethereum_wallet,
+            )?;
+
+            Ok((entry.chain, ConfiguredGasReadiness::Wired(readiness)))
+        })
+        .collect()
 }
 
-/// The equity leg is Base's wallet by construction; `confirm_equity_transfer_paths_support`
-/// guards that assumption at startup.
+/// The pre-dispatch admission check the trigger and the USDC corridor share:
+/// the corridor spans Base and Ethereum, and the trigger's equity leg still
+/// gates on the primary until the global rebalancer picks the chain. Each
+/// transfer's own chain is checked again from its
+/// [`ChainEquityServices`] entry.
 fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
     wallets: &ChainWallets<Signer>,
     ctx: &Ctx,
@@ -2644,8 +2658,8 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
 fn build_rebalancing_service(
     rebalancing_ctx: &RebalancingCtx,
     deps: &RebalancingDeps,
-    vault_registry_id: VaultRegistryId,
-    wrapper: Arc<dyn Wrapper>,
+    registry_ids: BTreeMap<Chain, VaultRegistryId>,
+    wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
 ) -> Arc<RebalancingService> {
     Arc::new(RebalancingService::new(
         RebalancingServiceConfig {
@@ -2658,12 +2672,101 @@ fn build_rebalancing_service(
             cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
         },
         deps.vault_registry.clone(),
-        vault_registry_id,
+        registry_ids,
         deps.inventory.clone(),
-        wrapper,
+        wrappers,
         deps.schedulers.clone(),
         deps.notifier.clone(),
     ))
+}
+
+/// Every watched chain's equity transfer services, plus the per-chain vault
+/// registry ids and wrappers the trigger reads.
+struct WatchedEquityServices {
+    chains: BTreeMap<Chain, ChainEquityServices>,
+    registry_ids: BTreeMap<Chain, VaultRegistryId>,
+    wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
+}
+
+/// Builds one [`ChainEquityServices`] per watched chain, so a mint or
+/// redemption resolves the chain its record names instead of borrowing the
+/// primary's wallet, vault registry and issuer.
+///
+/// A chain that rebalances equities without a gas threshold refuses startup
+/// here (see [`build_equity_gas_readiness`]); one that rebalances nothing
+/// keeps the fail-closed `Unwired` check.
+fn build_watched_equity_services<Signer: Wallet + Clone>(
+    deps: &RebalancingDeps,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    wallets: &ChainWallets<Signer>,
+) -> anyhow::Result<WatchedEquityServices> {
+    let watched_chain = |chain: Chain| {
+        deps.ctx.chains.watch(chain).with_context(|| {
+            format!("{chain} has tokenization services but no [chains.{chain}.trading] table")
+        })
+    };
+
+    let mut gas_chains = Vec::new();
+    for (chain, tokenization) in tokenizations {
+        gas_chains.push(EquityGasChain {
+            chain: *chain,
+            assets: &watched_chain(*chain)?.assets,
+            wallet: &tokenization.wallet,
+        });
+    }
+
+    let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.clone().into_parts();
+    let mut gas_readiness = build_equity_gas_readiness(
+        deps.ctx
+            .alerts
+            .as_ref()
+            .context("rebalancing requires [alerts] gas thresholds")?,
+        &gas_chains,
+        &base_wallet,
+        &ethereum_wallet,
+    )?;
+    drop(gas_chains);
+
+    let mut chains = BTreeMap::new();
+    let mut registry_ids = BTreeMap::new();
+    let mut wrappers: BTreeMap<Chain, Arc<dyn Wrapper>> = BTreeMap::new();
+    for (chain, tokenization) in tokenizations {
+        let watched = watched_chain(*chain)?;
+        let chain_wallet = tokenization.wallet.address();
+        let (registry_id, vault_lookup) = build_rebalancing_vault_lookup(
+            watched,
+            watched.vault_owner,
+            deps.vault_registry_projection.clone(),
+        );
+
+        registry_ids.insert(*chain, registry_id);
+        wrappers.insert(*chain, tokenization.wrapper.clone());
+        chains.insert(
+            *chain,
+            ChainEquityServices {
+                wallet: chain_wallet,
+                raindex: build_rebalancing_raindex_service(
+                    &tokenization.wallet,
+                    watched,
+                    chain_wallet,
+                ),
+                vault_lookup,
+                tokenizer: tokenization.tokenizer.clone(),
+                wrapper: tokenization.wrapper.clone(),
+                mint_authorizer: tokenization.mint_authorizer.clone(),
+                gas_readiness: gas_readiness
+                    .remove(chain)
+                    .unwrap_or(ConfiguredGasReadiness::Unwired),
+                equities: watched.assets.equities.clone(),
+            },
+        );
+    }
+
+    Ok(WatchedEquityServices {
+        chains,
+        registry_ids,
+        wrappers,
+    })
 }
 
 /// The rebalancer, the recovery jobs and the resume paths run on the primary
@@ -2684,7 +2787,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker;
 
         let primary_chain = deps.ctx.chains.primary().chain;
-        confirm_equity_transfer_paths_support(primary_chain)?;
         let primary = tokenizations.get(&primary_chain).with_context(|| {
             format!("no tokenization services were built for the primary chain {primary_chain}")
         })?;
@@ -2702,11 +2804,11 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let bot_gas_enqueuer =
             BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
 
-        let (vault_registry_id, vault_lookup) =
-            build_rebalancing_vault_lookup(&deps.ctx, deps.vault_registry_projection.clone());
-
-        let raindex_service =
-            build_rebalancing_raindex_service(&primary.wallet, &deps.ctx, market_maker_wallet);
+        let raindex_service = build_rebalancing_raindex_service(
+            &primary.wallet,
+            deps.ctx.chains.primary(),
+            market_maker_wallet,
+        );
 
         // One issuance client serves the tokenization preflight's vault-mode
         // reads and both mint-authorization consumers (the saga's vault-mode
@@ -2727,14 +2829,24 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let mint_authorization =
             build_mint_authorization_infra(issuance_client, &deps.apalis_pool, primary).await?;
 
+        let WatchedEquityServices {
+            chains: chain_services,
+            registry_ids,
+            wrappers,
+        } = build_watched_equity_services(&deps, &tokenizations, &wallets)?;
+
         let equity_transfer_services = EquityTransferServices {
-            raindex: raindex_service.clone(),
-            vault_lookup: vault_lookup.clone(),
-            tokenizer: tokenizer.clone(),
-            wrapper: wrapper.clone(),
+            chains: chain_services,
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
-            mint_authorizer: mint_authorization.authorizer,
         };
+
+        // The saga's own Raindex, wrapper and vault-lookup handles stay on the
+        // primary chain; each transfer's wallet, gas admission and asset table
+        // already come from its own entry.
+        let primary_vault_lookup = equity_transfer_services
+            .for_chain(primary_chain)?
+            .vault_lookup
+            .clone();
 
         let transfer_usdc_to_hedging_queue = deps.schedulers.transfer_usdc_to_hedging.clone();
         let transfer_usdc_to_market_making_queue =
@@ -2746,7 +2858,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let notifier = deps.notifier.clone();
 
         let rebalancing_service =
-            build_rebalancing_service(&rebalancing_ctx, &deps, vault_registry_id, wrapper.clone());
+            build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers);
 
         wire_transfer_admission_guards(
             &rebalancing_service,
@@ -2760,7 +2872,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             &deps.pool,
             deps.broadcaster,
             rebalancing_service.clone(),
-            equity_transfer_services,
+            equity_transfer_services.clone(),
             deps.pnl_ledger_reactor,
         )
         .await?;
@@ -2776,15 +2888,13 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let recovery_transfer = Arc::new(
             CrossVenueEquityTransfer::new(
                 raindex_service.clone(),
-                vault_lookup.clone(),
+                primary_vault_lookup.clone(),
                 tokenizer.clone(),
                 wrapper.clone(),
-                market_maker_wallet,
+                equity_transfer_services.clone(),
                 built.mint.clone(),
                 built.redemption.clone(),
-                bot_gas_enqueuer.clone(),
             )
-            .with_gas_readiness(gas_readiness.clone())
             .with_mint_authorization(mint_authorization.wiring),
         );
 
@@ -2794,7 +2904,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             build_equity_recovery_stores(
                 &deps.pool,
                 raindex_service.clone(),
-                vault_lookup.clone(),
+                primary_vault_lookup.clone(),
                 wrapper.clone(),
                 recovery_transfer.clone(),
                 market_maker_wallet,
@@ -2881,7 +2991,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             transfer: recovery_transfer.clone(),
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             mint_store: built.mint.clone(),
-            equities_config: deps.ctx.chains.primary().assets.equities.clone(),
+            transfer_services: equity_transfer_services,
             job_queue: transfer_equity_to_market_making_queue,
         });
 
@@ -5605,13 +5715,19 @@ mod tests {
                 },
             },
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: Address::ZERO,
-                owner: Address::ZERO,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: Address::ZERO,
+                    owner: Address::ZERO,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(LogNotifier),
         ))
@@ -6302,14 +6418,7 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let tokenizer = Arc::new(MockTokenizer::new());
 
-        let services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: tokenizer.clone(),
-            wrapper: wrapper.clone(),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-        };
+        let services = recovery_services(raindex.clone(), tokenizer.clone(), wrapper.clone());
 
         let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
             pool.clone(),
@@ -6371,13 +6480,19 @@ mod tests {
                 },
             },
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: alloy::primitives::Address::ZERO,
-                owner: alloy::primitives::Address::ZERO,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: alloy::primitives::Address::ZERO,
+                    owner: alloy::primitives::Address::ZERO,
+                },
+            )]),
             inventory.clone(),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -7322,14 +7437,7 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let tokenizer = Arc::new(MockTokenizer::new());
 
-        let services = EquityTransferServices {
-            raindex: raindex.clone(),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: tokenizer.clone(),
-            wrapper: wrapper.clone(),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-        };
+        let services = recovery_services(raindex.clone(), tokenizer.clone(), wrapper.clone());
 
         let seeding_mint_store = Arc::new(test_store::<TokenizedEquityMint>(
             pool.clone(),
@@ -7369,13 +7477,19 @@ mod tests {
                 },
             },
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: alloy::primitives::Address::ZERO,
-                owner: alloy::primitives::Address::ZERO,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: alloy::primitives::Address::ZERO,
+                    owner: alloy::primitives::Address::ZERO,
+                },
+            )]),
             inventory.clone(),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -7412,14 +7526,11 @@ mod tests {
         let (pool2, apalis_pool2) = setup_test_pools().await;
         let mint_id2 = issuer_request_id("pre-wrap-active-mint");
 
-        let services2 = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-        };
+        let services2 = recovery_services(
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+        );
 
         let seeding_mint_store2 = Arc::new(test_store::<TokenizedEquityMint>(
             pool2.clone(),
@@ -7459,13 +7570,19 @@ mod tests {
                 },
             },
             vault_registry2,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: alloy::primitives::Address::ZERO,
-                owner: alloy::primitives::Address::ZERO,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: alloy::primitives::Address::ZERO,
+                    owner: alloy::primitives::Address::ZERO,
+                },
+            )]),
             inventory2.clone(),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool2),
             Arc::new(crate::alerts::LogNotifier),
         );
@@ -11262,13 +11379,19 @@ mod tests {
                 },
             },
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook,
-                owner: order_owner,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook,
+                    owner: order_owner,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -11379,13 +11502,19 @@ mod tests {
                 },
             },
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook,
-                owner: order_owner,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook,
+                    owner: order_owner,
+                },
+            )]),
             Arc::clone(&inventory),
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -11506,13 +11635,19 @@ mod tests {
                 },
             },
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook,
-                owner: order_owner,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook,
+                    owner: order_owner,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -11652,13 +11787,19 @@ mod tests {
                 },
             },
             vault_registry,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook,
-                owner: order_owner,
-            },
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook,
+                    owner: order_owner,
+                },
+            )]),
             inventory,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -15095,25 +15236,21 @@ mod tests {
     async fn publish_recovery_handle_always_sets_the_cell() {
         let pool = setup_test_db().await;
 
-        let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-        };
+        let services = recovery_services(
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+        );
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let redemption_store = Arc::new(test_store(pool, services));
+        let redemption_store = Arc::new(test_store(pool, services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             Arc::new(MockRaindex::new()),
             Arc::new(MockVaultLookup::new()),
             Arc::new(MockTokenizer::new()),
             Arc::new(MockWrapper::new()),
-            Address::ZERO,
+            services,
             mint_store,
             redemption_store,
-            BotGasReceiptCostEnqueuer::Disabled,
         ));
         let rebalancing_service = freeze_guard_test_service().await;
         let usdc_recheck: Arc<dyn RecheckUsdcDeposit> = Arc::new(NeverCalledUsdcRecheck);
@@ -15361,26 +15498,131 @@ mod tests {
         ctx
     }
 
-    /// Startup approvals are per watched chain: each chain's targets name
-    /// its own orderbook, its own asset table and its own canonical USDC,
-    /// so Base's USDC constant never reaches another chain's orderbook.
-    /// The equity gas-readiness leg and the receipt-cost jobs still read
-    /// Base. A non-Base primary must be refused at startup rather than
-    /// checked and billed against a wallet the equity transfers never use.
-    #[test]
-    fn equity_transfer_paths_refuse_a_non_base_primary() {
-        confirm_equity_transfer_paths_support(Chain::Base).unwrap();
-
-        for chain in [Chain::Ethereum, Chain::HyperEvm] {
-            let error = confirm_equity_transfer_paths_support(chain).unwrap_err();
-            assert!(
-                matches!(
-                    error,
-                    EquityTransferPathsUnsupported::NonBasePrimary { primary } if primary == chain
-                ),
-                "got: {error:?}"
-            );
+    /// Mint and redemption services on one chain's mocks, for the startup
+    /// recovery fixtures: they exercise which aggregates are resumed, not
+    /// which chain's services drive them.
+    fn recovery_services(
+        raindex: Arc<dyn Raindex>,
+        tokenizer: Arc<dyn Tokenizer>,
+        wrapper: Arc<dyn Wrapper>,
+    ) -> EquityTransferServices {
+        EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex,
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer,
+                    wrapper,
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
+    }
+
+    /// One equity asset that opts into rebalancing, so the chain listing it
+    /// needs a gas threshold of its own.
+    fn rebalancing_equity_assets() -> st0x_config::ChainAssets {
+        let mut equities = st0x_config::ChainEquities::default();
+        equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            st0x_config::ChainEquityAsset {
+                tokenized_equity: Address::with_last_byte(9),
+                tokenized_equity_derivative: Address::with_last_byte(10),
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        st0x_config::ChainAssets {
+            equities,
+            cash: None,
+        }
+    }
+
+    fn gas_threshold_alerts() -> st0x_config::AlertsCtx {
+        st0x_config::AlertsCtx::for_test(
+            BTreeMap::from([
+                (Chain::Base, U256::from(50_u64)),
+                (Chain::Ethereum, U256::from(100_u64)),
+            ]),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        )
+    }
+
+    /// A chain whose equities opt into rebalancing must carry its own
+    /// `[alerts.low_balance_thresholds]` entry: without one its transfers
+    /// would run against a native balance nothing ever checked.
+    #[test]
+    fn equity_gas_readiness_refuses_a_rebalancing_chain_without_a_threshold() {
+        let base_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(1));
+        let ethereum_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(2));
+        let hyperevm_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(3));
+        let assets = rebalancing_equity_assets();
+
+        let Err(error) = build_equity_gas_readiness(
+            &gas_threshold_alerts(),
+            &[EquityGasChain {
+                chain: Chain::HyperEvm,
+                assets: &assets,
+                wallet: &hyperevm_wallet,
+            }],
+            &base_wallet,
+            &ethereum_wallet,
+        ) else {
+            panic!("a chain that rebalances equities without a gas threshold must be refused");
+        };
+        let error = error.to_string();
+
+        assert!(
+            error.contains("hyperevm") && error.contains("low_balance_thresholds"),
+            "expected the chain named alongside the missing threshold, got: {error}"
+        );
+    }
+
+    /// A watched chain that rebalances nothing needs no threshold: it gets no
+    /// readiness entry, so a transfer there is refused by the fail-closed
+    /// `Unwired` check rather than by startup.
+    #[test]
+    fn equity_gas_readiness_skips_a_chain_that_rebalances_nothing() {
+        let base_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(1));
+        let ethereum_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(2));
+        let hyperevm_wallet = st0x_evm::StubWallet::stub(Address::with_last_byte(3));
+        let idle = st0x_config::ChainAssets::default();
+        let rebalancing = rebalancing_equity_assets();
+
+        let Ok(readiness) = build_equity_gas_readiness(
+            &gas_threshold_alerts(),
+            &[
+                EquityGasChain {
+                    chain: Chain::HyperEvm,
+                    assets: &idle,
+                    wallet: &hyperevm_wallet,
+                },
+                EquityGasChain {
+                    chain: Chain::Base,
+                    assets: &rebalancing,
+                    wallet: &base_wallet,
+                },
+            ],
+            &base_wallet,
+            &ethereum_wallet,
+        ) else {
+            panic!("a chain that rebalances nothing must not need a threshold");
+        };
+
+        assert_eq!(
+            readiness.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base]
+        );
     }
 
     #[test]
