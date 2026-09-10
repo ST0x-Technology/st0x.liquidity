@@ -131,45 +131,45 @@ Operators pause rebalancing with narrow, explicit controls:
 None of these controls disable hedging, inventory visibility, or the recovery of
 in-flight transfers. A pause stops new rebalancing work only.
 
-##### Chain Roles: Watched (Primary or Secondary) and Transport
+##### Chain Roles: Hedged (Primary or Secondary) and Transport
 
 Every chain the bot touches is declared under `[chains.<name>]` with a
 `lifecycle` (`disabled`, `observe-only`, `prefunded`, `active`). A chain whose
-config carries a `[chains.<name>.trading]` table is a **watched** chain: the bot
-runs a fill watcher against its order book and accounts its fills. Exactly one
-watched chain must set `primary = true` on that table -- the **primary** chain
-is the chain the bot rebalances automatically (Base); fills are hedged, and
-vault balances are polled, on every watched chain. Vault balance polling runs
-once per watched chain, each on that chain's own Raindex service, its own
-chain-qualified vault registry and one pinned block, so every watched chain's
-inventory slot is seeded and corrected. A secondary chain's fill updates that
-chain's own inventory slot and never triggers the primary chain's rebalancing
-check: inventory is not fungible across chains, and a secondary is prefunded.
-The distinction exists so that fill watching and inventory polling can go
-multi-chain before rebalancing does: it names the chain the still-single-chain
-paths use. Once rebalancing is per chain (global rebalancer, USDC corridors),
-`primary` shrinks to the operator's default chain, or is removed. Zero or
-multiple primary claimants fail startup with a named error. Chains without a
-trading table are **transport** chains (RPC + confirmations only, e.g. Ethereum
-while it only carries CCTP transfers). Watch settings are per chain: poll
-interval, ingestion cutoff, asset tables with per-chain enable/disable flags.
-The periodic position check sweeps a symbol when any watched chain enables it
-and sizes the hedge with the tightest operational limit among those chains (one
-`Position` per symbol cannot say which chain its fills came from; the remainder
-is hedged on a later tick). Startup verifies every watched chain (chain-id
-identity, cutoff support, and one configured asset answering `decimals()` on
-that chain's own endpoint) and any failure is fatal; degraded per-chain startup
-is deferred to the chain-disable work.
+config carries a `[chains.<name>.trading]` table is a **hedged** chain: the bot
+runs a fill watcher against its order book, accounts its fills and hedges them
+with offsetting broker orders. Exactly one hedged chain must set
+`primary = true` on that table -- the **primary** chain is the chain the bot
+rebalances automatically (Base); hedging and vault balance polling happen on
+every hedged chain. Vault balance polling runs once per hedged chain, each on
+that chain's own Raindex service, its own chain-qualified vault registry and one
+pinned block, so every hedged chain's inventory slot is seeded and corrected. A
+secondary chain's fill updates that chain's own inventory slot and never
+triggers the primary chain's rebalancing check: inventory is not fungible across
+chains, and a secondary is prefunded. The distinction exists so that fill
+watching and inventory polling can go multi-chain before rebalancing does: it
+names the chain the still-single-chain paths use. Once rebalancing is per chain
+(global rebalancer, USDC corridors), `primary` shrinks to the operator's default
+chain, or is removed. Zero or multiple primary claimants fail startup with a
+named error. Chains without a trading table are **transport** chains (RPC +
+confirmations only, e.g. Ethereum while it only carries CCTP transfers). Watch
+settings are per chain: poll interval, ingestion cutoff, asset tables with
+per-chain enable/disable flags. The periodic position check sweeps a symbol when
+any hedged chain enables it and sizes the hedge with the tightest operational
+limit among those chains (one `Position` per symbol cannot say which chain its
+fills came from; the remainder is hedged on a later tick). Startup verifies
+every hedged chain (chain-id identity, cutoff support, and one configured asset
+answering `decimals()` on that chain's own endpoint) and any failure is fatal;
+degraded per-chain startup is deferred to the chain-disable work.
 
-HyperEVM supports prefunded fill ingestion and hedging as a watched secondary
+HyperEVM supports prefunded fill ingestion and hedging as a hedged secondary
 with manually funded equity, USDC and native HYPE gas. Configuring HyperEVM as
 the primary chain fails validation. Its canonical USDC is
 `0xb88339CB7199b77E23DB6E890353E22632Ba630f` (6 decimals). HyperEVM does not
 provide gas valuation or automated rebalancing capabilities; `active` remains
-unavailable. Its vault balances are polled like any watched chain's; automated
+unavailable. Its vault balances are polled like any hedged chain's; automated
 rebalancing remains on Base.
 
-The tokenization services are built per watched chain, never once for Base, on
+The tokenization services are built per hedged chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
 one rebalancing-enabled equity (the same per-asset flags that make the chain
 require the equity-rebalancing capability), get the full set: an issuer client,
@@ -193,14 +193,14 @@ resolves the entry of the chain its record names (see below), so only the
 orphan-recovery aggregates still borrow the primary's. A managed secondary
 chain's vault inventory is not polled until per-chain polling lands: the
 operator funds and watches it by hand, and startup warns once per such chain.
-The tokenization preflight (below) runs once per watched chain with that chain's
+The tokenization preflight (below) runs once per hedged chain with that chain's
 wallet, orderbook and canonical USDC, as does the stale-allowance revoke on each
-chain in managed inventory mode. The startup MAX approvals run on every watched
+chain in managed inventory mode. The startup MAX approvals run on every hedged
 chain in either mode, but only the USDC-to-orderbook grant is unconditional: the
 equity grants (underlying to wrapper vault, wrapped token to orderbook) are made
 only on chains that rebalance equity, since a hedge-only secondary has no
-wrapper to approve. A watched chain for which this build has no pinned USDC
-fails startup rather than borrowing another chain's address.
+wrapper to approve. A hedged chain for which this build has no pinned USDC fails
+startup rather than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
@@ -382,7 +382,7 @@ distinct — neither key alone can both mint and authorize.
   on X, every asset listed on X stays vault-direct. This bot enforces the order
   at three points, from earliest to last: a rebalancing-mode startup preflight
   refuses startup, naming chain and symbol, when issuance reports an
-  orchestrator-mode asset the preflight covers on a watched chain with no entry
+  orchestrator-mode asset the preflight covers on a hedged chain with no entry
   (see Startup Sequencing); a section carrying only other chains' entries warns
   at startup; and the server-side mint path reads the asset's mode again before
   signing and fails closed, so an orchestrator-mode mint without its chain's
@@ -417,9 +417,9 @@ excellent async ecosystem for handling concurrent trading flows.
 #### Raindex Event Monitor
 
 - Continuous HTTP `eth_getLogs` polling over a single transport -- no WebSocket.
-  One monitor instance runs per watched chain, each with its own provider,
+  One monitor instance runs per hedged chain, each with its own provider,
   per-chain poll interval (`order_fill_poll_interval_secs`, required on every
-  watched chain's trading table; no global default), a chain-selected constant
+  hedged chain's trading table; no global default), a chain-selected constant
   limiting each inclusive `eth_getLogs` request, checkpoint keyed
   `(chain, orderbook)`, and scan queue -- one chain's backlog or outage never
   blocks another chain's ingestion. Every poll interval the monitor enqueues a
@@ -429,7 +429,7 @@ excellent async ecosystem for handling concurrent trading flows.
   worker fetches the `Clear` and `TakeOrder` logs for the arbitrageur's owner
   address and advances the checkpoint only on success. `required_confirmations`
   governs transaction-submission paths only and does not affect fill ingestion.
-  Every backfill path, including durable retries, uses the watched chain's
+  Every backfill path, including durable retries, uses the hedged chain's
   explicit policy: HyperEVM 50 blocks, Base and Ethereum 1000 blocks per
   request, counted inclusively. Adding a chain requires an explicit policy
   before the code compiles. Poll intervals remain required deployment
@@ -564,26 +564,26 @@ can be missed across downtime: the order fill monitor always resumes from the
 persisted checkpoint and re-scans any gap.
 
 Before any worker or rebalancer runs, and in both modes whenever a signing
-wallet is configured, startup grants the one-time MAX approvals on every watched
+wallet is configured, startup grants the one-time MAX approvals on every hedged
 chain with that chain's wallet: that chain's canonical USDC to its orderbook on
-every watched chain, and each wrapped equity's underlying to its wrapper vault
+every hedged chain, and each wrapped equity's underlying to its wrapper vault
 and wrapped to that chain's orderbook: on the primary every equity with trading
 or rebalancing enabled, on a secondary only the equities with rebalancing
 enabled, the same selection its tokenization preflight attests (a hedge-only
 secondary has no wrapper to approve, so its allowance work is the USDC grant
 alone). Only when rebalancing is configured does it also revoke any stale
 orderbook allowance, per chain in managed inventory mode, the same way, and a
-tokenization preflight then runs per watched chain, read-only: the chain's
-issuer redemption wallet must be configured, and every preflighted equity's
-configured vault must report the configured underlying as its `asset()` (the
-same attestation a redemption's unwrap step performs). The preflighted equities
-are, on the primary, every trading- or rebalancing-enabled equity (the bot may
-wrap or redeem any of them there), and on a secondary only its
-rebalancing-enabled equities; a hedge-only secondary is skipped with a log line
-and has no redemption-wallet requirement. Each failure is fatal and names the
-chain and, where one applies, the symbol. Then, on every preflighted chain with
-no `[orchestrator.addresses]` entry, the preflight asks issuance's per-asset
-status endpoint (the freeze gate's endpoint, through the same client) for each
+tokenization preflight then runs per hedged chain, read-only: the chain's issuer
+redemption wallet must be configured, and every preflighted equity's configured
+vault must report the configured underlying as its `asset()` (the same
+attestation a redemption's unwrap step performs). The preflighted equities are,
+on the primary, every trading- or rebalancing-enabled equity (the bot may wrap
+or redeem any of them there), and on a secondary only its rebalancing-enabled
+equities; a hedge-only secondary is skipped with a log line and has no
+redemption-wallet requirement. Each failure is fatal and names the chain and,
+where one applies, the symbol. Then, on every preflighted chain with no
+`[orchestrator.addresses]` entry, the preflight asks issuance's per-asset status
+endpoint (the freeze gate's endpoint, through the same client) for each
 preflighted equity's `vault_mode` and refuses startup naming the chain and
 symbol when one is orchestrator-mode: its first mint would stall at the signing
 step. Chains with an entry are not queried: the entry is the only prerequisite
@@ -1384,7 +1384,7 @@ as block zero. Its block lag is therefore absent, and the dashboard surfaces the
 latest unknown-cutoff sample as degraded instead of reporting a healthy zero
 lag. Every block-lag sample is keyed by the chain whose fill watcher took it
 (legacy samples belong to Base), and the infra report exposes one block-lag
-series per watched chain, primary first, each with its own current lag: two
+series per hedged chain, primary first, each with its own current lag: two
 chains never merge into one series, even when their orderbooks share an address.
 
 ### Portfolio Capital and Return Tracking
@@ -1445,7 +1445,7 @@ genuine zero balance still produces a `0` row. The capture only proceeds once
 every configured balance has been polled at least once that run -- a
 partially-hydrated view (e.g. equity seen onchain but not yet offchain) is
 skipped and retried shortly after, since a captured day can never be amended.
-The required market-making balances are per watched chain: each chain requires
+The required market-making balances are per hedged chain: each chain requires
 the equities and the cash its own assets table declares, so a chain the poller
 reads is a chain the capture waits for. This is a PRESENCE check, not a
 freshness check: a balance that is merely present (e.g. replayed from a
@@ -1746,14 +1746,14 @@ systemd unit:
   candidate agenix secret into a temporary file, stages the plaintext config,
   and runs `validate-config` while the old process is still running. For Turnkey
   wallets it then lists policies through Turnkey's authenticated read-only API
-  and proves that every startup MAX approval target on every watched chain (that
+  and proves that every startup MAX approval target on every hedged chain (that
   chain's canonical USDC to its orderbook, plus equity token to wrapper and
   wrapper to that chain's orderbook for every equity the chain wraps in its
   role: trading or rebalancing enabled on the primary, rebalancing enabled on a
   secondary) is covered by an allow policy whose consensus the authenticated API
   user can satisfy alone and whose target condition provably applies on that
   chain's id. Applicable deny policies take precedence; unknown allow or deny
-  applicability, unsupported consensus, a watched chain with no pinned USDC, and
+  applicability, unsupported consensus, a hedged chain with no pinned USDC, and
   missing coverage fail closed, naming the chain, symbol, token contract, and
   spender. Only after both gates pass may activation stop the old process and
   install the candidate files, so a policy or config failure leaves the running
@@ -6042,10 +6042,10 @@ requests to the backend.
 The bot raises out-of-band alerts for conditions an operator must react to
 quickly. Every alert is emitted as a structured ERROR log (see "Structured log
 channel" below). The `[alerts]` config section is optional only in standalone
-mode without an enabled watched HyperEVM chain. Automated rebalancing requires
-it because its thresholds gate fresh transfers; enabled watched HyperEVM
-requires it for native-gas monitoring. Where omission is permitted, it disables
-only the gas monitors while all other alert sources still log.
+mode without an enabled hedged HyperEVM chain. Automated rebalancing requires it
+because its thresholds gate fresh transfers; enabled hedged HyperEVM requires it
+for native-gas monitoring. Where omission is permitted, it disables only the gas
+monitors while all other alert sources still log.
 
 ### Gas balance monitoring
 
@@ -6055,8 +6055,8 @@ to alert the operator before insufficient gas stops transactions.
 
 **Scope.** With `[alerts]` configured, independently supervised monitors watch
 Base and Ethereum. HyperEVM also has a monitor whenever its chain config has a
-lifecycle other than `disabled` and a trading table (a watched chain), including
-observe-only watched use. Absent, disabled or transport-only HyperEVM has no
+lifecycle other than `disabled` and a trading table (a hedged chain), including
+observe-only hedged use. Absent, disabled or transport-only HyperEVM has no
 monitor. Each monitor reads its own chain's RPC provider and signing wallet; no
 chain borrows another's provider or wallet. Monitors share polling and re-alert
 intervals but retain independent de-duplication and recovery state.
@@ -6077,7 +6077,7 @@ observed usage.
   parsed exactly to 18-decimal base units at startup. Missing, malformed or zero
   thresholds fail startup; there is no cross-chain fallback. Base and Ethereum
   entries remain required whenever `[alerts]` exists; HyperEVM is required only
-  when enabled and watched. Thresholds for unselected chains are rejected.
+  when enabled and hedged. Thresholds for unselected chains are rejected.
   HyperEVM balances and thresholds are reported as HYPE.
 
 - **De-duplication.** The monitor alerts once on the transition into the low
@@ -6115,7 +6115,7 @@ persisted lifecycle state controls recovery; resuming it does not rerun the
 fresh-transfer admission check or strand funds that are already in flight.
 
 Because rebalancing consumes gas thresholds as a safety boundary and enabled
-watched HyperEVM requires gas monitoring, `[alerts]` is optional only when
+hedged HyperEVM requires gas monitoring, `[alerts]` is optional only when
 automated rebalancing is disabled and HyperEVM is absent, disabled or
 transport-only. Automatic funding from another wallet is not part of this
 behavior; prolonged low balances continue to use the monitor's repeated
