@@ -24313,6 +24313,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_out_redemption_cleanup_clears_the_inflight_on_its_own_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let id = redemption_aggregate_id("timed-out-redemption-ethereum");
+        // Base (the trading chain) carries an unrelated in-flight of 4; the
+        // Ethereum redemption moved 10 of its 20 into flight.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Ethereum,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(4)),
+                now,
+            )
+            .unwrap()
+            .update_equity_at(
+                &symbol,
+                Chain::Ethereum,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(10)),
+                now,
+            )
+            .unwrap();
+        let reactor = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(60)),
+        )
+        .await;
+        let trigger = reactor.clone();
+
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                chain: Chain::Ethereum,
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: now - ChronoDuration::minutes(5),
+            },
+        );
+
+        let cleanup = trigger
+            .cleanup_timed_out_redemption(&id, now)
+            .await
+            .unwrap();
+        assert!(
+            cleanup.is_some(),
+            "cleanup should tombstone the stale redemption"
+        );
+
+        let (ethereum_inflight, ethereum_available, base_inflight, base_available) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_available_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Base),
+                inventory.onchain_equity_available_at(&symbol, Chain::Base),
+            )
+        };
+        assert_eq!(
+            ethereum_inflight,
+            Some(shares(0)),
+            "the timeout must clear the in-flight on the redemption's own chain"
+        );
+        assert_eq!(ethereum_available, Some(shares(10)));
+        assert_eq!(
+            base_inflight,
+            Some(shares(4)),
+            "the timeout must not touch the trading chain's slot"
+        );
+        assert_eq!(base_available, Some(shares(46)));
+    }
+
+    #[tokio::test]
     async fn redemption_event_rechecks_tombstone_after_waiting_for_sync_gate() {
         let symbol = Symbol::new("AAPL").unwrap();
         let reactor = make_trigger_with_inventory_and_registry(
