@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest'
 
+import type { ChainBlockLag } from '$lib/api/ChainBlockLag'
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
 import type { InfraReport } from '$lib/api/InfraReport'
 import type { JobQueueHealth } from '$lib/api/JobQueueHealth'
 import type { LatencyStats } from '$lib/api/LatencyStats'
+import type { PollHealth } from '$lib/api/PollHealth'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 
 import {
-  blockLagCard,
+  type SloCard,
+  blockLagCards,
   detectionCard,
   errorsCard,
   exposureCard,
@@ -185,28 +188,44 @@ describe('errorsCard', () => {
   })
 })
 
-const infra = (overrides: Partial<InfraReport['monitor']>): InfraReport => ({
+const lagSeries = (overrides: Partial<ChainBlockLag>): ChainBlockLag => ({
+  chain: 'base',
+  currentLagBlocks: 5,
+  currentLagSampledAt: '2026-06-01T00:00:00Z',
+  points: [],
+  ...overrides,
+})
+
+/** A Base-only infra report; `poll` overrides the primary chain's poll health. */
+const infra = (overrides: Partial<ChainBlockLag>, poll?: Partial<PollHealth>): InfraReport => ({
   monitor: {
-    currentLagBlocks: 5,
-    currentLagSampledAt: '2026-06-01T00:00:00Z',
-    blockLag: [],
+    blockLag: [lagSeries(overrides)],
     poll: {
       cycles: 100,
       errors: 0,
       skippedTicks: 0,
       duration: null,
+      ...poll,
     },
-    ...overrides,
   },
   dependencies: [],
 })
 
-describe('blockLagCard', () => {
+/** The one card a single-chain report renders. */
+const onlyCard = (cards: SloCard[]): SloCard => {
+  const [card, ...rest] = cards
+  if (!card || rest.length > 0) {
+    throw new Error(`expected exactly one card, got ${String(cards.length)}`)
+  }
+  return card
+}
+
+describe('blockLagCards', () => {
   // One minute after the helper's currentLagSampledAt: fresh.
   const freshNow = new Date('2026-06-01T00:01:00Z')
 
   it('reports unknown while the report has not loaded', () => {
-    const card = blockLagCard(null, freshNow)
+    const card = onlyCard(blockLagCards(null, freshNow))
 
     expect(card.status).toBe('unknown')
     expect(card.primary).toBe('—')
@@ -215,33 +234,33 @@ describe('blockLagCard', () => {
   it('reports unknown before the first refresh sets a clock', () => {
     // The guard is `!report || !now`; this exercises the null-`now` branch
     // independently of the null-report case above.
-    const card = blockLagCard(infra({}), null)
+    const card = onlyCard(blockLagCards(infra({}), null))
 
     expect(card.status).toBe('unknown')
     expect(card.primary).toBe('—')
   })
 
   it('reports unknown when no checkpointed sample exists yet', () => {
-    const card = blockLagCard(
+    const card = onlyCard(blockLagCards(
       infra({
         currentLagBlocks: null,
         currentLagSampledAt: null,
       }),
       freshNow,
-    )
+    ))
 
     expect(card.status).toBe('unknown')
     expect(card.secondary).toBe('no checkpointed samples yet')
   })
 
   it('reports degraded when the latest cutoff is unavailable', () => {
-    const card = blockLagCard(
+    const card = onlyCard(blockLagCards(
       infra({
         currentLagBlocks: null,
         currentLagSampledAt: '2026-06-01T00:00:30Z'
       }),
       freshNow
-    )
+    ))
 
     expect(card.status).toBe('warning')
     expect(card.primary).toBe('—')
@@ -249,7 +268,7 @@ describe('blockLagCard', () => {
   })
 
   it('classifies the current lag against the block-lag thresholds', () => {
-    const card = blockLagCard(infra({}), freshNow)
+    const card = onlyCard(blockLagCards(infra({}), freshNow))
 
     expect(card.status).toBe('good')
     expect(card.primary).toBe('5 blocks')
@@ -257,18 +276,10 @@ describe('blockLagCard', () => {
   })
 
   it('degrades to critical on a large lag and surfaces skipped ticks', () => {
-    const card = blockLagCard(
-      infra({
-        currentLagBlocks: 2_000,
-        poll: {
-          cycles: 100,
-          errors: 1,
-          skippedTicks: 7,
-          duration: null,
-        },
-      }),
+    const card = onlyCard(blockLagCards(
+      infra({ currentLagBlocks: 2_000 }, { errors: 1, skippedTicks: 7 }),
       freshNow,
-    )
+    ))
 
     expect(card.status).toBe('critical')
     expect(card.primary).toBe('2000 blocks')
@@ -277,7 +288,7 @@ describe('blockLagCard', () => {
 
   it('classifies a mid-range lag as warning', () => {
     // Between the good (30) and warning (300) thresholds.
-    const card = blockLagCard(infra({ currentLagBlocks: 100 }), freshNow)
+    const card = onlyCard(blockLagCards(infra({ currentLagBlocks: 100 }), freshNow))
 
     expect(card.status).toBe('warning')
     expect(card.primary).toBe('100 blocks')
@@ -286,7 +297,7 @@ describe('blockLagCard', () => {
   it('degrades a healthy-looking lag to warning when the sample is stale', () => {
     // A wedged monitor stops sampling: the frozen lag value must not keep
     // rendering green.
-    const card = blockLagCard(infra({}), new Date('2026-06-01T03:00:00Z'))
+    const card = onlyCard(blockLagCards(infra({}), new Date('2026-06-01T03:00:00Z')))
 
     expect(card.status).toBe('warning')
     expect(card.secondary).toContain('STALE')
@@ -296,13 +307,38 @@ describe('blockLagCard', () => {
   it('keeps a stale sample critical when the frozen lag was already critical', () => {
     // Staleness floors the card at warning but must never downgrade a
     // reading that was already worse.
-    const card = blockLagCard(
+    const card = onlyCard(blockLagCards(
       infra({ currentLagBlocks: 2_000 }),
       new Date('2026-06-01T03:00:00Z'),
-    )
+    ))
 
     expect(card.status).toBe('critical')
     expect(card.secondary).toContain('STALE')
+  })
+})
+
+describe('blockLagCards per chain', () => {
+  const freshNow = new Date('2026-06-01T00:01:00Z')
+
+  it('renders one card per watched chain, each judged on its own lag', () => {
+    const report = infra({}, { skippedTicks: 3 })
+    report.monitor.blockLag.push(lagSeries({ chain: 'ethereum', currentLagBlocks: 2_000 }))
+
+    const cards = blockLagCards(report, freshNow)
+
+    expect(cards.map((card) => card.title)).toEqual(['Block lag · Base', 'Block lag · Ethereum'])
+    expect(cards.map((card) => card.status)).toEqual(['good', 'critical'])
+    expect(cards[1]?.primary).toBe('2000 blocks')
+  })
+
+  it('attributes skipped ticks to the primary chain only', () => {
+    const report = infra({}, { skippedTicks: 3 })
+    report.monitor.blockLag.push(lagSeries({ chain: 'ethereum' }))
+
+    const [base, ethereum] = blockLagCards(report, freshNow)
+
+    expect(base?.secondary).toContain('3 skipped ticks')
+    expect(ethereum?.secondary).not.toContain('skipped ticks')
   })
 })
 

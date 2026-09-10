@@ -1155,7 +1155,10 @@ API latency, persisted in a lightweight telemetry store outside the event store.
 An unavailable ingestion cutoff is recorded as unknown rather than synthesized
 as block zero. Its block lag is therefore absent, and the dashboard surfaces the
 latest unknown-cutoff sample as degraded instead of reporting a healthy zero
-lag.
+lag. Every block-lag sample is keyed by the chain whose fill watcher took it
+(legacy samples belong to Base), and the infra report exposes one block-lag
+series per watched chain, primary first, each with its own current lag: two
+chains never merge into one series, even when their orderbooks share an address.
 
 ### Portfolio Capital and Return Tracking
 

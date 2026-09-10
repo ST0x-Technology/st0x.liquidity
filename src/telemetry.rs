@@ -28,6 +28,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use st0x_evm::Chain;
+
 pub(crate) mod broker;
 pub(crate) mod executor;
 pub(crate) mod rpc;
@@ -41,6 +43,9 @@ const RETENTION: chrono::Duration = chrono::Duration::days(14);
 #[derive(Debug, Clone)]
 pub(crate) struct BlockLagSample {
     pub(crate) sampled_at: DateTime<Utc>,
+    /// The chain whose fill watcher took the sample: each watched chain
+    /// records its own lag series.
+    pub(crate) chain: Chain,
     pub(crate) orderbook: Address,
     pub(crate) chain_tip: u64,
     /// `None` when the configured ingestion cutoff tag is unavailable.
@@ -123,11 +128,12 @@ pub(crate) async fn record_block_lag(
 
     sqlx::query(
         "INSERT INTO block_lag_samples \
-         (sampled_at, orderbook, chain_tip, cutoff_block, last_processed_block, \
+         (sampled_at, chain, orderbook, chain_tip, cutoff_block, last_processed_block, \
           lag_blocks) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(sqlite_timestamp(sample.sampled_at))
+    .bind(sample.chain.as_str())
     .bind(sample.orderbook.to_string())
     .bind(i64::try_from(sample.chain_tip)?)
     .bind(cutoff_block)
@@ -484,6 +490,7 @@ mod tests {
 
     use alloy::primitives::address;
     use chrono::TimeZone;
+    use sqlx::migrate::{Migration, Migrator};
 
     use crate::test_utils::setup_test_db;
 
@@ -496,6 +503,7 @@ mod tests {
     fn sample(seconds: i64, chain_tip: u64, checkpoint: Option<u64>) -> BlockLagSample {
         BlockLagSample {
             sampled_at: timestamp(seconds),
+            chain: Chain::Base,
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             chain_tip,
             // Cutoff trails the tip by a few blocks in this mock.
@@ -559,6 +567,82 @@ mod tests {
 
     /// Orderbook all test samples are recorded against.
     const ORDERBOOK: Address = address!("0x1111111111111111111111111111111111111111");
+
+    /// Version of the last migration shipped before lag samples were keyed by
+    /// chain. Migrating a database only this far reproduces the legacy
+    /// `block_lag_samples` shape (orderbook, no chain).
+    const LAST_MIGRATION_BEFORE_PER_CHAIN_LAG_SAMPLES: i64 = 20_260_904_214_951;
+
+    async fn pool_migrated_before_per_chain_lag_samples() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let migrator = sqlx::migrate!();
+        let legacy_migrations: Vec<Migration> = migrator
+            .iter()
+            .filter(|migration| migration.version <= LAST_MIGRATION_BEFORE_PER_CHAIN_LAG_SAMPLES)
+            .cloned()
+            .collect();
+        Migrator {
+            migrations: Cow::Owned(legacy_migrations),
+            ..migrator
+        }
+        .run(&pool)
+        .await
+        .unwrap();
+
+        pool
+    }
+
+    /// Every sample written before samples were keyed by chain came from the
+    /// Base watcher, the only one that existed: the migration files them
+    /// under Base rather than leaving them unattributable.
+    #[tokio::test]
+    async fn legacy_lag_samples_are_filed_under_base_by_the_per_chain_migration() {
+        let pool = pool_migrated_before_per_chain_lag_samples().await;
+        sqlx::query(
+            "INSERT INTO block_lag_samples \
+             (sampled_at, orderbook, chain_tip, cutoff_block, last_processed_block, lag_blocks) \
+             VALUES ($1, $2, 105, 102, 100, 2)",
+        )
+        .bind(sqlite_timestamp(timestamp(0)))
+        .bind(ORDERBOOK.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let (chain, orderbook, lag_blocks): (String, String, Option<i64>) =
+            sqlx::query_as("SELECT chain, orderbook, lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(chain, Chain::Base.as_str());
+        assert_eq!(orderbook, ORDERBOOK.to_string());
+        assert_eq!(lag_blocks, Some(2));
+    }
+
+    /// A lag sample that names no chain is refused rather than silently filed
+    /// under Base: the writer must always say which watcher took it.
+    #[tokio::test]
+    async fn lag_sample_without_a_chain_is_refused() {
+        let pool = setup_test_db().await;
+
+        let error = sqlx::query(
+            "INSERT INTO block_lag_samples \
+             (sampled_at, orderbook, chain_tip, cutoff_block, last_processed_block, lag_blocks) \
+             VALUES ($1, $2, 105, 102, 100, 2)",
+        )
+        .bind(sqlite_timestamp(timestamp(0)))
+        .bind(ORDERBOOK.to_string())
+        .execute(&pool)
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.as_database_error().unwrap().message(),
+            "NOT NULL constraint failed: block_lag_samples.chain"
+        );
+    }
 
     #[tokio::test]
     async fn record_poll_cycle_stores_outcome_and_error() {

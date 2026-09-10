@@ -1,7 +1,10 @@
 /** Pure SLO card derivation for the Performance tab. */
 
+import type { ChainBlockLag } from '$lib/api/ChainBlockLag'
+import type { ChainName } from '$lib/api/ChainName'
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
 import type { InfraReport } from '$lib/api/InfraReport'
+import type { PollHealth } from '$lib/api/PollHealth'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 import {
   BLOCK_LAG_THRESHOLDS,
@@ -128,28 +131,43 @@ export const errorsCard = (
  */
 const BLOCK_LAG_STALE_AFTER_MS = 300_000
 
-export const blockLagCard = (
-  report: InfraReport | null,
-  now: Date | null,
-): SloCard => {
+export const CHAIN_LABELS: Record<ChainName, string> = {
+  base: 'Base',
+  ethereum: 'Ethereum',
+  hyperevm: 'HyperEVM',
+}
+
+/**
+ * One card per watched chain: each chain's fill watcher samples its own lag.
+ * Skipped ticks are poll health, which the API scopes to the primary chain
+ * and lists first, so only that chain's card carries them.
+ */
+export const blockLagCards = (report: InfraReport | null, now: Date | null): SloCard[] => {
   if (!report || !now) {
-    return loadingCard('Block lag')
+    return [loadingCard('Block lag')]
   }
 
-  const { currentLagBlocks, currentLagSampledAt, poll } = report.monitor
+  return report.monitor.blockLag.map((series, index) =>
+    blockLagCard(series, index === 0 ? report.monitor.poll : null, now),
+  )
+}
+
+const blockLagCard = (series: ChainBlockLag, poll: PollHealth | null, now: Date): SloCard => {
+  const title = `Block lag · ${CHAIN_LABELS[series.chain]}`
+  const { currentLagBlocks, currentLagSampledAt } = series
 
   if (currentLagBlocks === null && currentLagSampledAt !== null) {
     return {
-      title: 'Block lag',
+      title,
       primary: '—',
       secondary: 'cutoff unavailable — ingestion paused',
-      status: 'warning'
+      status: 'warning',
     }
   }
 
   if (currentLagBlocks === null || currentLagSampledAt === null) {
     return {
-      title: 'Block lag',
+      title,
       primary: '—',
       secondary: 'no checkpointed samples yet',
       status: 'unknown',
@@ -160,7 +178,7 @@ export const blockLagCard = (
 
   if (sampleAgeMs > BLOCK_LAG_STALE_AFTER_MS) {
     return {
-      title: 'Block lag',
+      title,
       primary: `${String(currentLagBlocks)} blocks`,
       secondary: `STALE · sampled ${formatDurationMs(sampleAgeMs)} ago — monitor silent`,
       // Staleness floors the card at warning, but a frozen reading that was
@@ -170,12 +188,12 @@ export const blockLagCard = (
     }
   }
 
+  const skippedTicks = poll === null ? '' : ` · ${String(poll.skippedTicks)} skipped ticks`
+
   return {
-    title: 'Block lag',
+    title,
     primary: `${String(currentLagBlocks)} blocks`,
-    secondary:
-      `sampled ${formatDurationMs(sampleAgeMs)} ago · ` +
-      `${String(poll.skippedTicks)} skipped ticks`,
+    secondary: `sampled ${formatDurationMs(sampleAgeMs)} ago${skippedTicks}`,
     status: classifySlo(currentLagBlocks, BLOCK_LAG_THRESHOLDS),
   }
 }

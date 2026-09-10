@@ -540,10 +540,30 @@ pub struct DependencyBucket {
     pub p50_ms: Option<i64>,
 }
 
-/// Ingestion-health telemetry sampled by the order-fill monitor.
+/// Ingestion-health telemetry sampled by the order-fill monitors.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MonitorTelemetry {
+    /// One block-lag series per watched chain, the primary chain first.
+    pub block_lag: Vec<ChainBlockLag>,
+    pub poll: PollHealth,
+}
+
+/// A watched chain, by the wire name `st0x_evm::Chain` pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainName {
+    Base,
+    Ethereum,
+    #[serde(rename = "hyperevm")]
+    HyperEvm,
+}
+
+/// Block lag of one watched chain's fill watcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainBlockLag {
+    pub chain: ChainName,
     /// Latest sampled block lag, regardless of the report range. `None`
     /// until a sample with a backfill checkpoint exists.
     #[ts(type = "number | null")]
@@ -552,8 +572,7 @@ pub struct MonitorTelemetry {
     /// monitor (no recent samples) distinctly from a healthy zero lag.
     pub current_lag_sampled_at: Option<DateTime<Utc>>,
     /// Worst observed block lag per time bucket, oldest first.
-    pub block_lag: Vec<BlockLagPoint>,
-    pub poll: PollHealth,
+    pub points: Vec<BlockLagPoint>,
 }
 
 /// Worst block lag within one time bucket.
@@ -899,5 +918,70 @@ mod tests {
         assert_eq!(json["detection"]["sampleCount"], json!(5));
         assert_eq!(json["decision"], json!(null));
         assert_eq!(json["exposureWindow"], json!(null));
+    }
+
+    #[test]
+    fn monitor_telemetry_serializes_one_block_lag_series_per_chain() {
+        let telemetry = MonitorTelemetry {
+            block_lag: vec![
+                ChainBlockLag {
+                    chain: ChainName::Base,
+                    current_lag_blocks: Some(7),
+                    current_lag_sampled_at: DateTime::from_timestamp(1_750_000_000, 0),
+                    points: vec![BlockLagPoint {
+                        start: DateTime::from_timestamp(1_750_000_000, 0).unwrap(),
+                        max_lag_blocks: 22,
+                    }],
+                },
+                ChainBlockLag {
+                    chain: ChainName::Ethereum,
+                    current_lag_blocks: None,
+                    current_lag_sampled_at: None,
+                    points: vec![],
+                },
+            ],
+            poll: PollHealth {
+                cycles: 1,
+                errors: 0,
+                skipped_ticks: 0,
+                duration: None,
+            },
+        };
+
+        let json = serde_json::to_value(&telemetry).expect("serialization should succeed");
+        assert_eq!(json["blockLag"][0]["chain"], json!("base"));
+        assert_eq!(json["blockLag"][0]["currentLagBlocks"], json!(7));
+        assert_eq!(
+            json["blockLag"][0]["currentLagSampledAt"],
+            json!("2025-06-15T15:06:40Z")
+        );
+        assert_eq!(
+            json["blockLag"][0]["points"][0]["start"],
+            json!("2025-06-15T15:06:40Z")
+        );
+        assert_eq!(json["blockLag"][0]["points"][0]["maxLagBlocks"], json!(22));
+        assert_eq!(json["blockLag"][1]["chain"], json!("ethereum"));
+        assert_eq!(json["blockLag"][1]["currentLagBlocks"], json!(null));
+        assert_eq!(json["blockLag"][1]["currentLagSampledAt"], json!(null));
+        assert_eq!(json["blockLag"][1]["points"], json!([]));
+    }
+
+    /// The wire names are the chain names pinned by `st0x_evm::Chain`, which
+    /// the read path maps from; asserted as literals so a rename here cannot
+    /// silently diverge from the persisted spellings.
+    #[test]
+    fn chain_name_wire_names_are_pinned_literals() {
+        assert_eq!(
+            serde_json::to_value(ChainName::Base).unwrap(),
+            json!("base")
+        );
+        assert_eq!(
+            serde_json::to_value(ChainName::Ethereum).unwrap(),
+            json!("ethereum")
+        );
+        assert_eq!(
+            serde_json::to_value(ChainName::HyperEvm).unwrap(),
+            json!("hyperevm")
+        );
     }
 }

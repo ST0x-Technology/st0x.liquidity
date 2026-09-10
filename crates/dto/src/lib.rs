@@ -109,6 +109,8 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     JobQueueHealth::export_all_to(out_dir)?;
     InfraReport::export_all_to(out_dir)?;
     MonitorTelemetry::export_all_to(out_dir)?;
+    ChainName::export_all_to(out_dir)?;
+    ChainBlockLag::export_all_to(out_dir)?;
     BlockLagPoint::export_all_to(out_dir)?;
     PollHealth::export_all_to(out_dir)?;
     DependencyName::export_all_to(out_dir)?;

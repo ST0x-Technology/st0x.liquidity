@@ -339,6 +339,7 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
         let sampled_checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
         let sample = BlockLagSample {
             sampled_at,
+            chain: self.evm_ctx.chain,
             orderbook: self.evm_ctx.orderbook,
             chain_tip,
             cutoff_block: cutoff_opt,
@@ -620,6 +621,8 @@ mod tests {
     use serde_json::Value;
     use sqlx::{ConnectOptions, SqlitePool};
 
+    use st0x_evm::Chain;
+
     use super::*;
     use crate::test_utils::setup_test_pools;
 
@@ -709,13 +712,25 @@ mod tests {
         apalis_sqlite::SqlitePool,
         TradingChain,
     ) {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let backfill_queue = BackfillJobQueue::new(&apalis_pool);
-
         let evm_ctx = TradingChain::test()
             .deployment_block(deployment_block)
             .ingestion_cutoff(ingestion_cutoff)
             .call();
+
+        setup_with_trading_chain(provider, evm_ctx).await
+    }
+
+    async fn setup_with_trading_chain<P>(
+        provider: P,
+        evm_ctx: TradingChain,
+    ) -> (
+        OrderFillMonitor<P>,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
+        TradingChain,
+    ) {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let backfill_queue = BackfillJobQueue::new(&apalis_pool);
 
         let monitor = OrderFillMonitor::new(
             evm_ctx.clone(),
@@ -1487,6 +1502,31 @@ mod tests {
         assert_eq!(chain_tip, 105);
         assert_eq!(cutoff_block, 102);
         assert_eq!(last_processed_block, Some(99));
+        assert_eq!(lag_blocks, Some(3));
+    }
+
+    /// One watcher runs per watched chain: a secondary chain's sample is
+    /// filed under that chain, never under the primary's.
+    #[tokio::test]
+    async fn poll_once_files_the_lag_sample_under_the_watchers_chain() {
+        let ethereum = TradingChain::test()
+            .chain(Chain::Ethereum)
+            .deployment_block(1)
+            .call();
+        let (mut monitor, pool, _apalis_pool, evm_ctx) =
+            setup_with_trading_chain(provider_at(105, 102), ethereum).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let (chain, lag_blocks): (String, Option<i64>) =
+            sqlx::query_as("SELECT chain, lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(chain, Chain::Ethereum.as_str());
         assert_eq!(lag_blocks, Some(3));
     }
 
