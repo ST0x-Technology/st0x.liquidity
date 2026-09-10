@@ -18,11 +18,10 @@ markets by providing continuous two-sided liquidity.
 ## Features
 
 - **Supported Executors**: Execute hedges through Alpaca Broker API (managed
-  accounts, auto-rebalancing) or dry-run mode for testing
+  accounts, auto-rebalancing); tests and local simulation run it in mock mode
 - **Real-Time Hedging**: WebSocket-based monitoring for near instant execution
   when onchain liquidity is taken
-- **Fractional Share Support**: Executes fractional shares on Alpaca; dry-run
-  mirrors the same execution model for testing
+- **Fractional Share Support**: Executes fractional shares on Alpaca
 - **Alpaca Hedge Preflight**: Checks available offchain shares for sells and
   cash buying power for buys (includes unsettled T+1 equity-sale proceeds,
   excludes margin) before submitting Alpaca hedge orders
@@ -130,7 +129,10 @@ than skipping the chain:
   on the chain table (not inside `[trading]`). There is no default: the depth
   encodes that chain's reorg behaviour, so omitting it fails config parsing.
 
-Current broker support is limited to `alpaca-broker-api` and `dry-run`.
+Current broker support is limited to the Alpaca Broker API: secrets
+`type = "alpaca-broker-api"` (stored API keys) or its keyless authentication
+variant `type = "alpaca-broker-api-kms"` (Cloud KMS signed client assertions).
+For local whole-system testing use the simulation apps (`nix run .#simulate`).
 
 #### Validating a config
 
@@ -631,8 +633,7 @@ CI will fail if `bun.nix` is out of sync with `bun.lock`.
 3. **Parse Trade**: Extract details (symbol, amount, direction, price) from
    blockchain events
 4. **Accumulate**: Batch positions until the configured execution threshold is
-   reached (typically dollar-based for Alpaca Broker API, whole-share for
-   `dry-run`)
+   reached (typically dollar-based)
 5. **Hedge**: Execute offsetting market order on traditional brokerage to reduce
    exposure
 6. **Track**: Maintain complete audit trail linking onchain fills to offchain
@@ -643,5 +644,4 @@ onchain order price and offchain hedge execution price) while hedging
 directional exposure.
 
 **Note**: Alpaca Broker API supports fractional share execution and the bot can
-hedge using dollar-value thresholds. `dry-run` remains available for local
-testing with whole-share thresholds when that is operationally useful.
+hedge using dollar-value thresholds.

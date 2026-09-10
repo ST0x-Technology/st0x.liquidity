@@ -152,7 +152,6 @@ mod tests {
                 server_port: 8001,
                 orderbook: "0x0000000000000000000000000000000000000000".to_string(),
                 deployment_block: 12345,
-                trading_mode: "rebalancing".to_string(),
                 broker: "alpaca".to_string(),
                 order_polling_interval: 5,
                 inventory_poll_interval: 15,

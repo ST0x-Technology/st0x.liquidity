@@ -71,8 +71,8 @@ required_confirmations = 1
 [rest_api]
 url = "http://localhost:8099"
 
-# ETH/USD valuation source for bot-gas cost recording (ADR 0020). Only
-# required once [rebalancing] is enabled. `chainlink_feed` here is the real
+# ETH/USD valuation source for bot-gas cost recording (ADR 0020). Always
+# required. `chainlink_feed` here is the real
 # Base mainnet address -- a PLACEHOLDER with no deployed code on the local
 # anvil chain the e2e harness runs against, so it is NOT usable as-is for a
 # server started from this file with rebalancing on. Rebalancing e2e
@@ -85,11 +85,11 @@ url = "http://localhost:8099"
 [bot_gas_valuation]
 chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 
-# Required by the single supported topology (there is no global rebalancing
-# off-switch). Every trigger stays inert for a server started from this
-# file: per-asset `rebalancing = "disabled"` above, USDC mode disabled,
-# freeze guard disabled. Rebalancing e2e scenarios build their ctx
-# programmatically instead of reading this section.
+# The [rebalancing] section is required for every parseable config. The e2e
+# template keeps every trigger inert: per-asset `rebalancing` is disabled
+# above, USDC rebalancing is disabled below, and the freeze guard is off.
+# Rebalancing e2e scenarios build their ctx programmatically instead of
+# reading this section.
 [rebalancing]
 transfer_timeout_secs = 1800
 inventory_staleness_bound_secs = 300
@@ -113,3 +113,11 @@ realert_interval = 3600
 [alerts.low_balance_thresholds]
 base = "0.05"
 ethereum = "0.05"
+
+# Matches [chains.base.trading].vault_owner: in legacy inventory mode the
+# bot's EOA owns the vaults. Runtime e2e ctxs build their wallets
+# programmatically (TestWallet); this section exists so the template parses
+# like a deployable config.
+[wallet]
+kind = "private-key"
+address = "0x3333333333333333333333333333333333333333"
