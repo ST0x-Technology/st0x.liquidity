@@ -420,28 +420,27 @@ mod tests {
         );
     }
 
-    /// No USDC is pinned for HyperEVM, so there is nothing to reset there
-    /// and no other chain's address is tried.
     #[tokio::test]
-    async fn reset_allowance_refuses_a_chain_without_a_pinned_usdc() {
+    async fn reset_allowance_on_hyperevm_uses_canonical_usdc() {
         let mut ctx = create_ctx_with_stub_wallet();
         ctx.chains
             .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
 
         let mut stdout = Vec::new();
-        let error = reset_allowance_command::<OpenChainErrorRegistry, _>(
+        reset_allowance_command::<OpenChainErrorRegistry, _>(
             &mut stdout,
             TokenizationNetwork::HyperEvm,
             &ctx,
         )
         .await
-        .unwrap_err()
-        .to_string();
-
+        .unwrap_err();
+        let output = String::from_utf8(stdout).unwrap();
         assert!(
-            error.contains("hyperevm") && error.contains("USDC"),
-            "expected the unpinned chain named, got: {error}"
+            output.contains(&format!("USDC: {}", st0x_evm::USDC_HYPEREVM)),
+            "{output}"
         );
+        assert!(!output.contains(&USDC_BASE.to_string()), "{output}");
+        assert!(!output.contains(&USDC_ETHEREUM.to_string()), "{output}");
     }
 
     #[tokio::test]

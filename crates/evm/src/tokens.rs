@@ -10,3 +10,6 @@ pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02
 
 /// USDC on Ethereum Sepolia testnet.
 pub const USDC_ETHEREUM_SEPOLIA: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+
+/// USDC on HyperEVM mainnet.
+pub const USDC_HYPEREVM: Address = address!("0xb88339CB7199b77E23DB6E890353E22632Ba630f");

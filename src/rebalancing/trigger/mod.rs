@@ -12053,78 +12053,80 @@ mod tests {
     /// rebalancing disabled on every asset).
     #[tokio::test]
     async fn secondary_chain_fill_stays_on_its_own_chain() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let now = Utc::now();
-        let inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(50), shares(50))
-            .with_usdc(usdc(10000), usdc(10000))
-            .apply_snapshot_event(
-                &InventorySnapshotEvent::OnchainEquity {
-                    chain: Chain::Ethereum,
-                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
-                    fetched_at: now,
-                    block_number: None,
-                },
-                now,
-            )
-            .unwrap()
-            .apply_snapshot_event(
-                &InventorySnapshotEvent::OnchainUsdc {
-                    chain: Chain::Ethereum,
-                    usdc_balance: usdc(5000),
-                    fetched_at: now,
-                    block_number: None,
-                },
-                now,
-            )
-            .unwrap();
+        for chain in [Chain::Ethereum, Chain::HyperEvm] {
+            let symbol = Symbol::new("AAPL").unwrap();
+            let now = Utc::now();
+            let inventory = InventoryView::default()
+                .with_equity(symbol.clone(), shares(50), shares(50))
+                .with_usdc(usdc(10000), usdc(10000))
+                .apply_snapshot_event(
+                    &InventorySnapshotEvent::OnchainEquity {
+                        chain,
+                        balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                        fetched_at: now,
+                        block_number: None,
+                    },
+                    now,
+                )
+                .unwrap()
+                .apply_snapshot_event(
+                    &InventorySnapshotEvent::OnchainUsdc {
+                        chain,
+                        usdc_balance: usdc(5000),
+                        fetched_at: now,
+                        block_number: None,
+                    },
+                    now,
+                )
+                .unwrap();
 
-        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let trigger = reactor.clone();
-        let harness = ReactorHarness::new(reactor.clone());
+            let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+            let trigger = reactor.clone();
+            let harness = ReactorHarness::new(reactor.clone());
 
-        // Ethereum buy of 10 shares at $150.
-        harness
-            .receive::<Position>(
-                symbol.clone(),
-                make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::Ethereum),
-            )
-            .await
-            .unwrap();
+            // Buy 10 shares at $150.
+            harness
+                .receive::<Position>(
+                    symbol.clone(),
+                    make_onchain_fill_on_chain(shares(10), Direction::Buy, chain),
+                )
+                .await
+                .unwrap();
 
-        let inventory = trigger.inventory.read().await;
-        assert_eq!(
-            inventory.equity_available(&symbol, Venue::MarketMaking),
-            Some(shares(50)),
-            "an Ethereum fill must not move the primary chain's equity slot"
-        );
-        assert_eq!(
-            inventory.usdc_available(Venue::MarketMaking),
-            Some(usdc(10000)),
-            "an Ethereum fill must not move the primary chain's USDC slot"
-        );
-        assert_eq!(
-            inventory.onchain_equity_available_at(&symbol, Chain::Ethereum),
-            Some(shares(30)),
-            "the fill's equity leg belongs to the chain it filled on"
-        );
-        assert_eq!(
-            inventory.onchain_usdc_available_at(Chain::Ethereum),
-            Some(usdc(3500)),
-            "the fill's cash leg belongs to the chain it filled on"
-        );
-        drop(inventory);
+            let inventory = trigger.inventory.read().await;
+            assert_eq!(
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+                Some(shares(50)),
+                "a secondary fill must not move the primary chain's equity slot"
+            );
+            assert_eq!(
+                inventory.usdc_available(Venue::MarketMaking),
+                Some(usdc(10000)),
+                "a secondary fill must not move the primary chain's USDC slot"
+            );
+            assert_eq!(
+                inventory.onchain_equity_available_at(&symbol, chain),
+                Some(shares(30)),
+                "the fill's equity leg belongs to the chain it filled on"
+            );
+            assert_eq!(
+                inventory.onchain_usdc_available_at(chain),
+                Some(usdc(3500)),
+                "the fill's cash leg belongs to the chain it filled on"
+            );
+            drop(inventory);
 
-        assert_eq!(
-            count_pending_equity_check_jobs(&trigger).await,
-            0,
-            "a secondary chain's fill must not schedule the primary's equity rebalancing"
-        );
-        assert_eq!(
-            count_pending_usdc_check_jobs(&trigger).await,
-            0,
-            "a secondary chain's fill must not schedule the primary's USDC rebalancing"
-        );
+            assert_eq!(
+                count_pending_equity_check_jobs(&trigger).await,
+                0,
+                "a secondary chain's fill must not schedule the primary's equity rebalancing"
+            );
+            assert_eq!(
+                count_pending_usdc_check_jobs(&trigger).await,
+                0,
+                "a secondary chain's fill must not schedule the primary's USDC rebalancing"
+            );
+        }
     }
 
     /// A watched secondary chain is not polled, so no snapshot has seeded its

@@ -1128,6 +1128,30 @@ configured `apalis_finished_job_cleanup_interval_secs` cadence. Those rows are
 queue bookkeeping, while trade history lives in CQRS events and projections. The
 cadence is required config and must be non-zero.
 
+## Native-gas monitoring
+
+With `[alerts]` configured, Base and Ethereum always have separate gas monitors.
+HyperEVM gets a third monitor only when its lifecycle is not `disabled` and it
+has a trading table. This includes observe-only watched use; transport-only
+HyperEVM keeps its existing configuration without a HYPE threshold. Enabled
+watched HyperEVM requires alerts and a positive HyperEVM threshold. Unselected
+HyperEVM thresholds are rejected rather than silently ignored.
+
+Each monitor uses its own chain's signing wallet and RPC provider. ETH and HYPE
+thresholds use exact 18-decimal native-token units, following the
+[Hyperliquid native HYPE specification](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm)
+for both mainnet and testnet. HyperEVM logs and alerts say HYPE. Monitors share
+intervals but keep independent low-balance/re-alert state. The HyperEVM
+readiness slot is acknowledged during assembly when absent, or by its supervised
+run loop when selected, just like the existing gas monitors.
+
+Do not use Alloy's `parse_ether` to validate configuration thresholds. In
+`alloy-primitives`' `utils/units.rs`, `ParseUnits::parse_units` truncates excess
+fractional digits, and its signed-to-`U256` conversion preserves negative values
+as raw unsigned bits. Threshold validation instead pads decimal digits to 18
+places and parses directly into `U256`, rejecting negative values, excess
+precision and overflow before a monitor starts.
+
 ## Native-gas admission for transfers
 
 Fresh rebalancing transfers are admitted only after reading the native-token

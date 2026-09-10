@@ -171,6 +171,7 @@ pub(crate) struct SupervisorStartupTokens {
     pub(crate) executor_maintenance: StartupToken,
     pub(crate) base_gas_monitor: StartupToken,
     pub(crate) ethereum_gas_monitor: StartupToken,
+    pub(crate) hyperevm_gas_monitor: StartupToken,
 }
 
 /// Opens an apalis-side pool (sqlx 0.8) against the same database as the
@@ -5327,7 +5328,7 @@ mod tests {
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiMode, AlpacaBrokerAuth, Direction, EquityPosition,
         ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder, MockExecutor, Positive,
@@ -5356,7 +5357,7 @@ mod tests {
         MintAuthorizationError, MockMintAuthorizer, StubVaultModeReader, VaultModeCheckError,
     };
     use crate::offchain::order::{CancellationReason, OrderPlacementResult, RetainedFill};
-    use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget, StartupApprovalError};
+    use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
     use crate::onchain::mock::MockRaindex;
     use crate::onchain::trade::{InventoryTrade, OnchainTrade};
     use crate::rebalancing::equity::{
@@ -16056,29 +16057,28 @@ mod tests {
         );
     }
 
-    /// A watched chain this build pins no USDC for cannot have its
-    /// approvals granted: startup refuses naming the chain instead of
-    /// approving another chain's USDC there.
     #[test]
-    fn startup_approval_targets_refuse_a_watched_chain_without_pinned_usdc() {
+    fn startup_approval_targets_use_hyperevm_usdc_and_orderbook() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains
-            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
+        let mut hyperevm = TradingChain::test().chain(Chain::HyperEvm).call();
+        hyperevm.orderbook = Address::repeat_byte(0x99);
+        ctx.chains.insert_secondary(hyperevm);
 
-        let error = startup_approval_targets(&ctx).unwrap_err();
-
-        assert!(matches!(
-            error,
-            StartupApprovalError::UsdcNotPinned {
-                chain: Chain::HyperEvm
-            }
-        ));
+        let targets = startup_approval_targets(&ctx).unwrap();
+        assert_eq!(
+            targets[&Chain::HyperEvm],
+            vec![ApprovalTarget {
+                token: USDC_HYPEREVM,
+                spender: Address::repeat_byte(0x99),
+                symbol: None,
+                purpose: ApprovalPurpose::DepositUsdc,
+            }]
+        );
     }
 
     /// The stale-allowance revoke walks each managed-inventory chain's own
     /// wrapped tokens and canonical USDC; a legacy-mode chain has no
-    /// distinct inventory and is left out, and a managed chain with no
-    /// pinned USDC is refused up front.
+    /// distinct inventory and is left out.
     #[test]
     fn stale_allowance_revocations_follow_each_managed_chain() {
         let mut ctx = ctx_with_base_and_ethereum_trading();
@@ -16097,14 +16097,12 @@ mod tests {
         ctx.chains
             .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
 
-        let error = stale_allowance_revocations(&ctx).unwrap_err();
-
-        assert!(matches!(
-            error,
-            StartupApprovalError::UsdcNotPinned {
-                chain: Chain::HyperEvm
-            }
-        ));
+        let revocations = stale_allowance_revocations(&ctx).unwrap();
+        assert_eq!(revocations[&Chain::HyperEvm], vec![USDC_HYPEREVM]);
+        assert_eq!(
+            revocations[&Chain::Ethereum],
+            vec![USDC_ETHEREUM, Address::repeat_byte(0xe6)]
+        );
     }
 
     fn assets_with_equity(symbol: &str, asset: ChainEquityAsset) -> ChainAssets {

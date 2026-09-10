@@ -1,7 +1,7 @@
 //! Supervised native-gas balance monitor.
 //!
 //! [`GasMonitor`] is a long-running [`SupervisedTask`] that polls the bot
-//! wallet's native-ETH balance on a fixed interval and raises an alert when it
+//! wallet's native-token balance on a fixed interval and raises an alert when it
 //! drops below the configured threshold. Alerts go to two places: a structured
 //! `warn!`/`error!` log (target `"gas"`) and a [`Notifier`] (structured
 //! operational-alert logs in production).
@@ -123,6 +123,11 @@ impl GasMonitor {
     /// fires logs/notifications for the resulting outcome. Returns the next
     /// state. A read failure is logged and leaves the state unchanged.
     async fn poll_once(&self, state: AlertState, now: Instant) -> AlertState {
+        let native_token = match self.chain {
+            Chain::Base | Chain::Ethereum => "ETH",
+            Chain::HyperEvm => "HYPE",
+        };
+
         let balance = match self.balance_reader.native_balance(self.wallet).await {
             Ok(balance) => balance,
             Err(error) => {
@@ -131,6 +136,7 @@ impl GasMonitor {
                     ?error,
                     wallet = %self.wallet,
                     chain = %self.chain,
+                    native_token,
                     "Failed to read native balance; will retry next tick"
                 );
                 return state;
@@ -153,24 +159,35 @@ impl GasMonitor {
     /// Emits the log line and notification appropriate for `outcome`. Quiet
     /// outcomes (`StillHealthy`, `StillLowSuppressed`) produce no output.
     async fn act_on_outcome(&self, outcome: PollOutcome, balance: U256) {
+        let native_token = match self.chain {
+            Chain::Base | Chain::Ethereum => "ETH",
+            Chain::HyperEvm => "HYPE",
+        };
+
         match outcome {
             PollOutcome::StillHealthy | PollOutcome::StillLowSuppressed => {}
             PollOutcome::DroppedBelow | PollOutcome::StillLowRealert => {
-                let balance_eth = format_ether(balance);
-                let threshold_eth = format_ether(self.threshold_wei);
+                let balance_native = format_ether(balance);
+                let threshold_native = format_ether(self.threshold_wei);
 
                 error!(
                     target: "gas",
                     wallet = %self.wallet,
                     chain = %self.chain,
-                    balance_eth = %balance_eth,
-                    threshold_eth = %threshold_eth,
+                    native_token,
+                    balance_native = %balance_native,
+                    threshold_native = %threshold_native,
                     "Wallet native-gas balance is below threshold"
                 );
 
                 let message = format!(
-                    "\u{26a0}\u{fe0f} Low gas: wallet {} on {} has {} ETH (threshold {} ETH)",
-                    self.wallet, self.chain, balance_eth, threshold_eth
+                    "\u{26a0}\u{fe0f} Low gas: wallet {} on {} has {} {} (threshold {} {})",
+                    self.wallet,
+                    self.chain,
+                    balance_native,
+                    native_token,
+                    threshold_native,
+                    native_token
                 );
                 self.send(&message).await;
             }
@@ -183,8 +200,9 @@ impl GasMonitor {
                     target: "gas",
                     wallet = %self.wallet,
                     chain = %self.chain,
-                    balance_eth = %format_ether(balance),
-                    threshold_eth = %format_ether(self.threshold_wei),
+                    native_token,
+                    balance_native = %format_ether(balance),
+                    threshold_native = %format_ether(self.threshold_wei),
                     "Wallet native-gas balance recovered above threshold"
                 );
             }
@@ -206,11 +224,17 @@ impl GasMonitor {
 
 impl SupervisedTask for GasMonitor {
     async fn run(&mut self) -> TaskResult {
+        let native_token = match self.chain {
+            Chain::Base | Chain::Ethereum => "ETH",
+            Chain::HyperEvm => "HYPE",
+        };
+
         info!(
             target: "gas",
             wallet = %self.wallet,
             chain = %self.chain,
-            threshold_eth = %format_ether(self.threshold_wei),
+            native_token,
+            threshold_native = %format_ether(self.threshold_wei),
             "Gas monitor started"
         );
 
@@ -234,6 +258,7 @@ mod tests {
 
     use super::*;
     use crate::native_gas::BalanceReadError;
+    use crate::startup::{StartupBarrier, StartupTask};
 
     /// Notifier that records every message it is asked to deliver, so tests can
     /// assert exactly which alerts fired.
@@ -313,6 +338,43 @@ mod tests {
                 "0x0000000000000000000000000000000000000000 on ethereum ",
                 "has 0.000000000000000050 ETH (threshold 0.000000000000000100 ETH)"
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn hyperevm_startup_waits_until_monitor_is_polled() {
+        let barrier = StartupBarrier::new();
+        let notifier = Arc::new(CapturingNotifier::new());
+        let mut monitor = monitor_with(U256::from(50u64), false, notifier.clone());
+        monitor.chain = Chain::HyperEvm;
+        let mut task = StartupTask {
+            task: monitor,
+            token: barrier.token(),
+        };
+        tokio::time::timeout(Duration::from_millis(10), barrier.wait())
+            .await
+            .unwrap_err();
+        let running = tokio::spawn(async move { task.run().await });
+        tokio::time::timeout(Duration::from_secs(1), barrier.wait())
+            .await
+            .unwrap();
+        assert!(!running.is_finished());
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn hyperevm_below_threshold_reports_hype() {
+        let notifier = Arc::new(CapturingNotifier::new());
+        let mut monitor = monitor_with(U256::from(50u64), false, notifier.clone());
+        monitor.chain = Chain::HyperEvm;
+        monitor.poll_once(AlertState::Normal, Instant::now()).await;
+        assert_eq!(
+            notifier.messages(),
+            vec![concat!(
+                "⚠️ Low gas: wallet 0x0000000000000000000000000000000000000000 on hyperevm ",
+                "has 0.000000000000000050 HYPE (threshold 0.000000000000000100 HYPE)"
+            )]
         );
     }
 

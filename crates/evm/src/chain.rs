@@ -10,7 +10,7 @@ use std::str::FromStr;
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
-use crate::tokens::{USDC_BASE, USDC_ETHEREUM};
+use crate::tokens::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
 
 /// An EVM chain the bot acts on.
 ///
@@ -53,7 +53,7 @@ impl Chain {
         match self {
             Self::Base => Some(USDC_BASE),
             Self::Ethereum => Some(USDC_ETHEREUM),
-            Self::HyperEvm => None,
+            Self::HyperEvm => Some(USDC_HYPEREVM),
         }
     }
 
@@ -137,6 +137,16 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Chain::HyperEvm).unwrap(),
             "\"hyperevm\""
+        );
+    }
+
+    #[test]
+    fn hyperevm_usdc_is_the_canonical_contract() {
+        assert_eq!(
+            Chain::HyperEvm.usdc(),
+            Some(alloy::primitives::address!(
+                "0xb88339CB7199b77E23DB6E890353E22632Ba630f"
+            ))
         );
     }
 

@@ -30,8 +30,8 @@ Two contracts apply to the network-aware commands:
   `--registry` (the st0x.registry token list), and `alpaca-tokenize` accepts the
   tStock address directly with `--token`.
 
-Where a command needs USDC it uses the selected chain's canonical contract,
-refused on a chain this build pins none for (HyperEVM).
+Where a command needs USDC it uses the selected chain's canonical contract.
+HyperEVM uses `USDC_HYPEREVM` (`0xb88339CB7199b77E23DB6E890353E22632Ba630f`).
 
 ## Running the CLI on GCP
 

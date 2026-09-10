@@ -15,6 +15,13 @@ captures arbitrage profits.
 The system enables efficient price discovery for onchain tokenized equity
 markets by providing continuous two-sided liquidity.
 
+HyperEVM supports prefunded fill ingestion and hedging with canonical USDC.
+Operators fund its equity, USDC and HYPE gas manually. An enabled watched
+HyperEVM chain requires an explicit HYPE threshold in
+`[alerts.low_balance_thresholds]`; transport-only entries retain their existing
+configuration. Active mode, gas valuation and automated rebalancing on HyperEVM
+remain unavailable.
+
 ## Features
 
 - **Supported Executors**: Execute hedges through Alpaca Broker API (managed

@@ -3021,17 +3021,13 @@ mod tests {
         );
     }
 
-    /// USDC differs per chain: the pinned contracts resolve, an unpinned
-    /// chain is refused by name rather than served another chain's address.
     #[test]
-    fn chain_usdc_refuses_a_chain_without_a_pinned_contract() {
+    fn chain_usdc_uses_each_chains_canonical_contract() {
         assert_eq!(chain_usdc(Chain::Base).unwrap(), USDC_BASE);
         assert_eq!(chain_usdc(Chain::Ethereum).unwrap(), USDC_ETHEREUM);
-
-        let error = chain_usdc(Chain::HyperEvm).unwrap_err().to_string();
-        assert!(
-            error.contains("hyperevm"),
-            "expected the unpinned chain named, got: {error}"
+        assert_eq!(
+            chain_usdc(Chain::HyperEvm).unwrap(),
+            st0x_evm::USDC_HYPEREVM
         );
     }
 

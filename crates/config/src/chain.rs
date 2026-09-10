@@ -530,6 +530,8 @@ pub enum ChainRegistryError {
         chains.iter().map(|chain| chain.as_str()).collect::<Vec<_>>().join(", ")
     )]
     NoPrimaryChain { chains: Vec<Chain> },
+    #[error("{chain} is supported only as a watched secondary, not as the primary chain")]
+    UnsupportedPrimaryChain { chain: Chain },
     #[error(
         "[chains.{chain}] is configured but the secrets file has no [chains.{chain}] \
          entry supplying its rpc_url"
@@ -619,6 +621,12 @@ fn enabled_chains(
             });
         }
     };
+
+    if primary_chain == Chain::HyperEvm {
+        return Err(ChainRegistryError::UnsupportedPrimaryChain {
+            chain: primary_chain,
+        });
+    }
 
     for (chain, config) in &enabled {
         check_enablement(
