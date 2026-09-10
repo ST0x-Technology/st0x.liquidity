@@ -59,7 +59,7 @@ use crate::operator::portfolio_snapshot::{EquityMarkCorrection, set_equity_mark}
 use crate::operator::position::{
     OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
 };
-use crate::operator::process_tx::{self, HedgeDisposition, ProcessTxOutcome};
+use crate::operator::process_tx::{self, HedgeDisposition, ProcessTxOutcome, ProcessTxStores};
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
@@ -1323,6 +1323,10 @@ pub(crate) struct RecoveryHandle {
 pub(crate) struct ProcessTxHandle {
     pub(crate) order_placer: Arc<dyn OrderPlacer>,
     pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
+    /// The conductor's wired stores, so the fill's events reach the running
+    /// reactors (the rebalancing inventory and pending-order gate update at
+    /// once, not on the next inventory poll).
+    pub(crate) stores: ProcessTxStores,
 }
 
 /// Serializes operator transfer-recovery requests so they cannot race through
@@ -2659,6 +2663,7 @@ async fn process_transaction(
         &state.pool,
         &provider,
         &cache,
+        &handle.stores,
         handle.order_placer.clone(),
         Some(&handle.counter_trade_submission_lock),
     )

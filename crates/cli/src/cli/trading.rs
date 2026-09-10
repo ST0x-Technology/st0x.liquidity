@@ -632,12 +632,17 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     cache: &SymbolCache,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
+    // The CLI runs outside the bot: no reactors to reach, so standalone stores.
+    let stores =
+        st0x_hedge::operator::process_tx::ProcessTxStores::standalone(pool, order_placer.clone())
+            .await?;
     let outcome = st0x_hedge::operator::process_tx::process_tx(
         tx_hash,
         ctx,
         pool,
         provider,
         cache,
+        &stores,
         order_placer,
         None,
     )
