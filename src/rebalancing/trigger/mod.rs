@@ -2748,10 +2748,12 @@ pub(crate) enum RecoveryRollback {
     /// failed transfer that had cancelled its in-flight back to available).
     /// Rollback cancels the in-flight back to available.
     CancelInflight,
-    /// The rebuild re-set the in-flight and dropped the timeout tombstone
-    /// (a timed-out transfer). Rollback clears the in-flight again and restores
-    /// the tombstone + suppressed-inflight markers it removed.
+    /// The rebuild re-set the in-flight on the record's `chain` and dropped the
+    /// timeout tombstone (a timed-out transfer). Rollback clears that chain's
+    /// in-flight again and restores the tombstone + suppressed-inflight markers
+    /// it removed.
     RestoreTombstone {
+        chain: Chain,
         timed_out_at: DateTime<Utc>,
         suppressed_at: Option<DateTime<Utc>>,
     },
@@ -5254,6 +5256,7 @@ impl RebalancingService {
                 (
                     Box::new(Inventory::set_inflight(Venue::Hedging, quantity)),
                     RecoveryRollback::RestoreTombstone {
+                        chain: entity.chain(),
                         timed_out_at,
                         suppressed_at,
                     },
@@ -5340,14 +5343,17 @@ impl RebalancingService {
                 .await?;
             }
             RecoveryRollback::RestoreTombstone {
+                chain,
                 timed_out_at,
                 suppressed_at,
             } => {
                 let mut inventory = self.inventory.write().await;
-                *inventory =
-                    inventory
-                        .clone()
-                        .clear_equity_inflight(symbol, Venue::Hedging, Utc::now())?;
+                *inventory = inventory.clone().clear_equity_inflight_at(
+                    symbol,
+                    chain,
+                    Venue::Hedging,
+                    Utc::now(),
+                )?;
                 drop(inventory);
                 self.timed_out_mints.write().await.insert(
                     id.clone(),
@@ -5459,6 +5465,7 @@ impl RebalancingService {
                 .remove(symbol);
 
             RecoveryRollback::RestoreTombstone {
+                chain: entity.chain(),
                 timed_out_at,
                 suppressed_at,
             }
@@ -5497,12 +5504,14 @@ impl RebalancingService {
             // `Start`-based variant is mint-only, so there is no balance to undo.
             RecoveryRollback::TrackingOnly | RecoveryRollback::CancelInflight => {}
             RecoveryRollback::RestoreTombstone {
+                chain,
                 timed_out_at,
                 suppressed_at,
             } => {
                 let mut inventory = self.inventory.write().await;
-                *inventory = inventory.clone().clear_equity_inflight(
+                *inventory = inventory.clone().clear_equity_inflight_at(
                     symbol,
+                    chain,
                     Venue::MarketMaking,
                     Utc::now(),
                 )?;
