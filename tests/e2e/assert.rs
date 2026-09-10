@@ -467,14 +467,28 @@ fn assert_offchain_order_events(expected_positions: &[ExpectedPosition], events:
 /// Computes a truncation-aware epsilon scaled by the number of broker orders.
 /// Each order can lose up to 1e-9 of precision from Alpaca's 9-decimal-place
 /// truncation; cumulative fields need epsilon proportional to order count.
-fn truncation_epsilon(order_count: usize) -> Float {
+pub(crate) fn truncation_epsilon(order_count: usize) -> Float {
     let per_order = Float::parse("0.000000001".to_string()).expect("per_order_epsilon parse");
     let count = Float::parse(order_count.to_string()).expect("order_count parse");
     (per_order * count).expect("epsilon mul")
 }
 
+/// True when `left` and `right` differ by at most `epsilon`.
+///
+/// `assert_decimal_eq!` panics, so pollers waiting for a value to arrive use
+/// this predicate form of the same comparison.
+pub(crate) fn within_epsilon(left: Float, right: Float, epsilon: Float) -> bool {
+    let difference = (left - right).expect("Float subtraction");
+
+    difference
+        .abs()
+        .expect("Float abs")
+        .lte(epsilon)
+        .expect("Float comparison")
+}
+
 /// Counts the number of OffchainOrderEvent::Placed events for a given symbol.
-fn count_offchain_orders_for_symbol(events: &[StoredEvent], symbol: &str) -> usize {
+pub(crate) fn count_offchain_orders_for_symbol(events: &[StoredEvent], symbol: &str) -> usize {
     events
         .iter()
         .filter(|event| {

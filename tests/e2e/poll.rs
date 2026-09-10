@@ -4,6 +4,7 @@
 //! managing the bot task, and `poll_for_events*` for waiting on CQRS
 //! events to appear in the database.
 
+use rain_math_float::Float;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use std::time::Duration;
@@ -20,7 +21,9 @@ use st0x_hedge::{
     run_bot_session_with_injector,
 };
 
-use crate::assert::ExpectedPosition;
+use crate::assert::{
+    ExpectedPosition, count_offchain_orders_for_symbol, truncation_epsilon, within_epsilon,
+};
 
 /// Returns an available TCP port by binding to port 0 and reading the assigned
 /// port. The socket is dropped immediately, freeing the port for the caller.
@@ -347,6 +350,12 @@ pub async fn poll_for_snapshot_field(
 /// fill's hedge is placed, so an empty `pending_offchain_order_id` alone does
 /// not prove the hedge cycle ran. Matching the accumulated fills rules out a
 /// read before a later fill landed; `net == 0` rules out an unfilled hedge.
+///
+/// The quantities match within [`truncation_epsilon`], because the broker
+/// truncates every fill to nine decimal places and an exact comparison would
+/// never see the dust that leaves behind. The tolerance is the same bound the
+/// post-poll assertions use, and stays orders of magnitude below one fill, so
+/// a missing fill still holds the poll.
 pub async fn poll_for_hedge_completion(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
@@ -357,11 +366,16 @@ pub async fn poll_for_hedge_completion(
     let deadline = tokio::time::Instant::now() + timeout;
     let symbol = Symbol::new(expected.symbol.to_owned()).unwrap();
     let context = format!("Position({symbol}) hedge completed");
-    let is_hedged = |position: &Position| {
-        position.accumulated_long == FractionalShares::new(expected.expected_accumulated_long)
-            && position.accumulated_short
-                == FractionalShares::new(expected.expected_accumulated_short)
-            && position.net == FractionalShares::new(expected.expected_net)
+    let is_hedged = |position: &Position, epsilon: Float| {
+        within_epsilon(
+            position.accumulated_long.inner(),
+            expected.expected_accumulated_long,
+            epsilon,
+        ) && within_epsilon(
+            position.accumulated_short.inner(),
+            expected.expected_accumulated_short,
+            epsilon,
+        ) && within_epsilon(position.net.inner(), expected.expected_net, epsilon)
     };
 
     loop {
@@ -378,11 +392,29 @@ pub async fn poll_for_hedge_completion(
         let loaded = Projection::<Position>::sqlite(pool.clone())
             .load(&symbol)
             .await;
+        let hedge_count = fetch_all_domain_events(&pool)
+            .await
+            .map(|events| count_offchain_orders_for_symbol(&events, expected.symbol));
 
         pool.close().await;
 
+        let epsilon = match hedge_count {
+            // A read can race the first placement, so the count floors at the
+            // one hedge every expected position needs.
+            Ok(count) => truncation_epsilon(count.max(1)),
+
+            Err(query_error) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "Timed out after {timeout:?} waiting for {context} \
+                     (hedge count query failed: {query_error})",
+                );
+                continue;
+            }
+        };
+
         match loaded {
-            Ok(Some(position)) if is_hedged(&position) => return,
+            Ok(Some(position)) if is_hedged(&position, epsilon) => return,
 
             Ok(Some(position)) => assert!(
                 tokio::time::Instant::now() < deadline,
@@ -656,6 +688,10 @@ pub async fn fetch_all_domain_events(
 /// Polls the broker mock until the total filled quantity for a symbol/side
 /// reaches the expected amount. This asserts on the actual external
 /// interaction (broker orders) rather than internal event counts.
+///
+/// The total matches within [`truncation_epsilon`] of the filled order count,
+/// since each fill is truncated to the broker's nine decimal places and the
+/// sum carries that dust once per order.
 pub async fn poll_for_broker_fills(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     broker: &st0x_execution::alpaca_broker_api::AlpacaBrokerMock,
@@ -670,17 +706,25 @@ pub async fn poll_for_broker_fills(
     loop {
         sleep_or_crash(bot, &context).await;
 
-        let filled_total: FractionalShares = broker
+        let filled_orders: Vec<_> = broker
             .orders()
-            .iter()
+            .into_iter()
             .filter(|order| {
                 order.symbol == symbol && order.side == side && order.status == OrderStatus::Filled
             })
+            .collect();
+
+        let filled_total = filled_orders
+            .iter()
             .fold(FractionalShares::ZERO, |acc, order| {
                 (acc + FractionalShares::new(order.quantity)).unwrap()
             });
 
-        if filled_total == expected_total {
+        if within_epsilon(
+            filled_total.inner(),
+            expected_total.inner(),
+            truncation_epsilon(filled_orders.len()),
+        ) {
             return;
         }
 

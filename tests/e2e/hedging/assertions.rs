@@ -23,12 +23,16 @@ use st0x_hedge::{ImbalanceThreshold, OperationMode, RebalancingCtx, UsdcRebalanc
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
 pub(crate) use crate::assert::ExpectedPosition;
-use crate::assert::{assert_broker_state, assert_cqrs_state};
+use crate::assert::{
+    assert_broker_state, assert_cqrs_state, count_offchain_orders_for_symbol, truncation_epsilon,
+    within_epsilon,
+};
 pub(crate) use crate::base_chain::TakeDirection;
 use crate::base_chain::{self, TakeOrderResult};
 pub(crate) use crate::poll::{
-    DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_events, poll_for_aggregate_events_containing,
-    poll_for_events, sleep_or_crash, spawn_bot, wait_for_processing,
+    DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_events, fetch_all_domain_events,
+    poll_for_aggregate_events_containing, poll_for_events, sleep_or_crash, spawn_bot,
+    wait_for_processing,
 };
 use crate::rebalancing::assertions::TestWallet;
 pub(crate) use crate::test_infra::TestInfra;
@@ -168,8 +172,12 @@ pub(crate) async fn assert_offchain_order_event_sequence(
     Ok(())
 }
 
-/// Polls until the Position projection for `symbol` has `net == 0`,
+/// Polls until the Position projection for `symbol` has a net of zero,
 /// indicating the position is fully hedged.
+///
+/// Zero is matched within [`truncation_epsilon`] of the placed hedge count:
+/// the broker truncates every fill to nine decimal places, so a hedged
+/// position can settle on dust that an exact comparison never accepts.
 pub(crate) async fn poll_for_hedged_position(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
@@ -192,12 +200,30 @@ pub(crate) async fn poll_for_hedged_position(
             continue;
         };
 
+        let hedge_count = match fetch_all_domain_events(&pool).await {
+            Ok(events) => count_offchain_orders_for_symbol(&events, symbol),
+
+            Err(query_error) => {
+                pool.close().await;
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "Timed out after {timeout:?} waiting for {context} \
+                     (hedge count query failed: {query_error})",
+                );
+                continue;
+            }
+        };
+
+        // A read can race the first placement, so the count floors at the one
+        // hedge a position needs to reach zero.
+        let epsilon = truncation_epsilon(hedge_count.max(1));
+
         let is_hedged = {
             let projection = Projection::<Position>::sqlite(pool.clone());
             match projection.load(&target_symbol).await {
-                Ok(maybe_position) => {
-                    maybe_position.is_some_and(|position| position.net == FractionalShares::ZERO)
-                }
+                Ok(maybe_position) => maybe_position.is_some_and(|position| {
+                    within_epsilon(position.net.inner(), float!(0), epsilon)
+                }),
                 Err(load_error) => panic!("failed to load Position projection: {load_error}"),
             }
         };
