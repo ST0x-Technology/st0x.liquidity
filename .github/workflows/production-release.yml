@@ -1,28 +1,28 @@
 name: production-release
 
-# Production releases that are NOT a new version tag (those are
-# release-tag.yml):
-#   - a merge to master touching config/prod/st0x-hedge.toml is a
-#     CONFIG-ONLY release: the file is validated inside the bot digest LIVE
-#     in production, published as a new liquidity-runtime-config version,
-#     and images.env is rewritten with that CONFIG_VERSION on the same
-#     digests (the VM restarts the stack behind its health gate);
-#   - workflow_dispatch with a version is a ROLLBACK (or re-deploy): images
-#     and config both come from that tag.
-# Both block on the app-deploy PAM grant in t0-liquidity, approved in the
-# GCP console; the justification names the digest and config version swap.
+# THE production release for this repo, and the only way to roll it. One
+# manual action plus the app-deploy PAM approval in t0-liquidity:
+#   Actions -> production-release -> Run workflow
+#     version = vX.Y.Z  : images AND config/prod/st0x-hedge.toml from that
+#                         tag (new version, re-deploy or rollback);
+#     version empty     : CONFIG-ONLY release, config/prod/st0x-hedge.toml
+#                         from master on the digests LIVE in production.
+# Nothing fires on its own any more (until 2026-09-08 a merge touching the
+# prod config requested a grant by itself, and release-tag.yml did the same
+# for every tag; RAI-2266). Either way the file is validated inside the
+# exact bot image it will run on before the grant is requested, published
+# as a liquidity-runtime-config version, and images.env is rewritten with
+# the digests + CONFIG_VERSION once an approver activates the grant; the VM
+# verifies attestations, restarts the stack and publishes deployed.env,
+# which the job waits for.
 
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - config/prod/st0x-hedge.toml
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag to deploy (vX.Y.Z), images and config both from that tag"
-        required: true
+        description: "vX.Y.Z to deploy images and config from that tag; leave empty for a config-only release of config/prod/st0x-hedge.toml from master onto the live images"
+        required: false
+        default: ""
         type: string
 
 concurrency:
