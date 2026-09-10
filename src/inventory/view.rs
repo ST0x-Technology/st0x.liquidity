@@ -167,6 +167,20 @@ where
         + std::fmt::Display
         + std::fmt::Debug,
 {
+    /// Available and inflight totalled over every chain slot: the bot's
+    /// onchain holding of this asset is what all its chains hold together,
+    /// and a display that named one chain would understate the rest.
+    fn onchain_totals(&self) -> Result<(T, T), FloatError> {
+        self.onchain
+            .values()
+            .try_fold((T::ZERO, T::ZERO), |(available, inflight), balance| {
+                Ok((
+                    (available + balance.available())?,
+                    (inflight + balance.inflight())?,
+                ))
+            })
+    }
+
     fn has_inflight(&self) -> Result<bool, FloatError> {
         for balance in self.onchain.values() {
             if balance.has_inflight()? {
@@ -998,8 +1012,10 @@ impl InventoryView {
         alpaca_to_base_usdc_capacity(self.withdrawable_cash_cents, reserved)
     }
 
-    /// Converts the in-memory inventory view to a DTO for dashboard serialization.
-    pub(crate) fn to_dto(&self) -> st0x_dto::Inventory {
+    /// Converts the in-memory inventory view to a DTO for dashboard
+    /// serialization. Fallible because totalling each asset's per-chain
+    /// onchain slots is `Float` arithmetic.
+    pub(crate) fn to_dto(&self) -> Result<st0x_dto::Inventory, InventoryViewError> {
         let per_symbol = self
             .equities
             .keys()
@@ -1008,10 +1024,10 @@ impl InventoryView {
             .sorted()
             .map(|symbol| {
                 let inventory = self.equities.get(symbol);
-                let (onchain_available, onchain_inflight) = inventory
-                    .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
-                        venue_balances(item.onchain.get(&self.trading_chain).copied())
-                    });
+                let (onchain_available, onchain_inflight) = inventory.map_or(
+                    Ok((FractionalShares::ZERO, FractionalShares::ZERO)),
+                    |item| item.onchain_totals(),
+                )?;
 
                 let (offchain_available, offchain_inflight) = inventory
                     .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
@@ -1029,19 +1045,18 @@ impl InventoryView {
                         .map_or(FractionalShares::ZERO, |entry| entry.amount),
                 };
 
-                SymbolInventory {
+                Ok(SymbolInventory {
                     symbol: symbol.clone(),
                     onchain_available,
                     onchain_inflight,
                     offchain_available,
                     offchain_inflight,
                     inflight_equity,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, InventoryViewError>>()?;
 
-        let (usdc_onchain_available, usdc_onchain_inflight) =
-            venue_balances(self.usdc.onchain.get(&self.trading_chain).copied());
+        let (usdc_onchain_available, usdc_onchain_inflight) = self.usdc.onchain_totals()?;
 
         let (usdc_offchain_available, usdc_offchain_inflight) = venue_balances(self.usdc.offchain);
 
@@ -1060,7 +1075,7 @@ impl InventoryView {
                 .map(|entry| entry.amount),
         };
 
-        st0x_dto::Inventory {
+        Ok(st0x_dto::Inventory {
             per_symbol,
             usdc: UsdcInventory {
                 onchain_available: usdc_onchain_available,
@@ -1072,7 +1087,7 @@ impl InventoryView {
                 alpaca_usdc: self.alpaca_usdc,
                 inflight_cash,
             },
-        }
+        })
     }
 
     /// Extracts a flat list of observed balances for the daily portfolio
@@ -5850,7 +5865,7 @@ mod tests {
             .apply_snapshot_event(&usdc_on(Chain::Ethereum, 50_000), now)
             .unwrap();
 
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
 
         assert_eq!(dto.per_symbol.len(), 1);
         assert_eq!(dto.per_symbol[0].onchain_available, shares(57));
@@ -5867,7 +5882,7 @@ mod tests {
             .with_equity(aapl.clone(), shares(100), shares(50))
             .with_usdc(Usdc::new(float!(10000)), Usdc::new(float!(5000)));
 
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
 
         assert_eq!(dto.per_symbol.len(), 1);
 
@@ -5924,7 +5939,7 @@ mod tests {
             trading_chain: Chain::Base,
         };
 
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
 
         let tsla_dto = &dto.per_symbol[0];
         assert_eq!(
@@ -5989,7 +6004,7 @@ mod tests {
             trading_chain: Chain::Base,
         };
 
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
 
         let spy_dto = &dto.per_symbol[0];
         assert_eq!(spy_dto.onchain_available, FractionalShares::new(float!(75)));
@@ -6020,7 +6035,7 @@ mod tests {
                 fetched_at,
             );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
 
         assert_eq!(
             dto.usdc.inflight_cash.ethereum_wallet,
@@ -6036,14 +6051,14 @@ mod tests {
             ..InventoryView::default()
         };
 
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
 
         assert_eq!(dto.usdc.withdrawable_cash, Some(Usdc::new(float!(32000))));
     }
 
     #[test]
     fn to_dto_withdrawable_cash_is_none_when_broker_omitted_field() {
-        let dto = InventoryView::default().to_dto();
+        let dto = InventoryView::default().to_dto().unwrap();
 
         assert_eq!(dto.usdc.withdrawable_cash, None);
     }
@@ -6053,7 +6068,7 @@ mod tests {
     /// "observed as zero".
     #[test]
     fn to_dto_inflight_cash_is_none_for_unobserved_locations() {
-        let dto = InventoryView::default().to_dto();
+        let dto = InventoryView::default().to_dto().unwrap();
 
         assert_eq!(dto.usdc.inflight_cash.ethereum_wallet, None);
         assert_eq!(dto.usdc.inflight_cash.base_wallet, None);
@@ -6073,7 +6088,8 @@ mod tests {
                 now,
             )
             .unwrap()
-            .to_dto();
+            .to_dto()
+            .unwrap();
 
         assert_eq!(
             dto.usdc.alpaca_usdc,
@@ -6098,7 +6114,8 @@ mod tests {
                 reason,
             )
             .unwrap()
-            .to_dto();
+            .to_dto()
+            .unwrap();
 
         assert_eq!(
             dto.usdc.alpaca_usdc,
@@ -6131,7 +6148,7 @@ mod tests {
                 fetched_at,
             );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
         let aapl_dto = &dto.per_symbol[0];
 
         assert_eq!(aapl_dto.symbol, aapl);
@@ -6153,7 +6170,7 @@ mod tests {
             fetched_at,
         );
 
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
         let aapl_dto = &dto.per_symbol[0];
 
         assert_eq!(aapl_dto.symbol, aapl);
@@ -6184,7 +6201,7 @@ mod tests {
             .unwrap();
 
         // Verify inflight is set in DTO
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
         let aapl = &dto.per_symbol[0];
         assert_eq!(
             aapl.onchain_inflight, transfer_quantity,
@@ -6199,7 +6216,7 @@ mod tests {
 
         // Inflight MUST still be present — the polling snapshot
         // should not clear inflight set by the transfer trigger.
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
         let aapl = &dto.per_symbol[0];
         assert_eq!(
             aapl.onchain_inflight, transfer_quantity,
@@ -6234,7 +6251,7 @@ mod tests {
             )
             .unwrap();
 
-        let dto = view.to_dto();
+        let dto = view.to_dto().unwrap();
         let aapl = &dto.per_symbol[0];
         assert_eq!(
             aapl.onchain_inflight, transfer_quantity,
@@ -6502,7 +6519,7 @@ mod tests {
         fn set_inflight_cash_keeps_freshest_per_location(
             calls in prop::collection::vec(arb_call(), 0..16),
         ) {
-            let dto = apply_calls(&calls).to_dto();
+            let dto = apply_calls(&calls).to_dto().unwrap();
 
             for location in LOCATIONS {
                 let expected = calls
@@ -6531,7 +6548,7 @@ mod tests {
                 call.location = target;
             }
 
-            let dto = apply_calls(&calls).to_dto();
+            let dto = apply_calls(&calls).to_dto().unwrap();
             prop_assert_eq!(dto_slot(&dto, untouched), None);
         }
 
@@ -6565,7 +6582,7 @@ mod tests {
             calls in prop::collection::vec(arb_call(), 0..16),
         ) {
             let view = apply_calls(&calls);
-            let dto = view.to_dto();
+            let dto = view.to_dto().unwrap();
 
             for location in LOCATIONS {
                 prop_assert_eq!(dto_slot(&dto, location), view.inflight_cash_at(location));

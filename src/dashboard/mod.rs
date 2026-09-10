@@ -10,7 +10,7 @@ use futures_util::stream::{SplitSink, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
-use tracing::{info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use st0x_config::{ExecutionThreshold, OperationMode};
 use st0x_dto::{
@@ -253,7 +253,19 @@ async fn send_initial_state(
     state: &AppState,
     trade_protocol: TradeProtocol,
 ) -> bool {
-    let inventory_dto = state.inventory.read().await.to_dto();
+    // Without inventory the initial frame would misstate the book, so the
+    // socket is closed and the client retries rather than shown a gap.
+    let inventory_dto = match state.inventory.read().await.to_dto() {
+        Ok(inventory_dto) => inventory_dto,
+        Err(error) => {
+            error!(
+                target: "dashboard",
+                %error,
+                "Failed to render inventory for the initial dashboard frame"
+            );
+            return false;
+        }
+    };
     let transfers = transfer_loader::load_transfers(&state.pool).await;
     let mut warnings = transfers.warnings;
     let trades = match query_trades(&state.pool, &TradeQuery::newest(trade_protocol)).await {
