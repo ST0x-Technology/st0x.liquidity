@@ -2989,6 +2989,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             deps.inventory.as_ref(),
             built.mint.clone(),
             built.redemption.clone(),
+            &equity_transfer_services,
             &mut resume_tokenization_queue,
         )
         .await?;
@@ -3203,12 +3204,32 @@ async fn recover_stuck_redemptions(
     Ok(())
 }
 
+/// An unfinished equity transfer recorded on a chain this configuration
+/// builds no equity services for. Every resume attempt would fail on the
+/// missing entry, so the transfer would sit half-done forever.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the unfinished equity transfer {transfer} ({symbol}) is recorded on {chain}, which \
+     rebalances no equity under this configuration and so gets no transfer services: it \
+     could never finish. Re-enable rebalancing for one of {chain}'s equities until the \
+     transfer completes, or resolve the transfer with the CLI"
+)]
+struct TransferStrandedByChainServices {
+    chain: Chain,
+    transfer: ResumeTokenizationTarget,
+    symbol: Symbol,
+}
+
+/// Queues one resume job per interrupted mint and redemption. A transfer
+/// whose recorded chain lost its equity services refuses startup instead:
+/// queueing a resume that can only fail would strand it silently.
 async fn recover_interrupted_tokenization_aggregates(
     pool: &SqlitePool,
     rebalancing_service: &RebalancingService,
     inventory: &BroadcastingInventory,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
+    equity_services: &EquityTransferServices,
     resume_queue: &mut ResumeTokenizationJobQueue,
 ) -> anyhow::Result<()> {
     // First promote any Running/Queued orphans (from a previous process that
@@ -3272,6 +3293,15 @@ async fn recover_interrupted_tokenization_aggregates(
             ));
         };
 
+        if !equity_services.chains.contains_key(&mint.chain()) {
+            return Err(TransferStrandedByChainServices {
+                chain: mint.chain(),
+                transfer: ResumeTokenizationTarget::Mint(mint_id.clone()),
+                symbol: mint.symbol().clone(),
+            }
+            .into());
+        }
+
         rebalancing_service
             .recover_mint_state(mint_id, &mint)
             .await?;
@@ -3308,6 +3338,15 @@ async fn recover_interrupted_tokenization_aggregates(
                 "Interrupted redemption aggregate {redemption_id} missing from store"
             ));
         };
+
+        if !equity_services.chains.contains_key(&redemption.chain()) {
+            return Err(TransferStrandedByChainServices {
+                chain: redemption.chain(),
+                transfer: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
+                symbol: redemption.symbol().clone(),
+            }
+            .into());
+        }
 
         rebalancing_service
             .recover_redemption_state(redemption_id, &redemption)
@@ -6657,6 +6696,7 @@ mod tests {
                 inventory.as_ref(),
                 mint_store,
                 redemption_store,
+                &services,
                 &mut resume_queue,
             ),
         )
@@ -6751,6 +6791,7 @@ mod tests {
                 pool.clone(),
                 services.clone(),
             )),
+            &services,
             &mut resume_queue,
         )
         .await
@@ -6775,6 +6816,7 @@ mod tests {
                 pool.clone(),
                 services.clone(),
             )),
+            &services,
             &mut resume_queue,
         )
         .await
@@ -6827,7 +6869,11 @@ mod tests {
                 pool.clone(),
                 services.clone(),
             )),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), services)),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &services,
             &mut resume_queue,
         )
         .await
@@ -6937,7 +6983,11 @@ mod tests {
                 pool.clone(),
                 services.clone(),
             )),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), services)),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &services,
             &mut resume_queue,
         )
         .await
@@ -7017,7 +7067,11 @@ mod tests {
                 pool.clone(),
                 services.clone(),
             )),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), services)),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &services,
             &mut resume_queue,
         )
         .await
@@ -7183,7 +7237,11 @@ mod tests {
             &rebalancing_service,
             inventory.as_ref(),
             mint_store,
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), services)),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &services,
             &mut resume_queue,
         )
         .await
@@ -7250,7 +7308,11 @@ mod tests {
                 pool.clone(),
                 services.clone(),
             )),
-            Arc::new(test_store::<EquityRedemption>(pool.clone(), services)),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &services,
             &mut resume_queue,
         )
         .await
@@ -7335,8 +7397,9 @@ mod tests {
             )),
             Arc::new(test_store::<EquityRedemption>(
                 fixture.pool.clone(),
-                fixture.services,
+                fixture.services.clone(),
             )),
+            &fixture.services,
             &mut fixture.resume_queue,
         )
         .await
@@ -7425,6 +7488,7 @@ mod tests {
                 fixture.pool.clone(),
                 fixture.services.clone(),
             )),
+            &fixture.services,
             &mut fixture.resume_queue,
         )
         .await
@@ -7434,10 +7498,10 @@ mod tests {
             error.to_string(),
             format!(
                 "the unfinished equity transfer redemption {stranded_id} (AAPL) is recorded on \
-                 Ethereum, which rebalances no equity under this configuration and so gets no \
+                 ethereum, which rebalances no equity under this configuration and so gets no \
                  transfer services: it could never finish. Re-enable rebalancing for one of \
-                 Ethereum's equities until the transfer completes, or resolve the transfer with \
-                 the CLI"
+                 ethereum's equities until the transfer completes, or resolve the transfer \
+                 with the CLI"
             )
         );
     }
@@ -7480,6 +7544,7 @@ mod tests {
                 pool.clone(),
                 services.clone(),
             )),
+            &services,
             &mut resume_queue,
         )
         .await
@@ -7508,6 +7573,7 @@ mod tests {
                 pool.clone(),
                 services.clone(),
             )),
+            &services,
             &mut resume_queue,
         )
         .await
@@ -7634,6 +7700,7 @@ mod tests {
             inventory.as_ref(),
             mint_store,
             redemption_store,
+            &services,
             &mut resume_queue,
         )
         .await
@@ -7727,6 +7794,7 @@ mod tests {
             inventory2.as_ref(),
             mint_store2,
             redemption_store2,
+            &services2,
             &mut resume_queue2,
         )
         .await
