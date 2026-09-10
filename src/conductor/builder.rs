@@ -180,16 +180,18 @@ struct ConfiguredChainVaults {
 /// Equity symbols the portfolio treats as configured. Shared with the CLI's
 /// snapshot-mark repair so the two cannot drift on what "configured" means.
 pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
-    ctx.chains
-        .primary()
-        .assets
+    chain_equity_symbols(&ctx.chains.primary().assets)
+}
+
+/// The equities one chain operates: either switch on counts, both off does
+/// not. A chain lists its own, so a symbol traded on one chain alone is
+/// required there and nowhere else.
+fn chain_equity_symbols(assets: &st0x_config::ChainAssets) -> HashSet<Symbol> {
+    assets
         .equities
         .symbols
         .keys()
-        .filter(|symbol| {
-            ctx.chains.primary().assets.is_trading_enabled(symbol)
-                || ctx.chains.primary().assets.is_rebalancing_enabled(symbol)
-        })
+        .filter(|symbol| assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol))
         .cloned()
         .collect()
 }
@@ -199,15 +201,18 @@ pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
 /// assets table declares, so the gate demands what the inventory poller can
 /// actually stamp for that chain and nothing more.
 fn market_making_slots(ctx: &Ctx) -> BTreeMap<Chain, MarketMakingSlots> {
-    let primary = ctx.chains.primary();
-
-    BTreeMap::from([(
-        primary.chain,
-        MarketMakingSlots {
-            equity_symbols: configured_equity_symbols(ctx),
-            usdc_tracking_enabled: primary.assets.cash.is_some(),
-        },
-    )])
+    ctx.chains
+        .watched()
+        .map(|watched| {
+            (
+                watched.chain,
+                MarketMakingSlots {
+                    equity_symbols: chain_equity_symbols(&watched.assets),
+                    usdc_tracking_enabled: watched.assets.cash.is_some(),
+                },
+            )
+        })
+        .collect()
 }
 
 fn configured_chain_vaults(watched: &st0x_config::TradingChain) -> ConfiguredChainVaults {

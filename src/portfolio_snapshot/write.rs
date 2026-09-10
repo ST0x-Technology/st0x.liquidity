@@ -1321,6 +1321,55 @@ mod tests {
         Arc::new(BroadcastingInventory::new(inventory, sender))
     }
 
+    /// The capture must wait for every chain the poller reads, so each
+    /// watched chain's own market-making slots are required -- and only the
+    /// assets that chain declares.
+    #[tokio::test]
+    async fn required_slots_cover_each_watched_chains_market_making_slots() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let nvda = Symbol::new("NVDA").unwrap();
+        let (mut ctx, _position) = build_ctx(
+            pool,
+            apalis_pool,
+            InventoryView::default(),
+            HashSet::from([aapl()]),
+            true,
+            false,
+            None,
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::from([nvda.clone()]),
+                usdc_tracking_enabled: false,
+            },
+        );
+
+        let slots: HashSet<_> = required_slots(&ctx).collect();
+
+        assert_eq!(
+            slots,
+            HashSet::from([
+                (
+                    PortfolioLocation::MarketMaking(Chain::Base),
+                    PortfolioAsset::Equity(aapl())
+                ),
+                (
+                    PortfolioLocation::MarketMaking(Chain::Base),
+                    PortfolioAsset::Usdc
+                ),
+                (
+                    PortfolioLocation::MarketMaking(Chain::Ethereum),
+                    PortfolioAsset::Equity(nvda)
+                ),
+                (PortfolioLocation::Hedging, PortfolioAsset::Equity(aapl())),
+                (PortfolioLocation::Hedging, PortfolioAsset::Usdc),
+            ]),
+            "each watched chain gates on its own market-making slots"
+        );
+    }
+
     async fn build_ctx(
         pool: SqlitePool,
         apalis_pool: apalis_sqlite::SqlitePool,
