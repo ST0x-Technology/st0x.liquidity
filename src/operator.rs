@@ -5,9 +5,10 @@
 //! implementation modules themselves private.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use st0x_execution::Symbol;
+use st0x_execution::{FractionalShares, Symbol};
 
 use crate::offchain::order::OffchainOrderId;
+use crate::onchain_trade::OnChainTradeId;
 
 /// A caller-facing reason an operator recovery command refused to apply, each
 /// variant carrying the typed context its message renders.
@@ -101,6 +102,33 @@ pub enum RejectionReason {
          it still holds no executed shares -- re-run the release."
     )]
     OffchainOrderChangedConcurrently { offchain_order_id: OffchainOrderId },
+    #[error("Fill {trade_id}: missing block_number, cannot witness fill")]
+    FillMissingBlockNumber { trade_id: OnChainTradeId },
+    #[error(
+        "existing pending offchain order {offchain_order_id} for {symbol} is still Pending \
+         before placement; refusing to clear the position claim"
+    )]
+    OffchainOrderStillPendingBeforePlacement {
+        offchain_order_id: OffchainOrderId,
+        symbol: Symbol,
+    },
+    #[error(
+        "offchain order {offchain_order_id} for {symbol} is in an unexpected post-placement \
+         state; refusing to clear the position claim"
+    )]
+    OffchainOrderUnexpectedPostPlacementState {
+        offchain_order_id: OffchainOrderId,
+        symbol: Symbol,
+    },
+    #[error(
+        "offchain order {offchain_order_id} for {symbol} has {shares_filled} filled shares \
+         without an average price; refusing to clear the position claim"
+    )]
+    OffchainOrderUnpricedFill {
+        offchain_order_id: OffchainOrderId,
+        symbol: Symbol,
+        shares_filled: FractionalShares,
+    },
 }
 
 /// The failure of a shared operator recovery command, letting a caller-facing
@@ -1456,6 +1484,7 @@ pub mod process_tx {
 
     use alloy::primitives::TxHash;
     use alloy::providers::Provider;
+    use anyhow::Context;
     use sqlx::SqlitePool;
     use tokio::sync::Mutex;
     use tracing::{error, info};
@@ -1482,7 +1511,7 @@ pub mod process_tx {
     use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
     use crate::position::{AnchorDisposition, Position, PositionCommand};
 
-    use super::OperatorError;
+    use super::{OperatorError, RejectionReason};
 
     /// The state of a hedge order after (attempted) broker placement, or of an
     /// existing pending hedge found before placement.
@@ -1558,9 +1587,7 @@ pub mod process_tx {
         match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await
         {
             Ok(Some(onchain_trade)) => {
-                process_found_trade(onchain_trade, ctx, pool, order_placer, submission_lock)
-                    .await
-                    .map_err(OperatorError::Operational)
+                process_found_trade(onchain_trade, ctx, pool, order_placer, submission_lock).await
             }
             Ok(None) => Ok(ProcessTxOutcome::NoTradeableEvents),
             Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(_))) => {
@@ -1576,7 +1603,7 @@ pub mod process_tx {
         pool: &SqlitePool,
         order_placer: Arc<dyn OrderPlacer>,
         submission_lock: Option<&Mutex<()>>,
-    ) -> anyhow::Result<ProcessTxOutcome> {
+    ) -> Result<ProcessTxOutcome, OperatorError> {
         let trade_id = OnChainTradeId::new(
             onchain_trade.chain,
             onchain_trade.tx_hash,
@@ -1585,16 +1612,19 @@ pub mod process_tx {
 
         let (onchain_trade_store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
-            .await?;
+            .await
+            .context("failed to build onchain trade store")?;
         let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
-            .await?;
+            .await
+            .context("failed to build position store")?;
         let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
             .build(order_placer.clone())
-            .await?;
+            .await
+            .context("failed to build offchain order store")?;
 
         let Some(block_number) = onchain_trade.block_number else {
-            anyhow::bail!("Fill {trade_id}: missing block_number, cannot witness fill");
+            return Err(RejectionReason::FillMissingBlockNumber { trade_id }.into());
         };
 
         let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
@@ -1605,7 +1635,8 @@ pub mod process_tx {
             block_number,
             ctx.execution_threshold,
         )
-        .await?
+        .await
+        .context("failed to account for the onchain fill")?
         else {
             return Ok(ProcessTxOutcome::AlreadyAccounted);
         };
@@ -1657,7 +1688,8 @@ pub mod process_tx {
             &ctx.assets,
             trading_enabled,
         )
-        .await?
+        .await
+        .context("failed to check execution readiness")?
         else {
             mark_and_settle_fill(
                 &onchain_trade_store,
@@ -1682,7 +1714,8 @@ pub mod process_tx {
                     "Failed to load position for the idempotency anchor; refusing \
                      placement until it can be read"
                 );
-            })?
+            })
+            .context("failed to load position for the idempotency anchor")?
             .and_then(|position| position.last_failed_offchain_order_id);
 
         // Serialize the aggregate claim and the broker placement against the
@@ -1724,7 +1757,7 @@ pub mod process_tx {
                     symbol: params.symbol.clone(),
                 });
             }
-            Err(error) => return Err(anyhow::Error::new(error)),
+            Err(error) => return Err(OperatorError::Operational(anyhow::Error::new(error))),
         }
 
         let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
@@ -1741,7 +1774,8 @@ pub mod process_tx {
                 client_order_id,
             ),
         )
-        .await?;
+        .await
+        .context("failed to place the offchain order at the broker")?;
 
         let disposition = reconcile_post_place_state(
             &offchain_order_store,
@@ -1787,8 +1821,12 @@ pub mod process_tx {
         offchain_order_store: &Store<OffchainOrder>,
         position_store: &Store<Position>,
         symbol: &Symbol,
-    ) -> anyhow::Result<Option<HedgeDisposition>> {
-        let Some(position) = position_store.load(symbol).await? else {
+    ) -> Result<Option<HedgeDisposition>, OperatorError> {
+        let Some(position) = position_store
+            .load(symbol)
+            .await
+            .context("failed to load position")?
+        else {
             return Ok(None);
         };
         let Some(offchain_order_id) = position.pending_offchain_order_id else {
@@ -1804,7 +1842,8 @@ pub mod process_tx {
                     %error,
                     "Failed to load existing pending offchain order; cannot safely acknowledge fill"
                 );
-            })?;
+            })
+            .context("failed to load existing pending offchain order")?;
         reconcile_offchain_order_state(
             loaded_order,
             position_store,
@@ -1824,7 +1863,7 @@ pub mod process_tx {
         position_store: &Store<Position>,
         symbol: &Symbol,
         offchain_order_id: OffchainOrderId,
-    ) -> anyhow::Result<HedgeDisposition> {
+    ) -> Result<HedgeDisposition, OperatorError> {
         let loaded_order = offchain_order_store
             .load(&offchain_order_id)
             .await
@@ -1835,7 +1874,8 @@ pub mod process_tx {
                     %error,
                     "Failed to load offchain order after Place; cannot determine post-broker state"
                 );
-            })?;
+            })
+            .context("failed to load offchain order after Place")?;
         reconcile_offchain_order_state(
             loaded_order,
             position_store,
@@ -1864,7 +1904,7 @@ pub mod process_tx {
         symbol: &Symbol,
         offchain_order_id: OffchainOrderId,
         context: PlacementContext,
-    ) -> anyhow::Result<HedgeDisposition> {
+    ) -> Result<HedgeDisposition, OperatorError> {
         match loaded_order {
             Some(OffchainOrder::Failed { error, .. }) => {
                 // Broker placement failed: clear pending_offchain_order_id so the
@@ -1880,7 +1920,8 @@ pub mod process_tx {
                             anchor: AnchorDisposition::Preserve,
                         },
                     )
-                    .await?;
+                    .await
+                    .context("failed to clear the failed offchain order from the position")?;
                 Ok(HedgeDisposition::ClearedForRetry)
             }
             Some(
@@ -1904,18 +1945,25 @@ pub mod process_tx {
                             anchor: AnchorDisposition::Preserve,
                         },
                     )
-                    .await?;
+                    .await
+                    .context("failed to clear the missing offchain order from the position")?;
                 Ok(HedgeDisposition::ClearedForRetry)
             }
             Some(OffchainOrder::Pending { .. }) => match context {
-                PlacementContext::PrePlacement => anyhow::bail!(
-                    "existing pending offchain order {offchain_order_id} for {symbol} is still \
-                     Pending before placement; refusing to clear the position claim"
-                ),
-                PlacementContext::PostPlacement => anyhow::bail!(
-                    "offchain order {offchain_order_id} for {symbol} is in an unexpected \
-                     post-placement state; refusing to clear the position claim"
-                ),
+                PlacementContext::PrePlacement => {
+                    Err(RejectionReason::OffchainOrderStillPendingBeforePlacement {
+                        offchain_order_id,
+                        symbol: symbol.clone(),
+                    }
+                    .into())
+                }
+                PlacementContext::PostPlacement => {
+                    Err(RejectionReason::OffchainOrderUnexpectedPostPlacementState {
+                        offchain_order_id,
+                        symbol: symbol.clone(),
+                    }
+                    .into())
+                }
             },
             Some(order @ (OffchainOrder::Filled { .. } | OffchainOrder::Cancelled { .. })) => {
                 reconcile_terminal_offchain_order(&order, position_store, symbol, offchain_order_id)
@@ -1929,33 +1977,44 @@ pub mod process_tx {
         position_store: &Store<Position>,
         symbol: &Symbol,
         offchain_order_id: OffchainOrderId,
-    ) -> anyhow::Result<HedgeDisposition> {
+    ) -> Result<HedgeDisposition, OperatorError> {
         let Some(finalization) = terminal_position_finalization(order) else {
-            anyhow::bail!(
+            // Filled and Cancelled orders always classify; reaching here means an
+            // invariant broke, not a state the operator can act on.
+            return Err(OperatorError::Operational(anyhow::anyhow!(
                 "offchain order {offchain_order_id} for {symbol} is terminal but did not \
                  produce a position finalization; refusing to clear the position claim"
-            );
+            )));
         };
 
         let command = match finalization {
-            TerminalPositionFinalization::UnpricedFill { shares_filled } => anyhow::bail!(
-                "offchain order {offchain_order_id} for {symbol} has {shares_filled} filled \
-                 shares without an average price; refusing to clear the position claim"
-            ),
+            TerminalPositionFinalization::UnpricedFill { shares_filled } => {
+                return Err(RejectionReason::OffchainOrderUnpricedFill {
+                    offchain_order_id,
+                    symbol: symbol.clone(),
+                    shares_filled,
+                }
+                .into());
+            }
             finalization => {
                 let Some(command) =
                     position_command_for_finalization(finalization, offchain_order_id)
                 else {
-                    anyhow::bail!(
+                    // Only UnpricedFill maps to no command, and that arm returned
+                    // above; reaching here means an invariant broke.
+                    return Err(OperatorError::Operational(anyhow::anyhow!(
                         "offchain order {offchain_order_id} for {symbol} could not be mapped to a \
                          position finalization command; refusing to clear the position claim"
-                    );
+                    )));
                 };
                 command
             }
         };
 
-        position_store.send(symbol, command).await?;
+        position_store
+            .send(symbol, command)
+            .await
+            .context("failed to finalize the position claim")?;
         Ok(HedgeDisposition::Finalized)
     }
 
@@ -1985,7 +2044,8 @@ pub mod process_tx {
         };
         use crate::offchain::order::{
             CancellationReason, ExecutorOrderPlacer, OffchainOrder, OffchainOrderId,
-            OrderPlacementResult, OrderPlacer, PollOrderStatusJobQueue, noop_order_placer,
+            OrderPlacementResult, OrderPlacer, PollOrderStatusJobQueue, RetainedFill,
+            noop_order_placer,
         };
         use crate::onchain::trade::RaindexTradeEvent;
         use crate::onchain_trade::{
@@ -2001,8 +2061,8 @@ pub mod process_tx {
         use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
         use super::{
-            HedgeDisposition, PlacementContext, ProcessTxOutcome, process_found_trade,
-            reconcile_offchain_order_state, reconcile_post_place_state,
+            HedgeDisposition, OperatorError, PlacementContext, ProcessTxOutcome, RejectionReason,
+            process_found_trade, reconcile_offchain_order_state, reconcile_post_place_state,
         };
 
         fn positive_shares(value: &str) -> Positive<FractionalShares> {
@@ -2462,9 +2522,9 @@ pub mod process_tx {
             );
         }
 
-        /// A new fill with no `block_number` must return an error containing
-        /// "missing block_number" so the operator sees a loud failure rather than
-        /// a silent skip.
+        /// A new fill with no `block_number` must surface as the typed
+        /// `FillMissingBlockNumber` rejection so the operator sees a loud,
+        /// classifiable refusal rather than a silent skip or an opaque 500.
         #[tokio::test]
         async fn process_tx_fails_on_missing_block_number() {
             let pool = setup_test_db().await;
@@ -2479,8 +2539,11 @@ pub mod process_tx {
                 .unwrap_err();
 
             assert!(
-                error.to_string().contains("missing block_number"),
-                "missing block_number must produce an explicit error, got: {error}"
+                matches!(
+                    error,
+                    OperatorError::Rejected(RejectionReason::FillMissingBlockNumber { .. })
+                ),
+                "a fill with no block_number must be a typed rejection, got: {error}"
             );
         }
 
@@ -2506,7 +2569,13 @@ pub mod process_tx {
                 .await
                 .unwrap_err();
 
-            let trade_accounting_error = error
+            let OperatorError::Operational(inner) = &error else {
+                panic!(
+                    "missing block_timestamp is an accounting failure and must stay \
+                     operational, got: {error}"
+                );
+            };
+            let trade_accounting_error = inner
                 .downcast_ref::<TradeAccountingError>()
                 .expect("missing block_timestamp should bubble up as TradeAccountingError");
             assert!(
@@ -3054,15 +3123,9 @@ pub mod process_tx {
 
         #[tokio::test]
         async fn pending_order_refusal_names_the_placement_phase() {
-            for (context, expected_fragment) in [
-                (
-                    PlacementContext::PrePlacement,
-                    "is still Pending before placement",
-                ),
-                (
-                    PlacementContext::PostPlacement,
-                    "unexpected post-placement state",
-                ),
+            for context in [
+                PlacementContext::PrePlacement,
+                PlacementContext::PostPlacement,
             ] {
                 let pool = setup_test_db().await;
                 let symbol = Symbol::new("AAPL").unwrap();
@@ -3094,9 +3157,32 @@ pub mod process_tx {
                 )
                 .await
                 .unwrap_err();
+                let reason = match error {
+                    OperatorError::Rejected(reason) => reason,
+                    other @ OperatorError::Operational(_) => panic!(
+                        "a Pending order must surface as a typed rejection for {context:?}, got: {other}"
+                    ),
+                };
+                let names_phase = match (context, &reason) {
+                    (
+                        PlacementContext::PrePlacement,
+                        RejectionReason::OffchainOrderStillPendingBeforePlacement {
+                            offchain_order_id: id,
+                            symbol: rejected,
+                        },
+                    )
+                    | (
+                        PlacementContext::PostPlacement,
+                        RejectionReason::OffchainOrderUnexpectedPostPlacementState {
+                            offchain_order_id: id,
+                            symbol: rejected,
+                        },
+                    ) => *id == offchain_order_id && *rejected == symbol,
+                    _ => false,
+                };
                 assert!(
-                    error.to_string().contains(expected_fragment),
-                    "the refusal must name the placement phase for {context:?}, got: {error}"
+                    names_phase,
+                    "the rejection must carry the placement phase and the order for {context:?}, got: {reason:?}"
                 );
 
                 let position = position_store
@@ -3110,6 +3196,67 @@ pub mod process_tx {
                     "a refusal must leave the position claim in place for {context:?}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn unpriced_terminal_fill_is_a_typed_rejection_and_keeps_the_claim() {
+            let pool = setup_test_db().await;
+            let symbol = Symbol::new("AAPL").unwrap();
+            let offchain_order_id = OffchainOrderId::new();
+            let block_timestamp = Utc::now();
+            let position_store = seed_position_with_pending_order(
+                &pool,
+                &symbol,
+                offchain_order_id,
+                block_timestamp,
+            )
+            .await;
+            let shares_filled: FractionalShares = "0.5".parse().unwrap();
+            let cancelled_order = OffchainOrder::Cancelled {
+                symbol: symbol.clone(),
+                shares: positive_shares("1"),
+                requested_shares: Some(positive_shares("1")),
+                retained_fill: Some(RetainedFill::Unpriced { shares_filled }),
+                filled_shares: Some(shares_filled),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                executor_order_id: ExecutorOrderId::new("broker-order-id"),
+                reason: CancellationReason::MarketOpenReplacement,
+                placed_at: block_timestamp,
+                cancelled_at: block_timestamp,
+            };
+
+            let error = reconcile_offchain_order_state(
+                Some(cancelled_order),
+                &position_store,
+                &symbol,
+                offchain_order_id,
+                PlacementContext::PrePlacement,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    OperatorError::Rejected(RejectionReason::OffchainOrderUnpricedFill {
+                        offchain_order_id: id,
+                        symbol: rejected,
+                        ..
+                    }) if *id == offchain_order_id && *rejected == symbol
+                ),
+                "an unpriced terminal fill must be a typed rejection carrying the order, got: {error}"
+            );
+
+            let position = position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .expect("position should exist after setup");
+            assert_eq!(
+                position.pending_offchain_order_id,
+                Some(offchain_order_id),
+                "an unpriced fill must leave the position claim in place"
+            );
         }
 
         /// When a second client shares the same pool and witnesses the fill first,
@@ -3712,7 +3859,7 @@ pub mod process_tx {
             // pending hedge (PendingHedgeInFlight / PlacementRejected) or lost the
             // optimistic-concurrency race on the shared Position aggregate
             // (aggregate conflict, retried upstream); never a second placement.
-            let placed = |result: &anyhow::Result<ProcessTxOutcome>| {
+            let placed = |result: &Result<ProcessTxOutcome, OperatorError>| {
                 matches!(result, Ok(ProcessTxOutcome::HedgePlaced { .. }))
             };
             let placed_count = usize::from(placed(&outcome_a)) + usize::from(placed(&outcome_b));
