@@ -665,6 +665,53 @@ mod tests {
         assert_eq!(duration.max_ms, 300);
     }
 
+    /// A secondary chain runs its own fill watcher against its own
+    /// orderbook, so its poll cycles belong in the report's poll health --
+    /// keyed to the primary alone, an outage there would read as healthy.
+    #[tokio::test]
+    async fn poll_health_aggregates_every_watched_chain() {
+        let ethereum_orderbook = address!("0x3333333333333333333333333333333333333333");
+        let pool = setup_test_db().await;
+        let mut chains = base_only();
+        chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ethereum_orderbook)
+                .call(),
+        );
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            ORDERBOOK,
+            timestamp(10),
+            StdDuration::from_millis(100),
+            0,
+            Ok::<(), &Infallible>(()),
+        )
+        .await
+        .unwrap();
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            ethereum_orderbook,
+            timestamp(20),
+            StdDuration::from_millis(400),
+            3,
+            Err(&"secondary rpc unreachable"),
+        )
+        .await
+        .unwrap();
+
+        let telemetry = load_monitor_telemetry(&pool, &range(), &chains)
+            .await
+            .unwrap();
+
+        assert_eq!(telemetry.poll.cycles, 2);
+        assert_eq!(telemetry.poll.errors, 1);
+        assert_eq!(telemetry.poll.skipped_ticks, 3);
+        assert_eq!(telemetry.poll.duration.unwrap().max_ms, 400);
+    }
+
     async fn insert_call(
         pool: &SqlitePool,
         seconds: i64,
