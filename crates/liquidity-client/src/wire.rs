@@ -34,6 +34,12 @@ pub(crate) struct ClearPendingBurnRequest {
     pub(crate) reason: String,
 }
 
+/// Body of `POST /transfers/usdc/{id}/fail`.
+#[derive(Serialize)]
+pub(crate) struct FailUsdcTransferRequest {
+    pub(crate) reason: String,
+}
+
 /// Body of `POST /positions/{symbol}/set`.
 #[derive(Serialize)]
 pub(crate) struct SetPositionRequest {
