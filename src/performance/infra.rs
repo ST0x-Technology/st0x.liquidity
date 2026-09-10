@@ -353,7 +353,9 @@ mod tests {
     }
 
     /// The dashboard's chain discriminator serializes to the wire name
-    /// `st0x_evm::Chain` pins, for every chain the bot can watch.
+    /// `st0x_evm::Chain` pins, for every chain the bot can watch. It lives
+    /// here because the dto crate cannot see `Chain`: the two spellings are
+    /// separately pinned literals, so nothing else catches them drifting.
     #[test]
     fn chain_name_wire_names_match_the_evm_chain_names() {
         for chain in Chain::ALL {
