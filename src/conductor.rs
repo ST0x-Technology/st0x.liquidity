@@ -15247,10 +15247,6 @@ mod tests {
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool, services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(MockVaultLookup::new()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
             services,
             mint_store,
             redemption_store,
