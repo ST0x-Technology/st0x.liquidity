@@ -272,6 +272,13 @@ impl Executor for AlpacaBrokerApi {
         }
     }
 
+    async fn recover_order_by_client_id(
+        &self,
+        order: &MarketOrder,
+    ) -> Result<Option<OrderPlacement<Self::OrderId>>, Self::Error> {
+        super::order::recover_order_by_client_id(&self.client, order).await
+    }
+
     fn to_supported_executor(&self) -> SupportedExecutor {
         SupportedExecutor::AlpacaBrokerApi
     }

@@ -263,6 +263,19 @@ defaults. Ordinary extended-hours orders retain their 300-second timeout, while
 close-flatten orders use the dedicated 60-second timeout and cross progressively
 wider until the session closes.
 
+The optional `[pricing.trading_schedule]` block coordinates flattening with
+pricing's authenticated runtime schedule. Its timing and per-asset scope fields
+are explicit. The [rollout fragments](docs/trading-schedule/) use
+`mode = "observe"`, which leaves order behavior unchanged. Runtime configs omit
+this block until a supporting binary is released. Once separately approved and
+enabled, every actual eligible closure starts flattening at pricing's execution
+cutoff, including overnight closures. Cached earlier boundaries survive outages
+and restarts. Missing schedule evidence uses a configured emergency buffer
+against a trusted broker close without disabling ordinary hedging. QSEP, FTF,
+and CBRS have no pricing registry entries and are isolated in unpriced scopes:
+their fallback is degraded, not a guarantee of schedule coverage. See
+[ADR 0021](adrs/0021-consume-pricing-trading-schedule.md).
+
 Extended-hours limit orders use an ordered reference chain: an optional current
 bid/ask quote source, the broker's **position mark**, then an emergency
 `delayed_sip` quote. The current deployment has no primary quote provider, so

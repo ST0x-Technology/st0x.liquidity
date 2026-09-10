@@ -404,6 +404,17 @@ impl EquityPriceMonitor {
                 match frame {
                     ServerFrame::Price(frame) => self.apply_frame(frame).await,
                     ServerFrame::Error(frame) => self.apply_error(frame).await,
+                    ServerFrame::Halt(frame) => {
+                        if let Some(expected) = self.expected.get(&frame.asset) {
+                            info!(symbol = %expected.symbol, asset = %frame.asset, halted = frame.halted,
+                                "Pricing halt status changed");
+                            if frame.halted {
+                                self.set_unavailable(&expected.symbol).await;
+                            }
+                        } else {
+                            debug!(asset = %frame.asset, "Ignoring halt for an unrequested asset");
+                        }
+                    }
                     ServerFrame::Ping(heartbeat) => {
                         let response = ClientFrame::Pong(PongFrame {
                             ts_unix_ms: heartbeat.ts_unix_ms,
@@ -591,50 +602,38 @@ enum PricingSessionError {
     IdentityTokenStatus(u16),
 }
 
-/// GCE metadata identity endpoint (same seam shape as
-/// `crates/evm/src/gcp_kms_stamper.rs`: the const is the production
-/// base, tests inject a mock server's URL).
-const METADATA_IDENTITY_URL: &str =
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity";
-
 /// Mints a Google ID token for `audience` from the GCE instance metadata
 /// server — the VM's ambient service-account identity, the same
 /// no-stored-credential model as the Turnkey KMS stamper. Only reachable
 /// on GCP by construction; the config layer refuses `gcp_id_token`
 /// without wss, and off-GCP this endpoint simply does not resolve.
 async fn fetch_gcp_identity_token(audience: &str) -> Result<String, PricingSessionError> {
-    fetch_gcp_identity_token_from(METADATA_IDENTITY_URL, audience).await
+    fetch_gcp_identity_token_from(crate::pricing_identity::METADATA_IDENTITY_URL, audience).await
 }
 
 async fn fetch_gcp_identity_token_from(
     base_url: &str,
     audience: &str,
 ) -> Result<String, PricingSessionError> {
-    let url = format!("{base_url}?audience={audience}");
     // no_proxy: the token must travel ONLY the direct link to the
     // metadata server — a proxy honored from HTTP_PROXY/ALL_PROXY env
     // would otherwise see a live credential (review catch). The fixed
     // transport timeout mirrors the KMS stamper's: an implementation
     // detail of a link-local endpoint, not an operational knob.
-    let response = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(PricingSessionError::IdentityToken)?
-        .get(&url)
-        .header("Metadata-Flavor", "Google")
-        .send()
-        .await
-        .map_err(PricingSessionError::IdentityToken)?;
-    if !response.status().is_success() {
-        return Err(PricingSessionError::IdentityTokenStatus(
-            response.status().as_u16(),
-        ));
-    }
-    response
-        .text()
-        .await
-        .map_err(PricingSessionError::IdentityToken)
+    crate::pricing_identity::fetch_identity_from(
+        base_url,
+        audience,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| match error {
+        crate::pricing_identity::PricingIdentityError::Request(source) => {
+            PricingSessionError::IdentityToken(source)
+        }
+        crate::pricing_identity::PricingIdentityError::Status(status) => {
+            PricingSessionError::IdentityTokenStatus(status)
+        }
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -663,7 +662,7 @@ enum InvalidPrice {
 mod tests {
     use alloy::primitives::address;
     use chrono::TimeDelta;
-    use st0x_pricing_types::{ErrorCode, PingFrame, WireAddress, WireFloat};
+    use st0x_pricing_types::{ErrorCode, HaltFrame, PingFrame, WireAddress, WireFloat};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::handshake::server::{
@@ -712,6 +711,12 @@ mod tests {
             quote: WireAddress::from_bytes(USDC_BASE.into_array()),
             rate_base_to_quote: wire_float(bid),
             rate_quote_to_base: wire_float(quote_to_base),
+            underlying_rate_base_to_quote: wire_float(bid),
+            underlying_rate_quote_to_base: wire_float(quote_to_base),
+            nav_ratio: st0x_pricing_types::WireU256::from_bytes(
+                alloy::primitives::U256::from(1_000_000_000_000_000_000_u64).to_be_bytes(),
+            ),
+            execution_deadline_unix_ms: None,
             expiry_unix_ms: (now + TimeDelta::seconds(30)).timestamp_millis(),
             model_version: "test".to_string(),
             source_ts_unix_ms: now.timestamp_millis(),
@@ -746,6 +751,89 @@ mod tests {
             validated_price(&frame(float!(99), float!(0.01), now), &expected(), now).unwrap();
 
         assert_eq!(price.price_usd.format().unwrap(), "99.5");
+    }
+
+    #[tokio::test]
+    async fn halt_invalidates_only_requested_assets_until_a_fresh_price_arrives() {
+        let assets = assets();
+        let store = EquityPriceStore::new(&assets);
+        let (sender, mut receiver) = broadcast::channel(4);
+        let monitor = EquityPriceMonitor::new(
+            PricingCtx::new(Url::parse("ws://localhost").unwrap(), "test".into()).unwrap(),
+            &assets,
+            store.clone(),
+            sender,
+        );
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let mut socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            stream,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let price = frame(float!(100), float!(0.01), Utc::now());
+        monitor.apply_frame(price.clone()).await;
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            Statement::EquityPriceUpdate(EquityPrice {
+                status: EquityPriceStatus::Available { .. },
+                ..
+            })
+        ));
+        for (asset, halted, available, broadcasts) in [
+            ("wtUNKNOWN", true, true, false),
+            ("wtAAPL", true, false, true),
+            ("wtAAPL", true, false, false),
+            ("wtAAPL", false, false, false),
+        ] {
+            let halt = ServerFrame::Halt(HaltFrame {
+                asset: asset.into(),
+                chain_id: price.chain_id,
+                base: price.base,
+                quote: price.quote,
+                halted,
+                reason: None,
+            });
+            monitor
+                .handle_message(&mut socket, Message::binary(encode_frame(&halt).unwrap()))
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    store.snapshot(Utc::now()).await[0].status,
+                    EquityPriceStatus::Available { .. }
+                ),
+                available
+            );
+            if broadcasts {
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    Statement::EquityPriceUpdate(EquityPrice {
+                        status: EquityPriceStatus::Unavailable,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ));
+            }
+        }
+        monitor
+            .apply_frame(frame(float!(100), float!(0.01), Utc::now()))
+            .await;
+        assert!(matches!(
+            store.snapshot(Utc::now()).await[0].status,
+            EquityPriceStatus::Available { .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            Statement::EquityPriceUpdate(EquityPrice {
+                status: EquityPriceStatus::Available { .. },
+                ..
+            })
+        ));
     }
 
     #[test]

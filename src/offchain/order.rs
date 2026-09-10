@@ -39,7 +39,7 @@ use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
@@ -100,6 +100,13 @@ pub enum JobError {
 /// the idempotent placement with the same broker `client_order_id`.
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceOffchainOrderError {
+    #[error("Broker placement deferred; pending intent is retained")]
+    Deferred,
+    #[error("Broker placement admission failed; pending intent is retained")]
+    Admission {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("Offchain order command failed: {0}")]
     Command(#[from] SendError<OffchainOrder>),
     #[error("Broker placement was rate-limited")]
@@ -241,27 +248,43 @@ pub async fn place_offchain_order_at_broker(
         Direction::Sell => "sell",
     };
 
-    let placement = match kind {
-        CounterTradeOrderKind::Market => {
-            let market_order = MarketOrder {
-                symbol,
+    let admission = order_placer
+        .prepare_placement(
+            &MarketOrder {
+                symbol: symbol.clone(),
                 shares,
                 direction,
-                client_order_id,
-            };
-            order_placer.place_market_order(market_order).await
-        }
-        CounterTradeOrderKind::ExtendedHoursLimit { limit_price, .. } => {
-            let limit_order = LimitOrder {
-                symbol,
-                shares,
-                direction,
-                limit_price,
-                extended_hours: true,
-                client_order_id,
-            };
-            order_placer.place_limit_order(limit_order).await
-        }
+                client_order_id: client_order_id.clone(),
+            },
+            &kind,
+        )
+        .await
+        .map_err(|source| PlaceOffchainOrderError::Admission { source })?;
+    let placement = match admission {
+        PlacementAdmission::Deferred => return Err(PlaceOffchainOrderError::Deferred),
+        PlacementAdmission::Recovered(placement) => Ok(placement),
+        PlacementAdmission::New => match kind {
+            CounterTradeOrderKind::Market => {
+                let market_order = MarketOrder {
+                    symbol,
+                    shares,
+                    direction,
+                    client_order_id,
+                };
+                order_placer.place_market_order(market_order).await
+            }
+            CounterTradeOrderKind::ExtendedHoursLimit { limit_price, .. } => {
+                let limit_order = LimitOrder {
+                    symbol,
+                    shares,
+                    direction,
+                    limit_price,
+                    extended_hours: true,
+                    client_order_id,
+                };
+                order_placer.place_limit_order(limit_order).await
+            }
+        },
     };
     let outcome = match placement {
         Ok(result) => {
@@ -2564,6 +2587,13 @@ pub struct OrderPlacementResult {
 /// implementations to be used via `Arc<dyn OrderPlacer>`.
 #[async_trait]
 pub trait OrderPlacer: Send + Sync {
+    async fn prepare_placement(
+        &self,
+        _order: &MarketOrder,
+        _kind: &CounterTradeOrderKind,
+    ) -> Result<PlacementAdmission, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(PlacementAdmission::New)
+    }
     async fn place_market_order(
         &self,
         order: MarketOrder,
@@ -2670,15 +2700,94 @@ pub trait OrderPlacer: Send + Sync {
 
 /// Bridges `Executor` (which has associated types and is not object-safe)
 /// to `OrderPlacer` (object-safe).
-pub(crate) struct ExecutorOrderPlacer<E>(pub E);
+pub(crate) struct ExecutorOrderPlacer<E> {
+    pub(crate) executor: E,
+    pub(crate) close_flatten_policy:
+        Option<crate::trading::offchain::close_flatten::CloseFlattenPolicy>,
+}
+
+pub enum PlacementAdmission {
+    New,
+    Recovered(OrderPlacementResult),
+    Deferred,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Recovered broker order does not match the pending symbol and direction")]
+struct RecoveredOrderMismatch;
+
+#[derive(Debug, Clone, Copy)]
+enum PlacementDeferralReason {
+    Session,
+    BrokerBoundary,
+    ScheduleClosed,
+}
+
+impl PlacementDeferralReason {
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Session => "broker_session",
+            Self::BrokerBoundary => "broker_boundary",
+            Self::ScheduleClosed => "schedule_closed",
+        }
+    }
+}
 
 #[async_trait]
 impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
+    async fn prepare_placement(
+        &self,
+        order: &MarketOrder,
+        kind: &CounterTradeOrderKind,
+    ) -> Result<PlacementAdmission, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(policy) = &self.close_flatten_policy else {
+            return Ok(PlacementAdmission::New);
+        };
+        if !policy.schedule_enabled() {
+            return Ok(PlacementAdmission::New);
+        }
+        if let Some(existing) = self.executor.recover_order_by_client_id(order).await? {
+            if existing.symbol != order.symbol || existing.direction != order.direction {
+                return Err(Box::new(RecoveredOrderMismatch));
+            }
+            return Ok(PlacementAdmission::Recovered(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new(&existing.order_id),
+                placed_shares: existing.shares,
+                is_extended_hours: existing.extended_hours,
+                limit_price: existing.limit_price,
+            }));
+        }
+        let status = self.executor.market_session_status().await?;
+        let eligible = match (status.session, kind) {
+            (MarketSession::Regular, CounterTradeOrderKind::Market)
+            | (MarketSession::Extended, CounterTradeOrderKind::ExtendedHoursLimit { .. }) => true,
+            (MarketSession::Regular, CounterTradeOrderKind::ExtendedHoursLimit { .. })
+            | (MarketSession::Extended, CounterTradeOrderKind::Market)
+            | (
+                MarketSession::Closed,
+                CounterTradeOrderKind::Market | CounterTradeOrderKind::ExtendedHoursLimit { .. },
+            ) => false,
+        };
+        let observed = policy.observe_broker(&order.symbol, status).await;
+        let reason = if !eligible {
+            PlacementDeferralReason::Session
+        } else if !observed {
+            PlacementDeferralReason::BrokerBoundary
+        } else if !policy.allows_new_order(&order.symbol, Utc::now()) {
+            PlacementDeferralReason::ScheduleClosed
+        } else {
+            return Ok(PlacementAdmission::New);
+        };
+        counter!("hedge_placement_deferred_total", "reason" => reason.metric_label()).increment(1);
+        info!(symbol = %order.symbol, client_order_id = %order.client_order_id,
+            reason = reason.metric_label(), "Retaining hedge intent until broker admission permits placement");
+        Ok(PlacementAdmission::Deferred)
+    }
     async fn place_market_order(
         &self,
         order: MarketOrder,
     ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        let placement = self.0.place_market_order(order).await?;
+        let placement = self.executor.place_market_order(order).await?;
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
@@ -2691,7 +2800,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         &self,
         order: LimitOrder,
     ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        let placement = self.0.place_limit_order(order).await?;
+        let placement = self.executor.place_limit_order(order).await?;
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
@@ -2704,8 +2813,8 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         &self,
         executor_order_id: &ExecutorOrderId,
     ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        let order_id = self.0.parse_order_id(executor_order_id.as_ref())?;
-        Ok(self.0.cancel_order(&order_id).await?)
+        let order_id = self.executor.parse_order_id(executor_order_id.as_ref())?;
+        Ok(self.executor.cancel_order(&order_id).await?)
     }
 
     async fn fetch_position_mark(
@@ -2713,21 +2822,21 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         symbol: &Symbol,
     ) -> Result<Option<st0x_execution::Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
     {
-        Ok(self.0.fetch_position_mark(symbol).await?)
+        Ok(self.executor.fetch_position_mark(symbol).await?)
     }
 
     async fn fetch_primary_limit_quote(
         &self,
         symbol: &Symbol,
     ) -> Result<Option<LatestQuote>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.fetch_primary_limit_quote(symbol).await?)
+        Ok(self.executor.fetch_primary_limit_quote(symbol).await?)
     }
 
     async fn fetch_latest_quote(
         &self,
         symbol: &Symbol,
     ) -> Result<Option<LatestQuote>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.fetch_latest_quote(symbol).await?)
+        Ok(self.executor.fetch_latest_quote(symbol).await?)
     }
 
     async fn preflight_counter_trade_at_price(
@@ -2736,7 +2845,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         reference_price: Positive<Usd>,
     ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self
-            .0
+            .executor
             .preflight_counter_trade_at_price(order, reference_price)
             .await?)
     }
@@ -2744,21 +2853,21 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
     async fn market_session(
         &self,
     ) -> Result<st0x_execution::MarketSession, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.market_session().await?)
+        Ok(self.executor.market_session().await?)
     }
 
     async fn market_session_status(
         &self,
     ) -> Result<MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.market_session_status().await?)
+        Ok(self.executor.market_session_status().await?)
     }
 
     async fn get_order_status(
         &self,
         executor_order_id: &ExecutorOrderId,
     ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>> {
-        let order_id = self.0.parse_order_id(executor_order_id.as_ref())?;
-        Ok(self.0.get_order_status(&order_id).await?)
+        let order_id = self.executor.parse_order_id(executor_order_id.as_ref())?;
+        Ok(self.executor.get_order_status(&order_id).await?)
     }
 }
 
@@ -3189,7 +3298,10 @@ mod tests {
             Positive::new(Usd::new(float!(101))).unwrap(),
         )
         .unwrap();
-        let placer = ExecutorOrderPlacer(MockExecutor::new().with_primary_limit_quote(quote));
+        let placer = ExecutorOrderPlacer {
+            executor: MockExecutor::new().with_primary_limit_quote(quote),
+            close_flatten_policy: None,
+        };
 
         assert_eq!(
             placer

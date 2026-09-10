@@ -11,28 +11,18 @@ use crate::{MarketSession, MarketSessionStatus, PostCloseGap};
 
 const NEXT_SESSION_LOOKAHEAD_DAYS: u64 = 14;
 
-/// Response from the Alpaca calendar endpoint
-/// (https://docs.alpaca.markets/reference/getcalendar-1).
+/// Response from Alpaca's Broker API `/v1/calendar` endpoint:
+/// https://docs.alpaca.markets/us/reference/legacycalendar-1
 ///
 /// `date` identifies the trading day the entry describes, so callers can
 /// verify the broker answered for the day they actually queried.
 /// `open`/`close` are the regular trading hours (typically 09:30-16:00 ET).
-/// `session_open`/`session_close` span the full extended session including
-/// pre-market and after-hours (typically 04:00-20:00 ET). Alpaca only allows
-/// `extended_hours: true` on limit orders, not market orders.
-///
-/// CONTRACT RISK: Alpaca's reference does not define `session_open`/
-/// `session_close` semantics, and their observed values have changed over
-/// time (community reports show 07:00/19:00 historically, 04:00/20:00
-/// currently -- forum.alpaca.markets/t/2400). This module assumes they span
-/// exactly the window in which Alpaca accepts `extended_hours: true` limit
-/// orders, i.e. the 4:00-9:30/16:00-20:00 windows described in
-/// https://docs.alpaca.markets/docs/orders-at-alpaca#extended-hours-trading.
-/// If Alpaca redefines the session bounds (e.g. for 24/5 overnight trading),
-/// `Extended` classification may cover times where extended-hours limit
-/// orders are rejected; the failure mode is broker rejections of the hedge
-/// order, retried by the hedge job, not silent misclassification of money
-/// amounts.
+/// The Broker schema defines `session_open`/`session_close` as the session's
+/// opening/closing times in HHMM format (examples 0400/2000). These calendar
+/// bounds do not independently establish per-asset/account order eligibility.
+/// Extended-hours order constraints remain separately governed by
+/// https://docs.alpaca.markets/us/docs/orders-at-alpaca#extended-hours-trading.
+/// The calendar fields alone do not verify eligibility for a future 24/5 profile.
 #[derive(Debug, Clone, Deserialize)]
 struct CalendarDay {
     date: NaiveDate,
@@ -101,6 +91,8 @@ pub(super) async fn market_session_status_at(
 ) -> Result<MarketSessionStatus, AlpacaBrokerApiError> {
     let SessionAndClose {
         session,
+        session_opens_at,
+        regular_session_closes_at,
         extended_session_closes_at,
         today,
     } = session_and_close_at(client, now).await?;
@@ -117,6 +109,8 @@ pub(super) async fn market_session_status_at(
 
     Ok(MarketSessionStatus {
         session,
+        session_opens_at,
+        regular_session_closes_at,
         extended_session_closes_at,
         post_close_gap,
     })
@@ -128,6 +122,8 @@ pub(super) async fn market_session_status_at(
 /// only when the session is Extended.
 struct SessionAndClose {
     session: MarketSession,
+    session_opens_at: Option<DateTime<Utc>>,
+    regular_session_closes_at: Option<DateTime<Utc>>,
     extended_session_closes_at: Option<DateTime<Utc>>,
     /// The queried trading day, in Alpaca's calendar timezone. Threaded back
     /// out so `market_session_status_at` can feed it to
@@ -149,6 +145,8 @@ async fn session_and_close_at(
         debug!("Today is not a trading day");
         return Ok(SessionAndClose {
             session: MarketSession::Closed,
+            session_opens_at: None,
+            regular_session_closes_at: None,
             extended_session_closes_at: None,
             today,
         });
@@ -171,6 +169,8 @@ async fn session_and_close_at(
             );
             return Ok(SessionAndClose {
                 session: MarketSession::Closed,
+                session_opens_at: None,
+                regular_session_closes_at: None,
                 extended_session_closes_at: None,
                 today,
             });
@@ -184,8 +184,7 @@ async fn session_and_close_at(
         Ordering::Equal => {}
     }
 
-    // Detect a silent redefinition of the undocumented session bounds (see
-    // the CONTRACT RISK note on `CalendarDay`). A NARROWED window is the
+    // Detect a change in the returned session bounds. A NARROWED window is the
     // dangerous direction -- fills landing inside the assumed 04:00-20:00
     // extended window but outside Alpaca's would classify Closed and sit
     // unhedged with no broker rejection to surface it -- so warn loudly when
@@ -236,6 +235,11 @@ async fn session_and_close_at(
 
     Ok(SessionAndClose {
         session,
+        session_opens_at: Some(local_market_time_to_utc(
+            today,
+            today_calendar.session_open,
+        )?),
+        regular_session_closes_at: Some(local_market_time_to_utc(today, today_calendar.close)?),
         extended_session_closes_at: Some(extended_session_closes_at),
         today,
     })

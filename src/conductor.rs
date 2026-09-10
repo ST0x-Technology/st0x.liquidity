@@ -171,6 +171,7 @@ pub(crate) struct SupervisorStartupTokens {
     pub(crate) executor_maintenance: StartupToken,
     pub(crate) base_gas_monitor: StartupToken,
     pub(crate) ethereum_gas_monitor: StartupToken,
+    pub(crate) trading_schedule_monitor: StartupToken,
 }
 
 /// Opens an apalis-side pool (sqlx 0.8) against the same database as the
@@ -296,6 +297,7 @@ async fn setup_offchain_order_store<E>(
     position: &Arc<Store<Position>>,
     position_projection: &Arc<Projection<Position>>,
     broadcaster: Arc<Broadcaster>,
+    close_flatten_policy: Option<CloseFlattenPolicy>,
 ) -> anyhow::Result<(Arc<Store<OffchainOrder>>, Arc<Projection<OffchainOrder>>)>
 where
     E: Executor + Clone + Send + Sync + 'static,
@@ -308,7 +310,10 @@ where
     // the broker's own fill timestamp). Do NOT consolidate the two registrations:
     // routing OffchainOrder Filled/Failed here would drop the authoritative
     // broker timestamp.
-    let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
+    let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+        executor: executor.clone(),
+        close_flatten_policy,
+    });
     let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())
             .with(broadcaster)
@@ -832,6 +837,26 @@ pub(crate) struct ServerHandles {
     pub(crate) pnl_ledger: Arc<PnlLedger>,
 }
 
+async fn setup_trading_schedule(
+    ctx: &Ctx,
+    pool: &SqlitePool,
+) -> Result<
+    Option<Arc<crate::trading_schedule::TradingScheduleStore>>,
+    crate::trading_schedule::TradingScheduleError,
+> {
+    match ctx
+        .pricing
+        .as_ref()
+        .and_then(|pricing| pricing.trading_schedule.as_ref())
+    {
+        Some(config) => Ok(Some(Arc::new(
+            crate::trading_schedule::TradingScheduleStore::load(config.clone(), pool.clone())
+                .await?,
+        ))),
+        None => Ok(None),
+    }
+}
+
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -940,12 +965,17 @@ impl Conductor {
         ))
         .await?;
 
+        let trading_schedule = setup_trading_schedule(&ctx, &pool).await?;
+        let startup_policy =
+            CloseFlattenPolicy::from_secs(ctx.extended_hours_close_flatten_window_secs)?
+                .with_schedule(trading_schedule.clone());
         let (offchain_order, offchain_order_projection) = setup_offchain_order_store(
             &pool,
             &executor,
             &position,
             &position_projection,
             dashboard_delivery.broadcaster.clone(),
+            Some(startup_policy),
         )
         .await?;
 
@@ -1000,6 +1030,7 @@ impl Conductor {
         );
 
         let conductor_ctx = builder::ConductorCtx {
+            trading_schedule,
             ctx: ctx.clone(),
             watch_providers,
             poll_freshness,
@@ -3675,7 +3706,7 @@ async fn recover_single_orphaned_order(
                 .and_then(|position| position.last_failed_offchain_order_id);
             let client_order_id = client_order_id_for_placement(order_id, anchor);
 
-            let recovered = place_offchain_order_at_broker(
+            let recovery_result = place_offchain_order_at_broker(
                 offchain_order,
                 order_placer,
                 &order_id,
@@ -3687,7 +3718,12 @@ async fn recover_single_orphaned_order(
                     client_order_id,
                 ),
             )
-            .await?;
+            .await;
+            let recovered = match recovery_result {
+                Ok(recovered) => recovered,
+                Err(crate::offchain::order::PlaceOffchainOrderError::Deferred) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
 
             // The broker rejected the re-drive: clear the position claim. A
             // re-drive that reaches a live broker state needs a `PollOrderStatus`
@@ -4303,7 +4339,9 @@ where
 
     match reconcile_existing_pending_order(base_symbol, cqrs).await? {
         ExistingPendingOrderOutcome::NoPending | ExistingPendingOrderOutcome::Cleared => {}
-        ExistingPendingOrderOutcome::InFlight => return Ok(None),
+        ExistingPendingOrderOutcome::InFlight | ExistingPendingOrderOutcome::Deferred => {
+            return Ok(None);
+        }
     }
 
     let executor_type = executor.to_supported_executor();
@@ -4541,7 +4579,19 @@ async fn resolve_extended_hours_preflight(
         }
     };
     let now = Utc::now();
-    let close_flatten_window = cqrs.close_flatten_policy.active_window(status, now);
+    if !cqrs
+        .close_flatten_policy
+        .observe_broker(&execution.symbol, status)
+        .await
+    {
+        record_scan_skip(&execution.symbol, HedgeScanSkipReason::BrokerBoundary, None);
+        warn!(target: "hedge", symbol = %execution.symbol,
+            "Skipping immediate extended-hours hedge enqueue: cannot persist broker boundary");
+        return None;
+    }
+    let close_flatten_window = cqrs
+        .close_flatten_policy
+        .window_for(&execution.symbol, status, now);
     let reference = match resolve_extended_hours_reference_price(
         cqrs.order_placer.as_ref(),
         &execution.symbol,
@@ -4750,7 +4800,9 @@ async fn place_offchain_order(
         return recover_claimed_offchain_order(execution, cqrs).await;
     }
 
-    execute_create_offchain_order(execution, cqrs, offchain_order_id).await?;
+    if !execute_create_offchain_order(execution, cqrs, offchain_order_id).await? {
+        return Ok(None);
+    }
 
     let loaded = cqrs
         .offchain_order
@@ -4776,6 +4828,7 @@ async fn place_offchain_order(
 enum ExistingPendingOrderOutcome {
     NoPending,
     InFlight,
+    Deferred,
     Cleared,
 }
 
@@ -4803,6 +4856,23 @@ async fn reconcile_existing_pending_order(
                 "Failed to load existing pending offchain order; cannot safely acknowledge fill"
             );
         })?;
+
+    if cqrs.close_flatten_policy.schedule_enabled()
+        && matches!(loaded, Some(OffchainOrder::Pending { .. }))
+    {
+        let _submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+        let recovered = recover_claimed_offchain_order_for_symbol(symbol, cqrs).await?;
+        let retained = cqrs
+            .position
+            .load(symbol)
+            .await?
+            .and_then(|position| position.pending_offchain_order_id);
+        return Ok(match (recovered, retained) {
+            (_, None) => ExistingPendingOrderOutcome::Cleared,
+            (Some(_), Some(_)) => ExistingPendingOrderOutcome::InFlight,
+            (None, Some(_)) => ExistingPendingOrderOutcome::Deferred,
+        });
+    }
 
     match dispatch_post_place_state(loaded, symbol, cqrs, offchain_order_id).await? {
         PostPlaceOutcome::InFlight(_) => Ok(ExistingPendingOrderOutcome::InFlight),
@@ -4832,13 +4902,20 @@ async fn recover_claimed_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
+    recover_claimed_offchain_order_for_symbol(&execution.symbol, cqrs).await
+}
+
+async fn recover_claimed_offchain_order_for_symbol(
+    position_symbol: &Symbol,
+    cqrs: &TradeProcessingCqrs,
+) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
     use OffchainOrder::{
         Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
     };
 
     let Some(pending_id) = cqrs
         .position
-        .load(&execution.symbol)
+        .load(position_symbol)
         .await?
         .and_then(|position| position.pending_offchain_order_id)
     else {
@@ -4847,13 +4924,8 @@ async fn recover_claimed_offchain_order(
 
     let order = cqrs.offchain_order.load(&pending_id).await?;
 
-    if resolve_terminal_claimed_order(
-        &cqrs.position,
-        &execution.symbol,
-        pending_id,
-        order.as_ref(),
-    )
-    .await?
+    if resolve_terminal_claimed_order(&cqrs.position, position_symbol, pending_id, order.as_ref())
+        .await?
     {
         return Ok(None);
     }
@@ -4869,7 +4941,7 @@ async fn recover_claimed_offchain_order(
             .inspect_err(|error| {
                 error!(
                     offchain_order_id = %pending_id,
-                    symbol = %execution.symbol,
+                    symbol = %position_symbol,
                     %error,
                     "Failed to re-enqueue PollOrderStatus for a claimed pending order"
                 );
@@ -4890,7 +4962,7 @@ async fn recover_claimed_offchain_order(
                 .and_then(|position| position.last_failed_offchain_order_id);
             let client_order_id = client_order_id_for_placement(pending_id, anchor);
 
-            let placed = place_offchain_order_at_broker(
+            let placement_result = place_offchain_order_at_broker(
                 &cqrs.offchain_order,
                 cqrs.order_placer.as_ref(),
                 &pending_id,
@@ -4902,9 +4974,14 @@ async fn recover_claimed_offchain_order(
                     client_order_id,
                 ),
             )
-            .await?;
+            .await;
+            let placed = match placement_result {
+                Ok(placed) => placed,
+                Err(crate::offchain::order::PlaceOffchainOrderError::Deferred) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
 
-            match dispatch_post_place_state(placed, &execution.symbol, cqrs, pending_id).await? {
+            match dispatch_post_place_state(placed, position_symbol, cqrs, pending_id).await? {
                 PostPlaceOutcome::InFlight(order_id) | PostPlaceOutcome::Failed(order_id) => {
                     Ok(Some(order_id))
                 }
@@ -5082,7 +5159,7 @@ async fn execute_create_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
-) -> Result<(), TradeAccountingError> {
+) -> Result<bool, TradeAccountingError> {
     // Derive the broker-side client_order_id from the live position aggregate
     // (read after PlaceOffChainOrder claimed it), reusing a prior failed
     // attempt's stashed OffchainOrderId as the idempotency anchor so the broker
@@ -5114,7 +5191,7 @@ async fn execute_create_offchain_order(
     // idempotent re-drive (or startup orphan recovery) reconciles it. Swallowing
     // here would let the caller observe `Pending` and force-fail the position,
     // stranding the live broker order.
-    place_offchain_order_at_broker(
+    let placement = place_offchain_order_at_broker(
         &cqrs.offchain_order,
         cqrs.order_placer.as_ref(),
         &offchain_order_id,
@@ -5126,24 +5203,29 @@ async fn execute_create_offchain_order(
             client_order_id,
         ),
     )
-    .await
-    .inspect(|_| {
-        debug!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            "OffchainOrder placement completed"
-        );
-    })
-    .inspect_err(|error| {
-        error!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            %error,
-            "OffchainOrder placement failed"
-        );
-    })?;
+    .await;
+    let placement = match placement {
+        Err(crate::offchain::order::PlaceOffchainOrderError::Deferred) => return Ok(false),
+        result => result,
+    };
+    placement
+        .inspect(|_| {
+            debug!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "OffchainOrder placement completed"
+            );
+        })
+        .inspect_err(|error| {
+            error!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                %error,
+                "OffchainOrder placement failed"
+            );
+        })?;
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -5971,6 +6053,7 @@ mod tests {
             &position,
             &position_projection,
             broadcaster,
+            None,
         )
         .await
         .unwrap();
@@ -10287,7 +10370,10 @@ mod tests {
             &apalis_pool,
             extended_hours_assets(&symbol),
         );
-        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor.clone()));
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer {
+            executor: executor.clone(),
+            close_flatten_policy: None,
+        });
         let execution = ExecutionCtx {
             symbol,
             direction: Direction::Buy,
@@ -10326,7 +10412,10 @@ mod tests {
             &apalis_pool,
             extended_hours_assets(&symbol),
         );
-        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor));
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer {
+            executor,
+            close_flatten_policy: None,
+        });
         let execution = ExecutionCtx {
             symbol,
             direction: Direction::Buy,
@@ -10371,7 +10460,10 @@ mod tests {
             &apalis_pool,
             extended_hours_assets(&symbol),
         );
-        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor));
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer {
+            executor,
+            close_flatten_policy: None,
+        });
         let execution = ExecutionCtx {
             symbol,
             direction: Direction::Buy,
@@ -10410,7 +10502,10 @@ mod tests {
             &apalis_pool,
             extended_hours_assets(&symbol),
         );
-        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor));
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer {
+            executor,
+            close_flatten_policy: None,
+        });
         let execution = ExecutionCtx {
             symbol,
             direction: Direction::Buy,
@@ -10456,7 +10551,10 @@ mod tests {
             &apalis_pool,
             extended_hours_assets(&symbol),
         );
-        cqrs.order_placer = Arc::new(ExecutorOrderPlacer(executor.clone()));
+        cqrs.order_placer = Arc::new(ExecutorOrderPlacer {
+            executor: executor.clone(),
+            close_flatten_policy: None,
+        });
         let execution = ExecutionCtx {
             symbol,
             direction: Direction::Buy,
@@ -14148,6 +14246,183 @@ mod tests {
         assert_eq!(
             position.last_failed_offchain_order_id, None,
             "cancellation must NOT set the failure/idempotency anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_fill_reconciles_accepted_or_deferred_pending_without_losing_claim() {
+        for accepted in [false, true] {
+            let (pool, apalis_pool) = setup_test_pools().await;
+            let (frameworks, _) = create_cqrs_frameworks(&pool).await;
+            let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
+                &frameworks,
+                &pool,
+                ExecutionThreshold::whole_share(),
+                &apalis_pool,
+            );
+            let config = toml::from_str(
+                r#"
+                mode = "enabled"
+                environment = "staging"
+                poll_interval_secs = 5
+                request_timeout_secs = 3
+                response_freshness_secs = 30
+                calendar_max_age_secs = 7200
+                evidence_clock_skew_secs = 2
+                emergency_buffer_secs = 900
+                [[scopes]]
+                id = "extended"
+                profile_revision = "v1"
+                extended_hours = true
+                assets = ["AAPL"]
+            "#,
+            )
+            .unwrap();
+            let schedule =
+                crate::trading_schedule::TradingScheduleStore::load(config, pool.clone())
+                    .await
+                    .unwrap();
+            let policy = CloseFlattenPolicy::from_secs(900)
+                .unwrap()
+                .with_schedule(Some(Arc::new(schedule)));
+            let symbol = Symbol::new("AAPL").unwrap();
+            let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+            let pending_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+            let mut executor = MockExecutor::new().with_market_session(MarketSession::Extended);
+            if accepted {
+                executor = executor.with_recovered_order(st0x_execution::OrderPlacement {
+                    order_id: "accepted-before-outcome-commit".into(),
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    placed_at: Utc::now(),
+                    extended_hours: true,
+                    limit_price: Some(Positive::new(Usd::new(float!(101))).unwrap()),
+                });
+            }
+            cqrs.order_placer = Arc::new(crate::offchain::order::ExecutorOrderPlacer {
+                executor,
+                close_flatten_policy: Some(policy.clone()),
+            });
+            cqrs.close_flatten_policy = policy;
+            cqrs.offchain_order
+                .send(
+                    &pending_id,
+                    OffchainOrderCommand::Place {
+                        symbol: symbol.clone(),
+                        shares,
+                        direction: Direction::Sell,
+                        executor: st0x_execution::SupportedExecutor::DryRun,
+                        client_order_id: ClientOrderId::from_uuid(pending_id.as_uuid()),
+                        kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                    },
+                )
+                .await
+                .unwrap();
+            for index in [90, 91] {
+                assert_eq!(
+                    process_queued_trade(
+                        &MockExecutor::with_failure("readiness must not run for retained claim"),
+                        &make_trade_event(index),
+                        test_trade_with_amount(float!(1.5), index),
+                        &cqrs,
+                        &assets,
+                        true,
+                    )
+                    .await
+                    .unwrap(),
+                    None
+                );
+            }
+            assert_eq!(
+                cqrs.position
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending_offchain_order_id,
+                Some(pending_id)
+            );
+            let order = cqrs
+                .offchain_order
+                .load(&pending_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if accepted {
+                let OffchainOrder::Submitted {
+                    executor_order_id, ..
+                } = order
+                else {
+                    panic!("accepted order must be adopted");
+                };
+                assert_eq!(
+                    executor_order_id,
+                    ExecutorOrderId::new("accepted-before-outcome-commit")
+                );
+            } else {
+                assert!(matches!(order, OffchainOrder::Pending { .. }));
+            }
+            assert_eq!(
+                pending_job_count::<PollOrderStatus>(&apalis_pool).await,
+                i64::from(accepted)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_reconciliation_without_schedule_preserves_strict_error_and_claim() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) = create_cqrs_frameworks(&pool).await;
+        let (mut cqrs, _) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        cqrs.close_flatten_policy = CloseFlattenPolicy::from_secs(900).unwrap();
+        cqrs.order_placer = Arc::new(crate::offchain::order::ExecutorOrderPlacer {
+            executor: MockExecutor::new(),
+            close_flatten_policy: None,
+        });
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let pending_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+        cqrs.offchain_order
+            .send(
+                &pending_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(pending_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        let Err(error) = reconcile_existing_pending_order(&symbol, &cqrs).await else {
+            panic!("pending order without schedule must retain strict reconciliation error");
+        };
+        assert!(
+            matches!(
+                error,
+                TradeAccountingError::UnexpectedPostPlaceState {
+                    state: OffchainOrder::Pending { .. },
+                    ..
+                }
+            ),
+            "unexpected reconciliation error: {error:?}"
+        );
+        assert_eq!(
+            cqrs.position
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_offchain_order_id,
+            Some(pending_id)
         );
     }
 

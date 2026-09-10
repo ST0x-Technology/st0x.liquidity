@@ -17,6 +17,7 @@ mod pricing;
 mod rebalancing;
 mod telemetry;
 mod threshold;
+mod trading_schedule;
 mod wallet;
 
 pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, GAS_MONITORED_CHAINS};
@@ -48,4 +49,8 @@ pub use telemetry::{
     TelemetryGuard, mk_env_filter, setup_tracing,
 };
 pub use threshold::{ExecutionThreshold, InvalidThresholdError};
+pub use trading_schedule::{
+    TradingScheduleConfig, TradingScheduleConfigError, TradingScheduleEnvironment,
+    TradingScheduleMembershipError, TradingScheduleMode, TradingScheduleScope,
+};
 pub use wallet::{OnchainWalletCtx, SigningChains, WalletCtxError, build_wallet};

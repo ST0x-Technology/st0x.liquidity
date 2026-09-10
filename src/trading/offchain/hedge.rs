@@ -174,7 +174,8 @@ pub(crate) struct HedgeCtx {
 ///
 /// The pair is reserved before delivery so the hedge and position-scan workers
 /// cannot both send it. A failed or timed-out delivery releases the reservation
-/// for the next scan; a successful one keeps it latched until the symbol places.
+/// for the next scan. Abandonment keys clear when the symbol places; residual
+/// exposure clears only when the scan sees zero net exposure or reopened admission.
 ///
 /// Takes the notifier and the dedup set rather than a `HedgeCtx` because the
 /// position scan pages through the same mechanism for a buy it drops before a
@@ -192,6 +193,10 @@ pub(crate) async fn alert_dead_letter(
     if !alerted_dead_letters.lock().await.insert(key.clone()) {
         return;
     }
+    if reason == DeadLetterReason::ResidualAfterClose {
+        error!(target: "operational_alert", alert = true, %symbol, message,
+            "Residual exposure remains after the latched close; reconciliation continues");
+    }
 
     match tokio::time::timeout(DEAD_LETTER_ALERT_TIMEOUT, notifier.notify(message)).await {
         Ok(Ok(())) => {}
@@ -199,7 +204,7 @@ pub(crate) async fn alert_dead_letter(
             alerted_dead_letters.lock().await.remove(&key);
             warn!(
                 target: "hedge", ?error, %symbol,
-                "Failed to deliver hedge dead-letter alert; the next scan re-attempts it"
+                "Failed to deliver hedge alert; the next scan re-attempts it"
             );
         }
         Err(_elapsed) => {
@@ -208,7 +213,7 @@ pub(crate) async fn alert_dead_letter(
                 target: "hedge",
                 %symbol,
                 timeout_secs = DEAD_LETTER_ALERT_TIMEOUT.as_secs(),
-                "Timed out delivering hedge dead-letter alert; the next scan re-attempts it"
+                "Timed out delivering hedge alert; the next scan re-attempts it"
             );
         }
     }
@@ -310,6 +315,21 @@ async fn select_order_kind_for_current_session(
         })?;
     let current_session = status.session;
 
+    if !ctx
+        .close_flatten_policy
+        .observe_broker(symbol, status)
+        .await
+    {
+        return Ok(None);
+    }
+    if !ctx
+        .close_flatten_policy
+        .allows_new_order(symbol, chrono::Utc::now())
+    {
+        info!(%symbol, "Latched broker close reached; retaining exposure for reconciliation");
+        return Ok(None);
+    }
+
     if current_session != enqueued_session {
         info!(
             target: "hedge",
@@ -343,7 +363,7 @@ async fn select_order_kind_for_current_session(
             }
 
             let now = chrono::Utc::now();
-            let close_flatten_window = ctx.close_flatten_policy.active_window(status, now);
+            let close_flatten_window = ctx.close_flatten_policy.window_for(symbol, status, now);
             let close_flatten_active = close_flatten_window.is_some();
 
             if close_flatten_active {
@@ -798,6 +818,8 @@ enum ClaimOutcome {
     /// The order already filled. The hedge happened, so it is the opposite of
     /// an abandonment even though nothing is outstanding at the broker.
     Completed,
+    /// The pending intent remains claimed until broker admission permits it.
+    Deferred,
     /// Nothing is outstanding at the broker: no pending order, one that is
     /// already terminal, or a re-drive the broker rejected (which rolled the
     /// position back). Abandoning here abandons a hedge that was never
@@ -845,25 +867,32 @@ async fn recover_pending_poll_status(
             market_session,
             ..
         }) => {
-            // Must re-wrap: a symbol-scoped variant escaping here would
-            // dead-letter an already-claimed position.
-            let Some(order_kind) = select_order_kind_for_current_session(
-                ctx,
-                &symbol,
-                shares,
-                direction,
-                market_session,
-                SubmittedPricePreflight::SkipForIdempotentRecovery,
-            )
-            .await
-            .map_err(|source| TradeAccountingError::ClaimedHedgeOrderKind {
-                symbol: symbol.clone(),
-                source: ClaimedHedgeOrderKindCause::classify(source),
-            })?
-            else {
-                // The venue closed under the claim, so nothing can be placed
-                // until it reopens.
-                return Ok(ClaimOutcome::NothingClaimed);
+            let order_kind = if ctx.close_flatten_policy.schedule_enabled() {
+                // Pending lacks the original limit. Admission adopts the client ID
+                // first; an absent order can only be re-driven during Regular.
+                CounterTradeOrderKind::Market
+            } else {
+                // Must re-wrap: a symbol-scoped variant escaping here would
+                // dead-letter an already-claimed position.
+                let Some(order_kind) = select_order_kind_for_current_session(
+                    ctx,
+                    &symbol,
+                    shares,
+                    direction,
+                    market_session,
+                    SubmittedPricePreflight::SkipForIdempotentRecovery,
+                )
+                .await
+                .map_err(|source| TradeAccountingError::ClaimedHedgeOrderKind {
+                    symbol: symbol.clone(),
+                    source: ClaimedHedgeOrderKindCause::classify(source),
+                })?
+                else {
+                    // The venue closed under the claim, so nothing can be placed
+                    // until it reopens.
+                    return Ok(ClaimOutcome::NothingClaimed);
+                };
+                order_kind
             };
 
             let anchor = ctx
@@ -873,7 +902,7 @@ async fn recover_pending_poll_status(
                 .and_then(|position| position.last_failed_offchain_order_id);
             let client_order_id = client_order_id_for_placement(pending_id, anchor);
 
-            let placed = place_offchain_order_at_broker(
+            let placement_result = place_offchain_order_at_broker(
                 &ctx.offchain_order,
                 ctx.order_placer.as_ref(),
                 &pending_id,
@@ -886,7 +915,14 @@ async fn recover_pending_poll_status(
                     order_kind,
                 ),
             )
-            .await?;
+            .await;
+            let placed = match placement_result {
+                Ok(placed) => placed,
+                Err(crate::offchain::order::PlaceOffchainOrderError::Deferred) => {
+                    return Ok(ClaimOutcome::Deferred);
+                }
+                Err(error) => return Err(error.into()),
+            };
 
             // Read before the outcome is routed (which consumes it): a
             // re-drive the broker rejected lands `Failed` and is rolled back,
@@ -981,15 +1017,14 @@ async fn route_placement_outcome(
             )
             .await?;
 
-            // This symbol is placing again, so whatever paged for it has
-            // resolved: release its alert slots. Without this the dedup set
-            // latches for the process lifetime, and a failure that recurs the
-            // following session -- the shape an entitlement or feed regression
-            // takes -- would accumulate a standing delta with no page at all.
+            // Placement resolves abandonment alerts, but accepted-order recovery
+            // after close does not prove the residual exposure is zero.
             ctx.alerted_dead_letters
                 .lock()
                 .await
-                .retain(|(alerted, _)| alerted != symbol);
+                .retain(|(alerted, reason)| {
+                    alerted != symbol || *reason == DeadLetterReason::ResidualAfterClose
+                });
         }
 
         // No order exists after a successful `Place` -- there is nothing to
@@ -1068,6 +1103,18 @@ impl Job<HedgeCtx> for PlaceHedge {
 
 impl PlaceHedge {
     async fn perform_body(&self, ctx: &HedgeCtx) -> Result<(), TradeAccountingError> {
+        if ctx.close_flatten_policy.schedule_enabled() {
+            let _submission_guard = ctx.counter_trade_submission_lock.lock().await;
+            if let Some(pending_id) = ctx
+                .position
+                .load(&self.symbol)
+                .await?
+                .and_then(|position| position.pending_offchain_order_id)
+            {
+                recover_pending_poll_status(ctx, pending_id).await?;
+                return Ok(());
+            }
+        }
         // Residual TOCTOU: the session read, the limit-price fetch, and the
         // broker submission are three separate awaits, so the venue clock can
         // cross a 9:30/16:00 boundary between them. This is inherent (the clock
@@ -1188,7 +1235,7 @@ impl PlaceHedge {
             .and_then(|position| position.last_failed_offchain_order_id);
         let client_order_id = client_order_id_for_placement(self.offchain_order_id, anchor);
 
-        let placed = place_offchain_order_at_broker(
+        let placement_result = place_offchain_order_at_broker(
             &ctx.offchain_order,
             ctx.order_placer.as_ref(),
             &self.offchain_order_id,
@@ -1201,7 +1248,12 @@ impl PlaceHedge {
                 order_kind,
             ),
         )
-        .await?;
+        .await;
+        let placed = match placement_result {
+            Ok(placed) => placed,
+            Err(crate::offchain::order::PlaceOffchainOrderError::Deferred) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
 
         route_placement_outcome(ctx, &self.symbol, self.offchain_order_id, placed).await
     }
@@ -1511,6 +1563,16 @@ impl PlaceHedge {
                 Ok(())
             }
 
+            ClaimOutcome::Deferred => {
+                info!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    offchain_order_id = %self.offchain_order_id,
+                    "Pending hedge retained until broker admission permits recovery"
+                );
+                Ok(())
+            }
+
             ClaimOutcome::NothingClaimed => {
                 self.record_abandoned_hedge(ctx, reason, error).await;
 
@@ -1577,8 +1639,8 @@ mod tests {
     use st0x_event_sorcery::StoreBuilder;
     use st0x_evm::Chain;
     use st0x_execution::{
-        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
-        Symbol,
+        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, MockExecutor, Positive,
+        SupportedExecutor, Symbol,
     };
     use st0x_finance::Usd;
     use st0x_float_macro::float;
@@ -1586,7 +1648,7 @@ mod tests {
     use super::*;
     use crate::conductor::job::Job;
     use crate::offchain::order::{
-        OffchainOrder, OffchainOrderCommand, OrderPlacementResult, OrderPlacer,
+        ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OrderPlacementResult, OrderPlacer,
     };
     use crate::position::{AnchorDisposition, Position, PositionCommand, TradeId};
     use crate::test_utils::TEST_POLL_INTERVAL;
@@ -2056,6 +2118,8 @@ mod tests {
     fn ramp_start_session_status() -> st0x_execution::MarketSessionStatus {
         st0x_execution::MarketSessionStatus {
             session: MarketSession::Extended,
+            session_opens_at: None,
+            regular_session_closes_at: None,
             extended_session_closes_at: Some(chrono::Utc::now() + chrono::TimeDelta::seconds(900)),
             post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
         }
@@ -2242,6 +2306,32 @@ mod tests {
         assert!(
             alerted.lock().await.is_empty(),
             "a delivery that never completed must not suppress the next page"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_order_does_not_clear_residual_exposure_alert() {
+        let TestInfra { ctx, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let residual = (symbol.clone(), DeadLetterReason::ResidualAfterClose);
+        ctx.alerted_dead_letters.lock().await.extend([
+            residual.clone(),
+            (symbol.clone(), DeadLetterReason::BackpressureExhausted),
+        ]);
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2)),
+            Direction::Buy,
+        )
+        .await;
+        hedge_job(&symbol, 2.0, Direction::Sell)
+            .perform(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            *ctx.alerted_dead_letters.lock().await,
+            HashSet::from([residual])
         );
     }
 
@@ -3220,6 +3310,8 @@ mod tests {
                 if !self.extended_session.load(Ordering::SeqCst) {
                     return Ok(st0x_execution::MarketSessionStatus {
                         session: MarketSession::Regular,
+                        session_opens_at: None,
+                        regular_session_closes_at: None,
                         extended_session_closes_at: None,
                         post_close_gap: st0x_execution::PostCloseGap::OrdinaryOvernight,
                     });
@@ -3350,6 +3442,8 @@ mod tests {
                 // comes from the latest trade, not a close-flatten quote.
                 Ok(st0x_execution::MarketSessionStatus {
                     session: MarketSession::Extended,
+                    session_opens_at: None,
+                    regular_session_closes_at: None,
                     extended_session_closes_at: Some(
                         chrono::Utc::now() + chrono::TimeDelta::minutes(5),
                     ),
@@ -4544,6 +4638,8 @@ mod tests {
             {
                 Ok(st0x_execution::MarketSessionStatus {
                     session: MarketSession::Extended,
+                    session_opens_at: None,
+                    regular_session_closes_at: None,
                     extended_session_closes_at: None,
                     post_close_gap: st0x_execution::PostCloseGap::OrdinaryOvernight,
                 })
@@ -6474,6 +6570,218 @@ mod tests {
             poll_jobs, 1,
             "Pending re-drive must enqueue exactly one PollOrderStatus job"
         );
+    }
+
+    async fn scheduled_pending_hedge(executor: MockExecutor) -> (TestInfra, PlaceHedge) {
+        let (pool, _) = crate::test_utils::setup_test_pools().await;
+        let config = toml::from_str(
+            r#"
+            mode = "enabled"
+            environment = "staging"
+            poll_interval_secs = 5
+            request_timeout_secs = 3
+            response_freshness_secs = 30
+            calendar_max_age_secs = 7200
+            evidence_clock_skew_secs = 2
+            emergency_buffer_secs = 900
+            [[scopes]]
+            id = "extended"
+            profile_revision = "v1"
+            extended_hours = true
+            assets = ["AAPL"]
+        "#,
+        )
+        .unwrap();
+        let schedule = Arc::new(
+            crate::trading_schedule::TradingScheduleStore::load(config, pool)
+                .await
+                .unwrap(),
+        );
+        let policy = CloseFlattenPolicy::from_secs(900)
+            .unwrap()
+            .with_schedule(Some(schedule));
+        let placer = Arc::new(ExecutorOrderPlacer {
+            executor,
+            close_flatten_policy: Some(policy.clone()),
+        });
+        let mut infra = create_hedge_ctx(placer).await;
+        infra.ctx.close_flatten_policy = policy;
+        let symbol = Symbol::new("AAPL").unwrap();
+        fill_position(
+            &infra.ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2)),
+            Direction::Buy,
+        )
+        .await;
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+        infra
+            .ctx
+            .position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: job.offchain_order_id,
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    threshold: job.threshold,
+                },
+            )
+            .await
+            .unwrap();
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &job.offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol,
+                    shares: job.shares,
+                    direction: job.direction,
+                    executor: job.executor,
+                    client_order_id: ClientOrderId::from_uuid(job.offchain_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::ExtendedHoursLimit {
+                        limit_price: Positive::new(Usd::new(float!(101))).unwrap(),
+                        close_flatten: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        (infra, job)
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_never_invents_an_extended_limit() {
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_position_mark(Positive::new(Usd::new(float!(200))).unwrap());
+        let (infra, job) = scheduled_pending_hedge(executor).await;
+        for _ in 0..2 {
+            job.perform(&infra.ctx).await.unwrap();
+            assert_eq!(
+                recover_pending_poll_status(&infra.ctx, job.offchain_order_id)
+                    .await
+                    .unwrap(),
+                ClaimOutcome::Deferred
+            );
+            assert!(matches!(
+                infra
+                    .ctx
+                    .offchain_order
+                    .load(&job.offchain_order_id)
+                    .await
+                    .unwrap(),
+                Some(OffchainOrder::Pending { .. })
+            ));
+            let position = infra.ctx.position.load(&job.symbol).await.unwrap().unwrap();
+            assert_eq!(
+                position.pending_offchain_order_id,
+                Some(job.offchain_order_id)
+            );
+        }
+        let poll_jobs: i64 =
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(type_name::<PollOrderStatus>())
+                .fetch_one(&infra.apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(poll_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_pending_recovery_does_not_page_an_abandoned_hedge() {
+        let metrics_handle = crate::metrics::setup().unwrap();
+        let executor = MockExecutor::new().with_market_session(MarketSession::Extended);
+        let (infra, job) = scheduled_pending_hedge(executor).await;
+        job.handle_place_hedge_error(
+            &infra.ctx,
+            TradeAccountingError::LimitQuoteUnavailable {
+                symbol: job.symbol.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(infra.notifier.messages(), Vec::<String>::new());
+        assert_eq!(
+            dead_letter_count(
+                &metrics_handle.render(),
+                &job.symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteUnavailable),
+            ),
+            0
+        );
+        assert_eq!(
+            infra
+                .ctx
+                .position
+                .load(&job.symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_offchain_order_id,
+            Some(job.offchain_order_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_adopts_accepted_order_when_closed_or_reference_unavailable() {
+        for executor in [
+            MockExecutor::new().with_market_session(MarketSession::Closed),
+            MockExecutor::with_failure("reference unavailable")
+                .with_market_session(MarketSession::Extended),
+        ] {
+            let executor = executor.with_recovered_order(st0x_execution::OrderPlacement {
+                order_id: "accepted-before-crash".into(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                direction: Direction::Sell,
+                placed_at: chrono::Utc::now(),
+                extended_hours: true,
+                limit_price: Some(Positive::new(Usd::new(float!(101))).unwrap()),
+            });
+            let (infra, job) = scheduled_pending_hedge(executor).await;
+            job.perform(&infra.ctx).await.unwrap();
+            assert_eq!(
+                recover_pending_poll_status(&infra.ctx, job.offchain_order_id)
+                    .await
+                    .unwrap(),
+                ClaimOutcome::Recovered
+            );
+            let order = infra
+                .ctx
+                .offchain_order
+                .load(&job.offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let OffchainOrder::Submitted {
+                executor_order_id,
+                market_session,
+                shares,
+                ..
+            } = order
+            else {
+                panic!("accepted order must be submitted");
+            };
+            assert_eq!(
+                executor_order_id,
+                ExecutorOrderId::new("accepted-before-crash")
+            );
+            assert_eq!(market_session, MarketSession::Extended);
+            assert_eq!(
+                shares,
+                Positive::new(FractionalShares::new(float!(2))).unwrap()
+            );
+            let poll_jobs: i64 =
+                sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                    .bind(type_name::<PollOrderStatus>())
+                    .fetch_one(&infra.apalis_pool)
+                    .await
+                    .unwrap();
+            assert_eq!(poll_jobs, 1);
+        }
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use url::{Host, Url};
 #[serde(deny_unknown_fields)]
 pub struct PricingConfig {
     pub ws_url: Url,
+    pub trading_schedule: Option<crate::TradingScheduleConfig>,
     /// Authenticate with a Google ID token minted from the VM's ambient
     /// service-account identity (Cloud Run IAM) instead of a static
     /// `[pricing].api_key` secret — the pricing plane on Cloud Run runs
@@ -63,6 +64,7 @@ pub enum PricingAuth {
 pub struct PricingCtx {
     pub ws_url: Url,
     pub auth: PricingAuth,
+    pub trading_schedule: Option<crate::TradingScheduleConfig>,
 }
 
 impl PricingCtx {
@@ -71,6 +73,7 @@ impl PricingCtx {
         Self::assemble(
             Some(PricingConfig {
                 ws_url,
+                trading_schedule: None,
                 gcp_id_token: false,
             }),
             Some(PricingSecrets { api_key }),
@@ -116,12 +119,12 @@ impl PricingCtx {
                 if config.ws_url.scheme() != "wss" {
                     return Err(PricingCtxError::IdTokenRequiresWss);
                 }
-                let host = config
-                    .ws_url
-                    .host_str()
-                    .ok_or(PricingCtxError::InvalidWebSocketScheme)?;
+                let mut origin = config.ws_url.clone();
+                origin
+                    .set_scheme("https")
+                    .map_err(|()| PricingCtxError::InvalidWebSocketScheme)?;
                 PricingAuth::GcpIdToken {
-                    audience: format!("https://{host}"),
+                    audience: origin.origin().ascii_serialization(),
                 }
             }
             (false, Some(secrets)) => {
@@ -139,6 +142,7 @@ impl PricingCtx {
         Ok(Some(Self {
             ws_url: config.ws_url,
             auth,
+            trading_schedule: config.trading_schedule,
         }))
     }
 }
@@ -186,6 +190,7 @@ mod tests {
     fn config(url: &str) -> PricingConfig {
         PricingConfig {
             ws_url: Url::parse(url).unwrap(),
+            trading_schedule: None,
             gcp_id_token: false,
         }
     }
@@ -193,6 +198,7 @@ mod tests {
     fn gcp_config(url: &str) -> PricingConfig {
         PricingConfig {
             ws_url: Url::parse(url).unwrap(),
+            trading_schedule: None,
             gcp_id_token: true,
         }
     }
