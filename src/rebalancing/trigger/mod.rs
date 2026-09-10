@@ -7634,6 +7634,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback_after_timeout_redemption_dispatch_failure_clears_the_records_own_chain() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = redemption_aggregate_id("redemption-ethereum-rollback");
+        let tombstone_at = Utc::now();
+
+        // Base (the trading chain) holds 90/0 and Ethereum 20/0 after the
+        // timeout cleared the Ethereum redemption's in-flight.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(90), shares(0))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Ethereum,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: tombstone_at,
+                    block_number: None,
+                },
+                tombstone_at,
+            )
+            .unwrap();
+        trigger.timed_out_redemptions.write().await.insert(
+            redemption_id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: tombstone_at,
+            },
+        );
+        trigger
+            .suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(symbol.clone(), tombstone_at);
+
+        let failed = EquityRedemption::Failed {
+            chain: Chain::Ethereum,
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
+            reason: Some("timeout".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let rollback = trigger
+            .rebuild_redemption_tracking_for_recovery(&redemption_id, &failed)
+            .await
+            .unwrap()
+            .expect_claimed();
+
+        let restored_ethereum_inflight = trigger
+            .inventory
+            .read()
+            .await
+            .onchain_equity_inflight_at(&symbol, Chain::Ethereum);
+        assert_eq!(
+            restored_ethereum_inflight,
+            Some(shares(10)),
+            "the rebuild restores the in-flight on the record's own chain"
+        );
+
+        trigger
+            .rollback_redemption_tracking_for_recovery(&redemption_id, &symbol, rollback)
+            .await
+            .unwrap();
+
+        let (ethereum_inflight, ethereum_available, base_inflight, base_available) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_available_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Base),
+                inventory.onchain_equity_available_at(&symbol, Chain::Base),
+            )
+        };
+        assert_eq!(
+            ethereum_inflight,
+            Some(shares(0)),
+            "the rollback must clear the in-flight it restored on Ethereum"
+        );
+        assert_eq!(ethereum_available, Some(shares(20)));
+        assert_eq!(
+            base_inflight,
+            Some(shares(0)),
+            "the rollback must not touch the trading chain's slot"
+        );
+        assert_eq!(base_available, Some(shares(90)));
+    }
+
+    #[tokio::test]
     async fn rollback_after_explicit_redemption_dispatch_failure_keeps_inflight() {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
