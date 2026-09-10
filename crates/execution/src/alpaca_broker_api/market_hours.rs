@@ -11,8 +11,8 @@ use crate::{MarketSession, MarketSessionStatus, PostCloseGap};
 
 const NEXT_SESSION_LOOKAHEAD_DAYS: u64 = 14;
 
-/// Response from the Alpaca calendar endpoint
-/// (https://docs.alpaca.markets/reference/getcalendar-1).
+/// Response from Alpaca's Broker API `/v1/calendar` endpoint:
+/// https://docs.alpaca.markets/us/reference/legacycalendar-1
 ///
 /// `date` identifies the trading day the entry describes, so callers can
 /// verify the broker answered for the day they actually queried.
@@ -105,45 +105,52 @@ pub(super) async fn market_session_status_at(
     client: &AlpacaBrokerApiClient,
     now: DateTime<Utc>,
 ) -> Result<MarketSessionStatus, AlpacaBrokerApiError> {
-    match session_and_close_at(client, now).await? {
-        SessionAndClose::Regular => Ok(MarketSessionStatus::Regular),
-        SessionAndClose::Extended {
-            closes_at,
-            trading_day,
-        } => Ok(MarketSessionStatus::Extended {
-            closes_at: Some(closes_at),
-            post_close_gap: classify_post_close_gap(client, trading_day).await,
-        }),
-        SessionAndClose::Overnight => Ok(MarketSessionStatus::Overnight),
-        SessionAndClose::Closed => Ok(MarketSessionStatus::Closed),
-    }
+    let SessionAndClose {
+        session,
+        session_opens_at,
+        regular_session_closes_at,
+        extended_session_closes_at,
+        today,
+    } = session_and_close_at(client, now).await?;
+
+    // `post_close_gap` is only meaningful once the session is Extended (see
+    // `CloseFlattenPolicy::active_window`, which discards it otherwise), and
+    // computing it issues a full calendar HTTP round trip. Skip the network
+    // call entirely for the far more common Regular/Closed cases.
+    let post_close_gap = if session == MarketSession::Extended {
+        classify_post_close_gap(client, today).await
+    } else {
+        PostCloseGap::Unknown
+    };
+
+    Ok(MarketSessionStatus {
+        session,
+        session_opens_at,
+        regular_session_closes_at,
+        extended_session_closes_at,
+        post_close_gap,
+    })
 }
 
 /// Session classification plus the extended-session close time, without the
 /// post-close-gap lookahead. Shared by the lightweight `market_session_at`
 /// path and `market_session_status_at`, which layers the lookahead on top
 /// only when the session is Extended.
-enum SessionAndClose {
-    Regular,
-    Extended {
-        closes_at: DateTime<Utc>,
-        /// The trading day in Alpaca's calendar timezone. Threaded back out so
-        /// `market_session_status_at` can classify the post-close gap without
-        /// recomputing the timezone conversion.
-        trading_day: NaiveDate,
-    },
-    Overnight,
-    Closed,
+struct SessionAndClose {
+    session: MarketSession,
+    session_opens_at: Option<DateTime<Utc>>,
+    regular_session_closes_at: Option<DateTime<Utc>>,
+    extended_session_closes_at: Option<DateTime<Utc>>,
+    /// The queried trading day, in Alpaca's calendar timezone. Threaded back
+    /// out so `market_session_status_at` can feed it to
+    /// `classify_post_close_gap` without recomputing the timezone
+    /// conversion.
+    today: NaiveDate,
 }
 
 impl SessionAndClose {
     const fn session(&self) -> MarketSession {
-        match self {
-            Self::Regular => MarketSession::Regular,
-            Self::Extended { .. } => MarketSession::Extended,
-            Self::Overnight => MarketSession::Overnight,
-            Self::Closed => MarketSession::Closed,
-        }
+        self.session
     }
 }
 
@@ -156,7 +163,13 @@ async fn session_and_close_at(
 
     let Some(tomorrow) = today.checked_add_days(Days::new(1)) else {
         warn!(%today, "Could not compute next calendar day; classifying the session as closed");
-        return Ok(SessionAndClose::Closed);
+        return Ok(SessionAndClose {
+            session: MarketSession::Closed,
+            session_opens_at: None,
+            regular_session_closes_at: None,
+            extended_session_closes_at: None,
+            today,
+        });
     };
 
     // One request answers both overnight legs: today's entry classifies the
@@ -207,10 +220,22 @@ async fn session_and_close_at(
         // holiday's own 20:00 both start the next trading day's overnight
         // session even though today itself never traded.
         if in_overnight_evening_leg && tomorrow_is_trading_day {
-            return Ok(SessionAndClose::Overnight);
+            return Ok(SessionAndClose {
+                session: MarketSession::Overnight,
+                session_opens_at: None,
+                regular_session_closes_at: None,
+                extended_session_closes_at: None,
+                today,
+            });
         }
         debug!("Today is not a trading day");
-        return Ok(SessionAndClose::Closed);
+        return Ok(SessionAndClose {
+            session: MarketSession::Closed,
+            session_opens_at: None,
+            regular_session_closes_at: None,
+            extended_session_closes_at: None,
+            today,
+        });
     };
 
     // Detect a silent redefinition of the undocumented session bounds (see
@@ -244,21 +269,18 @@ async fn session_and_close_at(
 
     let extended_session_closes_at = local_market_time_to_utc(today, today_calendar.session_close)?;
 
-    let status = if now_time >= today_calendar.open && now_time < today_calendar.close {
-        SessionAndClose::Regular
+    let session = if now_time >= today_calendar.open && now_time < today_calendar.close {
+        MarketSession::Regular
     } else if now_time >= today_calendar.session_open && now_time < today_calendar.session_close {
-        SessionAndClose::Extended {
-            closes_at: extended_session_closes_at,
-            trading_day: today,
-        }
+        MarketSession::Extended
     } else if in_overnight_evening_leg && tomorrow_is_trading_day {
-        SessionAndClose::Overnight
+        MarketSession::Overnight
     } else if in_overnight_morning_leg {
         // Today's calendar entry exists, so today is a trading day and its
         // overnight morning leg (00:00-04:00) is open.
-        SessionAndClose::Overnight
+        MarketSession::Overnight
     } else {
-        SessionAndClose::Closed
+        MarketSession::Closed
     };
 
     debug!(
@@ -268,11 +290,20 @@ async fn session_and_close_at(
         session_close = %today_calendar.session_close,
         now = %now_time,
         tomorrow_is_trading_day,
-        session = ?status.session(),
+        ?session,
         "Checked market session"
     );
 
-    Ok(status)
+    Ok(SessionAndClose {
+        session,
+        session_opens_at: Some(local_market_time_to_utc(
+            today,
+            today_calendar.session_open,
+        )?),
+        regular_session_closes_at: Some(local_market_time_to_utc(today, today_calendar.close)?),
+        extended_session_closes_at: Some(extended_session_closes_at),
+        today,
+    })
 }
 
 async fn classify_post_close_gap(

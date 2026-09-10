@@ -125,6 +125,7 @@ pub(crate) enum CheckPositionsError {
 pub(crate) enum HedgeScanSkipReason {
     AnchoredOrder,
     MarketSessionCheck,
+    BrokerBoundary,
     ReferencePriceUnavailable,
     MarkFetchFailed,
     QuoteFetchFailed,
@@ -157,6 +158,7 @@ impl HedgeScanSkipReason {
         match self {
             Self::AnchoredOrder => "anchored_order",
             Self::MarketSessionCheck => "market_session_check",
+            Self::BrokerBoundary => "broker_boundary",
             Self::ReferencePriceUnavailable => "reference_price_unavailable",
             Self::MarkFetchFailed => "mark_fetch_failed",
             Self::QuoteFetchFailed => "quote_fetch_failed",
@@ -301,13 +303,16 @@ fn backstop_sizing_assets<'registry>(
 /// a `last_seen_session` payload field; the empty braces keep old payloads
 /// deserializing cleanly by ignoring it.)
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct CheckPositions {}
+pub(crate) struct CheckPositions {
+    #[serde(default)]
+    pub(crate) one_shot: bool,
+}
 
 #[derive(Debug, Default)]
 enum CloseFlattenWindowCache {
     #[default]
     Unresolved,
-    Resolved(Option<CloseFlattenWindow>),
+    Resolved(st0x_execution::MarketSessionStatus),
     Failed,
 }
 
@@ -383,7 +388,11 @@ where
             }
         }
 
-        ctx.reschedule().await
+        if self.one_shot {
+            Ok(())
+        } else {
+            ctx.reschedule().await
+        }
     }
 }
 
@@ -454,6 +463,10 @@ where
 
         let all_positions = self.position_projection.load_all().await?;
         self.enqueue_failed_anchor_recoveries(&all_positions).await;
+        for (symbol, position) in &all_positions {
+            self.report_residual_after_close(symbol, position.net, Utc::now())
+                .await;
+        }
         let active_transfers = symbols_with_active_transfers(&self.pool).await?;
 
         // Every unanchored symbol starts the scan at zero deficit; the
@@ -703,7 +716,7 @@ where
 
         let close_flatten_window = if extended_hours_buy {
             match self
-                .active_close_flatten_window(close_flatten_window_cache)
+                .active_close_flatten_window(&ready.symbol, close_flatten_window_cache)
                 .await
             {
                 Ok(window) => window,
@@ -763,6 +776,7 @@ where
             Ok(CounterTradePreflight::Skipped(reason)) => {
                 let blocked_by_close_flatten = self
                     .is_blocked_by_close_flatten(
+                        &ready.symbol,
                         close_flatten_window,
                         ready.market_session,
                         close_flatten_window_cache,
@@ -792,6 +806,7 @@ where
             Err(error) => {
                 let blocked_by_close_flatten = self
                     .is_blocked_by_close_flatten(
+                        &ready.symbol,
                         close_flatten_window,
                         ready.market_session,
                         close_flatten_window_cache,
@@ -816,7 +831,9 @@ where
     }
 
     /// Whether a preflight rejection happened during an active close-flatten
-    /// window, for log-severity/metric labeling only. `close_flatten_window`
+    /// window. The result controls log-severity/metric labeling; resolving a
+    /// window also observes and persists broker boundaries when schedule
+    /// integration is configured. `close_flatten_window`
     /// is `Some` when the caller already resolved it for a close-flatten buy;
     /// otherwise (sells, or buys on symbols without extended-hours enabled,
     /// or any preflight outside the `Extended` session) this re-checks
@@ -829,6 +846,7 @@ where
     /// than propagated.
     async fn is_blocked_by_close_flatten(
         &self,
+        symbol: &Symbol,
         close_flatten_window: Option<CloseFlattenWindow>,
         session: MarketSession,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
@@ -842,7 +860,7 @@ where
         }
 
         match self
-            .active_close_flatten_window(close_flatten_window_cache)
+            .active_close_flatten_window(symbol, close_flatten_window_cache)
             .await
         {
             Ok(window) => window.is_some(),
@@ -968,7 +986,7 @@ where
     async fn reschedule(&self) -> Result<(), CheckPositionsError> {
         let mut queue = self.check_positions_queue.clone();
         queue
-            .push_with_delay(CheckPositions {}, self.check_interval)
+            .push_with_delay(CheckPositions::default(), self.check_interval)
             .await?;
         Ok(())
     }
@@ -1178,13 +1196,13 @@ where
         self.sweep_live_extended_hours_orders_for_cancellation(
             CancellationReason::ExtendedHoursRepriceTimeout,
             "reprice timeout",
-            |order| {
+            |_, _, order| async move {
                 let timeout = extended_hours_reprice_timeout_for_order(
-                    order,
+                    &order,
                     ordinary_timeout,
                     close_flatten_timeout,
                 );
-                live_extended_hours_order_is_stale(order, now, timeout)
+                live_extended_hours_order_is_stale(&order, now, timeout)
             },
         )
         .await;
@@ -1198,26 +1216,52 @@ where
         &self,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
     ) {
-        let window = match self
-            .active_close_flatten_window(close_flatten_window_cache)
-            .await
-        {
-            Ok(Some(window)) => window,
-            Ok(None) | Err(CloseFlattenWindowResolutionError::CachedFailure) => return,
-            Err(CloseFlattenWindowResolutionError::Source(error)) => {
+        let status = match close_flatten_window_cache {
+            CloseFlattenWindowCache::Resolved(status) => *status,
+            CloseFlattenWindowCache::Failed => {
                 warn!(
-                    %error,
-                    "Failed to check market session for extended-hours close-flatten sweep; \
-                     skipping this tick"
+                    "Skipping close-flatten cancellation sweep: market session lookup failed \
+                    earlier in this scan; will retry next tick"
                 );
                 return;
+            }
+            CloseFlattenWindowCache::Unresolved => {
+                match self.executor.market_session_status().await {
+                    Ok(status) => {
+                        *close_flatten_window_cache = CloseFlattenWindowCache::Resolved(status);
+                        status
+                    }
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            "Failed to check market session for extended-hours close-flatten sweep; \
+                             skipping this tick"
+                        );
+                        return;
+                    }
+                }
             }
         };
 
         self.sweep_live_extended_hours_orders_for_cancellation(
             CancellationReason::ExtendedHoursCloseFlatten,
             "close flatten",
-            |order| live_extended_hours_order_needs_close_flatten(order, window.started_at),
+            |symbol, offchain_order_id, order| async move {
+                if !self
+                    .close_flatten_policy
+                    .observe_broker(&symbol, status)
+                    .await
+                {
+                    warn!(%symbol, %offchain_order_id, sweep = "close flatten",
+                        "Broker boundary persistence blocked cancellation; will retry next tick");
+                    return false;
+                }
+                self.close_flatten_policy
+                    .window_for(&symbol, status, Utc::now())
+                    .is_some_and(|window| {
+                        live_extended_hours_order_needs_close_flatten(&order, window.started_at)
+                    })
+            },
         )
         .await;
     }
@@ -1225,12 +1269,14 @@ where
     /// Shared skeleton for the reprice-timeout and close-flatten cancellation
     /// sweeps. Broker-backed work is bounded and concurrent so one slow
     /// cancellation cannot serialize the whole maintenance pass.
-    async fn sweep_live_extended_hours_orders_for_cancellation(
+    async fn sweep_live_extended_hours_orders_for_cancellation<Fut>(
         &self,
         reason: CancellationReason,
         sweep_label: &str,
-        needs_cancellation: impl Fn(&OffchainOrder) -> bool + Sync,
-    ) {
+        needs_cancellation: impl Fn(Symbol, OffchainOrderId, OffchainOrder) -> Fut + Sync,
+    ) where
+        Fut: std::future::Future<Output = bool> + Send,
+    {
         let all_positions = match self.position_projection.load_all().await {
             Ok(positions) => positions,
             Err(error) => {
@@ -1277,9 +1323,10 @@ where
                         }
                     };
 
-                    if order.executor() != self.executor.to_supported_executor()
-                        || !needs_cancellation(&order)
-                    {
+                    if order.executor() != self.executor.to_supported_executor() {
+                        return;
+                    }
+                    if !needs_cancellation(symbol.clone(), offchain_order_id, order).await {
                         return;
                     }
 
@@ -1302,20 +1349,71 @@ where
             .await;
     }
 
+    async fn report_residual_after_close(
+        &self,
+        symbol: &Symbol,
+        net: FractionalShares,
+        now: chrono::DateTime<Utc>,
+    ) {
+        let reason = DeadLetterReason::ResidualAfterClose;
+        if self.close_flatten_policy.allows_new_order(symbol, now) || net == FractionalShares::ZERO
+        {
+            self.alerted_dead_letters
+                .lock()
+                .await
+                .remove(&(symbol.clone(), reason));
+            return;
+        }
+        counter!("close_flatten_residual_observations_total", "symbol" => symbol.to_string())
+            .increment(1);
+        let message = format!(
+            "Residual exposure remains after the latched close: {symbol}, net exposure {net}. Reconciliation continues."
+        );
+        alert_dead_letter(
+            self.notifier.as_ref(),
+            &self.alerted_dead_letters,
+            symbol,
+            reason,
+            &message,
+        )
+        .await;
+    }
+
     async fn active_close_flatten_window(
         &self,
+        symbol: &Symbol,
         cache: &mut CloseFlattenWindowCache,
     ) -> Result<Option<CloseFlattenWindow>, CloseFlattenWindowResolutionError<E::Error>> {
         match cache {
-            CloseFlattenWindowCache::Resolved(window) => Ok(*window),
+            CloseFlattenWindowCache::Resolved(status) => {
+                if !self
+                    .close_flatten_policy
+                    .observe_broker(symbol, *status)
+                    .await
+                {
+                    return Err(CloseFlattenWindowResolutionError::CachedFailure);
+                }
+                Ok(self
+                    .close_flatten_policy
+                    .window_for(symbol, *status, Utc::now()))
+            }
             CloseFlattenWindowCache::Failed => {
                 Err(CloseFlattenWindowResolutionError::CachedFailure)
             }
             CloseFlattenWindowCache::Unresolved => {
                 match self.executor.market_session_status().await {
                     Ok(status) => {
-                        let window = self.close_flatten_policy.active_window(status, Utc::now());
-                        *cache = CloseFlattenWindowCache::Resolved(window);
+                        *cache = CloseFlattenWindowCache::Resolved(status);
+                        if !self
+                            .close_flatten_policy
+                            .observe_broker(symbol, status)
+                            .await
+                        {
+                            return Err(CloseFlattenWindowResolutionError::CachedFailure);
+                        }
+                        let window =
+                            self.close_flatten_policy
+                                .window_for(symbol, status, Utc::now());
                         Ok(window)
                     }
                     Err(error) => {
@@ -1565,9 +1663,11 @@ mod tests {
         CheckPositionsCtx<MockExecutor>,
         Arc<st0x_event_sorcery::Store<Position>>,
     ) {
-        let order_placer: Arc<dyn OrderPlacer> = Arc::new(
-            crate::offchain::order::ExecutorOrderPlacer(executor.clone()),
-        );
+        let order_placer: Arc<dyn OrderPlacer> =
+            Arc::new(crate::offchain::order::ExecutorOrderPlacer {
+                executor: executor.clone(),
+                close_flatten_policy: None,
+            });
         build_ctx_with_order_placer(
             pool,
             apalis_pool,
@@ -1924,9 +2024,11 @@ mod tests {
         .await;
 
         let executor = MockExecutor::with_failure("connection refused");
-        let order_placer: Arc<dyn crate::offchain::order::OrderPlacer> = Arc::new(
-            crate::offchain::order::ExecutorOrderPlacer(executor.clone()),
-        );
+        let order_placer: Arc<dyn crate::offchain::order::OrderPlacer> =
+            Arc::new(crate::offchain::order::ExecutorOrderPlacer {
+                executor: executor.clone(),
+                close_flatten_policy: None,
+            });
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .build(order_placer.clone())
@@ -1956,7 +2058,7 @@ mod tests {
             alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
         };
 
-        CheckPositions {}.perform(&ctx).await.unwrap();
+        CheckPositions::default().perform(&ctx).await.unwrap();
 
         assert_eq!(
             count_jobs(&apalis_pool, &hedge_job_type()).await,
@@ -2280,6 +2382,30 @@ mod tests {
             (run_at - expected).abs() <= 2,
             "expected run_at near {expected}, got {run_at}"
         );
+    }
+
+    #[tokio::test]
+    async fn schedule_wakeup_does_not_create_another_periodic_scan_chain() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, position) =
+            build_ctx(pool, apalis_pool.clone(), cfg, Duration::from_secs(42)).await;
+        accumulate_position(
+            &position,
+            &Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+        CheckPositions { one_shot: true }
+            .perform(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            count_jobs(&apalis_pool, &check_positions_job_type()).await,
+            0
+        );
+        assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 1);
     }
 
     /// Claims `symbol`'s position with the given pending offchain order id.
@@ -3719,6 +3845,7 @@ mod tests {
             [
                 HedgeScanSkipReason::AnchoredOrder,
                 HedgeScanSkipReason::MarketSessionCheck,
+                HedgeScanSkipReason::BrokerBoundary,
                 HedgeScanSkipReason::ReferencePriceUnavailable,
                 HedgeScanSkipReason::MarkFetchFailed,
                 HedgeScanSkipReason::QuoteFetchFailed,
@@ -3728,6 +3855,7 @@ mod tests {
             [
                 "anchored_order",
                 "market_session_check",
+                "broker_boundary",
                 "reference_price_unavailable",
                 "mark_fetch_failed",
                 "quote_fetch_failed",
@@ -3894,6 +4022,293 @@ mod tests {
             symbol,
             DeadLetterReason::SymbolScoped(SymbolScopedReason::SlippageCalculation)
         )));
+    }
+
+    async fn scanner_schedule_policy(pool: SqlitePool) -> CloseFlattenPolicy {
+        let config = toml::from_str(
+            r#"
+            mode = "enabled"
+            environment = "staging"
+            poll_interval_secs = 5
+            request_timeout_secs = 3
+            response_freshness_secs = 30
+            calendar_max_age_secs = 7200
+            evidence_clock_skew_secs = 2
+            emergency_buffer_secs = 900
+            [[scopes]]
+            id = "aapl"
+            profile_revision = "v1"
+            extended_hours = true
+            assets = ["AAPL"]
+            [[scopes]]
+            id = "msft"
+            profile_revision = "v1"
+            extended_hours = true
+            assets = ["MSFT"]
+        "#,
+        )
+        .unwrap();
+        let schedule = crate::trading_schedule::TradingScheduleStore::load(config, pool)
+            .await
+            .unwrap();
+        CloseFlattenPolicy::from_secs(900)
+            .unwrap()
+            .with_schedule(Some(Arc::new(schedule)))
+    }
+
+    #[tokio::test]
+    async fn residual_alert_is_deduplicated_until_flat_or_admission_reopens() {
+        let metrics = crate::metrics::setup().unwrap();
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let policy = scanner_schedule_policy(pool.clone()).await;
+        let (mut ctx, _) = build_ctx(
+            pool,
+            apalis_pool,
+            dry_run_ctx(&["AAPL"], OperationMode::Enabled),
+            Duration::from_secs(60),
+        )
+        .await;
+        ctx.close_flatten_policy = policy;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let initial_close = now - chrono::Duration::seconds(60);
+        assert!(
+            ctx.close_flatten_policy
+                .observe_broker(
+                    &symbol,
+                    st0x_execution::MarketSessionStatus {
+                        session: MarketSession::Closed,
+                        session_opens_at: None,
+                        regular_session_closes_at: None,
+                        extended_session_closes_at: Some(initial_close),
+                        post_close_gap: st0x_execution::PostCloseGap::Unknown,
+                    }
+                )
+                .await
+        );
+        let net = FractionalShares::new(float!(2));
+        let page = format!(
+            "Residual exposure remains after the latched close: {symbol}, net exposure {net}. Reconciliation continues."
+        );
+        let residual_key = (symbol.clone(), DeadLetterReason::ResidualAfterClose);
+        let unrelated_key = (symbol.clone(), DeadLetterReason::BackpressureExhausted);
+        ctx.alerted_dead_letters
+            .lock()
+            .await
+            .insert(unrelated_key.clone());
+        ctx.report_residual_after_close(&symbol, net, now).await;
+        ctx.report_residual_after_close(&symbol, net, now).await;
+        assert_eq!(notifier.messages(), vec![page.clone()]);
+        assert!(
+            ctx.alerted_dead_letters
+                .lock()
+                .await
+                .contains(&residual_key)
+        );
+
+        ctx.report_residual_after_close(&symbol, FractionalShares::ZERO, now)
+            .await;
+        assert!(
+            !ctx.alerted_dead_letters
+                .lock()
+                .await
+                .contains(&residual_key)
+        );
+        assert!(
+            ctx.alerted_dead_letters
+                .lock()
+                .await
+                .contains(&unrelated_key)
+        );
+        ctx.report_residual_after_close(&symbol, net, now).await;
+        assert_eq!(notifier.messages(), vec![page.clone(), page.clone()]);
+
+        let next_close = now + chrono::Duration::seconds(60);
+        assert!(
+            ctx.close_flatten_policy
+                .observe_broker(
+                    &symbol,
+                    st0x_execution::MarketSessionStatus {
+                        session: MarketSession::Extended,
+                        session_opens_at: Some(now - chrono::Duration::seconds(30)),
+                        regular_session_closes_at: None,
+                        extended_session_closes_at: Some(next_close),
+                        post_close_gap: st0x_execution::PostCloseGap::Unknown,
+                    }
+                )
+                .await
+        );
+        assert!(ctx.close_flatten_policy.allows_new_order(&symbol, now));
+        ctx.report_residual_after_close(&symbol, net, now).await;
+        assert!(
+            !ctx.alerted_dead_letters
+                .lock()
+                .await
+                .contains(&residual_key)
+        );
+        assert!(
+            ctx.alerted_dead_letters
+                .lock()
+                .await
+                .contains(&unrelated_key)
+        );
+        assert_eq!(notifier.messages(), vec![page.clone(), page.clone()]);
+
+        ctx.report_residual_after_close(&symbol, net, next_close)
+            .await;
+        ctx.report_residual_after_close(&symbol, net, next_close)
+            .await;
+        assert_eq!(notifier.messages(), vec![page.clone(), page.clone(), page]);
+        let rendered = metrics.render();
+        let observation = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("close_flatten_residual_observations_total{")
+                    && line.contains("symbol=\"AAPL\"")
+            })
+            .unwrap();
+        assert_eq!(observation.rsplit_once(' ').unwrap().1, "5");
+    }
+
+    #[tokio::test]
+    async fn observation_failure_reuses_status_without_blocking_another_scope() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let policy = scanner_schedule_policy(pool.clone()).await;
+        sqlx::query("CREATE TRIGGER reject_aapl_window BEFORE INSERT ON trading_schedule_broker_windows WHEN NEW.scope_id = 'aapl' BEGIN SELECT RAISE(FAIL, 'unavailable aapl persistence'); END")
+            .execute(&pool).await.unwrap();
+        let close = Utc::now() + chrono::Duration::seconds(300);
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_extended_session_closes_at(close);
+        let probe = executor.clone();
+        let (mut ctx, _) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool,
+            dry_run_ctx(&["AAPL", "MSFT"], OperationMode::Enabled),
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        ctx.close_flatten_policy = policy;
+        let mut cache = CloseFlattenWindowCache::Unresolved;
+        assert!(matches!(
+            ctx.active_close_flatten_window(&Symbol::new("AAPL").unwrap(), &mut cache)
+                .await,
+            Err(CloseFlattenWindowResolutionError::CachedFailure)
+        ));
+        let Ok(Some(window)) = ctx
+            .active_close_flatten_window(&Symbol::new("MSFT").unwrap(), &mut cache)
+            .await
+        else {
+            panic!("healthy scope must still resolve its broker window");
+        };
+        assert_eq!(probe.market_session_status_call_count(), 1);
+        assert_eq!(window.closes_at, close);
+        let persisted: (String, i64) =
+            sqlx::query_as("SELECT scope_id, closes_at FROM trading_schedule_broker_windows")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted, ("msft".to_string(), close.timestamp_millis()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_only_scan_persists_window_before_cancel_and_skips_failed_observation() {
+        for fail_observation in [false, true] {
+            let (pool, apalis_pool) = setup_test_pools().await;
+            let policy = scanner_schedule_policy(pool.clone()).await;
+            if fail_observation {
+                sqlx::query("CREATE TRIGGER reject_broker_window BEFORE INSERT ON trading_schedule_broker_windows BEGIN SELECT RAISE(FAIL, 'unavailable persistence'); END")
+                    .execute(&pool).await.unwrap();
+            }
+            let cancel_calls = Arc::new(AtomicUsize::new(0));
+            let placer = Arc::new(CountingCancelOrderPlacer {
+                cancel_calls: cancel_calls.clone(),
+            });
+            let close = Utc::now() + chrono::Duration::seconds(300);
+            let (mut ctx, position) = build_ctx_with_order_placer(
+                pool.clone(),
+                apalis_pool,
+                dry_run_ctx(&["AAPL"], OperationMode::Enabled),
+                Duration::from_secs(60),
+                MockExecutor::new()
+                    .with_market_session(MarketSession::Extended)
+                    .with_extended_session_closes_at(close),
+                placer,
+            )
+            .await;
+            ctx.close_flatten_policy = policy;
+            let symbol = Symbol::new("AAPL").unwrap();
+            accumulate_position(
+                &position,
+                &symbol,
+                FractionalShares::new(float!(2)),
+                Direction::Buy,
+            )
+            .await;
+            let order_id = OffchainOrderId::new();
+            claim_position(&ctx, &symbol, order_id).await;
+            record_extended_hours_order_at(
+                &ctx,
+                &symbol,
+                order_id,
+                Utc::now() - chrono::Duration::seconds(1200),
+            )
+            .await;
+            ctx.request_extended_hours_close_flatten_cancellations(
+                &mut CloseFlattenWindowCache::Unresolved,
+            )
+            .await;
+            let order = ctx.offchain_order.load(&order_id).await.unwrap().unwrap();
+            if fail_observation {
+                assert!(matches!(order, OffchainOrder::Submitted { .. }));
+                assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
+                let rows: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM trading_schedule_broker_windows")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(rows, 0);
+            } else {
+                let OffchainOrder::Cancelling { reason, .. } = order else {
+                    panic!("durably observed drain must cancel the pre-window order");
+                };
+                assert_eq!(reason, CancellationReason::ExtendedHoursCloseFlatten);
+                assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+                let persisted: i64 = sqlx::query_scalar(
+                    "SELECT closes_at FROM trading_schedule_broker_windows WHERE scope_id = 'aapl'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(persisted, close.timestamp_millis());
+                let restored = scanner_schedule_policy(pool.clone()).await;
+                let window = restored
+                    .window_for(
+                        &symbol,
+                        st0x_execution::MarketSessionStatus::without_close_metadata(
+                            MarketSession::Extended,
+                        ),
+                        Utc::now(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    window.closes_at.timestamp_millis(),
+                    close.timestamp_millis()
+                );
+            }
+            assert_eq!(
+                position
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending_offchain_order_id,
+                Some(order_id)
+            );
+        }
     }
 
     #[tokio::test]

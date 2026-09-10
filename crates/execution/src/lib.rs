@@ -136,38 +136,30 @@ pub enum PostCloseGap {
 /// Current market-session classification, with close metadata available only
 /// for an extended session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MarketSessionStatus {
-    Regular,
-    Extended {
-        closes_at: Option<DateTime<Utc>>,
-        post_close_gap: PostCloseGap,
-    },
-    Overnight,
-    Closed,
+pub struct MarketSessionStatus {
+    pub session: MarketSession,
+    /// Earliest eligible broker session start for this calendar interval.
+    pub session_opens_at: Option<DateTime<Utc>>,
+    pub regular_session_closes_at: Option<DateTime<Utc>>,
+    pub extended_session_closes_at: Option<DateTime<Utc>>,
+    pub post_close_gap: PostCloseGap,
 }
 
 impl MarketSessionStatus {
     #[must_use]
     pub const fn without_close_metadata(session: MarketSession) -> Self {
-        match session {
-            MarketSession::Regular => Self::Regular,
-            MarketSession::Extended => Self::Extended {
-                closes_at: None,
-                post_close_gap: PostCloseGap::Unavailable,
-            },
-            MarketSession::Overnight => Self::Overnight,
-            MarketSession::Closed => Self::Closed,
+        Self {
+            session,
+            session_opens_at: None,
+            regular_session_closes_at: None,
+            extended_session_closes_at: None,
+            post_close_gap: PostCloseGap::Unavailable,
         }
     }
 
     #[must_use]
     pub const fn session(self) -> MarketSession {
-        match self {
-            Self::Regular => MarketSession::Regular,
-            Self::Extended { .. } => MarketSession::Extended,
-            Self::Overnight => MarketSession::Overnight,
-            Self::Closed => MarketSession::Closed,
-        }
+        self.session
     }
 }
 
@@ -303,6 +295,14 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error>;
+
+    /// Reads an earlier placement without submitting a new order.
+    async fn recover_order_by_client_id(
+        &self,
+        _order: &MarketOrder,
+    ) -> Result<Option<OrderPlacement<Self::OrderId>>, Self::Error> {
+        Ok(None)
+    }
 
     /// Get the current status of a specific order
     /// Used to check if pending orders have been filled or failed

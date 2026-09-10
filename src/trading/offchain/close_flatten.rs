@@ -1,5 +1,6 @@
 //! Policy for aggressive hedging before a multi-day market closure.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -7,34 +8,83 @@ use metrics::counter;
 use thiserror::Error;
 use tracing::error;
 
-use st0x_execution::{CounterTradeSkipReason, MarketSessionStatus, PostCloseGap};
+use st0x_execution::Symbol;
+use st0x_execution::{CounterTradeSkipReason, MarketSession, MarketSessionStatus, PostCloseGap};
+
+use crate::trading_schedule::TradingScheduleStore;
 
 /// Shared close-flatten decision used by position scanning and hedge pricing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CloseFlattenPolicy {
     window: chrono::Duration,
+    schedule: Option<Arc<TradingScheduleStore>>,
 }
 
 impl CloseFlattenPolicy {
     pub fn from_secs(window_secs: u64) -> Result<Self, chrono::OutOfRangeError> {
-        chrono::Duration::from_std(Duration::from_secs(window_secs)).map(|window| Self { window })
+        chrono::Duration::from_std(Duration::from_secs(window_secs)).map(|window| Self {
+            window,
+            schedule: None,
+        })
+    }
+
+    pub(crate) fn with_schedule(mut self, schedule: Option<Arc<TradingScheduleStore>>) -> Self {
+        self.schedule = schedule;
+        self
+    }
+
+    pub(crate) fn window_for(
+        &self,
+        symbol: &Symbol,
+        status: MarketSessionStatus,
+        now: DateTime<Utc>,
+    ) -> Option<CloseFlattenWindow> {
+        if let Some(schedule) = &self.schedule {
+            let window = schedule.window(symbol, status, now);
+            if schedule.enabled() {
+                return window;
+            }
+        }
+        self.active_window(status, now)
+    }
+
+    pub(crate) fn allows_new_order(&self, symbol: &Symbol, now: DateTime<Utc>) -> bool {
+        self.schedule
+            .as_ref()
+            .is_none_or(|schedule| schedule.allows_new_order(symbol, now))
+    }
+
+    pub(crate) fn schedule_enabled(&self) -> bool {
+        self.schedule
+            .as_ref()
+            .is_some_and(|schedule| schedule.enabled())
+    }
+
+    pub(crate) async fn observe_broker(
+        &self,
+        symbol: &Symbol,
+        status: MarketSessionStatus,
+    ) -> bool {
+        if let Some(schedule) = &self.schedule
+            && let Err(error) = schedule.observe_broker(symbol, status).await
+        {
+            error!(%symbol, %error, "Cannot persist conservative broker boundary");
+            return !schedule.enabled();
+        }
+        true
     }
 
     #[must_use]
     pub(crate) fn active_window(
-        self,
+        &self,
         status: MarketSessionStatus,
         now: DateTime<Utc>,
     ) -> Option<CloseFlattenWindow> {
-        let (closes_at, post_close_gap) = match status {
-            MarketSessionStatus::Regular
-            | MarketSessionStatus::Overnight
-            | MarketSessionStatus::Closed => return None,
-            MarketSessionStatus::Extended {
-                closes_at,
-                post_close_gap,
-            } => (closes_at, post_close_gap),
-        };
+        if status.session != MarketSession::Extended {
+            return None;
+        }
+        let closes_at = status.extended_session_closes_at;
+        let post_close_gap = status.post_close_gap;
         if post_close_gap == PostCloseGap::OrdinaryOvernight {
             return None;
         }
@@ -170,8 +220,11 @@ mod tests {
     use super::*;
 
     fn status(post_close_gap: PostCloseGap, closes_at: DateTime<Utc>) -> MarketSessionStatus {
-        MarketSessionStatus::Extended {
-            closes_at: Some(closes_at),
+        MarketSessionStatus {
+            session: MarketSession::Extended,
+            session_opens_at: None,
+            regular_session_closes_at: None,
+            extended_session_closes_at: Some(closes_at),
             post_close_gap,
         }
     }
@@ -197,9 +250,9 @@ mod tests {
         let policy = CloseFlattenPolicy::from_secs(900).unwrap();
 
         for status in [
-            MarketSessionStatus::Regular,
-            MarketSessionStatus::Overnight,
-            MarketSessionStatus::Closed,
+            MarketSessionStatus::without_close_metadata(MarketSession::Regular),
+            MarketSessionStatus::without_close_metadata(MarketSession::Overnight),
+            MarketSessionStatus::without_close_metadata(MarketSession::Closed),
         ] {
             assert_eq!(policy.active_window(status, now), None);
         }
@@ -264,9 +317,12 @@ mod tests {
         let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let now = Utc::now();
         let policy = CloseFlattenPolicy::from_secs(900).unwrap();
-        let status = MarketSessionStatus::Extended {
-            closes_at: None,
-            post_close_gap: PostCloseGap::Unavailable,
+        let status = MarketSessionStatus {
+            session: MarketSession::Extended,
+            session_opens_at: None,
+            regular_session_closes_at: None,
+            extended_session_closes_at: None,
+            post_close_gap: PostCloseGap::MultiDayClosure,
         };
 
         assert_eq!(policy.active_window(status, now), None);

@@ -166,8 +166,10 @@ impl AlpacaBrokerApiClient {
         self.get(&url).await
     }
 
-    /// Get an order by its `client_order_id`. Returns `None` if Alpaca has no
-    /// such order (404) -- i.e. it was never recorded. Used to reconcile a
+    /// Get an order by its `client_order_id`. Returns `None` on a current
+    /// not-found response (404), not proof that it was never recorded.
+    /// Contract: https://docs.alpaca.markets/us/reference/getorderbyclientorderidforaccount
+    /// The endpoint does not guarantee permanent historical retention. Used to reconcile a
     /// placement that the broker rejected as a duplicate `client_order_id`
     /// (it already accepted the original attempt, whose response was lost).
     pub(super) async fn get_order_by_client_order_id(

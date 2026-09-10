@@ -265,7 +265,7 @@ st0x-issuance-dto = { git = "https://github.com/ST0x-Technology/st0x.issuance.gi
 tower = { version = "0.5.3", features = ["util"] }
 tempfile.workspace = true
 ciborium = "0.2.2"
-st0x-pricing-types = { git = "https://github.com/ST0x-Technology/st0x.pricing-types", tag = "v0.4.0", version = "0.4.0" }
+st0x-pricing-types = { version = "0.8.0", git = "https://github.com/ST0x-Technology/st0x.pricing-types", rev = "5582721006def150199f8d2600e359fb7cfb153a" }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]

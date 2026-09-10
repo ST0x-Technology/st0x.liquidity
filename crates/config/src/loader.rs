@@ -1737,6 +1737,13 @@ fn validate_config(
     config_path: &Path,
     startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<ValidatedConfigParts, CtxError> {
+    if let Some(schedule) = config
+        .pricing
+        .as_ref()
+        .and_then(|pricing| pricing.trading_schedule.as_ref())
+    {
+        schedule.validate(&config.assets)?;
+    }
     let file_logging = match (&config.log_dir, &config.file_log_level) {
         (Some(directory), Some(level)) => {
             Some(crate::FileLogging::new(directory.clone(), level.clone()))
@@ -2498,6 +2505,8 @@ impl Ctx {
 #[derive(Debug, thiserror::Error)]
 pub enum CtxError {
     #[error(transparent)]
+    TradingSchedule(#[from] crate::TradingScheduleConfigError),
+    #[error(transparent)]
     Rebalancing(Box<RebalancingCtxError>),
     #[error(transparent)]
     Pricing(#[from] PricingCtxError),
@@ -2777,6 +2786,7 @@ impl CtxError {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
             Self::Pricing(_) => "pricing configuration error",
+            Self::TradingSchedule(_) => "trading schedule configuration error",
             Self::MissingRebalancing => "missing [rebalancing] config section",
             Self::MissingTokenization => "operation requires tokenization config",
             Self::RedemptionWalletNotConfigured { .. } => "missing per-chain redemption wallet",
@@ -9065,6 +9075,49 @@ mod tests {
         };
         assert_eq!(symbol, None);
         assert_eq!(configured, FractionalShares::new(float!(-1)));
+    }
+
+    #[test]
+    fn config_only_validation_rejects_invalid_schedule_timing_and_membership() {
+        let runtime: toml::Value =
+            toml::from_str(include_str!("../../../config/staging/st0x-hedge.toml")).unwrap();
+        let fragment: toml::Value =
+            toml::from_str(include_str!("../../../docs/trading-schedule/staging.toml")).unwrap();
+        for invalid_timing in [true, false] {
+            let mut config = runtime.clone();
+            config["pricing"].as_table_mut().unwrap().insert(
+                "trading_schedule".into(),
+                fragment["pricing"]["trading_schedule"].clone(),
+            );
+            let valid = toml_file(&toml::to_string(&config).unwrap());
+            Ctx::validate_config_file(valid.path()).unwrap();
+
+            let schedule = &mut config["pricing"]["trading_schedule"];
+            if invalid_timing {
+                schedule["request_timeout_secs"] = schedule["poll_interval_secs"].clone();
+            } else {
+                schedule["scopes"] = toml::Value::Array(Vec::new());
+            }
+            let invalid = toml_file(&toml::to_string(&config).unwrap());
+            let error = Ctx::validate_config_file(invalid.path()).unwrap_err();
+            if invalid_timing {
+                assert!(matches!(
+                    error,
+                    CtxError::TradingSchedule(crate::TradingScheduleConfigError::Timing)
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    CtxError::TradingSchedule(crate::TradingScheduleConfigError::Membership(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn trading_schedule_error_kind_identifies_configuration_failure() {
+        let error = CtxError::TradingSchedule(crate::TradingScheduleConfigError::Timing);
+        assert_eq!(error.kind(), "trading schedule configuration error");
     }
 
     /// The secrets half stays the deploy gate's job: without `--secrets` the
