@@ -2106,6 +2106,7 @@ mod tests {
         PortfolioSnapshotId, PortfolioSnapshotProjection, et_day,
     };
     use crate::position::{Position, PositionCommand, TradeId};
+    use crate::rebalancing::equity::ChainServicesMissing;
     use crate::rebalancing::usdc::UsdcTransferError;
     use crate::tokenized_equity_mint::TokenizedEquityMint;
 
@@ -5018,6 +5019,15 @@ mod tests {
         // Genuinely internal failure -> 500 with a generic body.
         let (status, message) =
             recheck_error_response(&RecheckError::Database(sqlx::Error::RowNotFound));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to recheck transfer");
+
+        // A record naming a chain the running bot has no services for is a
+        // wiring failure on the bot's side, not the operator's -> 500 too.
+        let (status, message) =
+            recheck_error_response(&RecheckError::ChainServicesMissing(ChainServicesMissing {
+                chain: Chain::Ethereum,
+            }));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
     }
