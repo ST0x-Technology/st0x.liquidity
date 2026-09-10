@@ -6190,20 +6190,23 @@ mod tests {
         sqlx::raw_sql(migration).execute(&pool).await.unwrap();
         sqlx::raw_sql(migration).execute(&pool).await.unwrap();
 
-        for (table, query) in [
-            (
-                "events",
-                "SELECT json_extract(payload, '$.MintRequested.chain') FROM events \
-                 WHERE aggregate_type = 'TokenizedEquityMint'",
-            ),
-            (
-                "snapshots",
-                "SELECT json_extract(payload, '$.MintRequested.chain') FROM snapshots \
-                 WHERE aggregate_type = 'TokenizedEquityMint'",
-            ),
-        ] {
-            let (chain,): (String,) = sqlx::query_as(query).fetch_one(&pool).await.unwrap();
-            assert_eq!(chain, "base", "{table} row must be stamped with the chain");
-        }
+        let (chain,): (String,) = sqlx::query_as(
+            "SELECT json_extract(payload, '$.MintRequested.chain') FROM events \
+             WHERE aggregate_type = 'TokenizedEquityMint'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chain, "base", "events row must be stamped with the chain");
+
+        // The schema-version bump discards every snapshot, so the migration leaves them alone.
+        let (snapshot_chain,): (Option<String>,) = sqlx::query_as(
+            "SELECT json_extract(payload, '$.MintRequested.chain') FROM snapshots \
+             WHERE aggregate_type = 'TokenizedEquityMint'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot_chain, None, "snapshots row must be left untouched");
     }
 }
