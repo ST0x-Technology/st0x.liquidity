@@ -1805,9 +1805,15 @@ pub mod process_tx {
                     "Failed to load existing pending offchain order; cannot safely acknowledge fill"
                 );
             })?;
-        reconcile_offchain_order_state(loaded_order, position_store, symbol, offchain_order_id)
-            .await
-            .map(Some)
+        reconcile_offchain_order_state(
+            loaded_order,
+            position_store,
+            symbol,
+            offchain_order_id,
+            PlacementContext::PrePlacement,
+        )
+        .await
+        .map(Some)
     }
 
     /// Mirrors dispatch_post_place_state in the normal pipeline: inspect the
@@ -1830,8 +1836,26 @@ pub mod process_tx {
                     "Failed to load offchain order after Place; cannot determine post-broker state"
                 );
             })?;
-        reconcile_offchain_order_state(loaded_order, position_store, symbol, offchain_order_id)
-            .await
+        reconcile_offchain_order_state(
+            loaded_order,
+            position_store,
+            symbol,
+            offchain_order_id,
+            PlacementContext::PostPlacement,
+        )
+        .await
+    }
+
+    /// Whether the offchain order under reconciliation predates this run's
+    /// placement or is the order it just placed, so the persisted failure
+    /// reason and the refusal error describe the right one.
+    #[derive(Debug, Clone, Copy)]
+    enum PlacementContext {
+        /// A pending order already recorded on the position, inspected before
+        /// a new hedge is placed.
+        PrePlacement,
+        /// The order this run just placed at the broker.
+        PostPlacement,
     }
 
     async fn reconcile_offchain_order_state(
@@ -1839,6 +1863,7 @@ pub mod process_tx {
         position_store: &Store<Position>,
         symbol: &Symbol,
         offchain_order_id: OffchainOrderId,
+        context: PlacementContext,
     ) -> anyhow::Result<HedgeDisposition> {
         match loaded_order {
             Some(OffchainOrder::Failed { error, .. }) => {
@@ -1864,22 +1889,34 @@ pub mod process_tx {
                 | OffchainOrder::Cancelling { .. },
             ) => Ok(HedgeDisposition::InFlight),
             None => {
+                let error = match context {
+                    PlacementContext::PrePlacement => {
+                        "Existing pending offchain order missing before placement"
+                    }
+                    PlacementContext::PostPlacement => "Offchain order missing after Place",
+                };
                 position_store
                     .send(
                         symbol,
                         PositionCommand::FailOffChainOrder {
                             offchain_order_id,
-                            error: "Offchain order missing after Place".to_owned(),
+                            error: error.to_owned(),
                             anchor: AnchorDisposition::Preserve,
                         },
                     )
                     .await?;
                 Ok(HedgeDisposition::ClearedForRetry)
             }
-            Some(OffchainOrder::Pending { .. }) => anyhow::bail!(
-                "offchain order {offchain_order_id} for {symbol} is in an unexpected \
-                 post-placement state; refusing to clear the position claim"
-            ),
+            Some(OffchainOrder::Pending { .. }) => match context {
+                PlacementContext::PrePlacement => anyhow::bail!(
+                    "existing pending offchain order {offchain_order_id} for {symbol} is still \
+                     Pending before placement; refusing to clear the position claim"
+                ),
+                PlacementContext::PostPlacement => anyhow::bail!(
+                    "offchain order {offchain_order_id} for {symbol} is in an unexpected \
+                     post-placement state; refusing to clear the position claim"
+                ),
+            },
             Some(order @ (OffchainOrder::Filled { .. } | OffchainOrder::Cancelled { .. })) => {
                 reconcile_terminal_offchain_order(&order, position_store, symbol, offchain_order_id)
                     .await
@@ -1964,7 +2001,7 @@ pub mod process_tx {
         use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
         use super::{
-            HedgeDisposition, ProcessTxOutcome, process_found_trade,
+            HedgeDisposition, PlacementContext, ProcessTxOutcome, process_found_trade,
             reconcile_offchain_order_state, reconcile_post_place_state,
         };
 
@@ -2601,6 +2638,7 @@ pub mod process_tx {
                 &position_store,
                 &symbol,
                 offchain_order_id,
+                PlacementContext::PrePlacement,
             )
             .await
             .unwrap();
@@ -2680,6 +2718,7 @@ pub mod process_tx {
                 &position_store,
                 &symbol,
                 offchain_order_id,
+                PlacementContext::PostPlacement,
             )
             .await
             .unwrap();
@@ -2826,6 +2865,7 @@ pub mod process_tx {
                 &position_store,
                 &symbol,
                 offchain_order_id,
+                PlacementContext::PrePlacement,
             )
             .await
             .unwrap();
@@ -2904,6 +2944,7 @@ pub mod process_tx {
                 &position_store,
                 &symbol,
                 offchain_order_id,
+                PlacementContext::PrePlacement,
             )
             .await
             .unwrap();
@@ -2922,6 +2963,153 @@ pub mod process_tx {
                 position.pending_offchain_order_id, None,
                 "Cancelled must clear the position claim through CancelOffChainOrder"
             );
+        }
+
+        /// Seeds a position that holds `offchain_order_id` as its pending hedge,
+        /// the state both a stale pointer and a fresh placement leave behind.
+        async fn seed_position_with_pending_order(
+            pool: &sqlx::SqlitePool,
+            symbol: &Symbol,
+            offchain_order_id: OffchainOrderId,
+            block_timestamp: chrono::DateTime<chrono::Utc>,
+        ) -> Arc<st0x_event_sorcery::Store<Position>> {
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let onchain_trade = onchain_trade_builder()
+                .with_block_number(42)
+                .with_block_timestamp(Some(block_timestamp))
+                .build();
+            execute_acknowledge_fill(
+                &position_store,
+                &onchain_trade,
+                ExecutionThreshold::whole_share(),
+                block_timestamp,
+            )
+            .await
+            .unwrap();
+            position_store
+                .send(
+                    symbol,
+                    PositionCommand::PlaceOffChainOrder {
+                        offchain_order_id,
+                        shares: positive_shares("1"),
+                        direction: Direction::Sell,
+                        executor: SupportedExecutor::DryRun,
+                        threshold: ExecutionThreshold::whole_share(),
+                    },
+                )
+                .await
+                .unwrap();
+            position_store
+        }
+
+        #[tokio::test]
+        async fn missing_pending_order_audit_reason_names_the_placement_phase() {
+            for (context, expected_reason) in [
+                (
+                    PlacementContext::PrePlacement,
+                    "Existing pending offchain order missing before placement",
+                ),
+                (
+                    PlacementContext::PostPlacement,
+                    "Offchain order missing after Place",
+                ),
+            ] {
+                let pool = setup_test_db().await;
+                let symbol = Symbol::new("AAPL").unwrap();
+                let offchain_order_id = OffchainOrderId::new();
+                let position_store =
+                    seed_position_with_pending_order(&pool, &symbol, offchain_order_id, Utc::now())
+                        .await;
+
+                let disposition = reconcile_offchain_order_state(
+                    None,
+                    &position_store,
+                    &symbol,
+                    offchain_order_id,
+                    context,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(disposition, HedgeDisposition::ClearedForRetry),
+                    "a missing order must clear the pending marker for retry under {context:?}, got: {disposition:?}"
+                );
+
+                let (reason,): (String,) = sqlx::query_as(
+                    "SELECT json_extract(payload, '$.OffChainOrderFailed.error') FROM events \
+                     WHERE event_type = 'PositionEvent::OffChainOrderFailed'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(
+                    reason, expected_reason,
+                    "the persisted audit reason must name the placement phase for {context:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn pending_order_refusal_names_the_placement_phase() {
+            for (context, expected_fragment) in [
+                (
+                    PlacementContext::PrePlacement,
+                    "is still Pending before placement",
+                ),
+                (
+                    PlacementContext::PostPlacement,
+                    "unexpected post-placement state",
+                ),
+            ] {
+                let pool = setup_test_db().await;
+                let symbol = Symbol::new("AAPL").unwrap();
+                let offchain_order_id = OffchainOrderId::new();
+                let block_timestamp = Utc::now();
+                let position_store = seed_position_with_pending_order(
+                    &pool,
+                    &symbol,
+                    offchain_order_id,
+                    block_timestamp,
+                )
+                .await;
+                let pending_order = OffchainOrder::Pending {
+                    symbol: symbol.clone(),
+                    shares: positive_shares("1"),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    placed_at: block_timestamp,
+                    market_session: st0x_execution::MarketSession::Regular,
+                    close_flatten: false,
+                };
+
+                let error = reconcile_offchain_order_state(
+                    Some(pending_order),
+                    &position_store,
+                    &symbol,
+                    offchain_order_id,
+                    context,
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains(expected_fragment),
+                    "the refusal must name the placement phase for {context:?}, got: {error}"
+                );
+
+                let position = position_store
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .expect("position should exist after setup");
+                assert_eq!(
+                    position.pending_offchain_order_id,
+                    Some(offchain_order_id),
+                    "a refusal must leave the position claim in place for {context:?}"
+                );
+            }
         }
 
         /// When a second client shares the same pool and witnesses the fill first,
