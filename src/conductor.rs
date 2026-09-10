@@ -2166,7 +2166,7 @@ where
     // fail-loud beats a green /health hiding a dead chain; degraded start
     // arrives with chain-disable). The primary uses the main provider;
     // secondaries their own.
-    for hedged in ctx.chains.hedged() {
+    for (role, hedged) in ctx.chains.hedged_with_roles() {
         let chain_provider = if hedged.chain == ctx.chains.primary().chain {
             provider
         } else {
@@ -2198,7 +2198,7 @@ where
             CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
         }
 
-        confirm_configured_asset_responds(chain_provider, hedged).await?;
+        confirm_configured_assets_respond(chain_provider, role, hedged).await?;
     }
 
     confirm_transport_chain_ids(ctx).await?;
@@ -2213,59 +2213,120 @@ where
     Ok(())
 }
 
-/// Startup read-path canary: one configured equity's token contract must
-/// answer a `decimals()` view call on the chain it is configured for.
+/// Startup read-path canary: every configured token address must answer a
+/// `decimals()` view call on the chain it is configured for.
 ///
-/// Proves the configured address is a live contract on the endpoint the
+/// Proves the configured addresses are live contracts on the endpoint the
 /// registry entry names -- config, RPC transport, and ABI decoding exercised
-/// in one read, before any funds-adjacent work starts. Runs per hedged
-/// chain: a secondary's addresses are as mistypeable as the primary's, and
-/// its fills need the token as much. Read-only and cold-start-safe: a chain
-/// with no configured equities is the normal bring-up state and skips with a
-/// log instead of failing.
-async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
+/// in one read each, before any funds-adjacent work starts. Which addresses
+/// are read follows the roles they play: see [`asset_read_probes`].
+/// Read-only and cold-start-safe: a chain with no configured equities is the
+/// normal bring-up state and skips with a log instead of failing.
+async fn confirm_configured_assets_respond<P: Provider + Clone + 'static>(
     provider: &P,
+    role: ChainRole,
     hedged: &HedgedChain,
 ) -> anyhow::Result<()> {
-    let Some((symbol, asset)) = hedged
-        .assets
-        .equities
-        .symbols
-        .iter()
-        .min_by(|(first, _), (second, _)| first.cmp(second))
-    else {
+    let probes = asset_read_probes(role, &hedged.assets);
+
+    if probes.is_empty() {
         info!(
             target: "startup",
             chain = %hedged.chain,
             "No equities configured on this chain; skipping the asset read canary"
         );
         return Ok(());
-    };
+    }
 
     let evm = ReadOnlyEvm::new(provider.clone());
-    let decimals = evm
-        .call::<OpenChainErrorRegistry, _>(asset.tokenized_equity, IERC20::decimalsCall {})
-        .await
-        .with_context(|| {
-            format!(
-                "startup read canary failed: [chains.{chain}] equity {symbol} at \
-                 {token} did not answer decimals() -- wrong address, wrong chain, \
-                 or a broken endpoint",
-                chain = hedged.chain,
-                token = asset.tokenized_equity,
-            )
-        })?;
 
-    info!(
-        target: "startup",
-        chain = %hedged.chain,
-        %symbol,
-        token = %asset.tokenized_equity,
-        decimals,
-        "Confirmed a configured asset responds on its chain"
-    );
+    for (symbol, probed, token) in probes {
+        let decimals = evm
+            .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
+            .await
+            .with_context(|| {
+                format!(
+                    "startup read canary failed: [chains.{chain}] equity {symbol}'s \
+                     {field} at {token} did not answer decimals() -- wrong address, \
+                     wrong chain, or a broken endpoint",
+                    chain = hedged.chain,
+                    field = probed.field(),
+                )
+            })?;
+
+        info!(
+            target: "startup",
+            chain = %hedged.chain,
+            %symbol,
+            field = probed.field(),
+            %token,
+            decimals,
+            "Confirmed a configured asset responds on its chain"
+        );
+    }
 
     Ok(())
+}
+
+/// Which configured address a canary read covers, so a refusal names the
+/// config field to correct and not just an address.
+#[derive(Debug, Clone, Copy)]
+enum ProbedToken {
+    /// The wrapped share a fill resolves its symbol through: the vault
+    /// registry and the symbol cache both key on it.
+    WrappedShare,
+    /// The unwrapped token that mint, redeem, wrap, unwrap and wrapped-equity
+    /// recovery move.
+    UnwrappedEquity,
+}
+
+impl ProbedToken {
+    /// The config field holding the address, so a refusal points at the line
+    /// to fix.
+    const fn field(self) -> &'static str {
+        match self {
+            Self::WrappedShare => "tokenized_equity_derivative",
+            Self::UnwrappedEquity => "tokenized_equity",
+        }
+    }
+}
+
+/// The token reads one chain owes at startup, matching the roles each address
+/// plays there: every equity's wrapped share, because every fill on any hedged
+/// chain resolves through it, then the unwrapped token of each equity the
+/// chain's role rebalances, because only there is it minted, redeemed, wrapped
+/// or unwrapped. Both halves run in symbol order, so which read fails first is
+/// deterministic.
+fn asset_read_probes(
+    role: ChainRole,
+    assets: &ChainAssets,
+) -> Vec<(&Symbol, ProbedToken, Address)> {
+    let mut wrapped = assets
+        .equities
+        .symbols
+        .iter()
+        .map(|(symbol, equity)| {
+            (
+                symbol,
+                ProbedToken::WrappedShare,
+                equity.tokenized_equity_derivative,
+            )
+        })
+        .collect::<Vec<_>>();
+    wrapped.sort_by_key(|(symbol, _, _)| *symbol);
+
+    let unwrapped = role
+        .rebalanced_equities(assets)
+        .into_iter()
+        .map(|(symbol, equity)| {
+            (
+                symbol,
+                ProbedToken::UnwrappedEquity,
+                equity.tokenized_equity,
+            )
+        });
+
+    wrapped.into_iter().chain(unwrapped).collect()
 }
 
 async fn confirm_chain_id<P: Provider>(provider: &P, chain: Chain) -> anyhow::Result<()> {
@@ -5482,13 +5543,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asset_canary_accepts_a_token_that_answers_decimals() {
+    async fn asset_canary_accepts_tokens_that_answer_decimals() {
+        // A rebalancing role reads both of the equity's tokens, so both
+        // answers are queued.
         let asserter = Asserter::new();
-        asserter.push_success(
-            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
-                &18u8,
-            ),
-        );
+        for decimals in [18u8, 6u8] {
+            asserter.push_success(
+                &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                    &decimals,
+                ),
+            );
+        }
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
         let trading = hedged_chain_with_equities([(
             "AAPL",
@@ -5496,7 +5561,7 @@ mod tests {
             address!("0x2222222222222222222222222222222222222222"),
         )]);
 
-        confirm_configured_asset_responds(&provider, &trading)
+        confirm_configured_assets_respond(&provider, ChainRole::Primary, &trading)
             .await
             .unwrap();
     }
@@ -5515,7 +5580,7 @@ mod tests {
             address!("0x2222222222222222222222222222222222222222"),
         )]);
 
-        let error = confirm_configured_asset_responds(&provider, &trading)
+        let error = confirm_configured_assets_respond(&provider, ChainRole::Primary, &trading)
             .await
             .unwrap_err();
 
@@ -5541,7 +5606,7 @@ mod tests {
             .primary()
             .clone();
 
-        confirm_configured_asset_responds(&provider, &trading)
+        confirm_configured_assets_respond(&provider, ChainRole::Primary, &trading)
             .await
             .unwrap();
 
@@ -5583,11 +5648,13 @@ mod tests {
         ctx.chains.insert_secondary(secondary);
 
         let primary_asserter = hedged_chain_asserter(Chain::Base);
-        primary_asserter.push_success(
-            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
-                &18u8,
-            ),
-        );
+        for decimals in [18u8, 6u8] {
+            primary_asserter.push_success(
+                &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                    &decimals,
+                ),
+            );
+        }
         let provider = ProviderBuilder::new().connect_mocked_client(primary_asserter);
 
         // The secondary's configured token answers nothing: a dead address,
