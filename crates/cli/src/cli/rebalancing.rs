@@ -11,7 +11,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_config::{BrokerCtx, Ctx, OnchainWalletCtx, TradingChain};
+use st0x_config::{BrokerCtx, Ctx, HedgedChain, OnchainWalletCtx};
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{
     Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM, Wallet,
@@ -112,7 +112,7 @@ fn usdc_gas_readiness(
 /// Gas readiness for an equity transfer on the selected chain: its wallet is
 /// checked against its own `[alerts.low_balance_thresholds]` entry, refused
 /// by name when the chain has none.
-fn gas_readiness(ctx: &Ctx, equity: &TradingChainContext<'_>) -> anyhow::Result<Arc<GasReadiness>> {
+fn gas_readiness(ctx: &Ctx, equity: &HedgedChainContext<'_>) -> anyhow::Result<Arc<GasReadiness>> {
     let alerts = ctx
         .alerts
         .as_ref()
@@ -164,10 +164,10 @@ pub(super) fn tokenization_network_context(
 
 /// The chain an operator command acts on: its signing wallet and its
 /// `[chains.<name>.trading]` table (orderbook, inventory, vault owner, assets).
-pub(super) struct TradingChainContext<'ctx> {
+pub(super) struct HedgedChainContext<'ctx> {
     pub(super) chain: Chain,
     pub(super) wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    pub(super) trading: &'ctx TradingChain,
+    pub(super) trading: &'ctx HedgedChain,
 }
 
 /// Resolves the selected network's wallet and trading table.
@@ -176,10 +176,10 @@ pub(super) struct TradingChainContext<'ctx> {
 /// that chain's orderbook, and the primary's addresses mean nothing there.
 /// The config check runs before the wallet is required, so a misnamed chain
 /// fails without a `[wallet]` section.
-pub(super) fn trading_chain_context(
+pub(super) fn hedged_chain_context(
     ctx: &Ctx,
     network: TokenizationNetwork,
-) -> anyhow::Result<TradingChainContext<'_>> {
+) -> anyhow::Result<HedgedChainContext<'_>> {
     let chain = Chain::from(network);
     let Some(trading) = ctx.chains.watch(chain) else {
         anyhow::bail!(
@@ -190,7 +190,7 @@ pub(super) fn trading_chain_context(
 
     let (wallet, chain) = tokenization_network_context(ctx.wallet()?, network);
 
-    Ok(TradingChainContext {
+    Ok(HedgedChainContext {
         chain,
         wallet,
         trading,
@@ -208,10 +208,10 @@ async fn build_equity_transfer_services(
 ) -> anyhow::Result<EquityTransferCliServices> {
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
-    let context = trading_chain_context(ctx, network)?;
+    let context = hedged_chain_context(ctx, network)?;
     let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
     let gas_readiness = gas_readiness(ctx, &context)?;
-    let TradingChainContext {
+    let HedgedChainContext {
         chain,
         wallet: caller,
         trading,
@@ -1887,7 +1887,7 @@ mod tests {
         ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, LogFormat, LogLevel,
         OperationMode,
     };
-    use st0x_config::{InventoryMode, TradingChain};
+    use st0x_config::{HedgedChain, InventoryMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError};
     #[cfg(feature = "test-support")]
     use st0x_evm::StubWallet;
@@ -2412,8 +2412,8 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(
-                TradingChain::test()
+            chains: ChainRegistry::single_hedged_chain(
+                HedgedChain::test()
                     .orderbook(address!("0x1234567890123456789012345678901234567890"))
                     .inventory(InventoryMode::Managed {
                         inventory: address!("0x1234567890123456789012345678901234567890"),
@@ -2490,8 +2490,8 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(
-                TradingChain::test()
+            chains: ChainRegistry::single_hedged_chain(
+                HedgedChain::test()
                     .orderbook(address!("0x1234567890123456789012345678901234567890"))
                     .inventory(InventoryMode::Managed {
                         inventory: address!("0x1234567890123456789012345678901234567890"),
@@ -2967,7 +2967,7 @@ mod tests {
         let ethereum_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         ctx.chains.primary_mut().redemption_wallet = Some(base_wallet);
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .redemption_wallet(ethereum_wallet)
                 .call(),
@@ -3042,7 +3042,7 @@ mod tests {
         let mut ctx = create_base_test_ctx();
         ctx.wallet = Some(OnchainWalletCtx::stub());
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(ETHEREUM_ORDERBOOK)
                 .call(),
@@ -3053,11 +3053,11 @@ mod tests {
     /// The selected network yields its own wallet and its own trading table,
     /// never the primary's.
     #[test]
-    fn trading_chain_context_resolves_the_selected_chains_wallet_and_trading_table() {
+    fn hedged_chain_context_resolves_the_selected_chains_wallet_and_trading_table() {
         let ctx = create_ctx_watching_ethereum();
         let base_orderbook = ctx.chains.primary().orderbook;
 
-        let ethereum = trading_chain_context(&ctx, TokenizationNetwork::Ethereum).unwrap();
+        let ethereum = hedged_chain_context(&ctx, TokenizationNetwork::Ethereum).unwrap();
         assert_eq!(ethereum.chain, Chain::Ethereum);
         assert_eq!(
             ethereum.wallet.address(),
@@ -3065,7 +3065,7 @@ mod tests {
         );
         assert_eq!(ethereum.trading.orderbook, ETHEREUM_ORDERBOOK);
 
-        let base = trading_chain_context(&ctx, TokenizationNetwork::Base).unwrap();
+        let base = hedged_chain_context(&ctx, TokenizationNetwork::Base).unwrap();
         assert_eq!(base.chain, Chain::Base);
         assert_eq!(
             base.wallet.address(),
@@ -3078,10 +3078,10 @@ mod tests {
     /// act on; the refusal names the chain and the table, before the wallet
     /// is required.
     #[test]
-    fn trading_chain_context_refuses_a_network_without_a_trading_table() {
+    fn hedged_chain_context_refuses_a_network_without_a_trading_table() {
         let ctx = create_base_test_ctx();
 
-        let Err(error) = trading_chain_context(&ctx, TokenizationNetwork::Ethereum) else {
+        let Err(error) = hedged_chain_context(&ctx, TokenizationNetwork::Ethereum) else {
             panic!("a chain without a trading table must be refused");
         };
         let error = error.to_string();
@@ -3111,7 +3111,7 @@ mod tests {
             Duration::from_secs(1),
         ));
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(ETHEREUM_ORDERBOOK)
                 .vault_owner(ETHEREUM_VAULT_OWNER)
@@ -3398,8 +3398,8 @@ mod tests {
     fn gas_readiness_refuses_a_chain_without_a_low_balance_threshold() {
         let mut ctx = create_alpaca_ctx_watching_ethereum();
         ctx.chains
-            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
-        let hyperevm = trading_chain_context(&ctx, TokenizationNetwork::HyperEvm).unwrap();
+            .insert_secondary(HedgedChain::test().chain(Chain::HyperEvm).call());
+        let hyperevm = hedged_chain_context(&ctx, TokenizationNetwork::HyperEvm).unwrap();
 
         let error = gas_readiness(&ctx, &hyperevm)
             .err()
@@ -4746,7 +4746,7 @@ mod tests {
             .symbols
             .insert(symbol.clone(), equity_asset(ethereum_token));
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .assets(ChainAssets {
                     equities: ethereum_equities,

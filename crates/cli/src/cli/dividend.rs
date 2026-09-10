@@ -161,7 +161,7 @@ mod tests {
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        BrokerCtx, ExecutionThreshold, InventoryMode, LogFormat, LogLevel, TradingChain,
+        BrokerCtx, ExecutionThreshold, HedgedChain, InventoryMode, LogFormat, LogLevel,
     };
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_hedge::operator::test_utils::{mock_alpaca_broker_ctx, try_positive_shares};
@@ -224,8 +224,8 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(
-                TradingChain::test()
+            chains: ChainRegistry::single_hedged_chain(
+                HedgedChain::test()
                     .orderbook(address!("0x1234567890123456789012345678901234567890"))
                     .inventory(InventoryMode::Managed {
                         inventory: address!("0x1234567890123456789012345678901234567890"),
