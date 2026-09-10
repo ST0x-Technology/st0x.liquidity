@@ -477,31 +477,60 @@ impl RedemptionTracking {
                 quantity,
                 submitted_at,
                 ..
-            } => Some(Self {
-                symbol: symbol.clone(),
-                chain: crate::onchain::legacy_chain(),
-                quantity: FractionalShares::new(*quantity),
-                tokenization_request_id: None,
-                redemption_tx: None,
-                stage: RedemptionTrackingStage::VaultWithdrawSubmitted,
-                last_progress_at: *submitted_at,
-            }),
+            } => {
+                let stage = RedemptionTrackingStage::VaultWithdrawSubmitted;
+                let chain = Self::default_chain_for_chainless_genesis(symbol, stage);
+                Some(Self {
+                    symbol: symbol.clone(),
+                    chain,
+                    quantity: FractionalShares::new(*quantity),
+                    tokenization_request_id: None,
+                    redemption_tx: None,
+                    stage,
+                    last_progress_at: *submitted_at,
+                })
+            }
             EquityRedemptionEvent::WithdrawnFromRaindex {
                 symbol,
                 quantity,
                 withdrawn_at,
                 ..
-            } => Some(Self {
-                symbol: symbol.clone(),
-                chain: crate::onchain::legacy_chain(),
-                quantity: FractionalShares::new(*quantity),
-                tokenization_request_id: None,
-                redemption_tx: None,
-                stage: RedemptionTrackingStage::WithdrawnFromRaindex,
-                last_progress_at: *withdrawn_at,
-            }),
+            } => {
+                let stage = RedemptionTrackingStage::WithdrawnFromRaindex;
+                let chain = Self::default_chain_for_chainless_genesis(symbol, stage);
+                Some(Self {
+                    symbol: symbol.clone(),
+                    chain,
+                    quantity: FractionalShares::new(*quantity),
+                    tokenization_request_id: None,
+                    redemption_tx: None,
+                    stage,
+                    last_progress_at: *withdrawn_at,
+                })
+            }
             _ => None,
         }
+    }
+
+    /// Only `VaultWithdrawPending` records the chain. Tracking built from a
+    /// later event is right for a pre-multichain stream, but a live redemption
+    /// on another chain whose tracking went missing would land on the legacy
+    /// chain with no other signal, so the default is logged loudly.
+    fn default_chain_for_chainless_genesis(
+        symbol: &Symbol,
+        stage: RedemptionTrackingStage,
+    ) -> Chain {
+        let chain = crate::onchain::legacy_chain();
+        warn!(
+            target: "rebalance",
+            %symbol,
+            %stage,
+            %chain,
+            "Redemption tracking created from an event that carries no chain; \
+             defaulted the chain to the legacy chain. A live redemption on \
+             another chain would have its in-flight debited from the wrong slot"
+        );
+        chain
     }
 
     fn track_progress(
@@ -14002,6 +14031,51 @@ mod tests {
     fn extract_redemption_info_returns_none_without_tokens_sent() {
         let result = RebalancingService::extract_redemption_info(&make_redemption_completed());
         assert!(result.is_none());
+    }
+
+    /// Tracking rebuilt from a chainless event lands on the legacy chain; a
+    /// live redemption on another chain would be debited from the wrong slot,
+    /// so the default must be loud.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn redemption_tracking_from_a_chainless_event_warns_about_the_defaulted_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(30)),
+            FractionalShares::new(float!(20)),
+        );
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("chainless-genesis");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawSubmitted {
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(10_000_000_000_000_000_000_u128),
+                    tx_hash: TxHash::random(),
+                    submitted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let created = trigger
+            .redemption_tracking
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("tracking must be created from the chainless event");
+        assert_eq!(created.chain, crate::onchain::legacy_chain());
+        assert_eq!(
+            created.stage,
+            RedemptionTrackingStage::VaultWithdrawSubmitted
+        );
+        assert!(logs_contain("carries no chain"));
     }
 
     #[test]
