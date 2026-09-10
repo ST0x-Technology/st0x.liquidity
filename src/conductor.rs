@@ -117,9 +117,10 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
-    DurableCheckedGuardRelease, PreflightAlertGate, RecheckUsdcDeposit, TransferUsdcToHedging,
-    TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    UsdcDriverGate, UsdcDriverPause, UsdcSettlementParams, usdc_driver_pause,
+    DurableCheckedGuardRelease, PreflightAlertGate, RecheckUsdcDeposit, RecoverCctpMint,
+    TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking,
+    TransferUsdcToMarketMakingCtx, UsdcDriverGate, UsdcDriverPause, UsdcSettlementParams,
+    usdc_driver_pause,
 };
 use crate::rebalancing::{
     BaseWallet, ChainWallets, EthereumWallet, RebalancerServices, RebalancingSchedulers,
@@ -903,6 +904,7 @@ fn publish_recovery_handle(
     redemption_store: Arc<Store<EquityRedemption>>,
     rebalancing_service: Arc<RebalancingService>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     usdc_driver_pause: Arc<UsdcDriverPause>,
     usdc_store: Arc<Store<UsdcRebalance>>,
 ) {
@@ -912,6 +914,7 @@ fn publish_recovery_handle(
         redemption_store,
         rebalancing_service,
         usdc_recheck,
+        cctp_mint_recovery,
         usdc_driver_pause,
         usdc_store,
     });
@@ -1032,6 +1035,7 @@ impl Conductor {
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck,
+            cctp_mint_recovery,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
             wrapped_equity_recovery_store,
@@ -1218,6 +1222,7 @@ impl Conductor {
             recovery_redemption_store,
             recovery_service,
             usdc_recheck,
+            cctp_mint_recovery,
             usdc_driver_pause,
             recovery_usdc_store,
         );
@@ -1784,6 +1789,9 @@ struct RebalancingInfrastructure {
     /// Operator `transfer recheck` entry point for a failed USDC deposit,
     /// published on the recovery handle.
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    /// Operator `cctp complete-mint` entry point, published on the recovery
+    /// handle.
+    cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     /// Operator pause control for the USDC driver, published on the recovery
     /// handle so a write route can quiesce the workers before it mutates.
     pub(crate) usdc_driver_pause: Arc<UsdcDriverPause>,
@@ -1835,6 +1843,7 @@ struct PositionAndRebalancing {
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     usdc_driver_pause: Arc<UsdcDriverPause>,
     usdc_store: Arc<Store<UsdcRebalance>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
@@ -2042,6 +2051,7 @@ impl PositionAndRebalancing {
             service: infra.service,
             recovery_transfer: infra.recovery_transfer,
             usdc_recheck: infra.usdc_recheck,
+            cctp_mint_recovery: infra.cctp_mint_recovery,
             usdc_driver_pause: infra.usdc_driver_pause,
             usdc_store: infra.usdc_store,
             wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
@@ -3231,6 +3241,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck: usdc_handles.recheck_deposit,
+            cctp_mint_recovery: usdc_handles.recover_cctp_mint,
             usdc_driver_pause: Arc::new(usdc_driver_pause),
             usdc_store: recovery_usdc_store,
             wrapped_equity_recovery_store,
@@ -5532,7 +5543,7 @@ mod tests {
         ResumeTokenizationJobQueue, ResumeTokenizationTarget, TransferEquityToHedging,
         TransferEquityToMarketMaking,
     };
-    use crate::rebalancing::usdc::UsdcRecheckError;
+    use crate::rebalancing::usdc::{CctpMintRecoveryError, RecoveredCctpMint, UsdcRecheckError};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService};
     use crate::test_utils::{
         OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_log, get_test_order,
@@ -15793,6 +15804,17 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl RecoverCctpMint for NeverCalledUsdcRecheck {
+        async fn recover_cctp_mint(
+            &self,
+            _direction: st0x_bridge::BridgeDirection,
+            _burn_tx: TxHash,
+        ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
+            panic!("cctp mint recovery must not be called in this test")
+        }
+    }
+
     /// The collapse to the single always-rebalancing topology makes every
     /// half of the recovery handle concrete, so publishing after startup
     /// must always populate the OnceCell backing `/transfers/resume` (the
@@ -15818,6 +15840,7 @@ mod tests {
         let usdc_recheck: Arc<dyn RecheckUsdcDeposit> = Arc::new(NeverCalledUsdcRecheck);
         let usdc_driver_pause = Arc::new(usdc_driver_pause().0);
         let usdc_store = Arc::new(test_store::<UsdcRebalance>(pool, ()));
+        let cctp_mint_recovery: Arc<dyn RecoverCctpMint> = Arc::new(NeverCalledUsdcRecheck);
 
         let recovery_cell = tokio::sync::OnceCell::new();
 
@@ -15828,6 +15851,7 @@ mod tests {
             redemption_store.clone(),
             rebalancing_service.clone(),
             usdc_recheck,
+            cctp_mint_recovery,
             usdc_driver_pause.clone(),
             usdc_store.clone(),
         );

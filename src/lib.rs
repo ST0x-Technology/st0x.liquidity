@@ -77,6 +77,7 @@ mod unwrapped_equity_recovery;
 mod usdc_rebalance;
 mod vault_lookup;
 mod vault_registry;
+mod view_rebuild;
 mod wrapped_equity_recovery;
 
 pub use st0x_config::{

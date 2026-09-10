@@ -29,7 +29,6 @@ use tracing::info;
 use uuid::Uuid;
 
 use st0x_config::{Ctx, Env};
-use st0x_event_sorcery::Projection;
 use st0x_evm::{Chain, OpenChainErrorRegistry};
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
@@ -38,13 +37,8 @@ use st0x_registry::SymbolCache;
 
 #[cfg(test)]
 use st0x_hedge::operator::bot_gas::BotGasReceiptCostEnqueuer;
-use st0x_hedge::operator::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
-use st0x_hedge::operator::performance::equity_timing::EquityTimingProjection;
-use st0x_hedge::operator::performance::rebalance::RebalanceTimingProjection;
-use st0x_hedge::operator::performance::reliability::LifecycleFailureProjection;
-use st0x_hedge::operator::portfolio_snapshot::PortfolioSnapshotProjection;
-use st0x_hedge::operator::position::Position;
-use st0x_hedge::operator::vault_registry::VaultRegistry;
+use st0x_hedge::operator::offchain::order::{OffchainOrderId, OrderPlacer};
+use st0x_hedge::operator::view_rebuild::{self, RebuildScope};
 
 /// Direction for transferring assets between trading venues.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -133,30 +127,9 @@ pub enum ReconcileKind {
     Redemption,
 }
 
-/// Read models rebuildable by replaying events from scratch.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum AggregateView {
-    /// Position aggregate (position_view)
-    Position,
-    /// Offchain order aggregate (offchain_order_view)
-    OffchainOrder,
-    /// Vault registry aggregate (vault_registry_view)
-    VaultRegistry,
-    /// Rebalance stage-timing read model (rebalance_stage_timing). Replays every
-    /// `UsdcRebalance` event stream through the reactor fold. Supports `--all` only.
-    RebalanceTiming,
-    /// Equity mint/redemption stage-timing read model (equity_stage_timing).
-    /// Replays every `TokenizedEquityMint`/`EquityRedemption` event stream
-    /// through the reactor fold. Supports `--all` only.
-    EquityTiming,
-    /// Lifecycle-failure read model (lifecycle_failure_event). Replays every
-    /// failure across all four subscribed streams through the reactor fold.
-    /// Supports `--all` only.
-    LifecycleFailure,
-    /// Daily portfolio snapshot read model. Replays captures and every audited
-    /// historical-mark correction. Supports `--all` only.
-    PortfolioSnapshot,
-}
+/// Read models rebuildable by replaying events from scratch; the one
+/// definition shared with the ops API route.
+pub use st0x_hedge::operator::view_rebuild::RebuildableView as AggregateView;
 
 /// CCTP chain identifier for specifying source chain.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1905,121 +1878,37 @@ async fn rebuild_view<W: Write>(
     id: Option<String>,
     all: bool,
 ) -> anyhow::Result<()> {
-    match aggregate {
-        AggregateView::Position => {
-            let projection = Projection::<Position>::sqlite(pool.clone());
-
-            if let Some(raw_id) = id {
-                let symbol: Symbol = raw_id.parse()?;
-                projection.rebuild(&symbol).await?;
-                writeln!(stdout, "Rebuilt position view for {symbol}")?;
-            } else if all {
-                projection.rebuild_all().await?;
-                writeln!(stdout, "Rebuilt all position views")?;
-            }
+    // Clap enforces exactly one of --id / --all; the read models additionally
+    // refuse --id. Validate here so the operator sees the flag names rather
+    // than the library's neutral wording.
+    if !aggregate.supports_single_id() {
+        if id.is_some() {
+            anyhow::bail!("{aggregate} rebuild replays the whole read model; pass --all, not --id");
         }
-        AggregateView::OffchainOrder => {
-            let projection = Projection::<OffchainOrder>::sqlite(pool.clone());
-
-            if let Some(raw_id) = id {
-                let order_id: OffchainOrderId = raw_id.parse()?;
-                projection.rebuild(&order_id).await?;
-                writeln!(stdout, "Rebuilt offchain order view for {order_id}")?;
-            } else if all {
-                projection.rebuild_all().await?;
-                writeln!(stdout, "Rebuilt all offchain order views")?;
-            }
+        if !all {
+            anyhow::bail!("{aggregate} rebuild replays the whole read model; pass --all");
         }
-        AggregateView::VaultRegistry => {
-            let projection = Projection::<VaultRegistry>::sqlite(pool.clone());
+    }
 
-            if let Some(raw_id) = id {
-                let registry_id = raw_id.parse()?;
-                projection.rebuild(&registry_id).await?;
-                writeln!(stdout, "Rebuilt vault registry view for {raw_id}")?;
-            } else if all {
-                projection.rebuild_all().await?;
-                writeln!(stdout, "Rebuilt all vault registry views")?;
-            }
-        }
-        AggregateView::RebalanceTiming => {
-            if id.is_some() {
-                anyhow::bail!(
-                    "rebalance-timing rebuild replays the whole read model; pass --all, not --id"
-                );
-            }
+    let scope = id.map_or(RebuildScope::All, RebuildScope::Id);
+    let rebuilt = view_rebuild::rebuild_view(pool, aggregate, scope).await?;
 
-            if !all {
-                anyhow::bail!("rebalance-timing rebuild replays the whole read model; pass --all");
-            }
-
-            let replayed = RebalanceTimingProjection::new(pool.clone())
-                .rebuild_all()
-                .await?;
-            writeln!(
-                stdout,
-                "Rebuilt rebalance stage-timing read model ({replayed} events replayed)"
-            )?;
-        }
-        AggregateView::EquityTiming => {
-            if id.is_some() {
-                anyhow::bail!(
-                    "equity-timing rebuild replays the whole read model; pass --all, not --id"
-                );
-            }
-
-            if !all {
-                anyhow::bail!("equity-timing rebuild replays the whole read model; pass --all");
-            }
-
-            let replayed = EquityTimingProjection::new(pool.clone())
-                .rebuild_all()
-                .await?;
-            writeln!(
-                stdout,
-                "Rebuilt equity stage-timing read model ({replayed} events replayed)"
-            )?;
-        }
-        AggregateView::LifecycleFailure => {
-            if id.is_some() {
-                anyhow::bail!(
-                    "lifecycle-failure rebuild replays the whole read model; pass --all, not --id"
-                );
-            }
-
-            if !all {
-                anyhow::bail!("lifecycle-failure rebuild replays the whole read model; pass --all");
-            }
-
-            let replayed = LifecycleFailureProjection::new(pool.clone())
-                .rebuild_all()
-                .await?;
-            writeln!(
-                stdout,
-                "Rebuilt lifecycle-failure read model ({replayed} events replayed)"
-            )?;
-        }
-        AggregateView::PortfolioSnapshot => {
-            if id.is_some() {
-                anyhow::bail!(
-                    "portfolio-snapshot rebuild replays the whole read model; pass --all, not --id"
-                );
-            }
-
-            if !all {
-                anyhow::bail!(
-                    "portfolio-snapshot rebuild replays the whole read model; pass --all"
-                );
-            }
-
-            let replayed = PortfolioSnapshotProjection::new(pool.clone())
-                .rebuild_all()
-                .await?;
-            writeln!(
-                stdout,
-                "Rebuilt portfolio-snapshot read model ({replayed} events replayed)"
-            )?;
-        }
+    let label = match rebuilt.view {
+        AggregateView::Position => "position",
+        AggregateView::OffchainOrder => "offchain order",
+        AggregateView::VaultRegistry => "vault registry",
+        AggregateView::RebalanceTiming => "rebalance stage-timing",
+        AggregateView::EquityTiming => "equity stage-timing",
+        AggregateView::LifecycleFailure => "lifecycle-failure",
+        AggregateView::PortfolioSnapshot => "portfolio-snapshot",
+    };
+    match (rebuilt.scope, rebuilt.replayed) {
+        (RebuildScope::Id(id), _) => writeln!(stdout, "Rebuilt {label} view for {id}")?,
+        (RebuildScope::All, None) => writeln!(stdout, "Rebuilt all {label} views")?,
+        (RebuildScope::All, Some(replayed)) => writeln!(
+            stdout,
+            "Rebuilt {label} read model ({replayed} events replayed)"
+        )?,
     }
 
     Ok(())
@@ -2191,7 +2080,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{BrokerCtx, LogFormat, LogLevel};
     use st0x_config::{IngestionCutoff, InventoryMode, TradingChain};
-    use st0x_event_sorcery::StoreBuilder;
+    use st0x_event_sorcery::{Projection, StoreBuilder};
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_float_macro::float;
     use st0x_tokenization::IssuerRequestId;
@@ -2203,6 +2092,7 @@ mod tests {
     use st0x_hedge::operator::native_gas::ConfiguredGasReadiness;
     use st0x_hedge::operator::offchain::order::OffchainOrderEvent;
     use st0x_hedge::operator::onchain::mock::MockRaindex;
+    use st0x_hedge::operator::position::Position;
     use st0x_hedge::operator::rebalancing::equity::{ChainEquityServices, EquityTransferServices};
     use st0x_hedge::operator::test_utils::{try_positive_shares, try_setup_test_db};
     use st0x_hedge::operator::tokenized_equity_mint::{
