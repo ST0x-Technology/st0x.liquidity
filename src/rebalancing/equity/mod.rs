@@ -2342,15 +2342,17 @@ impl CrossVenueEquityTransfer {
 #[cfg(test)]
 mod tests {
     use crate::inventory::PollFreshness;
-    use alloy::primitives::{Address, B256, address};
+    use alloy::primitives::{Address, B256, Bytes, address};
+    use async_trait::async_trait;
     use chrono::Utc;
+    use rain_math_float::Float;
     use sqlx::SqlitePool;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::broadcast;
 
-    use st0x_config::{ChainAssets, ChainEquities};
+    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_dto::Statement;
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_evm::Chain;
@@ -2370,7 +2372,10 @@ mod tests {
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };
-    use crate::mint_authorization::{MockMintAuthorizer, StubVaultModeReader};
+    use crate::mint_authorization::{
+        MintAuthorizationError, MintAuthorizer, MockMintAuthorizer, SignedMintAuthorization,
+        StubVaultModeReader,
+    };
     use crate::native_gas::GasReadiness;
     use crate::onchain::mock::{DepositBehavior, DepositCall, MockRaindex};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
@@ -3994,10 +3999,29 @@ mod tests {
         );
     }
 
+    /// A chain's equity table listing one symbol at `tokenized_equity`.
+    fn equities_listing(symbol: &str, tokenized_equity: Address) -> ChainEquities {
+        ChainEquities {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                Symbol::new(symbol).unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            )]),
+        }
+    }
+
     /// Builds a transfer with full mint-authorization wiring: a stubbed
-    /// vault-mode reader, a token map for AAPL, an Enabled mock authorizer
-    /// in the aggregate services, and a real (in-memory) delivery queue.
-    /// Returns the event pool and the apalis pool for assertions.
+    /// vault-mode reader, an Enabled mock authorizer on Base listing AAPL,
+    /// and a real (in-memory) delivery queue. Returns the event pool and
+    /// the apalis pool for assertions.
     async fn create_authorization_wired_transfer(
         mode: VaultModeTag,
     ) -> (
@@ -4005,18 +4029,36 @@ mod tests {
         SqlitePool,
         apalis_sqlite::SqlitePool,
     ) {
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let mut services = mock_services();
         for chain_services in services.chains.values_mut() {
             chain_services.mint_authorizer =
                 ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer));
+            chain_services.equities = equities_listing("AAPL", Address::repeat_byte(0x11));
         }
 
+        authorization_wired_transfer(services, mode).await
+    }
+
+    /// Wires mint authorization onto `services` the way the conductor does:
+    /// the token map is the primary (Base) entry's equity table.
+    async fn authorization_wired_transfer(
+        services: EquityTransferServices,
+        mode: VaultModeTag,
+    ) -> (
+        CrossVenueEquityTransfer,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
+    ) {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), services.clone()));
 
-        let mut token_addresses = HashMap::new();
-        token_addresses.insert(Symbol::new("AAPL").unwrap(), Address::repeat_byte(0x11));
+        let token_addresses = services.chains[&Chain::Base]
+            .equities
+            .symbols
+            .iter()
+            .map(|(symbol, equity)| (symbol.clone(), equity.tokenized_equity))
+            .collect();
 
         let transfer =
             CrossVenueEquityTransfer::new(services.clone(), mint_store, redemption_store)
@@ -4027,6 +4069,76 @@ mod tests {
                 });
 
         (transfer, pool, apalis_pool)
+    }
+
+    /// Test authorizer that keeps every token it was asked to bind, so a
+    /// test can tell which chain's tokenized equity an authorization names.
+    #[derive(Default)]
+    struct RecordingMintAuthorizer {
+        bound_tokens: Mutex<Vec<Address>>,
+    }
+
+    #[async_trait]
+    impl MintAuthorizer for RecordingMintAuthorizer {
+        async fn sign_mint_authorization(
+            &self,
+            token: Address,
+            _quantity: Float,
+            nonce: B256,
+        ) -> Result<SignedMintAuthorization, MintAuthorizationError> {
+            self.bound_tokens.lock().unwrap().push(token);
+            Ok(SignedMintAuthorization {
+                nonce,
+                signature: Bytes::from(vec![0x42; 65]),
+            })
+        }
+    }
+
+    /// An orchestrator-mode mint recorded on Ethereum binds Ethereum's
+    /// tokenized-equity address, never Base's: the same symbol is a
+    /// different contract on each chain, and a MintAuth over the wrong one
+    /// authorizes nothing the issuer will mint.
+    #[tokio::test]
+    async fn an_ethereum_mint_authorization_binds_ethereums_token_address() {
+        let base_token = Address::repeat_byte(0xba);
+        let ethereum_token = Address::repeat_byte(0xe7);
+        let ethereum_authorizer = Arc::new(RecordingMintAuthorizer::default());
+        let mut services = mock_services();
+        services.chains.get_mut(&Chain::Base).unwrap().equities =
+            equities_listing("AAPL", base_token);
+        let mut ethereum = chain_services(Arc::new(MockTokenizer::new()));
+        ethereum.mint_authorizer = ConfiguredMintAuthorizer::Enabled(ethereum_authorizer.clone());
+        ethereum.equities = equities_listing("AAPL", ethereum_token);
+        services.chains.insert(Chain::Ethereum, ethereum);
+        let (transfer, _pool, _apalis_pool) =
+            authorization_wired_transfer(services, VaultModeTag::Orchestrator).await;
+
+        let id = issuer_request_id("ISS-ETHEREUM-AUTH");
+        let symbol = Symbol::new("AAPL").unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Ethereum,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        submit_requested_mint(&transfer, &id).await;
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        let bound_tokens = ethereum_authorizer.bound_tokens.lock().unwrap().clone();
+        assert_eq!(
+            bound_tokens,
+            vec![ethereum_token],
+            "the authorization must bind Ethereum's tokenized equity, not Base's {base_token}"
+        );
     }
 
     async fn count_events(pool: &SqlitePool, event_type: &str) -> i64 {
