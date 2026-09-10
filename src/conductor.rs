@@ -5445,30 +5445,40 @@ mod tests {
         );
     }
 
-    fn hedged_chain_with_equity(symbol: &str, token: Address) -> HedgedChain {
-        let mut trading = create_test_ctx_with_order_owner(Address::ZERO)
+    /// A hedged chain carrying the given equities, each named by its symbol,
+    /// its unwrapped token and its wrapped share. Rebalancing stays off, so a
+    /// chain's role alone decides whether its unwrapped tokens are used.
+    fn hedged_chain_with_equities<'symbols>(
+        equities: impl IntoIterator<Item = (&'symbols str, Address, Address)>,
+    ) -> HedgedChain {
+        let mut hedged = create_test_ctx_with_order_owner(Address::ZERO)
             .chains
             .primary()
             .clone();
-        trading.assets = ChainAssets {
+        hedged.assets = ChainAssets {
             equities: ChainEquities {
                 operational_limit: None,
-                symbols: HashMap::from([(
-                    Symbol::new(symbol).unwrap(),
-                    ChainEquityAsset {
-                        tokenized_equity: token,
-                        tokenized_equity_derivative: Address::ZERO,
-                        vault_ids: vec![],
-                        trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
-                        wrapped_equity_recovery: OperationMode::Disabled,
-                        operational_limit: None,
-                    },
-                )]),
+                symbols: equities
+                    .into_iter()
+                    .map(|(symbol, unwrapped, wrapped)| {
+                        (
+                            Symbol::new(symbol).unwrap(),
+                            ChainEquityAsset {
+                                tokenized_equity: unwrapped,
+                                tokenized_equity_derivative: wrapped,
+                                vault_ids: vec![],
+                                trading: OperationMode::Enabled,
+                                rebalancing: OperationMode::Disabled,
+                                wrapped_equity_recovery: OperationMode::Disabled,
+                                operational_limit: None,
+                            },
+                        )
+                    })
+                    .collect(),
             },
             cash: None,
         };
-        trading
+        hedged
     }
 
     #[tokio::test]
@@ -5480,10 +5490,11 @@ mod tests {
             ),
         );
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-        let trading = hedged_chain_with_equity(
+        let trading = hedged_chain_with_equities([(
             "AAPL",
             address!("0x1111111111111111111111111111111111111111"),
-        );
+            address!("0x2222222222222222222222222222222222222222"),
+        )]);
 
         confirm_configured_asset_responds(&provider, &trading)
             .await
@@ -5498,10 +5509,11 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("connection reset by peer");
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-        let trading = hedged_chain_with_equity(
+        let trading = hedged_chain_with_equities([(
             "AAPL",
             address!("0x1111111111111111111111111111111111111111"),
-        );
+            address!("0x2222222222222222222222222222222222222222"),
+        )]);
 
         let error = confirm_configured_asset_responds(&provider, &trading)
             .await
@@ -5557,14 +5569,16 @@ mod tests {
     #[tokio::test]
     async fn asset_canary_runs_on_every_hedged_chain() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        *ctx.chains.primary_mut() = hedged_chain_with_equity(
+        *ctx.chains.primary_mut() = hedged_chain_with_equities([(
             "AAPL",
             address!("0x1111111111111111111111111111111111111111"),
-        );
-        let mut secondary = hedged_chain_with_equity(
+            address!("0x3333333333333333333333333333333333333333"),
+        )]);
+        let mut secondary = hedged_chain_with_equities([(
             "MSFT",
             address!("0x2222222222222222222222222222222222222222"),
-        );
+            address!("0x4444444444444444444444444444444444444444"),
+        )]);
         secondary.chain = Chain::Ethereum;
         ctx.chains.insert_secondary(secondary);
 
@@ -5599,6 +5613,134 @@ mod tests {
             "the error must name the secondary chain and its symbol: {message}"
         );
     }
+
+    /// A hedge-only chain touches the wrapped share and nothing else: the
+    /// vault registry and the symbol cache key on it, so a fill there cannot
+    /// be recognised when that address is wrong. The canary must read it.
+    #[tokio::test]
+    async fn asset_canary_probes_the_wrapped_share_on_a_hedge_only_chain() {
+        let unwrapped = Address::repeat_byte(0x11);
+        let wrapped = Address::repeat_byte(0x22);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary = hedged_chain_with_equities([("MSFT", unwrapped, wrapped)]);
+        secondary.chain = Chain::Ethereum;
+        ctx.chains.insert_secondary(secondary);
+
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Base));
+        let secondary_asserter = hedged_chain_asserter(Chain::Ethereum);
+        secondary_asserter.push_failure_msg("connection reset by peer");
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(secondary_asserter),
+        )]);
+
+        let error = startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&wrapped.to_string()),
+            "the refusal must name the wrapped share that did not answer: {message}"
+        );
+        assert!(
+            message.contains("MSFT") && message.contains("ethereum"),
+            "the refusal must name the chain and the symbol: {message}"
+        );
+        assert!(
+            message.contains("wrong address, wrong chain, or a broken endpoint"),
+            "the refusal must keep naming the three ways this goes wrong: {message}"
+        );
+    }
+
+    /// A chain that rebalances equity mints, redeems, wraps and unwraps the
+    /// unwrapped token, so a wrapped share that answers is not enough there.
+    #[tokio::test]
+    async fn asset_canary_probes_the_unwrapped_token_where_equity_rebalances() {
+        let unwrapped = Address::repeat_byte(0x11);
+        let wrapped = Address::repeat_byte(0x22);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        *ctx.chains.primary_mut() = hedged_chain_with_equities([("AAPL", unwrapped, wrapped)]);
+
+        let asserter = hedged_chain_asserter(Chain::Base);
+        asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &18u8,
+            ),
+        );
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = startup_smoke_checks(&MockExecutor::new(), &provider, &BTreeMap::new(), &ctx)
+            .await
+            .expect_err("a rebalancing chain whose unwrapped token is dead must refuse startup");
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&unwrapped.to_string()),
+            "the refusal must name the unwrapped token that did not answer: {message}"
+        );
+        assert!(
+            message.contains("AAPL") && message.contains("base"),
+            "the refusal must name the chain and the symbol: {message}"
+        );
+    }
+
+    /// Every equity on the chain is probed, not just the first by symbol, and
+    /// a hedge-only chain reads no unwrapped token at all: nothing there mints,
+    /// redeems, wraps or unwraps, so that address plays no part.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn asset_canary_reads_every_wrapped_share_and_no_unwrapped_token_when_hedge_only() {
+        let apple_unwrapped = Address::repeat_byte(0x11);
+        let apple_wrapped = Address::repeat_byte(0x22);
+        let microsoft_unwrapped = Address::repeat_byte(0x33);
+        let microsoft_wrapped = Address::repeat_byte(0x44);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary = hedged_chain_with_equities([
+            ("AAPL", apple_unwrapped, apple_wrapped),
+            ("MSFT", microsoft_unwrapped, microsoft_wrapped),
+        ]);
+        secondary.chain = Chain::Ethereum;
+        ctx.chains.insert_secondary(secondary);
+
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Base));
+        // Two answers for two wrapped shares: a third read would find the
+        // queue empty and fail startup, which is the assertion that no
+        // unwrapped token is read here.
+        let secondary_asserter = hedged_chain_asserter(Chain::Ethereum);
+        for decimals in [18u8, 6u8] {
+            secondary_asserter.push_success(
+                &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                    &decimals,
+                ),
+            );
+        }
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(secondary_asserter),
+        )]);
+
+        startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            logs_contain(&apple_wrapped.to_string()),
+            "the first equity's wrapped share must be read and logged"
+        );
+        assert!(
+            logs_contain(&microsoft_wrapped.to_string()),
+            "the second equity's wrapped share must be read and logged"
+        );
+        assert!(
+            !logs_contain(&apple_unwrapped.to_string()),
+            "a hedge-only chain must not read an unwrapped token"
+        );
+    }
+
     /// The durable double-hedge guard keys on the full chain-qualified fill
     /// identity: the same (tx_hash, log_index) on another chain is a distinct
     /// fill, never a duplicate (SPEC multi-chain invariant 3), while the same
