@@ -138,32 +138,36 @@ Every chain the bot touches is declared under `[chains.<name>]` with a
 config carries a `[chains.<name>.trading]` table is a **watched** chain: the bot
 runs a fill watcher against its order book and accounts its fills. Exactly one
 watched chain must set `primary = true` on that table -- the **primary** chain
-is the chain whose inventory the bot polls and rebalances automatically (Base);
-fills are hedged on every watched chain. A secondary chain's fill updates that
+is the chain the bot rebalances automatically (Base); fills are hedged, and
+vault balances are polled, on every watched chain. Vault balance polling runs
+once per watched chain, each on that chain's own Raindex service, its own
+chain-qualified vault registry and one pinned block, so every watched chain's
+inventory slot is seeded and corrected. A secondary chain's fill updates that
 chain's own inventory slot and never triggers the primary chain's rebalancing
 check: inventory is not fungible across chains, and a secondary is prefunded.
-The distinction exists so that fill watching can go multi-chain before inventory
-management does: it names the chain the still-single-chain paths use. Once
-inventory polling and rebalancing are per chain (global rebalancer, USDC
-corridors), `primary` shrinks to the operator's default chain, or is removed.
-Zero or multiple primary claimants fail startup with a named error. Chains
-without a trading table are **transport** chains (RPC + confirmations only, e.g.
-Ethereum while it only carries CCTP transfers). Watch settings are per chain:
-poll interval, ingestion cutoff, asset tables with per-chain enable/disable
-flags. The periodic position check sweeps a symbol when any watched chain
-enables it and sizes the hedge with the tightest operational limit among those
-chains (one `Position` per symbol cannot say which chain its fills came from;
-the remainder is hedged on a later tick). Startup verifies every watched chain
-(chain-id identity, cutoff support, and one configured asset answering
-`decimals()` on that chain's own endpoint) and any failure is fatal; degraded
-per-chain startup is deferred to the chain-disable work.
+The distinction exists so that fill watching and inventory polling can go
+multi-chain before rebalancing does: it names the chain the still-single-chain
+paths use. Once rebalancing is per chain (global rebalancer, USDC corridors),
+`primary` shrinks to the operator's default chain, or is removed. Zero or
+multiple primary claimants fail startup with a named error. Chains without a
+trading table are **transport** chains (RPC + confirmations only, e.g. Ethereum
+while it only carries CCTP transfers). Watch settings are per chain: poll
+interval, ingestion cutoff, asset tables with per-chain enable/disable flags.
+The periodic position check sweeps a symbol when any watched chain enables it
+and sizes the hedge with the tightest operational limit among those chains (one
+`Position` per symbol cannot say which chain its fills came from; the remainder
+is hedged on a later tick). Startup verifies every watched chain (chain-id
+identity, cutoff support, and one configured asset answering `decimals()` on
+that chain's own endpoint) and any failure is fatal; degraded per-chain startup
+is deferred to the chain-disable work.
 
 HyperEVM supports prefunded fill ingestion and hedging as a watched secondary
 with manually funded equity, USDC and native HYPE gas. Configuring HyperEVM as
 the primary chain fails validation. Its canonical USDC is
 `0xb88339CB7199b77E23DB6E890353E22632Ba630f` (6 decimals). HyperEVM does not
 provide gas valuation or automated rebalancing capabilities; `active` remains
-unavailable. Automated inventory polling and rebalancing remain on Base.
+unavailable. Its vault balances are polled like any watched chain's; automated
+rebalancing remains on Base.
 
 The tokenization services are built per watched chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
@@ -1438,13 +1442,16 @@ genuine zero balance still produces a `0` row. The capture only proceeds once
 every configured balance has been polled at least once that run -- a
 partially-hydrated view (e.g. equity seen onchain but not yet offchain) is
 skipped and retried shortly after, since a captured day can never be amended.
-This is a PRESENCE check, not a freshness check: a balance that is merely
-present (e.g. replayed from a persisted `InventorySnapshot` at startup, without
-ever being re-polled this run) still satisfies it on its own. An earlier attempt
-at a time-window freshness gate was reverted: the underlying `InventorySnapshot`
-suppresses events, and their watermarks, on unchanged balances, so tying
-freshness to that watermark freezes on a static book and the window would
-eventually block every future capture.
+The required market-making balances are per watched chain: each chain requires
+the equities and the cash its own assets table declares, so a chain the poller
+reads is a chain the capture waits for. This is a PRESENCE check, not a
+freshness check: a balance that is merely present (e.g. replayed from a
+persisted `InventorySnapshot` at startup, without ever being re-polled this run)
+still satisfies it on its own. An earlier attempt at a time-window freshness
+gate was reverted: the underlying `InventorySnapshot` suppresses events, and
+their watermarks, on unchanged balances, so tying freshness to that watermark
+freezes on a static book and the window would eventually block every future
+capture.
 
 A vault-registry symbol can outlive its config entry (registry seeds are
 permanent events, config entries are not), and such a symbol has no wrapper
