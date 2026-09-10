@@ -1277,6 +1277,24 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
+        // The sweep relatches, clears, and re-arms under the guard an operator
+        // operation may be mutating, and it runs from the check job, the
+        // equity check, and inline on the snapshot reactor. Claim the driver
+        // without parking so a pause waits for an active sweep and a held
+        // pause skips the sweep; the next caller sweeps once it resumes.
+        let _in_flight = if let Some(gate) = self.usdc_driver_gate.get() {
+            let Some(in_flight) = gate.try_enter() else {
+                debug!(
+                    target: "rebalance",
+                    "Skipping stuck USDC sweep: driver paused by an operator operation"
+                );
+                return Ok(());
+            };
+            Some(in_flight)
+        } else {
+            None
+        };
+
         // Select ids to examine this tick. The selection is intentionally broad:
         //
         // - Post-burn entries are ALWAYS selected regardless of elapsed time.
@@ -3436,20 +3454,22 @@ impl RebalancingService {
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
-        // An operator operation holding the driver quiesced must not see a
-        // fresh transfer row or a sweep that relatches, clears, or re-arms
-        // under it. The check is enqueued again by the next fill or snapshot.
-        if self
-            .usdc_driver_gate
-            .get()
-            .is_some_and(UsdcDriverGate::is_paused)
-        {
-            debug!(
-                target: "rebalance",
-                "Skipping USDC rebalancing check: driver paused by an operator operation"
-            );
-            return;
-        }
+        // Hold a claim on the driver for the whole check so an operator
+        // operation's pause waits for an active check, and a held pause skips
+        // it: neither a fresh transfer row nor a sweep lands under the
+        // operation. The check is enqueued again by the next fill or snapshot.
+        let _in_flight = if let Some(gate) = self.usdc_driver_gate.get() {
+            let Some(in_flight) = gate.try_enter() else {
+                debug!(
+                    target: "rebalance",
+                    "Skipping USDC rebalancing check: driver paused by an operator operation"
+                );
+                return;
+            };
+            Some(in_flight)
+        } else {
+            None
+        };
 
         self.expire_stuck_operations_with_logging().await;
 
