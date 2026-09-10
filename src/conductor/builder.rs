@@ -1502,7 +1502,10 @@ mod tests {
         ResumeEquityToHedging, ResumeEquityToMarketMaking,
     };
     use crate::rebalancing::trigger::{GuardGeneration, GuardState, InProgressGuard};
-    use crate::rebalancing::usdc::{ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcTransferError};
+    use crate::rebalancing::usdc::{
+        PreflightAlertGate, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcGuardRelease,
+        UsdcTransferError,
+    };
     use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
     use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_lookup::MockVaultLookup;
@@ -1690,6 +1693,13 @@ mod tests {
     struct PoisonThenHealthyMintResume {
         poison_id: IssuerRequestId,
         healthy_completed: Arc<tokio::sync::Notify>,
+    }
+
+    struct NoopGuardRelease;
+
+    #[async_trait]
+    impl UsdcGuardRelease for NoopGuardRelease {
+        async fn release_unless_durably_held(&self) {}
     }
 
     struct PoisonThenHealthyUsdcResume {
@@ -2008,6 +2018,8 @@ mod tests {
             job_queue: queue.clone(),
             max_burn_revert_redrives: 1,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         });
         let monitor = register_transfer_usdc_to_market_making_worker(
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),
