@@ -168,10 +168,10 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) failure_injector: FailureInjector,
 }
 
-/// The configured equity symbols plus the equity/USDC vaults the inventory
-/// poller watches, derived from the assets config.
-struct ConfiguredInventoryVaults {
-    equity_symbols: HashSet<Symbol>,
+/// The equity and USDC vaults one watched chain's assets table configures.
+/// The inventory poller checks its retired-vault warnings against these: a
+/// registered vault outside the set is one the config no longer names.
+struct ConfiguredChainVaults {
     equity_vaults: BTreeMap<Address, BTreeSet<B256>>,
     usdc_vaults: Option<BTreeSet<B256>>,
 }
@@ -193,61 +193,78 @@ pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
         .collect()
 }
 
-fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
-    let equity_symbols = configured_equity_symbols(ctx);
-
+fn configured_chain_vaults(watched: &st0x_config::TradingChain) -> ConfiguredChainVaults {
     let mut equity_vaults: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
-    for equity_config in ctx.chains.primary().assets.equities.symbols.values() {
+    for equity_config in watched.assets.equities.symbols.values() {
         equity_vaults
             .entry(equity_config.tokenized_equity_derivative)
             .or_default()
             .extend(equity_config.vault_ids.iter().copied());
     }
 
-    let usdc_vaults = ctx
-        .chains
-        .primary()
+    let usdc_vaults = watched
         .assets
         .cash
         .as_ref()
         .map(|cash| cash.vault_ids.iter().copied().collect());
 
-    ConfiguredInventoryVaults {
-        equity_symbols,
+    ConfiguredChainVaults {
         equity_vaults,
         usdc_vaults,
     }
 }
 
-/// The vault-reading leg of the inventory poller, one entry per chain whose
-/// vaults it reads. Each entry carries that chain's own Raindex service, its
-/// own orderbook and vault owner (which key its chain-qualified vault
-/// registry), and the configured vault sets its retired-vault warnings check
-/// against.
+/// The vault-reading leg of the inventory poller, one entry per watched
+/// chain. Each entry carries that chain's own Raindex service on that chain's
+/// own provider, its own orderbook and vault owner (which key its
+/// chain-qualified vault registry), and the vaults its own assets table
+/// configures -- the set its retired-vault warnings check against.
+///
+/// Without an entry a chain's inventory slots stay empty for the process
+/// lifetime: nothing corrects drift there and no fill-absorption watermark
+/// ever advances.
 fn vault_polling_entries<Prov>(
     ctx: &Ctx,
     primary_provider: &Prov,
-    configured_equity_vaults: BTreeMap<Address, BTreeSet<B256>>,
-    configured_usdc_vaults: Option<BTreeSet<B256>>,
+    watch_providers: &std::collections::BTreeMap<Chain, Prov>,
 ) -> Result<Vec<ChainVaultPolling<ReadOnlyEvm<Prov>>>, ConductorSpawnError>
 where
     Prov: Provider + Clone + Send + Sync + 'static,
 {
-    let primary = ctx.chains.primary();
+    let primary_chain = ctx.chains.primary().chain;
 
-    Ok(vec![
-        ChainVaultPolling::new(
-            primary.chain,
-            Arc::new(RaindexService::new(
-                ReadOnlyEvm::new(primary_provider.clone()),
-                crate::onchain::raindex_contracts(primary),
-                ctx.order_owner(),
-            )),
-            primary.orderbook,
-            primary.vault_owner,
-        )
-        .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults),
-    ])
+    ctx.chains
+        .watched()
+        .map(|watched| {
+            let chain = watched.chain;
+            let provider = if chain == primary_chain {
+                primary_provider.clone()
+            } else {
+                watch_providers.get(&chain).cloned().ok_or(
+                    ConductorSpawnError::MissingWatchWiring {
+                        chain,
+                        what: "vault polling provider",
+                    },
+                )?
+            };
+            let ConfiguredChainVaults {
+                equity_vaults,
+                usdc_vaults,
+            } = configured_chain_vaults(watched);
+
+            Ok(ChainVaultPolling::new(
+                chain,
+                Arc::new(RaindexService::new(
+                    ReadOnlyEvm::new(provider),
+                    crate::onchain::raindex_contracts(watched),
+                    ctx.order_owner(),
+                )),
+                watched.orderbook,
+                watched.vault_owner,
+            )
+            .with_configured_vaults(equity_vaults, usdc_vaults))
+        })
+        .collect()
 }
 
 /// Wires all runtime components and returns a running [`Conductor`].
@@ -322,11 +339,7 @@ where
         owner: order_owner,
     };
 
-    let ConfiguredInventoryVaults {
-        equity_symbols: configured_equity_symbols,
-        equity_vaults: configured_equity_vaults,
-        usdc_vaults: configured_usdc_vaults,
-    } = configured_inventory_vaults(&context.ctx);
+    let configured_equity_symbols = configured_equity_symbols(&context.ctx);
 
     // The snapshot capture gate below must require exactly the wallet slots
     // this poller populates, so both derive from this single Option: the
@@ -344,12 +357,7 @@ where
     let polling_service = Arc::new(
         InventoryPollingService::new(
             poll_freshness.clone(),
-            vault_polling_entries(
-                &context.ctx,
-                &context.provider,
-                configured_equity_vaults,
-                configured_usdc_vaults,
-            )?,
+            vault_polling_entries(&context.ctx, &context.provider, &watch_providers)?,
             context.executor.clone(),
             context.frameworks.vault_registry.clone(),
             snapshot_id,
@@ -1656,8 +1664,10 @@ mod tests {
         let entries = vault_polling_entries(
             &ctx,
             &ProviderBuilder::new().connect_mocked_client(Asserter::new()),
-            BTreeMap::new(),
-            None,
+            &BTreeMap::from([(
+                Chain::Ethereum,
+                ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            )]),
         )
         .unwrap();
 
