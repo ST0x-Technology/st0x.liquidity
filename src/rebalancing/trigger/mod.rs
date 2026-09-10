@@ -9392,11 +9392,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                TokenAddressError::UnwiredChain {
+                TokenAddressError::UnwiredRegistry {
                     chain: Chain::Ethereum
                 }
             ),
-            "expected UnwiredChain for ethereum, got {error:?}"
+            "expected the unwired chain named, got {error:?}"
         );
     }
 
@@ -9471,11 +9471,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                equity::EquityTriggerError::UnwiredChain {
+                equity::EquityTriggerError::UnwiredWrapper {
                     chain: Chain::Ethereum
                 }
             ),
-            "expected UnwiredChain for ethereum, got {error:?}"
+            "expected the unwired chain named, got {error:?}"
         );
     }
 
