@@ -243,7 +243,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
-    use st0x_config::{BrokerCtx, CtxError, LogFormat, LogLevel, TradingMode};
+    use st0x_config::{BrokerCtx, CtxError, LogFormat, LogLevel};
     use st0x_config::{InventoryMode, TradingChain};
     use st0x_evm::Chain;
     use st0x_evm::OpenChainErrorRegistry;
@@ -251,7 +251,7 @@ mod tests {
 
     use super::*;
 
-    fn create_ctx_without_rebalancing() -> Ctx {
+    fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -286,7 +286,7 @@ mod tests {
             alerts: None,
             startup_notices: Vec::new(),
             pricing: None,
-            trading_mode: TradingMode::Standalone,
+            rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
             wallet: None,
             wallet_meta: None,
@@ -303,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cctp_bridge_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let amount = Some(Usdc::new(Float::parse("100".to_string()).unwrap()));
 
         let mut stdout = Vec::new();
@@ -328,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cctp_recover_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let burn_tx = B256::ZERO;
 
         let mut stdout = Vec::new();
@@ -348,7 +348,7 @@ mod tests {
     const ETHEREUM_ORDERBOOK: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
     fn create_ctx_with_stub_wallet() -> Ctx {
-        let mut ctx = create_ctx_without_rebalancing();
+        let mut ctx = create_base_test_ctx();
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
         ctx
     }
@@ -446,7 +446,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_allowance_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
 
         let mut stdout = Vec::new();
         let error = reset_allowance_command::<OpenChainErrorRegistry, _>(

@@ -225,7 +225,6 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         BrokerCtx, ChainAssets, ChainCashAsset, ChainEquities, LogFormat, LogLevel, OperationMode,
-        TradingMode,
     };
     use st0x_config::{InventoryMode, TradingChain};
     use st0x_evm::IERC20::decimalsCall;
@@ -236,7 +235,7 @@ mod tests {
     use super::*;
     use st0x_hedge::operator::inventory::ImbalanceThreshold;
 
-    fn create_ctx_without_rebalancing() -> Ctx {
+    fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -271,7 +270,7 @@ mod tests {
             alerts: None,
             startup_notices: Vec::new(),
             pricing: None,
-            trading_mode: TradingMode::Standalone,
+            rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
             wallet: None,
             wallet_meta: None,
@@ -326,7 +325,7 @@ mod tests {
             alerts: None,
             startup_notices: Vec::new(),
             pricing: None,
-            trading_mode: TradingMode::Rebalancing(Box::new(
+            rebalancing: Box::new(
                 RebalancingCtx::stub()
                     .equity(ImbalanceThreshold {
                         target: float!(0.5),
@@ -337,7 +336,7 @@ mod tests {
                         deviation: float!(0.1),
                     })
                     .call(),
-            )),
+            ),
             order_owner: Address::ZERO,
             wallet: Some(st0x_config::OnchainWalletCtx::stub()),
             wallet_meta: None,
@@ -358,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_deposit_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let amount = float!(100);
 
         let mut stdout = Vec::new();
@@ -379,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_withdraw_requires_wallet_config() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let withdraw = Withdraw {
             amount: float!(100),
             token: TEST_TOKEN,
@@ -399,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_deposit_writes_amount_to_stdout() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
 
         let mut stdout = Vec::new();
         let deposit = Deposit {
@@ -421,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
-        let ctx = create_ctx_without_rebalancing();
+        let ctx = create_base_test_ctx();
         let withdraw = Withdraw {
             amount: float!(250.25),
             token: TEST_TOKEN,
@@ -587,7 +586,7 @@ mod tests {
             &mut stdout,
             amount,
             TokenizationNetwork::Base,
-            &create_ctx_without_rebalancing(),
+            &create_base_test_ctx(),
         )
         .await
         .unwrap_err()

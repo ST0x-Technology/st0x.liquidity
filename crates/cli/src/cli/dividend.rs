@@ -161,7 +161,6 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         BrokerCtx, ExecutionThreshold, InventoryMode, LogFormat, LogLevel, TradingChain,
-        TradingMode,
     };
     use st0x_hedge::operator::test_utils::try_positive_shares;
 
@@ -249,7 +248,7 @@ mod tests {
             alerts: None,
             startup_notices: Vec::new(),
             pricing: None,
-            trading_mode: TradingMode::Standalone,
+            rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
             wallet: None,
             wallet_meta: None,

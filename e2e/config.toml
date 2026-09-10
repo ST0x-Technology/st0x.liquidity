@@ -46,6 +46,10 @@ order_fill_poll_interval_secs = 5
 # Exactly one watched chain is the primary: the one whose inventory the bot
 # polls and rebalances automatically. Fills are hedged on every watched chain.
 primary = true
+# PLACEHOLDER, same caveat as [bot_gas_valuation] below: present so the
+# config passes the config-only validation gate. Scenarios that redeem
+# build their ctx programmatically and override this.
+redemption_wallet = "0xcccccccccccccccccccccccccccccccccccccccc"
 
 # Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
 # there, but runs no orderbook and ingests no fills, so it has no [trading]
@@ -80,3 +84,32 @@ url = "http://localhost:8099"
 # this file; do not rely on it to run rebalancing against a live server.
 [bot_gas_valuation]
 chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
+
+# Required by the single supported topology (there is no global rebalancing
+# off-switch). Every trigger stays inert for a server started from this
+# file: per-asset `rebalancing = "disabled"` above, USDC mode disabled,
+# freeze guard disabled. Rebalancing e2e scenarios build their ctx
+# programmatically instead of reading this section.
+[rebalancing]
+transfer_timeout_secs = 1800
+inventory_staleness_bound_secs = 300
+transfer_attempt_timeout_secs = 3600
+attestation_retry_deadline_secs = 86400
+max_burn_revert_redrives = 5
+freeze_check = "disabled"
+
+[rebalancing.equity]
+target = 0.5
+deviation = 0.05
+
+[rebalancing.usdc]
+mode = "disabled"
+
+# Gas alert thresholds (required with [rebalancing]).
+[alerts]
+poll_interval = 300
+realert_interval = 3600
+
+[alerts.low_balance_thresholds]
+base = "0.05"
+ethereum = "0.05"
