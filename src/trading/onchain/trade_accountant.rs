@@ -1675,7 +1675,15 @@ mod tests {
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
 
-            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            // Base stays the primary: a fill on another chain is routed to
+            // that chain's own secondary accounting entry, which is the only
+            // shape config validation admits for HyperEVM.
+            let fill_chain_provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let idle_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+            let (primary_provider, secondary_provider) = match chain {
+                Chain::Base => (fill_chain_provider, None),
+                Chain::Ethereum | Chain::HyperEvm => (idle_provider, Some(fill_chain_provider)),
+            };
             let executor = MockExecutorCtx.try_into_executor().await.unwrap();
             let ctx = create_test_ctx_with_order_owner(Address::ZERO);
             let cache = SymbolCache::default();
@@ -1687,41 +1695,44 @@ mod tests {
                 &apalis_pool,
                 ctx,
                 cache,
-                provider.clone(),
+                primary_provider,
                 executor,
                 ExecutionThreshold::whole_share(),
             )
             .await;
-
-            if chain == Chain::HyperEvm {
-                let mut secondary = TradingChain::test().chain(Chain::HyperEvm).call();
-                secondary.vault_owner = Address::ZERO;
+            if let Some(secondary_provider) = secondary_provider {
+                let mut secondary = accountant_ctx.ctx.chains.primary().clone();
+                secondary.chain = chain;
                 accountant_ctx.chains.insert(
-                    Chain::HyperEvm,
+                    chain,
                     ChainAccounting {
                         contracts: crate::onchain::raindex_contracts(&secondary),
                         trading: secondary,
-                        evm: ReadOnlyEvm::new(provider),
+                        evm: ReadOnlyEvm::new(secondary_provider),
                     },
                 );
             }
 
             // Should succeed (skip) rather than error -- a spoofed token address
             // must not trip the fail-stop.
-            job.perform(&accountant_ctx).await.unwrap();
+            job.perform(&accountant_ctx).await.unwrap_or_else(|error| {
+                panic!("spoofed USDC on {chain} must skip, not fail: {error:?}")
+            });
 
-            let recorded = sqlx::query!(
-                "SELECT tx_hash, log_index, event_type, reason, detail FROM skipped_fills \
-             ORDER BY log_index"
+            let recorded: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT chain, event_type, reason FROM skipped_fills ORDER BY log_index",
             )
             .fetch_all(&pool)
             .await
             .unwrap();
-            assert_eq!(recorded.len(), 1, "{chain}");
-            assert_eq!(recorded[0].event_type, "InventoryTrade", "{chain}");
             assert_eq!(
-                recorded[0].reason, "unrecognized_inventory_token",
-                "{chain}"
+                recorded,
+                vec![(
+                    chain.to_string(),
+                    "InventoryTrade".to_owned(),
+                    "unrecognized_inventory_token".to_owned()
+                )],
+                "exactly one fill, recorded on {chain}, skipped as an unrecognized token"
             );
         }
     }
