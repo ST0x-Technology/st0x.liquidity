@@ -13,7 +13,7 @@ use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sqlx::SqlitePool;
 use tracing::warn;
 
-use st0x_config::{ChainRegistry, TradingChain};
+use st0x_config::{ChainRegistry, HedgedChain};
 use st0x_dto::{
     BlockLagPoint, ChainBlockLag, ChainName, DependencyBucket, DependencyName, DependencyStats,
     MonitorTelemetry, PollHealth,
@@ -40,8 +40,8 @@ pub(crate) async fn load_monitor_telemetry(
     chains: &ChainRegistry,
 ) -> Result<MonitorTelemetry, PerformanceError> {
     let mut block_lag = Vec::new();
-    for trading_chain in chains.watched() {
-        block_lag.push(chain_block_lag(pool, range, trading_chain).await?);
+    for hedged_chain in chains.watched() {
+        block_lag.push(chain_block_lag(pool, range, hedged_chain).await?);
     }
     let poll_summary = poll_health(pool, range, chains).await?;
 
@@ -54,13 +54,13 @@ pub(crate) async fn load_monitor_telemetry(
 async fn chain_block_lag(
     pool: &SqlitePool,
     range: &ReportRange,
-    trading_chain: &TradingChain,
+    hedged_chain: &HedgedChain,
 ) -> Result<ChainBlockLag, PerformanceError> {
-    let (current_lag_blocks, current_lag_sampled_at) = current_lag(pool, trading_chain).await?;
-    let points = block_lag_buckets(pool, range, trading_chain).await?;
+    let (current_lag_blocks, current_lag_sampled_at) = current_lag(pool, hedged_chain).await?;
+    let points = block_lag_buckets(pool, range, hedged_chain).await?;
 
     Ok(ChainBlockLag {
-        chain: chain_name(trading_chain.chain),
+        chain: chain_name(hedged_chain.chain),
         current_lag_blocks,
         current_lag_sampled_at,
         points,
@@ -79,15 +79,15 @@ fn chain_name(chain: Chain) -> ChainName {
 
 async fn current_lag(
     pool: &SqlitePool,
-    trading_chain: &TradingChain,
+    hedged_chain: &HedgedChain,
 ) -> Result<(Option<i64>, Option<DateTime<Utc>>), PerformanceError> {
     let latest: Option<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
         "SELECT sampled_at, cutoff_block, lag_blocks FROM block_lag_samples \
          WHERE chain = $1 AND orderbook = $2 \
          ORDER BY sampled_at DESC, id DESC LIMIT 1",
     )
-    .bind(trading_chain.chain.as_str())
-    .bind(trading_chain.orderbook.to_string())
+    .bind(hedged_chain.chain.as_str())
+    .bind(hedged_chain.orderbook.to_string())
     .fetch_optional(pool)
     .await?;
 
@@ -116,7 +116,7 @@ async fn current_lag(
 async fn block_lag_buckets(
     pool: &SqlitePool,
     range: &ReportRange,
-    trading_chain: &TradingChain,
+    hedged_chain: &HedgedChain,
 ) -> Result<Vec<BlockLagPoint>, PerformanceError> {
     let width = range.bucket_width();
     // strftime('%s', ...) truncates sample timestamps to whole seconds, so
@@ -135,8 +135,8 @@ async fn block_lag_buckets(
     )
     .bind(sqlite_timestamp(range.from))
     .bind(sqlite_timestamp(range.to))
-    .bind(trading_chain.chain.as_str())
-    .bind(trading_chain.orderbook.to_string())
+    .bind(hedged_chain.chain.as_str())
+    .bind(hedged_chain.orderbook.to_string())
     .bind(origin.timestamp())
     .bind(width.num_seconds())
     .fetch_all(pool)
@@ -371,7 +371,7 @@ mod tests {
     use alloy::primitives::address;
     use chrono::TimeZone;
 
-    use st0x_config::{ChainRegistry, TradingChain};
+    use st0x_config::{ChainRegistry, HedgedChain};
     use st0x_dto::{ChainBlockLag, ChainName};
     use st0x_evm::Chain;
 
@@ -438,7 +438,7 @@ mod tests {
 
     /// Base watched alone, against [`ORDERBOOK`].
     fn base_only() -> ChainRegistry {
-        ChainRegistry::single_trading_chain(TradingChain::test().orderbook(ORDERBOOK).call())
+        ChainRegistry::single_hedged_chain(HedgedChain::test().orderbook(ORDERBOOK).call())
     }
 
     /// The one series a Base-only report carries.
@@ -457,7 +457,7 @@ mod tests {
         let pool = setup_test_db().await;
         let mut chains = base_only();
         chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(ORDERBOOK)
                 .call(),
@@ -706,7 +706,7 @@ mod tests {
         let pool = setup_test_db().await;
         let mut chains = base_only();
         chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(ethereum_orderbook)
                 .call(),

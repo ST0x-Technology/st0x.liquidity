@@ -225,7 +225,7 @@ fn market_making_slots(ctx: &Ctx) -> BTreeMap<Chain, MarketMakingSlots> {
         .collect()
 }
 
-fn configured_chain_vaults(watched: &st0x_config::TradingChain) -> ConfiguredChainVaults {
+fn configured_chain_vaults(watched: &st0x_config::HedgedChain) -> ConfiguredChainVaults {
     let mut equity_vaults: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
     for equity_config in watched.assets.equities.symbols.values() {
         equity_vaults
@@ -639,7 +639,7 @@ where
     // `watch_providers` (absent entries are a startup bug: the token map,
     // queue map, and provider map are all derived from the same registry).
     let primary_chain = context.ctx.chains.primary().chain;
-    let watched_chains: Vec<st0x_config::TradingChain> =
+    let watched_chains: Vec<st0x_config::HedgedChain> =
         context.ctx.chains.watched().cloned().collect();
     for watched in watched_chains {
         let chain = watched.chain;
@@ -1729,7 +1729,7 @@ mod tests {
         let ethereum_vault_owner = Address::repeat_byte(0xe1);
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.insert_secondary(
-            st0x_config::TradingChain::test()
+            st0x_config::HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(ethereum_orderbook)
                 .vault_owner(ethereum_vault_owner)
@@ -1785,7 +1785,7 @@ mod tests {
             }),
         };
         ctx.chains.insert_secondary(
-            st0x_config::TradingChain::test()
+            st0x_config::HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .assets(ChainAssets {
                     equities: ChainEquities {
