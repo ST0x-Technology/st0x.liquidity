@@ -1146,11 +1146,12 @@ readiness slot is acknowledged during assembly when absent, or by its supervised
 run loop when selected, just like the existing gas monitors.
 
 Do not use Alloy's `parse_ether` to validate configuration thresholds. In
-`alloy-primitives`' `utils/units.rs`, `ParseUnits::parse_units` truncates excess
-fractional digits, and its signed-to-`U256` conversion preserves negative values
-as raw unsigned bits. Threshold validation instead pads decimal digits to 18
-places and parses directly into `U256`, rejecting negative values, excess
-precision and overflow before a monitor starts.
+`alloy-primitives` 1.6.0 (the version `Cargo.lock` pins), `utils/units.rs`'s
+`ParseUnits::parse_units` truncates excess fractional digits, and its
+signed-to-`U256` conversion preserves negative values as raw unsigned bits.
+Threshold validation instead pads decimal digits to 18 places and parses
+directly into `U256`, rejecting negative values, excess precision and overflow
+before a monitor starts.
 
 ## Native-gas admission for transfers
 
