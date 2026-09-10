@@ -1891,10 +1891,9 @@ mod tests {
     use super::*;
     use crate::alerts::CapturingNotifier;
     use crate::equity_redemption::RedemptionAggregateId;
+    use crate::inventory::projection::InventoryProjection;
     use crate::inventory::snapshot::InventorySnapshotEvent;
-    use crate::inventory::{
-        BroadcastingInventory, InventoryDivergenceGate, InventoryProjection, InventoryView,
-    };
+    use crate::inventory::{BroadcastingInventory, InventoryDivergenceGate, InventoryView};
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;

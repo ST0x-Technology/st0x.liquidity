@@ -15,10 +15,7 @@ use tracing::warn;
 use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::SupportedExecutor;
 
-use super::{
-    build_unwrapped_equity_recovery_ctx, build_wrapped_equity_recovery_ctx,
-    requeue_equity_recovery_orphans, requeue_trading_orphans,
-};
+use super::{requeue_recovery_orphans, requeue_trading_orphans};
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::BroadcastingInventory;
 use crate::offchain::order::{
@@ -39,14 +36,14 @@ use crate::wrapped_equity_recovery::{
 };
 
 /// Equity-recovery stores and related state passed to [`setup_trading_job_queues`].
-/// Bundles the optional rebalancing-side inputs needed to build the equity
-/// recovery contexts, keeping the function argument count within the lint limit.
+/// Bundles the rebalancing-side inputs needed to build the equity recovery
+/// contexts, keeping the function argument count within the lint limit.
 pub(super) struct EquityRecoveryInputs {
-    pub(super) wrapped_store: Option<Arc<Store<WrappedEquityRecovery>>>,
-    pub(super) unwrapped_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
-    pub(super) rebalancing_service: Option<Arc<RebalancingService>>,
-    pub(super) mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
-    pub(super) redemption_store: Option<Arc<Store<EquityRedemption>>>,
+    pub(super) wrapped_store: Arc<Store<WrappedEquityRecovery>>,
+    pub(super) unwrapped_store: Arc<Store<UnwrappedEquityRecovery>>,
+    pub(super) rebalancing_service: Arc<RebalancingService>,
+    pub(super) mint_store: Arc<Store<TokenizedEquityMint>>,
+    pub(super) redemption_store: Arc<Store<EquityRedemption>>,
     pub(super) inventory: Arc<BroadcastingInventory>,
     pub(super) inventory_poll_interval: Duration,
 }
@@ -60,8 +57,8 @@ pub(super) struct TradingJobQueues {
     pub(super) rejection_queue: HandleOrderRejectionJobQueue,
     pub(super) wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     pub(super) unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
-    pub(super) wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
-    pub(super) unwrapped_equity_recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
+    pub(super) wrapped_equity_recovery_ctx: Arc<WrappedEquityRecoveryCtx>,
+    pub(super) unwrapped_equity_recovery_ctx: Arc<UnwrappedEquityRecoveryCtx>,
     pub(super) check_positions_queue: CheckPositionsJobQueue,
     pub(super) portfolio_snapshot_queue: PortfolioSnapshotJobQueue,
 }
@@ -109,33 +106,28 @@ pub(super) async fn setup_trading_job_queues(
     let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(apalis_pool);
     let unwrapped_equity_recovery_queue = UnwrappedEquityRecoveryJobQueue::new(apalis_pool);
 
-    let wrapped_equity_recovery_ctx = build_wrapped_equity_recovery_ctx(
-        wrapped_equity_recovery_store,
-        rebalancing_service.clone(),
-        mint_store.clone(),
-        redemption_store.clone(),
-        inventory.clone(),
-        wrapped_equity_recovery_queue.clone(),
-        inventory_poll_interval,
-    );
+    let wrapped_equity_recovery_ctx = Arc::new(WrappedEquityRecoveryCtx {
+        inventory: inventory.clone(),
+        store: wrapped_equity_recovery_store,
+        mint_store: mint_store.clone(),
+        redemption_store: redemption_store.clone(),
+        equity_in_progress: rebalancing_service.equity_in_progress.clone(),
+        queue: wrapped_equity_recovery_queue.clone(),
+        reschedule_interval: inventory_poll_interval,
+    });
 
-    let unwrapped_equity_recovery_ctx = build_unwrapped_equity_recovery_ctx(
-        unwrapped_equity_recovery_store,
-        rebalancing_service,
+    let unwrapped_equity_recovery_ctx = Arc::new(UnwrappedEquityRecoveryCtx {
+        inventory,
+        store: unwrapped_equity_recovery_store,
         mint_store,
         redemption_store,
-        inventory,
-        unwrapped_equity_recovery_queue.clone(),
-        inventory_poll_interval,
-    );
+        equity_in_progress: rebalancing_service.equity_in_progress.clone(),
+        queue: unwrapped_equity_recovery_queue.clone(),
+        reschedule_interval: inventory_poll_interval,
+    });
 
-    requeue_equity_recovery_orphans(
-        wrapped_equity_recovery_ctx.as_ref(),
-        unwrapped_equity_recovery_ctx.as_ref(),
-        &wrapped_equity_recovery_queue,
-        &unwrapped_equity_recovery_queue,
-    )
-    .await?;
+    requeue_recovery_orphans(&wrapped_equity_recovery_queue, "wrapped equity").await?;
+    requeue_recovery_orphans(&unwrapped_equity_recovery_queue, "unwrapped equity").await?;
 
     let check_positions_queue = CheckPositionsJobQueue::new(apalis_pool);
 
