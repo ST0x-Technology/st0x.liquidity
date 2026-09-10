@@ -5164,8 +5164,9 @@ impl RebalancingService {
                 let mut inventory = self.inventory.write().await;
                 let mut updated = inventory.clone();
                 if matches!(entity, MintAccepted { .. }) {
-                    updated = updated.update_equity(
+                    updated = updated.update_equity_at(
                         symbol,
+                        entity.chain(),
                         Inventory::set_inflight(Venue::Hedging, quantity),
                         Utc::now(),
                     )?;
@@ -5284,9 +5285,10 @@ impl RebalancingService {
                 return Ok(RecoveryClaim::Conflict);
             }
 
-            *inventory = inventory
-                .clone()
-                .update_equity(symbol, update, Utc::now())?;
+            *inventory =
+                inventory
+                    .clone()
+                    .update_equity_at(symbol, entity.chain(), update, Utc::now())?;
         }
 
         // The inventory update succeeded; now consume the timeout markers.
@@ -5439,8 +5441,9 @@ impl RebalancingService {
             }
 
             if timed_out_at.is_some() {
-                *inventory = inventory.clone().update_equity(
+                *inventory = inventory.clone().update_equity_at(
                     symbol,
+                    entity.chain(),
                     Box::new(Inventory::set_inflight(Venue::MarketMaking, quantity)),
                     Utc::now(),
                 )?;
@@ -5640,8 +5643,9 @@ impl RebalancingService {
                 self.mark_equity_active_transfer(symbol, || equity::GUARD_GENERATION.next());
 
                 let mut inventory = self.inventory.write().await;
-                let updated = inventory.clone().update_equity(
+                let updated = inventory.clone().update_equity_at(
                     symbol,
+                    entity.chain(),
                     Inventory::set_inflight(Venue::MarketMaking, quantity),
                     Utc::now(),
                 )?;
