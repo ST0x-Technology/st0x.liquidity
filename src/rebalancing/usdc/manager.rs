@@ -4857,6 +4857,78 @@ where
     }
 }
 
+/// A recovered CCTP mint: the destination-chain `receiveMessage` landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredCctpMint {
+    pub(crate) mint_tx: TxHash,
+    /// USDC minted to the recipient, net of the fee.
+    pub(crate) amount_received: Usdc,
+    pub(crate) fee_collected: Usdc,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CctpMintRecoveryError {
+    /// Circle has not attested the burn within the polling window, or the
+    /// attestation call failed; retryable once the attestation is complete.
+    #[error("attestation not available for burn {burn_tx}: {source}")]
+    Attestation {
+        burn_tx: TxHash,
+        #[source]
+        source: CctpError,
+    },
+    /// `receiveMessage` failed or its receipt could not be read.
+    #[error("mint failed for burn {burn_tx}: {source}")]
+    Mint {
+        burn_tx: TxHash,
+        #[source]
+        source: CctpError,
+    },
+    #[error(transparent)]
+    Amount(#[from] Box<UsdcTransferError>),
+}
+
+/// Trait-erased entry point for the operator `cctp complete-mint` recovery
+/// of a burn whose destination mint never completed: polls the attestation
+/// for the burn and submits `receiveMessage` through the bot's own bridge and
+/// wallet. Live RPC only; touches no aggregate. The caller quiesces the USDC
+/// driver so a worker cannot drive the same mint concurrently.
+#[async_trait::async_trait]
+pub(crate) trait RecoverCctpMint: Send + Sync + 'static {
+    async fn recover_cctp_mint(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+    ) -> Result<RecoveredCctpMint, CctpMintRecoveryError>;
+}
+
+#[async_trait::async_trait]
+impl<Chain> RecoverCctpMint for CrossVenueCashTransfer<Chain>
+where
+    Chain: Wallet + Send + Sync + 'static,
+{
+    async fn recover_cctp_mint(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+    ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
+        let attestation = self
+            .cctp_bridge
+            .poll_attestation(direction, burn_tx)
+            .await
+            .map_err(|source| CctpMintRecoveryError::Attestation { burn_tx, source })?;
+        let receipt = self
+            .cctp_bridge
+            .mint(direction, &attestation)
+            .await
+            .map_err(|source| CctpMintRecoveryError::Mint { burn_tx, source })?;
+        Ok(RecoveredCctpMint {
+            mint_tx: receipt.tx,
+            amount_received: u256_to_usdc(receipt.amount).map_err(Box::new)?,
+            fee_collected: u256_to_usdc(receipt.fee).map_err(Box::new)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::node_bindings::Anvil;
