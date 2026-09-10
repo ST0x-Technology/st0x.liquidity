@@ -1281,10 +1281,9 @@ mod tests {
             trade: EmittedOnChain::from_log(Chain::HyperEvm, event, &log).unwrap(),
             backpressure_streak: BackpressureStreak::default(),
         };
-        let asserter = Asserter::new();
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        let secondary_provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        // Both symbols are preloaded below and TakeOrderV3 amounts are already
+        // Float-encoded, so no token introspection reaches either provider.
+        let secondary_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let primary_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let cache = SymbolCache::default();
