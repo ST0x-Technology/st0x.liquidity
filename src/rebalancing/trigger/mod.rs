@@ -6772,6 +6772,60 @@ mod tests {
         assert_eq!(inflight, Some(FractionalShares::new(float!(12))));
     }
 
+    /// A recovered record names its chain; the in-flight it restores belongs
+    /// to that chain's slot, not the primary's.
+    #[tokio::test]
+    async fn recovered_redemption_sets_inflight_on_the_records_own_chain() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Ethereum,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        trigger
+            .recover_redemption_state(
+                &redemption_aggregate_id("redemption-on-ethereum"),
+                &EquityRedemption::VaultWithdrawPending {
+                    chain: Chain::Ethereum,
+                    symbol: symbol.clone(),
+                    quantity: float!(12),
+                    token: Address::ZERO,
+                    wrapped_amount: U256::ZERO,
+                    pending_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (ethereum_inflight, base_inflight) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Base),
+            )
+        };
+        assert_eq!(
+            ethereum_inflight,
+            Some(shares(12)),
+            "the recovered in-flight belongs to the chain the record names"
+        );
+        assert_eq!(
+            base_inflight,
+            Some(shares(0)),
+            "recovering an Ethereum record must not touch the primary chain's slot"
+        );
+    }
+
     #[tokio::test]
     async fn recovery_after_explicit_mint_failure_moves_equity_to_market_making() {
         let trigger = make_trigger().await;
