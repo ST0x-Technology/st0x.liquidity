@@ -1749,6 +1749,21 @@ impl InventoryView {
             .is_some_and(|watermark| block_number <= *watermark)
     }
 
+    /// Whether an onchain snapshot has seeded `chain`'s MarketMaking equity
+    /// slot for `symbol`. A fill on an unseeded slot waits for the chain's
+    /// first snapshot, which already contains it (ADR 0018).
+    pub(crate) fn onchain_equity_slot_seeded(&self, symbol: &Symbol, chain: Chain) -> bool {
+        self.equities
+            .get(symbol)
+            .and_then(|equity| equity.get_venue(Venue::MarketMaking, chain))
+            .is_some()
+    }
+
+    /// Whether an onchain snapshot has seeded `chain`'s MarketMaking USDC slot.
+    pub(crate) fn onchain_usdc_slot_seeded(&self, chain: Chain) -> bool {
+        self.usdc.get_venue(Venue::MarketMaking, chain).is_some()
+    }
+
     /// Marks a symbol as having an open offchain order, so offchain equity
     /// snapshots stop applying to it until the order reaches a terminal state.
     /// An existing different gate wins until durable reconciliation identifies

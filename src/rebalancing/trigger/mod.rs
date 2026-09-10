@@ -2416,29 +2416,51 @@ impl Reactor for RebalancingService {
                         // Each delta leg yields to a pinned onchain snapshot
                         // that provably already contains it: a vaultBalance2
                         // read at block N includes every fill at a block <= N
-                        // (ADR 0018). Checked and applied under one write
-                        // lock so no snapshot can advance the watermark in
-                        // between. An absorbed leg is normal operation under
-                        // load, not an error -- the poll simply observed the
-                        // fill before this event arrived.
+                        // (ADR 0018). The same reasoning covers a slot no
+                        // snapshot has seeded yet (a watched secondary chain
+                        // is not polled): its first snapshot contains the fill,
+                        // so the leg waits rather than debiting an empty slot
+                        // or inventing one that holds only the delta. Checked
+                        // and applied under one write lock so no snapshot can
+                        // advance the watermark in between. A skipped leg is
+                        // normal operation, not an error.
                         let trading_chain = {
                             let mut inventory = self.inventory.write().await;
-                            let apply_equity_leg = !inventory
+                            let equity_slot_seeded =
+                                inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
+                            let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
+                            let equity_absorbed = inventory
                                 .onchain_fill_absorbed_by_equity_snapshot(&symbol, trade_id.chain, *block_number);
-                            let apply_usdc_leg =
-                                !inventory.onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
+                            let usdc_absorbed =
+                                inventory.onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
 
-                            if !apply_equity_leg || !apply_usdc_leg {
+                            if !equity_slot_seeded || !usdc_slot_seeded {
+                                info!(
+                                    target: "rebalance",
+                                    %symbol,
+                                    chain = %trade_id.chain,
+                                    equity_slot_seeded,
+                                    usdc_slot_seeded,
+                                    "Skipping onchain fill delta leg(s) on a slot \
+                                     no onchain snapshot has seeded yet; the \
+                                     chain's first snapshot contains the fill"
+                                );
+                            }
+
+                            if equity_absorbed || usdc_absorbed {
                                 info!(
                                     target: "rebalance",
                                     %symbol,
                                     ?block_number,
-                                    apply_equity_leg,
-                                    apply_usdc_leg,
+                                    equity_absorbed,
+                                    usdc_absorbed,
                                     "Skipping onchain fill delta leg(s) already \
                                      absorbed by a pinned onchain snapshot"
                                 );
                             }
+
+                            let apply_equity_leg = equity_slot_seeded && !equity_absorbed;
+                            let apply_usdc_leg = usdc_slot_seeded && !usdc_absorbed;
 
                             // Chain-addressed: inventory is not fungible
                             // across chains, so a fill credits and debits the
