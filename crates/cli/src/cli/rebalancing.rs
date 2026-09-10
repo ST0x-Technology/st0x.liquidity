@@ -197,14 +197,6 @@ pub(super) fn trading_chain_context(
     })
 }
 
-/// The canonical USDC on the selected chain, refused by name where this build
-/// pins none: another chain's address would approve or withdraw nothing.
-pub(super) fn chain_usdc(chain: Chain) -> anyhow::Result<Address> {
-    chain
-        .usdc()
-        .with_context(|| format!("no canonical USDC is pinned for {chain} in this build"))
-}
-
 /// Builds the mint/redemption saga on the selected chain: its wallet signs,
 /// its trading table supplies the orderbook, vault owner and asset map, and
 /// its issuer redemption wallet receives redeemed tokens.
@@ -3018,16 +3010,6 @@ mod tests {
         assert!(
             error.contains("[chains.ethereum.trading]"),
             "expected the missing trading table named, got: {error}"
-        );
-    }
-
-    #[test]
-    fn chain_usdc_uses_each_chains_canonical_contract() {
-        assert_eq!(chain_usdc(Chain::Base).unwrap(), USDC_BASE);
-        assert_eq!(chain_usdc(Chain::Ethereum).unwrap(), USDC_ETHEREUM);
-        assert_eq!(
-            chain_usdc(Chain::HyperEvm).unwrap(),
-            st0x_evm::USDC_HYPEREVM
         );
     }
 

@@ -11,7 +11,7 @@ use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet}
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
-use super::rebalancing::{TradingChainContext, chain_usdc, trading_chain_context};
+use super::rebalancing::{TradingChainContext, trading_chain_context};
 use super::{CctpChain, TokenizationNetwork};
 
 impl CctpChain {
@@ -194,7 +194,7 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
         wallet: caller,
         trading,
     } = trading_chain_context(ctx, network)?;
-    let usdc_address = chain_usdc(chain)?;
+    let usdc_address = chain.usdc();
     let spender = trading.orderbook;
     let owner = caller.address();
 

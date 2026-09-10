@@ -87,15 +87,13 @@ use crate::offchain::order::{
 };
 #[cfg(test)]
 use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
+use crate::onchain::OnchainTrade;
 #[cfg(test)]
 use crate::onchain::accumulator::check_all_positions;
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
-use crate::onchain::approvals::{
-    ApprovalTarget, StartupApprovalError, build_approval_targets, grant_startup_approvals,
-};
+use crate::onchain::approvals::{ApprovalTarget, build_approval_targets, grant_startup_approvals};
 use crate::onchain::backfill::BackfillQueues;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain_trade::{
     OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId, OnChainTradeSource,
     SourceAttributionDecision,
@@ -1368,24 +1366,17 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
 
 /// The startup approval targets of every watched chain, keyed by chain: its
 /// canonical USDC against its own orderbook, plus, where the chain rebalances
-/// equity, each enabled equity's wrap and deposit grants. A watched chain this
-/// build pins no USDC for is refused rather than approving another chain's
-/// USDC address there.
-fn startup_approval_targets(
-    ctx: &Ctx,
-) -> Result<BTreeMap<Chain, Vec<ApprovalTarget>>, StartupApprovalError> {
+/// equity, each enabled equity's wrap and deposit grants.
+fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
     ctx.chains
         .watched_with_roles()
         .map(|(role, watched)| {
             let chain = watched.chain;
-            let usdc = chain
-                .usdc()
-                .ok_or(StartupApprovalError::UsdcNotPinned { chain })?;
 
-            Ok((
+            (
                 chain,
-                build_approval_targets(role, &watched.assets, watched.orderbook, usdc),
-            ))
+                build_approval_targets(role, &watched.assets, watched.orderbook, chain.usdc()),
+            )
         })
         .collect()
 }
@@ -1412,7 +1403,7 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     };
 
-    for (chain, targets) in startup_approval_targets(ctx)? {
+    for (chain, targets) in startup_approval_targets(ctx) {
         grant_startup_approvals(chain_wallet(wallet_ctx, chain), &targets)
             .await
             .with_context(|| format!("startup token approvals failed on {chain}"))?;
@@ -2320,11 +2311,8 @@ async fn preflight_inventory_access<Signer: Wallet + Clone>(
 /// The tokens whose stale orderbook allowance startup revokes, per watched
 /// chain in managed inventory mode: that chain's canonical USDC and every
 /// configured wrapped equity. A legacy-mode chain has no distinct inventory
-/// to have migrated from, so it has no entry; a managed chain this build
-/// pins no USDC for is refused rather than revoking another chain's USDC.
-fn stale_allowance_revocations(
-    ctx: &Ctx,
-) -> Result<BTreeMap<Chain, Vec<Address>>, StartupApprovalError> {
+/// to have migrated from, so it has no entry.
+fn stale_allowance_revocations(ctx: &Ctx) -> BTreeMap<Chain, Vec<Address>> {
     ctx.chains
         .watched()
         .filter(|watched| match watched.inventory {
@@ -2333,10 +2321,7 @@ fn stale_allowance_revocations(
         })
         .map(|watched| {
             let chain = watched.chain;
-            let usdc = chain
-                .usdc()
-                .ok_or(StartupApprovalError::UsdcNotPinned { chain })?;
-            let tokens = std::iter::once(usdc)
+            let tokens = std::iter::once(chain.usdc())
                 .chain(
                     watched
                         .assets
@@ -2347,7 +2332,7 @@ fn stale_allowance_revocations(
                 )
                 .collect();
 
-            Ok((chain, tokens))
+            (chain, tokens)
         })
         .collect()
 }
@@ -2356,13 +2341,12 @@ fn stale_allowance_revocations(
 /// the bot granted that chain's orderbook directly, through that chain's own
 /// wallet. Deposits now approve the inventory instead, so a leftover orderbook
 /// allowance is dead capital-exposure surface. Idempotent (a no-op once zero)
-/// and non-fatal per token -- a failed revoke must not block startup; only a
-/// chain with no pinned USDC is.
+/// and non-fatal per token -- a failed revoke must not block startup.
 async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
     ctx: &Ctx,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
-) -> Result<(), StartupApprovalError> {
-    for (chain, tokens) in stale_allowance_revocations(ctx)? {
+) {
+    for (chain, tokens) in stale_allowance_revocations(ctx) {
         let (Some(watched), Some(tokenization)) =
             (ctx.chains.watch(chain), tokenizations.get(&chain))
         else {
@@ -2396,8 +2380,6 @@ async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
             }
         }
     }
-
-    Ok(())
 }
 
 /// A watched chain's vault attestation failed at startup; the wrapper's own
@@ -2897,7 +2879,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )?);
 
         preflight_inventory_access(&raindex_service, &deps.ctx).await?;
-        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await?;
+        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await;
         preflight_tokenization(&deps.ctx, &tokenizations, issuance_client.as_ref()).await?;
 
         let tokenizer = primary_equity.tokenizer.clone();
@@ -3870,13 +3852,7 @@ pub(crate) async fn discover_vaults_for_trade(
         orderbook: context.orderbook,
         owner: context.order_owner,
     };
-    let usdc = trade_event
-        .chain
-        .usdc()
-        .ok_or(TradeValidationError::UsdcUnknownOnChain {
-            chain: trade_event.chain,
-        })
-        .map_err(OnChainError::from)?;
+    let usdc = trade_event.chain.usdc();
 
     for owned_vault in our_vaults {
         let vault = owned_vault.vault;
@@ -15976,7 +15952,7 @@ mod tests {
         let ctx = ctx_with_base_and_ethereum_trading();
         let base_orderbook = ctx.chains.primary().orderbook;
 
-        let targets = startup_approval_targets(&ctx).unwrap();
+        let targets = startup_approval_targets(&ctx);
 
         assert_eq!(
             targets.keys().copied().collect::<Vec<_>>(),
@@ -16030,7 +16006,7 @@ mod tests {
         );
         ctx.chains.insert_secondary(ethereum);
 
-        let targets = startup_approval_targets(&ctx).unwrap();
+        let targets = startup_approval_targets(&ctx);
 
         assert_eq!(
             targets[&Chain::Ethereum],
@@ -16064,7 +16040,7 @@ mod tests {
         hyperevm.orderbook = Address::repeat_byte(0x99);
         ctx.chains.insert_secondary(hyperevm);
 
-        let targets = startup_approval_targets(&ctx).unwrap();
+        let targets = startup_approval_targets(&ctx);
         assert_eq!(
             targets[&Chain::HyperEvm],
             vec![ApprovalTarget {
@@ -16083,7 +16059,7 @@ mod tests {
     fn stale_allowance_revocations_follow_each_managed_chain() {
         let mut ctx = ctx_with_base_and_ethereum_trading();
 
-        let revocations = stale_allowance_revocations(&ctx).unwrap();
+        let revocations = stale_allowance_revocations(&ctx);
 
         assert_eq!(
             revocations,
@@ -16097,7 +16073,7 @@ mod tests {
         ctx.chains
             .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
 
-        let revocations = stale_allowance_revocations(&ctx).unwrap();
+        let revocations = stale_allowance_revocations(&ctx);
         assert_eq!(revocations[&Chain::HyperEvm], vec![USDC_HYPEREVM]);
         assert_eq!(
             revocations[&Chain::Ethereum],

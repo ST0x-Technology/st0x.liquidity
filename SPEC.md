@@ -598,14 +598,8 @@ processed block and the next startup begins at the following block. The
 checkpoint is updated only after the full backfill range succeeds, so a partial
 failure cannot skip unprocessed history.
 
-If fill decoding or vault discovery cannot resolve canonical USDC for the fill's
-chain, accounting skips that fill successfully instead of exhausting retries and
-stopping all chains. It records the chain, transaction hash, log index and
-`usdc_unknown_on_chain` reason in the skipped-fill audit, and emits a structured
-ERROR log plus an operational alert stating that the unhedged fill requires
-manual reconciliation. Failure to persist the skipped-fill record is logged and
-does not convert this skip into a worker failure. Other infrastructure and
-accounting failures retain their existing retry policy.
+Every supported chain pins its canonical USDC contract in code, so adding a
+chain requires pinning its USDC before the code compiles.
 
 Completed apalis jobs are operational queue records, not audit history. The
 runtime periodically deletes terminal job rows and vacuums SQLite at the

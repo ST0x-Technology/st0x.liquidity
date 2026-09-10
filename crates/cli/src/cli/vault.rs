@@ -13,7 +13,7 @@ use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
 
 use super::TokenizationNetwork;
-use super::rebalancing::{TradingChainContext, chain_usdc, trading_chain_context};
+use super::rebalancing::{TradingChainContext, trading_chain_context};
 
 pub(super) struct Deposit {
     pub(super) amount: Float,
@@ -180,7 +180,7 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let TradingChainContext { chain, trading, .. } = trading_chain_context(ctx, network)?;
-    let token = chain_usdc(chain)?;
+    let token = chain.usdc();
 
     let cash = trading.assets.cash.as_ref().ok_or_else(|| {
         anyhow::anyhow!(

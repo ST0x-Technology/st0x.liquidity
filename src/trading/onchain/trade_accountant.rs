@@ -279,15 +279,7 @@ where
                 .await;
                 return Ok(());
             }
-            Err(error) => {
-                return skip_fill_with_unknown_usdc(
-                    error.into(),
-                    &ctx.pool,
-                    trade_event,
-                    ctx.notifier.as_ref(),
-                )
-                .await;
-            }
+            Err(error) => return Err(error.into()),
         };
 
         let Some(trade) = onchain_trade else {
@@ -318,17 +310,7 @@ where
             "Processing trade event",
         );
 
-        if let Err(error) =
-            discover_vaults_for_trade(trade_event, &trade, &vault_discovery_ctx).await
-        {
-            return skip_fill_with_unknown_usdc(
-                error,
-                &ctx.pool,
-                trade_event,
-                ctx.notifier.as_ref(),
-            )
-            .await;
-        }
+        discover_vaults_for_trade(trade_event, &trade, &vault_discovery_ctx).await?;
 
         let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
         let _guard = symbol_lock.lock().await;
@@ -438,46 +420,6 @@ impl AccountForDexTrade {
 
         Ok(())
     }
-}
-
-async fn skip_fill_with_unknown_usdc(
-    error: TradeAccountingError,
-    pool: &SqlitePool,
-    trade_event: &EmittedOnChain<RaindexTradeEvent>,
-    notifier: &dyn Notifier,
-) -> Result<(), TradeAccountingError> {
-    let TradeAccountingError::OnChain(OnChainError::Validation(
-        validation @ TradeValidationError::UsdcUnknownOnChain { .. },
-    )) = &error
-    else {
-        return Err(error);
-    };
-
-    error!(
-        target: "hedge",
-        chain = %trade_event.chain,
-        tx_hash = ?trade_event.tx_hash,
-        log_index = trade_event.log_index,
-        event_type = trade_event.event.kind(),
-        %validation,
-        "Skipping unhedged fill with unknown canonical USDC; manual reconciliation required"
-    );
-    persist_skipped_fill(
-        pool,
-        trade_event,
-        SkipReason::UsdcUnknownOnChain,
-        &validation.to_string(),
-    )
-    .await;
-    let message = format!(
-        "Skipping unhedged fill on chain {}: canonical USDC is unknown; \
-         transaction {}, log index {} requires manual reconciliation",
-        trade_event.chain, trade_event.tx_hash, trade_event.log_index,
-    );
-    if let Err(notify_error) = notifier.notify(&message).await {
-        error!(target: "hedge", %notify_error, "Failed to notify about skipped unhedged fill");
-    }
-    Ok(())
 }
 
 /// Best-effort durable record of a skipped fill for manual reconciliation. A
@@ -1035,81 +977,6 @@ mod tests {
             pool,
             job_queue,
         }
-    }
-
-    #[tokio::test]
-    async fn unknown_usdc_handler_persists_once_and_alerts_on_each_attempt() {
-        let (pool, _apalis_pool) = setup_test_pools().await;
-        let notifier = crate::alerts::CapturingNotifier::default();
-        let mut job = test_job();
-        job.trade.chain = Chain::HyperEvm;
-
-        for _ in 0..2 {
-            let error = OnChainError::Validation(TradeValidationError::UsdcUnknownOnChain {
-                chain: Chain::HyperEvm,
-            });
-            skip_fill_with_unknown_usdc(error.into(), &pool, &job.trade, &notifier)
-                .await
-                .unwrap();
-        }
-
-        let rows: Vec<(String, String, i64, String)> =
-            sqlx::query_as("SELECT chain, tx_hash, log_index, reason FROM skipped_fills")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            rows,
-            vec![(
-                "hyperevm".to_string(),
-                job.trade.tx_hash.to_string(),
-                i64::try_from(job.trade.log_index).unwrap(),
-                "usdc_unknown_on_chain".to_string()
-            )]
-        );
-        let expected = format!(
-            "Skipping unhedged fill on chain hyperevm: canonical USDC is unknown; \
-            transaction {}, log index {} requires manual reconciliation",
-            job.trade.tx_hash, job.trade.log_index
-        );
-        assert_eq!(notifier.messages(), vec![expected.clone(), expected]);
-    }
-
-    #[tokio::test]
-    async fn unknown_usdc_still_alerts_and_succeeds_when_skip_persistence_fails() {
-        let (pool, _apalis_pool) = setup_test_pools().await;
-        pool.close().await;
-        let notifier = crate::alerts::CapturingNotifier::default();
-        let job = test_job();
-        let error = OnChainError::Validation(TradeValidationError::UsdcUnknownOnChain {
-            chain: job.trade.chain,
-        });
-        skip_fill_with_unknown_usdc(error.into(), &pool, &job.trade, &notifier)
-            .await
-            .unwrap();
-        assert_eq!(notifier.messages().len(), 1);
-        assert!(notifier.messages()[0].contains("manual reconciliation"));
-    }
-
-    #[tokio::test]
-    async fn unrelated_accounting_error_propagates_without_skip_or_alert() {
-        let (pool, _apalis_pool) = setup_test_pools().await;
-        let notifier = crate::alerts::CapturingNotifier::default();
-        let job = test_job();
-        let error = TradeAccountingError::OnChain(OnChainError::Database(sqlx::Error::PoolClosed));
-        let error = skip_fill_with_unknown_usdc(error, &pool, &job.trade, &notifier)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            TradeAccountingError::OnChain(OnChainError::Database(sqlx::Error::PoolClosed))
-        ));
-        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM skipped_fills")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(notifier.messages(), Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -2178,7 +2045,7 @@ mod tests {
             let (pool, apalis_pool) = setup_test_pools().await;
             let asserter = Asserter::new();
 
-            let usdc_token = chain.usdc().unwrap();
+            let usdc_token = chain.usdc();
             let equity_token = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
             let operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
 

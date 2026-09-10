@@ -83,10 +83,6 @@ pub enum ApprovalPolicyVerificationError {
 pub enum ChainCoverageError {
     #[error(transparent)]
     MissingCoverage(#[from] MissingPolicyCoverage),
-    /// This build pins no canonical USDC for the chain, so its USDC grant has
-    /// no target to prove covered; fails closed.
-    #[error("[chains.{chain}] has no canonical USDC pinned in this build")]
-    UsdcNotPinned { chain: Chain },
 }
 
 /// Validates deploy inputs, lists Turnkey policies, and fails unless every
@@ -125,14 +121,11 @@ fn verify_watched_chains(
 
     for chain_inputs in watched {
         let chain = chain_inputs.chain;
-        let usdc = chain
-            .usdc()
-            .ok_or(ChainCoverageError::UsdcNotPinned { chain })?;
         let targets = build_approval_targets(
             chain_inputs.role,
             &chain_inputs.assets,
             chain_inputs.orderbook,
-            usdc,
+            chain.usdc(),
         );
         let context = ApprovalPolicyContext {
             user_id: &snapshot.user_id,
@@ -962,9 +955,7 @@ mod tests {
         )
         .unwrap_err();
 
-        let ChainCoverageError::MissingCoverage(missing) = error else {
-            panic!("an uncovered chain must fail as missing coverage, got: {error}");
-        };
+        let ChainCoverageError::MissingCoverage(missing) = error;
         assert_eq!(missing.chain, Chain::Ethereum);
         assert_eq!(
             missing
@@ -996,9 +987,7 @@ mod tests {
         ] {
             let error =
                 verify_watched_chains(&watched, &snapshot(policies), wallet_address).unwrap_err();
-            let ChainCoverageError::MissingCoverage(missing) = error else {
-                panic!("uncovered HyperEVM approval must fail as missing coverage, got: {error}");
-            };
+            let ChainCoverageError::MissingCoverage(missing) = error;
 
             assert_eq!(missing.chain, Chain::HyperEvm);
             assert_eq!(
