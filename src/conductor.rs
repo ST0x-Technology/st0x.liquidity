@@ -15236,25 +15236,21 @@ mod tests {
     async fn publish_recovery_handle_always_sets_the_cell() {
         let pool = setup_test_db().await;
 
-        let services = EquityTransferServices {
-            raindex: Arc::new(MockRaindex::new()),
-            vault_lookup: Arc::new(MockVaultLookup::new()),
-            tokenizer: Arc::new(MockTokenizer::new()),
-            wrapper: Arc::new(MockWrapper::new()),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-        };
+        let services = recovery_services(
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+        );
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let redemption_store = Arc::new(test_store(pool, services));
+        let redemption_store = Arc::new(test_store(pool, services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             Arc::new(MockRaindex::new()),
             Arc::new(MockVaultLookup::new()),
             Arc::new(MockTokenizer::new()),
             Arc::new(MockWrapper::new()),
-            Address::ZERO,
+            services,
             mint_store,
             redemption_store,
-            BotGasReceiptCostEnqueuer::Disabled,
         ));
         let rebalancing_service = freeze_guard_test_service().await;
         let usdc_recheck: Arc<dyn RecheckUsdcDeposit> = Arc::new(NeverCalledUsdcRecheck);
