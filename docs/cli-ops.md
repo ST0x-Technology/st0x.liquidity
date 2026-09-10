@@ -40,7 +40,10 @@ the CLI runs inside the live bot container: same mounted config and secrets,
 same live `/mnt/data/st0x-hedge.db`, and keyless signing through the container's
 ambient service-account identity (the same loader the server uses). There is no
 `stox` wrapper in the container, so pass `--config`/`--secrets` explicitly, with
-the paths the compose file mounts.
+the paths the compose file mounts. Replace `SUBCOMMAND OPTIONS` below with the
+CLI subcommand and its flags (plain words, so the quoted `--command` string
+stays paste-safe: angle-bracket placeholders would be parsed as shell
+redirection).
 
 Staging:
 
@@ -50,7 +53,7 @@ gcloud compute ssh t0-liquidity-staging --project t0-liquidity-staging \
   --command 'sudo docker exec "$(sudo docker ps -qf name=bot)" /bin/st0x-cli \
     --config /run/t0-config/st0x-hedge.toml \
     --secrets /run/t0-secrets/t0-liquidity-secrets.toml \
-    <command> [options]'
+    SUBCOMMAND OPTIONS'
 ```
 
 Production:
@@ -61,7 +64,7 @@ gcloud compute ssh t0-liquidity --project t0-liquidity \
   --command 'sudo docker exec "$(sudo docker ps -qf name=bot)" /bin/st0x-cli \
     --config /run/t0-config/st0x-hedge.toml \
     --secrets /run/t0-secrets/t0-liquidity-secrets.toml \
-    <command> [options]'
+    SUBCOMMAND OPTIONS'
 ```
 
 For an interactive session, SSH in first (drop `--command`), then
