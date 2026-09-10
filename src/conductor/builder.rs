@@ -45,9 +45,9 @@ use crate::dashboard::{
     DeliverDashboardTrade,
 };
 use crate::inventory::{
-    BroadcastingInventory, HedgeOrderGateReconciliationCtx, InventoryDivergenceRecoveryCtx,
-    InventoryPollingService, InventorySnapshot, InventorySnapshotId, PollFreshness,
-    WalletPollingCtx,
+    BroadcastingInventory, ChainVaultPolling, HedgeOrderGateReconciliationCtx,
+    InventoryDivergenceRecoveryCtx, InventoryPollingService, InventorySnapshot,
+    InventorySnapshotId, PollFreshness, WalletPollingCtx,
 };
 use crate::native_gas::ProviderBalanceReader;
 use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
@@ -219,6 +219,37 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
     }
 }
 
+/// The vault-reading leg of the inventory poller, one entry per chain whose
+/// vaults it reads. Each entry carries that chain's own Raindex service, its
+/// own orderbook and vault owner (which key its chain-qualified vault
+/// registry), and the configured vault sets its retired-vault warnings check
+/// against.
+fn vault_polling_entries<Prov>(
+    ctx: &Ctx,
+    primary_provider: &Prov,
+    configured_equity_vaults: BTreeMap<Address, BTreeSet<B256>>,
+    configured_usdc_vaults: Option<BTreeSet<B256>>,
+) -> Result<Vec<ChainVaultPolling<ReadOnlyEvm<Prov>>>, ConductorSpawnError>
+where
+    Prov: Provider + Clone + Send + Sync + 'static,
+{
+    let primary = ctx.chains.primary();
+
+    Ok(vec![
+        ChainVaultPolling::new(
+            primary.chain,
+            Arc::new(RaindexService::new(
+                ReadOnlyEvm::new(primary_provider.clone()),
+                crate::onchain::raindex_contracts(primary),
+                ctx.order_owner(),
+            )),
+            primary.orderbook,
+            primary.vault_owner,
+        )
+        .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults),
+    ])
+}
+
 /// Wires all runtime components and returns a running [`Conductor`].
 // Straight-line builder that wires every runtime context; splitting it would
 // scatter the wiring across helpers without reducing complexity.
@@ -274,12 +305,9 @@ where
     info!("Starting conductor orchestration");
 
     let order_owner = context.ctx.order_owner();
-    let evm = ReadOnlyEvm::new(context.provider.clone());
-    let raindex_service = Arc::new(RaindexService::new(
-        evm,
-        crate::onchain::raindex_contracts(context.ctx.chains.primary()),
-        order_owner,
-    ));
+    // Taken before the per-chain wiring below so the inventory poller can be
+    // built from the same provider map the fill watchers and accountants use.
+    let watch_providers = context.watch_providers;
 
     let reserved_cash = context
         .ctx
@@ -316,19 +344,21 @@ where
     let polling_service = Arc::new(
         InventoryPollingService::new(
             poll_freshness.clone(),
-            raindex_service,
+            vault_polling_entries(
+                &context.ctx,
+                &context.provider,
+                configured_equity_vaults,
+                configured_usdc_vaults,
+            )?,
             context.executor.clone(),
             context.frameworks.vault_registry.clone(),
-            context.ctx.chains.primary().chain,
             snapshot_id,
-            context.ctx.vault_owner(),
             context.frameworks.snapshot,
             wallet_polling,
             Some(tokenizer),
             reserved_cash,
         )
         .with_configured_equity_symbols(configured_equity_symbols.clone())
-        .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults)
         .with_divergence_recovery(InventoryDivergenceRecoveryCtx {
             inventory: context.inventory.clone(),
             threshold: context.ctx.inventory_divergence_threshold,
@@ -507,7 +537,6 @@ where
     // One accounting entry per watched chain: the primary reuses the main
     // provider; secondaries take theirs from `watch_providers` (shared with
     // the per-chain monitors below).
-    let watch_providers = context.watch_providers;
     let mut chain_accounting = std::collections::BTreeMap::new();
     for watched in context.ctx.chains.watched() {
         let provider = if watched.chain == context.ctx.chains.primary().chain {

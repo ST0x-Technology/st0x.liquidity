@@ -1337,8 +1337,8 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     use st0x_finance::Usd;
     use st0x_raindex::{RaindexContracts, RaindexService};
 
-    use crate::inventory::InventoryPollingService;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
+    use crate::inventory::{ChainVaultPolling, InventoryPollingService};
 
     let (pool, apalis_pool) = setup_test_pools().await;
 
@@ -1428,12 +1428,15 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
 
     let polling_service = InventoryPollingService::new(
         PollFreshness::new(),
-        raindex_service,
+        vec![ChainVaultPolling::new(
+            Chain::Base,
+            raindex_service,
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+        )],
         executor,
         vault_registry,
-        Chain::Base,
         snapshot_id,
-        TEST_ORDER_OWNER,
         snapshot_store.clone(),
         None,
         None,
