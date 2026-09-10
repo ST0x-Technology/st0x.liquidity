@@ -7619,6 +7619,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_recovery_claim_refuses_an_active_redemption_without_mutating() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let recovering = issuer_request_id("recovering-mint");
+        let other = redemption_aggregate_id("active-redemption");
+        let tok = tokenization_request_id("TOK-1");
+        let tombstone_at = Utc::now();
+
+        // Timeout shape (available debited to 90, in-flight 0) with a live
+        // redemption owning the symbol. The claim must refuse without restoring
+        // the in-flight, consuming the tombstone, or touching the guard.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(90))
+            .set_active_redemption(symbol.clone(), other.clone());
+        trigger.timed_out_mints.write().await.insert(
+            recovering.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: tombstone_at,
+            },
+        );
+
+        let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "timeout".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let claim = trigger
+            .rebuild_mint_tracking_for_recovery(&recovering, &failed, tok)
+            .await
+            .unwrap();
+        assert!(matches!(claim, RecoveryClaim::Conflict));
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "a conflicting claim must not restore the in-flight"
+        );
+        assert_eq!(inventory.active_redemption(&symbol), Some(&other));
+        drop(inventory);
+        assert!(
+            trigger
+                .timed_out_mints
+                .read()
+                .await
+                .contains_key(&recovering),
+            "a conflicting claim must not consume the timeout tombstone"
+        );
+        assert!(!trigger.mint_tracking.read().await.contains_key(&recovering));
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_recovery_claim_refuses_a_transfer_before_its_active_id_event() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let recovering = issuer_request_id("recovering-mint");
+        let tok = tokenization_request_id("TOK-1");
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100));
+
+        let newer_guard = trigger
+            .try_claim_equity_guard_for_transfer(&symbol)
+            .expect("new transfer claims the symbol before its first event");
+        let newer_generation = newer_guard.generation();
+        let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "rejected".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let claim = trigger
+            .rebuild_mint_tracking_for_recovery(&recovering, &failed, tok)
+            .await
+            .unwrap();
+        assert!(matches!(claim, RecoveryClaim::Conflict));
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::ActiveTransfer {
+                generation: newer_generation,
+            }),
+            "recovery must preserve the newer transfer's pre-event guard"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "a conflicting claim must not restore the in-flight"
+        );
+        assert!(!trigger.mint_tracking.read().await.contains_key(&recovering));
+
+        drop(newer_guard);
+    }
+
+    #[tokio::test]
     async fn redemption_recovery_claim_refuses_a_different_redemption_without_mutating() {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
