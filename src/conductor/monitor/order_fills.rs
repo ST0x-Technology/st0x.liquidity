@@ -1505,7 +1505,7 @@ mod tests {
         assert_eq!(lag_blocks, Some(3));
     }
 
-    /// One watcher runs per watched chain: a secondary chain's sample is
+    /// One watcher runs per hedged chain: a secondary chain's sample is
     /// filed under that chain, never under the primary's.
     #[tokio::test]
     async fn poll_once_files_the_lag_sample_under_the_watchers_chain() {

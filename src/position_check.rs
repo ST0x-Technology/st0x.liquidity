@@ -195,18 +195,18 @@ fn should_page_reference_price_failure(
     }
 }
 
-/// The asset table that sizes `symbol`'s backstop hedge: the watched chain that
+/// The asset table that sizes `symbol`'s backstop hedge: the hedged chain that
 /// enables the symbol or, when several do, the one with the tightest
 /// operational limit. One global `Position` cannot say which chain's fills it
 /// holds, so the sweep takes the most conservative cap; whatever the cap leaves
-/// behind is hedged on a later tick. `None` when no watched chain enables the
+/// behind is hedged on a later tick. `None` when no hedged chain enables the
 /// symbol.
 fn backstop_sizing_assets<'registry>(
     chains: &'registry ChainRegistry,
     symbol: &Symbol,
 ) -> Option<&'registry ChainAssets> {
     chains
-        .watched()
+        .hedged()
         .map(|chain| &chain.assets)
         .filter(|assets| assets.is_trading_enabled(symbol))
         .reduce(|tightest, candidate| {
@@ -394,8 +394,8 @@ where
         let active_transfers = symbols_with_active_transfers(&self.pool).await?;
 
         // Each symbol is paired with the asset table that sizes its hedge:
-        // the watched chain enabling it, or the tightest-capped one when
-        // several do. A symbol no watched chain enables is not swept.
+        // the hedged chain enabling it, or the tightest-capped one when
+        // several do. A symbol no hedged chain enables is not swept.
         let eligible: Vec<(Symbol, &ChainAssets)> = all_positions
             .iter()
             .filter_map(|(symbol, _)| {
@@ -1818,7 +1818,7 @@ mod tests {
             .collect()
     }
 
-    /// A symbol listed only on a watched secondary chain is still swept by
+    /// A symbol listed only on a hedged secondary chain is still swept by
     /// the backstop: its inline hedge can defer (broker outage, dead letter),
     /// and this scan is the only path that retries it. The hedge is sized by
     /// that chain's operational limit, not the primary's table (which does
@@ -1872,7 +1872,7 @@ mod tests {
         );
     }
 
-    /// A symbol enabled on two watched chains is sized by the tightest cap
+    /// A symbol enabled on two hedged chains is sized by the tightest cap
     /// among them, whichever chain carries it and whether the other chain
     /// caps it at all: the shared `Position` cannot say which chain's fills
     /// it holds, so the backstop takes the conservative limit.

@@ -319,8 +319,8 @@ async fn run_bot_session_inner(
     });
     let order_fill_monitor_tokens: std::collections::BTreeMap<_, _> = ctx
         .chains
-        .watched()
-        .map(|watched| (watched.chain, startup_barrier.token()))
+        .hedged()
+        .map(|hedged| (hedged.chain, startup_barrier.token()))
         .collect();
     let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,

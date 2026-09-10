@@ -654,7 +654,7 @@ mod tests {
     /// Base primary plus an Ethereum secondary with its own orderbook,
     /// inventory and cash table, on the stub wallets: a command resolving the
     /// wrong chain prints Base's addresses.
-    fn create_ctx_watching_ethereum(cash: Option<ChainCashAsset>) -> Ctx {
+    fn create_ctx_hedging_on_ethereum(cash: Option<ChainCashAsset>) -> Ctx {
         let mut ctx = create_ctx_with_rebalancing(None);
         ctx.chains.insert_secondary(
             HedgedChain::test()
@@ -700,7 +700,7 @@ mod tests {
     /// inventory; the stub wallet stops the run at the decimals read.
     #[tokio::test]
     async fn vault_deposit_on_ethereum_prints_that_chains_addresses() {
-        let ctx = create_ctx_watching_ethereum(None);
+        let ctx = create_ctx_hedging_on_ethereum(None);
         let deposit = Deposit {
             amount: float!(1),
             token: TEST_TOKEN,
@@ -719,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn vault_withdraw_on_ethereum_prints_that_chains_addresses() {
-        let ctx = create_ctx_watching_ethereum(None);
+        let ctx = create_ctx_hedging_on_ethereum(None);
         let withdraw = Withdraw {
             amount: float!(1),
             token: TEST_TOKEN,
@@ -770,7 +770,7 @@ mod tests {
     /// against it would have failed instead.
     #[tokio::test]
     async fn withdraw_usdc_on_ethereum_uses_ethereum_usdc_and_that_chains_cash_vault() {
-        let ctx = create_ctx_watching_ethereum(Some(ChainCashAsset {
+        let ctx = create_ctx_hedging_on_ethereum(Some(ChainCashAsset {
             vault_ids: vec![ETHEREUM_CASH_VAULT_ID],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,

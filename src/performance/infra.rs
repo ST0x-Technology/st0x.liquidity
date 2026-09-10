@@ -2,7 +2,7 @@
 //!
 //! Surfaces the order-fill monitors' block-lag and poll-cycle samples
 //! (recorded by `crate::telemetry`) as the dashboard's ingestion-health
-//! report: per watched chain, the current block lag and the worst lag per
+//! report: per hedged chain, the current block lag and the worst lag per
 //! time bucket; plus poll-cycle duration/error/skipped-tick aggregates.
 //! Strictly read-only.
 
@@ -24,10 +24,10 @@ use super::{PerformanceError, ReportRange, latency_stats};
 use crate::telemetry::{Monitor, PollOutcome, sqlite_timestamp};
 
 /// Load the monitors' ingestion-health telemetry for `range`: one block-lag
-/// series per watched chain (primary first), each scoped to that chain and
+/// series per hedged chain (primary first), each scoped to that chain and
 /// its orderbook so a database reused across configs, or two chains sharing
 /// an orderbook address, never mix lag series. Poll health covers every
-/// watched chain's orderbook: each runs its own fill watcher, so a report
+/// hedged chain's orderbook: each runs its own fill watcher, so a report
 /// scoped to the primary would read as healthy through a secondary's
 /// outage.
 ///
@@ -40,7 +40,7 @@ pub(crate) async fn load_monitor_telemetry(
     chains: &ChainRegistry,
 ) -> Result<MonitorTelemetry, PerformanceError> {
     let mut block_lag = Vec::new();
-    for hedged_chain in chains.watched() {
+    for hedged_chain in chains.hedged() {
         block_lag.push(chain_block_lag(pool, range, hedged_chain).await?);
     }
     let poll_summary = poll_health(pool, range, chains).await?;
@@ -158,7 +158,7 @@ async fn poll_health(
 ) -> Result<PollHealth, PerformanceError> {
     // Deduplicated because deterministic deployments put the same orderbook
     // address on several chains, and its samples must be counted once.
-    let orderbooks: BTreeSet<Address> = chains.watched().map(|watched| watched.orderbook).collect();
+    let orderbooks: BTreeSet<Address> = chains.hedged().map(|hedged| hedged.orderbook).collect();
 
     let mut cycles = 0_i64;
     let mut errors = 0_i64;
@@ -436,7 +436,7 @@ mod tests {
         insert_lag_for(pool, Chain::Base, ORDERBOOK, seconds, chain_tip, checkpoint).await;
     }
 
-    /// Base watched alone, against [`ORDERBOOK`].
+    /// Base hedged alone, against [`ORDERBOOK`].
     fn base_only() -> ChainRegistry {
         ChainRegistry::single_hedged_chain(HedgedChain::test().orderbook(ORDERBOOK).call())
     }
@@ -450,10 +450,10 @@ mod tests {
         series
     }
 
-    /// Two watched chains keep separate lag series even when the Raindex
+    /// Two hedged chains keep separate lag series even when the Raindex
     /// orderbook lands at the same deterministic address on both.
     #[tokio::test]
-    async fn each_watched_chain_gets_its_own_lag_series() {
+    async fn each_hedged_chain_gets_its_own_lag_series() {
         let pool = setup_test_db().await;
         let mut chains = base_only();
         chains.insert_secondary(
@@ -701,7 +701,7 @@ mod tests {
     /// orderbook, so its poll cycles belong in the report's poll health --
     /// keyed to the primary alone, an outage there would read as healthy.
     #[tokio::test]
-    async fn poll_health_aggregates_every_watched_chain() {
+    async fn poll_health_aggregates_every_hedged_chain() {
         let ethereum_orderbook = address!("0x3333333333333333333333333333333333333333");
         let pool = setup_test_db().await;
         let mut chains = base_only();
