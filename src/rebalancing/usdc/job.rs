@@ -43,6 +43,7 @@ use st0x_execution::{AlpacaWalletError, Backpressure};
 use st0x_finance::Usdc;
 
 use super::UsdcTransferError;
+use super::driver_pause::UsdcDriverGate;
 use super::manager::CrossVenueCashTransfer;
 use crate::alerts::Notifier;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -579,6 +580,9 @@ pub(crate) struct TransferUsdcToHedgingCtx {
     pub(crate) max_burn_revert_redrives: u32,
     /// Alerting channel: structured operational-alert logs in production.
     pub(crate) notifier: Arc<dyn Notifier>,
+    /// Pause gate shared with the API: an operator operation quiesces the
+    /// driver through it before mutating a transfer this worker could advance.
+    pub(crate) driver_gate: UsdcDriverGate,
 }
 
 /// Errors emitted by [`TransferUsdcToHedging::perform`].
@@ -658,6 +662,12 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
     }
 
     async fn perform(&self, ctx: &TransferUsdcToHedgingCtx) -> Result<Self::Output, Self::Error> {
+        // Park while an operator operation holds the driver quiesced, and hold
+        // the in-flight claim for the whole attempt so a pause requested mid
+        // attempt waits for it. Claimed before the per-attempt timeout so time
+        // spent parked is not charged to the attempt.
+        let _in_flight = ctx.driver_gate.enter().await;
+
         // Per-attempt timeout wrapper (hedging only): abort a hung resume so the
         // attempt fails and retries instead of wedging the single-concurrency
         // worker. The inner result is then classified for redrive/terminal
@@ -1191,6 +1201,9 @@ pub(crate) struct TransferUsdcToMarketMakingCtx {
     /// refusals that repeat on every rebalancing check do not page once per
     /// check.
     pub(crate) preflight_alerts: Arc<PreflightAlertGate>,
+    /// Pause gate shared with the API: an operator operation quiesces the
+    /// driver through it before mutating a transfer this worker could advance.
+    pub(crate) driver_gate: UsdcDriverGate,
 }
 
 /// A single balance-read blip is warn-only, but a sustained RPC outage halts
@@ -1472,6 +1485,11 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
         // as an `Err` that the redrive/retry paths handle. A phase-gated
         // perform-level timeout (safe only post-`Converting`) remains a
         // follow-up; it is deliberately not the blanket bound here.
+
+        // Park while an operator operation holds the driver quiesced, holding
+        // the in-flight claim for the whole attempt.
+        let _in_flight = ctx.driver_gate.enter().await;
+
         let result = ctx
             .transfer
             .resume_alpaca_to_base(&self.id, self.amount)
@@ -2290,6 +2308,7 @@ mod tests {
         pool: &apalis_sqlite::SqlitePool,
     ) -> TransferUsdcToHedgingCtx {
         TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer,
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(pool),
@@ -3005,6 +3024,7 @@ mod tests {
         // Short timeout to make the test fast. hedging_ctx uses 3600s by
         // default so override inline.
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -3057,6 +3077,7 @@ mod tests {
     async fn hedging_job_hits_redrive_limit_on_repeated_timeout() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -3093,6 +3114,7 @@ mod tests {
         pool: &apalis_sqlite::SqlitePool,
     ) -> TransferUsdcToMarketMakingCtx {
         TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer,
             job_queue: TransferUsdcToMarketMakingJobQueue::new(pool),
             max_burn_revert_redrives: 5,
@@ -3159,6 +3181,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedBaseToAlpaca),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -3201,6 +3224,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedBaseToAlpaca),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -3243,6 +3267,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedBaseToAlpaca),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -3318,6 +3343,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let guard_release = Arc::new(RecordingGuardRelease::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(AmbientPreflightAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3437,6 +3463,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let guard_release = Arc::new(RecordingGuardRelease::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BalanceUnavailableAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3488,6 +3515,7 @@ mod tests {
         };
 
         let ctx_with_balance = |balance: Usdc| TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(AmbientPreflightWithBalance(balance)),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3522,6 +3550,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BalanceUnavailableAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3575,6 +3604,7 @@ mod tests {
         };
 
         let failing = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BalanceUnavailableAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3583,6 +3613,7 @@ mod tests {
             preflight_alerts: gate.clone(),
         };
         let succeeding = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(OkAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3625,6 +3656,7 @@ mod tests {
         };
 
         let failing = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BalanceUnavailableAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3633,6 +3665,7 @@ mod tests {
             preflight_alerts: gate.clone(),
         };
         let ambient = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(AmbientPreflightWithBalance(Usdc::new(float!(50)))),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3686,6 +3719,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let guard_release = Arc::new(RecordingGuardRelease::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(UnrepresentableAmbientAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3726,6 +3760,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3766,6 +3801,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3807,6 +3843,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3868,6 +3905,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(InconclusiveAlpacaToBase::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -3947,6 +3985,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -4007,6 +4046,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -4052,6 +4092,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -4088,6 +4129,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::after_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -4134,6 +4176,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(InconclusiveAlpacaToBase::future_initiated_at()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -4187,6 +4230,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(InconclusiveAlpacaToBase::after_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -4263,6 +4307,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(InconclusiveAlpacaToBase::at_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -4323,6 +4368,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintRecoveryInconclusiveStub::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -4383,6 +4429,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintRecoveryInconclusiveStub::after_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -4471,6 +4518,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintRecoveryInconclusiveStub::before_deadline()),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -4525,6 +4573,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintRecoveryInconclusiveStub::after_deadline()),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -4729,6 +4778,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalBaseToAlpaca(outcome)),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -4780,6 +4830,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalAlpacaToBase(outcome)),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -5364,6 +5415,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(SettlementRpcFailureBaseToAlpaca),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5533,6 +5585,7 @@ mod tests {
         let closed_queue = TransferUsdcToHedgingJobQueue::new(&closed_pool);
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BotGasEnqueueFailureBaseToAlpaca(closed_queue)),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5602,6 +5655,7 @@ mod tests {
     async fn hedging_job_failing_notifier_does_not_abort_job() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5634,6 +5688,7 @@ mod tests {
     async fn market_making_job_failing_notifier_does_not_abort_job() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalAlpacaToBase(
                 TerminalOutcome::SettlementDeadlineElapsed,
             )),
@@ -5671,6 +5726,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let guard_release = Arc::new(RecordingGuardRelease::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalAlpacaToBase(
                 TerminalOutcome::SettlementDeadlineElapsed,
             )),
@@ -5820,6 +5876,7 @@ mod tests {
     async fn hedging_job_hits_redrive_limit_on_revert() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5883,6 +5940,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(NonRevertBurnErrorResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5913,6 +5971,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5960,6 +6019,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6006,6 +6066,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6049,6 +6110,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6091,6 +6153,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6128,6 +6191,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6174,6 +6238,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6216,6 +6281,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6330,6 +6396,7 @@ mod tests {
     async fn market_making_job_hits_redrive_limit_on_revert() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
@@ -6368,6 +6435,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -6415,6 +6483,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
@@ -6462,6 +6531,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
@@ -6519,6 +6589,7 @@ mod tests {
         }
 
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(NonRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -6549,6 +6620,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalBaseToAlpaca(TerminalOutcome::DeadlineElapsed)),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6585,6 +6657,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::DeadlineElapsed)),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -6646,6 +6719,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintPathRevert),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6702,6 +6776,7 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintPathRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -6745,6 +6820,7 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let guard_release = Arc::new(RecordingGuardRelease::default());
         let ctx = TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::AmbientBalance)),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,

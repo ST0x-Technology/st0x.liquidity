@@ -125,7 +125,7 @@ use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState}
 use crate::rebalancing::usdc::{
     DurableCheckedGuardRelease, PreflightAlertGate, RecheckUsdcDeposit, TransferUsdcToHedging,
     TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    UsdcSettlementParams,
+    UsdcDriverGate, UsdcDriverPause, UsdcSettlementParams, usdc_driver_pause,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -963,6 +963,7 @@ fn publish_recovery_handle(
     redemption_store: Arc<Store<EquityRedemption>>,
     rebalancing_service: Arc<RebalancingService>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    usdc_driver_pause: Arc<UsdcDriverPause>,
 ) {
     let _ = recovery_cell.set(crate::api::RecoveryHandle {
         transfer,
@@ -970,6 +971,7 @@ fn publish_recovery_handle(
         redemption_store,
         rebalancing_service,
         usdc_recheck,
+        usdc_driver_pause,
     });
 }
 
@@ -1118,6 +1120,7 @@ impl Conductor {
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck,
+            usdc_driver_pause,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store,
@@ -1332,6 +1335,7 @@ impl Conductor {
             recovery_redemption_store,
             recovery_service,
             usdc_recheck,
+            usdc_driver_pause,
         );
 
         publish_process_tx_handle(
@@ -1911,6 +1915,9 @@ struct RebalancingInfrastructure {
     /// Operator `transfer recheck` entry point for a failed USDC deposit,
     /// published on the recovery handle.
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    /// Operator pause control for the USDC driver, published on the recovery
+    /// handle so a write route can quiesce the workers before it mutates.
+    usdc_driver_pause: Arc<UsdcDriverPause>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -1955,6 +1962,7 @@ struct PositionAndRebalancing {
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    usdc_driver_pause: Arc<UsdcDriverPause>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -2167,6 +2175,7 @@ impl PositionAndRebalancing {
             service: infra.service,
             recovery_transfer: infra.recovery_transfer,
             usdc_recheck: infra.usdc_recheck,
+            usdc_driver_pause: infra.usdc_driver_pause,
             wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store: infra.unwrapped_equity_recovery_store,
             mint_store: infra.mint_store,
@@ -3108,13 +3117,15 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
 
 /// Builds the trigger service from the validated rebalancing config plus the
 /// conductor-owned dependencies (the trigger config is the runtime projection
-/// of `RebalancingCtx` onto every hedged chain's asset table).
+/// of `RebalancingCtx` onto every hedged chain's asset table), and wires its
+/// USDC driver pause: the gate is attached to the trigger and shared with the
+/// USDC workers, the controller is published for operator write routes.
 fn build_rebalancing_service(
     rebalancing_ctx: &RebalancingCtx,
     deps: &RebalancingDeps,
     registry_ids: BTreeMap<Chain, VaultRegistryId>,
     wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
-) -> Arc<RebalancingService> {
+) -> (Arc<RebalancingService>, UsdcDriverPause, UsdcDriverGate) {
     let allocation = rebalancing_ctx.allocation.clone();
     let chains = deps
         .ctx
@@ -3133,7 +3144,7 @@ fn build_rebalancing_service(
         })
         .collect();
 
-    Arc::new(RebalancingService::new(
+    let service = Arc::new(RebalancingService::new(
         RebalancingServiceConfig {
             poll_freshness: deps.poll_freshness.clone(),
             inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
@@ -3150,7 +3161,12 @@ fn build_rebalancing_service(
         wrappers,
         deps.schedulers.clone(),
         deps.notifier.clone(),
-    ))
+    ));
+
+    let (usdc_driver_pause, usdc_driver_gate) = usdc_driver_pause();
+    service.attach_usdc_driver_gate(usdc_driver_gate.clone());
+
+    (service, usdc_driver_pause, usdc_driver_gate)
 }
 
 /// Every hedged chain's equity transfer services, plus the per-chain vault
@@ -3382,7 +3398,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         // the saga uses there.
         let primary_equity_services = equity_transfer_services.for_chain(primary_chain)?.clone();
 
-        let rebalancing_service =
+        let (rebalancing_service, usdc_driver_pause, usdc_driver_gate) =
             build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
 
         wire_transfer_admission_guards(
@@ -3492,6 +3508,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
                 usdc_in_progress: rebalancing_service.usdc_in_progress.clone(),
             }),
             preflight_alerts: Arc::new(PreflightAlertGate::default()),
+            driver_gate: usdc_driver_gate.clone(),
         });
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
@@ -3500,6 +3517,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             job_queue: deps.schedulers.transfer_usdc_to_hedging.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
+            driver_gate: usdc_driver_gate,
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {
@@ -3529,6 +3547,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck: usdc_handles.recheck_deposit,
+            usdc_driver_pause: Arc::new(usdc_driver_pause),
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store: built.mint,
@@ -18128,6 +18147,7 @@ mod tests {
             redemption_store.clone(),
             rebalancing_service.clone(),
             usdc_recheck,
+            Arc::new(usdc_driver_pause().0),
         );
 
         let handle = recovery_cell
