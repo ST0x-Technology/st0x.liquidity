@@ -234,7 +234,7 @@ vault_id = "0xfab"
 # Whether automatic USDC rebalancing between venues is active.
 rebalancing = "enabled"
 # Maximum USDC moved per rebalance operation.
-operational_limit = 20000
+operational_limit = 50000
 
 # Per-equity config, grouped by symbol. Two tables are required:
 # [assets.equities.SYM] is the broker hedge policy (extended hours).
