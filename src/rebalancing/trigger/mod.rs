@@ -2795,11 +2795,9 @@ pub(crate) enum RecoveryRollback {
     /// The rebuild touched no inventory balances (called on a non-failed
     /// aggregate). Rollback only drops the tracking + in-progress guard.
     TrackingOnly,
-    /// Redemption recovery replaced inflight without changing available.
-    RestoreRedemptionInflight {
-        chain: Chain,
-        previous: FractionalShares,
-    },
+    /// Redemption recovery restored a released (zero) in-flight without
+    /// changing available. Rollback clears the chain's in-flight again.
+    ClearRestoredRedemptionInflight { chain: Chain },
     /// The rebuild moved available -> in-flight via `Start` (an explicitly
     /// failed transfer that had cancelled its in-flight back to available).
     /// Rollback cancels the in-flight back to available.
@@ -5451,8 +5449,8 @@ impl RebalancingService {
         rollback: RecoveryRollback,
     ) -> Result<(), RebalancingServiceError> {
         match rollback {
-            RecoveryRollback::TrackingOnly | RecoveryRollback::RestoreRedemptionInflight { .. } => {
-            }
+            RecoveryRollback::TrackingOnly
+            | RecoveryRollback::ClearRestoredRedemptionInflight { .. } => {}
             RecoveryRollback::CancelInflight => {
                 self.apply_equity_update(
                     symbol,
@@ -5632,9 +5630,8 @@ impl RebalancingService {
                 suppressed_at,
             }
         } else if previous.is_zero()? {
-            RecoveryRollback::RestoreRedemptionInflight {
+            RecoveryRollback::ClearRestoredRedemptionInflight {
                 chain: entity.chain(),
-                previous,
             }
         } else {
             RecoveryRollback::TrackingOnly
@@ -5670,11 +5667,11 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         match rollback {
             RecoveryRollback::TrackingOnly | RecoveryRollback::CancelInflight => {}
-            RecoveryRollback::RestoreRedemptionInflight { chain, previous } => {
+            RecoveryRollback::ClearRestoredRedemptionInflight { chain } => {
                 self.apply_equity_update(
                     symbol,
                     chain,
-                    Inventory::set_inflight(Venue::MarketMaking, previous),
+                    Inventory::set_inflight(Venue::MarketMaking, FractionalShares::ZERO),
                 )
                 .await?;
             }
