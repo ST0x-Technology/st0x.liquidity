@@ -96,6 +96,11 @@ pub enum RejectionReason {
          erase the executed hedge -- reconcile the fill into the position."
     )]
     AcquiredExecutedSharesConcurrently { offchain_order_id: OffchainOrderId },
+    #[error(
+        "OffchainOrder {offchain_order_id} changed concurrently while it was being failed; \
+         it still holds no executed shares -- re-run the release."
+    )]
+    OffchainOrderChangedConcurrently { offchain_order_id: OffchainOrderId },
 }
 
 /// The failure of a shared operator recovery command, letting a caller-facing
@@ -926,10 +931,14 @@ pub mod position {
     /// Fails a position's pending offchain order pointer and drives the orphaned
     /// `OffchainOrder` aggregate to `Failed`.
     ///
-    /// Shared by the operator CLI and the ops API. Operates directly on the
-    /// database: the caller must ensure the bot is not concurrently driving the
-    /// same order, since a fill landing between the state read and the commands
-    /// here cannot be guarded against.
+    /// Shared by the operator CLI and the ops API, so the bot may be driving the
+    /// same order concurrently. Aggregate-first: the order is failed with
+    /// `MarkFailedUnfilled`, which the aggregate evaluates against the state
+    /// the store loads under its per-aggregate lock and refuses once any share
+    /// has executed. A fill landing after the state read here is therefore
+    /// rejected atomically (`AcquiredExecutedSharesConcurrently`) and the
+    /// position pointer is left set, so the fill is accounted through the
+    /// normal flow.
     pub async fn release_pending_offchain_order(
         pool: &SqlitePool,
         symbol: &Symbol,
@@ -1100,39 +1109,36 @@ pub mod position {
             }
         }
 
-        /// What the repair must do with a freshly re-loaded `OffchainOrder` state.
+        /// How a terminal state reached concurrently (the send returned
+        /// `AlreadyCompleted`) is reported.
         ///
         /// The "executed shares always escalate" rule is the load-bearing
-        /// financial-safety invariant of this command; classifying the state in one
-        /// place keeps the pre-send guard and the post-send `AlreadyCompleted`
+        /// financial-safety invariant of this command; classifying the state in
+        /// one place keeps the pre-send snapshot check and the post-send
         /// recovery from encoding it differently and silently diverging.
         pub enum ReloadOutcome {
-            /// Executed shares present (`Filled`/`PartiallyFilled`): failing the order
-            /// would erase a hedge the position no longer accounts for. The caller must
-            /// refuse and route the operator to manual reconciliation.
+            /// Executed shares present (`Filled`/`PartiallyFilled`) or a
+            /// cancellation lifecycle (which may carry a partial fill): failing
+            /// the order would erase a hedge the position no longer accounts
+            /// for. The caller must refuse and route the operator to manual
+            /// reconciliation.
             Escalate,
-            /// Already `Failed`: a benign concurrent terminal transition. Report it and
-            /// leave the existing failure record untouched.
+            /// Already `Failed`: a benign concurrent terminal transition. Report
+            /// it and leave the existing failure record untouched.
             BenignTerminal,
-            /// No executed shares and not terminal (`Pending`/`Submitted`/absent). The
-            /// pre-send guard proceeds to `MarkFailed`; the post-`AlreadyCompleted` site
-            /// treats it as an unreachable invariant violation.
+            /// No executed shares and not terminal (`Pending`/`Submitted`/
+            /// absent). Unreachable after an `AlreadyCompleted` refusal; treated
+            /// as an invariant violation.
             Proceed,
         }
 
-        /// Single source of the executed-shares-escalate rule shared by both re-load
-        /// sites in [`fail_offchain_order_aggregate`].
+        /// Single source of the executed-shares-escalate rule.
         pub fn classify_reloaded_state(state: Option<&OffchainOrder>) -> ReloadOutcome {
             use OffchainOrder::{
                 Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
             };
 
             match state {
-                // Executed shares (Filled/PartiallyFilled) would erase a hedge; and a
-                // concurrent transition into a cancellation lifecycle state during a
-                // fail must route to manual reconciliation rather than being failed
-                // blind (a Cancelled order may carry a partial fill). Confirm the
-                // intended recovery path for cancellation states.
                 Some(
                     Filled { .. } | PartiallyFilled { .. } | Cancelling { .. } | Cancelled { .. },
                 ) => ReloadOutcome::Escalate,
@@ -1142,14 +1148,23 @@ pub mod position {
         }
 
         /// Drives the standalone `OffchainOrder` aggregate (pre-loaded by the caller)
-        /// to its `Failed` terminal via `MarkFailed`, after its position pointer has
-        /// been cleared.
+        /// to its `Failed` terminal via `MarkFailedUnfilled`.
         ///
-        /// Routed through the wired store so `offchain_order_view`
-        /// updates immediately. Idempotent: an already-`Failed` or absent order is
-        /// reported and left untouched rather than erroring, so a partial prior run
-        /// can be re-run safely; `Filled`/`PartiallyFilled` orders are refused because
+        /// Routed through the wired store so `offchain_order_view` updates
+        /// immediately. Idempotent: an already-`Failed` or absent order is reported
+        /// and left untouched rather than erroring, so a partial prior run can be
+        /// re-run safely; `Filled`/`PartiallyFilled` orders are refused because
         /// failing them would erase executed hedge shares.
+        ///
+        /// The caller's snapshot may be stale, and the bot may be driving this
+        /// order concurrently (the ops API route runs in the bot process). The
+        /// guard against a fill landing after the snapshot is therefore not a
+        /// re-load here but the command itself: `MarkFailedUnfilled` is evaluated
+        /// by the aggregate against the state `Store::send` loads under its
+        /// per-aggregate lock, and refuses `PartiallyFilled` with
+        /// `HasExecutedShares`. A fill in the snapshot->send gap is rejected
+        /// atomically and surfaced as `AcquiredExecutedSharesConcurrently`, with
+        /// the order and the position pointer left untouched.
         pub async fn fail_offchain_order_aggregate(
             pool: &SqlitePool,
             order: Option<OffchainOrder>,
@@ -1186,39 +1201,6 @@ pub mod position {
                 Pending { .. } | Submitted { .. } => {}
             }
 
-            // Re-load immediately before sending: the caller's snapshot may be stale,
-            // and MarkFailed is a legal transition from PartiallyFilled at the
-            // aggregate level (the bot's own post-partial-fill rejection path needs
-            // it), so a partial fill landing since the snapshot would otherwise be
-            // erased SILENTLY. This narrows the race window to the load->send gap.
-            //
-            // CONTRACT: this command requires that the bot is not concurrently driving
-            // this order (see the caller docstring). Honoring that contract means no
-            // event can land in the load->send gap, so the re-load is exact. The
-            // defenses for a contract violation are best-effort and ASYMMETRIC:
-            //   - a complete fill in the gap makes MarkFailed return AlreadyCompleted,
-            //     which the post-send handler below escalates;
-            //   - a PARTIAL fill in the gap does NOT -- MarkFailed succeeds from
-            //     PartiallyFilled -- so it would be erased silently and is UNGUARDED.
-            // That sliver is closed only by honoring the no-concurrent-bot contract;
-            // there is no in-process guard for it because the aggregate must keep
-            // MarkFailed legal from PartiallyFilled for the bot's own rejection path.
-            let current = load_entity::<OffchainOrder>(pool, &offchain_order_id)
-                .await
-                .context("failed to re-load offchain order before MarkFailed")?;
-            match classify_reloaded_state(current.as_ref()) {
-                ReloadOutcome::Escalate => {
-                    return Err(RejectionReason::AcquiredExecutedSharesConcurrently {
-                        offchain_order_id,
-                    }
-                    .into());
-                }
-                ReloadOutcome::BenignTerminal => {
-                    return Ok(OffchainOrderOutcome::TerminalConcurrently);
-                }
-                ReloadOutcome::Proceed => {}
-            }
-
             // The wired store (not bare send_command) so the offchain_order_view
             // projection updates immediately -- a stale 'Submitted' row in the view is
             // the very symptom this command exists to repair.
@@ -1229,22 +1211,32 @@ pub mod position {
             let send_result = store
                 .send(
                     &offchain_order_id,
-                    OffchainOrderCommand::MarkFailed {
+                    OffchainOrderCommand::MarkFailedUnfilled {
                         error: reason.to_string(),
-                        filled_shares: None,
                         failed_at: chrono::Utc::now(),
                     },
                 )
                 .await;
-
             match send_result {
                 Ok(()) => Ok(OffchainOrderOutcome::MarkedFailed),
-                // The bot can transition the order to a terminal state in the sliver
-                // between the re-load above and this command; a concurrent FAIL is
+                // The aggregate refused on the state it loaded under its lock: a
+                // fill (or a cancellation, which may carry one) landed after the
+                // caller's snapshot. The pointer is still set, so the fill is
+                // accounted through the normal flow; the operator reconciles.
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    OffchainOrderError::HasExecutedShares { .. }
+                    | OffchainOrderError::CancellationInProgress,
+                ))) => {
+                    Err(
+                        RejectionReason::AcquiredExecutedSharesConcurrently { offchain_order_id }
+                            .into(),
+                    )
+                }
+                // A terminal state reached concurrently: a concurrent FAIL is
                 // equivalent to finding it terminal up front, but a concurrent FILL
-                // means the pointer was cleared for an order that actually executed --
-                // surface that as a hard error so the operator reconciles the
-                // position instead of trusting a clean exit.
+                // or cancellation means executed shares the pointer does not
+                // account for -- surface that as a hard error so the operator
+                // reconciles the position instead of trusting a clean exit.
                 Err(AggregateError::UserError(LifecycleError::Apply(
                     OffchainOrderError::AlreadyCompleted,
                 ))) => {
@@ -1252,9 +1244,8 @@ pub mod position {
                         .await
                         .context("failed to re-load offchain order after concurrent transition")?;
                     match classify_reloaded_state(terminal.as_ref()) {
-                        // Executed shares always escalate: PartiallyFilled cannot
-                        // produce AlreadyCompleted today, but if it ever does, the
-                        // same pointer-cleared-without-accounting hazard applies.
+                        // Filled or Cancelled concurrently: executed shares the
+                        // cleared pointer would not account for.
                         ReloadOutcome::Escalate => {
                             Err(RejectionReason::AcquiredExecutedSharesConcurrently {
                                 offchain_order_id,
@@ -1264,17 +1255,45 @@ pub mod position {
                         ReloadOutcome::BenignTerminal => {
                             Ok(OffchainOrderOutcome::TerminalConcurrently)
                         }
-                        // MarkFailed only returns AlreadyCompleted from a terminal
-                        // aggregate (Filled or Failed), so a non-terminal or absent
-                        // state here means the order regressed out of a terminal state
-                        // -- impossible under the append-only lifecycle. Bail loudly as
-                        // an invariant violation rather than silently reporting a clean
-                        // "left as-is".
+                        // MarkFailedUnfilled only returns AlreadyCompleted from a
+                        // terminal aggregate (Filled, Failed, or Cancelled), so a
+                        // non-terminal or absent state here means the order regressed
+                        // out of a terminal state -- impossible under the append-only
+                        // lifecycle. Bail loudly as an invariant violation rather than
+                        // silently reporting a clean "left as-is".
                         ReloadOutcome::Proceed => Err(OperatorError::Operational(anyhow::anyhow!(
                             "OffchainOrder {offchain_order_id} returned AlreadyCompleted from \
-                             MarkFailed but re-loaded as a non-terminal state -- aggregate \
-                             lifecycle invariant violated"
+                             MarkFailedUnfilled but re-loaded as a non-terminal state -- \
+                             aggregate lifecycle invariant violated"
                         ))),
+                    }
+                }
+                // The bot's own store appended an event between this store's load
+                // and its append (the two stores hold separate per-aggregate
+                // locks; the event sequence is what serializes them). Nothing was
+                // written. Classify what landed: executed shares escalate, a
+                // concurrent fail is benign, and a still-unfilled advance
+                // (Pending -> Submitted) is safe to re-run.
+                Err(AggregateError::AggregateConflict) => {
+                    let current = load_entity::<OffchainOrder>(pool, &offchain_order_id)
+                        .await
+                        .context("failed to re-load offchain order after a concurrent append")?;
+                    match classify_reloaded_state(current.as_ref()) {
+                        ReloadOutcome::Escalate => {
+                            Err(RejectionReason::AcquiredExecutedSharesConcurrently {
+                                offchain_order_id,
+                            }
+                            .into())
+                        }
+                        ReloadOutcome::BenignTerminal => {
+                            Ok(OffchainOrderOutcome::TerminalConcurrently)
+                        }
+                        ReloadOutcome::Proceed => {
+                            Err(RejectionReason::OffchainOrderChangedConcurrently {
+                                offchain_order_id,
+                            }
+                            .into())
+                        }
                     }
                 }
                 Err(error) => Err(OperatorError::Operational(

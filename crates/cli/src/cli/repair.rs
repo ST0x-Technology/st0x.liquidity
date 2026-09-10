@@ -842,24 +842,29 @@ mod tests {
         );
     }
 
-    /// The in-contract guarantee for partial fills: a partial fill that lands
-    /// before the pre-send re-load must be caught. MarkFailed is legal from
-    /// PartiallyFilled at the aggregate level, so without the re-load the
-    /// executed shares would be erased silently. The remaining load->send
-    /// sliver is UNGUARDED by design -- it is closed only by honoring the
-    /// no-concurrent-bot contract (documented at the re-load site), since the
-    /// aggregate must keep MarkFailed legal from PartiallyFilled for the bot.
+    /// The exact interleaving the live route must survive: the bot commits a
+    /// PARTIAL fill after the repair's last read of the order and before its
+    /// `MarkFailedUnfilled` send. The fill must be refused by the aggregate
+    /// (evaluated on the state the store loads for the send, not on the stale
+    /// snapshot), the partial fill must survive, and because the repair is
+    /// aggregate-first the position pointer must still be set so the fill is
+    /// accounted through the normal flow. This is the case the bot's own
+    /// `MarkFailed` would erase silently.
     #[tokio::test]
-    async fn fail_offchain_order_aggregate_errors_on_concurrent_partial_fill() {
+    async fn fail_offchain_order_aggregate_refuses_a_partial_fill_landing_after_the_read() {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("MSTR").unwrap();
         let order_id = OffchainOrderId::new();
+        seed_pending_position(&pool, &symbol, order_id).await;
         seed_offchain_order(&pool, order_id, &symbol).await;
 
+        // The repair's last read of the order, while still Submitted...
         let stale = st0x_event_sorcery::load_entity::<OffchainOrder>(&pool, &order_id)
             .await
             .unwrap();
+        assert!(matches!(stale, Some(OffchainOrder::Submitted { .. })));
 
+        // ...then the bot commits a partial fill through its own store.
         st0x_event_sorcery::send_command::<OffchainOrder>(
             &pool,
             &order_id,
@@ -884,22 +889,41 @@ mod tests {
             "expected the concurrent-execution error; got: {error}"
         );
 
-        // The partial fill must survive untouched.
         let order = st0x_event_sorcery::load_entity::<OffchainOrder>(&pool, &order_id)
             .await
             .unwrap()
             .unwrap();
         assert!(
-            matches!(order, OffchainOrder::PartiallyFilled { .. }),
+            matches!(
+                order,
+                OffchainOrder::PartiallyFilled { shares_filled, .. }
+                    if shares_filled == FractionalShares::new(float!(0.25))
+            ),
             "the partial fill must not be erased, got {order:?}"
+        );
+
+        let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_offchain_order_id,
+            Some(order_id),
+            "the pointer must stay set so the fill is accounted through the normal flow",
         );
     }
 
     /// The escalation classifier is the single source of the executed-shares
-    /// rule shared by both re-load sites; every state must map to the right
-    /// outcome so the two sites cannot silently diverge. Covers all three
-    /// `ReloadOutcome` variants -- the branches the `AlreadyCompleted` recovery
-    /// arm depends on but cannot exercise deterministically in situ.
+    /// rule shared by the `AlreadyCompleted` and `AggregateConflict` recovery
+    /// arms; every state must map to the right outcome so the two cannot
+    /// silently diverge. Covers all three `ReloadOutcome` variants -- the
+    /// branches those arms depend on but cannot exercise deterministically in
+    /// situ.
     #[tokio::test]
     async fn classify_reloaded_state_routes_every_variant() {
         let pool = setup_test_db().await;

@@ -1106,6 +1106,10 @@ impl EventSourced for OffchainOrder {
                 filled_shares,
                 failed_at,
             } => mark_failed_events(self, error, filled_shares, failed_at),
+
+            OffchainOrderCommand::MarkFailedUnfilled { error, failed_at } => {
+                mark_failed_unfilled_events(self, error, failed_at)
+            }
         }
     }
 }
@@ -1206,6 +1210,39 @@ fn mark_failed_events(
         filled_shares,
         failed_at,
     }])
+}
+
+/// The operator repair terminal: fails an order only while it has no executed
+/// shares. Evaluated against the state `Store::send` loads under the
+/// per-aggregate lock, so a fill that lands after the operator's last read
+/// and before this command is refused here rather than erased. `Failed`
+/// reports `AlreadyCompleted` (not the idempotent no-op of `MarkFailed`) so a
+/// repair can tell a concurrent failure apart from its own.
+fn mark_failed_unfilled_events(
+    order: &OffchainOrder,
+    error: String,
+    failed_at: DateTime<Utc>,
+) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+    match order {
+        OffchainOrder::Pending { .. } | OffchainOrder::Submitted { .. } => {
+            Ok(vec![OffchainOrderEvent::Failed {
+                error,
+                filled_shares: None,
+                failed_at,
+            }])
+        }
+        OffchainOrder::PartiallyFilled { shares_filled, .. } => {
+            Err(OffchainOrderError::HasExecutedShares {
+                shares_filled: *shares_filled,
+            })
+        }
+        // A cancellation may carry a partial fill and is being driven by the
+        // bot; the repair must not race it.
+        OffchainOrder::Cancelling { .. } => Err(OffchainOrderError::CancellationInProgress),
+        OffchainOrder::Filled { .. }
+        | OffchainOrder::Failed { .. }
+        | OffchainOrder::Cancelled { .. } => Err(OffchainOrderError::AlreadyCompleted),
+    }
 }
 
 fn evolve_filled(
@@ -2941,6 +2978,16 @@ pub enum OffchainOrderCommand {
         /// queueing delays.
         failed_at: DateTime<Utc>,
     },
+    /// Operator repair: fail an order that has no executed shares, refusing
+    /// atomically if a fill has landed. Unlike `MarkFailed`, which the bot's
+    /// own rejection path must be able to send from `PartiallyFilled`, this
+    /// is only ever legal from `Pending`/`Submitted`; the check runs against
+    /// the state loaded under the store's per-aggregate lock, so no fill can
+    /// slip between an operator's read and the send.
+    MarkFailedUnfilled {
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3170,6 +3217,17 @@ pub enum OffchainOrderError {
     /// at the call site rather than carried here.
     #[error("Broker rejected the cancellation request for order {executor_order_id}")]
     CancelFailed { executor_order_id: ExecutorOrderId },
+    /// A repair that may only fail an unfilled order found executed shares on
+    /// the aggregate; failing it would erase a hedge the position no longer
+    /// accounts for.
+    #[error(
+        "Cannot fail order as unfilled: {shares_filled} shares have executed; reconcile the \
+         position instead"
+    )]
+    HasExecutedShares { shares_filled: FractionalShares },
+    /// A repair found the order in a broker cancellation the bot is driving.
+    #[error("Cannot fail order: a broker cancellation is in progress")]
+    CancellationInProgress,
 }
 
 #[cfg(test)]
@@ -4859,6 +4917,160 @@ mod tests {
             failed,
             store.load(&id).await.unwrap().unwrap(),
             "a duplicate MarkFailed must leave the original failure untouched"
+        );
+    }
+
+    /// The operator repair terminal on a live, unfilled order: the same
+    /// `Failed` event `MarkFailed` records, with no fill evidence.
+    #[tokio::test]
+    async fn mark_failed_unfilled_fails_a_submitted_order() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+        place_and_submit(&store, &id).await;
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkFailedUnfilled {
+                    error: "operator repair".to_string(),
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let failed = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                failed,
+                OffchainOrder::Failed {
+                    filled_shares: None,
+                    ..
+                }
+            ),
+            "got {failed:?}"
+        );
+    }
+
+    /// The atomic guard the repair relies on: `MarkFailedUnfilled` is evaluated
+    /// against the state the store loads under its lock, so a partial fill
+    /// that landed after the operator's read is refused here and the fill
+    /// survives. `MarkFailed` from the same state would succeed and erase it.
+    #[tokio::test]
+    async fn mark_failed_unfilled_refuses_a_partially_filled_order() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+        let id = OffchainOrderId::new();
+        place_and_submit(&store, &id).await;
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(25)),
+                    avg_price: Usd::new(float!(100)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let partially_filled = store.load(&id).await.unwrap().unwrap();
+
+        let error = store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkFailedUnfilled {
+                    error: "operator repair".to_string(),
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    OffchainOrderError::HasExecutedShares { shares_filled }
+                )) if shares_filled == FractionalShares::new(float!(25))
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(
+            partially_filled,
+            store.load(&id).await.unwrap().unwrap(),
+            "the refused repair must leave the partial fill untouched"
+        );
+    }
+
+    /// A cancellation the bot is driving may carry a partial fill; the repair
+    /// must not race it. A terminal order reports `AlreadyCompleted` rather
+    /// than the idempotent no-op of `MarkFailed`, so a repair can tell a
+    /// concurrent failure apart from its own.
+    #[tokio::test]
+    async fn mark_failed_unfilled_refuses_cancelling_and_terminal_orders() {
+        let store = TestStore::<OffchainOrder>::new(noop_order_placer());
+
+        let cancelling = OffchainOrderId::new();
+        place_and_submit(&store, &cancelling).await;
+        store
+            .send(
+                &cancelling,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+        let error = store
+            .send(
+                &cancelling,
+                OffchainOrderCommand::MarkFailedUnfilled {
+                    error: "operator repair".to_string(),
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    OffchainOrderError::CancellationInProgress
+                ))
+            ),
+            "got {error:?}"
+        );
+
+        let failed = OffchainOrderId::new();
+        store.send(&failed, place_command()).await.unwrap();
+        store
+            .send(
+                &failed,
+                OffchainOrderCommand::MarkFailed {
+                    error: "bot failure".to_string(),
+                    filled_shares: None,
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let error = store
+            .send(
+                &failed,
+                OffchainOrderCommand::MarkFailedUnfilled {
+                    error: "operator repair".to_string(),
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    OffchainOrderError::AlreadyCompleted
+                ))
+            ),
+            "got {error:?}"
         );
     }
 

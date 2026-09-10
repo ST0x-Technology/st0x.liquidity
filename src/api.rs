@@ -2449,9 +2449,11 @@ struct ReleaseHedgeResponse {
 }
 
 /// Fails a position's pending offchain order pointer and drives the orphaned
-/// `OffchainOrder` aggregate to `Failed`. Operates directly on the local CQRS
-/// state; the operator must ensure the bot is not concurrently driving the same
-/// order. Mirrors `stox position release-hedge`.
+/// `OffchainOrder` aggregate to `Failed`. Safe against the live bot: the order
+/// is failed with `MarkFailedUnfilled`, which the aggregate refuses atomically
+/// once any share has executed, so a fill landing between the handler's read
+/// and the send is rejected with the pointer left set rather than erased.
+/// Mirrors `stox position release-hedge`.
 async fn release_position_hedge(
     State(state): State<AppState>,
     Path(symbol): Path<String>,
