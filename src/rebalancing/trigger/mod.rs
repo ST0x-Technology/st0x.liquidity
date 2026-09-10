@@ -7357,20 +7357,21 @@ mod tests {
             tracked,
             "recovery tracking must survive the terminal failure reactor"
         );
-        let inventory = trigger.inventory.read().await;
+        let (market_making, hedging, hedging_inflight) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+                inventory.equity_available(&symbol, Venue::Hedging),
+                inventory.equity_inflight(&symbol, Venue::Hedging),
+            )
+        };
         assert_eq!(
-            inventory.equity_available(&symbol, Venue::MarketMaking),
+            market_making,
             Some(shares(10)),
             "recovered shares must be credited exactly once"
         );
-        assert_eq!(
-            inventory.equity_available(&symbol, Venue::Hedging),
-            Some(shares(90))
-        );
-        assert_eq!(
-            inventory.equity_inflight(&symbol, Venue::Hedging),
-            Some(shares(0))
-        );
+        assert_eq!(hedging, Some(shares(90)));
+        assert_eq!(hedging_inflight, Some(shares(0)));
     }
 
     #[tokio::test]

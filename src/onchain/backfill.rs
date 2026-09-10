@@ -89,8 +89,8 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
 /// `OperatorDeposit` / `OperatorWithdraw` logs from the shared
 /// `RaindexInventory` in `[from_block, to_block]`, pushes an
 /// `AccountForDexTrade` job for each (inventory legs first paired into a single
-/// `InventoryTrade` per settlement tx), and advances the backfill checkpoint to
-/// `to_block` on success.
+/// `InventoryTrade` per settlement tx), advancing the backfill checkpoint after
+/// each batch is fully enqueued so a failed range keeps the progress it made.
 ///
 /// Skips RPC calls when `from_block > to_block` (already caught up),
 /// but still moves the checkpoint forward so a stale row does not
@@ -145,11 +145,21 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
         )
         .await?;
         total_enqueued += enqueued;
+
+        // Commit each batch as it lands rather than the whole range at the end.
+        // The batches are contiguous and ascending from `from_block`
+        // (= checkpoint + 1), and are processed strictly in order, so
+        // `batch_end` is genuinely the last fully enqueued block -- committing
+        // it leaves no gap. This is what lets a range too large for one job
+        // attempt make progress: a timed-out or failed attempt resumes at the
+        // first unscanned block instead of restarting from `from_block` and
+        // never converging. The queue push is durable before the checkpoint
+        // moves, so a crash in between only costs a re-scan, which the pipeline
+        // dedupes on `(chain, tx_hash, log_index)`.
+        save_backfill_checkpoint(pool, evm_ctx, batch_end).await?;
     }
 
     info!(target: "orderbook", total_enqueued, "Backfill completed");
-
-    save_backfill_checkpoint(pool, evm_ctx, to_block).await?;
 
     Ok(())
 }
@@ -252,11 +262,12 @@ where
     const WORKER_NAME: &'static str = "backfill-worker";
 
     /// A range covering a long outage legitimately spends far longer than the
-    /// default bound working through batched log scans, and the checkpoint
-    /// only advances after the whole range completes, so a timed-out attempt
-    /// re-scans the range from the start (safe: downstream dedupes by
-    /// `(tx_hash, log_index)`, but not incremental). The generous bound keeps
-    /// the timeout a hang detector, not a cap on legitimate catch-up work.
+    /// default bound working through batched log scans, so the generous bound
+    /// keeps the timeout a hang detector, not a cap on legitimate catch-up
+    /// work. `backfill_range` checkpoints every batch it finishes, so an
+    /// attempt that still times out resumes at the first unscanned block
+    /// rather than restarting the range -- which on HyperEVM's 50-block
+    /// batches is what keeps a day-long backlog converging.
     const PERFORM_TIMEOUT: Option<std::time::Duration> =
         Some(std::time::Duration::from_secs(2 * 60 * 60));
 
