@@ -733,6 +733,35 @@
               pkgs.pkg-config
             ];
 
+            # mold links the debug test binaries in a fraction of GNU ld's time.
+            # Applied to the cargo shells only, via the target-specific rustflags
+            # env var, so the crane release builds (`nix build`, OCI images) keep
+            # the stock linker. Linux only; a macOS shell is unchanged.
+            moldInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.mold ];
+            moldEnv = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+              "CARGO_TARGET_${pkgs.stdenv.hostPlatform.rust.cargoEnvVarTarget}_RUSTFLAGS" =
+                "-C link-arg=-fuse-ld=mold";
+            };
+            # Cargo ignores an unset or misnamed target rustflags variable and
+            # silently links with the stock linker, so shell entry (local and
+            # CI) refuses to proceed unless mold is on PATH and the variable
+            # carries the flag. Derived from moldEnv: empty on macOS.
+            moldCheck = pkgs.lib.concatStrings (
+              pkgs.lib.mapAttrsToList (name: value: ''
+                command -v mold >/dev/null || {
+                  echo "mold is not on PATH; cargo would silently use the default linker" >&2
+                  exit 1
+                }
+                case "''${${name}-}" in
+                  *"${value}"*) ;;
+                  *)
+                    echo "${name} does not contain '${value}'; cargo would silently use the default linker" >&2
+                    exit 1
+                    ;;
+                esac
+              '') moldEnv
+            );
+
           in
           {
             # Local development. Rust-only rainix shell + infra/deploy tooling,
@@ -742,6 +771,7 @@
                 shellHook = ''
                   ${rustShell.shellHook}
                   ${rainMathFloatLink}
+                  ${moldCheck}
                 '';
 
                 SQLX_OFFLINE = true;
@@ -771,9 +801,11 @@
                   ]
                   ++ builtins.attrValues infraPkgs.packages
                   ++ builtins.attrValues deployScripts
-                  ++ rustShell.buildInputs;
+                  ++ rustShell.buildInputs
+                  ++ moldInputs;
               }
               // abiEnv
+              // moldEnv
             );
 
             # CI: cargo check/nextest/clippy + sqlx db reset. No terraform, no
@@ -782,18 +814,22 @@
             # tests spawn anvil for local EVM simulation.
             ci-backend = pkgs.mkShell (
               {
-                buildInputs = backendInputs ++ [
-                  pkgs.sqlx-cli
-                  pkgs.cargo-nextest
-                  foundryBin
-                ];
+                buildInputs =
+                  backendInputs
+                  ++ [
+                    pkgs.sqlx-cli
+                    pkgs.cargo-nextest
+                    foundryBin
+                  ]
+                  ++ moldInputs;
 
-                shellHook = rainMathFloatLink;
+                shellHook = rainMathFloatLink + moldCheck;
 
                 SQLX_OFFLINE = true;
                 DATABASE_URL = "sqlite:dev.db";
               }
               // abiEnv
+              // moldEnv
             );
 
             # CI dashboard: bun install + lint only. `nix build .#st0x-dashboard`
