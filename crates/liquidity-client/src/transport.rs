@@ -172,6 +172,24 @@ impl<A: TokenSource + Sync> Client<A> {
         .await
     }
 
+    /// Posts a typed JSON body under the write prefix. The body types live in
+    /// `wire.rs` and mirror the bot's request contracts field for field.
+    pub async fn post_json<Body: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &Body,
+    ) -> Result<serde_json::Value, TransportError> {
+        let url = self.url(WRITE_PREFIX, path, &[]);
+        let target = url.to_string();
+        let token = self
+            .write_auth
+            .bearer()
+            .await
+            .map_err(TransportError::Auth)?;
+        self.dispatch(self.http.post(url).json(body), target, token)
+            .await
+    }
+
     async fn dispatch(
         &self,
         request: reqwest::RequestBuilder,
