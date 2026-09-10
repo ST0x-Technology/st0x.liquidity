@@ -442,6 +442,13 @@ async fn finish_session_shutdown(
     shutdown_result
 }
 
+fn transfer_id<Tag>(id: uuid::Uuid) -> st0x_finance::Id<Tag> {
+    let Ok(id) = st0x_finance::Id::new(id.to_string()) else {
+        unreachable!("UUIDs always format as non-blank strings");
+    };
+    id
+}
+
 /// Drop guard that aborts the conductor task and shuts the runtime supervisors
 /// down while the session future can still be cancelled.
 ///
