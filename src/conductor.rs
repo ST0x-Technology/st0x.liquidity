@@ -98,6 +98,7 @@ use crate::onchain_trade::{
     OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId, OnChainTradeSource,
     SourceAttributionDecision,
 };
+use crate::operator::process_tx::ProcessTxStores;
 use crate::performance::HedgeLatencyProjection;
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
@@ -857,10 +858,12 @@ fn publish_process_tx_handle(
     process_tx_cell: &tokio::sync::OnceCell<crate::api::ProcessTxHandle>,
     order_placer: Arc<dyn OrderPlacer>,
     counter_trade_submission_lock: Arc<Mutex<()>>,
+    stores: ProcessTxStores,
 ) {
     let _ = process_tx_cell.set(crate::api::ProcessTxHandle {
         order_placer,
         counter_trade_submission_lock,
+        stores,
     });
 }
 
@@ -1018,6 +1021,15 @@ impl Conductor {
             portfolio_snapshot,
         };
 
+        // The in-bot process-tx route writes through these wired stores so the
+        // fill's events reach the running reactors, not a detached copy.
+        let process_tx_stores = ProcessTxStores {
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
+            position_projection: frameworks.position_projection.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
+        };
+
         let TradingJobQueues {
             hedge_queue,
             poll_status_queue,
@@ -1145,6 +1157,7 @@ impl Conductor {
             &process_tx_cell,
             process_tx_order_placer,
             counter_trade_submission_lock,
+            process_tx_stores,
         );
 
         conductor
