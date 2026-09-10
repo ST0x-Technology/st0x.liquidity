@@ -5266,12 +5266,14 @@ impl RebalancingService {
     /// `ProviderCompletionRecovered` inventory effect and the terminal
     /// cleanup once the recovery event is dispatched.
     ///
-    /// Returns [`RecoveryClaim::Conflict`] when a *different* live mint already
-    /// owns the symbol's slot: the ownership check and the in-flight restore run
-    /// under one inventory write lock (compare-and-claim) so a concurrent mint
-    /// cannot claim the slot in between, which would let recovery's `set_inflight`
-    /// (a replace, not an add) clobber its in-flight. A slot still owned by `id`
-    /// itself is not a conflict -- that is the stale state recovery reconciles.
+    /// Returns [`RecoveryClaim::Conflict`] when another live transfer owns the
+    /// symbol: a *different* mint, a redemption, or a job that claimed the
+    /// symbol guard before its first event. The ownership check, the guard
+    /// claim and the in-flight restore run under one inventory write lock
+    /// (compare-and-claim) so a concurrent transfer cannot claim the slot in
+    /// between, which would let recovery's `set_inflight` (a replace, not an
+    /// add) clobber its in-flight. A slot still owned by `id` itself is not a
+    /// conflict -- that is the stale state recovery reconciles.
     pub(crate) async fn rebuild_mint_tracking_for_recovery(
         &self,
         id: &IssuerRequestId,
@@ -5353,26 +5355,60 @@ impl RebalancingService {
                 )
             };
 
-        // Compare-and-claim: refuse if a *different* mint owns the slot, else
-        // restore the in-flight -- both under one write lock so the check and the
-        // claim cannot be interleaved by a concurrent live mint.
-        {
+        // Compare-and-claim: active request IDs catch established transfers,
+        // while the symbol guard catches a new transfer in the interval before
+        // its first event records an active ID. A stale self-owned mint already
+        // holds that guard and reuses it. The check, the guard claim and the
+        // in-flight restore all run under one write lock so a concurrent
+        // transfer cannot interleave. An error after the claim drops the guard,
+        // which releases the slot.
+        let recovery_guard = {
             let mut inventory = self.inventory.write().await;
-            if matches!(inventory.active_mint(symbol), Some(active) if active != id) {
+            if inventory.active_redemption(symbol).is_some()
+                || matches!(inventory.active_mint(symbol), Some(active) if active != id)
+            {
                 warn!(
                     target: "rebalance",
                     id = %id,
                     %symbol,
-                    "Refusing mint recovery: a different mint for this symbol is in progress"
+                    "Refusing mint recovery: a different transfer for this symbol is in progress"
                 );
                 return Ok(RecoveryClaim::Conflict);
             }
+
+            let reuses_self_owned_guard = inventory.active_mint(symbol) == Some(id)
+                && self
+                    .equity_in_progress
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(symbol)
+                    .is_some_and(|state| {
+                        matches!(state, equity::GuardState::ActiveTransfer { .. })
+                    });
+            let recovery_guard = if reuses_self_owned_guard {
+                None
+            } else {
+                let Some(guard) =
+                    claim_guard_for_recovery_or_orphan(&self.equity_in_progress, symbol)
+                else {
+                    warn!(
+                        target: "rebalance",
+                        id = %id,
+                        %symbol,
+                        "Refusing mint recovery: another transfer owns the symbol guard"
+                    );
+                    return Ok(RecoveryClaim::Conflict);
+                };
+                Some(guard)
+            };
 
             *inventory =
                 inventory
                     .clone()
                     .update_equity_at(symbol, entity.chain(), update, Utc::now())?;
-        }
+            drop(inventory);
+            recovery_guard
+        };
 
         // The inventory update succeeded; now consume the timeout markers.
         if timed_out_at.is_some() {
@@ -5394,8 +5430,10 @@ impl RebalancingService {
                 last_progress_at: Utc::now(),
             },
         );
-        self.mark_equity_active_transfer(symbol, || equity::GUARD_GENERATION.next());
-        Ok(RecoveryClaim::Claimed(rollback))
+        Ok(match recovery_guard {
+            Some(guard) => RecoveryClaim::Guarded { rollback, guard },
+            None => RecoveryClaim::Claimed(rollback),
+        })
     }
 
     /// Reverses what [`Self::rebuild_mint_tracking_for_recovery`] mutated, for
@@ -7592,6 +7630,13 @@ mod tests {
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(100))
             .set_active_mint(symbol.clone(), recovering.clone());
+        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        let guard_before = trigger
+            .equity_in_progress
+            .read()
+            .unwrap()
+            .get(&symbol)
+            .cloned();
 
         let failed = TokenizedEquityMint::Failed {
             chain: Chain::Base,
@@ -7607,6 +7652,16 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(claim, RecoveryClaim::Claimed(_)));
+        assert_eq!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&symbol)
+                .cloned(),
+            guard_before,
+            "same-ID recovery must reuse the existing guard generation"
+        );
         assert_eq!(
             trigger
                 .inventory
