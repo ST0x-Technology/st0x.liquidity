@@ -10674,6 +10674,58 @@ mod tests {
         );
     }
 
+    /// A watched secondary chain is not polled, so no snapshot has seeded its
+    /// slots. Debiting an unseeded slot would fail and crediting one would
+    /// invent a balance holding only the delta; the chain's first snapshot
+    /// contains the fill anyway (ADR 0018), so both legs wait for it.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn fill_on_an_unsnapshotted_chain_is_skipped_until_a_snapshot_seeds_it() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::Ethereum),
+            )
+            .await
+            .expect("a fill on an unsnapshotted chain must be skipped, not fail");
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(50)),
+            "an Ethereum fill must not move the primary chain's equity slot"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(10000)),
+            "an Ethereum fill must not move the primary chain's USDC slot"
+        );
+        assert_eq!(
+            inventory.onchain_equity_available_at(&symbol, Chain::Ethereum),
+            None,
+            "the delta must not invent an equity slot the poller never seeded"
+        );
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Ethereum),
+            None,
+            "the delta must not invent a USDC slot the poller never seeded"
+        );
+        drop(inventory);
+
+        assert!(logs_contain("no onchain snapshot has seeded"));
+        assert_eq!(count_pending_equity_check_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 0);
+    }
+
     #[tokio::test]
     async fn primary_chain_fill_schedules_rebalancing_checks() {
         let symbol = Symbol::new("AAPL").unwrap();
