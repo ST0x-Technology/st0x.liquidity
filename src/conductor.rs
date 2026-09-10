@@ -161,7 +161,7 @@ pub(crate) struct ConductorStartupTokens {
 }
 
 pub(crate) struct SupervisorStartupTokens {
-    /// One readiness token per watched chain's fill monitor: startup is not
+    /// One readiness token per hedged chain's fill monitor: startup is not
     /// complete until every watcher reached its run loop.
     pub(crate) order_fill_monitors: BTreeMap<Chain, StartupToken>,
     pub(crate) inventory_monitor: StartupToken,
@@ -733,12 +733,12 @@ type HttpProvider = FillProvider<
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The watched chains beyond the primary: the ones needing their own
+/// The hedged chains beyond the primary: the ones needing their own
 /// providers, watchers, and accounting entries.
-fn watched_secondaries(ctx: &Ctx) -> Vec<HedgedChain> {
+fn hedged_secondaries(ctx: &Ctx) -> Vec<HedgedChain> {
     ctx.chains
-        .watched()
-        .filter(|watched| watched.chain != ctx.chains.primary().chain)
+        .hedged()
+        .filter(|hedged| hedged.chain != ctx.chains.primary().chain)
         .cloned()
         .collect()
 }
@@ -785,7 +785,7 @@ where
     E: Executor + Clone,
 {
     let primary_chain = ctx.chains.primary();
-    let watched_secondaries = watched_secondaries(ctx);
+    let hedged_secondaries = hedged_secondaries(ctx);
     // Telemetry channel: the RPC layer and instrumented executor emit
     // dependency-call samples through it; the writer task batches them
     // into SQLite in the background.
@@ -799,14 +799,14 @@ where
     // contract calls. No WebSocket -- see `monitor::order_fills`.
     let provider = bounded_http_provider(&primary_chain.rpc_url, &telemetry)?;
 
-    // One provider per watched non-primary chain, bounded and timed exactly
+    // One provider per hedged non-primary chain, bounded and timed exactly
     // like the primary's: a hung secondary RPC must fail its own watcher,
     // not park it.
-    let watch_providers = watched_secondaries
+    let watch_providers = hedged_secondaries
         .iter()
-        .map(|watched| {
-            bounded_http_provider(&watched.rpc_url, &telemetry)
-                .map(|provider| (watched.chain, provider))
+        .map(|hedged| {
+            bounded_http_provider(&hedged.rpc_url, &telemetry)
+                .map(|provider| (hedged.chain, provider))
         })
         .collect::<anyhow::Result<BTreeMap<Chain, HttpProvider>>>()?;
 
@@ -1399,25 +1399,25 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .collect()
 }
 
-/// The startup approval targets of every watched chain, keyed by chain: its
+/// The startup approval targets of every hedged chain, keyed by chain: its
 /// canonical USDC against its own orderbook, plus, where the chain rebalances
 /// equity, each enabled equity's wrap and deposit grants.
 fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
     ctx.chains
-        .watched_with_roles()
-        .map(|(role, watched)| {
-            let chain = watched.chain;
+        .hedged_with_roles()
+        .map(|(role, hedged)| {
+            let chain = hedged.chain;
 
             (
                 chain,
-                build_approval_targets(role, &watched.assets, watched.orderbook, chain.usdc()),
+                build_approval_targets(role, &hedged.assets, hedged.orderbook, chain.usdc()),
             )
         })
         .collect()
 }
 
 /// Grants one-time idempotent MAX ERC20 approvals to the trusted spenders at
-/// startup, on every watched chain: that chain's USDC -> orderbook, and on the
+/// startup, on every hedged chain: that chain's USDC -> orderbook, and on the
 /// primary and every secondary that rebalances equity each enabled equity's
 /// underlying -> wrapper vault and wrapped -> that chain's orderbook, submitted
 /// through that chain's wallet so confirmations and nonce handling match every
@@ -1753,7 +1753,7 @@ fn chain_wallet(
     }
 }
 
-/// The tokenization services bound to one watched chain: its signer, and
+/// The tokenization services bound to one hedged chain: its signer, and
 /// the equity leg (issuer client, wrapper, mint authorizer) where the chain
 /// rebalances equity.
 struct ChainTokenization<Signer: Wallet> {
@@ -1763,14 +1763,14 @@ struct ChainTokenization<Signer: Wallet> {
     equity: EquityTokenization,
 }
 
-/// What a watched chain's tokenization set can do beyond signing.
+/// What a hedged chain's tokenization set can do beyond signing.
 enum EquityTokenization {
     /// The chain hedges its fills and rebalances no equity: nothing is
     /// minted, wrapped or redeemed there, so it needs no issuer client,
     /// redemption wallet or mint authorizer, and the preflight attests
     /// nothing. Its vaults still hold wrapped shares the daily portfolio
     /// capture must value, so it still gets a ratio reader
-    /// ([`watched_chain_wrappers`]).
+    /// ([`hedged_chain_wrappers`]).
     HedgeOnly,
     /// The chain moves equity between its vaults and the broker.
     Rebalancing(EquityTokenizationServices),
@@ -1784,12 +1784,12 @@ struct EquityTokenizationServices {
     mint_authorizer: ConfiguredMintAuthorizer,
 }
 
-/// Every watched chain's [`ChainTokenization`] on the wallets `[wallet]`
+/// Every hedged chain's [`ChainTokenization`] on the wallets `[wallet]`
 /// builds, keyed by chain.
-type WatchedChainTokenizations =
+type HedgedChainTokenizations =
     BTreeMap<Chain, ChainTokenization<Arc<dyn Wallet<Provider = RootProvider>>>>;
 
-/// One [`ChainTokenization`] per watched chain. The primary always carries
+/// One [`ChainTokenization`] per hedged chain. The primary always carries
 /// the equity leg: the rebalancer, the cash corridor and the recovery jobs
 /// run on its services until chain selection moves into the global
 /// rebalancer. A secondary carries it only when one of its equities opts
@@ -1800,26 +1800,26 @@ type WatchedChainTokenizations =
 fn build_chain_tokenizations(
     ctx: &Ctx,
     wallet_ctx: &OnchainWalletCtx,
-) -> anyhow::Result<WatchedChainTokenizations> {
+) -> anyhow::Result<HedgedChainTokenizations> {
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     ctx.chains
-        .watched_with_roles()
-        .map(|(role, watched)| {
-            let chain = watched.chain;
+        .hedged_with_roles()
+        .map(|(role, hedged)| {
+            let chain = hedged.chain;
             let wallet = chain_wallet(wallet_ctx, chain).clone();
-            let equity = if role.rebalances_equity(&watched.assets) {
+            let equity = if role.rebalances_equity(&hedged.assets) {
                 EquityTokenization::Rebalancing(build_equity_tokenization_services(
                     ctx,
                     alpaca_auth,
-                    watched,
+                    hedged,
                     wallet.clone(),
                 )?)
             } else {
                 info!(
                     target: "tokenization",
                     %chain,
-                    "Watched chain is hedge-only (no equity opts into rebalancing): it needs \
+                    "Hedged chain is hedge-only (no equity opts into rebalancing): it needs \
                      no wrapper vault, issuer client or redemption wallet, so none is built \
                      or preflighted"
                 );
@@ -1845,10 +1845,10 @@ fn build_chain_tokenizations(
 fn build_equity_tokenization_services(
     ctx: &Ctx,
     alpaca_auth: &AlpacaBrokerApiCtx,
-    watched: &HedgedChain,
+    hedged: &HedgedChain,
     wallet: Arc<dyn Wallet<Provider = RootProvider>>,
 ) -> anyhow::Result<EquityTokenizationServices> {
-    let chain = watched.chain;
+    let chain = hedged.chain;
     let redemption_wallet = ctx.redemption_wallet(chain)?;
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
@@ -1858,7 +1858,7 @@ fn build_equity_tokenization_services(
         chain,
         Some(redemption_wallet),
     )?);
-    let wrapper = build_wrapper(wallet.clone(), watched);
+    let wrapper = build_wrapper(wallet.clone(), hedged);
     let mint_authorizer = build_mint_authorizer(
         ctx.orchestrator.as_ref().map(|config| &config.addresses),
         chain,
@@ -1972,7 +1972,7 @@ struct MintAuthorizationInfra {
     issuance_client: Arc<IssuanceClient>,
 }
 
-/// The mint authorizer for one watched chain. `Enabled` only with that
+/// The mint authorizer for one hedged chain. `Enabled` only with that
 /// chain's `[orchestrator.addresses]` entry: while every asset is vault-direct
 /// the bot deploys dark without the section, and an orchestrator-mode mint
 /// reaching the signing step then fails loudly rather than guessing an
@@ -1993,7 +1993,7 @@ fn build_mint_authorizer<Signer: Wallet + 'static>(
             warn!(
                 %chain,
                 "[orchestrator.addresses] is configured without an entry for \
-                 watched chain {chain}; mint authorization stays disabled there, \
+                 hedged chain {chain}; mint authorization stays disabled there, \
                  so an orchestrator-mode mint would fail at the signing step"
             );
             ConfiguredMintAuthorizer::Disabled
@@ -2144,19 +2144,19 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The watched secondaries whose vaults are managed but never read: the
+/// The hedged secondaries whose vaults are managed but never read: the
 /// inventory poller runs on the primary chain alone, so nothing keeps these
-/// chains' slots current. Sorted by [`ChainRegistry::watched`]'s own order so
+/// chains' slots current. Sorted by [`ChainRegistry::hedged`]'s own order so
 /// the startup warnings come out deterministically.
 fn unpolled_managed_secondaries(ctx: &Ctx) -> Vec<Chain> {
     ctx.chains
-        .watched()
-        .filter(|watched| watched.chain != ctx.chains.primary().chain)
-        .filter(|watched| match watched.inventory {
+        .hedged()
+        .filter(|hedged| hedged.chain != ctx.chains.primary().chain)
+        .filter(|hedged| match hedged.inventory {
             InventoryMode::Legacy => false,
             InventoryMode::Managed { .. } => true,
         })
-        .map(|watched| watched.chain)
+        .map(|hedged| hedged.chain)
         .collect()
 }
 
@@ -2178,46 +2178,43 @@ where
     E: Executor,
     P: Provider + Clone + 'static,
 {
-    // Every watched chain is probed and any failure is fatal (signed-off:
+    // Every hedged chain is probed and any failure is fatal (signed-off:
     // fail-loud beats a green /health hiding a dead chain; degraded start
     // arrives with chain-disable). The primary uses the main provider;
     // secondaries their own.
-    for watched in ctx.chains.watched() {
-        let chain_provider = if watched.chain == ctx.chains.primary().chain {
+    for hedged in ctx.chains.hedged() {
+        let chain_provider = if hedged.chain == ctx.chains.primary().chain {
             provider
         } else {
             watch_providers
-                .get(&watched.chain)
-                .with_context(|| format!("no provider wired for watched chain {}", watched.chain))?
+                .get(&hedged.chain)
+                .with_context(|| format!("no provider wired for hedged chain {}", hedged.chain))?
         };
 
         // The HTTP transport connects lazily, so reach the RPC once to fail
         // fast on a misconfigured or unreachable endpoint rather than only
         // surfacing it as repeated poll-loop retries.
         let chain_tip = chain_provider.get_block_number().await.with_context(|| {
-            format!(
-                "failed to reach {}'s RPC endpoint at startup",
-                watched.chain
-            )
+            format!("failed to reach {}'s RPC endpoint at startup", hedged.chain)
         })?;
 
-        confirm_chain_id(chain_provider, watched.chain).await?;
+        confirm_chain_id(chain_provider, hedged.chain).await?;
 
         // A null response is allowed through (cold start); an error or a
         // detected `finalized`-aliasing-to-`latest` fails startup before the
         // fill monitor starts polling.
-        match probe_cutoff_block_support(chain_provider, chain_tip, watched.ingestion_cutoff)
+        match probe_cutoff_block_support(chain_provider, chain_tip, hedged.ingestion_cutoff)
             .await
             .with_context(|| {
                 format!(
                     "{}'s RPC endpoint cannot serve the configured cutoff block tag at startup",
-                    watched.chain
+                    hedged.chain
                 )
             })? {
             CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
         }
 
-        confirm_configured_asset_responds(chain_provider, watched).await?;
+        confirm_configured_asset_responds(chain_provider, hedged).await?;
     }
 
     // Not a refusal: a prefunded secondary is a valid rollout state, and
@@ -2250,16 +2247,16 @@ where
 ///
 /// Proves the configured address is a live contract on the endpoint the
 /// registry entry names -- config, RPC transport, and ABI decoding exercised
-/// in one read, before any funds-adjacent work starts. Runs per watched
+/// in one read, before any funds-adjacent work starts. Runs per hedged
 /// chain: a secondary's addresses are as mistypeable as the primary's, and
 /// its fills need the token as much. Read-only and cold-start-safe: a chain
 /// with no configured equities is the normal bring-up state and skips with a
 /// log instead of failing.
 async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
     provider: &P,
-    watched: &HedgedChain,
+    hedged: &HedgedChain,
 ) -> anyhow::Result<()> {
-    let Some((symbol, asset)) = watched
+    let Some((symbol, asset)) = hedged
         .assets
         .equities
         .symbols
@@ -2268,7 +2265,7 @@ async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
     else {
         info!(
             target: "startup",
-            chain = %watched.chain,
+            chain = %hedged.chain,
             "No equities configured on this chain; skipping the asset read canary"
         );
         return Ok(());
@@ -2283,14 +2280,14 @@ async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
                 "startup read canary failed: [chains.{chain}] equity {symbol} at \
                  {token} did not answer decimals() -- wrong address, wrong chain, \
                  or a broken endpoint",
-                chain = watched.chain,
+                chain = hedged.chain,
                 token = asset.tokenized_equity,
             )
         })?;
 
     info!(
         target: "startup",
-        chain = %watched.chain,
+        chain = %hedged.chain,
         %symbol,
         token = %asset.tokenized_equity,
         decimals,
@@ -2349,22 +2346,22 @@ async fn preflight_inventory_access<Signer: Wallet + Clone>(
     Ok(())
 }
 
-/// The tokens whose stale orderbook allowance startup revokes, per watched
+/// The tokens whose stale orderbook allowance startup revokes, per hedged
 /// chain in managed inventory mode: that chain's canonical USDC and every
 /// configured wrapped equity. A legacy-mode chain has no distinct inventory
 /// to have migrated from, so it has no entry.
 fn stale_allowance_revocations(ctx: &Ctx) -> BTreeMap<Chain, Vec<Address>> {
     ctx.chains
-        .watched()
-        .filter(|watched| match watched.inventory {
+        .hedged()
+        .filter(|hedged| match hedged.inventory {
             InventoryMode::Legacy => false,
             InventoryMode::Managed { .. } => true,
         })
-        .map(|watched| {
-            let chain = watched.chain;
+        .map(|hedged| {
+            let chain = hedged.chain;
             let tokens = std::iter::once(chain.usdc())
                 .chain(
-                    watched
+                    hedged
                         .assets
                         .equities
                         .symbols
@@ -2378,7 +2375,7 @@ fn stale_allowance_revocations(ctx: &Ctx) -> BTreeMap<Chain, Vec<Address>> {
         .collect()
 }
 
-/// Best-effort, per watched chain: revoke any stale pre-migration allowance
+/// Best-effort, per hedged chain: revoke any stale pre-migration allowance
 /// the bot granted that chain's orderbook directly, through that chain's own
 /// wallet. Deposits now approve the inventory instead, so a leftover orderbook
 /// allowance is dead capital-exposure surface. Idempotent (a no-op once zero)
@@ -2388,8 +2385,8 @@ async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
 ) {
     for (chain, tokens) in stale_allowance_revocations(ctx) {
-        let (Some(watched), Some(tokenization)) =
-            (ctx.chains.watch(chain), tokenizations.get(&chain))
+        let (Some(hedged), Some(tokenization)) =
+            (ctx.chains.hedged_chain(chain), tokenizations.get(&chain))
         else {
             warn!(
                 target: "inventory",
@@ -2401,7 +2398,7 @@ async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
         };
         let raindex_service = RaindexService::new(
             tokenization.wallet.clone(),
-            crate::onchain::raindex_contracts(watched),
+            crate::onchain::raindex_contracts(hedged),
             tokenization.wallet.address(),
         );
 
@@ -2423,7 +2420,7 @@ async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
     }
 }
 
-/// A watched chain's vault attestation failed at startup; the wrapper's own
+/// A hedged chain's vault attestation failed at startup; the wrapper's own
 /// error names the symbol, the vault and the two disagreeing tokens.
 #[derive(Debug, thiserror::Error)]
 #[error("tokenization preflight failed on {chain}")]
@@ -2462,13 +2459,13 @@ async fn attest_chain_vaults<Attester: Wrapper + ?Sized>(
     Ok(())
 }
 
-/// The orchestrator rollout order was broken on a watched chain: issuance
+/// The orchestrator rollout order was broken on a hedged chain: issuance
 /// reports an enabled equity as orchestrator-mode while the chain has no
 /// `[orchestrator.addresses]` entry, so its first mint would stall at signing.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "{symbol} is in orchestrator mode at issuance but [orchestrator.addresses] has no \
-     entry for watched chain {chain}; deploy the ST0xOrchestrator on {chain} and configure \
+     entry for hedged chain {chain}; deploy the ST0xOrchestrator on {chain} and configure \
      its address in both bots before cutting an asset listed there over"
 )]
 struct OrchestratorEntryMissing {
@@ -2519,7 +2516,7 @@ async fn preflight_orchestrator_entries<Reader: VaultModeReader + ?Sized>(
     Ok(())
 }
 
-/// The tokenization preflight, per watched chain on that chain's own wrapper
+/// The tokenization preflight, per hedged chain on that chain's own wrapper
 /// and mint authorizer; a hedge-only chain has neither and is skipped with a
 /// log line. A preflighted chain's redemption wallet was already required
 /// when its services were built.
@@ -2528,11 +2525,11 @@ async fn preflight_tokenization<Signer: Wallet + Clone, Reader: VaultModeReader 
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
     vault_modes: &Reader,
 ) -> anyhow::Result<()> {
-    for watched in ctx.chains.watched() {
-        let Some(tokenization) = tokenizations.get(&watched.chain) else {
+    for hedged in ctx.chains.hedged() {
+        let Some(tokenization) = tokenizations.get(&hedged.chain) else {
             anyhow::bail!(
-                "no tokenization services were built for watched chain {}",
-                watched.chain
+                "no tokenization services were built for hedged chain {}",
+                hedged.chain
             );
         };
 
@@ -2540,7 +2537,7 @@ async fn preflight_tokenization<Signer: Wallet + Clone, Reader: VaultModeReader 
             EquityTokenization::HedgeOnly => {
                 info!(
                     target: "tokenization",
-                    chain = %watched.chain,
+                    chain = %hedged.chain,
                     "Skipping the tokenization preflight on a hedge-only chain: no vault to \
                      attest, no mint to authorize"
                 );
@@ -2550,18 +2547,18 @@ async fn preflight_tokenization<Signer: Wallet + Clone, Reader: VaultModeReader 
         };
 
         attest_chain_vaults(
-            watched.chain,
+            hedged.chain,
             equity.wrapper.as_ref(),
-            &watched.assets,
+            &hedged.assets,
             tokenization.role,
         )
         .await?;
 
         preflight_orchestrator_entries(
-            watched.chain,
+            hedged.chain,
             &equity.mint_authorizer,
             vault_modes,
-            &watched.assets,
+            &hedged.assets,
             tokenization.role,
         )
         .await?;
@@ -2646,7 +2643,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
     .map_err(Into::into)
 }
 
-/// The vault-registry lookup for one watched chain. Every id is qualified by
+/// The vault-registry lookup for one hedged chain. Every id is qualified by
 /// its chain: a vault id means nothing on another network's orderbook.
 fn build_rebalancing_vault_lookup(
     chain: &HedgedChain,
@@ -2668,7 +2665,7 @@ struct EquityGasChain<'chain, Signer: Wallet> {
 }
 
 /// One [`GasReadiness`] per chain an equity transfer can run on: every
-/// watched chain with at least one rebalancing-enabled equity, each checking
+/// hedged chain with at least one rebalancing-enabled equity, each checking
 /// that chain's own signing wallet.
 ///
 /// Such a chain without an `[alerts.low_balance_thresholds]` entry refuses
@@ -2760,19 +2757,19 @@ fn build_rebalancing_service(
     ))
 }
 
-/// Every watched chain's equity transfer services, plus the per-chain vault
+/// Every hedged chain's equity transfer services, plus the per-chain vault
 /// registry ids the trigger reads and the per-chain ratio readers
-/// [`watched_chain_wrappers`] builds. `chains` and `registry_ids` cover the
-/// chains that rebalance equity; `wrappers` covers every watched chain.
-struct WatchedEquityServices {
+/// [`hedged_chain_wrappers`] builds. `chains` and `registry_ids` cover the
+/// chains that rebalance equity; `wrappers` covers every hedged chain.
+struct HedgedEquityServices {
     chains: BTreeMap<Chain, ChainEquityServices>,
     registry_ids: BTreeMap<Chain, VaultRegistryId>,
     wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
 }
 
-/// One ERC-4626 ratio reader per watched chain, hedge-only chains included.
+/// One ERC-4626 ratio reader per hedged chain, hedge-only chains included.
 ///
-/// Every watched chain's market-making vaults hold that chain's
+/// Every hedged chain's market-making vaults hold that chain's
 /// `tokenized_equity_derivative` -- wrapped vault shares -- and vault polling
 /// reads them all, so the daily portfolio capture needs the ratio of the chain
 /// each balance sits on to value it in underlying units. A hedge-only chain is
@@ -2780,7 +2777,7 @@ struct WatchedEquityServices {
 /// wallet, mint authorizer, wrap and deposit approvals), not from reading its
 /// own vault's ratio: that reader needs only the chain's signer and its asset
 /// table, both of which a hedge-only chain keeps.
-fn watched_chain_wrappers<Signer: Wallet + Clone + 'static>(
+fn hedged_chain_wrappers<Signer: Wallet + Clone + 'static>(
     ctx: &Ctx,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
 ) -> anyhow::Result<BTreeMap<Chain, Arc<dyn Wrapper>>> {
@@ -2790,14 +2787,14 @@ fn watched_chain_wrappers<Signer: Wallet + Clone + 'static>(
             let wrapper: Arc<dyn Wrapper> = match &tokenization.equity {
                 EquityTokenization::Rebalancing(equity) => equity.wrapper.clone(),
                 EquityTokenization::HedgeOnly => {
-                    let watched = ctx.chains.watch(*chain).with_context(|| {
+                    let hedged = ctx.chains.hedged_chain(*chain).with_context(|| {
                         format!(
                             "{chain} has tokenization services but no \
                              [chains.{chain}.trading] table"
                         )
                     })?;
 
-                    build_wrapper(tokenization.wallet.clone(), watched)
+                    build_wrapper(tokenization.wallet.clone(), hedged)
                 }
             };
 
@@ -2806,7 +2803,7 @@ fn watched_chain_wrappers<Signer: Wallet + Clone + 'static>(
         .collect()
 }
 
-/// Builds one [`ChainEquityServices`] per watched chain, so a mint or
+/// Builds one [`ChainEquityServices`] per hedged chain, so a mint or
 /// redemption resolves the chain its record names instead of borrowing the
 /// primary's wallet, vault registry and issuer.
 ///
@@ -2815,14 +2812,14 @@ fn watched_chain_wrappers<Signer: Wallet + Clone + 'static>(
 /// entry at all, so a transfer naming it is refused by the lookup; the
 /// primary, which always carries the equity leg, keeps the fail-closed
 /// `Unwired` check when it rebalances nothing. Its ratio reader is the one
-/// exception ([`watched_chain_wrappers`]).
-fn build_watched_equity_services<Signer: Wallet + Clone + 'static>(
+/// exception ([`hedged_chain_wrappers`]).
+fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
     deps: &RebalancingDeps,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
     wallets: &ChainWallets<Signer>,
-) -> anyhow::Result<WatchedEquityServices> {
-    let watched_chain = |chain: Chain| {
-        deps.ctx.chains.watch(chain).with_context(|| {
+) -> anyhow::Result<HedgedEquityServices> {
+    let hedged_chain = |chain: Chain| {
+        deps.ctx.chains.hedged_chain(chain).with_context(|| {
             format!("{chain} has tokenization services but no [chains.{chain}.trading] table")
         })
     };
@@ -2831,7 +2828,7 @@ fn build_watched_equity_services<Signer: Wallet + Clone + 'static>(
     for (chain, tokenization) in tokenizations {
         gas_chains.push(EquityGasChain {
             chain: *chain,
-            assets: &watched_chain(*chain)?.assets,
+            assets: &hedged_chain(*chain)?.assets,
             wallet: &tokenization.wallet,
         });
     }
@@ -2848,7 +2845,7 @@ fn build_watched_equity_services<Signer: Wallet + Clone + 'static>(
     )?;
     drop(gas_chains);
 
-    let wrappers = watched_chain_wrappers(&deps.ctx, tokenizations)?;
+    let wrappers = hedged_chain_wrappers(&deps.ctx, tokenizations)?;
     let mut chains = BTreeMap::new();
     let mut registry_ids = BTreeMap::new();
     for (chain, tokenization) in tokenizations {
@@ -2863,11 +2860,11 @@ fn build_watched_equity_services<Signer: Wallet + Clone + 'static>(
             }
             EquityTokenization::Rebalancing(equity) => equity,
         };
-        let watched = watched_chain(*chain)?;
+        let hedged = hedged_chain(*chain)?;
         let chain_wallet = tokenization.wallet.address();
         let (registry_id, vault_lookup) = build_rebalancing_vault_lookup(
-            watched,
-            watched.vault_owner,
+            hedged,
+            hedged.vault_owner,
             deps.vault_registry_projection.clone(),
         );
 
@@ -2878,7 +2875,7 @@ fn build_watched_equity_services<Signer: Wallet + Clone + 'static>(
                 wallet: chain_wallet,
                 raindex: build_rebalancing_raindex_service(
                     &tokenization.wallet,
-                    watched,
+                    hedged,
                     chain_wallet,
                 ),
                 vault_lookup,
@@ -2888,12 +2885,12 @@ fn build_watched_equity_services<Signer: Wallet + Clone + 'static>(
                 gas_readiness: gas_readiness
                     .remove(chain)
                     .unwrap_or(ConfiguredGasReadiness::Unwired),
-                equities: watched.assets.equities.clone(),
+                equities: hedged.assets.equities.clone(),
             },
         );
     }
 
-    Ok(WatchedEquityServices {
+    Ok(HedgedEquityServices {
         chains,
         registry_ids,
         wrappers,
@@ -2902,7 +2899,7 @@ fn build_watched_equity_services<Signer: Wallet + Clone + 'static>(
 
 /// The rebalancer, the recovery jobs and the resume paths run on the primary
 /// chain's [`ChainTokenization`] until chain selection moves into the global
-/// rebalancer; the other watched chains' services are built and preflighted
+/// rebalancer; the other hedged chains' services are built and preflighted
 /// so that move is a lookup, not a rewire.
 fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
@@ -2966,11 +2963,11 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let mint_authorization =
             build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
 
-        let WatchedEquityServices {
+        let HedgedEquityServices {
             chains: chain_services,
             registry_ids,
             wrappers,
-        } = build_watched_equity_services(&deps, &tokenizations, &wallets)?;
+        } = build_hedged_equity_services(&deps, &tokenizations, &wallets)?;
 
         let equity_transfer_services = EquityTransferServices {
             chains: chain_services,
@@ -5571,10 +5568,10 @@ mod tests {
         );
     }
 
-    /// Queues the RPC responses one watched chain's startup probes read, in
+    /// Queues the RPC responses one hedged chain's startup probes read, in
     /// order: the chain tip, the chain id, then a null cutoff block (a cold
     /// endpoint, which startup allows through).
-    fn watched_chain_asserter(chain: Chain) -> Asserter {
+    fn hedged_chain_asserter(chain: Chain) -> Asserter {
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(100u64));
         asserter.push_success(&format!("0x{:x}", chain.chain_id()));
@@ -5582,12 +5579,12 @@ mod tests {
         asserter
     }
 
-    /// The read canary belongs to every watched chain, not just the primary:
+    /// The read canary belongs to every hedged chain, not just the primary:
     /// a secondary's mistyped token address is exactly the config error the
     /// canary exists to catch, and a bot that starts anyway only discovers it
     /// when the first fill on that chain needs the token.
     #[tokio::test]
-    async fn asset_canary_runs_on_every_watched_chain() {
+    async fn asset_canary_runs_on_every_hedged_chain() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         *ctx.chains.primary_mut() = hedged_chain_with_equity(
             "AAPL",
@@ -5600,7 +5597,7 @@ mod tests {
         secondary.chain = Chain::Ethereum;
         ctx.chains.insert_secondary(secondary);
 
-        let primary_asserter = watched_chain_asserter(Chain::Base);
+        let primary_asserter = hedged_chain_asserter(Chain::Base);
         primary_asserter.push_success(
             &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
                 &18u8,
@@ -5610,7 +5607,7 @@ mod tests {
 
         // The secondary's configured token answers nothing: a dead address,
         // a wrong-chain endpoint or a broken RPC all surface this way.
-        let secondary_asserter = watched_chain_asserter(Chain::Ethereum);
+        let secondary_asserter = hedged_chain_asserter(Chain::Ethereum);
         secondary_asserter.push_failure_msg("connection reset by peer");
         let watch_providers = BTreeMap::from([(
             Chain::Ethereum,
@@ -5653,10 +5650,10 @@ mod tests {
         );
 
         let provider =
-            ProviderBuilder::new().connect_mocked_client(watched_chain_asserter(Chain::Base));
+            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Base));
         let watch_providers = BTreeMap::from([(
             Chain::Ethereum,
-            ProviderBuilder::new().connect_mocked_client(watched_chain_asserter(Chain::Ethereum)),
+            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Ethereum)),
         )]);
 
         startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
@@ -7587,7 +7584,7 @@ mod tests {
         .await;
 
         // The fixture's services carry Base alone, which is exactly what
-        // `build_watched_equity_services` produces once Ethereum lists no
+        // `build_hedged_equity_services` produces once Ethereum lists no
         // rebalancing-enabled equity.
         let stranded_id = redemption_aggregate_id("stranded-secondary-redemption");
         test_store::<EquityRedemption>(fixture.pool.clone(), fixture.services.clone())
@@ -15649,7 +15646,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, MintAuthorizationError::NotConfigured));
         assert!(logs_contain(
-            "[orchestrator.addresses] is configured without an entry for watched chain base"
+            "[orchestrator.addresses] is configured without an entry for hedged chain base"
         ));
     }
 
@@ -15684,7 +15681,7 @@ mod tests {
             mint_authorizer_for(&ctx, Chain::Base),
             ConfiguredMintAuthorizer::Disabled
         ));
-        assert!(!logs_contain("without an entry for watched chain"));
+        assert!(!logs_contain("without an entry for hedged chain"));
     }
 
     fn alpaca_broker_ctx() -> BrokerCtx {
@@ -15713,7 +15710,7 @@ mod tests {
         }
     }
 
-    /// A watched Ethereum listing one TSLA that trades, with the given
+    /// A hedged Ethereum listing one TSLA that trades, with the given
     /// rebalancing flag and issuer redemption wallet.
     fn ethereum_hedged_chain(
         redemption_wallet: Option<Address>,
@@ -15736,13 +15733,13 @@ mod tests {
         trading
     }
 
-    /// One set of tokenization services per watched chain that rebalances
+    /// One set of tokenization services per hedged chain that rebalances
     /// equity, each bound to that chain's own signer and asset table --
     /// never the Base wallet or the primary's tokens -- and none for a chain
     /// with no trading table (HyperEVM here: a signer exists, nothing is
-    /// watched).
+    /// hedged).
     #[test]
-    fn chain_tokenizations_cover_every_watched_chain_with_its_own_wallet_and_assets() {
+    fn chain_tokenizations_cover_every_hedged_chain_with_its_own_wallet_and_assets() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.broker = alpaca_broker_ctx();
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
@@ -15790,11 +15787,11 @@ mod tests {
         ));
     }
 
-    /// A watched chain that rebalances equity without its own issuer
+    /// A hedged chain that rebalances equity without its own issuer
     /// redemption wallet cannot redeem, so building its services fails
     /// startup naming that chain rather than borrowing the primary's wallet.
     #[test]
-    fn chain_tokenizations_refuse_a_watched_chain_without_its_redemption_wallet() {
+    fn chain_tokenizations_refuse_a_hedged_chain_without_its_redemption_wallet() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.broker = alpaca_broker_ctx();
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
@@ -15802,7 +15799,7 @@ mod tests {
             .insert_secondary(ethereum_hedged_chain(None, OperationMode::Enabled));
 
         let Err(error) = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()) else {
-            panic!("a watched chain without a redemption wallet must fail startup");
+            panic!("a hedged chain without a redemption wallet must fail startup");
         };
 
         assert!(matches!(
@@ -15890,7 +15887,7 @@ mod tests {
         ])
     }
 
-    /// Vault polling reads every watched chain's market-making vaults, and
+    /// Vault polling reads every hedged chain's market-making vaults, and
     /// those hold that chain's `tokenized_equity_derivative` -- wrapped vault
     /// shares -- so the daily portfolio capture needs the ratio reader of the
     /// chain each balance sits on. A hedge-only chain is exempt from the
@@ -15898,16 +15895,16 @@ mod tests {
     /// ratio, and the reader must read that chain's own asset table rather
     /// than the primary's.
     #[test]
-    fn watched_chain_wrappers_cover_a_hedge_only_secondary() {
+    fn hedged_chain_wrappers_cover_a_hedge_only_secondary() {
         let ctx = ctx_with_base_and_ethereum_trading();
         let tokenizations = base_and_hedge_only_ethereum_tokenizations(MockWrapper::new());
 
-        let wrappers = watched_chain_wrappers(&ctx, &tokenizations).unwrap();
+        let wrappers = hedged_chain_wrappers(&ctx, &tokenizations).unwrap();
 
         assert_eq!(
             wrappers.keys().copied().collect::<Vec<_>>(),
             vec![Chain::Base, Chain::Ethereum],
-            "every watched chain needs a ratio reader for its market-making shares"
+            "every hedged chain needs a ratio reader for its market-making shares"
         );
         assert_eq!(
             wrappers[&Chain::Ethereum]
@@ -16053,7 +16050,7 @@ mod tests {
         );
     }
 
-    /// A watched chain that rebalances nothing needs no threshold: it gets no
+    /// A hedged chain that rebalances nothing needs no threshold: it gets no
     /// readiness entry, so a transfer there is refused by the fail-closed
     /// `Unwired` check rather than by startup.
     #[test]
@@ -16130,12 +16127,12 @@ mod tests {
         );
     }
 
-    /// Each watched chain's targets use its own orderbook and USDC. The
+    /// Each hedged chain's targets use its own orderbook and USDC. The
     /// primary carries its equities' wrap and deposit grants; a hedge-only
     /// secondary (Ethereum here: TSLA trades but does not rebalance) has no
     /// wrapper to approve, so only its USDC grant remains.
     #[test]
-    fn startup_approval_targets_follow_each_watched_chain() {
+    fn startup_approval_targets_follow_each_hedged_chain() {
         let ctx = ctx_with_base_and_ethereum_trading();
         let base_orderbook = ctx.chains.primary().orderbook;
 
@@ -16347,7 +16344,7 @@ mod tests {
     }
 
     /// The orchestrator preflight enforces the rollout order: an equity
-    /// issuance reports as orchestrator-mode, enabled on a watched chain
+    /// issuance reports as orchestrator-mode, enabled on a hedged chain
     /// with no `[orchestrator.addresses]` entry, refuses startup naming the
     /// chain and the symbol, before its first mint could stall at signing.
     #[tokio::test]

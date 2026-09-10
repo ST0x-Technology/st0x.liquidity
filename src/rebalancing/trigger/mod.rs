@@ -699,7 +699,7 @@ pub(crate) struct RebalancingService {
     config: RebalancingServiceConfig,
     vault_registry: Arc<Store<VaultRegistry>>,
     /// The (orderbook, vault-owner) pair that keys vault-registry lookups, per
-    /// watched chain. The owner is the inventory contract post-migration, the
+    /// hedged chain. The owner is the inventory contract post-migration, the
     /// bot EOA before it; production sources it from each chain's
     /// `[chains.<name>.trading] vault_owner`.
     registry_ids: BTreeMap<Chain, VaultRegistryId>,
@@ -723,7 +723,7 @@ pub(crate) struct RebalancingService {
     divergence_gate: Arc<InventoryDivergenceGate>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     notifier: Arc<dyn crate::alerts::Notifier>,
-    /// The ERC-4626 wrapper on each watched chain: a symbol's derivative and
+    /// The ERC-4626 wrapper on each hedged chain: a symbol's derivative and
     /// its share ratio are that chain's, never another's.
     wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     pub(super) equity_scheduler: EquityRebalancingCheckScheduler,
@@ -2481,7 +2481,7 @@ impl Reactor for RebalancingService {
                         // that provably already contains it: a vaultBalance2
                         // read at block N includes every fill at a block <= N
                         // (ADR 0018). The same reasoning covers a secondary
-                        // chain's slot no snapshot has seeded yet (a watched
+                        // chain's slot no snapshot has seeded yet (a hedged
                         // secondary is not polled): its first snapshot
                         // contains the fill, so the leg waits rather than
                         // debiting an empty slot or inventing one that holds
@@ -12048,7 +12048,7 @@ mod tests {
         assert_eq!(onchain_usdc, usdc(11500));
     }
 
-    /// A fill on a watched secondary chain belongs to that chain: it moves
+    /// A fill on a hedged secondary chain belongs to that chain: it moves
     /// the secondary's own inventory slot, leaves the primary's untouched,
     /// and asks for no rebalancing (secondaries are prefunded, with
     /// rebalancing disabled on every asset).
@@ -12130,7 +12130,7 @@ mod tests {
         }
     }
 
-    /// A watched secondary chain is not polled, so no snapshot has seeded its
+    /// A hedged secondary chain is not polled, so no snapshot has seeded its
     /// slots. Debiting an unseeded slot would fail and crediting one would
     /// invent a balance holding only the delta; the chain's first snapshot
     /// contains the fill anyway (ADR 0018), so both legs wait for it.

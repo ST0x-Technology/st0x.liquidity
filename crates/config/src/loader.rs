@@ -184,7 +184,7 @@ pub fn load_deployment_symbol_policy(
     )
 }
 
-/// One watched chain's approval surface: the orderbook and asset table its
+/// One hedged chain's approval surface: the orderbook and asset table its
 /// startup MAX approvals target, and the role that decides whether its
 /// equities' wrap and deposit grants are targeted at all.
 #[cfg(feature = "wallet-turnkey")]
@@ -197,7 +197,7 @@ pub struct ChainApprovalInputs {
 }
 
 /// Validated, network-free inputs required by the deploy-time Turnkey approval
-/// policy coverage check: one approval surface per watched chain, since
+/// policy coverage check: one approval surface per hedged chain, since
 /// startup grants approvals on every one of them.
 #[cfg(feature = "wallet-turnkey")]
 #[derive(Clone, Debug)]
@@ -206,7 +206,7 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub kms_api_key: Option<st0x_evm::turnkey::TurnkeyKmsApiKey>,
     pub api_private_key: Option<st0x_evm::turnkey::TurnkeyApiPrivateKey>,
     pub wallet_address: Address,
-    pub watched: Vec<ChainApprovalInputs>,
+    pub hedged: Vec<ChainApprovalInputs>,
 }
 
 /// Non-secret settings deserialized from the plaintext config TOML.
@@ -2188,14 +2188,14 @@ impl Ctx {
             kms_api_key,
             api_private_key,
             wallet_address,
-            watched: parts
+            hedged: parts
                 .chains
-                .watched_with_roles()
-                .map(|(role, watched)| ChainApprovalInputs {
-                    chain: watched.chain,
+                .hedged_with_roles()
+                .map(|(role, hedged)| ChainApprovalInputs {
+                    chain: hedged.chain,
                     role,
-                    orderbook: watched.orderbook,
-                    assets: watched.assets.clone(),
+                    orderbook: hedged.orderbook,
+                    assets: hedged.assets.clone(),
                 })
                 .collect(),
         }))
@@ -2214,7 +2214,7 @@ impl Ctx {
     /// primary's: tokens sent to another chain's issuer address are lost.
     pub fn redemption_wallet(&self, chain: Chain) -> Result<Address, CtxError> {
         self.chains
-            .watch(chain)
+            .hedged_chain(chain)
             .and_then(|trading| trading.redemption_wallet)
             .ok_or(CtxError::RedemptionWalletNotConfigured { chain })
     }
@@ -8565,7 +8565,7 @@ mod tests {
     }
 
     #[test]
-    fn prefunded_watched_hyperevm_loads_with_hype_monitoring() {
+    fn prefunded_hedged_hyperevm_loads_with_hype_monitoring() {
         let mut config = prefunded_hyperevm_config();
         let validated =
             validate_config(&config, Path::new("example.config.toml"), &mut Vec::new()).unwrap();
@@ -9614,14 +9614,14 @@ mod tests {
             inputs.wallet_address,
             address!("0x6666666666666666666666666666666666666666")
         );
-        assert_eq!(inputs.watched.len(), 1);
-        assert_eq!(inputs.watched[0].chain, Chain::Base);
+        assert_eq!(inputs.hedged.len(), 1);
+        assert_eq!(inputs.hedged[0].chain, Chain::Base);
         assert_eq!(
-            inputs.watched[0].orderbook,
+            inputs.hedged[0].orderbook,
             address!("0x1111111111111111111111111111111111111111")
         );
         assert!(
-            inputs.watched[0]
+            inputs.hedged[0]
                 .assets
                 .is_trading_enabled(&Symbol::new("AAPL").unwrap())
         );
@@ -9631,11 +9631,11 @@ mod tests {
     }
 
     /// The deploy gate proves coverage for every chain startup grants
-    /// approvals on, so the inputs list each watched chain with its own
+    /// approvals on, so the inputs list each hedged chain with its own
     /// orderbook and asset table -- not only the primary's.
     #[cfg(feature = "wallet-turnkey")]
     #[test]
-    fn load_turnkey_approval_policy_inputs_list_every_watched_chain() {
+    fn load_turnkey_approval_policy_inputs_list_every_hedged_chain() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
@@ -9781,7 +9781,7 @@ mod tests {
 
         assert_eq!(
             inputs
-                .watched
+                .hedged
                 .iter()
                 .map(|chain| (chain.chain, chain.role, chain.orderbook))
                 .collect::<Vec<_>>(),
@@ -9799,7 +9799,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            inputs.watched[1]
+            inputs.hedged[1]
                 .assets
                 .equities
                 .symbols
