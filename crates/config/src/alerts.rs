@@ -187,6 +187,10 @@ fn parse_threshold(chain: Chain, value: &str) -> Result<U256, AlertsAssemblyErro
         digits.len() - index
     });
 
+    if digits.is_empty() {
+        return Err(AlertsAssemblyError::EmptyThreshold { chain });
+    }
+
     if fractional_digits > 18 {
         return Err(AlertsAssemblyError::ExcessThresholdPrecision { chain });
     }
@@ -220,6 +224,8 @@ pub enum AlertsAssemblyError {
     ZeroInterval { field: &'static str },
     #[error("[alerts.low_balance_thresholds] {chain} must be greater than zero")]
     ZeroThreshold { chain: Chain },
+    #[error("[alerts.low_balance_thresholds] {chain} has no digits")]
+    EmptyThreshold { chain: Chain },
     #[error(
         "[alerts.low_balance_thresholds] {chain} value {value} is not a valid \
          decimal native-token amount"
@@ -345,6 +351,23 @@ order_fill_poll_interval_secs = 1
                     chain: Chain::HyperEvm
                 })
             ));
+        }
+    }
+
+    #[test]
+    fn digitless_native_thresholds_are_rejected_before_the_zero_check() {
+        for chain in [Chain::Base, Chain::Ethereum, Chain::HyperEvm] {
+            for value in ["", "."] {
+                let error = parse_threshold(chain, value).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        AlertsAssemblyError::EmptyThreshold { chain: failed_chain }
+                            if failed_chain == chain
+                    ),
+                    "expected empty threshold {value:?} for {chain}, got {error:?}"
+                );
+            }
         }
     }
 
