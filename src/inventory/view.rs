@@ -5820,6 +5820,46 @@ mod tests {
         );
     }
 
+    /// Funds held on a secondary chain are still the bot's funds: the
+    /// dashboard's single onchain figure must total every chain's slot, not
+    /// report the primary's alone.
+    #[test]
+    fn to_dto_totals_onchain_balances_across_chains() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let equity_on = |chain: Chain, amount: i64| InventorySnapshotEvent::OnchainEquity {
+            chain,
+            balances: BTreeMap::from([(aapl.clone(), shares(amount))]),
+            fetched_at: now,
+            block_number: None,
+        };
+        let usdc_on = |chain: Chain, amount: i64| InventorySnapshotEvent::OnchainUsdc {
+            chain,
+            usdc_balance: Usdc::from_cents(amount).unwrap(),
+            fetched_at: now,
+            block_number: None,
+        };
+
+        let view = InventoryView::for_trading_chain(Chain::Base)
+            .apply_snapshot_event(&equity_on(Chain::Base, 50), now)
+            .unwrap()
+            .apply_snapshot_event(&equity_on(Chain::Ethereum, 7), now)
+            .unwrap()
+            .apply_snapshot_event(&usdc_on(Chain::Base, 200_000), now)
+            .unwrap()
+            .apply_snapshot_event(&usdc_on(Chain::Ethereum, 50_000), now)
+            .unwrap();
+
+        let dto = view.to_dto();
+
+        assert_eq!(dto.per_symbol.len(), 1);
+        assert_eq!(dto.per_symbol[0].onchain_available, shares(57));
+        assert_eq!(
+            dto.usdc.onchain_available,
+            Usdc::from_cents(250_000).unwrap()
+        );
+    }
+
     #[test]
     fn to_dto_converts_equities_and_usdc() {
         let aapl = Symbol::new("AAPL").unwrap();
