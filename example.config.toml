@@ -154,8 +154,8 @@ ingestion_cutoff = "safe"
 # Seconds between fill-watch poll cycles on this chain (required; was the
 # global order_fill_poll_interval with a hidden default of 5).
 order_fill_poll_interval_secs = 5
-# Exactly one watched chain is the primary: the one whose inventory the bot
-# polls and rebalances automatically. Fills are hedged on every watched chain.
+# Exactly one hedged chain is the primary: the one whose inventory the bot
+# polls and rebalances automatically. Fills are hedged on every hedged chain.
 primary = true
 # Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption go
 # here. Per chain: a redemption delivers tokens that exist on one chain, so
@@ -212,10 +212,10 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 # orchestrator-mode is owned by the issuance bot (the vault_mode field on its
 # per-asset status endpoint); this section only supplies contract addresses,
 # one per chain (each chain carries its own deployment; the keys are chain
-# names: base, ethereum, hyperevm). Every watched chain gets a mint authorizer
+# names: base, ethereum, hyperevm). Every hedged chain gets a mint authorizer
 # built from its own entry; a mint signs against the entry of the chain it
 # lands on (the primary chain today) and fails loudly without it, and a
-# watched chain with no entry is warned about at startup.
+# hedged chain with no entry is warned about at startup.
 # Order per chain: deploy the orchestrator there, add its address here AND in
 # the issuance bot's [orchestrator.addresses], deploy both, extend the Turnkey
 # MintAuth signing policy to that chain's id and orchestrator, and only then
@@ -308,7 +308,7 @@ rebalancing = "enabled"
 [issuance]
 base_url = "https://issuance.internal:8000"
 
-# Required in rebalancing mode and for a watched HyperEVM chain (a trading
+# Required in rebalancing mode and for a hedged HyperEVM chain (a trading
 # table with lifecycle other than disabled). Optional only when neither applies.
 # Provides low-gas alerts and thresholds that refuse fresh transfers before
 # funds move. Every field is required (no silent defaults).
@@ -324,7 +324,7 @@ realert_interval = 43200
 # Native-gas balance below which alerts fire, as decimal strings in the chain's
 # native token (ETH for Base/Ethereum, HYPE for HyperEVM). Base and Ethereum
 # thresholds are required whenever [alerts] is present. A positive hyperevm
-# threshold is also required for a watched HyperEVM chain. Disabled, absent,
+# threshold is also required for a hedged HyperEVM chain. Disabled, absent,
 # and transport-only HyperEVM configurations reject an unused threshold.
 [alerts.low_balance_thresholds]
 base = "0.05"
