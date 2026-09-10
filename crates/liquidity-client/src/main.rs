@@ -203,6 +203,15 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
+        Command::Debug(Debug::FailUsdcTransfer { id, reason }) => {
+            let id = encode_segment(&id);
+            client
+                .post_json(
+                    &format!("/transfers/usdc/{id}/fail"),
+                    &wire::FailUsdcTransferRequest { reason },
+                )
+                .await?
+        }
         Command::Debug(Debug::Position(Position::Set(args))) => {
             let symbol = encode_segment(&args.symbol);
             client
@@ -491,6 +500,24 @@ mod tests {
         assert_eq!(
             request_body(&request),
             serde_json::json!({ "reason": "burn never landed" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_posts_the_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::FailUsdcTransfer {
+            id: "abc".to_owned(),
+            reason: "pre-burn crash, burn not attempted".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/usdc/abc/fail HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "reason": "pre-burn crash, burn not attempted" })
         );
         Ok(())
     }
