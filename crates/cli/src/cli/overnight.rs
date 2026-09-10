@@ -15,8 +15,8 @@ use std::io::Write;
 
 use st0x_config::BrokerCtx;
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiError, AssetDetails, Backpressure, Executor, MarketSession,
-    Permanence, Symbol, TryIntoExecutor,
+    AlpacaBrokerApi, AlpacaBrokerApiError, AssetDetails, Backpressure, Executor,
+    MarketSessionStatus, Permanence, Symbol, TryIntoExecutor,
 };
 
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
@@ -51,20 +51,34 @@ pub(super) async fn market_session_command<W: Write>(
         "   Time (ET):  {}",
         now.with_timezone(&New_York).format("%Y-%m-%d %H:%M:%S %Z")
     )?;
-    writeln!(stdout, "   Session: {:?}", status.session)?;
 
-    match status.extended_session_closes_at {
-        Some(closes_at) => writeln!(
-            stdout,
-            "   Extended session closes at: {} ({} ET)",
-            closes_at.format("%Y-%m-%d %H:%M:%S UTC"),
-            closes_at.with_timezone(&New_York).format("%H:%M:%S")
-        )?,
-        None => writeln!(stdout, "   Extended session closes at: n/a")?,
-    }
+    write_market_session_details(stdout, status)
+}
 
-    if status.session == MarketSession::Extended {
-        writeln!(stdout, "   Post-close gap: {:?}", status.post_close_gap)?;
+fn write_market_session_details<W: Write>(
+    stdout: &mut W,
+    status: MarketSessionStatus,
+) -> anyhow::Result<()> {
+    writeln!(stdout, "   Session: {:?}", status.session())?;
+
+    if let MarketSessionStatus::Extended {
+        closes_at,
+        post_close_gap,
+    } = status
+    {
+        match closes_at {
+            Some(closes_at) => writeln!(
+                stdout,
+                "   Extended session closes at: {} ({} ET)",
+                closes_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                closes_at.with_timezone(&New_York).format("%H:%M:%S")
+            )?,
+            None => writeln!(stdout, "   Extended session closes at: n/a")?,
+        }
+
+        writeln!(stdout, "   Post-close gap: {post_close_gap:?}")?;
+    } else {
+        writeln!(stdout, "   Extended session closes at: n/a")?;
     }
 
     Ok(())
@@ -340,6 +354,56 @@ mod tests {
             .unwrap();
 
         assert!(output(stdout).contains("Session: Closed"));
+    }
+
+    #[test]
+    fn market_session_details_prints_extended_metadata() {
+        let closes_at = "2026-09-11T20:00:00Z".parse().unwrap();
+        let mut stdout = Vec::new();
+
+        write_market_session_details(
+            &mut stdout,
+            MarketSessionStatus::Extended {
+                closes_at: Some(closes_at),
+                post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
+            },
+        )
+        .unwrap();
+
+        let output = output(stdout);
+        assert!(output.contains("Session: Extended"), "got: {output}");
+        assert!(
+            output.contains("Extended session closes at: 2026-09-11 20:00:00 UTC"),
+            "got: {output}"
+        );
+        assert!(
+            output.contains("Post-close gap: MultiDayClosure"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn market_session_details_omit_metadata_for_non_extended_variants() {
+        for status in [
+            MarketSessionStatus::Regular,
+            MarketSessionStatus::Overnight,
+            MarketSessionStatus::Closed,
+        ] {
+            let mut stdout = Vec::new();
+
+            write_market_session_details(&mut stdout, status).unwrap();
+
+            let output = output(stdout);
+            assert!(
+                output.contains(&format!("Session: {:?}", status.session())),
+                "got: {output}"
+            );
+            assert!(
+                output.contains("Extended session closes at: n/a"),
+                "got: {output}"
+            );
+            assert!(!output.contains("Post-close gap:"), "got: {output}");
+        }
     }
 
     #[tokio::test]

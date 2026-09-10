@@ -706,6 +706,13 @@ the broker calendar:
   hedge once the venue reopens, rather than failing a durable job against a
   multi-hour closure.
 
+The richer session status used by close flattening models `Regular`, `Extended`,
+`Overnight`, and `Closed` as mutually exclusive variants. Extended-session close
+metadata can exist only on the `Extended` variant. Its post-close gap is
+`OrdinaryOvernight`, `MultiDayClosure`, `Unknown`, or `Unavailable`; an executor
+that cannot provide the classification reports `Unavailable`, which remains
+distinct from a metadata-capable executor reporting `Unknown`.
+
 **External contract (Alpaca).** The session windows (pre-market 04:00–09:30 ET,
 after-hours 16:00–20:00 ET), the extended-hours order constraints (only `limit`
 orders with `time_in_force` of `day` or `gtc` and `extended_hours = true` are

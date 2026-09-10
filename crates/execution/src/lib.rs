@@ -126,24 +126,44 @@ pub enum PostCloseGap {
     MultiDayClosure,
     /// The executor could not identify the next trading session.
     Unknown,
+    /// The executor does not provide post-close gap classification.
+    Unavailable,
 }
 
-/// Current market-session classification plus close metadata for the full
-/// extended-hours trading day.
+/// Current market-session classification, with close metadata available only
+/// for an extended session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MarketSessionStatus {
-    pub session: MarketSession,
-    pub extended_session_closes_at: Option<DateTime<Utc>>,
-    pub post_close_gap: PostCloseGap,
+pub enum MarketSessionStatus {
+    Regular,
+    Extended {
+        closes_at: Option<DateTime<Utc>>,
+        post_close_gap: PostCloseGap,
+    },
+    Overnight,
+    Closed,
 }
 
 impl MarketSessionStatus {
     #[must_use]
-    pub fn without_close_metadata(session: MarketSession) -> Self {
-        Self {
-            session,
-            extended_session_closes_at: None,
-            post_close_gap: PostCloseGap::Unknown,
+    pub const fn without_close_metadata(session: MarketSession) -> Self {
+        match session {
+            MarketSession::Regular => Self::Regular,
+            MarketSession::Extended => Self::Extended {
+                closes_at: None,
+                post_close_gap: PostCloseGap::Unavailable,
+            },
+            MarketSession::Overnight => Self::Overnight,
+            MarketSession::Closed => Self::Closed,
+        }
+    }
+
+    #[must_use]
+    pub const fn session(self) -> MarketSession {
+        match self {
+            Self::Regular => MarketSession::Regular,
+            Self::Extended { .. } => MarketSession::Extended,
+            Self::Overnight => MarketSession::Overnight,
+            Self::Closed => MarketSession::Closed,
         }
     }
 }
@@ -823,6 +843,52 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn session_status_without_close_metadata_preserves_each_session_variant() {
+        assert_eq!(
+            MarketSessionStatus::without_close_metadata(MarketSession::Regular),
+            MarketSessionStatus::Regular
+        );
+        assert_eq!(
+            MarketSessionStatus::without_close_metadata(MarketSession::Extended),
+            MarketSessionStatus::Extended {
+                closes_at: None,
+                post_close_gap: PostCloseGap::Unavailable,
+            }
+        );
+        assert_eq!(
+            MarketSessionStatus::without_close_metadata(MarketSession::Overnight),
+            MarketSessionStatus::Overnight
+        );
+        assert_eq!(
+            MarketSessionStatus::without_close_metadata(MarketSession::Closed),
+            MarketSessionStatus::Closed
+        );
+    }
+
+    #[test]
+    fn extended_status_keeps_close_metadata_on_the_extended_variant() {
+        let closes_at = Utc::now();
+        let status = MarketSessionStatus::Extended {
+            closes_at: Some(closes_at),
+            post_close_gap: PostCloseGap::Unknown,
+        };
+
+        assert_eq!(status.session(), MarketSession::Extended);
+        assert_eq!(
+            status,
+            MarketSessionStatus::Extended {
+                closes_at: Some(closes_at),
+                post_close_gap: PostCloseGap::Unknown,
+            }
+        );
+        assert_ne!(
+            status,
+            MarketSessionStatus::without_close_metadata(MarketSession::Extended),
+            "a metadata-capable executor with an unknown gap must remain distinct from an executor that cannot report the gap"
+        );
+    }
 
     #[test]
     fn positive_to_whole_shares_succeeds_for_whole_numbers() {

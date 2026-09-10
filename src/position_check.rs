@@ -2256,8 +2256,10 @@ mod tests {
             Duration::from_secs(60),
             MockExecutor::new()
                 .with_market_session(MarketSession::Extended)
-                .with_extended_session_closes_at(now + chrono::Duration::seconds(300))
-                .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+                .with_extended_session_close_metadata(
+                    now + chrono::Duration::seconds(300),
+                    st0x_execution::PostCloseGap::MultiDayClosure,
+                )
                 .with_order_status(OrderState::Submitted {
                     order_id: ExecutorOrderId::new("broker-eh-1"),
                 }),
@@ -2556,8 +2558,10 @@ mod tests {
             Duration::from_secs(60),
             MockExecutor::new()
                 .with_market_session(MarketSession::Extended)
-                .with_extended_session_closes_at(now + chrono::Duration::seconds(300))
-                .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+                .with_extended_session_close_metadata(
+                    now + chrono::Duration::seconds(300),
+                    st0x_execution::PostCloseGap::MultiDayClosure,
+                )
                 .with_order_status(OrderState::Submitted {
                     order_id: ExecutorOrderId::new("broker-eh-1"),
                 }),
@@ -2609,8 +2613,10 @@ mod tests {
             Duration::from_secs(60),
             MockExecutor::new()
                 .with_market_session(MarketSession::Extended)
-                .with_extended_session_closes_at(now + chrono::Duration::seconds(300))
-                .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+                .with_extended_session_close_metadata(
+                    now + chrono::Duration::seconds(300),
+                    st0x_execution::PostCloseGap::MultiDayClosure,
+                )
                 .with_order_status(OrderState::Submitted {
                     order_id: ExecutorOrderId::new("broker-eh-1"),
                 }),
@@ -2667,10 +2673,10 @@ mod tests {
             Duration::from_secs(60),
             MockExecutor::new()
                 .with_market_session(MarketSession::Extended)
-                .with_extended_session_closes_at(
+                .with_extended_session_close_metadata(
                     chrono::Utc::now() + chrono::Duration::seconds(300),
+                    st0x_execution::PostCloseGap::OrdinaryOvernight,
                 )
-                .with_post_close_gap(st0x_execution::PostCloseGap::OrdinaryOvernight)
                 .with_order_status(OrderState::Submitted {
                     order_id: ExecutorOrderId::new("broker-eh-1"),
                 }),
@@ -2717,8 +2723,10 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(chrono::Utc::now() + chrono::Duration::seconds(300))
-            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
             .with_inventory(Inventory {
                 positions: Vec::new(),
                 usd_balance_cents: 100_000,
@@ -2759,8 +2767,10 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(chrono::Utc::now() + chrono::Duration::seconds(300))
-            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
             .with_latest_quote(
                 st0x_execution::LatestQuote::new(
                     Positive::new(Usd::new(float!(99.0))).unwrap(),
@@ -2817,8 +2827,10 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(chrono::Utc::now() + chrono::Duration::seconds(300))
-            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
             .with_preflight_price(float!(10.0))
             .with_latest_quote(
                 st0x_execution::LatestQuote::new(
@@ -2874,8 +2886,10 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(chrono::Utc::now() + chrono::Duration::seconds(300))
-            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
             .with_preflight_price(float!(10.0))
             .with_latest_quote(
                 st0x_execution::LatestQuote::new(
@@ -2923,8 +2937,10 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(chrono::Utc::now() + chrono::Duration::seconds(300))
-            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
             .with_inventory(Inventory {
                 positions: Vec::new(),
                 usd_balance_cents: 100_000,
@@ -2972,8 +2988,10 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(chrono::Utc::now() + chrono::Duration::seconds(300))
-            .with_post_close_gap(st0x_execution::PostCloseGap::OrdinaryOvernight)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::OrdinaryOvernight,
+            )
             .with_preflight_price(float!(10.0))
             .with_position_mark(Positive::new(Usd::new(float!(100.0))).unwrap())
             .with_latest_quote(
@@ -3030,8 +3048,10 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(chrono::Utc::now() + chrono::Duration::seconds(300))
-            .with_post_close_gap(st0x_execution::PostCloseGap::OrdinaryOvernight)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::OrdinaryOvernight,
+            )
             .with_position_mark(Positive::new(Usd::new(float!(100.0))).unwrap())
             .with_inventory(Inventory {
                 positions: Vec::new(),
@@ -3201,8 +3221,10 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(chrono::Utc::now() + chrono::Duration::seconds(300))
-            .with_post_close_gap(st0x_execution::PostCloseGap::OrdinaryOvernight)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::OrdinaryOvernight,
+            )
             .with_inventory(Inventory {
                 positions: Vec::new(),
                 usd_balance_cents: 100_000,
@@ -3316,8 +3338,10 @@ mod tests {
         let cfg = dry_run_ctx(&["AAPL", "MSFT"], OperationMode::Enabled);
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(chrono::Utc::now() + chrono::Duration::seconds(300))
-            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
             .with_latest_quote(
                 st0x_execution::LatestQuote::new(
                     Positive::new(Usd::new(float!(99.0))).unwrap(),

@@ -308,7 +308,7 @@ async fn select_order_kind_for_current_session(
             symbol: symbol.clone(),
             source,
         })?;
-    let current_session = status.session;
+    let current_session = status.session();
 
     if current_session != enqueued_session {
         info!(
@@ -356,17 +356,17 @@ async fn select_order_kind_for_current_session(
 
             let now = chrono::Utc::now();
             let close_flatten_window = ctx.close_flatten_policy.active_window(status, now);
-            let close_flatten_active = close_flatten_window.is_some();
 
-            if close_flatten_active {
+            if let Some(window) = close_flatten_window {
                 counter!(
                     "close_flatten_attempts_total",
                     "symbol" => symbol.to_string(),
                     "direction" => direction_label(direction),
-                    "reason" => post_close_gap_label(status.post_close_gap)
+                    "reason" => post_close_gap_label(window.post_close_gap)
                 )
                 .increment(1);
             }
+            let close_flatten_active = close_flatten_window.is_some();
 
             let reference = resolve_extended_hours_reference_price(
                 ctx.order_placer.as_ref(),
@@ -786,6 +786,7 @@ fn post_close_gap_label(post_close_gap: PostCloseGap) -> &'static str {
         PostCloseGap::OrdinaryOvernight => "ordinary_overnight",
         PostCloseGap::MultiDayClosure => "multi_day_closure",
         PostCloseGap::Unknown => "unknown",
+        PostCloseGap::Unavailable => "unavailable",
     }
 }
 
@@ -2066,9 +2067,8 @@ mod tests {
     /// a moving ramp, so every close-flatten placer shares this one status
     /// rather than repeating the literal.
     fn ramp_start_session_status() -> st0x_execution::MarketSessionStatus {
-        st0x_execution::MarketSessionStatus {
-            session: MarketSession::Extended,
-            extended_session_closes_at: Some(chrono::Utc::now() + chrono::TimeDelta::seconds(900)),
+        st0x_execution::MarketSessionStatus::Extended {
+            closes_at: Some(chrono::Utc::now() + chrono::TimeDelta::seconds(900)),
             post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
         }
     }
@@ -2432,6 +2432,23 @@ mod tests {
         assert_eq!(
             ReferencePriceSource::DelayedSipQuote.metric_label(),
             "delayed_sip_quote"
+        );
+    }
+
+    #[test]
+    fn post_close_gap_metric_labels_are_stable() {
+        assert_eq!(
+            post_close_gap_label(PostCloseGap::OrdinaryOvernight),
+            "ordinary_overnight"
+        );
+        assert_eq!(
+            post_close_gap_label(PostCloseGap::MultiDayClosure),
+            "multi_day_closure"
+        );
+        assert_eq!(post_close_gap_label(PostCloseGap::Unknown), "unknown");
+        assert_eq!(
+            post_close_gap_label(PostCloseGap::Unavailable),
+            "unavailable"
         );
     }
 
@@ -3230,11 +3247,7 @@ mod tests {
             ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
             {
                 if !self.extended_session.load(Ordering::SeqCst) {
-                    return Ok(st0x_execution::MarketSessionStatus {
-                        session: MarketSession::Regular,
-                        extended_session_closes_at: None,
-                        post_close_gap: st0x_execution::PostCloseGap::OrdinaryOvernight,
-                    });
+                    return Ok(st0x_execution::MarketSessionStatus::Regular);
                 }
 
                 Ok(ramp_start_session_status())
@@ -3360,11 +3373,8 @@ mod tests {
             {
                 // Extended with an ordinary overnight gap: the limit price
                 // comes from the latest trade, not a close-flatten quote.
-                Ok(st0x_execution::MarketSessionStatus {
-                    session: MarketSession::Extended,
-                    extended_session_closes_at: Some(
-                        chrono::Utc::now() + chrono::TimeDelta::minutes(5),
-                    ),
+                Ok(st0x_execution::MarketSessionStatus::Extended {
+                    closes_at: Some(chrono::Utc::now() + chrono::TimeDelta::minutes(5)),
                     post_close_gap: st0x_execution::PostCloseGap::OrdinaryOvernight,
                 })
             }
@@ -4554,9 +4564,8 @@ mod tests {
                 &self,
             ) -> Result<st0x_execution::MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>>
             {
-                Ok(st0x_execution::MarketSessionStatus {
-                    session: MarketSession::Extended,
-                    extended_session_closes_at: None,
+                Ok(st0x_execution::MarketSessionStatus::Extended {
+                    closes_at: None,
                     post_close_gap: st0x_execution::PostCloseGap::OrdinaryOvernight,
                 })
             }
