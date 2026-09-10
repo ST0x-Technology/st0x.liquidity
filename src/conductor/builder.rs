@@ -1649,8 +1649,8 @@ mod tests {
     };
     use crate::rebalancing::trigger::{GuardGeneration, GuardState, InProgressGuard};
     use crate::rebalancing::usdc::{
-        PreflightAlertGate, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcGuardRelease,
-        UsdcTransferError,
+        PreflightAlertGate, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcDriverGate,
+        UsdcGuardRelease, UsdcTransferError,
     };
     use crate::startup::StartupBarrier;
     use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
@@ -2550,6 +2550,7 @@ mod tests {
         let healthy_completed = Arc::new(tokio::sync::Notify::new());
         let notifier = Arc::new(CapturingNotifier::default());
         let transfer_ctx = Arc::new(TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(PoisonThenHealthyUsdcResume {
                 poison_id,
                 healthy_completed: healthy_completed.clone(),
@@ -2635,6 +2636,7 @@ mod tests {
         let healthy_completed = Arc::new(tokio::sync::Notify::new());
         let notifier = Arc::new(CapturingNotifier::default());
         let transfer_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(PoisonThenHealthyUsdcResume {
                 poison_id,
                 healthy_completed: healthy_completed.clone(),
