@@ -7270,6 +7270,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_recovery_waits_for_inflight_failure_reactor() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = issuer_request_id("mint-terminal-recovery-race");
+        let tok = tokenization_request_id("TOK-mint-race");
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(90))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::Hedging, shares(10)),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_mint(symbol.clone(), mint_id.clone());
+        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        trigger.mint_tracking.write().await.insert(
+            mint_id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                chain: Chain::Base,
+                quantity: shares(10),
+                tokenization_request_id: Some(tok.clone()),
+                stage: MintTrackingStage::Accepted,
+                last_progress_at: Utc::now(),
+            },
+        );
+        let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "rejected".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        // The durable Failed state is visible while its reactor waits on tracking.
+        let tracking_barrier = trigger.mint_tracking.read().await;
+        let mut failure = pin!(trigger.on_mint(
+            mint_id.clone(),
+            TokenizedEquityMintEvent::MintAcceptanceFailed {
+                reason: "rejected".to_string(),
+                failed_at: Utc::now(),
+            },
+        ));
+        assert!(poll!(&mut failure).is_pending());
+        let mut recovery =
+            pin!(trigger.rebuild_mint_tracking_for_recovery(&mint_id, &failed, tok.clone()));
+        assert!(poll!(&mut recovery).is_pending());
+        drop(tracking_barrier);
+        let (failure_result, claim) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(failure, recovery)
+        })
+        .await
+        .expect("terminal cleanup and recovery must not deadlock");
+        failure_result.unwrap();
+        let claim = claim.unwrap();
+        trigger
+            .on_mint(
+                mint_id.clone(),
+                TokenizedEquityMintEvent::ProviderCompletionRecovered {
+                    issuer_request_id: mint_id.clone(),
+                    wallet: Address::ZERO,
+                    tokenization_request_id: tok,
+                    tx_hash: TxHash::random(),
+                    shares_minted: U256::from(10u64),
+                    fees: None,
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(claim);
+        // The terminal reactor must not have removed the tracking recovery
+        // inserted: without it the recovery event finds nothing to complete.
+        let tracked = trigger.mint_tracking.read().await.contains_key(&mint_id);
+        assert!(
+            tracked,
+            "recovery tracking must survive the terminal failure reactor"
+        );
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(10)),
+            "recovered shares must be credited exactly once"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(90))
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0))
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_after_explicit_redemption_failure_moves_equity_to_hedging() {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
