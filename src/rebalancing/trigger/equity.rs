@@ -433,7 +433,7 @@ pub(super) async fn check_imbalance_and_build_operation(
         let inventory = inventory.read().await;
         inventory.check_equity_imbalance(
             symbol,
-            inventory.trading_chain(),
+            inventory.primary_chain(),
             threshold,
             vault_ratio,
         )?

@@ -682,11 +682,11 @@ const PORTFOLIO_EQUITY_TRANSIT_LOCATIONS: [InFlightEquityLocation; 2] = [
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
-    /// Chain the venue-addressed (trading) operations act on. Snapshot
+    /// The primary chain: the one venue-addressed operations act on. Snapshot
     /// application routes by each event's own chain; everything reaching a
     /// slot through [`Venue::MarketMaking`] means this chain's slot.
     #[serde(default = "crate::onchain::legacy_chain")]
-    trading_chain: Chain,
+    primary_chain: Chain,
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
     last_updated: DateTime<Utc>,
@@ -879,10 +879,10 @@ impl InventoryView {
     /// splits or dividends.
     ///
     /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
-    /// Chain the venue-addressed operations act on (the sole trading chain
-    /// at construction time).
-    pub(crate) fn trading_chain(&self) -> Chain {
-        self.trading_chain
+    /// The primary chain: the one whose vault inventory is polled and
+    /// rebalanced, and the one venue-addressed operations act on.
+    pub(crate) fn primary_chain(&self) -> Chain {
+        self.primary_chain
     }
 
     pub(crate) fn check_equity_imbalance(
@@ -1222,9 +1222,9 @@ where
 
 impl InventoryView {
     /// A fresh view whose venue-addressed operations act on `chain`.
-    pub(crate) fn for_trading_chain(chain: Chain) -> Self {
+    pub(crate) fn for_primary_chain(chain: Chain) -> Self {
         Self {
-            trading_chain: chain,
+            primary_chain: chain,
             ..Self::default()
         }
     }
@@ -1260,7 +1260,7 @@ impl Default for InventoryView {
             last_offchain_fill_applied_at: HashMap::new(),
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
-            trading_chain: Chain::Base,
+            primary_chain: Chain::Base,
         }
     }
 }
@@ -1299,7 +1299,7 @@ impl InventoryView {
     ) -> Option<FractionalShares> {
         let inventory = self.equities.get(symbol)?;
         inventory
-            .get_venue(venue, self.trading_chain)
+            .get_venue(venue, self.primary_chain)
             .map(VenueBalance::available)
     }
 
@@ -1353,7 +1353,7 @@ impl InventoryView {
         symbol: &Symbol,
         venue: Venue,
     ) -> Option<FractionalShares> {
-        self.equity_inflight_at(symbol, venue, self.trading_chain)
+        self.equity_inflight_at(symbol, venue, self.primary_chain)
     }
 
     pub(crate) fn equity_inflight_at(
@@ -1369,7 +1369,7 @@ impl InventoryView {
     }
 
     /// The market-making equity available in an explicit chain's slot.
-    /// [`Self::equity_available`] resolves the trading chain, so a test
+    /// [`Self::equity_available`] resolves the primary chain, so a test
     /// covering a secondary chain reads through here instead.
     #[cfg(test)]
     pub(crate) fn onchain_equity_available_at(
@@ -1410,7 +1410,7 @@ impl InventoryView {
             Venue::MarketMaking => self
                 .usdc
                 .onchain
-                .get(&self.trading_chain)
+                .get(&self.primary_chain)
                 .copied()
                 .map(VenueBalance::available),
             Venue::Hedging => self.usdc.offchain.map(VenueBalance::available),
@@ -1424,7 +1424,7 @@ impl InventoryView {
             Venue::MarketMaking => self
                 .usdc
                 .onchain
-                .get(&self.trading_chain)
+                .get(&self.primary_chain)
                 .copied()
                 .map(VenueBalance::inflight),
             Venue::Hedging => self.usdc.offchain.map(VenueBalance::inflight),
@@ -1432,7 +1432,7 @@ impl InventoryView {
     }
 
     /// Sets USDC inventory with specified available balances (zero inflight).
-    /// The onchain balance is seeded under the view's trading chain so
+    /// The onchain balance is seeded under the view's primary chain so
     /// non-Base fixtures exercise the same slot the venue-addressed
     /// operations route to.
     #[cfg(test)]
@@ -1440,7 +1440,7 @@ impl InventoryView {
         Self {
             usdc: Inventory {
                 onchain: BTreeMap::from([(
-                    self.trading_chain,
+                    self.primary_chain,
                     VenueBalance::new(onchain_available, Usdc::ZERO),
                 )]),
                 offchain: Some(VenueBalance::new(offchain_available, Usdc::ZERO)),
@@ -1467,7 +1467,7 @@ impl InventoryView {
         Self {
             usdc: Inventory {
                 onchain: BTreeMap::from([(
-                    self.trading_chain,
+                    self.primary_chain,
                     VenueBalance::new(onchain_available, onchain_inflight),
                 )]),
                 offchain: Some(VenueBalance::new(offchain_available, offchain_inflight)),
@@ -1523,13 +1523,13 @@ impl InventoryView {
             -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let chain = self.trading_chain;
+        let chain = self.primary_chain;
         self.update_equity_at(symbol, chain, update, now)
     }
 
     /// Like [`Self::update_equity`], addressed to an explicit chain's slot:
     /// snapshot application and fill deltas route by the event's own chain
-    /// rather than the trading chain.
+    /// rather than the primary chain.
     pub(crate) fn update_equity_at(
         self,
         symbol: &Symbol,
@@ -1576,7 +1576,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
-            trading_chain: self.trading_chain,
+            primary_chain: self.primary_chain,
         })
     }
 
@@ -1585,7 +1585,7 @@ impl InventoryView {
         update: impl FnOnce(Inventory<Usdc>, Chain) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let chain = self.trading_chain;
+        let chain = self.primary_chain;
         self.update_usdc_at(chain, update, now)
     }
 
@@ -1626,7 +1626,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
-            trading_chain: self.trading_chain,
+            primary_chain: self.primary_chain,
         })
     }
 
@@ -1987,7 +1987,7 @@ impl InventoryView {
             .filter(|(symbol, _)| self.pending_offchain_orders.contains_key(*symbol))
             .filter_map(|(symbol, inventory)| {
                 inventory
-                    .get_venue(Venue::Hedging, self.trading_chain)
+                    .get_venue(Venue::Hedging, self.primary_chain)
                     .map(|balance| {
                         (
                             symbol.clone(),
@@ -2012,7 +2012,7 @@ impl InventoryView {
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols.clone(),
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
-            trading_chain: self.trading_chain,
+            primary_chain: self.primary_chain,
             ..Self::default()
         }
     }
@@ -2384,13 +2384,13 @@ impl InventoryView {
         venue: Venue,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let chain = self.trading_chain;
+        let chain = self.primary_chain;
         self.clear_equity_inflight_at(symbol, chain, venue, now)
     }
 
     /// Like [`Self::clear_equity_inflight`], addressed to an explicit chain's
     /// slot: a recovery rollback clears the in-flight on the chain the
-    /// transfer's record names rather than the trading chain.
+    /// transfer's record names rather than the primary chain.
     pub(crate) fn clear_equity_inflight_at(
         self,
         symbol: &Symbol,
@@ -2436,7 +2436,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
-            trading_chain: self.trading_chain,
+            primary_chain: self.primary_chain,
         })
     }
 
@@ -2446,8 +2446,8 @@ impl InventoryView {
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         let cleared =
-            Inventory::set_inflight(venue, Usdc::ZERO)(self.usdc.clone(), self.trading_chain)?;
-        let cleared = Inventory::with_last_rebalancing(now)(cleared, self.trading_chain)?;
+            Inventory::set_inflight(venue, Usdc::ZERO)(self.usdc.clone(), self.primary_chain)?;
+        let cleared = Inventory::with_last_rebalancing(now)(cleared, self.primary_chain)?;
 
         Ok(Self {
             usdc: cleared,
@@ -2477,7 +2477,7 @@ impl InventoryView {
             offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
             restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
             restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
-            trading_chain: self.trading_chain,
+            primary_chain: self.primary_chain,
         })
     }
 
@@ -2723,7 +2723,7 @@ impl InventoryView {
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         if self
-            .equity_snapshot_watermark(symbol, Venue::Hedging, self.trading_chain)
+            .equity_snapshot_watermark(symbol, Venue::Hedging, self.primary_chain)
             .is_some_and(|watermark| fetched_at <= watermark)
         {
             warn!(
@@ -2769,10 +2769,10 @@ impl InventoryView {
             now,
         )?;
 
-        let trading_chain = view.trading_chain;
+        let primary_chain = view.primary_chain;
         Ok(view.record_equity_snapshot_watermarks(
             Venue::Hedging,
-            trading_chain,
+            primary_chain,
             [symbol],
             fetched_at,
         ))
@@ -2953,10 +2953,10 @@ impl InventoryView {
             }
 
             OffchainEquity { positions, .. } => {
-                let trading_chain = self.trading_chain;
+                let primary_chain = self.primary_chain;
                 self.apply_equity_snapshot(
                     Venue::Hedging,
-                    trading_chain,
+                    primary_chain,
                     positions.iter(),
                     fetched_at,
                     None,
@@ -3235,10 +3235,10 @@ impl InventoryView {
                         .keys()
                         .filter(|symbol| !view.has_pending_offchain_order(symbol))
                         .collect();
-                    let trading_chain = view.trading_chain;
+                    let primary_chain = view.primary_chain;
                     view.record_equity_snapshot_watermarks(
                         Venue::Hedging,
-                        trading_chain,
+                        primary_chain,
                         applied,
                         *fetched_at,
                     )
@@ -3597,7 +3597,7 @@ mod tests {
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
-            trading_chain: Chain::Base,
+            primary_chain: Chain::Base,
         }
     }
 
@@ -3640,7 +3640,7 @@ mod tests {
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
-            trading_chain: Chain::Base,
+            primary_chain: Chain::Base,
         }
     }
 
@@ -3715,12 +3715,12 @@ mod tests {
     }
 
     /// A snapshot event from a second chain lands in its own slot and leaves
-    /// the trading chain's balance untouched.
+    /// the primary chain's balance untouched.
     #[test]
-    fn second_chain_snapshot_does_not_leak_into_the_trading_chain_slot() {
+    fn second_chain_snapshot_does_not_leak_into_the_primary_chain_slot() {
         let aapl = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
-        let view = InventoryView::for_trading_chain(Chain::Base)
+        let view = InventoryView::for_primary_chain(Chain::Base)
             .apply_equity_snapshot(
                 Venue::MarketMaking,
                 Chain::Base,
@@ -3743,7 +3743,7 @@ mod tests {
         assert_eq!(
             view.equity_available(&aapl, Venue::MarketMaking),
             Some(shares(50)),
-            "the venue accessor reads the trading chain's slot"
+            "the venue accessor reads the primary chain's slot"
         );
 
         let inventory = view.equities.get(&aapl).unwrap();
@@ -5856,7 +5856,7 @@ mod tests {
             block_number: None,
         };
 
-        let view = InventoryView::for_trading_chain(Chain::Base)
+        let view = InventoryView::for_primary_chain(Chain::Base)
             .apply_snapshot_event(&equity_on(Chain::Base, 50), now)
             .unwrap()
             .apply_snapshot_event(&equity_on(Chain::Ethereum, 7), now)
@@ -5938,7 +5938,7 @@ mod tests {
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
-            trading_chain: Chain::Base,
+            primary_chain: Chain::Base,
         };
 
         let dto = view.to_dto();
@@ -6003,7 +6003,7 @@ mod tests {
             offchain_usd_snapshot_watermark: None,
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
-            trading_chain: Chain::Base,
+            primary_chain: Chain::Base,
         };
 
         let dto = view.to_dto();
