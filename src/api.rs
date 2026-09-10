@@ -70,7 +70,9 @@ use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performan
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
 };
-use crate::rebalancing::usdc::{RecheckUsdcDeposit, UsdcRecheckError};
+use crate::rebalancing::usdc::{
+    DriverNotQuiesced, RecheckUsdcDeposit, UsdcDriverPause, UsdcDriverPauseGuard, UsdcRecheckError,
+};
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
@@ -1315,6 +1317,10 @@ pub(crate) struct RecoveryHandle {
     /// Runs in the bot process, so the recovery events reach the live
     /// trigger reactor and clear the in-progress guard without a restart.
     pub(crate) usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    /// Pause control for the USDC rebalancing driver. A write route that must
+    /// read then mutate a USDC rebalance, or spend the rebalancing wallet,
+    /// quiesces the workers through it first and resumes them on every exit.
+    pub(crate) usdc_driver_pause: Arc<UsdcDriverPause>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
@@ -1332,6 +1338,24 @@ pub(crate) struct ProcessTxHandle {
 /// Serializes operator transfer-recovery requests so they cannot race through
 /// duplicate or conflicting mint/redemption flows.
 pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
+
+/// Quiesces the USDC rebalancing driver for the caller's mutation window:
+/// returns once no worker execution is in flight and none can start, or 503
+/// when a transfer is executing and the driver cannot be paused within the
+/// quiesce window. The guard resumes the driver when dropped.
+async fn quiesce_usdc_driver(
+    pause: &UsdcDriverPause,
+) -> Result<UsdcDriverPauseGuard, (StatusCode, Json<ErrorResponse>)> {
+    pause.pause().await.map_err(|DriverNotQuiesced| {
+        warn!("USDC driver did not quiesce for an operator write; refusing");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "A USDC transfer is executing; retry once it is not in flight".to_string(),
+            }),
+        )
+    })
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1689,6 +1713,13 @@ async fn recheck_transfer(
                 )
             })?;
 
+            // The recheck sends transactions from the rebalancing wallet and
+            // advances the aggregate on this task, so quiesce the workers first
+            // and hold them parked for the whole recheck. Not bounded here:
+            // dropping the recheck mid step could strand the aggregate, and each
+            // call inside it is already transport bounded.
+            let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause).await?;
+
             let outcome = handle
                 .usdc_recheck
                 .recheck_deposit(&rebalance_id)
@@ -1834,6 +1865,11 @@ async fn resume_usdc_transfer(
             }),
         )
     })?;
+
+    // Quiesce the workers so the resume's preflight (durable holder scan and
+    // job row dedupe) and its enqueue cannot straddle an execution already in
+    // flight for the same aggregate.
+    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause).await?;
 
     handle
         .rebalancing_service
@@ -3015,7 +3051,7 @@ mod tests {
     };
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
-    use crate::rebalancing::usdc::UsdcTransferError;
+    use crate::rebalancing::usdc::{UsdcTransferError, usdc_driver_pause};
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef};
 
@@ -7337,5 +7373,41 @@ mod tests {
             "got: {}",
             body.error
         );
+    }
+
+    /// A write route must refuse with 503 while a transfer is executing, and
+    /// the refusal must leave the driver running rather than flagged paused.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_usdc_driver_returns_503_while_a_transfer_executes() {
+        let (control, gate) = usdc_driver_pause();
+        let _executing = gate.enter().await;
+
+        let Err((status, Json(body))) = quiesce_usdc_driver(&control).await else {
+            panic!("a quiesce with an execution in flight must be refused");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "A USDC transfer is executing; retry once it is not in flight"
+        );
+        assert!(
+            !gate.is_paused(),
+            "a refused quiesce must not leave the driver paused"
+        );
+    }
+
+    /// With no execution in flight the route gets its guard at once, the
+    /// driver stays parked for the guard's lifetime, and dropping the guard
+    /// resumes it, so every handler exit path resumes the driver.
+    #[tokio::test]
+    async fn quiesce_usdc_driver_parks_the_driver_until_the_guard_drops() {
+        let (control, gate) = usdc_driver_pause();
+
+        let guard = quiesce_usdc_driver(&control).await.unwrap();
+        assert!(gate.is_paused());
+
+        drop(guard);
+        assert!(!gate.is_paused());
     }
 }

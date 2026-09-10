@@ -5,9 +5,13 @@
 //! with matching `resume_*` paths for apalis-driven crash recovery. Each
 //! transfer handles USD/USDC conversion, withdrawal, CCTP bridging, and deposit.
 
+mod driver_pause;
 mod job;
 mod manager;
 
+pub(crate) use driver_pause::{
+    DriverNotQuiesced, UsdcDriverGate, UsdcDriverPause, UsdcDriverPauseGuard, usdc_driver_pause,
+};
 #[cfg(test)]
 pub(crate) use job::UsdcGuardRelease;
 pub(crate) use job::{

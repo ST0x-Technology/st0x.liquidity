@@ -60,7 +60,7 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::usdc::{
     TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
-    TransferUsdcToMarketMakingJobQueue,
+    TransferUsdcToMarketMakingJobQueue, UsdcDriverGate,
 };
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
@@ -716,6 +716,11 @@ pub(crate) struct RebalancingService {
     /// [`Self::divergence_gate`].
     divergence_gate: Arc<InventoryDivergenceGate>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
+    /// Driver pause gate, attached by the conductor once the USDC workers are
+    /// built. Unset in tests that never wire a pause, where the trigger runs
+    /// unpaused. Consulted so a check neither enqueues a transfer nor sweeps
+    /// while an operator operation holds the driver quiesced.
+    usdc_driver_gate: std::sync::OnceLock<UsdcDriverGate>,
     notifier: Arc<dyn crate::alerts::Notifier>,
     /// The ERC-4626 wrapper on each watched chain: a symbol's derivative and
     /// its share ratio are that chain's, never another's.
@@ -875,6 +880,7 @@ impl RebalancingService {
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             divergence_gate: Arc::default(),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
+            usdc_driver_gate: std::sync::OnceLock::new(),
             notifier,
             wrappers,
             equity_scheduler,
@@ -2891,6 +2897,12 @@ impl RebalancingService {
         usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
     }
 
+    /// Attaches the USDC driver pause gate once the conductor has built the
+    /// workers. Attached once per boot; a second attach is ignored.
+    pub(crate) fn attach_usdc_driver_gate(&self, gate: UsdcDriverGate) {
+        let _ = self.usdc_driver_gate.set(gate);
+    }
+
     async fn load_mint_tracking(&self, id: &IssuerRequestId) -> Option<MintTracking> {
         let Some(tracking) = self.mint_tracking.read().await.get(id).cloned() else {
             warn!(target: "rebalance", id = %id, "Mint event for untracked aggregate");
@@ -3424,6 +3436,21 @@ impl RebalancingService {
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
+        // An operator operation holding the driver quiesced must not see a
+        // fresh transfer row or a sweep that relatches, clears, or re-arms
+        // under it. The check is enqueued again by the next fill or snapshot.
+        if self
+            .usdc_driver_gate
+            .get()
+            .is_some_and(UsdcDriverGate::is_paused)
+        {
+            debug!(
+                target: "rebalance",
+                "Skipping USDC rebalancing check: driver paused by an operator operation"
+            );
+            return;
+        }
+
         self.expire_stuck_operations_with_logging().await;
 
         let Some((threshold, usdc_limit, reserved)) = self.usdc_rebalancing_params() else {
