@@ -1638,6 +1638,87 @@ mod tests {
         );
     }
 
+    /// A job whose chain has no services entry cannot evaluate the handoff
+    /// predicate, so a `PostReceipt` error propagates for apalis to retry and
+    /// the guard stays `ActiveTransfer`: the tokens are never parked in a
+    /// recovery slot nothing on that chain would claim.
+    #[tokio::test]
+    async fn perform_post_receipt_propagates_when_the_jobs_chain_has_no_services() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let issuer_id = issuer_request_id("post-receipt-chain-unwired");
+        let mut ctx = test_ctx_with_recovery(
+            Arc::new(RecordingResume::post_receipt_failure()),
+            OperationMode::Enabled,
+        )
+        .await;
+
+        // The mint was recorded on Ethereum while that chain was wired; the
+        // job now resumes it against services that carry only Base.
+        let mut recorded_services = ctx.transfer_services.clone();
+        let base_entry = recorded_services.chains[&Chain::Base].clone();
+        recorded_services.chains.insert(Chain::Ethereum, base_entry);
+        ctx.mint_store = Arc::new(test_store(
+            crate::test_utils::setup_test_db().await,
+            recorded_services,
+        ));
+
+        ctx.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::ActiveTransfer {
+                generation: GuardGeneration::default(),
+            },
+        );
+
+        ctx.mint_store
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Ethereum,
+                    issuer_request_id: issuer_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .expect("RequestMint must persist");
+
+        submit_requested_mint(&ctx, &issuer_id).await;
+
+        ctx.mint_store
+            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .await
+            .expect("Poll must transition to TokensReceived");
+
+        let job = TransferEquityToMarketMaking {
+            chain: Chain::Ethereum,
+            issuer_request_id: issuer_id.clone(),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(5)),
+            generation: GuardGeneration::default(),
+
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let error = Job::perform(&job, &ctx).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
+            ),
+            "PostReceipt must propagate as Err when the job's chain is unwired, got {error:?}"
+        );
+
+        assert!(
+            matches!(
+                ctx.equity_in_progress.read().unwrap().get(&symbol),
+                Some(GuardState::ActiveTransfer { .. })
+            ),
+            "guard must stay ActiveTransfer when the job's chain has no services entry"
+        );
+    }
+
     /// `PostReceipt` error with the mint aggregate already in a terminal state
     /// (e.g. `Failed`) must propagate as `Err` — not transition the guard to
     /// `HeldForRecovery`. If this were allowed, a finished mint's symbol would be

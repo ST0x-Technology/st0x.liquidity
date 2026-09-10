@@ -1563,8 +1563,8 @@ async fn recheck_transfer(
 /// not leak internals (the full error is logged at the call site).
 fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
     use RecheckError::{
-        Database, MalformedTokenizationRequestId, MalformedWallet, Mint, MissingTxHash,
-        NoAcceptedRequest, Rebalancing, Redemption, Tokenizer,
+        ChainServicesMissing, Database, MalformedTokenizationRequestId, MalformedWallet, Mint,
+        MissingTxHash, NoAcceptedRequest, Rebalancing, Redemption, Tokenizer,
     };
 
     match error {
@@ -1578,7 +1578,7 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
             StatusCode::BAD_GATEWAY,
             "Tokenization provider unavailable; retry later".to_string(),
         ),
-        Mint(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
+        ChainServicesMissing(_) | Mint(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to recheck transfer".to_string(),
         ),
@@ -2106,6 +2106,7 @@ mod tests {
         PortfolioSnapshotId, PortfolioSnapshotProjection, et_day,
     };
     use crate::position::{Position, PositionCommand, TradeId};
+    use crate::rebalancing::equity::ChainServicesMissing;
     use crate::rebalancing::usdc::UsdcTransferError;
     use crate::tokenized_equity_mint::TokenizedEquityMint;
 
@@ -5018,6 +5019,15 @@ mod tests {
         // Genuinely internal failure -> 500 with a generic body.
         let (status, message) =
             recheck_error_response(&RecheckError::Database(sqlx::Error::RowNotFound));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to recheck transfer");
+
+        // A record naming a chain the running bot has no services for is a
+        // wiring failure on the bot's side, not the operator's -> 500 too.
+        let (status, message) =
+            recheck_error_response(&RecheckError::ChainServicesMissing(ChainServicesMissing {
+                chain: Chain::Ethereum,
+            }));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
     }

@@ -35,7 +35,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
@@ -112,6 +112,8 @@ pub(crate) enum RecheckOutcome {
 
 #[derive(Debug, Error)]
 pub(crate) enum RecheckError {
+    #[error(transparent)]
+    ChainServicesMissing(#[from] ChainServicesMissing),
     #[error(transparent)]
     Mint(#[from] MintError),
     #[error(transparent)]
@@ -573,11 +575,12 @@ pub enum MintError {
     /// mint stays `MintAccepted`; the resume path retries the check.
     #[error("Vault-mode check failed: {0}")]
     VaultModeCheck(#[from] VaultModeCheckError),
-    /// `vault_mode` reads orchestrator but the symbol has no
-    /// `[assets.equities.<symbol>] tokenized_equity` config entry to bind
-    /// the authorization to.
-    #[error("No tokenized-equity address configured for {symbol}")]
-    UnknownTokenizedEquity { symbol: Symbol },
+    /// `vault_mode` reads orchestrator but the record's chain lists no
+    /// `[chains.<name>.trading.assets.equities.<symbol>] tokenized_equity`
+    /// to bind the authorization to. Never resolved through another
+    /// chain's table: the same symbol is a different contract there.
+    #[error("No tokenized-equity address configured for {symbol} on {chain}")]
+    UnknownTokenizedEquity { chain: Chain, symbol: Symbol },
     /// Enqueueing the authorization delivery job failed -- a local SQLite
     /// write. The signed authorization is already persisted on the
     /// aggregate, so the resume path re-enqueues without re-signing.
@@ -784,13 +787,10 @@ struct WrappedMintResult {
 /// through [`Self::resume_equity_to_market_making`] and
 /// [`Self::resume_equity_to_hedging`].
 pub struct CrossVenueEquityTransfer {
-    raindex: Arc<dyn Raindex>,
-    vault_lookup: Arc<dyn VaultLookup>,
-    tokenizer: Arc<dyn Tokenizer>,
-    wrapper: Arc<dyn Wrapper>,
-    /// The per-chain entries the saga resolves a transfer's wallet, gas
-    /// admission and bot-gas enqueuer through -- the same map the two
-    /// aggregates' command handlers read.
+    /// The per-chain entries every step resolves through -- the same map the
+    /// two aggregates' command handlers read. The chain comes from the
+    /// aggregate the step is driving, so a resume never borrows another
+    /// chain's wallet, registry, RPC or issuer.
     services: EquityTransferServices,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
@@ -820,35 +820,25 @@ pub(crate) enum ConfiguredMintAuthorization {
 }
 
 /// Everything the mint saga needs to produce and deliver a MintAuthV1
-/// recipient authorization for orchestrator-mode assets (RAI-1243).
+/// recipient authorization for orchestrator-mode assets (RAI-1243). The
+/// `token` the MintAuth binds is not here: it comes from the record chain's
+/// own [`ChainEquityServices::equities`] table.
 pub(crate) struct MintAuthorizationWiring {
     /// Reads each asset's `vault_mode` from issuance -- the single source
     /// of truth for which assets need an authorization; the bot keeps no
     /// asset-mode list of its own.
     pub(crate) vault_mode_reader: Arc<dyn VaultModeReader>,
-    /// Tokenized-equity ERC-20 per symbol, from
-    /// `[assets.equities.<SYM>] tokenized_equity` config -- the `token`
-    /// the EIP-712 MintAuth binds.
-    pub(crate) token_addresses: HashMap<Symbol, Address>,
     /// Delivery job queue; enqueued idempotently per issuer request id.
     pub(crate) delivery_queue: DeliverMintAuthorizationJobQueue,
 }
 
 impl CrossVenueEquityTransfer {
     pub fn new(
-        raindex: Arc<dyn Raindex>,
-        vault_lookup: Arc<dyn VaultLookup>,
-        tokenizer: Arc<dyn Tokenizer>,
-        wrapper: Arc<dyn Wrapper>,
         services: EquityTransferServices,
         mint_store: Arc<Store<TokenizedEquityMint>>,
         redemption_store: Arc<Store<EquityRedemption>>,
     ) -> Self {
         Self {
-            raindex,
-            vault_lookup,
-            tokenizer,
-            wrapper,
             services,
             mint_store,
             redemption_store,
@@ -872,6 +862,7 @@ impl CrossVenueEquityTransfer {
     async fn ensure_mint_authorization(
         &self,
         issuer_request_id: &IssuerRequestId,
+        chain: Chain,
         symbol: &Symbol,
     ) -> Result<(), MintError> {
         let wiring = match &self.mint_authorization {
@@ -899,11 +890,20 @@ impl CrossVenueEquityTransfer {
         match wiring.vault_mode_reader.vault_mode(symbol).await? {
             VaultModeTag::VaultDirect => Ok(()),
             VaultModeTag::Orchestrator => {
-                let token = wiring.token_addresses.get(symbol).copied().ok_or_else(|| {
-                    MintError::UnknownTokenizedEquity {
+                // The MintAuth names the tokenized equity as deployed on the
+                // record's chain; the primary's table would bind the wrong
+                // contract wherever the addresses differ.
+                let token = self
+                    .services
+                    .for_chain(chain)?
+                    .equities
+                    .symbols
+                    .get(symbol)
+                    .map(|equity| equity.tokenized_equity)
+                    .ok_or_else(|| MintError::UnknownTokenizedEquity {
+                        chain,
                         symbol: symbol.clone(),
-                    }
-                })?;
+                    })?;
 
                 self.mint_store
                     .send(
@@ -1064,7 +1064,11 @@ impl CrossVenueEquityTransfer {
         // confirmed before depositing. Without this, a load-balanced backend
         // that hasn't indexed the wrap block yet sees the wrapped-token balance
         // as zero and the vault deposit reverts with ERC20InsufficientBalance.
-        self.wrapper.wait_for_block(block).await?;
+        self.services
+            .for_chain(tokens_received.chain)?
+            .wrapper
+            .wait_for_block(block)
+            .await?;
 
         self.deposit_wrapped_mint(
             issuer_request_id,
@@ -1084,9 +1088,13 @@ impl CrossVenueEquityTransfer {
         wrapped_token: Address,
         wrapped_shares: U256,
     ) -> Result<(), MintError> {
-        let vault_id = self.vault_lookup.vault_id_for_token(wrapped_token).await?;
+        let chain_services = self.services.for_chain(chain)?;
+        let vault_id = chain_services
+            .vault_lookup
+            .vault_id_for_token(wrapped_token)
+            .await?;
 
-        let vault_deposit_tx_hash = self
+        let vault_deposit_tx_hash = chain_services
             .raindex
             .submit_deposit(
                 wrapped_token,
@@ -1105,7 +1113,10 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
-        self.raindex.confirm_tx(vault_deposit_tx_hash).await?;
+        chain_services
+            .raindex
+            .confirm_tx(vault_deposit_tx_hash)
+            .await?;
         self.enqueue_bot_gas_cost(
             chain,
             vault_deposit_tx_hash,
@@ -1219,8 +1230,12 @@ impl CrossVenueEquityTransfer {
             "Tokens received, verifying onchain"
         );
 
-        let unwrapped_token = self.wrapper.lookup_underlying(&tokens_received.symbol)?;
-        self.tokenizer
+        let chain_services = self.services.for_chain(tokens_received.chain)?;
+        let unwrapped_token = chain_services
+            .wrapper
+            .lookup_underlying(&tokens_received.symbol)?;
+        chain_services
+            .tokenizer
             .verify_mint_tx(
                 tokens_received.tx_hash,
                 unwrapped_token,
@@ -1242,9 +1257,12 @@ impl CrossVenueEquityTransfer {
     ) -> Result<WrappedMintResult, MintError> {
         info!(target: "rebalance", "Onchain verification passed, wrapping into ERC-4626 shares");
 
-        let token = self.wrapper.lookup_derivative(&tokens_received.symbol)?;
+        let chain_services = self.services.for_chain(tokens_received.chain)?;
+        let token = chain_services
+            .wrapper
+            .lookup_derivative(&tokens_received.symbol)?;
 
-        let wrap_tx_hash = self
+        let wrap_tx_hash = chain_services
             .wrapper
             .submit_wrap(token, tokens_received.shares_minted, tokens_received.wallet)
             .await?;
@@ -1256,8 +1274,10 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
-        let WrapConfirmation { shares, block } =
-            self.wrapper.confirm_wrap(token, wrap_tx_hash).await?;
+        let WrapConfirmation { shares, block } = chain_services
+            .wrapper
+            .confirm_wrap(token, wrap_tx_hash)
+            .await?;
         self.enqueue_bot_gas_cost(
             tokens_received.chain,
             wrap_tx_hash,
@@ -1292,14 +1312,14 @@ impl CrossVenueEquityTransfer {
     ) -> Result<(), MintError> {
         loop {
             match self.load_mint_entity(issuer_request_id).await? {
-                TokenizedEquityMint::MintAccepted { symbol, .. } => {
+                TokenizedEquityMint::MintAccepted { symbol, chain, .. } => {
                     info!(%issuer_request_id, "Resuming accepted mint");
                     // Idempotent: signing no-ops once an authorization
                     // exists and the delivery enqueue is keyed on the
                     // issuer request id, so a resumed orchestrator-mode
                     // mint re-delivers its PERSISTED authorization rather
                     // than minting a fresh nonce.
-                    self.ensure_mint_authorization(issuer_request_id, &symbol)
+                    self.ensure_mint_authorization(issuer_request_id, chain, &symbol)
                         .await?;
                     self.mint_store
                         .send(issuer_request_id, TokenizedEquityMintCommand::Poll)
@@ -1319,11 +1339,12 @@ impl CrossVenueEquityTransfer {
                     ..
                 } => {
                     info!(%issuer_request_id, %wrap_tx_hash, "Resuming submitted wrap");
-                    let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
+                    let chain_services = self.services.for_chain(chain)?;
+                    let wrapped_token = chain_services.wrapper.lookup_derivative(&symbol)?;
                     let WrapConfirmation {
                         shares: wrapped_shares,
                         block: wrap_block,
-                    } = self
+                    } = chain_services
                         .wrapper
                         .confirm_wrap(wrapped_token, wrap_tx_hash)
                         .await?;
@@ -1346,7 +1367,7 @@ impl CrossVenueEquityTransfer {
                         )
                         .await?;
 
-                    self.wrapper.wait_for_block(wrap_block).await?;
+                    chain_services.wrapper.wait_for_block(wrap_block).await?;
 
                     info!(target: "rebalance", %wrap_tx_hash, %wrapped_shares, "Wrap confirmed on resume, depositing to Raindex vault");
                     return self
@@ -1367,11 +1388,12 @@ impl CrossVenueEquityTransfer {
                     ..
                 } => {
                     info!(%issuer_request_id, "Resuming wrapped mint");
-                    let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
+                    let chain_services = self.services.for_chain(chain)?;
+                    let wrapped_token = chain_services.wrapper.lookup_derivative(&symbol)?;
 
                     // Skip the wait for legacy aggregates persisted before wrap_block was added.
                     if let Some(block) = wrap_block {
-                        self.wrapper.wait_for_block(block).await?;
+                        chain_services.wrapper.wait_for_block(block).await?;
                     }
 
                     return self
@@ -1391,7 +1413,11 @@ impl CrossVenueEquityTransfer {
                     ..
                 } => {
                     info!(%issuer_request_id, %vault_deposit_tx_hash, "Resuming submitted vault deposit");
-                    self.raindex.confirm_tx(vault_deposit_tx_hash).await?;
+                    self.services
+                        .for_chain(chain)?
+                        .raindex
+                        .confirm_tx(vault_deposit_tx_hash)
+                        .await?;
                     self.enqueue_bot_gas_cost(
                         chain,
                         vault_deposit_tx_hash,
@@ -1545,9 +1571,16 @@ impl CrossVenueEquityTransfer {
     async fn poll_detection(
         &self,
         aggregate_id: &RedemptionAggregateId,
+        chain: Chain,
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequestId, RedemptionError> {
-        let detected = match self.tokenizer.poll_for_redemption(tx_hash).await {
+        let detected = match self
+            .services
+            .for_chain(chain)?
+            .tokenizer
+            .poll_for_redemption(tx_hash)
+            .await
+        {
             Ok(req) => req,
             Err(error) => {
                 warn!(target: "rebalance", %error, %tx_hash, "Polling for redemption detection failed");
@@ -1595,9 +1628,12 @@ impl CrossVenueEquityTransfer {
     async fn poll_completion(
         &self,
         aggregate_id: &RedemptionAggregateId,
+        chain: Chain,
         request_id: &TokenizationRequestId,
     ) -> Result<(), RedemptionError> {
         let completed = match self
+            .services
+            .for_chain(chain)?
             .tokenizer
             .poll_redemption_until_complete(request_id)
             .await
@@ -1703,15 +1739,16 @@ impl CrossVenueEquityTransfer {
                     redemption_tx,
                     ..
                 } => {
-                    self.resume_sent_redemption(aggregate_id, chain, symbol, redemption_tx)
+                    self.resume_sent_redemption(aggregate_id, chain, symbol, &redemption_tx)
                         .await?;
                 }
                 EquityRedemption::Pending {
                     tokenization_request_id,
+                    chain,
                     ..
                 } => {
                     return self
-                        .resume_pending_redemption(aggregate_id, &tokenization_request_id)
+                        .resume_pending_redemption(aggregate_id, chain, &tokenization_request_id)
                         .await;
                 }
                 EquityRedemption::Completed { .. }
@@ -1750,13 +1787,16 @@ impl CrossVenueEquityTransfer {
         aggregate_id: &RedemptionAggregateId,
         chain: Chain,
         symbol: Symbol,
-        redemption_tx: TxHash,
+        redemption_tx: &TxHash,
     ) -> Result<(), RedemptionError> {
         info!(%aggregate_id, "Resuming sent redemption");
-        self.enqueue_redemption_send_gas_cost(chain, redemption_tx, symbol)
+        self.enqueue_redemption_send_gas_cost(chain, *redemption_tx, symbol)
             .await?;
 
-        match self.poll_detection(aggregate_id, &redemption_tx).await {
+        match self
+            .poll_detection(aggregate_id, chain, redemption_tx)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(error) => {
                 self.ignore_redemption_error_if_terminal(aggregate_id, error)
@@ -1768,11 +1808,12 @@ impl CrossVenueEquityTransfer {
     async fn resume_pending_redemption(
         &self,
         aggregate_id: &RedemptionAggregateId,
+        chain: Chain,
         tokenization_request_id: &TokenizationRequestId,
     ) -> Result<(), RedemptionError> {
         info!(%aggregate_id, "Resuming detected redemption");
         match self
-            .poll_completion(aggregate_id, tokenization_request_id)
+            .poll_completion(aggregate_id, chain, tokenization_request_id)
             .await
         {
             Ok(()) => Ok(()),
@@ -1853,6 +1894,8 @@ impl CrossVenueEquityTransfer {
         }
 
         let request = match self
+            .services
+            .for_chain(entity.chain())?
             .tokenizer
             .get_request(&context.tokenization_request_id)
             .await
@@ -2005,10 +2048,11 @@ impl CrossVenueEquityTransfer {
             }
         };
 
+        let chain_services = self.services.for_chain(entity.chain())?;
         let request = match &tokenization_request_id {
             // A missing provider request leaves the redemption unchanged rather
             // than failing the operator command; transient/other errors propagate.
-            Some(request_id) => match self.tokenizer.get_request(request_id).await {
+            Some(request_id) => match chain_services.tokenizer.get_request(request_id).await {
                 Ok(request) => request,
                 Err(TokenizerError::Alpaca(AlpacaTokenizationError::RequestNotFound { id })) => {
                     warn!(
@@ -2021,7 +2065,11 @@ impl CrossVenueEquityTransfer {
                 }
                 Err(error) => return Err(error.into()),
             },
-            None => match self.tokenizer.find_redemption_by_tx(&redemption_tx).await? {
+            None => match chain_services
+                .tokenizer
+                .find_redemption_by_tx(&redemption_tx)
+                .await?
+            {
                 Some(request) => request,
                 None => return Ok(RecheckOutcome::NotDetectedYet),
             },
@@ -2202,7 +2250,7 @@ impl CrossVenueEquityTransfer {
         // and on its way to issuance BEFORE polling: issuance will not mint
         // (and the poll cannot complete) until the authorization arrives.
         // Still pre-receipt -- a failure here leaves the mint resumable.
-        self.ensure_mint_authorization(issuer_request_id, symbol)
+        self.ensure_mint_authorization(issuer_request_id, chain, symbol)
             .await
             .map_err(MintTransferError::PreReceipt)?;
 
@@ -2265,13 +2313,16 @@ impl CrossVenueEquityTransfer {
         chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError> {
-        self.services
-            .for_chain(chain)?
+        let chain_services = self.services.for_chain(chain)?;
+        chain_services
             .gas_readiness
             .ensure_ready(TransferGasRoute::Equity)
             .await?;
 
-        let token = self.vault_lookup.vault_token_for_symbol(symbol).await?;
+        let token = chain_services
+            .vault_lookup
+            .vault_token_for_symbol(symbol)
+            .await?;
         let amount = quantity.to_u256_18_decimals()?;
 
         info!(target: "rebalance", %token, %amount, %aggregate_id, "Starting equity transfer to hedging venue");
@@ -2284,10 +2335,13 @@ impl CrossVenueEquityTransfer {
         let redemption_tx = self.unwrap_and_send(aggregate_id).await?;
 
         info!(target: "rebalance", %redemption_tx, "Tokens sent, polling for detection");
-        let request_id = self.poll_detection(aggregate_id, &redemption_tx).await?;
+        let request_id = self
+            .poll_detection(aggregate_id, chain, &redemption_tx)
+            .await?;
 
         info!(target: "rebalance", %request_id, "Redemption detected, awaiting completion");
-        self.poll_completion(aggregate_id, &request_id).await?;
+        self.poll_completion(aggregate_id, chain, &request_id)
+            .await?;
 
         info!(target: "rebalance", "Equity transfer to hedging venue completed successfully");
         Ok(())
@@ -2297,15 +2351,17 @@ impl CrossVenueEquityTransfer {
 #[cfg(test)]
 mod tests {
     use crate::inventory::PollFreshness;
-    use alloy::primitives::{Address, B256, address};
+    use alloy::primitives::{Address, B256, Bytes, address};
+    use async_trait::async_trait;
     use chrono::Utc;
+    use rain_math_float::Float;
     use sqlx::SqlitePool;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::broadcast;
 
-    use st0x_config::{ChainAssets, ChainEquities};
+    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_dto::Statement;
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_evm::Chain;
@@ -2325,9 +2381,12 @@ mod tests {
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };
-    use crate::mint_authorization::{MockMintAuthorizer, StubVaultModeReader};
+    use crate::mint_authorization::{
+        MintAuthorizationError, MintAuthorizer, MockMintAuthorizer, SignedMintAuthorization,
+        StubVaultModeReader,
+    };
     use crate::native_gas::GasReadiness;
-    use crate::onchain::mock::{DepositBehavior, MockRaindex};
+    use crate::onchain::mock::{DepositBehavior, DepositCall, MockRaindex};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::UsdcRebalance;
@@ -2376,6 +2435,330 @@ mod tests {
         assert_eq!(chain, Chain::Ethereum);
     }
 
+    /// One chain's mocks, kept by the test so it can tell which chain's
+    /// services a resume drove.
+    struct ChainMocks {
+        raindex: Arc<MockRaindex>,
+        vault_lookup: Arc<MockVaultLookup>,
+        tokenizer: Arc<MockTokenizer>,
+        wrapper: Arc<MockWrapper>,
+    }
+
+    impl ChainMocks {
+        fn new() -> Self {
+            Self {
+                raindex: Arc::new(MockRaindex::new()),
+                vault_lookup: Arc::new(mock_vault_lookup()),
+                tokenizer: Arc::new(
+                    MockTokenizer::new()
+                        .with_detection_outcome(MockDetectionOutcome::Detected)
+                        .with_completion_outcome(MockCompletionOutcome::Completed),
+                ),
+                wrapper: Arc::new(MockWrapper::new()),
+            }
+        }
+
+        fn entry(&self) -> ChainEquityServices {
+            ChainEquityServices {
+                wallet: Address::ZERO,
+                raindex: self.raindex.clone(),
+                vault_lookup: self.vault_lookup.clone(),
+                tokenizer: self.tokenizer.clone(),
+                wrapper: self.wrapper.clone(),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            }
+        }
+
+        /// Nothing on this chain was touched: no vault read, no wrap wait, no
+        /// deposit, no confirmation and no issuer call.
+        fn assert_untouched(&self, chain: Chain) {
+            assert_eq!(self.vault_lookup.lookups(), 0, "{chain} vault registry");
+            assert_eq!(
+                self.wrapper.wait_for_block_calls(),
+                Vec::<u64>::new(),
+                "{chain} wrapper"
+            );
+            assert_eq!(self.raindex.last_deposit_call(), None, "{chain} deposit");
+            assert_eq!(self.raindex.last_confirmed_tx(), None, "{chain} confirm");
+            assert_eq!(self.tokenizer.call_count(), 0, "{chain} issuer");
+        }
+    }
+
+    /// A transfer whose Base and Ethereum entries are distinct mocks.
+    async fn two_chain_transfer() -> (CrossVenueEquityTransfer, ChainMocks, ChainMocks) {
+        let base = ChainMocks::new();
+        let ethereum = ChainMocks::new();
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([
+                (Chain::Base, base.entry()),
+                (Chain::Ethereum, ethereum.entry()),
+            ]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services.clone()));
+
+        let transfer = CrossVenueEquityTransfer::new(services, mint_store, redemption_store);
+
+        (transfer, base, ethereum)
+    }
+
+    /// Requests and submits an Ethereum mint, leaving it accepted by the
+    /// issuer so a test can advance it to any later step.
+    async fn request_ethereum_mint(transfer: &CrossVenueEquityTransfer, id: &IssuerRequestId) {
+        transfer
+            .mint_store
+            .send(
+                id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Ethereum,
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A mint resumed from `TokensReceived` wraps and deposits on the chain
+    /// its record names, so Base's wrapper, registry and orderbook stay idle.
+    #[tokio::test]
+    async fn a_resumed_ethereum_mint_wraps_and_deposits_on_ethereum() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = issuer_request_id("ISS-ETHEREUM-TOKENS-RECEIVED");
+        request_ethereum_mint(&transfer, &id).await;
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert_eq!(
+            ethereum.raindex.last_deposit_call(),
+            Some(DepositCall {
+                token: Address::ZERO,
+                vault_id: RaindexVaultId(B256::ZERO),
+                amount: U256::from(10_000_000_000_000_000_000_u128),
+                decimals: TOKENIZED_EQUITY_DECIMALS,
+            }),
+            "the wrapped shares must be deposited through Ethereum's orderbook"
+        );
+        assert_eq!(
+            ethereum.vault_lookup.lookups(),
+            1,
+            "the destination vault must come from Ethereum's registry"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
+    /// A mint resumed from `WrapSubmitted` confirms the wrap on the chain that
+    /// submitted it.
+    #[tokio::test]
+    async fn a_resumed_ethereum_wrap_confirms_on_ethereum() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = issuer_request_id("ISS-ETHEREUM-WRAP-SUBMITTED");
+        request_ethereum_mint(&transfer, &id).await;
+        let wrap_tx_hash = TxHash::with_last_byte(7);
+        ethereum
+            .wrapper
+            .seed_submitted_amount(wrap_tx_hash, U256::from(1_u64));
+        for command in [
+            TokenizedEquityMintCommand::Poll,
+            TokenizedEquityMintCommand::SubmitWrap { wrap_tx_hash },
+        ] {
+            transfer.mint_store.send(&id, command).await.unwrap();
+        }
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert_eq!(
+            ethereum.wrapper.wait_for_block_calls(),
+            vec![0],
+            "the wrap must be confirmed against Ethereum's wrapper"
+        );
+        assert_eq!(
+            ethereum.raindex.last_deposit_call(),
+            Some(DepositCall {
+                token: Address::ZERO,
+                vault_id: RaindexVaultId(B256::ZERO),
+                amount: U256::from(1_u64),
+                decimals: TOKENIZED_EQUITY_DECIMALS,
+            }),
+            "the deposit must follow on Ethereum's orderbook"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
+    /// A mint resumed from `VaultDepositSubmitted` confirms the deposit tx on
+    /// the chain it was broadcast to.
+    #[tokio::test]
+    async fn a_resumed_ethereum_vault_deposit_confirms_on_ethereum() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = issuer_request_id("ISS-ETHEREUM-DEPOSIT-SUBMITTED");
+        request_ethereum_mint(&transfer, &id).await;
+        let vault_deposit_tx_hash = TxHash::with_last_byte(9);
+        for command in [
+            TokenizedEquityMintCommand::Poll,
+            TokenizedEquityMintCommand::SubmitWrap {
+                wrap_tx_hash: TxHash::with_last_byte(8),
+            },
+            TokenizedEquityMintCommand::WrapTokens {
+                wrap_tx_hash: TxHash::with_last_byte(8),
+                wrapped_shares: U256::from(1_u64),
+                wrap_block: 1,
+            },
+            TokenizedEquityMintCommand::SubmitVaultDeposit {
+                vault_deposit_tx_hash,
+            },
+        ] {
+            transfer.mint_store.send(&id, command).await.unwrap();
+        }
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert_eq!(
+            ethereum.raindex.last_confirmed_tx(),
+            Some(vault_deposit_tx_hash),
+            "the deposit must be confirmed on Ethereum's RPC"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
+    /// A fresh redemption resolves its vault token through the chain it was
+    /// asked for, never the primary's registry.
+    #[tokio::test]
+    async fn a_fresh_ethereum_redemption_reads_ethereums_registry() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = redemption_aggregate_id("ETHEREUM-FRESH-REDEMPTION");
+
+        transfer
+            .resume_equity_to_hedging(
+                &id,
+                &Symbol::new("TEST").unwrap(),
+                Chain::Ethereum,
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ethereum.vault_lookup.lookups(),
+            2,
+            "the redeemed token must come from Ethereum's registry"
+        );
+        assert_eq!(
+            ethereum.tokenizer.call_count(),
+            5,
+            "the redemption must be sent through Ethereum's issuer"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
+    /// A redemption resumed from `TokensSent` polls the issuer of the chain
+    /// the tokens left from.
+    #[tokio::test]
+    async fn a_resumed_ethereum_redemption_polls_ethereums_issuer() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = redemption_aggregate_id("ETHEREUM-REDEMPTION-RESUME");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let token = ethereum
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+
+        transfer
+            .withdraw_from_raindex(
+                &id,
+                &symbol,
+                Chain::Ethereum,
+                quantity,
+                token,
+                quantity.to_u256_18_decimals().unwrap(),
+            )
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(&id).await.unwrap();
+        let issuer_calls_before_resume = ethereum.tokenizer.call_count();
+
+        transfer.resume_redemption(&id).await.unwrap();
+
+        assert_eq!(
+            ethereum.tokenizer.call_count(),
+            issuer_calls_before_resume + 2,
+            "the detection and completion polls must reach Ethereum's issuer"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
+    /// A redemption resumed from `Pending` waits on the completion of the
+    /// issuer that already detected it, not the primary's.
+    #[tokio::test]
+    async fn a_resumed_ethereum_pending_redemption_polls_ethereums_issuer() {
+        let (transfer, base, ethereum) = two_chain_transfer().await;
+        let id = redemption_aggregate_id("ETHEREUM-PENDING-RESUME");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let token = ethereum
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+
+        transfer
+            .withdraw_from_raindex(
+                &id,
+                &symbol,
+                Chain::Ethereum,
+                quantity,
+                token,
+                quantity.to_u256_18_decimals().unwrap(),
+            )
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(&id).await.unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Detect {
+                    tokenization_request_id: tokenization_request_id("ETHEREUM-PENDING"),
+                },
+            )
+            .await
+            .unwrap();
+        let issuer_calls_before_resume = ethereum.tokenizer.call_count();
+
+        transfer.resume_redemption(&id).await.unwrap();
+
+        assert_eq!(
+            ethereum.tokenizer.call_count(),
+            issuer_calls_before_resume + 1,
+            "the completion poll must reach Ethereum's issuer"
+        );
+        base.assert_untouched(Chain::Base);
+    }
+
     /// A resume follows the chain the record names: both the genesis request
     /// and the later poll reach that chain's issuer, never the primary's.
     #[tokio::test]
@@ -2394,15 +2777,8 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool, services.clone()));
-        let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(mock_vault_lookup()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
-            services.clone(),
-            mint_store,
-            redemption_store,
-        );
+        let transfer =
+            CrossVenueEquityTransfer::new(services.clone(), mint_store, redemption_store);
 
         let id = issuer_request_id("ISS-ETHEREUM-RESUME");
         transfer
@@ -2429,9 +2805,9 @@ mod tests {
                 ethereum_tokenizer.mint_request_call_count(),
                 ethereum_tokenizer.call_count(),
             ),
-            (0, 1, 1, 3),
-            "the reconcile lookup, the mint request and the resumed poll must all reach \
-             Ethereum's issuer"
+            (0, 1, 1, 4),
+            "the reconcile lookup, the mint request, the resumed poll and the \
+             onchain verification must all reach Ethereum's issuer"
         );
     }
 
@@ -2677,11 +3053,11 @@ mod tests {
             Arc::new(MockTokenizer::new().with_pending_requests(vec![completed_request]));
 
         let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(MockVaultLookup::new()),
-            tokenizer,
-            Arc::new(MockWrapper::new()),
-            mock_services(),
+            mock_services_with(
+                &(tokenizer as Arc<dyn Tokenizer>),
+                &(Arc::new(MockRaindex::new()) as Arc<dyn Raindex>),
+                &(Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>),
+            ),
             mint_store,
             redemption_store,
         );
@@ -2828,11 +3204,11 @@ mod tests {
             Arc::new(MockTokenizer::new().with_pending_requests(vec![completed_request]));
 
         let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(MockVaultLookup::new()),
-            tokenizer,
-            Arc::new(MockWrapper::new()),
-            mock_services(),
+            mock_services_with(
+                &(tokenizer as Arc<dyn Tokenizer>),
+                &(Arc::new(MockRaindex::new()) as Arc<dyn Raindex>),
+                &(Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>),
+            ),
             mint_store,
             redemption_store,
         );
@@ -2990,6 +3366,9 @@ mod tests {
         let id = redemption_aggregate_id("redeem-reconciled");
         let symbol = Symbol::new("TEST").unwrap();
         let token = transfer
+            .services
+            .for_chain(Chain::Base)
+            .unwrap()
             .vault_lookup
             .vault_token_for_symbol(&symbol)
             .await
@@ -3101,6 +3480,9 @@ mod tests {
         let id = redemption_aggregate_id("redeem-recover-reconciled");
         let symbol = Symbol::new("TEST").unwrap();
         let token = transfer
+            .services
+            .for_chain(Chain::Base)
+            .unwrap()
             .vault_lookup
             .vault_token_for_symbol(&symbol)
             .await
@@ -3214,15 +3596,7 @@ mod tests {
             )
             .await;
 
-        let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(mock_vault_lookup()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
-            mock_services(),
-            mint_store,
-            redemption_store,
-        );
+        let transfer = CrossVenueEquityTransfer::new(mock_services(), mint_store, redemption_store);
 
         (transfer, service, pool)
     }
@@ -3247,12 +3621,27 @@ mod tests {
         services
     }
 
+    /// [`mock_services`] with the caller's mocks in every entry, so a test
+    /// drives its own tokenizer, orderbook and wrapper on whichever chain its
+    /// record names.
+    fn mock_services_with(
+        tokenizer: &Arc<dyn Tokenizer>,
+        raindex: &Arc<dyn Raindex>,
+        wrapper: &Arc<dyn Wrapper>,
+    ) -> EquityTransferServices {
+        let mut services = mock_services();
+        for chain_services in services.chains.values_mut() {
+            chain_services.tokenizer = tokenizer.clone();
+            chain_services.raindex = raindex.clone();
+            chain_services.wrapper = wrapper.clone();
+        }
+
+        services
+    }
+
     /// Like [`create_equity_transfer`] but on caller-supplied services, for
     /// tests that need a wired gas check or a second chain's entry.
     async fn create_equity_transfer_with_services(
-        tokenizer: Arc<dyn Tokenizer>,
-        raindex: Arc<dyn Raindex>,
-        wrapper: Arc<dyn Wrapper>,
         services: EquityTransferServices,
     ) -> CrossVenueEquityTransfer {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
@@ -3261,15 +3650,7 @@ mod tests {
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool, services.clone()));
 
-        CrossVenueEquityTransfer::new(
-            raindex,
-            Arc::new(mock_vault_lookup()),
-            tokenizer,
-            wrapper,
-            services,
-            mint_store,
-            redemption_store,
-        )
+        CrossVenueEquityTransfer::new(services, mint_store, redemption_store)
     }
 
     /// Like [`create_equity_transfer`] but also returns the backing pool, so a
@@ -3282,36 +3663,12 @@ mod tests {
     ) -> (CrossVenueEquityTransfer, SqlitePool) {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let vault_lookup = Arc::new(mock_vault_lookup());
-        let services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: raindex.clone(),
-                    vault_lookup: vault_lookup.clone(),
-                    tokenizer: tokenizer.clone(),
-                    wrapper: wrapper.clone(),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        };
+        let services = mock_services_with(&tokenizer, &raindex, &wrapper);
 
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), services.clone()));
 
-        let transfer = CrossVenueEquityTransfer::new(
-            raindex,
-            vault_lookup,
-            tokenizer,
-            wrapper,
-            services,
-            mint_store,
-            redemption_store,
-        );
+        let transfer = CrossVenueEquityTransfer::new(services, mint_store, redemption_store);
 
         (transfer, pool)
     }
@@ -3322,6 +3679,9 @@ mod tests {
         symbol: &Symbol,
     ) -> TxHash {
         let token = transfer
+            .services
+            .for_chain(Chain::Base)
+            .unwrap()
             .vault_lookup
             .vault_token_for_symbol(symbol)
             .await
@@ -3386,17 +3746,14 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_mint_refuses_low_base_gas_before_creating_aggregate() {
-        let transfer = create_equity_transfer_with_services(
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockRaindex::new()),
-            Arc::new(MockWrapper::new()),
-            mock_services_with_gas_readiness(&crate::native_gas::GasReadiness::for_test(
+        let transfer = create_equity_transfer_with_services(mock_services_with_gas_readiness(
+            &crate::native_gas::GasReadiness::for_test(
                 U256::ZERO,
                 U256::from(1_u64),
                 U256::MAX,
                 U256::from(1_u64),
-            )),
-        )
+            ),
+        ))
         .await;
         let id = issuer_request_id("ISS-LOW-GAS");
 
@@ -3432,10 +3789,6 @@ mod tests {
         let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
 
         let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(mock_vault_lookup()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
             EquityTransferServices {
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
                 ..services.clone()
@@ -3493,10 +3846,6 @@ mod tests {
         apalis_pool.close().await;
 
         let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(mock_vault_lookup()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
             EquityTransferServices {
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
                 ..services.clone()
@@ -3537,10 +3886,6 @@ mod tests {
         let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
 
         let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(mock_vault_lookup()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
             EquityTransferServices {
                 bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
                 ..services.clone()
@@ -3663,10 +4008,29 @@ mod tests {
         );
     }
 
+    /// A chain's equity table listing one symbol at `tokenized_equity`.
+    fn equities_listing(symbol: &str, tokenized_equity: Address) -> ChainEquities {
+        ChainEquities {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                Symbol::new(symbol).unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            )]),
+        }
+    }
+
     /// Builds a transfer with full mint-authorization wiring: a stubbed
-    /// vault-mode reader, a token map for AAPL, an Enabled mock authorizer
-    /// in the aggregate services, and a real (in-memory) delivery queue.
-    /// Returns the event pool and the apalis pool for assertions.
+    /// vault-mode reader, an Enabled mock authorizer on Base listing AAPL,
+    /// and a real (in-memory) delivery queue. Returns the event pool and
+    /// the apalis pool for assertions.
     async fn create_authorization_wired_transfer(
         mode: VaultModeTag,
     ) -> (
@@ -3674,35 +4038,108 @@ mod tests {
         SqlitePool,
         apalis_sqlite::SqlitePool,
     ) {
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let mut services = mock_services();
         for chain_services in services.chains.values_mut() {
             chain_services.mint_authorizer =
                 ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer));
+            chain_services.equities = equities_listing("AAPL", Address::repeat_byte(0x11));
         }
 
+        authorization_wired_transfer(services, mode).await
+    }
+
+    /// Wires mint authorization onto `services`: a stubbed vault-mode
+    /// reader and a real (in-memory) delivery queue.
+    async fn authorization_wired_transfer(
+        services: EquityTransferServices,
+        mode: VaultModeTag,
+    ) -> (
+        CrossVenueEquityTransfer,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
+    ) {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), services.clone()));
 
-        let mut token_addresses = HashMap::new();
-        token_addresses.insert(Symbol::new("AAPL").unwrap(), Address::repeat_byte(0x11));
-
-        let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(mock_vault_lookup()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
-            services.clone(),
-            mint_store,
-            redemption_store,
-        )
-        .with_mint_authorization(MintAuthorizationWiring {
-            vault_mode_reader: Arc::new(StubVaultModeReader(mode)),
-            token_addresses,
-            delivery_queue: DeliverMintAuthorizationJobQueue::new(&apalis_pool),
-        });
+        let transfer =
+            CrossVenueEquityTransfer::new(services.clone(), mint_store, redemption_store)
+                .with_mint_authorization(MintAuthorizationWiring {
+                    vault_mode_reader: Arc::new(StubVaultModeReader(mode)),
+                    delivery_queue: DeliverMintAuthorizationJobQueue::new(&apalis_pool),
+                });
 
         (transfer, pool, apalis_pool)
+    }
+
+    /// Test authorizer that keeps every token it was asked to bind, so a
+    /// test can tell which chain's tokenized equity an authorization names.
+    #[derive(Default)]
+    struct RecordingMintAuthorizer {
+        bound_tokens: Mutex<Vec<Address>>,
+    }
+
+    #[async_trait]
+    impl MintAuthorizer for RecordingMintAuthorizer {
+        async fn sign_mint_authorization(
+            &self,
+            token: Address,
+            _quantity: Float,
+            nonce: B256,
+        ) -> Result<SignedMintAuthorization, MintAuthorizationError> {
+            self.bound_tokens.lock().unwrap().push(token);
+            Ok(SignedMintAuthorization {
+                nonce,
+                signature: Bytes::from(vec![0x42; 65]),
+            })
+        }
+    }
+
+    /// An orchestrator-mode mint recorded on Ethereum binds Ethereum's
+    /// tokenized-equity address, never Base's: the same symbol is a
+    /// different contract on each chain, and a MintAuth over the wrong one
+    /// authorizes nothing the issuer will mint.
+    #[tokio::test]
+    async fn an_ethereum_mint_authorization_binds_ethereums_token_address() {
+        let base_token = Address::repeat_byte(0xba);
+        let ethereum_token = Address::repeat_byte(0xe7);
+        let ethereum_authorizer = Arc::new(RecordingMintAuthorizer::default());
+        let mut services = mock_services();
+        services.chains.get_mut(&Chain::Base).unwrap().equities =
+            equities_listing("AAPL", base_token);
+        let mut ethereum = chain_services(Arc::new(MockTokenizer::new()));
+        ethereum.mint_authorizer = ConfiguredMintAuthorizer::Enabled(ethereum_authorizer.clone());
+        ethereum.equities = equities_listing("AAPL", ethereum_token);
+        services.chains.insert(Chain::Ethereum, ethereum);
+        let (transfer, _pool, _apalis_pool) =
+            authorization_wired_transfer(services, VaultModeTag::Orchestrator).await;
+
+        let id = issuer_request_id("ISS-ETHEREUM-AUTH");
+        let symbol = Symbol::new("AAPL").unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Ethereum,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        submit_requested_mint(&transfer, &id).await;
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        let bound_tokens = ethereum_authorizer.bound_tokens.lock().unwrap().clone();
+        assert_eq!(
+            bound_tokens,
+            vec![ethereum_token],
+            "the authorization must bind Ethereum's tokenized equity, not Base's {base_token}"
+        );
     }
 
     async fn count_events(pool: &SqlitePool, event_type: &str) -> i64 {
@@ -3827,7 +4264,7 @@ mod tests {
         assert_eq!(count_delivery_jobs(&apalis_pool).await, 1);
 
         transfer
-            .ensure_mint_authorization(&id, &symbol)
+            .ensure_mint_authorization(&id, Chain::Base, &symbol)
             .await
             .unwrap();
 
@@ -3877,28 +4314,28 @@ mod tests {
         assert_eq!(count_delivery_jobs(&apalis_pool).await, 0);
     }
 
-    /// An orchestrator-mode asset with no `[assets.equities.<SYM>]`
-    /// tokenized-equity entry cannot bind the EIP-712 MintAuth to a token:
-    /// the mint must fail with the exact variant, never proceed
-    /// unauthorized.
+    /// An orchestrator-mode asset its chain does not list under
+    /// `[chains.<name>.trading.assets.equities]` cannot bind the EIP-712
+    /// MintAuth to a token: the mint must fail naming the chain and symbol,
+    /// never proceed unauthorized.
     #[tokio::test]
     async fn orchestrator_asset_without_token_address_fails_before_signing() {
         let (transfer, pool, apalis_pool) =
             create_authorization_wired_transfer(VaultModeTag::Orchestrator).await;
 
-        // TSLA is absent from the helper's AAPL-only token map.
+        // TSLA is absent from the helper's AAPL-only Base equity table.
         let tsla = Symbol::new("TSLA").unwrap();
         let error = transfer
-            .ensure_mint_authorization(&issuer_request_id("ISS-NO-TOKEN"), &tsla)
+            .ensure_mint_authorization(&issuer_request_id("ISS-NO-TOKEN"), Chain::Base, &tsla)
             .await
             .unwrap_err();
 
         assert!(
             matches!(
-                error,
-                MintError::UnknownTokenizedEquity { symbol } if symbol == tsla
+                &error,
+                MintError::UnknownTokenizedEquity { chain: Chain::Base, symbol } if *symbol == tsla
             ),
-            "expected UnknownTokenizedEquity for the unmapped symbol"
+            "expected UnknownTokenizedEquity naming Base and TSLA, got {error:?}"
         );
         assert_eq!(
             count_events(&pool, "TokenizedEquityMintEvent::MintAuthorizationSigned").await,
@@ -3923,15 +4360,8 @@ mod tests {
         }
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(mock_vault_lookup()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
-            services.clone(),
-            mint_store,
-            redemption_store,
-        );
+        let transfer =
+            CrossVenueEquityTransfer::new(services.clone(), mint_store, redemption_store);
 
         let id = issuer_request_id("ISS-VAULT-DIRECT-ONLY");
         let symbol = Symbol::new("AAPL").unwrap();
@@ -3952,7 +4382,7 @@ mod tests {
         submit_requested_mint(&transfer, &id).await;
 
         transfer
-            .ensure_mint_authorization(&id, &symbol)
+            .ensure_mint_authorization(&id, Chain::Base, &symbol)
             .await
             .unwrap();
 
@@ -3969,17 +4399,14 @@ mod tests {
     /// rather than re-requesting the mint from Alpaca.
     #[tokio::test]
     async fn resume_equity_to_market_making_resumes_existing_aggregate_despite_low_gas() {
-        let transfer = create_equity_transfer_with_services(
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockRaindex::new()),
-            Arc::new(MockWrapper::new()),
-            mock_services_with_gas_readiness(&crate::native_gas::GasReadiness::for_test(
+        let transfer = create_equity_transfer_with_services(mock_services_with_gas_readiness(
+            &crate::native_gas::GasReadiness::for_test(
                 U256::ZERO,
                 U256::from(1_u64),
                 U256::MAX,
                 U256::from(1_u64),
-            )),
-        )
+            ),
+        ))
         .await;
 
         let id = issuer_request_id("ISS-CRASH-RESUME");
@@ -4082,6 +4509,9 @@ mod tests {
         let id = redemption_aggregate_id("redemption-resume");
         let symbol = Symbol::new("TEST").unwrap();
         let token = transfer
+            .services
+            .for_chain(Chain::Base)
+            .unwrap()
             .vault_lookup
             .vault_token_for_symbol(&symbol)
             .await
@@ -4214,17 +4644,14 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_redemption_refuses_low_base_gas_before_creating_aggregate() {
-        let transfer = create_equity_transfer_with_services(
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockRaindex::new()),
-            Arc::new(MockWrapper::new()),
-            mock_services_with_gas_readiness(&crate::native_gas::GasReadiness::for_test(
+        let transfer = create_equity_transfer_with_services(mock_services_with_gas_readiness(
+            &crate::native_gas::GasReadiness::for_test(
                 U256::ZERO,
                 U256::from(1_u64),
                 U256::MAX,
                 U256::from(1_u64),
-            )),
-        )
+            ),
+        ))
         .await;
         let id = redemption_aggregate_id("redemption-low-gas");
 
@@ -4276,15 +4703,8 @@ mod tests {
         };
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool, services.clone()));
-        let transfer = CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(mock_vault_lookup()),
-            tokenizer,
-            Arc::new(MockWrapper::new()),
-            services,
-            mint_store,
-            redemption_store,
-        );
+        let transfer =
+            CrossVenueEquityTransfer::new(services.clone(), mint_store, redemption_store);
 
         let symbol = Symbol::new("TEST").unwrap();
         let id = redemption_aggregate_id("redeem-bot-gas");
@@ -4398,23 +4818,29 @@ mod tests {
                 .with_detection_outcome(MockDetectionOutcome::Detected)
                 .with_completion_outcome(MockCompletionOutcome::Completed),
         );
-        let transfer = create_equity_transfer_with_services(
-            tokenizer,
-            Arc::new(MockRaindex::new()),
-            Arc::new(MockWrapper::new()),
-            mock_services_with_gas_readiness(&crate::native_gas::GasReadiness::for_test(
-                U256::ZERO,
-                U256::from(1_u64),
-                U256::MAX,
-                U256::from(1_u64),
-            )),
-        )
-        .await;
+        let mut services = mock_services_with(
+            &tokenizer,
+            &(Arc::new(MockRaindex::new()) as Arc<dyn Raindex>),
+            &(Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>),
+        );
+        let readiness = crate::native_gas::GasReadiness::for_test(
+            U256::ZERO,
+            U256::from(1_u64),
+            U256::MAX,
+            U256::from(1_u64),
+        );
+        for chain_services in services.chains.values_mut() {
+            chain_services.gas_readiness = ConfiguredGasReadiness::Wired(readiness.clone());
+        }
+        let transfer = create_equity_transfer_with_services(services).await;
 
         let id = redemption_aggregate_id("redeem-crash-resume");
         let symbol = Symbol::new("TEST").unwrap();
         let quantity = FractionalShares::new(float!(50));
         let token = transfer
+            .services
+            .for_chain(Chain::Base)
+            .unwrap()
             .vault_lookup
             .vault_token_for_symbol(&symbol)
             .await

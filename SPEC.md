@@ -165,23 +165,26 @@ wallet, plus that chain's `[orchestrator.addresses]` entry when the section
 carries one; without the entry the chain's mint authorizer is disabled with a
 startup warning and only an orchestrator-mode mint fails (see Mint Recipient
 Authorization). Every watched chain must have its own redemption wallet, or
-startup fails naming the chain. The rebalancer, the equity-recovery jobs and the
-portfolio snapshot consume the primary chain's set until the global rebalancer
-owns chain selection; the sets exist so that selection is a lookup rather than a
-rewire. A managed secondary chain's vault inventory is not polled until
-per-chain polling lands: the operator funds and watches it by hand, and startup
-warns once per such chain. The tokenization preflight (below) runs once per
-watched chain with that chain's wallet, orderbook and canonical USDC, as do the
-startup MAX approvals in either mode and the stale-allowance revoke on each
-chain in managed inventory mode; a watched chain for which this build has no
-pinned USDC fails startup rather than borrowing another chain's address.
+startup fails naming the chain. The rebalancer, the portfolio snapshot and the
+wrapped- and unwrapped-equity orphan-recovery aggregates consume the primary
+chain's entry until the global rebalancer owns chain selection; the sets exist
+so that selection is a lookup rather than a rewire. A mint or redemption
+transfer is not among them: it resolves the entry of the chain its record names
+(see below), so only the orphan-recovery aggregates still borrow the primary's.
+A managed secondary chain's vault inventory is not polled until per-chain
+polling lands: the operator funds and watches it by hand, and startup warns once
+per such chain. The tokenization preflight (below) runs once per watched chain
+with that chain's wallet, orderbook and canonical USDC, as do the startup MAX
+approvals in either mode and the stale-allowance revoke on each chain in managed
+inventory mode; a watched chain for which this build has no pinned USDC fails
+startup rather than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
 chain's signing wallet; the `transfer` recovery verbs (`recheck`, `resume`,
 `reconcile`, `fail`) take none, since they act on local records or hand the work
-to the running bot, whose recovery runs on the primary chain's services. The
-orderbook-backed commands -- `vault-deposit`, `vault-withdraw`,
+to the running bot, and a resumed transfer resolves the chain its record names.
+The orderbook-backed commands -- `vault-deposit`, `vault-withdraw`,
 `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`, `donate-equity` and
 `dividend-bump` -- read that chain's `[chains.<name>.trading]` table (orderbook,
 inventory, vault owner, asset table and redemption wallet) and refuse a network
@@ -193,12 +196,12 @@ table, and `alpaca-tokenize` takes the tStock address directly with `--token`.
 USDC is the selected chain's canonical contract, refused where this build pins
 none. An operator equity transfer checks gas on the selected chain's wallet
 against its `[alerts.low_balance_thresholds]` entry and refuses a chain without
-one. The mint and redemption aggregates record no chain yet, and the server's
-startup recovery resumes every interrupted transfer with the primary chain's
-services, so `transfer-equity` refuses any network but the primary until the
-aggregates carry their chain. The network a transfer started on has to be named
-only for `transfer-equity --issuer-request-id`, which re-runs the transfer
-command itself; the recovery verbs above carry no network at all.
+one. The mint and redemption aggregates record the chain they run on, and both
+the server's startup recovery and the operator's resume drive an interrupted
+transfer with that chain's services. The network a transfer started on has to be
+named only for `transfer-equity --issuer-request-id`, which re-runs the transfer
+command itself, and a `--network` that disagrees with the record is refused; the
+recovery verbs above carry no network at all.
 
 ##### Shared-Inventory Settlement
 

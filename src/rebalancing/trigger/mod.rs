@@ -9033,10 +9033,10 @@ mod tests {
     const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
-    async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
+    async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, chain: Chain) {
         let store = test_store::<VaultRegistry>(pool.clone(), ());
         let vault_registry_id = VaultRegistryId {
-            chain: st0x_evm::Chain::Base,
+            chain,
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         };
@@ -9345,7 +9345,7 @@ mod tests {
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        seed_vault_registry(&pool, symbol).await;
+        seed_vault_registry(&pool, symbol, Chain::Base).await;
 
         Arc::new(RebalancingService::new(
             config,
@@ -9374,6 +9374,29 @@ mod tests {
         assert!(
             matches!(result, Err(TokenAddressError::Uninitialized)),
             "Expected Uninitialized error, got {result:?}"
+        );
+    }
+
+    /// A chain with no vault registry wired is refused by name rather than
+    /// resolving its tokens through another chain's registry.
+    #[tokio::test]
+    async fn load_token_address_refuses_a_chain_without_a_registry() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let error = trigger
+            .load_token_address(Chain::Ethereum, &symbol)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TokenAddressError::UnwiredRegistry {
+                    chain: Chain::Ethereum
+                }
+            ),
+            "expected the unwired chain named, got {error:?}"
         );
     }
 
@@ -9408,6 +9431,54 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    /// A trading chain whose registry resolves the token but that has no
+    /// wrapper wired is refused by name rather than reading its vault ratio
+    /// through another chain's wrapper.
+    #[tokio::test]
+    async fn build_equity_operation_refuses_a_trading_chain_without_a_wrapper() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::for_trading_chain(Chain::Ethereum).with_equity(
+            symbol.clone(),
+            shares(0),
+            shares(0),
+        );
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        seed_vault_registry(&pool, &symbol, Chain::Ethereum).await;
+        let trigger = RebalancingService::new(
+            test_config(),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            BTreeMap::from([(
+                Chain::Ethereum,
+                VaultRegistryId {
+                    chain: Chain::Ethereum,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
+            inventory,
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(LogNotifier),
+        );
+
+        let error = trigger.build_equity_operation(&symbol).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                equity::EquityTriggerError::UnwiredWrapper {
+                    chain: Chain::Ethereum
+                }
+            ),
+            "expected the unwired chain named, got {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn position_events_auto_register_symbol_and_trigger_rebalancing() {
         // Reproduces the production scenario: InventoryView starts empty (no
@@ -9428,7 +9499,7 @@ mod tests {
         ));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        seed_vault_registry(&pool, &symbol).await;
+        seed_vault_registry(&pool, &symbol, Chain::Base).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
@@ -22533,7 +22604,7 @@ mod tests {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         // Seed vault registry so token lookup succeeds
-        seed_vault_registry(&pool, &symbol).await;
+        seed_vault_registry(&pool, &symbol, Chain::Base).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
@@ -22611,7 +22682,7 @@ mod tests {
             InventoryView::default(),
             event_sender,
         ));
-        seed_vault_registry(&pool, &symbol).await;
+        seed_vault_registry(&pool, &symbol, Chain::Base).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
@@ -22699,7 +22770,7 @@ mod tests {
             InventoryView::default(),
             event_sender,
         ));
-        seed_vault_registry(&pool, &symbol).await;
+        seed_vault_registry(&pool, &symbol, Chain::Base).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
@@ -22771,7 +22842,7 @@ mod tests {
             InventoryView::default(),
             event_sender,
         ));
-        seed_vault_registry(&pool, &symbol).await;
+        seed_vault_registry(&pool, &symbol, Chain::Base).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),

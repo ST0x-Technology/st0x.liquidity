@@ -3236,6 +3236,185 @@ mod tests {
             .unwrap();
     }
 
+    /// One chain's issuer, kept by the test so it can tell which chain's
+    /// entry a transition reached. Only Ethereum's entry can sign: a
+    /// transition that resolved Base's authorizer would fail rather than
+    /// sign, so success proves the record's chain was used.
+    fn two_chain_mint_services() -> (
+        EquityTransferServices,
+        Arc<MockTokenizer>,
+        Arc<MockTokenizer>,
+    ) {
+        let base_tokenizer = Arc::new(MockTokenizer::new());
+        let ethereum_tokenizer = Arc::new(MockTokenizer::new());
+        let entry = |tokenizer: &Arc<MockTokenizer>, mint_authorizer| ChainEquityServices {
+            wallet: Address::ZERO,
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
+            tokenizer: tokenizer.clone(),
+            wrapper: Arc::new(MockWrapper::new()),
+            mint_authorizer,
+            gas_readiness: ConfiguredGasReadiness::Unwired,
+            equities: ChainEquities::default(),
+        };
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([
+                (
+                    Chain::Base,
+                    entry(&base_tokenizer, ConfiguredMintAuthorizer::Disabled),
+                ),
+                (
+                    Chain::Ethereum,
+                    entry(
+                        &ethereum_tokenizer,
+                        ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer)),
+                    ),
+                ),
+            ]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+
+        (services, base_tokenizer, ethereum_tokenizer)
+    }
+
+    fn ethereum_mint_command() -> TokenizedEquityMintCommand {
+        TokenizedEquityMintCommand::RequestMint {
+            chain: Chain::Ethereum,
+            issuer_request_id: issuer_request_id("ISS-ETHEREUM"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(10),
+            wallet: Address::ZERO,
+        }
+    }
+
+    /// A mint recorded on Ethereum is submitted to Ethereum's issuer, never
+    /// the primary's.
+    #[tokio::test]
+    async fn an_ethereum_mint_is_requested_from_ethereums_issuer() {
+        let (services, base_tokenizer, ethereum_tokenizer) = two_chain_mint_services();
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS-ETHEREUM");
+        store.send(&id, ethereum_mint_command()).await.unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ethereum_tokenizer.mint_request_call_count(), 1);
+        assert_eq!(base_tokenizer.call_count(), 0, "Base issuer");
+    }
+
+    /// An accepted Ethereum mint is polled on Ethereum's issuer.
+    #[tokio::test]
+    async fn an_ethereum_mint_is_polled_on_ethereums_issuer() {
+        let (services, base_tokenizer, ethereum_tokenizer) = two_chain_mint_services();
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS-ETHEREUM");
+        store.send(&id, ethereum_mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let issuer_calls_before_poll = ethereum_tokenizer.call_count();
+
+        store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ethereum_tokenizer.call_count(),
+            issuer_calls_before_poll + 1
+        );
+        assert_eq!(base_tokenizer.call_count(), 0, "Base issuer");
+    }
+
+    /// An Ethereum mint's authorization is signed by Ethereum's authorizer:
+    /// Base's is disabled, so resolving it would fail instead of signing.
+    #[tokio::test]
+    async fn an_ethereum_mint_is_signed_by_ethereums_authorizer() {
+        let (services, base_tokenizer, _ethereum_tokenizer) = two_chain_mint_services();
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS-ETHEREUM");
+        store.send(&id, ethereum_mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SignMintAuthorization {
+                    token: Address::repeat_byte(0x11),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        let TokenizedEquityMint::MintAccepted {
+            authorization: MintAuthorizationProgress::Signed(signed),
+            ..
+        } = entity
+        else {
+            panic!("expected Signed authorization, got: {entity:?}");
+        };
+        assert_eq!(signed.signature, Bytes::from(vec![0x42; 65]));
+        assert_eq!(base_tokenizer.call_count(), 0, "Base issuer");
+    }
+
+    /// A mint recorded on a chain the services do not carry is refused by
+    /// name rather than submitted through another chain's issuer.
+    #[tokio::test]
+    async fn an_ethereum_mint_without_ethereum_services_is_refused() {
+        let base_tokenizer = Arc::new(MockTokenizer::new());
+        let mut services = mint_services_sharing(&base_tokenizer);
+        services.chains.retain(|chain, _| *chain == Chain::Base);
+        let store = TestStore::<TokenizedEquityMint>::new(services);
+        let id = issuer_request_id("ISS-ETHEREUM");
+        store.send(&id, ethereum_mint_command()).await.unwrap();
+
+        let error = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    TokenizedEquityMintError::ChainServicesMissing(ChainServicesMissing {
+                        chain: Chain::Ethereum
+                    })
+                ))
+            ),
+            "expected the unwired chain named, got: {error:?}"
+        );
+        assert_eq!(base_tokenizer.call_count(), 0, "Base issuer");
+    }
+
     fn provider_mint_request(
         id: &IssuerRequestId,
         status: TokenizationRequestStatus,

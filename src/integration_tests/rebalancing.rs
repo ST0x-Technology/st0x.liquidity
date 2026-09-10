@@ -465,9 +465,9 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
 
 fn build_equity_transfer_with_wrapper(
     pool: &SqlitePool,
-    raindex: Arc<dyn Raindex>,
-    vault_lookup: Arc<dyn VaultLookup>,
-    tokenizer: Arc<dyn Tokenizer>,
+    raindex: &Arc<dyn Raindex>,
+    vault_lookup: &Arc<dyn VaultLookup>,
+    tokenizer: &Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
     wallet: Address,
 ) -> Arc<CrossVenueEquityTransfer> {
@@ -478,9 +478,9 @@ fn build_equity_transfer_with_wrapper(
             Chain::Base,
             ChainEquityServices {
                 wallet,
-                raindex: Arc::clone(&raindex),
-                vault_lookup: Arc::clone(&vault_lookup),
-                tokenizer: Arc::clone(&tokenizer),
+                raindex: Arc::clone(raindex),
+                vault_lookup: Arc::clone(vault_lookup),
+                tokenizer: Arc::clone(tokenizer),
                 wrapper: Arc::clone(&wrapper),
                 mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                 gas_readiness: ConfiguredGasReadiness::Unwired,
@@ -498,10 +498,6 @@ fn build_equity_transfer_with_wrapper(
         equity_services.clone(),
     ));
     Arc::new(CrossVenueEquityTransfer::new(
-        raindex,
-        vault_lookup,
-        tokenizer,
-        wrapper,
         equity_services,
         mint_store,
         redemption_store,
@@ -514,9 +510,9 @@ fn build_equity_transfer_with_wrapper(
 /// lifecycle events flow through the trigger and update inflight state.
 async fn build_equity_transfer_with_service(
     pool: &SqlitePool,
-    raindex: Arc<dyn Raindex>,
-    vault_lookup: Arc<dyn VaultLookup>,
-    tokenizer: Arc<dyn Tokenizer>,
+    raindex: &Arc<dyn Raindex>,
+    vault_lookup: &Arc<dyn VaultLookup>,
+    tokenizer: &Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
     wallet: Address,
     service: &Arc<RebalancingService>,
@@ -528,9 +524,9 @@ async fn build_equity_transfer_with_service(
             Chain::Base,
             ChainEquityServices {
                 wallet,
-                raindex: Arc::clone(&raindex),
-                vault_lookup: Arc::clone(&vault_lookup),
-                tokenizer: Arc::clone(&tokenizer),
+                raindex: Arc::clone(raindex),
+                vault_lookup: Arc::clone(vault_lookup),
+                tokenizer: Arc::clone(tokenizer),
                 wrapper: Arc::clone(&wrapper),
                 mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                 gas_readiness: ConfiguredGasReadiness::Unwired,
@@ -554,10 +550,6 @@ async fn build_equity_transfer_with_service(
             .unwrap();
 
     Arc::new(CrossVenueEquityTransfer::new(
-        raindex,
-        vault_lookup,
-        tokenizer,
-        wrapper,
         equity_services.clone(),
         mint_store,
         redemption_store,
@@ -638,9 +630,9 @@ async fn equity_offchain_imbalance_triggers_mint() {
         .with_wrapped_token(token_address);
     let equity_transfer = build_equity_transfer_with_wrapper(
         &pool,
-        raindex,
-        mock_vault_lookup_for_symbol(&symbol, token_address),
-        tokenizer,
+        &raindex,
+        &mock_vault_lookup_for_symbol(&symbol, token_address),
+        &tokenizer,
         mock_wrapper,
         signer.address(),
     );
@@ -920,9 +912,9 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         .with_wrapped_token(token_address);
     let equity_transfer = build_equity_transfer_with_wrapper(
         &pool,
-        raindex,
-        mock_vault_lookup_for_symbol(&symbol, token_address),
-        tokenizer,
+        &raindex,
+        &mock_vault_lookup_for_symbol(&symbol, token_address),
+        &tokenizer,
         wrapper,
         Address::ZERO,
     );
@@ -1703,9 +1695,9 @@ async fn mint_api_failure_preserves_requested_intent() {
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
     let equity_transfer = build_equity_transfer_with_wrapper(
         &pool,
-        raindex,
-        mock_vault_lookup_for_symbol(&symbol, token),
-        tokenizer,
+        &raindex,
+        &mock_vault_lookup_for_symbol(&symbol, token),
+        &tokenizer,
         MockWrapper::new(),
         Address::ZERO,
     );
@@ -2304,9 +2296,9 @@ async fn mint_accepted_sets_offchain_inflight() {
     // inflight state through the trigger's Reactor
     let equity_transfer = build_equity_transfer_with_service(
         &pool,
-        raindex,
-        mock_vault_lookup_for_symbol(&symbol, token_address),
-        tokenizer,
+        &raindex,
+        &mock_vault_lookup_for_symbol(&symbol, token_address),
+        &tokenizer,
         mock_wrapper,
         signer.address(),
         &service,
@@ -2524,9 +2516,9 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
 
     let equity_transfer = build_equity_transfer_with_service(
         &pool,
-        raindex,
-        mock_vault_lookup_for_symbol(&symbol, token_address),
-        tokenizer,
+        &raindex,
+        &mock_vault_lookup_for_symbol(&symbol, token_address),
+        &tokenizer,
         mock_wrapper,
         signer.address(),
         &service,
@@ -2828,20 +2820,18 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
+    let chain_services = ChainEquityServices {
+        wallet: Address::random(),
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        gas_readiness: ConfiguredGasReadiness::Unwired,
+        equities: ChainEquities::default(),
+    };
     let equity_services = EquityTransferServices {
-        chains: BTreeMap::from([(
-            Chain::Base,
-            ChainEquityServices {
-                wallet: Address::random(),
-                raindex: Arc::clone(&raindex),
-                vault_lookup: Arc::clone(&vault_lookup),
-                tokenizer: Arc::clone(&tokenizer),
-                wrapper: Arc::clone(&wrapper),
-                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                gas_readiness: ConfiguredGasReadiness::Unwired,
-                equities: ChainEquities::default(),
-            },
-        )]),
+        chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -2853,10 +2843,6 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
         equity_services.clone(),
     ));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
-        Arc::clone(&raindex),
-        Arc::clone(&vault_lookup),
-        Arc::clone(&tokenizer),
-        Arc::clone(&wrapper),
         equity_services.clone(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
@@ -2864,9 +2850,8 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     let store = Arc::new(test_store(
         pool.clone(),
         WrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
+            chain: Chain::Base,
+            chain_services,
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
@@ -2958,20 +2943,18 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     );
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
+    let chain_services = ChainEquityServices {
+        wallet: Address::random(),
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        gas_readiness: ConfiguredGasReadiness::Unwired,
+        equities: ChainEquities::default(),
+    };
     let equity_services = EquityTransferServices {
-        chains: BTreeMap::from([(
-            Chain::Base,
-            ChainEquityServices {
-                wallet: Address::random(),
-                raindex: Arc::clone(&raindex),
-                vault_lookup: Arc::clone(&vault_lookup),
-                tokenizer: Arc::clone(&tokenizer),
-                wrapper: Arc::clone(&wrapper),
-                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                gas_readiness: ConfiguredGasReadiness::Unwired,
-                equities: ChainEquities::default(),
-            },
-        )]),
+        chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -2983,10 +2966,6 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
         equity_services.clone(),
     ));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
-        Arc::clone(&raindex),
-        Arc::clone(&vault_lookup),
-        Arc::clone(&tokenizer),
-        Arc::clone(&wrapper),
         equity_services.clone(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
@@ -2994,9 +2973,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     let store = Arc::new(test_store(
         pool.clone(),
         WrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
+            chain: Chain::Base,
+            chain_services,
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
@@ -3107,20 +3085,18 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     );
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
+    let chain_services = ChainEquityServices {
+        wallet: Address::random(),
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        gas_readiness: ConfiguredGasReadiness::Unwired,
+        equities: ChainEquities::default(),
+    };
     let equity_services = EquityTransferServices {
-        chains: BTreeMap::from([(
-            Chain::Base,
-            ChainEquityServices {
-                wallet: Address::random(),
-                raindex: Arc::clone(&raindex),
-                vault_lookup: Arc::clone(&vault_lookup),
-                tokenizer: Arc::clone(&tokenizer),
-                wrapper: Arc::clone(&wrapper),
-                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                gas_readiness: ConfiguredGasReadiness::Unwired,
-                equities: ChainEquities::default(),
-            },
-        )]),
+        chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -3132,10 +3108,6 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
         equity_services.clone(),
     ));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
-        Arc::clone(&raindex),
-        Arc::clone(&vault_lookup),
-        Arc::clone(&tokenizer),
-        Arc::clone(&wrapper),
         equity_services.clone(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
@@ -3143,11 +3115,9 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     let store = Arc::new(test_store(
         pool.clone(),
         UnwrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
+            chain: Chain::Base,
+            chain_services,
             transfer,
-            wallet: Address::ZERO,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
@@ -3248,20 +3218,18 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     );
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
 
+    let chain_services = ChainEquityServices {
+        wallet: Address::random(),
+        raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
+        tokenizer: Arc::clone(&tokenizer),
+        wrapper: Arc::clone(&wrapper),
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        gas_readiness: ConfiguredGasReadiness::Unwired,
+        equities: ChainEquities::default(),
+    };
     let equity_services = EquityTransferServices {
-        chains: BTreeMap::from([(
-            Chain::Base,
-            ChainEquityServices {
-                wallet: Address::random(),
-                raindex: Arc::clone(&raindex),
-                vault_lookup: Arc::clone(&vault_lookup),
-                tokenizer: Arc::clone(&tokenizer),
-                wrapper: Arc::clone(&wrapper),
-                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                gas_readiness: ConfiguredGasReadiness::Unwired,
-                equities: ChainEquities::default(),
-            },
-        )]),
+        chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
     };
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
@@ -3273,10 +3241,6 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         equity_services.clone(),
     ));
     let transfer = Arc::new(CrossVenueEquityTransfer::new(
-        Arc::clone(&raindex),
-        Arc::clone(&vault_lookup),
-        Arc::clone(&tokenizer),
-        Arc::clone(&wrapper),
         equity_services.clone(),
         Arc::clone(&mint_store),
         Arc::clone(&redemption_store),
@@ -3284,11 +3248,9 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     let store = Arc::new(test_store(
         pool.clone(),
         UnwrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
+            chain: Chain::Base,
+            chain_services,
             transfer,
-            wallet: Address::ZERO,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));

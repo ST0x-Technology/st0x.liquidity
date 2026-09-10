@@ -1730,9 +1730,6 @@ struct ChainTokenization<Signer: Wallet> {
     tokenizer: Arc<dyn Tokenizer>,
     wrapper: Arc<WrapperService<Signer>>,
     mint_authorizer: ConfiguredMintAuthorizer,
-    /// Every configured equity's underlying token on this chain: the table
-    /// the mint saga resolves a symbol through before signing.
-    token_addresses: HashMap<Symbol, Address>,
 }
 
 /// Every watched chain's [`ChainTokenization`] on the wallets `[wallet]`
@@ -1770,14 +1767,6 @@ fn build_chain_tokenizations(
                 chain,
                 wallet.clone(),
             );
-            let token_addresses = watched
-                .assets
-                .equities
-                .symbols
-                .iter()
-                .map(|(symbol, equity)| (symbol.clone(), equity.tokenized_equity))
-                .collect();
-
             Ok((
                 chain,
                 ChainTokenization {
@@ -1786,7 +1775,6 @@ fn build_chain_tokenizations(
                     tokenizer,
                     wrapper,
                     mint_authorizer,
-                    token_addresses,
                 },
             ))
         })
@@ -1888,7 +1876,7 @@ async fn run_startup_maintenance(ctx: &Ctx, pool: &SqlitePool) -> anyhow::Result
 struct MintAuthorizationInfra {
     /// Delivery job queue, shared by the saga's enqueue and the worker.
     queue: DeliverMintAuthorizationJobQueue,
-    /// The saga-side bundle: vault-mode reads, token map, delivery enqueue.
+    /// The saga-side bundle: vault-mode reads and delivery enqueue.
     wiring: MintAuthorizationWiring,
     /// The shared issuance client, handed on to the delivery job.
     issuance_client: Arc<IssuanceClient>,
@@ -1924,10 +1912,9 @@ fn build_mint_authorizer<Signer: Wallet + 'static>(
     }
 }
 
-/// Builds [`MintAuthorizationInfra`] around the primary chain's token table:
-/// the MintAuth an orchestrator-mode mint binds names the tokenized equity,
-/// which the saga still resolves through the primary's map. The per-chain
-/// authorizers live on each [`ChainEquityServices`] entry instead, all
+/// Builds [`MintAuthorizationInfra`], the chain-independent half of mint
+/// authorization: the per-chain authorizers and the tokenized-equity table
+/// the MintAuth binds live on each [`ChainEquityServices`] entry, all
 /// sharing the one delivery queue built here. The issuance client is the one
 /// the tokenization preflight already read vault modes through.
 ///
@@ -1936,10 +1923,9 @@ fn build_mint_authorizer<Signer: Wallet + 'static>(
 /// authorization, unlike resume jobs, which startup re-derives). A failed
 /// sweep fails startup -- an unrepaired orphan would read as a live
 /// delivery and suppress resume.
-async fn build_mint_authorization_infra<Signer: Wallet>(
+async fn build_mint_authorization_infra(
     issuance_client: Arc<IssuanceClient>,
     apalis_pool: &apalis_sqlite::SqlitePool,
-    primary: &ChainTokenization<Signer>,
 ) -> anyhow::Result<MintAuthorizationInfra> {
     let queue = DeliverMintAuthorizationJobQueue::new(apalis_pool);
 
@@ -1963,7 +1949,6 @@ async fn build_mint_authorization_infra<Signer: Wallet>(
     Ok(MintAuthorizationInfra {
         wiring: MintAuthorizationWiring {
             vault_mode_reader: issuance_client.clone(),
-            token_addresses: primary.token_addresses.clone(),
             delivery_queue: queue.clone(),
         },
         queue,
@@ -2635,10 +2620,11 @@ fn build_equity_gas_readiness<Signer: Wallet>(
 }
 
 /// The pre-dispatch admission check the trigger and the USDC corridor share:
-/// the corridor spans Base and Ethereum, and the trigger's equity leg still
-/// gates on the primary until the global rebalancer picks the chain. Each
-/// transfer's own chain is checked again from its
-/// [`ChainEquityServices`] entry.
+/// the corridor spans Base and Ethereum, and the trigger's equity leg gates
+/// on the primary chain's own wallet until the global rebalancer picks the
+/// chain. Each transfer's own chain is checked again from its
+/// [`ChainEquityServices`] entry. Only the corridor's two wallets are wired
+/// here, so a primary outside the corridor refuses startup by name.
 fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
     wallets: &ChainWallets<Signer>,
     ctx: &Ctx,
@@ -2648,8 +2634,23 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
         .as_ref()
         .context("rebalancing requires [alerts] gas thresholds")?;
     let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.clone().into_parts();
+    let primary_chain = ctx.chains.primary().chain;
+    let primary_wallet = match primary_chain {
+        Chain::Base => &base_wallet,
+        Chain::Ethereum => &ethereum_wallet,
+        Chain::HyperEvm => anyhow::bail!(
+            "the transfer gas readiness has no {primary_chain} wallet: \
+             only the Base and Ethereum signers are wired"
+        ),
+    };
 
-    GasReadiness::from_wallets(alerts, &base_wallet, &ethereum_wallet)
+    GasReadiness::for_equity_chain(
+        alerts,
+        primary_chain,
+        primary_wallet,
+        &base_wallet,
+        &ethereum_wallet,
+    )
 }
 
 /// Builds the trigger service from the validated rebalancing config plus the
@@ -2827,7 +2828,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let wrapper = primary.wrapper.clone();
 
         let mint_authorization =
-            build_mint_authorization_infra(issuance_client, &deps.apalis_pool, primary).await?;
+            build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
 
         let WatchedEquityServices {
             chains: chain_services,
@@ -2840,13 +2841,12 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         };
 
-        // The saga's own Raindex, wrapper and vault-lookup handles stay on the
-        // primary chain; each transfer's wallet, gas admission and asset table
-        // already come from its own entry.
-        let primary_vault_lookup = equity_transfer_services
-            .for_chain(primary_chain)?
-            .vault_lookup
-            .clone();
+        // The equity recovery aggregates run where the orphaned balance sits:
+        // the primary chain, until chain selection moves into the global
+        // rebalancer. They take that chain's entry rather than loose handles,
+        // so their registry, orderbook, wrapper and wallet are the same ones
+        // the saga uses there.
+        let primary_equity_services = equity_transfer_services.for_chain(primary_chain)?.clone();
 
         let transfer_usdc_to_hedging_queue = deps.schedulers.transfer_usdc_to_hedging.clone();
         let transfer_usdc_to_market_making_queue =
@@ -2887,10 +2887,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let recovery_transfer = Arc::new(
             CrossVenueEquityTransfer::new(
-                raindex_service.clone(),
-                primary_vault_lookup.clone(),
-                tokenizer.clone(),
-                wrapper.clone(),
                 equity_transfer_services.clone(),
                 built.mint.clone(),
                 built.redemption.clone(),
@@ -2903,11 +2899,9 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let (wrapped_equity_recovery_store, unwrapped_equity_recovery_store) =
             build_equity_recovery_stores(
                 &deps.pool,
-                raindex_service.clone(),
-                primary_vault_lookup.clone(),
-                wrapper.clone(),
+                primary_chain,
+                primary_equity_services,
                 recovery_transfer.clone(),
-                market_maker_wallet,
                 bot_gas_enqueuer.clone(),
             )
             .await?;
@@ -3066,17 +3060,14 @@ async fn catch_up_stage_timing_projections(
 
 /// Builds the wrapped and unwrapped equity-recovery aggregate stores.
 ///
-/// Both share the recovery `transfer` and the raindex/vault/wrapper
-/// dependencies; the unwrapped store additionally needs the base `wallet`
-/// address to settle unwraps. Kept together because they are the recovery
-/// counterpart built from the same `recovery_transfer`.
-async fn build_equity_recovery_stores<Signer: Wallet + Clone>(
+/// Both drive the same chain entry -- its registry, orderbook, wrapper and
+/// wallet -- and the same recovery `transfer`. Kept together because they are
+/// the recovery counterpart built from the same `recovery_transfer`.
+async fn build_equity_recovery_stores(
     pool: &SqlitePool,
-    raindex: Arc<RaindexService<Signer>>,
-    vault_lookup: Arc<dyn VaultLookup>,
-    wrapper: Arc<WrapperService<Signer>>,
+    chain: Chain,
+    chain_services: ChainEquityServices,
     transfer: Arc<CrossVenueEquityTransfer>,
-    wallet: Address,
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 ) -> anyhow::Result<(
     Arc<Store<WrappedEquityRecovery>>,
@@ -3084,9 +3075,8 @@ async fn build_equity_recovery_stores<Signer: Wallet + Clone>(
 )> {
     let wrapped_store = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
         .build(WrappedEquityRecoveryServices {
-            raindex: raindex.clone(),
-            vault_lookup: vault_lookup.clone(),
-            wrapper: wrapper.clone(),
+            chain,
+            chain_services: chain_services.clone(),
             transfer: transfer.clone(),
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         })
@@ -3094,11 +3084,9 @@ async fn build_equity_recovery_stores<Signer: Wallet + Clone>(
 
     let unwrapped_store = StoreBuilder::<UnwrappedEquityRecovery>::new(pool.clone())
         .build(UnwrappedEquityRecoveryServices {
-            raindex,
-            vault_lookup,
-            wrapper,
+            chain,
+            chain_services,
             transfer,
-            wallet,
             bot_gas_enqueuer,
         })
         .await?;
@@ -15244,10 +15232,6 @@ mod tests {
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool, services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            Arc::new(MockRaindex::new()),
-            Arc::new(MockVaultLookup::new()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
             services,
             mint_store,
             redemption_store,
@@ -15443,20 +15427,12 @@ mod tests {
             base.wallet.address(),
             address!("0x0000000000000000000000000000000000000ba5")
         );
-        assert_eq!(
-            base.token_addresses,
-            HashMap::from([(Symbol::new("AAPL").unwrap(), Address::repeat_byte(0xa5))])
-        );
 
         let ethereum = &tokenizations[&Chain::Ethereum];
         assert_eq!(ethereum.chain, Chain::Ethereum);
         assert_eq!(
             ethereum.wallet.address(),
             address!("0x0000000000000000000000000000000000000e78")
-        );
-        assert_eq!(
-            ethereum.token_addresses,
-            HashMap::from([(Symbol::new("TSLA").unwrap(), Address::repeat_byte(0xe5))])
         );
     }
 
@@ -15622,6 +15598,46 @@ mod tests {
         assert_eq!(
             readiness.keys().copied().collect::<Vec<_>>(),
             vec![Chain::Base]
+        );
+    }
+
+    /// The shared pre-dispatch admission check gates the equity leg on the
+    /// primary chain's own wallet, not Base's: with Ethereum as the primary
+    /// it checks the Ethereum signer.
+    #[test]
+    fn transfer_gas_readiness_checks_the_primary_chains_wallet() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.alerts = Some(gas_threshold_alerts());
+        ctx.chains.primary_mut().chain = Chain::Ethereum;
+        let wallet_ctx = OnchainWalletCtx::stub();
+        let wallets = ChainWallets::from_wallet_ctx(&wallet_ctx);
+
+        let readiness = build_transfer_gas_readiness(&wallets, &ctx).unwrap();
+
+        assert_eq!(
+            readiness.equity_route(),
+            (Chain::Ethereum, wallet_ctx.ethereum_wallet().address())
+        );
+    }
+
+    /// A primary chain outside the Base/Ethereum corridor has no wallet in
+    /// the shared check, so startup refuses it by name rather than gating
+    /// its transfers on Base's balance.
+    #[test]
+    fn transfer_gas_readiness_refuses_a_hyperevm_primary_by_name() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.alerts = Some(gas_threshold_alerts());
+        ctx.chains.primary_mut().chain = Chain::HyperEvm;
+        let wallets = ChainWallets::from_wallet_ctx(&OnchainWalletCtx::stub());
+
+        let Err(error) = build_transfer_gas_readiness(&wallets, &ctx) else {
+            panic!("a primary chain without a wired wallet must be refused");
+        };
+        let error = error.to_string();
+
+        assert!(
+            error.contains("hyperevm") && error.contains("wallet"),
+            "expected the unwired chain named, got: {error}"
         );
     }
 

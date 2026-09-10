@@ -191,8 +191,8 @@ The vault, allowance, transfer, donate and dividend commands (`vault-deposit`,
 `vault-withdraw`, `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`,
 `donate-equity`, `dividend-bump`) take the same `--network` flag and run on that
 chain's `[chains.<name>.trading]` table (no `--registry`: they need the chain's
-orderbook). `transfer-equity` accepts only the primary chain until the transfer
-aggregates record their chain:
+orderbook). `transfer-equity` records the chain it ran on and is resumed on that
+same chain:
 
 ```bash
 cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml vault-deposit --amount 10 --token 0x... --vault-id 0x... --network ethereum
