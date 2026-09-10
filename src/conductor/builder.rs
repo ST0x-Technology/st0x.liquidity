@@ -1579,7 +1579,7 @@ mod tests {
     use alloy::providers::{ProviderBuilder, RootProvider};
     use async_trait::async_trait;
     use st0x_config::{
-        ChainAssets, ChainEquities, ChainEquityAsset, OperationMode,
+        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
         create_test_ctx_with_order_owner,
     };
     use st0x_event_sorcery::test_store;
@@ -1702,6 +1702,66 @@ mod tests {
                 (Chain::Ethereum, ethereum_orderbook, ethereum_vault_owner),
             ],
             "each watched chain must get its own vault-polling entry"
+        );
+    }
+
+    /// A watched chain's balances are captured in the daily snapshot, so its
+    /// market-making slots must gate the capture too -- with only the assets
+    /// that chain's own table declares.
+    #[test]
+    fn market_making_slots_cover_every_watched_chain() {
+        let secondary_symbol = Symbol::new("NVDA").unwrap();
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                operational_limit: None,
+                symbols: HashMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                )]),
+            },
+            cash: Some(ChainCashAsset {
+                vault_ids: vec![B256::repeat_byte(0xc0)],
+                rebalancing: OperationMode::Disabled,
+                operational_limit: None,
+            }),
+        };
+        ctx.chains.insert_secondary(
+            st0x_config::TradingChain::test()
+                .chain(Chain::Ethereum)
+                .assets(ChainAssets {
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            secondary_symbol.clone(),
+                            equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                        )]),
+                    },
+                    cash: None,
+                })
+                .call(),
+        );
+
+        let slots = market_making_slots(&ctx);
+
+        assert_eq!(
+            slots
+                .iter()
+                .map(|(chain, slots)| (
+                    *chain,
+                    slots.equity_symbols.clone(),
+                    slots.usdc_tracking_enabled
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Chain::Base,
+                    HashSet::from([Symbol::new("AAPL").unwrap()]),
+                    true
+                ),
+                (Chain::Ethereum, HashSet::from([secondary_symbol]), false),
+            ],
+            "each watched chain contributes the slots its own assets table declares"
         );
     }
 
