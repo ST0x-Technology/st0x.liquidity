@@ -12,12 +12,15 @@ use tokio::task::JoinHandle;
 
 use st0x_config::Ctx;
 use st0x_dto::Statement;
-use st0x_execution::FractionalShares;
+use st0x_event_sorcery::Projection;
 use st0x_execution::alpaca_broker_api::OrderStatus;
+use st0x_execution::{FractionalShares, Symbol};
 use st0x_hedge::{
-    FailureInjector, run_bot_session, run_bot_session_with_event_channel,
+    FailureInjector, Position, run_bot_session, run_bot_session_with_event_channel,
     run_bot_session_with_injector,
 };
+
+use crate::assert::ExpectedPosition;
 
 /// Returns an available TCP port by binding to port 0 and reading the assigned
 /// port. The socket is dropped immediately, freeing the port for the caller.
@@ -337,21 +340,29 @@ pub async fn poll_for_snapshot_field(
     }
 }
 
-/// Polls the Position projection view until the given symbol has no
-/// pending offchain order (hedge cycle completed).
+/// Polls the Position projection until `expected.symbol` carries every
+/// expected onchain fill and its hedges have brought `net` back to zero.
 ///
-/// Uses `pending_offchain_order_id == null` instead of `net == 0`
-/// because Float precision truncation at the broker API boundary
-/// can leave a tiny non-zero residual that never reaches exact zero.
+/// The position row appears with the first acknowledged fill, before that
+/// fill's hedge is placed, so an empty `pending_offchain_order_id` alone does
+/// not prove the hedge cycle ran. Matching the accumulated fills rules out a
+/// read before a later fill landed; `net == 0` rules out an unfilled hedge.
 pub async fn poll_for_hedge_completion(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
-    symbol: &str,
+    expected: &ExpectedPosition,
     timeout: Duration,
 ) {
     let connect_opts = SqliteConnectOptions::new().filename(db_path);
     let deadline = tokio::time::Instant::now() + timeout;
+    let symbol = Symbol::new(expected.symbol.to_owned()).unwrap();
     let context = format!("Position({symbol}) hedge completed");
+    let is_hedged = |position: &Position| {
+        position.accumulated_long == FractionalShares::new(expected.expected_accumulated_long)
+            && position.accumulated_short
+                == FractionalShares::new(expected.expected_accumulated_short)
+            && position.net == FractionalShares::new(expected.expected_net)
+    };
 
     loop {
         sleep_or_crash(bot, &context).await;
@@ -364,44 +375,30 @@ pub async fn poll_for_hedge_completion(
             continue;
         };
 
-        let query_result =
-            sqlx::query_as::<_, (String,)>("SELECT payload FROM position_view WHERE view_id = ?")
-                .bind(symbol)
-                .fetch_optional(&pool)
-                .await;
+        let loaded = Projection::<Position>::sqlite(pool.clone())
+            .load(&symbol)
+            .await;
 
         pool.close().await;
 
-        match query_result {
-            Ok(Some((payload,))) => {
-                if let Ok(lifecycle) = serde_json::from_str::<serde_json::Value>(&payload)
-                    && let Some(live) = lifecycle.get("Live")
-                {
-                    let pending = live
-                        .get("pending_offchain_order_id")
-                        .and_then(|value| value.as_str());
+        match loaded {
+            Ok(Some(position)) if is_hedged(&position) => return,
 
-                    if pending.is_none() {
-                        return;
-                    }
-                }
-
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "Timed out after {timeout:?} waiting for {context}",
-                );
-            }
+            Ok(Some(position)) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} \
+                 (net={}, long={}, short={})",
+                position.net,
+                position.accumulated_long,
+                position.accumulated_short,
+            ),
 
             Ok(None) => assert!(
                 tokio::time::Instant::now() < deadline,
                 "Timed out after {timeout:?} waiting for {context} (position not found)",
             ),
 
-            Err(query_error) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out after {timeout:?} waiting for {context} \
-                 (query failed: {query_error})",
-            ),
+            Err(load_error) => panic!("failed to load Position projection: {load_error}"),
         }
     }
 }

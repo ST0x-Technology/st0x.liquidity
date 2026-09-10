@@ -738,8 +738,6 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
     )
     .await;
 
-    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(trade_amount)
@@ -750,6 +748,14 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .expected_accumulated_short(float!(0))
         .expected_net(float!(0))
         .build()];
+
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     let redemption_wallet_balance_after =
         crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
@@ -859,12 +865,6 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
     )
     .await;
 
-    // Redemption is driven by the inventory poller observing the
-    // post-take vault balance, so it can complete before the bot has
-    // processed the TakeOrderV3 event and placed its hedge. Wait for
-    // the position to settle so broker assertions are deterministic.
-    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(trade_amount)
@@ -875,6 +875,18 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
         .expected_accumulated_short(float!(0))
         .expected_net(float!(0))
         .build()];
+
+    // Redemption is driven by the inventory poller observing the
+    // post-take vault balance, so it can complete before the bot has
+    // processed the TakeOrderV3 event and placed its hedge. Wait for
+    // the position to settle so broker assertions are deterministic.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     let redemption_wallet_balance_after =
         crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
@@ -1157,8 +1169,6 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 
     let total_amount = (amount_per_trade * float!(3)).unwrap();
 
-    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(total_amount)
@@ -1169,6 +1179,14 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         .expected_accumulated_short(float!(0))
         .expected_net(float!(0))
         .build()];
+
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     assert_usdc_rebalancing_flow()
         .expected_positions(&expected_positions)
@@ -1354,12 +1372,6 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
 
     let total_amount = (amount_per_trade * float!(3)).unwrap();
 
-    // CheckPositions batches hedges across scan cycles. The
-    // last onchain fill may arrive during the USDC rebalance, so
-    // its hedge completes after the rebalance event. Wait for all
-    // hedges to fill by polling until the position net reaches zero.
-    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(total_amount)
@@ -1370,6 +1382,18 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .expected_accumulated_short(total_amount)
         .expected_net(float!(0))
         .build()];
+
+    // CheckPositions batches hedges across scan cycles. The
+    // last onchain fill may arrive during the USDC rebalance, so
+    // its hedge completes after the rebalance event. Wait for all
+    // hedges to fill by polling until the position net reaches zero.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     assert_usdc_rebalancing_flow()
         .expected_positions(&expected_positions)
@@ -1490,7 +1514,23 @@ async fn redemption_rejected_releases_inflight_and_preserves_failed_transfer() -
         .to_owned();
     pool.close().await;
 
-    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
+    let expected_position = ExpectedPosition::builder()
+        .symbol("AAPL")
+        .amount(trade_amount)
+        .direction(TakeDirection::BuyEquity)
+        .onchain_price(onchain_price)
+        .broker_fill_price(broker_fill_price)
+        .expected_accumulated_long(trade_amount)
+        .expected_accumulated_short(float!(0))
+        .expected_net(float!(0))
+        .build();
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_position,
+        Duration::from_secs(30),
+    )
+    .await;
     let broker_quantity = infra
         .broker_service
         .positions()
@@ -2050,8 +2090,6 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
     )
     .await;
 
-    poll_for_hedge_completion(&mut bot2, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(float!(22.5))
@@ -2062,6 +2100,14 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         .expected_accumulated_short(float!(22.5))
         .expected_net(float!(0))
         .build()];
+
+    poll_for_hedge_completion(
+        &mut bot2,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
@@ -2253,8 +2299,6 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
     )
     .await;
 
-    poll_for_hedge_completion(&mut bot2, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(trade_amount)
@@ -2265,6 +2309,14 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
         .expected_accumulated_short(float!(0))
         .expected_net(float!(0))
         .build()];
+
+    poll_for_hedge_completion(
+        &mut bot2,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     let redemption_wallet_balance_after =
         crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
