@@ -295,6 +295,7 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 transfer_timeout_secs = 1800
 transfer_attempt_timeout_secs = 3600
 attestation_retry_deadline_secs = 86400
+settlement_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
 # An inventory book last polled more than this many seconds ago (or never,
 # e.g. right after a restart) is stale: its imbalance checks are skipped with

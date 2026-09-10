@@ -388,6 +388,18 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         source: Box<Self>,
     },
+    /// The retryable settlement wait outlived the configured settlement
+    /// retry deadline (anchored on the durable `WithdrawalComplete`
+    /// `confirmed_at`). `FailBridging` has already been sent by the time
+    /// this is returned: the aggregate is a pre-burn `BridgingFailed`,
+    /// reconcile-eligible because the withdrawal completed and the funds
+    /// are off Alpaca. The job pages the operator and must NOT redrive.
+    #[error(
+        "USDC rebalance {id}: withdrawal settlement retry deadline elapsed; \
+         bridge marked failed for operator reconciliation \
+         (`transfer reconcile --kind usdc`)"
+    )]
+    SettlementRetryDeadlineElapsed { id: UsdcRebalanceId },
     #[error(
         "USDC rebalance {id}: withdrawal tx {tx} has only {actual} confirmations, \
          need {required}; waiting for on-chain settlement"
@@ -527,6 +539,7 @@ impl UsdcTransferError {
             | Self::ResumeWithoutMintScanBound { .. }
             | Self::AttestationTimedOut { .. }
             | Self::AttestationRetryDeadlineElapsed { .. }
+            | Self::SettlementRetryDeadlineElapsed { .. }
             | Self::WithdrawalPollInconclusive { .. }
             | Self::AttestationRetryDeadlineOverflow { .. }
             | Self::AttestationNonceMismatch { .. }
@@ -596,6 +609,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::WalletUsdcAmbientPreflight { .. }
             | Self::WalletUsdcAmbientPreflightUnrepresentable { .. }
             | Self::PreflightBalanceUnavailable { .. }
+            | Self::SettlementRetryDeadlineElapsed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::SettlementCheckTransient { .. }
             | Self::MintRecoveryInconclusive { .. }

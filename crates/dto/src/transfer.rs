@@ -157,9 +157,13 @@ pub enum UsdcBridgeStatus {
     Failed {
         failed_at: DateTime<Utc>,
         // True when the failure happened post-burn (`DepositFailed`, a post-burn
-        // `BridgingFailed`, or a `BaseToAlpaca ConversionFailed`) -- the only USDC
-        // failures `transfer reconcile --kind usdc` accepts. False for pre-burn
-        // failures, which strand nothing and the CLI rejects, so the dashboard can
+        // `BridgingFailed`, an AlpacaToBase `BridgingFailed` -- post-withdrawal,
+        // funds off Alpaca even without burn evidence -- or a `BaseToAlpaca
+        // ConversionFailed`) -- the USDC failures `transfer reconcile --kind
+        // usdc` accepts. The name is historical: the semantic is
+        // reconcile-eligibility, kept as `post_burn` on the wire for
+        // older-payload compatibility. False for failures whose funds never
+        // left the source venue, which the CLI rejects, so the dashboard can
         // offer reconcile per-object only when this is true. NOTE: a plain `//`
         // comment, not `///` -- ts-rs emits doc comments into the generated TS
         // binding, and a field-level doc lands awkwardly inside the object type

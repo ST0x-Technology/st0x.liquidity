@@ -158,6 +158,7 @@ transfer_timeout_secs = 1800
 inventory_staleness_bound_secs = 300
 transfer_attempt_timeout_secs = 3600
 attestation_retry_deadline_secs = 86400
+settlement_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
 # NOTE: [rebalancing].inventory_staleness_bound_secs is REQUIRED by every
 # bot image built after st0x.liquidity #1352 and REJECTED ("unknown field",

@@ -2533,6 +2533,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
         raindex_service,
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations,
             reserved_cash,
             #[cfg(feature = "test-support")]
