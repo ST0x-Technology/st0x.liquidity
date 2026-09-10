@@ -1490,7 +1490,7 @@ pub mod process_tx {
     use tracing::{error, info};
 
     use st0x_config::Ctx;
-    use st0x_event_sorcery::{Store, StoreBuilder};
+    use st0x_event_sorcery::{Projection, Store, StoreBuilder};
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{Direction, FractionalShares, MockExecutor, Positive, Symbol};
     use st0x_registry::SymbolCache;
@@ -1559,21 +1559,67 @@ pub mod process_tx {
         },
     }
 
+    /// The three stores a process-tx writes through.
+    ///
+    /// In the bot process these are the conductor's wired stores, so every
+    /// event the fill produces reaches the running reactors: the
+    /// `RebalancingService` applies the fill to its inventory and arms the
+    /// pending-order gate immediately, rather than after the next inventory
+    /// poll. The offline CLI has no reactors to reach and builds standalone
+    /// stores with default projections.
+    #[derive(Clone)]
+    pub struct ProcessTxStores {
+        pub onchain_trade: Arc<Store<OnChainTrade>>,
+        pub position: Arc<Store<Position>>,
+        pub position_projection: Arc<Projection<Position>>,
+        pub offchain_order: Arc<Store<OffchainOrder>>,
+    }
+
+    impl ProcessTxStores {
+        /// Standalone stores with default projections and no reactors, for a
+        /// process with no running bot to dispatch to.
+        pub async fn standalone(
+            pool: &SqlitePool,
+            order_placer: Arc<dyn OrderPlacer>,
+        ) -> anyhow::Result<Self> {
+            let (onchain_trade, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+                .build(())
+                .await
+                .context("failed to build onchain trade store")?;
+            let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .context("failed to build position store")?;
+            let (offchain_order, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .context("failed to build offchain order store")?;
+            Ok(Self {
+                onchain_trade,
+                position,
+                position_projection,
+                offchain_order,
+            })
+        }
+    }
+
     /// Accounts a missed on-chain fill from `tx_hash` and, when the resulting
     /// net exposure warrants it, places the opposite hedge.
     ///
-    /// Run inside the bot process, pass the live `submission_lock` so the broker
-    /// placement serializes against the trading loop (ADR 0014); the shared
-    /// `Position` aggregate's pending-order gate and the event store's
+    /// Run inside the bot process, pass the conductor's wired `stores` (so the
+    /// fill reaches the running reactors) and the live `submission_lock` so the
+    /// broker placement serializes against the trading loop (ADR 0014); the
+    /// shared `Position` aggregate's pending-order gate and the event store's
     /// per-aggregate sequence already prevent a racing tick from double-placing
-    /// the hedge. The CLI runs in a separate process with no shared lock and
-    /// passes `None`.
+    /// the hedge. The CLI runs in a separate process with standalone stores, no
+    /// shared lock, and passes `None`.
     pub async fn process_tx<P: Provider + Clone + 'static>(
         tx_hash: TxHash,
         ctx: &Ctx,
         pool: &SqlitePool,
         provider: &P,
         cache: &SymbolCache,
+        stores: &ProcessTxStores,
         order_placer: Arc<dyn OrderPlacer>,
         submission_lock: Option<&Mutex<()>>,
     ) -> Result<ProcessTxOutcome, OperatorError> {
@@ -1587,7 +1633,15 @@ pub mod process_tx {
         match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await
         {
             Ok(Some(onchain_trade)) => {
-                process_found_trade(onchain_trade, ctx, pool, order_placer, submission_lock).await
+                process_found_trade(
+                    onchain_trade,
+                    ctx,
+                    pool,
+                    stores,
+                    order_placer,
+                    submission_lock,
+                )
+                .await
             }
             Ok(None) => Ok(ProcessTxOutcome::NoTradeableEvents),
             Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(_))) => {
@@ -1601,6 +1655,7 @@ pub mod process_tx {
         onchain_trade: OnchainTrade,
         ctx: &Ctx,
         pool: &SqlitePool,
+        stores: &ProcessTxStores,
         order_placer: Arc<dyn OrderPlacer>,
         submission_lock: Option<&Mutex<()>>,
     ) -> Result<ProcessTxOutcome, OperatorError> {
@@ -1610,27 +1665,20 @@ pub mod process_tx {
             onchain_trade.log_index,
         );
 
-        let (onchain_trade_store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
-            .build(())
-            .await
-            .context("failed to build onchain trade store")?;
-        let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .context("failed to build position store")?;
-        let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(order_placer.clone())
-            .await
-            .context("failed to build offchain order store")?;
-
+        let ProcessTxStores {
+            onchain_trade: onchain_trade_store,
+            position: position_store,
+            position_projection,
+            offchain_order: offchain_order_store,
+        } = stores;
         let Some(block_number) = onchain_trade.block_number else {
             return Err(RejectionReason::FillMissingBlockNumber { trade_id }.into());
         };
 
         let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
             pool,
-            &onchain_trade_store,
-            &position_store,
+            onchain_trade_store,
+            position_store,
             &onchain_trade,
             block_number,
             ctx.execution_threshold,
@@ -1643,14 +1691,14 @@ pub mod process_tx {
 
         let base_symbol = onchain_trade.symbol();
 
-        match reconcile_existing_pending_order(&offchain_order_store, &position_store, base_symbol)
+        match reconcile_existing_pending_order(offchain_order_store, position_store, base_symbol)
             .await?
         {
             None | Some(HedgeDisposition::ClearedForRetry | HedgeDisposition::Finalized) => {}
             Some(HedgeDisposition::InFlight) => {
                 mark_and_settle_fill(
-                    &onchain_trade_store,
-                    &position_store,
+                    onchain_trade_store,
+                    position_store,
                     &trade_id,
                     &onchain_trade,
                 )
@@ -1663,8 +1711,8 @@ pub mod process_tx {
 
         if !trading_enabled {
             mark_and_settle_fill(
-                &onchain_trade_store,
-                &position_store,
+                onchain_trade_store,
+                position_store,
                 &trade_id,
                 &onchain_trade,
             )
@@ -1681,7 +1729,7 @@ pub mod process_tx {
         let executor = MockExecutor::new();
         let Some(params) = check_execution_readiness(
             &executor,
-            &position_projection,
+            position_projection,
             base_symbol,
             executor_type,
             &ctx.chains.primary().assets,
@@ -1692,8 +1740,8 @@ pub mod process_tx {
         .context("failed to check execution readiness")?
         else {
             mark_and_settle_fill(
-                &onchain_trade_store,
-                &position_store,
+                onchain_trade_store,
+                position_store,
                 &trade_id,
                 &onchain_trade,
             )
@@ -1747,8 +1795,8 @@ pub mod process_tx {
                     "Position::PlaceOffChainOrder rejected by domain state: {error}"
                 );
                 mark_and_settle_fill(
-                    &onchain_trade_store,
-                    &position_store,
+                    onchain_trade_store,
+                    position_store,
                     &trade_id,
                     &onchain_trade,
                 )
@@ -1763,7 +1811,7 @@ pub mod process_tx {
         let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
 
         place_offchain_order_at_broker(
-            &offchain_order_store,
+            offchain_order_store,
             order_placer.as_ref(),
             &offchain_order_id,
             OffchainOrderPlacement::market(
@@ -1778,16 +1826,16 @@ pub mod process_tx {
         .context("failed to place the offchain order at the broker")?;
 
         let disposition = reconcile_post_place_state(
-            &offchain_order_store,
-            &position_store,
+            offchain_order_store,
+            position_store,
             &params.symbol,
             offchain_order_id,
         )
         .await?;
 
         mark_and_settle_fill(
-            &onchain_trade_store,
-            &position_store,
+            onchain_trade_store,
+            position_store,
             &trade_id,
             &onchain_trade,
         )
@@ -2061,8 +2109,9 @@ pub mod process_tx {
         use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
         use super::{
-            HedgeDisposition, OperatorError, PlacementContext, ProcessTxOutcome, RejectionReason,
-            process_found_trade, reconcile_offchain_order_state, reconcile_post_place_state,
+            HedgeDisposition, OperatorError, PlacementContext, ProcessTxOutcome, ProcessTxStores,
+            RejectionReason, process_found_trade, reconcile_offchain_order_state,
+            reconcile_post_place_state,
         };
 
         fn positive_shares(value: &str) -> Positive<FractionalShares> {
@@ -2081,6 +2130,18 @@ pub mod process_tx {
 
         fn create_base_test_ctx() -> Ctx {
             st0x_config::create_test_ctx_with_order_owner(Address::ZERO)
+        }
+
+        /// Standalone stores for the offline-path tests; the reactor-wired
+        /// path is covered by
+        /// `wired_position_store_updates_rebalancing_inventory_immediately`.
+        async fn stores_for(
+            pool: &sqlx::SqlitePool,
+            order_placer: &Arc<dyn OrderPlacer>,
+        ) -> ProcessTxStores {
+            ProcessTxStores::standalone(pool, order_placer.clone())
+                .await
+                .expect("standalone stores must build")
         }
 
         /// `OrderPlacer` that always returns a broker error, used to drive the
@@ -2233,9 +2294,16 @@ pub mod process_tx {
             .await
             .unwrap();
 
-            let outcome = process_found_trade(onchain_trade, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap();
+            let outcome = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(outcome, ProcessTxOutcome::AlreadyAccounted),
                 "acknowledged fill must resolve to AlreadyAccounted, got: {outcome:?}"
@@ -2330,9 +2398,16 @@ pub mod process_tx {
                 .unwrap();
 
             // Call process_found_trade: must resume and complete the acknowledge step.
-            process_found_trade(onchain_trade, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap();
+            process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
 
             // Verify the trade is now fully acknowledged.
             let state = store
@@ -2375,9 +2450,16 @@ pub mod process_tx {
             let trade_id =
                 OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
 
-            process_found_trade(onchain_trade, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap();
+            process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
 
             // The OnChainTrade aggregate must be acknowledged.
             let (store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
@@ -2425,6 +2507,7 @@ pub mod process_tx {
                 onchain_trade.clone(),
                 &ctx,
                 &pool,
+                &stores_for(&pool, &order_placer).await,
                 order_placer.clone(),
                 None,
             )
@@ -2534,9 +2617,16 @@ pub mod process_tx {
 
             let onchain_trade = onchain_trade_builder().with_block_number(None).build();
 
-            let error = process_found_trade(onchain_trade, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap_err();
+            let error = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap_err();
 
             assert!(
                 matches!(
@@ -2565,9 +2655,16 @@ pub mod process_tx {
             let expected_trade_id =
                 OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
 
-            let error = process_found_trade(onchain_trade, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap_err();
+            let error = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap_err();
 
             let OperatorError::Operational(inner) = &error else {
                 panic!(
@@ -2616,9 +2713,16 @@ pub mod process_tx {
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(FailingOrderPlacer);
             let onchain_trade = onchain_trade_builder().with_block_number(42).build();
 
-            let outcome = process_found_trade(onchain_trade, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap();
+            let outcome = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(
                     outcome,
@@ -3305,9 +3409,16 @@ pub mod process_tx {
 
             // Call process_found_trade: must resume the acknowledge step and complete
             // it rather than silently dropping the fill.
-            process_found_trade(onchain_trade, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap();
+            process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
 
             // The trade must be fully acknowledged after the resume.
             let state = store_a
@@ -3412,9 +3523,16 @@ pub mod process_tx {
             .await
             .unwrap();
 
-            let outcome = process_found_trade(onchain_trade, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap();
+            let outcome = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(outcome, ProcessTxOutcome::AlreadyAccounted),
                 "concurrent-acknowledged fill must resolve to AlreadyAccounted, got: {outcome:?}"
@@ -3558,9 +3676,16 @@ pub mod process_tx {
             // re-apply it: last_slot (B) != A, so DuplicateTrade does NOT fire.
 
             // Step 4: Retry process-tx for fill A (crash-recovery scenario).
-            process_found_trade(fill_a, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap();
+            process_found_trade(
+                fill_a,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
 
             // Assertion 1: OnChainTrade A must now be acknowledged.
             let state_a = onchain_store
@@ -3678,9 +3803,16 @@ pub mod process_tx {
             // Step 3: Run process_found_trade for fill A. It takes the None branch
             // (no OnChainTrade record), witnesses A, then the authoritative guard must
             // detect A already in Position and skip the re-apply.
-            process_found_trade(fill_a, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap();
+            process_found_trade(
+                fill_a,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
 
             // Assertion 1: OnChainTrade A must be acknowledged (witness + mark ran).
             let state_a = onchain_store
@@ -3741,9 +3873,16 @@ pub mod process_tx {
             // 1 share buy -> net +1 -> is_ready_for_execution returns (Sell, 1).
             let onchain_trade = onchain_trade_builder().with_block_number(42).build();
 
-            let outcome = process_found_trade(onchain_trade, &ctx, &pool, order_placer, None)
-                .await
-                .unwrap();
+            let outcome = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(
                     outcome,
@@ -3849,10 +3988,25 @@ pub mod process_tx {
             // The one submission lock the conductor shares with every placement
             // path; passing it to both calls is what serializes them.
             let lock = Mutex::new(());
+            let stores = stores_for(&pool, &order_placer).await;
 
             let (outcome_a, outcome_b) = tokio::join!(
-                process_found_trade(fill_a, &ctx, &pool, order_placer.clone(), Some(&lock)),
-                process_found_trade(fill_b, &ctx, &pool, order_placer.clone(), Some(&lock)),
+                process_found_trade(
+                    fill_a,
+                    &ctx,
+                    &pool,
+                    &stores,
+                    order_placer.clone(),
+                    Some(&lock)
+                ),
+                process_found_trade(
+                    fill_b,
+                    &ctx,
+                    &pool,
+                    &stores,
+                    order_placer.clone(),
+                    Some(&lock)
+                ),
             );
 
             // Exactly one path placed a hedge. The loser either observed the
@@ -3880,6 +4034,201 @@ pub mod process_tx {
                 order_count, 1,
                 "concurrent process-tx and tick must place exactly one hedge order, got {order_count}"
             );
+        }
+
+        /// Builds a `RebalancingService` over a fresh inventory and a `Position`
+        /// store that carries it as a reactor, the way the conductor wires the
+        /// bot's own store. Returns the inventory handle so a test can read the
+        /// service's live view.
+        async fn service_wired_position_store(
+            pool: &sqlx::SqlitePool,
+        ) -> (
+            Arc<crate::inventory::BroadcastingInventory>,
+            Arc<st0x_event_sorcery::Store<Position>>,
+            Arc<st0x_event_sorcery::Projection<Position>>,
+        ) {
+            use crate::inventory::{
+                BroadcastingInventory, ImbalanceThreshold, InventoryView, PollFreshness,
+            };
+            use crate::rebalancing::{
+                RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
+            };
+            use crate::vault_registry::{VaultRegistry, VaultRegistryId};
+
+            let (_pool, apalis_pool) = try_setup_test_pools().await.expect("test pools must build");
+            let (event_sender, _) = tokio::sync::broadcast::channel(16);
+            // A funded view: the fill's USDC leg debits the market-making cash
+            // balance, and the equity leg is a delta on the existing holding,
+            // as in production.
+            let inventory = Arc::new(BroadcastingInventory::new(
+                InventoryView::default()
+                    .with_equity(
+                        Symbol::new("AAPL").unwrap(),
+                        FractionalShares::new(st0x_float_macro::float!(10)),
+                        FractionalShares::new(st0x_float_macro::float!(10)),
+                    )
+                    .with_usdc(
+                        st0x_finance::Usdc::new(st0x_float_macro::float!(10_000)),
+                        st0x_finance::Usdc::new(st0x_float_macro::float!(10_000)),
+                    ),
+                event_sender,
+            ));
+            let (vault_registry, _) = StoreBuilder::<VaultRegistry>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let service = Arc::new(RebalancingService::new(
+                RebalancingServiceConfig {
+                    poll_freshness: PollFreshness::always_fresh(),
+                    inventory_staleness_bound: std::time::Duration::from_secs(300),
+                    cash_reserved: None,
+                    equity: ImbalanceThreshold {
+                        target: st0x_float_macro::float!(0.5),
+                        deviation: st0x_float_macro::float!(0.2),
+                    },
+                    usdc: None,
+                    transfer_timeout: std::time::Duration::from_secs(60),
+                    assets: ChainAssets {
+                        equities: crate::test_utils::rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    },
+                },
+                vault_registry,
+                VaultRegistryId {
+                    chain: Chain::Base,
+                    orderbook: Address::ZERO,
+                    owner: Address::ZERO,
+                },
+                inventory.clone(),
+                Arc::new(st0x_wrapper::MockWrapper::new()),
+                RebalancingSchedulers::new(&apalis_pool),
+                Arc::new(crate::alerts::LogNotifier),
+            ));
+
+            let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+                .with(service)
+                .build(())
+                .await
+                .unwrap();
+            (inventory, position, position_projection)
+        }
+
+        /// The in-bot route must write through the conductor's wired `Position`
+        /// store: with the `RebalancingService` reactor attached, processing a
+        /// fill applies it to the service's inventory and arms the symbol's
+        /// pending-order gate at once, so a rebalancing check that runs before
+        /// the next inventory poll sees the live balances and the open hedge.
+        /// A detached store (the pre-fix route) leaves both untouched until
+        /// polling repairs them, a window in which a check acts on stale state.
+        #[tokio::test]
+        async fn wired_position_store_updates_rebalancing_inventory_immediately() {
+            let pool = setup_test_db().await;
+            let symbol = Symbol::new("AAPL").unwrap();
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
+
+            let (inventory, position, position_projection) =
+                service_wired_position_store(&pool).await;
+            let standalone = stores_for(&pool, &order_placer).await;
+            let stores = ProcessTxStores {
+                onchain_trade: standalone.onchain_trade,
+                position,
+                position_projection,
+                offchain_order: standalone.offchain_order,
+            };
+
+            // 1 share buy at 150 -> net +1 -> the opposite hedge is placed.
+            let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            let outcome =
+                process_found_trade(onchain_trade, &ctx, &pool, &stores, order_placer, None)
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(outcome, ProcessTxOutcome::HedgePlaced { .. }),
+                "got {outcome:?}"
+            );
+
+            // No inventory poll has run: the reactor alone must have applied the
+            // fill and armed the gate.
+            let (market_making, gate_armed) = {
+                let view = inventory.read().await;
+                (
+                    view.equity_available(&symbol, crate::inventory::Venue::MarketMaking),
+                    view.has_pending_offchain_order(&symbol),
+                )
+            };
+            assert_eq!(
+                market_making,
+                Some(FractionalShares::new(st0x_float_macro::float!(11))),
+                "the on-chain buy must land in the market-making equity balance before any poll"
+            );
+            assert!(
+                gate_armed,
+                "the placed hedge must arm the symbol's pending-order gate before any poll"
+            );
+        }
+
+        /// The contrast that makes the wired-store requirement observable: the
+        /// same fill through standalone stores never reaches the service.
+        #[tokio::test]
+        async fn detached_position_store_leaves_rebalancing_inventory_stale() {
+            let pool = setup_test_db().await;
+            let symbol = Symbol::new("AAPL").unwrap();
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
+            let (inventory, _wired_position, _wired_projection) =
+                service_wired_position_store(&pool).await;
+
+            let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            let outcome = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, ProcessTxOutcome::HedgePlaced { .. }));
+
+            let (market_making, gate_armed) = {
+                let view = inventory.read().await;
+                (
+                    view.equity_available(&symbol, crate::inventory::Venue::MarketMaking),
+                    view.has_pending_offchain_order(&symbol),
+                )
+            };
+            assert_eq!(
+                market_making,
+                Some(FractionalShares::new(st0x_float_macro::float!(10))),
+                "a detached store never reaches the service; the balance stays at its seed"
+            );
+            assert!(!gate_armed);
         }
     }
 }
