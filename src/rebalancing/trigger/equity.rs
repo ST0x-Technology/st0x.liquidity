@@ -29,7 +29,7 @@ pub(crate) enum EquityTriggerError {
     #[error("token not in vault registry: {0}")]
     TokenNotInRegistry(Symbol),
     #[error("no wrapper is wired for {chain}, so its equity ratios cannot be read")]
-    UnwiredChain { chain: st0x_evm::Chain },
+    UnwiredWrapper { chain: st0x_evm::Chain },
     #[error(transparent)]
     Imbalance(#[from] EquityImbalanceError),
     #[error(transparent)]

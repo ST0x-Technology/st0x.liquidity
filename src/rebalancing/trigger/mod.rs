@@ -211,7 +211,7 @@ pub(crate) enum TokenAddressError {
     #[error("vault registry aggregate not initialized")]
     Uninitialized,
     #[error("no vault registry is wired for {chain}, so its tokens cannot be resolved")]
-    UnwiredChain { chain: Chain },
+    UnwiredRegistry { chain: Chain },
     #[error(transparent)]
     Persistence(#[from] AggregateError<LifecycleError<VaultRegistry>>),
 }
@@ -2864,7 +2864,7 @@ impl RebalancingService {
         let wrapper = self
             .wrappers
             .get(&chain)
-            .ok_or(equity::EquityTriggerError::UnwiredChain { chain })?;
+            .ok_or(equity::EquityTriggerError::UnwiredWrapper { chain })?;
         let unwrapped_token = wrapper.lookup_underlying(symbol)?;
         let vault_ratio = wrapper.get_ratio_for_symbol(symbol).await?;
         let shares_limit = self
@@ -3399,7 +3399,7 @@ impl RebalancingService {
         let registry_id = self
             .registry_ids
             .get(&chain)
-            .ok_or(TokenAddressError::UnwiredChain { chain })?;
+            .ok_or(TokenAddressError::UnwiredRegistry { chain })?;
         let registry = self
             .vault_registry
             .load(registry_id)
