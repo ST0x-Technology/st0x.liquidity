@@ -15,6 +15,7 @@
 //! continue running. Aggregates already in a terminal state return `Ok(())`
 //! (idempotent).
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,17 @@ const BOT_GAS_ENQUEUE_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 pub(crate) enum ResumeTokenizationTarget {
     Mint(IssuerRequestId),
     Redemption(RedemptionAggregateId),
+}
+
+/// Names the aggregate the way an operator reads it in a refusal or a log:
+/// the kind first, then the id it was persisted under.
+impl fmt::Display for ResumeTokenizationTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mint(issuer_request_id) => write!(formatter, "mint {issuer_request_id}"),
+            Self::Redemption(aggregate_id) => write!(formatter, "redemption {aggregate_id}"),
+        }
+    }
 }
 
 /// Apalis job payload. Holds the target aggregate to resume.

@@ -26,9 +26,9 @@ pub use assets::{
 };
 pub use bot_gas_valuation::BotGasValuationConfig;
 pub use chain::{
-    ChainConfig, ChainConfigError, ChainCtx, ChainRegistry, ChainRegistryError, ChainSecrets,
-    IngestionCutoff, InventoryAdapter, InventoryAdapterVenue, InventoryAdapters, InventoryMode,
-    InventoryModeTag, TradingChain, TradingConfig,
+    ChainConfig, ChainConfigError, ChainCtx, ChainRegistry, ChainRegistryError, ChainRole,
+    ChainSecrets, IngestionCutoff, InventoryAdapter, InventoryAdapterVenue, InventoryAdapters,
+    InventoryMode, InventoryModeTag, TradingChain, TradingConfig,
 };
 pub use enablement::{
     ChainCapability, ChainEnablementError, ChainLifecycle, MissingCapabilities,

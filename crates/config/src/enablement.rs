@@ -161,14 +161,7 @@ pub fn required_capabilities(
     if lifecycle == ChainLifecycle::Active {
         required.insert(GasValuation);
 
-        let rebalances_equity = assets.is_some_and(|assets| {
-            assets
-                .equities
-                .symbols
-                .values()
-                .any(|equity| equity.rebalancing == OperationMode::Enabled)
-        });
-        if rebalances_equity {
+        if assets.is_some_and(ChainAssets::rebalances_equity) {
             required.insert(EquityRebalancing);
         }
 

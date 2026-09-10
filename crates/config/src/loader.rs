@@ -185,11 +185,13 @@ pub fn load_deployment_symbol_policy(
 }
 
 /// One watched chain's approval surface: the orderbook and asset table its
-/// startup MAX approvals target.
+/// startup MAX approvals target, and the role that decides whether its
+/// equities' wrap and deposit grants are targeted at all.
 #[cfg(feature = "wallet-turnkey")]
 #[derive(Clone, Debug)]
 pub struct ChainApprovalInputs {
     pub chain: Chain,
+    pub role: crate::ChainRole,
     pub orderbook: Address,
     pub assets: crate::ChainAssets,
 }
@@ -2073,9 +2075,10 @@ impl Ctx {
             wallet_address,
             watched: parts
                 .chains
-                .watched()
-                .map(|watched| ChainApprovalInputs {
+                .watched_with_roles()
+                .map(|(role, watched)| ChainApprovalInputs {
                     chain: watched.chain,
+                    role,
                     orderbook: watched.orderbook,
                     assets: watched.assets.clone(),
                 })
@@ -9395,15 +9398,17 @@ mod tests {
             inputs
                 .watched
                 .iter()
-                .map(|chain| (chain.chain, chain.orderbook))
+                .map(|chain| (chain.chain, chain.role, chain.orderbook))
                 .collect::<Vec<_>>(),
             vec![
                 (
                     Chain::Base,
+                    crate::ChainRole::Primary,
                     address!("0x1111111111111111111111111111111111111111")
                 ),
                 (
                     Chain::Ethereum,
+                    crate::ChainRole::Secondary,
                     address!("0x9999999999999999999999999999999999999999")
                 ),
             ]

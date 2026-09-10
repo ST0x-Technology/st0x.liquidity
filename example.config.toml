@@ -161,9 +161,11 @@ primary = true
 # here. Per chain: a redemption delivers tokens that exist on one chain, so
 # sending them to another chain's issuer address would burn them.
 #
-# Required on every watched chain when [rebalancing] is configured: startup
-# builds each watched chain's tokenization services and refuses, naming the
-# chain, without its wallet. Also used by the alpaca-redeem and
+# Required when [rebalancing] is configured on the primary chain and on every
+# secondary with an equity that has rebalancing = "enabled": startup builds
+# those chains' tokenization services and refuses, naming the chain, without
+# its wallet. A hedge-only secondary (every equity rebalancing = "disabled")
+# needs none, and no wrapper vault either. Also used by the alpaca-redeem and
 # transfer-equity CLI commands (overridable there with --redemption-wallet).
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 

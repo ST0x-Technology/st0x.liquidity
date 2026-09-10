@@ -13,8 +13,9 @@ use thiserror::Error;
 use url::Url;
 
 use st0x_evm::Chain;
+use st0x_execution::Symbol;
 
-use crate::assets::ChainAssets;
+use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode};
 use crate::enablement::{ChainEnablementError, ChainLifecycle, check_enablement};
 
 /// Which block tag to use as the fill-ingestion cutoff.
@@ -636,6 +637,51 @@ fn enabled_chains(
     })
 }
 
+/// A watched chain's place in the registry: THE primary, which always carries
+/// the equity-rebalancing wiring, or a secondary, which carries it only when
+/// one of its equities opts into rebalancing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainRole {
+    Primary,
+    Secondary,
+}
+
+impl ChainRole {
+    /// Whether a chain in this role rebalances equity on `assets`, and so
+    /// needs a wrapper vault, issuer client, redemption wallet and the equity
+    /// MAX approvals there. The primary always does; a secondary only when one
+    /// of its equities opts in.
+    pub fn rebalances_equity(self, assets: &ChainAssets) -> bool {
+        match self {
+            Self::Primary => true,
+            Self::Secondary => assets.rebalances_equity(),
+        }
+    }
+
+    /// The equities a chain in this role wraps and redeems on `assets`, in
+    /// symbol order so approval grants and preflight failures are
+    /// deterministic: on the primary every equity with trading or rebalancing
+    /// enabled; on a secondary only the equities that opt into rebalancing,
+    /// so a trading-only equity there is hedged but never wrapped, and a
+    /// hedge-only secondary lists none.
+    pub fn rebalanced_equities(self, assets: &ChainAssets) -> Vec<(&Symbol, &ChainEquityAsset)> {
+        let mut equities = assets
+            .equities
+            .symbols
+            .iter()
+            .filter(|(_, equity)| match self {
+                Self::Primary => {
+                    equity.trading == OperationMode::Enabled
+                        || equity.rebalancing == OperationMode::Enabled
+                }
+                Self::Secondary => equity.rebalancing == OperationMode::Enabled,
+            })
+            .collect::<Vec<_>>();
+        equities.sort_by_key(|(symbol, _)| *symbol);
+        equities
+    }
+}
+
 impl ChainRegistry {
     /// Pairs each configured chain with its secrets entry.
     ///
@@ -736,7 +782,16 @@ impl ChainRegistry {
     /// Every watched chain (primary first, then secondaries): the chains a
     /// fill watcher runs against.
     pub fn watched(&self) -> impl Iterator<Item = &TradingChain> {
-        std::iter::once(&self.primary).chain(self.secondary.values())
+        self.watched_with_roles().map(|(_, watched)| watched)
+    }
+
+    /// Every watched chain tagged with its [`ChainRole`], primary first.
+    pub fn watched_with_roles(&self) -> impl Iterator<Item = (ChainRole, &TradingChain)> {
+        std::iter::once((ChainRole::Primary, &self.primary)).chain(
+            self.secondary
+                .values()
+                .map(|secondary| (ChainRole::Secondary, secondary)),
+        )
     }
 
     /// The watched chain with this id, if any.
@@ -801,14 +856,115 @@ impl ChainRegistry {
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
+    use std::collections::HashMap;
 
     use st0x_execution::Symbol;
 
     use super::*;
+    use crate::assets::ChainEquities;
 
     #[derive(Debug, Deserialize)]
     struct CutoffWrapper {
         ingestion_cutoff: IngestionCutoffTag,
+    }
+
+    /// The primary carries the equity leg whatever its table says; a
+    /// secondary only when one of its equities opts into rebalancing.
+    #[test]
+    fn role_rebalances_equity_on_the_primary_and_on_an_opted_in_secondary() {
+        let hedge_only = ChainAssets::default();
+        let rebalancing = ChainAssets {
+            equities: ChainEquities {
+                symbols: HashMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::repeat_byte(0xa5),
+                        tokenized_equity_derivative: Address::repeat_byte(0xa6),
+                        vault_ids: Vec::new(),
+                        trading: OperationMode::Disabled,
+                        rebalancing: OperationMode::Enabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                )]),
+                operational_limit: None,
+            },
+            cash: None,
+        };
+
+        assert!(ChainRole::Primary.rebalances_equity(&hedge_only));
+        assert!(ChainRole::Primary.rebalances_equity(&rebalancing));
+        assert!(!ChainRole::Secondary.rebalances_equity(&hedge_only));
+        assert!(ChainRole::Secondary.rebalances_equity(&rebalancing));
+    }
+
+    /// The primary wraps every equity that trades or rebalances; a secondary
+    /// only those that opt into rebalancing, in symbol order on both.
+    #[test]
+    fn role_rebalanced_equities_narrow_to_opted_in_equities_on_a_secondary() {
+        let equity = |trading: OperationMode, rebalancing: OperationMode| ChainEquityAsset {
+            tokenized_equity: Address::repeat_byte(0xa5),
+            tokenized_equity_derivative: Address::repeat_byte(0xa6),
+            vault_ids: Vec::new(),
+            trading,
+            rebalancing,
+            wrapped_equity_recovery: OperationMode::Disabled,
+            operational_limit: None,
+        };
+        let assets = ChainAssets {
+            equities: ChainEquities {
+                symbols: HashMap::from([
+                    (
+                        Symbol::new("TSLA").unwrap(),
+                        equity(OperationMode::Enabled, OperationMode::Disabled),
+                    ),
+                    (
+                        Symbol::new("NVDA").unwrap(),
+                        equity(OperationMode::Disabled, OperationMode::Disabled),
+                    ),
+                    (
+                        Symbol::new("AAPL").unwrap(),
+                        equity(OperationMode::Disabled, OperationMode::Enabled),
+                    ),
+                ]),
+                operational_limit: None,
+            },
+            cash: None,
+        };
+        let symbols = |role: ChainRole| {
+            role.rebalanced_equities(&assets)
+                .into_iter()
+                .map(|(symbol, _)| symbol.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(symbols(ChainRole::Primary), vec!["AAPL", "TSLA"]);
+        assert_eq!(symbols(ChainRole::Secondary), vec!["AAPL"]);
+        assert!(
+            ChainRole::Secondary
+                .rebalanced_equities(&ChainAssets::default())
+                .is_empty(),
+            "a hedge-only secondary wraps nothing"
+        );
+    }
+
+    /// Watched chains come primary first, each tagged with its role.
+    #[test]
+    fn watched_with_roles_tags_the_primary_and_each_secondary() {
+        let mut chains =
+            ChainRegistry::single_trading_chain(TradingChain::test().chain(Chain::Base).call());
+        chains.insert_secondary(TradingChain::test().chain(Chain::Ethereum).call());
+
+        assert_eq!(
+            chains
+                .watched_with_roles()
+                .map(|(role, watched)| (role, watched.chain))
+                .collect::<Vec<_>>(),
+            vec![
+                (ChainRole::Primary, Chain::Base),
+                (ChainRole::Secondary, Chain::Ethereum),
+            ]
+        );
     }
 
     /// The confirmations mode needs its companion depth and produces the
