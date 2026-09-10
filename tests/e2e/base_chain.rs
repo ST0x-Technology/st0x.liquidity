@@ -202,6 +202,16 @@ pub struct BaseChain<P> {
     /// nonce collisions with the bot's concurrent owner transactions.
     pub minter: Address,
     pub minter_provider: P,
+    /// Separate bot-wallet account (Anvil account #3) for tests where the
+    /// harness submits owner-account transactions concurrently with the
+    /// bot's own wallet transactions (startup approvals). Hedging and chaos
+    /// tests give the bot this key so its nonce management never collides
+    /// with the owner account the harness drives.
+    pub bot_wallet_key: B256,
+    /// Address of `bot_wallet_key`. Tests that boot the bot in managed
+    /// inventory mode must grant this address `OPERATOR_ROLE` on their
+    /// `RaindexInventory`, or the startup preflight fails.
+    pub bot_wallet: Address,
     pub orderbook: Address,
     deployer: Address,
     interpreter: Address,
@@ -304,6 +314,9 @@ impl BaseChain<()> {
 
         provider.anvil_set_balance(minter, hundred_eth).await?;
 
+        let bot_wallet_key = B256::from_slice(&anvil.keys()[3].to_bytes());
+        let bot_wallet = PrivateKeySigner::from_bytes(&bot_wallet_key)?.address();
+
         let mock_chainlink_feed = MockChainlinkFeed::deploy(
             &provider,
             I256::try_from(MOCK_CHAINLINK_ETH_USD_ANSWER)
@@ -322,6 +335,8 @@ impl BaseChain<()> {
             taker_provider,
             minter,
             minter_provider,
+            bot_wallet_key,
+            bot_wallet,
             orderbook,
             deployer,
             interpreter,

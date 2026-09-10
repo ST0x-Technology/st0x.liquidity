@@ -3642,7 +3642,8 @@ async fn equity_mint_orchestrator_mode_delivers_exactly_one_authorization() -> a
     // and verify the delivered signature.
     let (issuance_base_url, recorded_deliveries) = spawn_recording_issuance().await?;
 
-    let (infra, mut bot) = drive_mint_with_orchestrator_configured(issuance_base_url).await?;
+    let (infra, mut bot) =
+        Box::pin(drive_mint_with_orchestrator_configured(issuance_base_url)).await?;
 
     let pool = connect_db(&infra.db_path).await?;
     let completed_mint_id = fetch_events_by_type(&pool, "TokenizedEquityMint")
@@ -3815,8 +3816,10 @@ async fn equity_mint_vault_direct_mode_delivers_no_authorization() -> anyhow::Re
         })
         .await;
 
-    let (infra, bot) =
-        drive_mint_with_orchestrator_configured(issuance.base_url().parse()?).await?;
+    let (infra, bot) = Box::pin(drive_mint_with_orchestrator_configured(
+        issuance.base_url().parse()?,
+    ))
+    .await?;
 
     authorization_deliveries.assert_calls_async(0).await;
 
