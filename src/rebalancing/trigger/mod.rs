@@ -2416,16 +2416,22 @@ impl Reactor for RebalancingService {
                         // Each delta leg yields to a pinned onchain snapshot
                         // that provably already contains it: a vaultBalance2
                         // read at block N includes every fill at a block <= N
-                        // (ADR 0018). The same reasoning covers a slot no
-                        // snapshot has seeded yet (a watched secondary chain
-                        // is not polled): its first snapshot contains the fill,
-                        // so the leg waits rather than debiting an empty slot
-                        // or inventing one that holds only the delta. Checked
-                        // and applied under one write lock so no snapshot can
-                        // advance the watermark in between. A skipped leg is
-                        // normal operation, not an error.
+                        // (ADR 0018). The same reasoning covers a secondary
+                        // chain's slot no snapshot has seeded yet (a watched
+                        // secondary is not polled): its first snapshot
+                        // contains the fill, so the leg waits rather than
+                        // debiting an empty slot or inventing one that holds
+                        // only the delta. The primary chain is different: its
+                        // unseeded slot is the normal cold state, the fill
+                        // creates it and the primary's poll reconciles it
+                        // shortly after. Checked and applied under one write
+                        // lock so no snapshot can advance the watermark in
+                        // between. A skipped leg is normal operation, not an
+                        // error.
                         let trading_chain = {
                             let mut inventory = self.inventory.write().await;
+                            let trading_chain = inventory.trading_chain();
+                            let on_primary = trade_id.chain == trading_chain;
                             let equity_slot_seeded =
                                 inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
                             let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
@@ -2434,16 +2440,17 @@ impl Reactor for RebalancingService {
                             let usdc_absorbed =
                                 inventory.onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
 
-                            if !equity_slot_seeded || !usdc_slot_seeded {
+                            if !on_primary && (!equity_slot_seeded || !usdc_slot_seeded) {
                                 info!(
                                     target: "rebalance",
                                     %symbol,
                                     chain = %trade_id.chain,
                                     equity_slot_seeded,
                                     usdc_slot_seeded,
-                                    "Skipping onchain fill delta leg(s) on a slot \
-                                     no onchain snapshot has seeded yet; the \
-                                     chain's first snapshot contains the fill"
+                                    "Skipping onchain fill delta leg(s) on a \
+                                     secondary chain slot no onchain snapshot \
+                                     has seeded yet; the chain's first snapshot \
+                                     contains the fill"
                                 );
                             }
 
@@ -2459,8 +2466,9 @@ impl Reactor for RebalancingService {
                                 );
                             }
 
-                            let apply_equity_leg = equity_slot_seeded && !equity_absorbed;
-                            let apply_usdc_leg = usdc_slot_seeded && !usdc_absorbed;
+                            let apply_equity_leg =
+                                (on_primary || equity_slot_seeded) && !equity_absorbed;
+                            let apply_usdc_leg = (on_primary || usdc_slot_seeded) && !usdc_absorbed;
 
                             // Chain-addressed: inventory is not fungible
                             // across chains, so a fill credits and debits the
@@ -2488,7 +2496,7 @@ impl Reactor for RebalancingService {
                                 )?;
                             }
                             *inventory = updated;
-                            inventory.trading_chain()
+                            trading_chain
                         };
 
                         // Only the trading chain rebalances: a secondary is
