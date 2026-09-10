@@ -7381,6 +7381,67 @@ mod tests {
         assert_eq!(status, Status::Killed.to_string());
     }
 
+    /// A vault-direct transfer started on a secondary chain, whose chain then
+    /// loses its last `rebalancing = "enabled"` equity: the chain is hedge-only
+    /// from that config on and gets no equity transfer services, so the
+    /// persisted transfer could never resume. Startup refuses by name rather
+    /// than stranding it half-done.
+    #[tokio::test]
+    async fn persisted_secondary_transfer_refuses_startup_when_its_chain_goes_hedge_only() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service(
+            7,
+            "hedge-only-flip-mint",
+            "hedge-only-flip-redemption",
+        )
+        .await;
+
+        // The fixture's services carry Base alone, which is exactly what
+        // `build_watched_equity_services` produces once Ethereum lists no
+        // rebalancing-enabled equity.
+        let stranded_id = redemption_aggregate_id("stranded-secondary-redemption");
+        test_store::<EquityRedemption>(fixture.pool.clone(), fixture.services.clone())
+            .send(
+                &stranded_id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Ethereum,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(3),
+                    token: Address::from([7; 20]),
+                    amount: U256::from(3_000_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = recover_interrupted_tokenization_aggregates(
+            &fixture.pool,
+            &fixture.rebalancing_service,
+            &fixture.inventory,
+            Arc::new(test_store::<TokenizedEquityMint>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            &mut fixture.resume_queue,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the unfinished equity transfer redemption {stranded_id} (AAPL) is recorded on \
+                 Ethereum, which rebalances no equity under this configuration and so gets no \
+                 transfer services: it could never finish. Re-enable rebalancing for one of \
+                 Ethereum's equities until the transfer completes, or resolve the transfer with \
+                 the CLI"
+            )
+        );
+    }
+
     /// Extension of the above: a crash mid-job leaves a `Running` row (not
     /// `Pending`). `cancel_all_pending` alone cannot clean it up; the orphan
     /// must be promoted to `Pending` first and then cancelled. Without the
