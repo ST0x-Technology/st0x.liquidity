@@ -165,8 +165,10 @@ Direction logic: positive net position -> sell offchain; negative net position
 The calendar-derived interval between the current extended-session close and the
 next trading session. `PostCloseGap` distinguishes an ordinary overnight (next
 session is the following calendar day), a multi-day closure (weekend or exchange
-holiday), and unknown next-session metadata. The distinction drives close
-flattening without hardcoding weekdays or holiday dates.
+holiday), and unknown next-session metadata. The distinction drives legacy close
+flattening in observation mode. Enabled pricing-schedule coordination instead
+flattens before every actual eligible closure, including ordinary overnight
+gaps, without hardcoding weekdays or holiday dates.
 
 ### Position
 

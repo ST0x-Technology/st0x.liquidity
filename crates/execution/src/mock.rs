@@ -56,10 +56,12 @@ pub struct MockExecutor {
     health: Health,
     inventory_result: InventoryResult,
     order_status_override: Option<OrderState>,
+    recovered_order: Option<OrderPlacement<String>>,
     market_open: bool,
     market_session_override: Option<MarketSession>,
     market_session_status_calls: Arc<AtomicU64>,
     market_session_status_failure: Option<String>,
+    regular_session_closes_at_override: Option<DateTime<Utc>>,
     extended_session_closes_at_override: Option<DateTime<Utc>>,
     post_close_gap_override: PostCloseGap,
     primary_limit_quote_override: Option<LatestQuote>,
@@ -74,10 +76,12 @@ impl MockExecutor {
             health: Health::Healthy,
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
+            recovered_order: None,
             market_open: true,
             market_session_override: None,
             market_session_status_calls: Arc::new(AtomicU64::new(0)),
             market_session_status_failure: None,
+            regular_session_closes_at_override: None,
             extended_session_closes_at_override: None,
             post_close_gap_override: PostCloseGap::Unknown,
             primary_limit_quote_override: None,
@@ -107,6 +111,12 @@ impl MockExecutor {
     #[must_use]
     pub fn with_order_status(mut self, status: OrderState) -> Self {
         self.order_status_override = Some(status);
+        self
+    }
+
+    #[must_use]
+    pub fn with_recovered_order(mut self, order: OrderPlacement<String>) -> Self {
+        self.recovered_order = Some(order);
         self
     }
 
@@ -140,6 +150,12 @@ impl MockExecutor {
     #[must_use]
     pub fn with_market_session_status_failure(mut self, message: impl Into<String>) -> Self {
         self.market_session_status_failure = Some(message.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_regular_session_closes_at(mut self, closes_at: DateTime<Utc>) -> Self {
+        self.regular_session_closes_at_override = Some(closes_at);
         self
     }
 
@@ -278,6 +294,12 @@ impl Default for MockExecutor {
 
 #[async_trait]
 impl Executor for MockExecutor {
+    async fn recover_order_by_client_id(
+        &self,
+        _order: &MarketOrder,
+    ) -> Result<Option<OrderPlacement<Self::OrderId>>, Self::Error> {
+        Ok(self.recovered_order.clone())
+    }
     type Error = ExecutionError;
     type OrderId = String;
     type Ctx = MockExecutorCtx;
@@ -418,6 +440,8 @@ impl Executor for MockExecutor {
 
         Ok(MarketSessionStatus {
             session: self.market_session().await?,
+            session_opens_at: None,
+            regular_session_closes_at: self.regular_session_closes_at_override,
             extended_session_closes_at: self.extended_session_closes_at_override,
             post_close_gap: self.post_close_gap_override,
         })

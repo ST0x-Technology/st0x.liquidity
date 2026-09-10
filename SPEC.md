@@ -694,16 +694,75 @@ sub-penny increment rejected at submission, error code `42210000`) are all
 specified by Alpaca's order documentation:
 <https://docs.alpaca.markets/us/docs/orders-at-alpaca>. The regular
 `open`/`close` edges are read from Alpaca's `/v1/calendar`; the extended
-`session_open`/ `session_close` edges are also read from the calendar but
-cross-checked against the documented 04:00/20:00 window (a mismatch is logged),
-since Alpaca's reference does not formally define those two fields.
+`session_open`/ `session_close` edges are also read from the calendar and
+cross-checked against the 04:00/20:00 window (a mismatch is logged). The current
+[Broker Calendar schema](https://docs.alpaca.markets/us/reference/legacycalendar-1)
+defines these fields as session opening/closing times in HHMM format. Calendar
+bounds alone do not establish per-asset/account eligibility for future 24/5
+trading.
 
 The session is re-checked at execution time, immediately before placement, so a
 hedge job that was enqueued in one session but runs after a 9:30/16:00 boundary
 places the order type appropriate to the _current_ session, not the stale
 enqueue-time one.
 
-##### Long-gap close flattening
+##### Schedule-driven close flattening
+
+Pricing owns the execution cutoff for each explicit asset eligibility scope. The
+trading-owned consumer polls `/trading-state`, independently of dashboard
+pricing. It validates environment, scope membership, eligibility profile,
+calendar evidence, and timestamp ordering before accepting a schedule.
+
+Enabled mode starts flattening at the announced cutoff before every actual
+closure, including ordinary overnight gaps, weekends, holidays, and half-days.
+Adjacent eligible sessions have one closing boundary. This does not enable new
+broker sessions. Regular-only assets retain market orders during regular hours;
+extended-eligible assets retain the protected limit-order policy below.
+
+The earliest accepted drain and close boundaries are durable. Outages, restarts,
+stale responses, and conflicting revisions cannot delay them. Startup rejects
+configuration that no longer matches a persisted pricing or broker-only safety
+scope's identity, membership, eligibility, or profile revision. A new interval
+must be fresh, non-overlapping, and already open after the old latch closes. The
+local cutoff timer requests a one-shot scan without multiplying periodic scan
+chains. Placement rechecks the same decision and broker execution status.
+
+With schedule enforcement enabled, recovery first looks up the original client
+order ID before checking the session or fetching a reference price, even after
+closure, and adopts any accepted broker order for reconciliation. A definitive
+absence is distinct from a lookup failure. Deferred placement retains its
+durable Pending intent and claim for later retries. Existing Pending records do
+not retain the extended-hours limit price: if such an orphan was never accepted,
+recovery waits for regular hours rather than inventing a limit price. Non-zero
+net exposure at the latched close is reported even when a Pending claim or
+quantity threshold prevents a hedge; a deferred order does not establish that
+the bot is flat. Observation mode retains the legacy recovery path.
+
+Polling, request timeout, response freshness, calendar age, and evidence clock
+skew are explicit settings. Initial deployment values are 5, 3, 30, 7200, and 2
+seconds. Missing usable schedule data uses the explicit 900-second emergency
+buffer only with trusted broker close metadata. Without either source, normal
+risk-reducing hedging continues where executable and the missing protection is
+reported. Cached state never grants broker eligibility.
+
+Observation mode records these decisions without changing orders or the old
+long-gap policy below. Runtime configs omit this optional block until the
+released binary accepts it. Tested observation-mode fragments in
+`docs/trading-schedule/` describe the initial rollout configuration. Adding them
+to runtime configs requires a supporting binary release first; config validation
+must not be bypassed to send a new schema to an older binary. Activation and
+signed-order expiry verification require separate approval. See
+[ADR 0021](adrs/0021-consume-pricing-trading-schedule.md).
+
+`trading_schedule_accepted_total{scope}` counts validated response processing,
+including repeated revisions. It increments before persistence, so it does not
+count distinct revisions or prove a successful durable commit.
+`hedge_placement_deferred_total{reason}` counts admission deferrals by broker
+session, broker-boundary persistence, or schedule closure. Logs retain the
+symbol and original client order ID; deferral does not mean that exposure is
+covered.
+
+##### Observation-mode legacy close flattening
 
 During the configured final `extended_hours_close_flatten_window_secs` of an
 extended session, the bot enters **close-flatten mode** only when the next

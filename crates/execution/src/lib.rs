@@ -122,6 +122,9 @@ pub enum PostCloseGap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketSessionStatus {
     pub session: MarketSession,
+    /// Earliest eligible broker session start for this calendar interval.
+    pub session_opens_at: Option<DateTime<Utc>>,
+    pub regular_session_closes_at: Option<DateTime<Utc>>,
     pub extended_session_closes_at: Option<DateTime<Utc>>,
     pub post_close_gap: PostCloseGap,
 }
@@ -131,6 +134,8 @@ impl MarketSessionStatus {
     pub fn without_close_metadata(session: MarketSession) -> Self {
         Self {
             session,
+            session_opens_at: None,
+            regular_session_closes_at: None,
             extended_session_closes_at: None,
             post_close_gap: PostCloseGap::Unknown,
         }
@@ -256,6 +261,14 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error>;
+
+    /// Reads an earlier placement without submitting a new order.
+    async fn recover_order_by_client_id(
+        &self,
+        _order: &MarketOrder,
+    ) -> Result<Option<OrderPlacement<Self::OrderId>>, Self::Error> {
+        Ok(None)
+    }
 
     /// Get the current status of a specific order
     /// Used to check if pending orders have been filled or failed

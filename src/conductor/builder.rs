@@ -111,6 +111,8 @@ pub(crate) struct CqrsFrameworks {
 
 #[derive(Debug, Error)]
 pub(crate) enum ConductorSpawnError {
+    #[error(transparent)]
+    TradingSchedule(#[from] crate::trading_schedule::TradingScheduleError),
     #[error(
         "watched chain {chain} has no {what} wired; the provider, queue, and \
          token maps must all be derived from the same chain registry"
@@ -134,6 +136,7 @@ pub(crate) enum ConductorSpawnError {
 
 /// Everything needed to construct a running [`Conductor`].
 pub(crate) struct ConductorCtx<Prov, Exec> {
+    pub(crate) trading_schedule: Option<Arc<crate::trading_schedule::TradingScheduleStore>>,
     pub(crate) ctx: Ctx,
     /// Providers for watched, non-primary chains (the primary's fill watcher
     /// reuses `provider`). Keyed by chain; derived from the same registry as
@@ -401,16 +404,32 @@ where
     // The broker placement capability, lifted out of the (now pure)
     // `OffchainOrder::Place` handler: both the rebalancing hedge job and the
     // trade-processing path place through it instead of the aggregate.
-    let order_placer: Arc<dyn OrderPlacer> =
-        Arc::new(ExecutorOrderPlacer(context.executor.clone()));
 
     // Validated once here rather than re-parsed from the raw config
     // `u64` on every hedge job / position-check tick (RAI-1404 follow-up):
     // the window is fixed for the process lifetime, so a construction-time
     // failure should fail startup, not thread a per-call `Result` through
     // the hot placement and scan paths.
+    let schedule = context.trading_schedule;
+    let schedule_monitor =
+        schedule
+            .as_ref()
+            .zip(context.ctx.pricing.as_ref())
+            .map(
+                |(store, pricing)| crate::trading_schedule::TradingScheduleMonitor {
+                    store: store.clone(),
+                    pricing: pricing.clone(),
+                    queue: check_positions_queue.clone(),
+                },
+            );
     let close_flatten_policy =
-        CloseFlattenPolicy::from_secs(context.ctx.extended_hours_close_flatten_window_secs)?;
+        CloseFlattenPolicy::from_secs(context.ctx.extended_hours_close_flatten_window_secs)?
+            .with_schedule(schedule);
+
+    let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+        executor: context.executor.clone(),
+        close_flatten_policy: Some(close_flatten_policy.clone()),
+    });
 
     let close_flatten_ramp = CloseFlattenCrossRamp::new(
         context.ctx.broker.counter_trade_slippage_bps(),
@@ -431,7 +450,7 @@ where
         hedge_queue: hedge_queue.clone(),
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock: counter_trade_submission_lock.clone(),
-        close_flatten_policy,
+        close_flatten_policy: close_flatten_policy.clone(),
         close_flatten_ramp,
         poll_interval,
         notifier: notifier.clone(),
@@ -452,7 +471,7 @@ where
         ctx: context.ctx.clone(),
         pool: context.pool.clone(),
         check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
-        close_flatten_policy,
+        close_flatten_policy: close_flatten_policy.clone(),
         close_flatten_ramp,
         poll_interval,
         notifier: notifier.clone(),
@@ -543,6 +562,7 @@ where
         executor_maintenance: executor_maintenance_startup,
         base_gas_monitor: base_gas_monitor_startup,
         ethereum_gas_monitor: ethereum_gas_monitor_startup,
+        trading_schedule_monitor: trading_schedule_monitor_startup,
     } = context.supervisor_startup;
 
     // Fail-fast: exit if any supervised task dies, relying on systemd restart for recovery.
@@ -661,6 +681,18 @@ where
         ethereum_gas_monitor_startup.acknowledge();
     }
 
+    log_optional_task_status("trading schedule monitor", schedule_monitor.is_some());
+    if let Some(monitor) = schedule_monitor {
+        supervisor_builder = supervisor_builder.with_task(
+            "trading-schedule-monitor",
+            StartupTask {
+                task: monitor,
+                token: trading_schedule_monitor_startup,
+            },
+        );
+    } else {
+        trading_schedule_monitor_startup.acknowledge();
+    }
     let supervisor = supervisor_builder.build().run();
 
     let monitor = MonitorWiring {

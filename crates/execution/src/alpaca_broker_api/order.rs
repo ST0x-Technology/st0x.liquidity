@@ -569,6 +569,45 @@ fn parse_limit_price(
         .map_err(Into::into)
 }
 
+pub(super) async fn recover_order_by_client_id(
+    client: &AlpacaBrokerApiClient,
+    order: &MarketOrder,
+) -> Result<Option<OrderPlacement<String>>, AlpacaBrokerApiError> {
+    let Some(existing) = client
+        .get_order_by_client_order_id(&order.client_order_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let direction = match existing.side {
+        OrderSide::Buy => Direction::Buy,
+        OrderSide::Sell => Direction::Sell,
+    };
+    let extended_hours =
+        existing
+            .extended_hours
+            .ok_or_else(|| AlpacaBrokerApiError::IncompleteOrder {
+                order_id: ExecutorOrderId::new(&existing.id),
+                field: MissingOrderField::ExtendedHours,
+            })?;
+    let limit_price = parse_limit_price(existing.limit_price)?;
+    if extended_hours && limit_price.is_none() {
+        return Err(AlpacaBrokerApiError::IncompleteOrder {
+            order_id: ExecutorOrderId::new(&existing.id),
+            field: MissingOrderField::Price,
+        });
+    }
+    Ok(Some(OrderPlacement {
+        order_id: existing.id.to_string(),
+        symbol: existing.symbol,
+        shares: existing.quantity,
+        direction,
+        placed_at: Utc::now(),
+        extended_hours,
+        limit_price,
+    }))
+}
+
 /// Alpaca returns a 422 with "client_order_id must be unique" when a placement
 /// re-uses a `client_order_id` already attached to an active order. This is the
 /// recoverable duplicate-submission case (the original 2xx was lost in flight),
@@ -1494,6 +1533,83 @@ mod tests {
         // A fresh market placement carries no session terms.
         assert!(!placement.extended_hours);
         assert_eq!(placement.limit_price, None);
+    }
+
+    #[tokio::test]
+    async fn recovery_lookup_distinguishes_absence_from_failure_without_submitting() {
+        for status in [404, 500] {
+            let server = MockServer::start();
+            let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+            let lookup = server.mock(|when, then| {
+                when.method(GET).path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id");
+                then.status(status).json_body(json!({"message": "lookup unavailable"}));
+            });
+            let placement = server.mock(|when, then| {
+                when.method(POST);
+                then.status(500);
+            });
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            let order = MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(uuid!(
+                    "33333333-3333-4333-8333-333333333333"
+                )),
+            };
+            let recovered = recover_order_by_client_id(&client, &order).await;
+            if status == 404 {
+                assert!(recovered.unwrap().is_none());
+            } else {
+                assert!(matches!(
+                    recovered.unwrap_err(),
+                    AlpacaBrokerApiError::ApiError {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        ..
+                    }
+                ));
+            }
+            lookup.assert();
+            placement.assert_calls(0);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_requires_explicit_session_terms_without_submitting() {
+        for (extended_hours, field) in [
+            (None, MissingOrderField::ExtendedHours),
+            (Some(true), MissingOrderField::Price),
+        ] {
+            let server = MockServer::start();
+            let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+            let lookup = server.mock(|when, then| {
+                when.method(GET).path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id");
+                then.status(200).json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b", "symbol": "AAPL", "qty": "1", "side": "sell", "status": "new", "extended_hours": extended_hours, "limit_price": null
+                }));
+            });
+            let placement = server.mock(|when, then| {
+                when.method(POST);
+                then.status(500);
+            });
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+            let order = MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(uuid!(
+                    "33333333-3333-4333-8333-333333333333"
+                )),
+            };
+            let error = recover_order_by_client_id(&client, &order)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AlpacaBrokerApiError::IncompleteOrder { field: actual, .. } if actual == field)
+            );
+            lookup.assert();
+            placement.assert_calls(0);
+        }
     }
 
     #[tokio::test]

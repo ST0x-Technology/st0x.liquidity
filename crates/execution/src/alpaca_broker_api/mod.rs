@@ -182,6 +182,7 @@ impl CryptoOrderFailureReason {
 /// spelling and new fields force exhaustive handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingOrderField {
+    ExtendedHours,
     FilledQty,
     Price,
     FilledAt,

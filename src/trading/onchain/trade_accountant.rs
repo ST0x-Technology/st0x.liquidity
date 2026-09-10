@@ -742,9 +742,8 @@ impl SymbolScopedReason {
     }
 }
 
-/// Why a hedge attempt was abandoned: the closed set of `reason` labels on
-/// `hedge_dead_lettered_total`, whose wire strings the dashboards query live
-/// in exactly one place.
+/// Shared hedge alert keys. Abandonment variants label `hedge_dead_lettered_total`;
+/// residual exposure is alert-only and does not count as abandonment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DeadLetterReason {
     /// A permanent failure raised before the position claim.
@@ -753,6 +752,8 @@ pub(crate) enum DeadLetterReason {
     /// rate-limiting outlives the reschedule budget, so every abandonment
     /// path shares one counter and is told apart by this label.
     BackpressureExhausted,
+    /// An alert-only retained exposure condition, not an abandoned hedge.
+    ResidualAfterClose,
 }
 
 impl DeadLetterReason {
@@ -760,6 +761,7 @@ impl DeadLetterReason {
         match self {
             Self::SymbolScoped(reason) => reason.metric_label(),
             Self::BackpressureExhausted => "backpressure_exhausted",
+            Self::ResidualAfterClose => "residual_after_close",
         }
     }
 }
