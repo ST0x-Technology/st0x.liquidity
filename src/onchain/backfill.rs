@@ -1156,7 +1156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hyperevm_second_batch_retries_preserve_checkpoint_until_full_success() {
+    async fn hyperevm_batch_failure_checkpoints_the_last_completed_batch() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let trading = TradingChain::test().chain(Chain::HyperEvm).call();
         save_backfill_checkpoint(&pool, &trading, 99).await.unwrap();
@@ -1195,9 +1195,13 @@ mod tests {
         for batch in &second[1..] {
             batch.assert_calls(1);
         }
+        // The first batch was fully enqueued, so its blocks are committed even
+        // though the range as a whole failed: a retry resumes at 150 instead of
+        // re-scanning from 100. Without this a long HyperEVM catch-up that
+        // exceeds PERFORM_TIMEOUT never converges.
         assert_eq!(
             load_backfill_checkpoint(&pool, &trading).await.unwrap(),
-            Some(99)
+            Some(149)
         );
 
         for batch in &mut second {
@@ -2478,9 +2482,11 @@ mod tests {
         .await;
 
         assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
+        // The first 1000-block batch completed before the second one failed, so
+        // its blocks stay committed and the retry resumes at 1001.
         assert_eq!(
             load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
-            None
+            Some(1000)
         );
     }
 
