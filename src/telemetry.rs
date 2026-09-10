@@ -43,7 +43,7 @@ const RETENTION: chrono::Duration = chrono::Duration::days(14);
 #[derive(Debug, Clone)]
 pub(crate) struct BlockLagSample {
     pub(crate) sampled_at: DateTime<Utc>,
-    /// The chain whose fill watcher took the sample: each watched chain
+    /// The chain whose fill watcher took the sample: each hedged chain
     /// records its own lag series.
     pub(crate) chain: Chain,
     pub(crate) orderbook: Address,

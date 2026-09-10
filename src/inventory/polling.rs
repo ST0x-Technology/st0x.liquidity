@@ -267,9 +267,9 @@ struct CashDivergenceEscalation {
     consecutive_polls: u32,
 }
 
-/// One watched chain's vault-reading leg: its own Raindex service, its own
+/// One hedged chain's vault-reading leg: its own Raindex service, its own
 /// chain-qualified vault registry, and the warning state scoped to the vaults
-/// it reads. The poller holds one per watched chain, so a chain's balances are
+/// it reads. The poller holds one per hedged chain, so a chain's balances are
 /// pinned to a block of its own and stamped with its own chain.
 pub(crate) struct ChainVaultPolling<Rpc>
 where
@@ -433,7 +433,7 @@ pub(crate) struct InventoryPollingService<Rpc, Exe>
 where
     Rpc: Evm,
 {
-    /// One entry per watched chain. Each is polled on its own pinned block, so
+    /// One entry per hedged chain. Each is polled on its own pinned block, so
     /// a chain's equity and USDC readings describe one consistent chain state.
     vault_polling: Vec<ChainVaultPolling<Rpc>>,
     executor: Exe,
@@ -582,7 +582,7 @@ where
         Ok(())
     }
 
-    /// Polls every watched chain's vaults. A chain that fails is logged with
+    /// Polls every hedged chain's vaults. A chain that fails is logged with
     /// its chain and the remaining chains still poll, so one chain's RPC
     /// outage cannot leave the others' inventory unrefreshed; the first
     /// failure is returned so the caller still sees the tick was incomplete.
@@ -598,7 +598,7 @@ where
                     target: "inventory",
                     chain = %vault_polling.chain,
                     ?error,
-                    "Vault polling failed on watched chain"
+                    "Vault polling failed on hedged chain"
                 );
                 first_error.get_or_insert(error);
             }

@@ -120,7 +120,7 @@ const EARLY_WAKE_BACKOFF: Duration = HYDRATION_RETRY_BACKOFF;
 const MAX_FRESHNESS_DEFER: chrono::Duration = chrono::Duration::hours(6);
 
 /// Shared dependencies for the [`PortfolioSnapshotJob`].
-/// What one watched chain contributes to the daily snapshot's completeness
+/// What one hedged chain contributes to the daily snapshot's completeness
 /// gates: the equities its own assets table configures, and whether it holds
 /// a cash vault there. Derived per chain rather than from the primary alone,
 /// because a chain the poller reads is a chain whose balances the capture
@@ -155,7 +155,7 @@ pub(crate) struct PortfolioSnapshotCtx {
     pub(crate) configured_equity_symbols: HashSet<Symbol>,
     /// Whether the hedging venue tracks cash at all.
     pub(crate) usdc_tracking_enabled: bool,
-    /// The market-making slots each watched chain contributes to the
+    /// The market-making slots each hedged chain contributes to the
     /// completeness gates, keyed by chain.
     pub(crate) market_making: BTreeMap<Chain, MarketMakingSlots>,
     /// Mirrors whether `[wallet_polling]` is configured (the same source the
@@ -1389,10 +1389,10 @@ mod tests {
     }
 
     /// The capture must wait for every chain the poller reads, so each
-    /// watched chain's own market-making slots are required -- and only the
+    /// hedged chain's own market-making slots are required -- and only the
     /// assets that chain declares.
     #[tokio::test]
-    async fn required_slots_cover_each_watched_chains_market_making_slots() {
+    async fn required_slots_cover_each_hedged_chains_market_making_slots() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let nvda = Symbol::new("NVDA").unwrap();
         let (mut ctx, _position) = build_ctx(
@@ -1433,7 +1433,7 @@ mod tests {
                 (PortfolioLocation::Hedging, PortfolioAsset::Equity(aapl())),
                 (PortfolioLocation::Hedging, PortfolioAsset::Usdc),
             ]),
-            "each watched chain gates on its own market-making slots"
+            "each hedged chain gates on its own market-making slots"
         );
     }
 

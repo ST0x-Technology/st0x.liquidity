@@ -81,7 +81,7 @@ pub(crate) struct ResumeTokenizationAggregate {
 
 /// Dependencies the job needs.
 ///
-/// `transfer` carries every watched chain's services, so a resume resolves
+/// `transfer` carries every hedged chain's services, so a resume resolves
 /// the chain its record names rather than assuming the primary.
 pub(crate) struct ResumeTokenizationCtx {
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,

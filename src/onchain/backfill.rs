@@ -167,7 +167,7 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
 /// Persistent job queue for backfill jobs.
 pub(crate) type BackfillJobQueue = crate::conductor::job::JobQueue<BackfillRange>;
 
-/// One namespaced backfill queue per watched chain. A chain's scan backlog,
+/// One namespaced backfill queue per hedged chain. A chain's scan backlog,
 /// in-flight rows, and orphan recovery are invisible to every other chain's
 /// queue and workers, so one chain's long catch-up cannot freeze another's
 /// ingestion through the monitor's overlap guard.
@@ -175,25 +175,25 @@ pub(crate) type BackfillJobQueue = crate::conductor::job::JobQueue<BackfillRange
 pub(crate) struct BackfillQueues(std::collections::BTreeMap<Chain, BackfillJobQueue>);
 
 impl BackfillQueues {
-    /// Builds one namespaced queue per watched chain in `chains`.
+    /// Builds one namespaced queue per hedged chain in `chains`.
     pub(crate) fn new(
         apalis_pool: &apalis_sqlite::SqlitePool,
         chains: &st0x_config::ChainRegistry,
     ) -> Self {
         Self(
             chains
-                .watched()
-                .map(|watched| {
+                .hedged()
+                .map(|hedged| {
                     (
-                        watched.chain,
-                        BackfillJobQueue::new_namespaced(apalis_pool, watched.chain.as_str()),
+                        hedged.chain,
+                        BackfillJobQueue::new_namespaced(apalis_pool, hedged.chain.as_str()),
                     )
                 })
                 .collect(),
         )
     }
 
-    /// The queue for `chain`; `None` when the chain is not watched.
+    /// The queue for `chain`; `None` when the chain is not hedged.
     pub(crate) fn for_chain(&self, chain: Chain) -> Option<&BackfillJobQueue> {
         self.0.get(&chain)
     }
@@ -288,7 +288,7 @@ where
         let chain_ctx = ctx
             .chains
             .get(&self.chain)
-            .ok_or(OnChainError::UnwatchedChain { chain: self.chain })?;
+            .ok_or(OnChainError::UnhedgedChain { chain: self.chain })?;
 
         backfill_range(
             chain_ctx.evm.provider(),
@@ -912,7 +912,7 @@ mod tests {
     use super::*;
     use crate::bindings::IRaindexV6;
 
-    /// Each watched chain advances its own checkpoint row: writing one
+    /// Each hedged chain advances its own checkpoint row: writing one
     /// chain's checkpoint neither clobbers nor reads through to another's.
     #[tokio::test]
     async fn checkpoints_are_scoped_per_chain() {
@@ -970,7 +970,7 @@ mod tests {
         );
     }
 
-    /// Admitting a second watched chain closes the rollback window: a
+    /// Admitting a second hedged chain closes the rollback window: a
     /// checkpoint write that names no chain is refused rather than silently
     /// filed under Base.
     #[tokio::test]

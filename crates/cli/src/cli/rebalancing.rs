@@ -181,7 +181,7 @@ pub(super) fn hedged_chain_context(
     network: TokenizationNetwork,
 ) -> anyhow::Result<HedgedChainContext<'_>> {
     let chain = Chain::from(network);
-    let Some(trading) = ctx.chains.watch(chain) else {
+    let Some(trading) = ctx.chains.hedged_chain(chain) else {
         anyhow::bail!(
             "{chain} has no [chains.{chain}.trading] table: vault operations need \
              that chain's orderbook, and the primary's addresses do not apply there"
@@ -1275,7 +1275,7 @@ fn resolve_tokenization_token(
     }
 
     let chain = Chain::from(network);
-    let Some(trading) = ctx.chains.watch(chain) else {
+    let Some(trading) = ctx.chains.hedged_chain(chain) else {
         anyhow::bail!(
             "pass --token with the {chain} tStock address for {symbol}: \
              no [chains.{chain}.trading] table lists it"
@@ -3038,7 +3038,7 @@ mod tests {
 
     /// A Base primary with an Ethereum secondary and the stub wallets, so a
     /// command that resolves the wrong chain observes Base's addresses.
-    fn create_ctx_watching_ethereum() -> Ctx {
+    fn create_ctx_hedging_on_ethereum() -> Ctx {
         let mut ctx = create_base_test_ctx();
         ctx.wallet = Some(OnchainWalletCtx::stub());
         ctx.chains.insert_secondary(
@@ -3054,7 +3054,7 @@ mod tests {
     /// never the primary's.
     #[test]
     fn hedged_chain_context_resolves_the_selected_chains_wallet_and_trading_table() {
-        let ctx = create_ctx_watching_ethereum();
+        let ctx = create_ctx_hedging_on_ethereum();
         let base_orderbook = ctx.chains.primary().orderbook;
 
         let ethereum = hedged_chain_context(&ctx, TokenizationNetwork::Ethereum).unwrap();
@@ -3099,7 +3099,7 @@ mod tests {
     /// Alpaca broker, stub wallets, gas thresholds for the corridor chains and
     /// an Ethereum secondary with its own orderbook, vault owner and
     /// redemption wallet: everything a service build needs short of a live RPC.
-    fn create_alpaca_ctx_watching_ethereum() -> Ctx {
+    fn create_alpaca_ctx_hedging_on_ethereum() -> Ctx {
         let mut ctx = create_alpaca_ctx_with_rebalancing(None);
         ctx.wallet = Some(OnchainWalletCtx::stub());
         ctx.alerts = Some(AlertsCtx::for_test(
@@ -3151,7 +3151,7 @@ mod tests {
 
     #[tokio::test]
     async fn transfer_equity_services_are_built_on_the_selected_chain() {
-        let ctx = create_alpaca_ctx_watching_ethereum();
+        let ctx = create_alpaca_ctx_hedging_on_ethereum();
         let pool = setup_test_db().await;
 
         let services =
@@ -3224,7 +3224,7 @@ mod tests {
     /// refused before anything reaches the chain.
     #[tokio::test]
     async fn transfer_equity_resume_refuses_a_network_the_record_disagrees_with() {
-        let ctx = create_alpaca_ctx_watching_ethereum();
+        let ctx = create_alpaca_ctx_hedging_on_ethereum();
         let pool = setup_test_db().await;
         let id = issuer_request_id("cli-mint-resume-chain-mismatch");
 
@@ -3396,7 +3396,7 @@ mod tests {
     /// by name instead of skipping the check.
     #[test]
     fn gas_readiness_refuses_a_chain_without_a_low_balance_threshold() {
-        let mut ctx = create_alpaca_ctx_watching_ethereum();
+        let mut ctx = create_alpaca_ctx_hedging_on_ethereum();
         ctx.chains
             .insert_secondary(HedgedChain::test().chain(Chain::HyperEvm).call());
         let hyperevm = hedged_chain_context(&ctx, TokenizationNetwork::HyperEvm).unwrap();
