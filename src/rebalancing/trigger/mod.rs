@@ -1965,10 +1965,10 @@ impl RebalancingService {
             ),
 
             OffchainEquity { positions, .. } => {
-                let trading_chain = inventory.trading_chain();
+                let primary_chain = inventory.primary_chain();
                 inventory.clone().apply_equity_snapshot(
                     Venue::Hedging,
-                    trading_chain,
+                    primary_chain,
                     positions.iter(),
                     fetched_at,
                     None,
@@ -2492,10 +2492,10 @@ impl Reactor for RebalancingService {
                         // lock so no snapshot can advance the watermark in
                         // between. A skipped leg is normal operation, not an
                         // error.
-                        let trading_chain = {
+                        let primary_chain = {
                             let mut inventory = self.inventory.write().await;
-                            let trading_chain = inventory.trading_chain();
-                            let on_primary = trade_id.chain == trading_chain;
+                            let primary_chain = inventory.primary_chain();
+                            let on_primary = trade_id.chain == primary_chain;
                             let equity_slot_seeded =
                                 inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
                             let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
@@ -2538,7 +2538,7 @@ impl Reactor for RebalancingService {
                             // across chains, so a fill credits and debits the
                             // slots of the chain it filled on. Routing it
                             // through the venue-addressed writers would move
-                            // the trading chain's balances instead.
+                            // the primary chain's balances instead.
                             let mut updated = inventory.clone();
                             if apply_equity_leg {
                                 updated = updated.update_equity_at(
@@ -2560,14 +2560,14 @@ impl Reactor for RebalancingService {
                                 )?;
                             }
                             *inventory = updated;
-                            trading_chain
+                            primary_chain
                         };
 
-                        // Only the trading chain rebalances: a secondary is
+                        // Only the primary chain rebalances: a secondary is
                         // prefunded and holds its own inventory, so its fill
-                        // must not schedule work against the trading chain's
+                        // must not schedule work against the primary chain's
                         // balances.
-                        if trade_id.chain == trading_chain {
+                        if trade_id.chain == primary_chain {
                             self.equity_scheduler.enqueue_check(symbol).await;
                             self.usdc_scheduler.enqueue_check().await;
                         }
@@ -2884,10 +2884,10 @@ impl RebalancingService {
         &self,
         symbol: &Symbol,
     ) -> Result<Option<TriggeredOperation>, equity::EquityTriggerError> {
-        // The trigger still dispatches on the trading chain; every lookup is
+        // The trigger still dispatches on the primary chain; every lookup is
         // keyed by it so the global rebalancer only has to pass a different
         // chain in.
-        let chain = self.inventory.read().await.trading_chain();
+        let chain = self.inventory.read().await.primary_chain();
         let wrapped_token = self.load_token_address(chain, symbol).await?.ok_or(
             equity::EquityTriggerError::TokenNotInRegistry(symbol.clone()),
         )?;
@@ -3319,7 +3319,7 @@ impl RebalancingService {
         // on every successful fetch, so an unchanged (event-suppressed) book
         // still reads fresh; the snapshot aggregate's own stamps freeze on
         // quiet books (see freshness.rs module doc).
-        let chain = self.inventory.read().await.trading_chain();
+        let chain = self.inventory.read().await.primary_chain();
         let last_polled = self.config.poll_freshness.last_observed(
             PortfolioLocation::MarketMaking(chain),
             &PortfolioAsset::Equity(symbol.clone()),
@@ -3489,7 +3489,7 @@ impl RebalancingService {
         // bridge must not be sized off a chain with no recent successful
         // USDC poll (PollFreshness, not snapshot stamps: a static USDC
         // balance emits no events, yet stays fresh while polled).
-        let chain = self.inventory.read().await.trading_chain();
+        let chain = self.inventory.read().await.primary_chain();
         let last_polled = self.config.poll_freshness.last_observed(
             PortfolioLocation::MarketMaking(chain),
             &PortfolioAsset::Usdc,
@@ -4402,9 +4402,9 @@ impl RebalancingService {
 
         let issuer_request_id = IssuerRequestId::generate();
         // The allocation planner is what will choose a chain per operation;
-        // until then every rebalance runs on the trading chain, and the job
+        // until then every rebalance runs on the primary chain, and the job
         // records it so the saga and its resume agree on where it ran.
-        let chain = self.inventory.read().await.trading_chain();
+        let chain = self.inventory.read().await.primary_chain();
 
         let push = queue
             .push(TransferEquityToMarketMaking {
@@ -4505,7 +4505,7 @@ impl RebalancingService {
         }
 
         let aggregate_id = RedemptionAggregateId::generate();
-        let chain = self.inventory.read().await.trading_chain();
+        let chain = self.inventory.read().await.primary_chain();
 
         let push = queue
             .push(TransferEquityToHedging {
@@ -8490,7 +8490,7 @@ mod tests {
         let redemption_id = redemption_aggregate_id("redemption-ethereum-rollback");
         let tombstone_at = Utc::now();
 
-        // Base (the trading chain) holds 90/0 and Ethereum 20/0 after the
+        // Base (the primary chain) holds 90/0 and Ethereum 20/0 after the
         // timeout cleared the Ethereum redemption's in-flight.
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(90), shares(0))
@@ -8569,7 +8569,7 @@ mod tests {
         assert_eq!(
             base_inflight,
             Some(shares(0)),
-            "the rollback must not touch the trading chain's slot"
+            "the rollback must not touch the primary chain's slot"
         );
         assert_eq!(base_available, Some(shares(90)));
     }
@@ -10456,13 +10456,13 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// A trading chain whose registry resolves the token but that has no
+    /// A primary chain whose registry resolves the token but that has no
     /// wrapper wired is refused by name rather than reading its vault ratio
     /// through another chain's wrapper.
     #[tokio::test]
-    async fn build_equity_operation_refuses_a_trading_chain_without_a_wrapper() {
+    async fn build_equity_operation_refuses_a_primary_chain_without_a_wrapper() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::for_trading_chain(Chain::Ethereum).with_equity(
+        let inventory = InventoryView::for_primary_chain(Chain::Ethereum).with_equity(
             symbol.clone(),
             shares(0),
             shares(0),
@@ -13022,13 +13022,13 @@ mod tests {
         drop(inventory);
     }
 
-    /// Terminal settlement must credit the configured trading chain's
+    /// Terminal settlement must credit the configured primary chain's
     /// onchain slot: with inventory keyed under Ethereum, a Base-hardcoded
     /// credit would leave the Ethereum slot at its seeded balance.
     #[tokio::test]
-    async fn terminal_deposit_credits_the_configured_trading_chain_slot() {
+    async fn terminal_deposit_credits_the_configured_primary_chain_slot() {
         let inventory =
-            InventoryView::for_trading_chain(Chain::Ethereum).with_usdc(usdc(100), usdc(900));
+            InventoryView::for_primary_chain(Chain::Ethereum).with_usdc(usdc(100), usdc(900));
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -13062,13 +13062,13 @@ mod tests {
     }
 
     /// Cancelling a failed onchain-sourced rebalance must release and credit
-    /// back the configured trading chain's slot. The mid-flight assertion
+    /// back the configured primary chain's slot. The mid-flight assertion
     /// pins the debit to the Ethereum slot; the final one pins the
     /// cancel's release and credit-back to the same slot.
     #[tokio::test]
-    async fn terminal_cancel_releases_the_configured_trading_chain_slot() {
+    async fn terminal_cancel_releases_the_configured_primary_chain_slot() {
         let inventory =
-            InventoryView::for_trading_chain(Chain::Ethereum).with_usdc(usdc(900), usdc(100));
+            InventoryView::for_primary_chain(Chain::Ethereum).with_usdc(usdc(900), usdc(100));
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
