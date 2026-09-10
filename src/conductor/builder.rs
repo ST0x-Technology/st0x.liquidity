@@ -61,7 +61,8 @@ use crate::offchain::order::{
 use crate::onchain::backfill::{BackfillQueues, BackfillRange};
 use crate::onchain_trade::OnChainTrade;
 use crate::portfolio_snapshot::{
-    PortfolioSnapshot, PortfolioSnapshotCtx, PortfolioSnapshotJob, PortfolioSnapshotJobQueue,
+    MarketMakingSlots, PortfolioSnapshot, PortfolioSnapshotCtx, PortfolioSnapshotJob,
+    PortfolioSnapshotJobQueue,
 };
 use crate::position::Position;
 use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
@@ -191,6 +192,22 @@ pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
         })
         .cloned()
         .collect()
+}
+
+/// The market-making slots the daily portfolio-snapshot completeness gates
+/// require, keyed by chain. Each chain contributes exactly what its own
+/// assets table declares, so the gate demands what the inventory poller can
+/// actually stamp for that chain and nothing more.
+fn market_making_slots(ctx: &Ctx) -> BTreeMap<Chain, MarketMakingSlots> {
+    let primary = ctx.chains.primary();
+
+    BTreeMap::from([(
+        primary.chain,
+        MarketMakingSlots {
+            equity_symbols: configured_equity_symbols(ctx),
+            usdc_tracking_enabled: primary.assets.cash.is_some(),
+        },
+    )])
 }
 
 fn configured_chain_vaults(watched: &st0x_config::TradingChain) -> ConfiguredChainVaults {
@@ -508,7 +525,7 @@ where
     });
 
     let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
-        trading_chain: context.ctx.chains.primary().chain,
+        market_making: market_making_slots(&context.ctx),
         inventory: context.inventory.clone(),
         position_projection: context.frameworks.position_projection.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),

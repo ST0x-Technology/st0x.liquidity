@@ -120,6 +120,16 @@ const EARLY_WAKE_BACKOFF: Duration = HYDRATION_RETRY_BACKOFF;
 const MAX_FRESHNESS_DEFER: chrono::Duration = chrono::Duration::hours(6);
 
 /// Shared dependencies for the [`PortfolioSnapshotJob`].
+/// What one watched chain contributes to the daily snapshot's completeness
+/// gates: the equities its own assets table configures, and whether it holds
+/// a cash vault there. Derived per chain rather than from the primary alone,
+/// because a chain the poller reads is a chain whose balances the capture
+/// must wait for.
+pub(crate) struct MarketMakingSlots {
+    pub(crate) equity_symbols: HashSet<Symbol>,
+    pub(crate) usdc_tracking_enabled: bool,
+}
+
 pub(crate) struct PortfolioSnapshotCtx {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) position_projection: Arc<Projection<Position>>,
@@ -135,9 +145,11 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// rather than recomputed, so the completeness gate and the live
     /// inventory poller always agree on what "fully hydrated" means.
     pub(crate) configured_equity_symbols: HashSet<Symbol>,
+    /// Whether the hedging venue tracks cash at all.
     pub(crate) usdc_tracking_enabled: bool,
-    /// Chain whose market-making slots the completeness gates require.
-    pub(crate) trading_chain: Chain,
+    /// The market-making slots each watched chain contributes to the
+    /// completeness gates, keyed by chain.
+    pub(crate) market_making: BTreeMap<Chain, MarketMakingSlots>,
     /// Mirrors whether `[wallet_polling]` is configured (the same source the
     /// live inventory poller reads, `crate::inventory::WalletPollingCtx`):
     /// when `true`, [`hydration_gap`] also requires the wallet-transit
@@ -751,24 +763,30 @@ fn next_capture_delay(now: DateTime<Utc>) -> (Duration, NaiveDate) {
 fn required_slots(
     ctx: &PortfolioSnapshotCtx,
 ) -> impl Iterator<Item = (PortfolioLocation, PortfolioAsset)> + '_ {
-    let equity_pairs = ctx.configured_equity_symbols.iter().flat_map(|symbol| {
-        [
-            PortfolioLocation::MarketMaking(ctx.trading_chain),
+    let market_making_pairs = ctx.market_making.iter().flat_map(|(chain, slots)| {
+        let location = PortfolioLocation::MarketMaking(*chain);
+        let equities = slots
+            .equity_symbols
+            .iter()
+            .map(move |symbol| (location, PortfolioAsset::Equity(symbol.clone())));
+        let usdc = slots
+            .usdc_tracking_enabled
+            .then_some((location, PortfolioAsset::Usdc));
+
+        equities.chain(usdc)
+    });
+
+    let equity_pairs = ctx.configured_equity_symbols.iter().map(|symbol| {
+        (
             PortfolioLocation::Hedging,
-        ]
-        .into_iter()
-        .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
+            PortfolioAsset::Equity(symbol.clone()),
+        )
     });
 
     let usdc_pairs = ctx
         .usdc_tracking_enabled
-        .then_some([
-            PortfolioLocation::MarketMaking(ctx.trading_chain),
-            PortfolioLocation::Hedging,
-        ])
-        .into_iter()
-        .flatten()
-        .map(|location| (location, PortfolioAsset::Usdc));
+        .then_some((PortfolioLocation::Hedging, PortfolioAsset::Usdc))
+        .into_iter();
 
     let wallet_usdc_pairs = ctx
         .wallet_polling_enabled
@@ -794,7 +812,8 @@ fn required_slots(
             .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
         });
 
-    equity_pairs
+    market_making_pairs
+        .chain(equity_pairs)
         .chain(usdc_pairs)
         .chain(wallet_usdc_pairs)
         .chain(wallet_equity_pairs)
@@ -1325,7 +1344,13 @@ mod tests {
         let queue = PortfolioSnapshotJobQueue::new(&apalis_pool);
 
         let ctx = PortfolioSnapshotCtx {
-            trading_chain: Chain::Base,
+            market_making: BTreeMap::from([(
+                Chain::Base,
+                MarketMakingSlots {
+                    equity_symbols: configured_equity_symbols.clone(),
+                    usdc_tracking_enabled,
+                },
+            )]),
             inventory: broadcasting(inventory),
             position_projection,
             portfolio_snapshot,
