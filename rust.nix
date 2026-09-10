@@ -41,6 +41,18 @@ let
 
   fullSrc = withRainMathFloat "st0x-src" cleanedSrc;
 
+  # st0x-finance is a git dependency, so crane builds it during buildDepsOnly.
+  # Its Float dependency must therefore expose the real API even in the dummy
+  # workspace; otherwise mkDummySrc replaces the path crate with an empty lib.
+  depsDummySrc = craneLib.mkDummySrc {
+    src = fullSrc;
+    extraDummyScript = ''
+      rm -rf $out/${rainMathFloatPath}
+      mkdir -p $(dirname $out/${rainMathFloatPath})
+      cp -rL --no-preserve=mode ${rainMathFloat} $out/${rainMathFloatPath}
+    '';
+  };
+
   # Vendor cargo deps with git dependency hashes
   baseVendorDir = craneLib.vendorCargoDeps {
     src = fullSrc;
@@ -48,10 +60,14 @@ let
     outputHashes = {
       "git+https://github.com/rainlanguage/rain.error#3d2ed70fb2f7c6156706846e10f163d1e493a8d3" =
         "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
-      "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=v0.2.0#8a57fca95f2bb090e9bd4cab4ba6f9b1e22fffc1" =
-        "sha256-1vsayhfS3kghmwlKvdNYRklk85VKG6DiuS8Qpn75/wE=";
+      "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=v0.3.0#5f88f1498aa565510fe20d9d0092f48a2f5b0615" =
+        "sha256-Ycs/ycz9V0+dDHdADUiLs4xh1aSJvZjuks5/M1nbv9o=";
+      "git+https://github.com/ST0x-Technology/st0x.pricing-types?tag=v0.4.0#c2cc945e607d27eff01e521e22f3c63824a09520" =
+        "sha256-QoSQMJ3TvFgAVazXemPO2Rj/i8gQdIRbk2rh8YrK/vw=";
       "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" =
         "sha256-MkuPc9mWAmry5Yzjph4/IbaIvjevFUerji1lipLUK4g=";
+      "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.2.0#49cf157109508516ff6a01868d471c7649234b2f" =
+        "sha256-3BxD4dYsrroTe7ZXR95QNouhUgp4/oZBPmNAnY6TYgc=";
     };
 
     # st0x.issuance is a Solidity repo with a deep git submodule tree
@@ -161,12 +177,12 @@ let
   # dashboard builds from realizing backend contract ABIs.
   dtoArgs = depsArgs // rainMathFloatAbiEnv // { doCheck = false; };
 
-  # Build only dependencies (cached separately from source changes).
-  # Crane's mkDummySrc internally strips to manifests + dummy crate roots,
-  # so we feed it fullSrc rather than pre-stripping ourselves -- our prior
-  # manifest-only filter dropped src/lib.rs files for crates with implicit
-  # `[lib]` detection, which broke the deps build.
-  cargoArtifacts = craneLib.buildDepsOnly depsArgs;
+  # Build only dependencies (cached separately from source changes). The
+  # custom dummy source retains rain-math-float's implementation because git
+  # dependencies consume its API while this derivation is being built.
+  cargoArtifacts = craneLib.buildDepsOnly (
+    builtins.removeAttrs depsArgs [ "src" ] // { dummySrc = depsDummySrc; }
+  );
 
 in
 {

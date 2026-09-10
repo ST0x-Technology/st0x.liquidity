@@ -233,9 +233,8 @@ This project uses a Cargo workspace with:
 - **`st0x-wrapper`** (`crates/wrapper/`): `Wrapper` trait for ERC-4626
   wrap/unwrap
 - **`st0x-evm`** (`crates/evm/`): EVM wallet, provider, test-chain support
-- **`st0x-finance`** (`crates/finance/`): Shared financial primitives
-- **`st0x-float-serde`** (`crates/float-serde/`): Rain Float serde helpers
-- **`st0x-float-macro`** (`crates/float-macro/`): Compile-time `Float` literals
+- **`st0x-finance`**, **`st0x-float-serde`**, and **`st0x-float-macro`**: Shared
+  git dependencies from `ST0x-Technology/st0x.finance`
 
 ### Building & Running
 

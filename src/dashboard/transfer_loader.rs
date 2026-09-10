@@ -12,7 +12,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use st0x_dto::{TransferOperation, TransferWarning};
-use st0x_finance::Id;
+use st0x_finance::{BlankIdError, Id};
 use st0x_tokenization::IssuerRequestId;
 
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
@@ -62,35 +62,39 @@ impl TransferKind {
         }
     }
 
-    fn replay_warning(self, view_id: &str) -> TransferWarning {
-        match self {
+    fn replay_warning(self, view_id: &str) -> Result<TransferWarning, BlankIdError> {
+        Ok(match self {
             Self::EquityMint => TransferWarning::MintReplayFailed {
-                id: Id::new(view_id.to_owned()),
+                id: Id::new(view_id.to_owned())?,
             },
             Self::EquityRedemption => TransferWarning::RedemptionReplayFailed {
-                id: Id::new(view_id.to_owned()),
+                id: Id::new(view_id.to_owned())?,
             },
             Self::UsdcBridge => TransferWarning::BridgeReplayFailed {
-                id: Id::new(view_id.to_owned()),
+                id: Id::new(view_id.to_owned())?,
             },
-        }
+        })
     }
 
-    fn lifecycle_warning(self, view_id: &str) -> TransferWarning {
-        match self {
+    fn lifecycle_warning(self, view_id: &str) -> Result<TransferWarning, BlankIdError> {
+        Ok(match self {
             Self::EquityMint => TransferWarning::MintLifecycleFailed {
-                id: Id::new(view_id.to_owned()),
+                id: Id::new(view_id.to_owned())?,
             },
             Self::EquityRedemption => TransferWarning::RedemptionLifecycleFailed {
-                id: Id::new(view_id.to_owned()),
+                id: Id::new(view_id.to_owned())?,
             },
             Self::UsdcBridge => TransferWarning::BridgeLifecycleFailed {
-                id: Id::new(view_id.to_owned()),
+                id: Id::new(view_id.to_owned())?,
             },
-        }
+        })
     }
 
-    fn row_warning(self, view_id: &str, error: &TransferRowError) -> TransferWarning {
+    fn row_warning(
+        self,
+        view_id: &str,
+        error: &TransferRowError,
+    ) -> Result<TransferWarning, BlankIdError> {
         match error {
             TransferRowError::LifecycleFailed => self.lifecycle_warning(view_id),
             TransferRowError::Payload(_)
@@ -184,6 +188,8 @@ pub(crate) enum TransferHistoryError {
     },
     #[error("transfer history query produced unknown kind discriminant {value}")]
     UnknownKind { value: i64 },
+    #[error("transfer history row has a blank warning id")]
+    BlankWarningId(#[from] BlankIdError),
 }
 
 #[derive(Default)]
@@ -343,7 +349,7 @@ async fn fetch_transfer_page(
                     %error,
                     "Skipping unreadable transfer history row"
                 );
-                warnings.push(kind.row_warning(&view_id, &error));
+                warnings.push(kind.row_warning(&view_id, &error)?);
             }
         }
     }
@@ -534,7 +540,19 @@ async fn load_category(
                     %error,
                     "Skipping unreadable transfer seed row"
                 );
-                warnings.push(kind.row_warning(&view_id, &error));
+                match kind.row_warning(&view_id, &error) {
+                    Ok(warning) => warnings.push(warning),
+                    Err(warning_error) => {
+                        warn!(
+                            target: "dashboard",
+                            %view_id,
+                            %kind,
+                            %warning_error,
+                            "Failed to identify unreadable transfer seed row"
+                        );
+                        warnings.push(kind.category_unavailable_warning());
+                    }
+                }
             }
         }
     }
@@ -597,7 +615,7 @@ mod tests {
 
     fn mint_transfer(status: EquityMintStatus) -> TransferOperation {
         TransferOperation::EquityMint(EquityMintOperation {
-            id: Id::<EquityMintTag>::new("mint-1".to_string()),
+            id: Id::<EquityMintTag>::new("mint-1".to_string()).unwrap(),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             status,
@@ -608,7 +626,7 @@ mod tests {
 
     fn usdc_transfer(status: UsdcBridgeStatus) -> TransferOperation {
         TransferOperation::UsdcBridge(UsdcBridgeOperation {
-            id: Id::<UsdcBridgeTag>::new("usdc-1".to_string()),
+            id: Id::<UsdcBridgeTag>::new("usdc-1".to_string()).unwrap(),
             direction: UsdcBridgeDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             status,
@@ -677,6 +695,15 @@ mod tests {
         let id_source = Uuid::parse_str("not-a-uuid").unwrap_err();
         let id = TransferRowError::Id(id_source);
         assert_eq!(id.to_string(), "invalid transfer aggregate id");
+    }
+
+    #[test]
+    fn row_warning_rejects_blank_view_id() {
+        let error = TransferKind::EquityMint
+            .row_warning("   ", &TransferRowError::Uninitialized)
+            .unwrap_err();
+
+        assert_eq!(error, BlankIdError);
     }
 
     #[tokio::test]
@@ -964,7 +991,7 @@ mod tests {
         if let TransferOperation::EquityMint(op) = active_mint {
             assert_eq!(
                 op.id,
-                Id::<EquityMintTag>::new(seeded.active_mint.to_string())
+                Id::<EquityMintTag>::new(seeded.active_mint.to_string()).unwrap()
             );
         }
 
@@ -990,7 +1017,7 @@ mod tests {
         if let TransferOperation::EquityRedemption(op) = active_redemption {
             assert_eq!(
                 op.id,
-                Id::<EquityRedemptionTag>::new(seeded.active_redemption.to_string())
+                Id::<EquityRedemptionTag>::new(seeded.active_redemption.to_string()).unwrap()
             );
         }
 
@@ -1056,7 +1083,7 @@ mod tests {
         {
             assert_eq!(
                 usdc_op.id,
-                Id::<UsdcBridgeTag>::new(seeded.usdc.to_string()),
+                Id::<UsdcBridgeTag>::new(seeded.usdc.to_string()).unwrap(),
                 "USDC bridge ID should match the aggregate_id"
             );
         }
@@ -1069,7 +1096,7 @@ mod tests {
         {
             assert_eq!(
                 mint_op.id,
-                Id::<EquityMintTag>::new(seeded.failed_mint.to_string()),
+                Id::<EquityMintTag>::new(seeded.failed_mint.to_string()).unwrap(),
                 "failed mint ID should match the aggregate_id"
             );
         }
@@ -1152,10 +1179,47 @@ mod tests {
         assert_eq!(result.warnings.len(), 1, "expected one warning");
         match result.warnings.as_slice() {
             [TransferWarning::MintReplayFailed { id }] => {
-                assert_eq!(id, &Id::<EquityMintTag>::new(bad_mint_id.to_string()));
+                assert_eq!(
+                    id,
+                    &Id::<EquityMintTag>::new(bad_mint_id.to_string()).unwrap()
+                );
             }
             other => panic!("expected MintReplayFailed, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn transfer_history_rejects_blank_warning_id() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let payload = serde_json::json!({
+            "Live": {
+                "MintRequested": {
+                    "requested_at": Utc::now(),
+                    "malformed": true
+                }
+            }
+        });
+        sqlx::query(
+            "INSERT INTO tokenized_equity_mint_view (view_id, version, payload) \
+             VALUES ('   ', 1, ?1)",
+        )
+        .bind(payload.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = query_transfer_history(
+            &pool,
+            &TransferHistoryQuery {
+                limit: NonZeroUsize::new(100).unwrap(),
+                ..TransferHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, TransferHistoryError::BlankWarningId(_)));
     }
 
     #[tokio::test]
@@ -1599,10 +1663,40 @@ mod tests {
         assert_eq!(loaded.warnings.len(), 1, "expected one replay warning");
         match loaded.warnings.as_slice() {
             [TransferWarning::MintReplayFailed { id }] => {
-                assert_eq!(id, &Id::<EquityMintTag>::new(bad_mint_id.to_string()));
+                assert_eq!(
+                    id,
+                    &Id::<EquityMintTag>::new(bad_mint_id.to_string()).unwrap()
+                );
             }
             other => panic!("expected MintReplayFailed, got: {other:?}"),
         }
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn load_transfers_reports_category_unavailable_for_blank_warning_id() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO tokenized_equity_mint_view (view_id, version, payload) \
+             VALUES ('   ', 1, '{\"Uninitialized\":null}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let loaded = load_transfers(&pool).await;
+
+        assert!(loaded.active.is_empty());
+        assert!(loaded.recent.is_empty());
+        assert!(matches!(
+            loaded.warnings.as_slice(),
+            [TransferWarning::MintCategoryUnavailable]
+        ));
+        assert!(logs_contain(
+            "Failed to identify unreadable transfer seed row"
+        ));
     }
 
     #[tokio::test]
@@ -1635,7 +1729,7 @@ mod tests {
         assert!(loaded.recent.is_empty());
         match loaded.warnings.as_slice() {
             [TransferWarning::MintLifecycleFailed { id }] => {
-                assert_eq!(id, &Id::<EquityMintTag>::new(mint_id.to_string()));
+                assert_eq!(id, &Id::<EquityMintTag>::new(mint_id.to_string()).unwrap());
             }
             other => panic!("expected MintLifecycleFailed, got: {other:?}"),
         }

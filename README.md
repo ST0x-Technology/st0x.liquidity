@@ -510,16 +510,13 @@ Workspace crates:
 - **`st0x-wrapper`** (`crates/wrapper/`) - `Wrapper` trait and ERC-4626
   wrap/unwrap domain types
 - **`st0x-evm`** (`crates/evm/`) - EVM wallet, provider, and test-chain support
-- **`st0x-finance`** (`crates/finance/`) - Shared financial primitives:
-  `Symbol`, `FractionalShares`, `Usdc`, `Usd`, and related domain types
-- **`st0x-float-serde`** (`crates/float-serde/`) - Shared Rain Float formatting
-  and serde helpers for workspace wire formats
-- **`st0x-float-macro`** (`crates/float-macro/`) - Proc-macro for compile-time
-  `Float` literals (`float!(1.5)`)
 
-`st0x-event-sorcery` is an external git dependency (lives in the separate
-[event-sorcery](https://github.com/ST0x-Technology/event-sorcery) repo) and is
-not a workspace crate.
+External crates:
+
+- **`st0x-finance`**, **`st0x-float-serde`**, and **`st0x-float-macro`** come
+  from [st0x.finance](https://github.com/ST0x-Technology/st0x.finance)
+- **`st0x-event-sorcery`** comes from the separate
+  [event-sorcery](https://github.com/ST0x-Technology/event-sorcery) repository
 
 ### Infrastructure
 

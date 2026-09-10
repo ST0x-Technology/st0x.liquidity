@@ -46,7 +46,7 @@ pub enum MockOrderIdError {
     NonPositiveQuantity {
         order_id: String,
         #[source]
-        source: crate::NotPositive<crate::FractionalShares>,
+        source: Box<crate::NotPositive<crate::FractionalShares>>,
     },
 }
 
@@ -216,7 +216,7 @@ impl MockExecutor {
             })?;
         Positive::new(shares).map_err(|source| MockOrderIdError::NonPositiveQuantity {
             order_id: order_id.to_string(),
-            source,
+            source: Box::new(source),
         })
     }
 

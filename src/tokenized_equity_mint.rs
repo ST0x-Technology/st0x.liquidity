@@ -49,7 +49,6 @@ use tracing::{info, warn};
 use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::{FractionalShares, Symbol};
-use st0x_finance::Id;
 use st0x_tokenization::{
     ClientRequestId, IssuerRequestId, TokenizationRequest, TokenizationRequestId,
     TokenizationRequestStatus, TokenizationRequestType,
@@ -1458,7 +1457,7 @@ impl TokenizedEquityMint {
                 requested_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.to_string()),
+                id: crate::transfer_id(*issuer_request_id),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Minting,
@@ -1473,7 +1472,7 @@ impl TokenizedEquityMint {
                 accepted_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.to_string()),
+                id: crate::transfer_id(*issuer_request_id),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Minting,
@@ -1495,7 +1494,7 @@ impl TokenizedEquityMint {
                 received_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.to_string()),
+                id: crate::transfer_id(*issuer_request_id),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Wrapping,
@@ -1517,7 +1516,7 @@ impl TokenizedEquityMint {
                 wrapped_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.to_string()),
+                id: crate::transfer_id(*issuer_request_id),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Depositing,
@@ -1532,7 +1531,7 @@ impl TokenizedEquityMint {
                 deposited_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.to_string()),
+                id: crate::transfer_id(*issuer_request_id),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Completed {
@@ -1549,7 +1548,7 @@ impl TokenizedEquityMint {
                 failed_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.to_string()),
+                id: crate::transfer_id(*issuer_request_id),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Failed {
@@ -1567,7 +1566,7 @@ impl TokenizedEquityMint {
                 requested_at,
                 reconciled_at,
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.to_string()),
+                id: crate::transfer_id(*issuer_request_id),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Reconciled {
@@ -5107,7 +5106,7 @@ mod tests {
         let TransferOperation::EquityMint(op) = dto else {
             panic!("Expected EquityMint, got: {dto:?}");
         };
-        assert_eq!(op.id, Id::new(id.to_string()));
+        assert_eq!(op.id, crate::transfer_id(id.0));
         assert_eq!(op.symbol, symbol);
         assert_eq!(op.quantity, FractionalShares::new(float!(10)));
         assert!(

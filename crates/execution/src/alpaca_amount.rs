@@ -38,7 +38,10 @@ impl TryFrom<Float> for AlpacaAmount {
 
     fn try_from(amount: Float) -> Result<Self, Self::Error> {
         let raw = Usdc::new(amount);
-        let normalized = raw.floor_to_6_decimals()?;
+        if raw.is_negative()? {
+            return Err(UsdcConversionError::NegativeValue(amount));
+        }
+        let (normalized, _) = raw.truncate_to_decimals(6)?;
 
         Ok(Self { raw, normalized })
     }
