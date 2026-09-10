@@ -4924,26 +4924,46 @@ effect rather than a generic intent:
 **Standing rules:**
 
 - **All state-mutating recovery commands go through the CQRS aggregate-command
-  flow.** The CLI sends an aggregate command through the store, which routes it
-  to the aggregate's command handler to emit events; no recovery command writes
-  the `events` table directly. The non-mutating verb `rebuild` and the exempt
-  `cctp` group never touch the events table either: `rebuild` recomputes a
-  read-side projection from the existing event log, and `cctp` commands are pure
-  on-chain operations with no aggregate -- which is precisely why `reconcile`
-  exists to bring the aggregate back in sync after an out-of-band `cctp` action.
+  flow.** A direct-DB command sends an aggregate command through the local
+  store, which routes it to the aggregate's command handler to emit events. A
+  bot-routed command (`transfer resume`) posts to the running bot, whose worker
+  drives the same command flow. No recovery command writes the `events` table
+  directly on either path. The non-mutating verb `rebuild` and the exempt `cctp`
+  group never touch the events table either: `rebuild` recomputes a read-side
+  projection from the existing event log, and `cctp` commands are pure on-chain
+  operations with no aggregate -- which is precisely why `reconcile` exists to
+  bring the aggregate back in sync after an out-of-band `cctp` action.
 - **`recover` is not a CLI verb.** It historically meant three different things
   (raw mint completion, provider-truth un-failing, and on-chain mint adoption),
   so it carries no information. The raw bridge primitive is named
   `cctp complete-mint`; the legacy `cctp-recover` name has been removed.
 - **Execution mode is part of each command's contract.** Help text states which
   mode the command uses: direct-DB (the operator must ensure the bot is not
-  concurrently driving the same id); direct-DB plus a live RPC provider
-  (`transfer resume --kind usdc` drives the on-chain flow against the local
-  aggregate store, with the same no-concurrent-bot caveat); live RPC only
-  (`cctp complete-mint` touches no database state -- the caveat is the bot
-  concurrently driving the same on-chain mint); or the running bot (REST).
-  `recheck` and `transfer resume --kind equity` are the only commands that
+  concurrently driving the same id); direct-DB plus a live RPC provider; live
+  RPC only (`cctp complete-mint` touches no database state -- the caveat is the
+  bot concurrently driving the same on-chain mint); or the running bot (REST).
+  `recheck`, `transfer resume --kind equity`, and `transfer resume --kind usdc`
   require the bot.
+- **`transfer resume --kind usdc` routes through the running bot.** The CLI
+  posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
+  validates server-side (unknown id refuses -- a mistyped id must never start a
+  fresh burn; a direction mismatch refuses; a clean terminal refuses), then
+  applies the single-flight gates before it enqueues a transfer job keyed by the
+  EXISTING id for the apalis worker to drive: any live or retryable USDC job row
+  in either direction refuses with 409 (a terminal `Failed` row does NOT --
+  re-enqueueing it is the recovery case), and a durable guard holder other than
+  the requested id refuses with 409. The worker uses the aggregate's persisted
+  amount. Routing through the bot closes the CLI-vs-server race: the CLI process
+  never drives an aggregate the bot's worker may also drive. The manual
+  `transfer-usdc` command still starts a fresh transfer directly, but hands off
+  to this endpoint at the FIRST bot-resumable wait (attestation timeout,
+  settlement lag, inconclusive poll); when the bot is unreachable, the transfer
+  is durable -- a bot restart re-arms it automatically. Like the whole
+  `server_port` recovery surface (`/transfers/resume`, `/transfers/recheck`),
+  this endpoint is currently unauthenticated: any caller that can reach
+  `server_port` can drive live transfers. The deployment firewall must bind the
+  port to an operator-only interface. This is a tracked design constraint, not
+  an implemented guarantee.
 - **`--reason` MUST be required, with no default, on every event-emitting
   destructive verb** (`fail`, `reconcile`, `set`, and `position release-hedge`).
   A defaulted reason is an audit-hostile record and violates the
