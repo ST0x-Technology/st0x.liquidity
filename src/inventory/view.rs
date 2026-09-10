@@ -1363,6 +1363,19 @@ impl InventoryView {
             .map(VenueBalance::available)
     }
 
+    /// The market-making equity in flight in an explicit chain's slot.
+    #[cfg(test)]
+    pub(crate) fn onchain_equity_inflight_at(
+        &self,
+        symbol: &Symbol,
+        chain: Chain,
+    ) -> Option<FractionalShares> {
+        self.equities
+            .get(symbol)?
+            .get_venue(Venue::MarketMaking, chain)
+            .map(VenueBalance::inflight)
+    }
+
     /// The market-making USDC available in an explicit chain's slot.
     #[cfg(test)]
     pub(crate) fn onchain_usdc_available_at(&self, chain: Chain) -> Option<Usdc> {
@@ -2351,13 +2364,26 @@ impl InventoryView {
         venue: Venue,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
+        let chain = self.trading_chain;
+        self.clear_equity_inflight_at(symbol, chain, venue, now)
+    }
+
+    /// Like [`Self::clear_equity_inflight`], addressed to an explicit chain's
+    /// slot: a recovery rollback clears the in-flight on the chain the
+    /// transfer's record names rather than the trading chain.
+    pub(crate) fn clear_equity_inflight_at(
+        self,
+        symbol: &Symbol,
+        chain: Chain,
+        venue: Venue,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
         let Some(inventory) = self.equities.get(symbol).cloned() else {
             return Ok(self);
         };
 
-        let cleared =
-            Inventory::set_inflight(venue, FractionalShares::ZERO)(inventory, self.trading_chain)?;
-        let cleared = Inventory::with_last_rebalancing(now)(cleared, self.trading_chain)?;
+        let cleared = Inventory::set_inflight(venue, FractionalShares::ZERO)(inventory, chain)?;
+        let cleared = Inventory::with_last_rebalancing(now)(cleared, chain)?;
 
         let mut equities = self.equities;
         equities.insert(symbol.clone(), cleared);

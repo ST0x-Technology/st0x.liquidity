@@ -582,6 +582,7 @@ mod tests {
         UsdcBridgeDirection, UsdcBridgeOperation, UsdcBridgeStatus, UsdcBridgeTag,
     };
     use st0x_event_sorcery::{EventSourced, StoreBuilder};
+    use st0x_evm::Chain;
     use st0x_execution::{ClientOrderId, FractionalShares, Symbol};
     use st0x_finance::{Id, Usdc};
     use st0x_float_macro::float;
@@ -699,6 +700,7 @@ mod tests {
         let mint = TokenizedEquityMint::originate(&TokenizedEquityMintEvent::MintRequested {
             issuer_request_id: None,
             symbol: Symbol::new("AAPL").unwrap(),
+            chain: Chain::Base,
             quantity: float!(1),
             wallet: Address::ZERO,
             requested_at: Utc::now(),
@@ -771,6 +773,7 @@ mod tests {
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(10),
                 wallet: Address::ZERO,
@@ -789,6 +792,7 @@ mod tests {
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: Symbol::new("TSLA").unwrap(),
                 quantity: float!(5),
                 wallet: Address::ZERO,
@@ -1167,6 +1171,7 @@ mod tests {
         let mint = TokenizedEquityMint::originate(&TokenizedEquityMintEvent::MintRequested {
             issuer_request_id: None,
             symbol: Symbol::new("AAPL").unwrap(),
+            chain: Chain::Base,
             quantity: float!(1),
             wallet: Address::ZERO,
             requested_at: now,
@@ -1185,6 +1190,7 @@ mod tests {
         let redemption_id = redemption_aggregate_id("redemption-filter");
         let redemption = EquityRedemption::VaultWithdrawPending {
             symbol: Symbol::new("MSFT").unwrap(),
+            chain: Chain::Base,
             quantity: float!(2),
             token: Address::ZERO,
             wrapped_amount: alloy::primitives::U256::from(2),
@@ -1285,6 +1291,7 @@ mod tests {
             let entity = TokenizedEquityMint::originate(&TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
                 symbol: Symbol::new("AAPL").unwrap(),
+                chain: Chain::Base,
                 quantity: float!(1),
                 wallet: Address::ZERO,
                 requested_at,
@@ -1363,6 +1370,7 @@ mod tests {
             let entity = TokenizedEquityMint::originate(&TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
                 symbol: Symbol::new("AAPL").unwrap(),
+                chain: Chain::Base,
                 quantity: float!(1),
                 wallet: Address::ZERO,
                 requested_at,
@@ -1420,6 +1428,7 @@ mod tests {
             serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
                 symbol: Symbol::new("AAPL").unwrap(),
+                chain: Chain::Base,
                 quantity: float!(1),
                 wallet: Address::ZERO,
                 requested_at: Utc::now(),

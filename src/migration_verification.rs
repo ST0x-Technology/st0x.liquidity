@@ -872,6 +872,7 @@ mod tests {
 
         let open_mint = TokenizedEquityMint::MintRequested {
             issuer_request_id: None,
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(1),
             wallet: Address::ZERO,
@@ -884,6 +885,7 @@ mod tests {
         ));
         assert!(
             references_for(&TokenizedEquityMint::Failed {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: float!(1),
                 reason: "failed".to_string(),
@@ -894,6 +896,7 @@ mod tests {
         );
 
         let open_redemption = EquityRedemption::VaultWithdrawPending {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(1),
             token: Address::ZERO,
@@ -907,6 +910,7 @@ mod tests {
         ));
         assert!(
             references_for(&EquityRedemption::Failed {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: float!(1),
                 raindex_withdraw_tx: None,

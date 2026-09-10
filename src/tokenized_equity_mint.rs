@@ -48,6 +48,7 @@ use tracing::{info, warn};
 
 use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Id;
 use st0x_tokenization::{
@@ -298,6 +299,10 @@ pub enum TokenizedEquityMintCommand {
     RequestMint {
         issuer_request_id: IssuerRequestId,
         symbol: Symbol,
+        /// The chain this mint lands on. Carried by the genesis command
+        /// because `initialize` has no state to read it from, and persisted
+        /// so a resume never has to guess where the mint is running.
+        chain: Chain,
         quantity: Float,
         wallet: Address,
     },
@@ -308,6 +313,7 @@ pub enum TokenizedEquityMintCommand {
     RequestMintAt {
         issuer_request_id: IssuerRequestId,
         symbol: Symbol,
+        chain: Chain,
         quantity: Float,
         wallet: Address,
         requested_at: DateTime<Utc>,
@@ -455,6 +461,10 @@ pub enum TokenizedEquityMintEvent {
         #[serde(default)]
         issuer_request_id: Option<IssuerRequestId>,
         symbol: Symbol,
+        /// The chain this mint lands on. Absent in events recorded before
+        /// chains were tracked, which all ran on Base.
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -593,6 +603,7 @@ impl PartialEq for TokenizedEquityMintEvent {
                 Self::MintRequested {
                     issuer_request_id: id_a,
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     wallet: wal_a,
                     requested_at: req_a,
@@ -600,6 +611,7 @@ impl PartialEq for TokenizedEquityMintEvent {
                 Self::MintRequested {
                     issuer_request_id: id_b,
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     wallet: wal_b,
                     requested_at: req_b,
@@ -607,6 +619,7 @@ impl PartialEq for TokenizedEquityMintEvent {
             ) => {
                 id_a == id_b
                     && sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && wal_a == wal_b
                     && req_a == req_b
@@ -882,6 +895,11 @@ pub enum TokenizedEquityMint {
         #[serde(default)]
         issuer_request_id: Option<IssuerRequestId>,
         symbol: Symbol,
+        /// The chain this mint runs on, carried from the genesis event so a
+        /// resume never has to guess. Absent in aggregates persisted before
+        /// chains were tracked, which all ran on Base.
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -894,6 +912,8 @@ pub enum TokenizedEquityMint {
     /// Alpaca API accepted the mint request and returned tracking identifiers
     MintAccepted {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -913,6 +933,8 @@ pub enum TokenizedEquityMint {
     /// Onchain token transfer detected with transaction details
     TokensReceived {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -937,6 +959,8 @@ pub enum TokenizedEquityMint {
     /// Wrap transaction submitted, awaiting confirmation
     WrapSubmitted {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -962,6 +986,8 @@ pub enum TokenizedEquityMint {
     /// Tokens have been wrapped into ERC-4626 vault shares
     TokensWrapped {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -986,6 +1012,8 @@ pub enum TokenizedEquityMint {
     /// Vault deposit transaction submitted, awaiting confirmation
     VaultDepositSubmitted {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1008,6 +1036,8 @@ pub enum TokenizedEquityMint {
     /// Wrapped tokens deposited to Raindex vault
     DepositedIntoRaindex {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1029,6 +1059,8 @@ pub enum TokenizedEquityMint {
     /// Mint operation failed (terminal state)
     Failed {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1045,6 +1077,8 @@ pub enum TokenizedEquityMint {
     /// zero-value record.
     Reconciled {
         symbol: Symbol,
+        #[serde(default = "crate::onchain::legacy_chain")]
+        chain: Chain,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1068,6 +1102,7 @@ impl PartialEq for TokenizedEquityMint {
                 Self::MintRequested {
                     issuer_request_id: id_a,
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     wallet: wal_a,
                     requested_at: req_a,
@@ -1075,6 +1110,7 @@ impl PartialEq for TokenizedEquityMint {
                 Self::MintRequested {
                     issuer_request_id: id_b,
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     wallet: wal_b,
                     requested_at: req_b,
@@ -1082,6 +1118,7 @@ impl PartialEq for TokenizedEquityMint {
             ) => {
                 id_a == id_b
                     && sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && wal_a == wal_b
                     && req_a == req_b
@@ -1089,6 +1126,7 @@ impl PartialEq for TokenizedEquityMint {
             (
                 Self::MintAccepted {
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     wallet: wal_a,
                     issuer_request_id: iss_a,
@@ -1099,6 +1137,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
                 Self::MintAccepted {
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     wallet: wal_b,
                     issuer_request_id: iss_b,
@@ -1109,6 +1148,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
             ) => {
                 sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && wal_a == wal_b
                     && iss_a == iss_b
@@ -1120,6 +1160,7 @@ impl PartialEq for TokenizedEquityMint {
             (
                 Self::TokensReceived {
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     wallet: wal_a,
                     issuer_request_id: iss_a,
@@ -1133,6 +1174,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
                 Self::TokensReceived {
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     wallet: wal_b,
                     issuer_request_id: iss_b,
@@ -1146,6 +1188,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
             ) => {
                 sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && wal_a == wal_b
                     && iss_a == iss_b
@@ -1164,6 +1207,7 @@ impl PartialEq for TokenizedEquityMint {
             (
                 Self::WrapSubmitted {
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     wallet: wal_a,
                     issuer_request_id: iss_a,
@@ -1178,6 +1222,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
                 Self::WrapSubmitted {
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     wallet: wal_b,
                     issuer_request_id: iss_b,
@@ -1192,6 +1237,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
             ) => {
                 sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && wal_a == wal_b
                     && iss_a == iss_b
@@ -1211,6 +1257,7 @@ impl PartialEq for TokenizedEquityMint {
             (
                 Self::TokensWrapped {
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     wallet: wal_a,
                     issuer_request_id: iss_a,
@@ -1227,6 +1274,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
                 Self::TokensWrapped {
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     wallet: wal_b,
                     issuer_request_id: iss_b,
@@ -1243,6 +1291,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
             ) => {
                 sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && wal_a == wal_b
                     && iss_a == iss_b
@@ -1260,6 +1309,7 @@ impl PartialEq for TokenizedEquityMint {
             (
                 Self::VaultDepositSubmitted {
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     wallet: wal_a,
                     issuer_request_id: iss_a,
@@ -1276,6 +1326,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
                 Self::VaultDepositSubmitted {
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     wallet: wal_b,
                     issuer_request_id: iss_b,
@@ -1292,6 +1343,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
             ) => {
                 sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && wal_a == wal_b
                     && iss_a == iss_b
@@ -1309,6 +1361,7 @@ impl PartialEq for TokenizedEquityMint {
             (
                 Self::DepositedIntoRaindex {
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     issuer_request_id: iss_a,
                     tokenization_request_id: tok_a,
@@ -1320,6 +1373,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
                 Self::DepositedIntoRaindex {
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     issuer_request_id: iss_b,
                     tokenization_request_id: tok_b,
@@ -1331,6 +1385,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
             ) => {
                 sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && iss_a == iss_b
                     && tok_a == tok_b
@@ -1343,6 +1398,7 @@ impl PartialEq for TokenizedEquityMint {
             (
                 Self::Failed {
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     reason: reason_a,
                     requested_at: req_a,
@@ -1350,6 +1406,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
                 Self::Failed {
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     reason: reason_b,
                     requested_at: req_b,
@@ -1357,6 +1414,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
             ) => {
                 sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && reason_a == reason_b
                     && req_a == req_b
@@ -1365,6 +1423,7 @@ impl PartialEq for TokenizedEquityMint {
             (
                 Self::Reconciled {
                     symbol: sym_a,
+                    chain: chain_a,
                     quantity: qty_a,
                     failure_reason: fail_reason_a,
                     reconcile_reason: rec_reason_a,
@@ -1373,6 +1432,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
                 Self::Reconciled {
                     symbol: sym_b,
+                    chain: chain_b,
                     quantity: qty_b,
                     failure_reason: fail_reason_b,
                     reconcile_reason: rec_reason_b,
@@ -1381,6 +1441,7 @@ impl PartialEq for TokenizedEquityMint {
                 },
             ) => {
                 sym_a == sym_b
+                    && chain_a == chain_b
                     && qty_a.eq(*qty_b).unwrap_or(false)
                     && fail_reason_a == fail_reason_b
                     && rec_reason_a == rec_reason_b
@@ -1406,6 +1467,25 @@ impl TokenizedEquityMint {
             | Self::DepositedIntoRaindex { symbol, .. }
             | Self::Failed { symbol, .. }
             | Self::Reconciled { symbol, .. } => symbol,
+        }
+    }
+
+    /// The chain this mint runs on. Every service the saga uses -- tokenizer,
+    /// wrapper, raindex, vault lookup -- is resolved from it, so a resume
+    /// reads the chain off the aggregate instead of assuming the primary.
+    /// `pub` for the operator CLI, which refuses a resume whose `--network`
+    /// disagrees with the record.
+    pub fn chain(&self) -> Chain {
+        match self {
+            Self::MintRequested { chain, .. }
+            | Self::MintAccepted { chain, .. }
+            | Self::TokensReceived { chain, .. }
+            | Self::WrapSubmitted { chain, .. }
+            | Self::TokensWrapped { chain, .. }
+            | Self::VaultDepositSubmitted { chain, .. }
+            | Self::DepositedIntoRaindex { chain, .. }
+            | Self::Failed { chain, .. }
+            | Self::Reconciled { chain, .. } => *chain,
         }
     }
 
@@ -1566,6 +1646,7 @@ impl TokenizedEquityMint {
                 reconcile_reason,
                 requested_at,
                 reconciled_at,
+                ..
             } => TransferOperation::EquityMint(EquityMintOperation {
                 id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
@@ -1706,7 +1787,10 @@ impl EventSourced for TokenizedEquityMint {
     // the field is `#[serde(default)]`).
     // v6 invalidates snapshots so replay retains the optional request identity
     // in MintRequested. Events written before v6 deserialize with no identity.
-    const SCHEMA_VERSION: u64 = 6;
+    // v7: added `chain` to `MintRequested` and to every state variant, so a
+    // resume resolves the transfer's own chain instead of assuming the
+    // primary. Bumped to clear snapshots whose state predates the field.
+    const SCHEMA_VERSION: u64 = 7;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use TokenizedEquityMintEvent::*;
@@ -1714,12 +1798,14 @@ impl EventSourced for TokenizedEquityMint {
             MintRequested {
                 issuer_request_id,
                 symbol,
+                chain,
                 quantity,
                 wallet,
                 requested_at,
             } => Some(Self::MintRequested {
                 issuer_request_id: issuer_request_id.clone(),
                 symbol: symbol.clone(),
+                chain: *chain,
                 quantity: *quantity,
                 wallet: *wallet,
                 requested_at: *requested_at,
@@ -1731,6 +1817,11 @@ impl EventSourced for TokenizedEquityMint {
     #[allow(clippy::too_many_lines)]
     fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
         use TokenizedEquityMintEvent::*;
+
+        // Every state carries the chain the genesis event named; no later
+        // event can move a mint to another chain.
+        let chain = entity.chain();
+
         Ok(match event {
             MintRequested { .. } => None,
             WrappingFailed {
@@ -1742,6 +1833,7 @@ impl EventSourced for TokenizedEquityMint {
                 Self::TokensReceived { requested_at, .. }
                 | Self::WrapSubmitted { requested_at, .. } => Some(Self::Failed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     reason: reason
                         .clone()
@@ -1766,6 +1858,7 @@ impl EventSourced for TokenizedEquityMint {
                 };
                 Some(Self::Failed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     reason: reason.clone(),
                     requested_at: *requested_at,
@@ -1791,6 +1884,7 @@ impl EventSourced for TokenizedEquityMint {
 
                 Some(Self::MintAccepted {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     wallet: *wallet,
                     issuer_request_id: issuer_request_id.clone(),
@@ -1820,6 +1914,7 @@ impl EventSourced for TokenizedEquityMint {
 
                 Some(Self::MintAccepted {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     wallet: *wallet,
                     issuer_request_id: issuer_request_id.clone(),
@@ -1843,8 +1938,10 @@ impl EventSourced for TokenizedEquityMint {
                     requested_at,
                     accepted_at,
                     authorization: MintAuthorizationProgress::Signed(signed),
+                    ..
                 } => Some(Self::MintAccepted {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     wallet: *wallet,
                     issuer_request_id: issuer_request_id.clone(),
@@ -1889,6 +1986,7 @@ impl EventSourced for TokenizedEquityMint {
 
                 Some(Self::Failed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     reason: reason.clone(),
                     requested_at: *requested_at,
@@ -1913,6 +2011,7 @@ impl EventSourced for TokenizedEquityMint {
                     // The authorization served its purpose once tokens
                     // arrive; later states deliberately do not carry it.
                     authorization: _,
+                    ..
                 } = entity
                 else {
                     return Ok(None);
@@ -1920,6 +2019,7 @@ impl EventSourced for TokenizedEquityMint {
 
                 Some(Self::TokensReceived {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     wallet: *wallet,
                     issuer_request_id: issuer_request_id.clone(),
@@ -1954,6 +2054,7 @@ impl EventSourced for TokenizedEquityMint {
 
                 Some(Self::TokensReceived {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     wallet: *wallet,
                     issuer_request_id: issuer_request_id.clone(),
@@ -1983,6 +2084,7 @@ impl EventSourced for TokenizedEquityMint {
                     requested_at,
                     accepted_at,
                     received_at,
+                    ..
                 } = entity
                 else {
                     return Ok(None);
@@ -1990,6 +2092,7 @@ impl EventSourced for TokenizedEquityMint {
 
                 Some(Self::WrapSubmitted {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     wallet: *wallet,
                     issuer_request_id: issuer_request_id.clone(),
@@ -2037,6 +2140,7 @@ impl EventSourced for TokenizedEquityMint {
                     ..
                 } => Some(Self::TokensWrapped {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     wallet: *wallet,
                     issuer_request_id: issuer_request_id.clone(),
@@ -2080,6 +2184,7 @@ impl EventSourced for TokenizedEquityMint {
 
                 Some(Self::VaultDepositSubmitted {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     wallet: *wallet,
                     issuer_request_id: issuer_request_id.clone(),
@@ -2121,6 +2226,7 @@ impl EventSourced for TokenizedEquityMint {
                     ..
                 } => Some(Self::DepositedIntoRaindex {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: tokenization_request_id.clone(),
@@ -2147,6 +2253,7 @@ impl EventSourced for TokenizedEquityMint {
                     ..
                 } => Some(Self::Failed {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     reason: reason.clone(),
                     requested_at: *requested_at,
@@ -2172,6 +2279,7 @@ impl EventSourced for TokenizedEquityMint {
 
                 Some(Self::Reconciled {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: *quantity,
                     failure_reason: failure_reason.clone(),
                     reconcile_reason: reason.clone(),
@@ -2188,21 +2296,37 @@ impl EventSourced for TokenizedEquityMint {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use TokenizedEquityMintEvent::*;
 
-        let (issuer_request_id, symbol, quantity, wallet, now) = match command {
+        let (issuer_request_id, symbol, chain, quantity, wallet, now) = match command {
             TokenizedEquityMintCommand::RequestMint {
                 issuer_request_id,
                 symbol,
+                chain,
                 quantity,
                 wallet,
-            } => (issuer_request_id, symbol, quantity, wallet, Utc::now()),
+            } => (
+                issuer_request_id,
+                symbol,
+                chain,
+                quantity,
+                wallet,
+                Utc::now(),
+            ),
             #[cfg(any(test, feature = "test-support"))]
             TokenizedEquityMintCommand::RequestMintAt {
                 issuer_request_id,
                 symbol,
+                chain,
                 quantity,
                 wallet,
                 requested_at,
-            } => (issuer_request_id, symbol, quantity, wallet, requested_at),
+            } => (
+                issuer_request_id,
+                symbol,
+                chain,
+                quantity,
+                wallet,
+                requested_at,
+            ),
             _ => return Err(TokenizedEquityMintError::NotInitialized),
         };
 
@@ -2213,6 +2337,7 @@ impl EventSourced for TokenizedEquityMint {
         info!(
             target: "tokenization",
             %symbol,
+            %chain,
             ?quantity,
             %wallet,
             "Initiating mint request"
@@ -2221,6 +2346,7 @@ impl EventSourced for TokenizedEquityMint {
         Ok(vec![MintRequested {
             issuer_request_id: Some(issuer_request_id),
             symbol,
+            chain,
             quantity,
             wallet,
             requested_at: now,
@@ -3048,6 +3174,7 @@ mod tests {
 
     fn mint_command() -> TokenizedEquityMintCommand {
         TokenizedEquityMintCommand::RequestMint {
+            chain: Chain::Base,
             issuer_request_id: issuer_request_id("ISS001"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
@@ -3187,6 +3314,7 @@ mod tests {
     fn mint_requested_event() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
             issuer_request_id: None,
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
@@ -3201,6 +3329,7 @@ mod tests {
                 "11111111-2222-4333-8444-555555555555".parse().unwrap(),
             )),
             symbol: Symbol::new("AAPL").unwrap(),
+            chain: Chain::Base,
             quantity: float!(100.5),
             wallet: "0x0000000000000000000000000000000000000001"
                 .parse()
@@ -3211,6 +3340,7 @@ mod tests {
             "MintRequested": {
                 "issuer_request_id": "11111111-2222-4333-8444-555555555555",
                 "symbol": "AAPL",
+                "chain": "base",
                 "quantity": "100.5",
                 "wallet": "0x0000000000000000000000000000000000000001",
                 "requested_at": "2026-01-01T00:00:00Z"
@@ -3826,6 +3956,7 @@ mod tests {
     #[test]
     fn test_evolve_accepted_rejects_wrong_state() {
         let deposited = TokenizedEquityMint::DepositedIntoRaindex {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             issuer_request_id: issuer_request_id("ISS123"),
@@ -3851,6 +3982,7 @@ mod tests {
     fn test_evolve_tokens_received_rejects_wrong_state() {
         let requested = TokenizedEquityMint::MintRequested {
             issuer_request_id: None,
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
@@ -3871,6 +4003,7 @@ mod tests {
     #[test]
     fn test_evolve_rejected_rejects_non_requested_states() {
         let accepted = TokenizedEquityMint::MintAccepted {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
@@ -3897,6 +4030,7 @@ mod tests {
         // state past acceptance -- a mid-pipeline TokensReceived or a terminal
         // Failed mint.
         let already_failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             reason: "previous failure".to_string(),
@@ -3934,6 +4068,7 @@ mod tests {
     fn test_evolve_rejects_mint_requested_on_existing_state() {
         let requested = TokenizedEquityMint::MintRequested {
             issuer_request_id: None,
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
@@ -3942,6 +4077,7 @@ mod tests {
 
         let event = TokenizedEquityMintEvent::MintRequested {
             issuer_request_id: None,
+            chain: Chain::Base,
             symbol: Symbol::new("GOOG").unwrap(),
             quantity: float!(50),
             wallet: Address::random(),
@@ -3955,6 +4091,7 @@ mod tests {
     #[test]
     fn test_evolve_vault_deposited_rejects_wrong_state() {
         let accepted = TokenizedEquityMint::MintAccepted {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
@@ -4005,6 +4142,7 @@ mod tests {
     #[test]
     fn test_evolve_tokens_wrapped_rejects_wrong_state() {
         let accepted = TokenizedEquityMint::MintAccepted {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
@@ -4150,6 +4288,7 @@ mod tests {
     fn reject_mint_evolves_from_requested_to_failed() {
         let requested = TokenizedEquityMint::MintRequested {
             issuer_request_id: None,
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
             wallet: Address::random(),
@@ -4173,6 +4312,7 @@ mod tests {
     #[test]
     fn wrapping_failed_evolves_from_tokens_received_to_failed() {
         let tokens_received = TokenizedEquityMint::TokensReceived {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
             wallet: Address::random(),
@@ -4356,6 +4496,7 @@ mod tests {
         let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
             .given_no_previous_events()
             .when(TokenizedEquityMintCommand::RequestMintAt {
+                chain: Chain::Base,
                 issuer_request_id: issuer_request_id("ISS001"),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(10),
@@ -4762,6 +4903,7 @@ mod tests {
                 .send(
                     &id,
                     TokenizedEquityMintCommand::RequestMint {
+                        chain: Chain::Base,
                         issuer_request_id: id.clone(),
                         symbol: Symbol::new("AAPL").unwrap(),
                         quantity: float!(10),
@@ -5098,6 +5240,7 @@ mod tests {
 
         let requested = TokenizedEquityMint::MintRequested {
             issuer_request_id: None,
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             wallet: Address::ZERO,
@@ -5119,6 +5262,7 @@ mod tests {
         assert_eq!(op.updated_at, now);
 
         let accepted = TokenizedEquityMint::MintAccepted {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             wallet: Address::ZERO,
@@ -5140,6 +5284,7 @@ mod tests {
         assert_eq!(op.updated_at, later);
 
         let received = TokenizedEquityMint::TokensReceived {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             wallet: Address::ZERO,
@@ -5164,6 +5309,7 @@ mod tests {
         assert_eq!(op.updated_at, later);
 
         let wrapped = TokenizedEquityMint::TokensWrapped {
+            chain: Chain::Base,
             symbol,
             quantity: float!(10),
             wallet: Address::ZERO,
@@ -5199,6 +5345,7 @@ mod tests {
         let later = now + chrono::Duration::seconds(60);
 
         let deposited = TokenizedEquityMint::DepositedIntoRaindex {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             issuer_request_id: issuer_request_id("ISS001"),
@@ -5222,6 +5369,7 @@ mod tests {
         assert_eq!(op.updated_at, later);
 
         let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol,
             quantity: float!(10),
             reason: "Something went wrong".to_string(),
@@ -5247,6 +5395,7 @@ mod tests {
         let requested_at = Utc::now();
         let recovered_at = requested_at + chrono::Duration::seconds(60);
         let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             reason: "poll timeout".to_string(),
@@ -5771,6 +5920,7 @@ mod tests {
         let requested_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled = TokenizedEquityMint::Reconciled {
+            chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
             failure_reason: "timed out".to_string(),
@@ -5816,6 +5966,7 @@ mod tests {
         assert!(
             !TokenizedEquityMint::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 wallet: Address::ZERO,
@@ -5826,6 +5977,7 @@ mod tests {
 
         assert!(
             !TokenizedEquityMint::MintAccepted {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 wallet: Address::ZERO,
@@ -5840,6 +5992,7 @@ mod tests {
 
         assert!(
             !TokenizedEquityMint::TokensReceived {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 wallet: Address::ZERO,
@@ -5857,6 +6010,7 @@ mod tests {
 
         assert!(
             !TokenizedEquityMint::WrapSubmitted {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 wallet: Address::ZERO,
@@ -5875,6 +6029,7 @@ mod tests {
 
         assert!(
             !TokenizedEquityMint::TokensWrapped {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 wallet: Address::ZERO,
@@ -5895,6 +6050,7 @@ mod tests {
 
         assert!(
             !TokenizedEquityMint::VaultDepositSubmitted {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 wallet: Address::ZERO,
@@ -5915,6 +6071,7 @@ mod tests {
 
         assert!(
             TokenizedEquityMint::DepositedIntoRaindex {
+                chain: Chain::Base,
                 symbol: sym.clone(),
                 quantity: float!(1),
                 issuer_request_id: id,
@@ -5930,6 +6087,7 @@ mod tests {
 
         assert!(
             TokenizedEquityMint::Failed {
+                chain: Chain::Base,
                 symbol: sym,
                 quantity: float!(1),
                 reason: "test".to_string(),
@@ -5938,5 +6096,117 @@ mod tests {
             }
             .is_terminal(),
         );
+    }
+
+    /// Every mint persisted before chains were tracked ran on Base, so a
+    /// genesis payload with no `chain` must read as Base rather than fail.
+    #[test]
+    fn legacy_mint_requested_event_reads_as_base() {
+        let legacy = serde_json::json!({
+            "MintRequested": {
+                "symbol": "AAPL",
+                "quantity": "10",
+                "wallet": "0x0000000000000000000000000000000000000001",
+                "requested_at": "2026-01-01T00:00:00Z",
+            }
+        });
+
+        let event: TokenizedEquityMintEvent = serde_json::from_value(legacy).unwrap();
+        let TokenizedEquityMintEvent::MintRequested { chain, .. } = event else {
+            panic!("expected MintRequested, got {event:?}");
+        };
+
+        assert_eq!(chain, Chain::Base);
+    }
+
+    #[test]
+    fn mint_requested_event_roundtrips_its_chain() {
+        let event = TokenizedEquityMintEvent::MintRequested {
+            issuer_request_id: None,
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(10),
+            wallet: Address::ZERO,
+            chain: Chain::Ethereum,
+            requested_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        };
+
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            serialized["MintRequested"]["chain"],
+            serde_json::json!("ethereum")
+        );
+
+        let roundtripped: TokenizedEquityMintEvent = serde_json::from_value(serialized).unwrap();
+        assert_eq!(roundtripped, event);
+    }
+
+    #[tokio::test]
+    async fn mint_state_carries_the_chain_the_command_named() {
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given_no_previous_events()
+            .when(TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: issuer_request_id("ISS-CHAIN"),
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(10),
+                wallet: Address::ZERO,
+                chain: Chain::Ethereum,
+            })
+            .await
+            .events();
+
+        let state = replay::<TokenizedEquityMint>(events).unwrap().unwrap();
+
+        assert_eq!(state.chain(), Chain::Ethereum);
+    }
+
+    /// Belt-and-braces beside the serde default: the migration stamps `base`
+    /// into legacy genesis payloads so raw SQL readers see the field too.
+    #[tokio::test]
+    async fn migration_stamps_base_on_legacy_mint_genesis_records() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let legacy = r#"{"MintRequested":{"symbol":"AAPL","quantity":"10","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#;
+
+        insert_event(
+            &pool,
+            "legacy-mint",
+            0,
+            "TokenizedEquityMintEvent::MintRequested",
+            legacy,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO snapshots (aggregate_type, aggregate_id, last_sequence, payload, \
+             timestamp) VALUES ('TokenizedEquityMint', 'legacy-mint', 0, ?1, \
+             '2026-01-01T00:00:00Z')",
+        )
+        .bind(legacy)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let migration =
+            include_str!("../migrations/20260909111227_chain_qualified_equity_transfers.sql");
+        // Twice: the WHERE guards make the stamp idempotent.
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+        let (chain,): (String,) = sqlx::query_as(
+            "SELECT json_extract(payload, '$.MintRequested.chain') FROM events \
+             WHERE aggregate_type = 'TokenizedEquityMint'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chain, "base", "events row must be stamped with the chain");
+
+        // The schema-version bump discards every snapshot, so the migration leaves them alone.
+        let (snapshot_chain,): (Option<String>,) = sqlx::query_as(
+            "SELECT json_extract(payload, '$.MintRequested.chain') FROM snapshots \
+             WHERE aggregate_type = 'TokenizedEquityMint'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot_chain, None, "snapshots row must be left untouched");
     }
 }

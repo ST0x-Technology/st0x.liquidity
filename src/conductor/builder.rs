@@ -1677,6 +1677,7 @@ mod tests {
             &self,
             aggregate_id: &RedemptionAggregateId,
             _symbol: &Symbol,
+            _chain: Chain,
             _quantity: FractionalShares,
         ) -> Result<(), RedemptionError> {
             if aggregate_id == &self.poison_id {
@@ -1749,6 +1750,7 @@ mod tests {
             &self,
             issuer_request_id: &IssuerRequestId,
             _symbol: &Symbol,
+            _chain: Chain,
             _quantity: FractionalShares,
         ) -> Result<(), MintTransferError> {
             if issuer_request_id == &self.poison_id {
@@ -1834,6 +1836,7 @@ mod tests {
 
         queue
             .push(TransferEquityToHedging {
+                chain: Chain::Base,
                 aggregate_id: poison_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -1867,6 +1870,7 @@ mod tests {
 
         push_queue
             .push(TransferEquityToHedging {
+                chain: Chain::Base,
                 aggregate_id: healthy_id,
                 symbol,
                 quantity: FractionalShares::new(float!(1)),
@@ -2086,6 +2090,7 @@ mod tests {
 
         queue
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: poison_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -2134,6 +2139,7 @@ mod tests {
 
         push_queue
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: healthy_id,
                 symbol,
                 quantity: FractionalShares::new(float!(1)),

@@ -368,6 +368,7 @@ mod tests {
     use alloy::primitives::Address;
     use httpmock::MockServer;
     use st0x_event_sorcery::test_store;
+    use st0x_evm::Chain;
     use st0x_execution::Symbol;
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
@@ -435,6 +436,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("RKLB").unwrap(),
                     quantity: float!(10),

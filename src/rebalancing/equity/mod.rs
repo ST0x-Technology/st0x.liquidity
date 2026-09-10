@@ -41,7 +41,7 @@ use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
 
 use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
-use st0x_evm::EvmError;
+use st0x_evm::{Chain, EvmError};
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 use st0x_issuance_dto::VaultModeTag;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
@@ -1352,6 +1352,7 @@ impl CrossVenueEquityTransfer {
         &self,
         aggregate_id: &RedemptionAggregateId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
         token: Address,
         amount: U256,
@@ -1361,6 +1362,7 @@ impl CrossVenueEquityTransfer {
                 aggregate_id,
                 EquityRedemptionCommand::Redeem {
                     symbol: symbol.clone(),
+                    chain,
                     quantity: quantity.inner(),
                     token,
                     amount,
@@ -1835,7 +1837,13 @@ impl CrossVenueEquityTransfer {
             // so the live inventory does not show a phantom in-flight transfer or
             // a symbol locked in-progress until the next restart.
             if let Err(rollback_error) = rebalancing
-                .rollback_mint_tracking_for_recovery(issuer_request_id, &symbol, quantity, rollback)
+                .rollback_mint_tracking_for_recovery(
+                    issuer_request_id,
+                    &symbol,
+                    entity.chain(),
+                    quantity,
+                    rollback,
+                )
                 .await
             {
                 error!(
@@ -1987,11 +1995,16 @@ impl CrossVenueEquityTransfer {
     /// bot restarts that re-pick the job row) re-enter the same aggregate: an
     /// absent aggregate starts a new mint, an in-flight one resumes from its
     /// persisted state, and a terminal one is a no-op.
-    #[instrument(target = "rebalance", skip_all, fields(%issuer_request_id, %symbol, %quantity))]
+    #[instrument(
+        target = "rebalance",
+        skip_all,
+        fields(%issuer_request_id, %symbol, %chain, %quantity)
+    )]
     pub async fn resume_equity_to_market_making(
         &self,
         issuer_request_id: &IssuerRequestId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), MintTransferError> {
         let existing = self
@@ -2001,7 +2014,10 @@ impl CrossVenueEquityTransfer {
             .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
 
         match existing {
-            None => self.start_mint(issuer_request_id, symbol, quantity).await,
+            None => {
+                self.start_mint(issuer_request_id, symbol, chain, quantity)
+                    .await
+            }
             Some(
                 TokenizedEquityMint::MintRequested { .. }
                 | TokenizedEquityMint::MintAccepted { .. },
@@ -2024,6 +2040,7 @@ impl CrossVenueEquityTransfer {
         &self,
         issuer_request_id: &IssuerRequestId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), MintTransferError> {
         self.gas_readiness
@@ -2041,6 +2058,7 @@ impl CrossVenueEquityTransfer {
                 TokenizedEquityMintCommand::RequestMint {
                     issuer_request_id: issuer_request_id.clone(),
                     symbol: symbol.clone(),
+                    chain,
                     quantity: quantity.inner(),
                     wallet: self.wallet,
                 },
@@ -2119,17 +2137,25 @@ impl CrossVenueEquityTransfer {
     /// bot restarts that re-pick the job row) re-enter the same aggregate: an
     /// absent aggregate starts a new redemption, an in-flight one resumes
     /// from its persisted state, and a terminal one is a no-op.
-    #[instrument(target = "rebalance", skip_all, fields(%aggregate_id, %symbol, %quantity))]
+    #[instrument(
+        target = "rebalance",
+        skip_all,
+        fields(%aggregate_id, %symbol, %chain, %quantity)
+    )]
     pub async fn resume_equity_to_hedging(
         &self,
         aggregate_id: &RedemptionAggregateId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError> {
         let existing = self.redemption_store.load(aggregate_id).await?;
 
         match existing {
-            None => self.start_redemption(aggregate_id, symbol, quantity).await,
+            None => {
+                self.start_redemption(aggregate_id, symbol, chain, quantity)
+                    .await
+            }
             Some(_) => self.resume_redemption(aggregate_id).await,
         }
     }
@@ -2138,6 +2164,7 @@ impl CrossVenueEquityTransfer {
         &self,
         aggregate_id: &RedemptionAggregateId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError> {
         self.gas_readiness
@@ -2149,7 +2176,7 @@ impl CrossVenueEquityTransfer {
 
         info!(target: "rebalance", %token, %amount, %aggregate_id, "Starting equity transfer to hedging venue");
 
-        self.withdraw_from_raindex(aggregate_id, symbol, quantity, token, amount)
+        self.withdraw_from_raindex(aggregate_id, symbol, chain, quantity, token, amount)
             .await?;
 
         info!(target: "rebalance", "Withdrawn from Raindex, unwrapping and sending to Alpaca");
@@ -2250,6 +2277,7 @@ mod tests {
                     issuer_request_id: id.clone(),
                     symbol,
                     quantity: quantity.inner(),
+                    chain: Chain::Base,
                     wallet: transfer.wallet,
                 },
             )
@@ -2638,6 +2666,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -2759,6 +2788,7 @@ mod tests {
             .withdraw_from_raindex(
                 &id,
                 &symbol,
+                Chain::Base,
                 FractionalShares::new(float!(50)),
                 token,
                 amount,
@@ -2811,6 +2841,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -2868,6 +2899,7 @@ mod tests {
             .withdraw_from_raindex(
                 &id,
                 &symbol,
+                Chain::Base,
                 FractionalShares::new(float!(50)),
                 token,
                 amount,
@@ -3052,7 +3084,7 @@ mod tests {
         let amount = quantity.to_u256_18_decimals().unwrap();
 
         transfer
-            .withdraw_from_raindex(id, symbol, quantity, token, amount)
+            .withdraw_from_raindex(id, symbol, Chain::Base, quantity, token, amount)
             .await
             .unwrap();
         transfer.unwrap_and_send(id).await.unwrap()
@@ -3071,6 +3103,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -3094,6 +3127,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &id,
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -3124,6 +3158,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &id,
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -3166,6 +3201,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-BOT-GAS"),
                 &symbol,
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -3223,6 +3259,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-BOT-GAS-FAIL"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -3266,6 +3303,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -3353,6 +3391,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -3445,6 +3484,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -3498,6 +3538,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(10),
@@ -3559,6 +3600,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -3646,6 +3688,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(10),
@@ -3697,6 +3740,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(10),
@@ -3711,7 +3755,12 @@ mod tests {
         // fresh RequestMint here would fail with AlreadyInProgress, so
         // completing proves the resume path was taken.
         transfer
-            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10)))
+            .resume_equity_to_market_making(
+                &id,
+                &symbol,
+                Chain::Base,
+                FractionalShares::new(float!(10)),
+            )
             .await
             .unwrap();
 
@@ -3738,7 +3787,12 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
 
         transfer
-            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10)))
+            .resume_equity_to_market_making(
+                &id,
+                &symbol,
+                Chain::Base,
+                FractionalShares::new(float!(10)),
+            )
             .await
             .unwrap();
 
@@ -3749,7 +3803,12 @@ mod tests {
         );
 
         transfer
-            .resume_equity_to_market_making(&id, &symbol, FractionalShares::new(float!(10)))
+            .resume_equity_to_market_making(
+                &id,
+                &symbol,
+                Chain::Base,
+                FractionalShares::new(float!(10)),
+            )
             .await
             .expect("a completed mint must be a clean no-op for the job retry");
     }
@@ -3783,6 +3842,7 @@ mod tests {
             .withdraw_from_raindex(
                 &id,
                 &symbol,
+                Chain::Base,
                 FractionalShares::new(float!(50)),
                 token,
                 amount,
@@ -3893,6 +3953,7 @@ mod tests {
             .resume_equity_to_hedging(
                 &id,
                 &Symbol::new("TEST").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(50)),
             )
             .await
@@ -3925,6 +3986,7 @@ mod tests {
             .resume_equity_to_hedging(
                 &id,
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(50)),
             )
             .await
@@ -3974,7 +4036,7 @@ mod tests {
         let symbol = Symbol::new("TEST").unwrap();
         let id = redemption_aggregate_id("redeem-bot-gas");
         transfer
-            .resume_equity_to_hedging(&id, &symbol, FractionalShares::new(float!(50)))
+            .resume_equity_to_hedging(&id, &symbol, Chain::Base, FractionalShares::new(float!(50)))
             .await
             .unwrap();
 
@@ -4035,6 +4097,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(50),
                     token,
@@ -4100,7 +4163,7 @@ mod tests {
         // First attempt crashes after the withdrawal: the aggregate is
         // persisted mid-flight.
         transfer
-            .withdraw_from_raindex(&id, &symbol, quantity, token, amount)
+            .withdraw_from_raindex(&id, &symbol, Chain::Base, quantity, token, amount)
             .await
             .unwrap();
 
@@ -4108,7 +4171,7 @@ mod tests {
         // fresh Redeem command here would fail on the already-initialized
         // aggregate, so completing proves the resume path was taken.
         transfer
-            .resume_equity_to_hedging(&id, &symbol, quantity)
+            .resume_equity_to_hedging(&id, &symbol, Chain::Base, quantity)
             .await
             .unwrap();
 
@@ -4141,12 +4204,12 @@ mod tests {
         let quantity = FractionalShares::new(float!(50));
 
         transfer
-            .resume_equity_to_hedging(&id, &symbol, quantity)
+            .resume_equity_to_hedging(&id, &symbol, Chain::Base, quantity)
             .await
             .unwrap();
 
         transfer
-            .resume_equity_to_hedging(&id, &symbol, quantity)
+            .resume_equity_to_hedging(&id, &symbol, Chain::Base, quantity)
             .await
             .expect("a completed redemption must be a clean no-op for the job retry");
     }
@@ -4168,6 +4231,7 @@ mod tests {
             transfer.resume_equity_to_hedging(
                 &redemption_aggregate_id("redeem-workflow"),
                 &Symbol::new("TEST").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(50)),
             ),
         )
@@ -4189,6 +4253,7 @@ mod tests {
             .resume_equity_to_hedging(
                 &redemption_aggregate_id("redeem-detection-timeout"),
                 &Symbol::new("TEST").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(50)),
             )
             .await
@@ -4213,6 +4278,7 @@ mod tests {
             .resume_equity_to_hedging(
                 &redemption_aggregate_id("redeem-detection-api-error"),
                 &Symbol::new("TEST").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(50)),
             )
             .await
@@ -4240,6 +4306,7 @@ mod tests {
             .resume_equity_to_hedging(
                 &redemption_aggregate_id("redeem-completion-rejected"),
                 &Symbol::new("TEST").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(50)),
             )
             .await
@@ -4267,6 +4334,7 @@ mod tests {
             .resume_equity_to_hedging(
                 &redemption_aggregate_id("redeem-pending-status"),
                 &Symbol::new("TEST").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(50)),
             )
             .await
@@ -4291,6 +4359,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -4315,6 +4384,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -4339,6 +4409,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100)),
             )
             .await
@@ -4368,6 +4439,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100)),
             )
             .await
@@ -4410,6 +4482,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100)),
             )
             .await
@@ -4442,6 +4515,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -4474,6 +4548,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -4506,6 +4581,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -4538,6 +4614,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-TEST"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(100.0)),
             )
             .await
@@ -4575,6 +4652,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -4670,6 +4748,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -4754,6 +4833,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -4848,6 +4928,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -4956,6 +5037,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -5052,6 +5134,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -5118,6 +5201,7 @@ mod tests {
             .resume_equity_to_market_making(
                 &issuer_request_id("ISS-WAIT-BLOCK-FAIL"),
                 &Symbol::new("AAPL").unwrap(),
+                Chain::Base,
                 FractionalShares::new(float!(10.0)),
             )
             .await

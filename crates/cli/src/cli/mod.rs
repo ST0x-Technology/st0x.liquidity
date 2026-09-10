@@ -3298,6 +3298,7 @@ mod tests {
             .send(
                 &IssuerRequestId(operation_id),
                 TokenizedEquityMintCommand::RequestMintAt {
+                    chain: Chain::Base,
                     issuer_request_id: IssuerRequestId(operation_id),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(5),

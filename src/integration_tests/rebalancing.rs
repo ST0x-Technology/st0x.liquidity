@@ -2627,6 +2627,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
         .send(
             &redemption_id,
             EquityRedemptionCommand::Redeem {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: float!("10"),
                 token: token_address,
@@ -3175,6 +3176,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         .send(
             &mint_id,
             TokenizedEquityMintCommand::RequestMint {
+                chain: Chain::Base,
                 issuer_request_id: mint_id.clone(),
                 symbol: symbol.clone(),
                 quantity: float!(5),

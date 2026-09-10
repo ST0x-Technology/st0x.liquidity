@@ -69,9 +69,8 @@ pub(crate) struct ResumeTokenizationAggregate {
 
 /// Dependencies the job needs.
 ///
-/// `transfer` is the primary chain's: rebalancing runs there, and neither
-/// aggregate persists the chain it ran on, so a resume can only mean the
-/// primary chain. A persisted chain will replace that assumption.
+/// Each mint and redemption record names the chain it ran on; the resume
+/// runs there and refuses a network that disagrees with the record.
 pub(crate) struct ResumeTokenizationCtx {
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
@@ -163,6 +162,7 @@ mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256};
     use serde_json::json;
     use st0x_event_sorcery::test_store;
+    use st0x_evm::Chain;
     use st0x_float_macro::float;
     use st0x_raindex::{Raindex, RaindexVaultId};
     use st0x_tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
@@ -286,6 +286,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
@@ -357,6 +358,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
@@ -416,6 +418,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
                     token: Address::ZERO,
@@ -497,6 +500,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
@@ -592,6 +596,7 @@ mod tests {
             .send(
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
@@ -694,6 +699,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Redeem {
                     symbol,
+                    chain: Chain::Base,
                     quantity: float!(1.0),
                     token: Address::ZERO,
                     amount: U256::from(1_000_000_000_000_000_000_u128),
@@ -823,6 +829,7 @@ mod tests {
                     issuer_request_id: id.clone(),
                     symbol,
                     quantity: float!(1.0),
+                    chain: Chain::Base,
                     wallet: Address::ZERO,
                 },
             )
@@ -872,6 +879,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
                     token: Address::ZERO,

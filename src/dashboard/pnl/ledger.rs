@@ -781,6 +781,7 @@ mod tests {
             1,
             &TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(1),
                 wallet: Address::repeat_byte(0x22),
@@ -916,6 +917,7 @@ mod tests {
             1,
             &TokenizedEquityMintEvent::MintRequested {
                 issuer_request_id: None,
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(1),
                 wallet: Address::repeat_byte(0x22),

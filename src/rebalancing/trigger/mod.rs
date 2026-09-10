@@ -329,6 +329,9 @@ impl std::fmt::Display for MintTrackingStage {
 #[derive(Debug, Clone)]
 struct MintTracking {
     symbol: Symbol,
+    /// The chain the mint runs on, taken from its genesis event so the
+    /// reactor credits the slot the tokens actually land in.
+    chain: Chain,
     quantity: FractionalShares,
     tokenization_request_id: Option<TokenizationRequestId>,
     stage: MintTrackingStage,
@@ -339,6 +342,7 @@ impl MintTracking {
     fn from_requested_event(event: &TokenizedEquityMintEvent) -> Option<Self> {
         let TokenizedEquityMintEvent::MintRequested {
             symbol,
+            chain,
             quantity,
             requested_at,
             ..
@@ -349,6 +353,7 @@ impl MintTracking {
 
         Some(Self {
             symbol: symbol.clone(),
+            chain: *chain,
             quantity: FractionalShares::new(*quantity),
             tokenization_request_id: None,
             stage: MintTrackingStage::Requested,
@@ -439,6 +444,9 @@ impl std::fmt::Display for RedemptionTrackingStage {
 #[derive(Debug, Clone)]
 struct RedemptionTracking {
     symbol: Symbol,
+    /// The chain the redemption withdraws from, taken from its genesis event
+    /// so the reactor debits the slot the tokens actually leave.
+    chain: Chain,
     quantity: FractionalShares,
     tokenization_request_id: Option<TokenizationRequestId>,
     redemption_tx: Option<TxHash>,
@@ -451,11 +459,13 @@ impl RedemptionTracking {
         match event {
             EquityRedemptionEvent::VaultWithdrawPending {
                 symbol,
+                chain,
                 quantity,
                 pending_at,
                 ..
             } => Some(Self {
                 symbol: symbol.clone(),
+                chain: *chain,
                 quantity: FractionalShares::new(*quantity),
                 tokenization_request_id: None,
                 redemption_tx: None,
@@ -467,29 +477,60 @@ impl RedemptionTracking {
                 quantity,
                 submitted_at,
                 ..
-            } => Some(Self {
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                tokenization_request_id: None,
-                redemption_tx: None,
-                stage: RedemptionTrackingStage::VaultWithdrawSubmitted,
-                last_progress_at: *submitted_at,
-            }),
+            } => {
+                let stage = RedemptionTrackingStage::VaultWithdrawSubmitted;
+                let chain = Self::default_chain_for_chainless_genesis(symbol, stage);
+                Some(Self {
+                    symbol: symbol.clone(),
+                    chain,
+                    quantity: FractionalShares::new(*quantity),
+                    tokenization_request_id: None,
+                    redemption_tx: None,
+                    stage,
+                    last_progress_at: *submitted_at,
+                })
+            }
             EquityRedemptionEvent::WithdrawnFromRaindex {
                 symbol,
                 quantity,
                 withdrawn_at,
                 ..
-            } => Some(Self {
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(*quantity),
-                tokenization_request_id: None,
-                redemption_tx: None,
-                stage: RedemptionTrackingStage::WithdrawnFromRaindex,
-                last_progress_at: *withdrawn_at,
-            }),
+            } => {
+                let stage = RedemptionTrackingStage::WithdrawnFromRaindex;
+                let chain = Self::default_chain_for_chainless_genesis(symbol, stage);
+                Some(Self {
+                    symbol: symbol.clone(),
+                    chain,
+                    quantity: FractionalShares::new(*quantity),
+                    tokenization_request_id: None,
+                    redemption_tx: None,
+                    stage,
+                    last_progress_at: *withdrawn_at,
+                })
+            }
             _ => None,
         }
+    }
+
+    /// Only `VaultWithdrawPending` records the chain. Tracking built from a
+    /// later event is right for a pre-multichain stream, but a live redemption
+    /// on another chain whose tracking went missing would land on the legacy
+    /// chain with no other signal, so the default is logged loudly.
+    fn default_chain_for_chainless_genesis(
+        symbol: &Symbol,
+        stage: RedemptionTrackingStage,
+    ) -> Chain {
+        let chain = crate::onchain::legacy_chain();
+        warn!(
+            target: "rebalance",
+            %symbol,
+            %stage,
+            %chain,
+            "Redemption tracking created from an event that carries no chain; \
+             defaulted the chain to the legacy chain. A live redemption on \
+             another chain would have its in-flight debited from the wrong slot"
+        );
+        chain
     }
 
     fn track_progress(
@@ -1615,7 +1656,7 @@ impl RebalancingService {
         let mut inventory = self.inventory.write().await;
         *inventory = inventory
             .clone()
-            .clear_equity_inflight(&tracking.symbol, Venue::MarketMaking, now)?
+            .clear_equity_inflight_at(&tracking.symbol, tracking.chain, Venue::MarketMaking, now)?
             .clear_active_redemption(&tracking.symbol);
         drop(inventory);
 
@@ -2736,10 +2777,12 @@ pub(crate) enum RecoveryRollback {
     /// failed transfer that had cancelled its in-flight back to available).
     /// Rollback cancels the in-flight back to available.
     CancelInflight,
-    /// The rebuild re-set the in-flight and dropped the timeout tombstone
-    /// (a timed-out transfer). Rollback clears the in-flight again and restores
-    /// the tombstone + suppressed-inflight markers it removed.
+    /// The rebuild re-set the in-flight on the record's `chain` and dropped the
+    /// timeout tombstone (a timed-out transfer). Rollback clears that chain's
+    /// in-flight again and restores the tombstone + suppressed-inflight markers
+    /// it removed.
     RestoreTombstone {
+        chain: Chain,
         timed_out_at: DateTime<Utc>,
         suppressed_at: Option<DateTime<Utc>>,
     },
@@ -2944,11 +2987,14 @@ impl RebalancingService {
     async fn apply_equity_update(
         &self,
         symbol: &Symbol,
+        chain: Chain,
         update: EquityInventoryUpdate,
     ) -> Result<(), RebalancingServiceError> {
         let now = Utc::now();
         let mut inventory = self.inventory.write().await;
-        *inventory = inventory.clone().update_equity(symbol, update, now)?;
+        *inventory = inventory
+            .clone()
+            .update_equity_at(symbol, chain, update, now)?;
         drop(inventory);
         Ok(())
     }
@@ -2974,12 +3020,16 @@ impl RebalancingService {
     async fn apply_equity_update_or_defer(
         &self,
         symbol: &Symbol,
+        chain: Chain,
         venue: Venue,
         update: EquityInventoryUpdate,
     ) -> Result<EquitySettlementOutcome, RebalancingServiceError> {
         let now = Utc::now();
         let mut inventory = self.inventory.write().await;
-        let outcome = match inventory.clone().update_equity(symbol, update, now) {
+        let outcome = match inventory
+            .clone()
+            .update_equity_at(symbol, chain, update, now)
+        {
             Ok(updated) => {
                 *inventory = updated;
                 EquitySettlementOutcome::Reconciled
@@ -4302,12 +4352,17 @@ impl RebalancingService {
         }
 
         let issuer_request_id = IssuerRequestId::generate();
+        // The allocation planner is what will choose a chain per operation;
+        // until then every rebalance runs on the trading chain, and the job
+        // records it so the saga and its resume agree on where it ran.
+        let chain = self.inventory.read().await.trading_chain();
 
         let push = queue
             .push(TransferEquityToMarketMaking {
                 issuer_request_id: issuer_request_id.clone(),
                 symbol: symbol.clone(),
                 quantity,
+                chain,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -4401,6 +4456,7 @@ impl RebalancingService {
         }
 
         let aggregate_id = RedemptionAggregateId::generate();
+        let chain = self.inventory.read().await.trading_chain();
 
         let push = queue
             .push(TransferEquityToHedging {
@@ -4408,6 +4464,7 @@ impl RebalancingService {
                 symbol: symbol.clone(),
                 quantity,
                 generation,
+                chain,
                 backpressure_streak: BackpressureStreak::default(),
             })
             .await;
@@ -5099,6 +5156,7 @@ impl RebalancingService {
                     id.clone(),
                     MintTracking {
                         symbol: symbol.clone(),
+                        chain: entity.chain(),
                         quantity,
                         tokenization_request_id,
                         stage,
@@ -5137,8 +5195,9 @@ impl RebalancingService {
                 let mut inventory = self.inventory.write().await;
                 let mut updated = inventory.clone();
                 if matches!(entity, MintAccepted { .. }) {
-                    updated = updated.update_equity(
+                    updated = updated.update_equity_at(
                         symbol,
+                        entity.chain(),
                         Inventory::set_inflight(Venue::Hedging, quantity),
                         Utc::now(),
                     )?;
@@ -5226,6 +5285,7 @@ impl RebalancingService {
                 (
                     Box::new(Inventory::set_inflight(Venue::Hedging, quantity)),
                     RecoveryRollback::RestoreTombstone {
+                        chain: entity.chain(),
                         timed_out_at,
                         suppressed_at,
                     },
@@ -5257,9 +5317,10 @@ impl RebalancingService {
                 return Ok(RecoveryClaim::Conflict);
             }
 
-            *inventory = inventory
-                .clone()
-                .update_equity(symbol, update, Utc::now())?;
+            *inventory =
+                inventory
+                    .clone()
+                    .update_equity_at(symbol, entity.chain(), update, Utc::now())?;
         }
 
         // The inventory update succeeded; now consume the timeout markers.
@@ -5275,6 +5336,7 @@ impl RebalancingService {
             id.clone(),
             MintTracking {
                 symbol: symbol.clone(),
+                chain: entity.chain(),
                 quantity,
                 tokenization_request_id: Some(tokenization_request_id),
                 stage: MintTrackingStage::Accepted,
@@ -5295,6 +5357,7 @@ impl RebalancingService {
         &self,
         id: &IssuerRequestId,
         symbol: &Symbol,
+        chain: Chain,
         quantity: FractionalShares,
         rollback: RecoveryRollback,
     ) -> Result<(), RebalancingServiceError> {
@@ -5303,19 +5366,23 @@ impl RebalancingService {
             RecoveryRollback::CancelInflight => {
                 self.apply_equity_update(
                     symbol,
+                    chain,
                     Self::cancel_equity_transfer_update(Venue::Hedging, quantity),
                 )
                 .await?;
             }
             RecoveryRollback::RestoreTombstone {
+                chain,
                 timed_out_at,
                 suppressed_at,
             } => {
                 let mut inventory = self.inventory.write().await;
-                *inventory =
-                    inventory
-                        .clone()
-                        .clear_equity_inflight(symbol, Venue::Hedging, Utc::now())?;
+                *inventory = inventory.clone().clear_equity_inflight_at(
+                    symbol,
+                    chain,
+                    Venue::Hedging,
+                    Utc::now(),
+                )?;
                 drop(inventory);
                 self.timed_out_mints.write().await.insert(
                     id.clone(),
@@ -5409,8 +5476,9 @@ impl RebalancingService {
             }
 
             if timed_out_at.is_some() {
-                *inventory = inventory.clone().update_equity(
+                *inventory = inventory.clone().update_equity_at(
                     symbol,
+                    entity.chain(),
                     Box::new(Inventory::set_inflight(Venue::MarketMaking, quantity)),
                     Utc::now(),
                 )?;
@@ -5426,6 +5494,7 @@ impl RebalancingService {
                 .remove(symbol);
 
             RecoveryRollback::RestoreTombstone {
+                chain: entity.chain(),
                 timed_out_at,
                 suppressed_at,
             }
@@ -5437,6 +5506,7 @@ impl RebalancingService {
             id.clone(),
             RedemptionTracking {
                 symbol: symbol.clone(),
+                chain: entity.chain(),
                 quantity,
                 tokenization_request_id: tokenization_request_id.clone(),
                 redemption_tx: *redemption_tx,
@@ -5463,12 +5533,14 @@ impl RebalancingService {
             // `Start`-based variant is mint-only, so there is no balance to undo.
             RecoveryRollback::TrackingOnly | RecoveryRollback::CancelInflight => {}
             RecoveryRollback::RestoreTombstone {
+                chain,
                 timed_out_at,
                 suppressed_at,
             } => {
                 let mut inventory = self.inventory.write().await;
-                *inventory = inventory.clone().clear_equity_inflight(
+                *inventory = inventory.clone().clear_equity_inflight_at(
                     symbol,
+                    chain,
                     Venue::MarketMaking,
                     Utc::now(),
                 )?;
@@ -5598,6 +5670,7 @@ impl RebalancingService {
                     id.clone(),
                     RedemptionTracking {
                         symbol: symbol.clone(),
+                        chain: entity.chain(),
                         quantity,
                         tokenization_request_id,
                         redemption_tx,
@@ -5608,8 +5681,9 @@ impl RebalancingService {
                 self.mark_equity_active_transfer(symbol, || equity::GUARD_GENERATION.next());
 
                 let mut inventory = self.inventory.write().await;
-                let updated = inventory.clone().update_equity(
+                let updated = inventory.clone().update_equity_at(
                     symbol,
+                    entity.chain(),
                     Inventory::set_inflight(Venue::MarketMaking, quantity),
                     Utc::now(),
                 )?;
@@ -5673,8 +5747,13 @@ impl RebalancingService {
         let settlement =
             match Self::mint_inventory_update(&event, tracking.quantity, tracking.stage) {
                 Some(update) => {
-                    self.apply_equity_update_or_defer(&symbol, Venue::Hedging, update)
-                        .await?
+                    self.apply_equity_update_or_defer(
+                        &symbol,
+                        tracking.chain,
+                        Venue::Hedging,
+                        update,
+                    )
+                    .await?
                 }
                 None => EquitySettlementOutcome::Reconciled,
             };
@@ -5804,6 +5883,7 @@ impl RebalancingService {
                 let shortfall = (existing.quantity - actual_quantity)?;
                 self.apply_equity_update_or_defer(
                     &existing.symbol,
+                    existing.chain,
                     Venue::MarketMaking,
                     Self::cancel_equity_transfer_update(Venue::MarketMaking, shortfall),
                 )
@@ -5828,6 +5908,7 @@ impl RebalancingService {
                 // a no-op.
                 self.apply_equity_update(
                     &existing.symbol,
+                    existing.chain,
                     Inventory::set_inflight(Venue::MarketMaking, actual_quantity),
                 )
                 .await?;
@@ -5843,8 +5924,13 @@ impl RebalancingService {
 
         let settlement = match Self::redemption_inventory_update(&event, tracking.quantity) {
             Some(update) => {
-                self.apply_equity_update_or_defer(&symbol, Venue::MarketMaking, update)
-                    .await?
+                self.apply_equity_update_or_defer(
+                    &symbol,
+                    tracking.chain,
+                    Venue::MarketMaking,
+                    update,
+                )
+                .await?
             }
             None => EquitySettlementOutcome::Reconciled,
         };
@@ -6366,6 +6452,7 @@ mod tests {
             .recover_mint_state(
                 &mint_id,
                 &TokenizedEquityMint::MintAccepted {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(10),
                     wallet: Address::ZERO,
@@ -6519,6 +6606,7 @@ mod tests {
             &symbol,
             "startup-tokens-received",
             TokenizedEquityMint::TokensReceived {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: float!(5),
                 wallet: Address::ZERO,
@@ -6541,6 +6629,7 @@ mod tests {
             &symbol,
             "startup-wrap-submitted",
             TokenizedEquityMint::WrapSubmitted {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: float!(5),
                 wallet: Address::ZERO,
@@ -6591,6 +6680,7 @@ mod tests {
             &symbol,
             "startup-tokens-wrapped",
             TokenizedEquityMint::TokensWrapped {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: float!(5),
                 wallet: Address::ZERO,
@@ -6616,6 +6706,7 @@ mod tests {
             &symbol,
             "startup-vault-deposit-submitted",
             TokenizedEquityMint::VaultDepositSubmitted {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: float!(5),
                 wallet: Address::ZERO,
@@ -6641,6 +6732,7 @@ mod tests {
             &symbol,
             "startup-tokens-received-disabled",
             TokenizedEquityMint::TokensReceived {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: float!(5),
                 wallet: Address::ZERO,
@@ -6671,6 +6763,7 @@ mod tests {
             .recover_redemption_state(
                 &redemption_id,
                 &EquityRedemption::Pending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(12),
                     redemption_tx,
@@ -6721,6 +6814,60 @@ mod tests {
         assert_eq!(inflight, Some(FractionalShares::new(float!(12))));
     }
 
+    /// A recovered record names its chain; the in-flight it restores belongs
+    /// to that chain's slot, not the primary's.
+    #[tokio::test]
+    async fn recovered_redemption_sets_inflight_on_the_records_own_chain() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Ethereum,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        trigger
+            .recover_redemption_state(
+                &redemption_aggregate_id("redemption-on-ethereum"),
+                &EquityRedemption::VaultWithdrawPending {
+                    chain: Chain::Ethereum,
+                    symbol: symbol.clone(),
+                    quantity: float!(12),
+                    token: Address::ZERO,
+                    wrapped_amount: U256::ZERO,
+                    pending_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (ethereum_inflight, base_inflight) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Base),
+            )
+        };
+        assert_eq!(
+            ethereum_inflight,
+            Some(shares(12)),
+            "the recovered in-flight belongs to the chain the record names"
+        );
+        assert_eq!(
+            base_inflight,
+            Some(shares(0)),
+            "recovering an Ethereum record must not touch the primary chain's slot"
+        );
+    }
+
     #[tokio::test]
     async fn recovery_after_explicit_mint_failure_moves_equity_to_market_making() {
         let trigger = make_trigger().await;
@@ -6735,6 +6882,7 @@ mod tests {
             InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100));
 
         let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             reason: "rejected".to_string(),
@@ -6795,6 +6943,7 @@ mod tests {
         );
 
         let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             reason: "timeout".to_string(),
@@ -6858,6 +7007,7 @@ mod tests {
             .unwrap();
 
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             raindex_withdraw_tx: None,
@@ -6914,6 +7064,7 @@ mod tests {
         );
 
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             raindex_withdraw_tx: None,
@@ -6970,6 +7121,7 @@ mod tests {
             InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100));
 
         let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             reason: "rejected".to_string(),
@@ -7039,6 +7191,7 @@ mod tests {
             .set_active_mint(symbol.clone(), other.clone());
 
         let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             reason: "rejected".to_string(),
@@ -7085,6 +7238,7 @@ mod tests {
             .set_active_mint(symbol.clone(), recovering.clone());
 
         let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             reason: "rejected".to_string(),
@@ -7130,6 +7284,7 @@ mod tests {
         );
 
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             raindex_withdraw_tx: None,
@@ -7197,6 +7352,7 @@ mod tests {
         );
 
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             raindex_withdraw_tx: None,
@@ -7260,6 +7416,7 @@ mod tests {
             InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100));
 
         let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             reason: "rejected".to_string(),
@@ -7290,6 +7447,7 @@ mod tests {
             .rollback_mint_tracking_for_recovery(
                 &mint_id,
                 &symbol,
+                Chain::Base,
                 FractionalShares::new(float!(10)),
                 rollback,
             )
@@ -7342,6 +7500,7 @@ mod tests {
             .insert(symbol.clone(), tombstone_at);
 
         let failed = TokenizedEquityMint::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             reason: "timeout".to_string(),
@@ -7370,6 +7529,7 @@ mod tests {
             .rollback_mint_tracking_for_recovery(
                 &mint_id,
                 &symbol,
+                Chain::Base,
                 FractionalShares::new(float!(10)),
                 rollback,
             )
@@ -7438,6 +7598,7 @@ mod tests {
             .insert(symbol.clone(), tombstone_at);
 
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             raindex_withdraw_tx: None,
@@ -7511,6 +7672,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback_after_timeout_redemption_dispatch_failure_clears_the_records_own_chain() {
+        let trigger = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = redemption_aggregate_id("redemption-ethereum-rollback");
+        let tombstone_at = Utc::now();
+
+        // Base (the trading chain) holds 90/0 and Ethereum 20/0 after the
+        // timeout cleared the Ethereum redemption's in-flight.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(90), shares(0))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Ethereum,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: tombstone_at,
+                    block_number: None,
+                },
+                tombstone_at,
+            )
+            .unwrap();
+        trigger.timed_out_redemptions.write().await.insert(
+            redemption_id.clone(),
+            TimeoutTombstone {
+                symbol: symbol.clone(),
+                timed_out_at: tombstone_at,
+            },
+        );
+        trigger
+            .suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(symbol.clone(), tombstone_at);
+
+        let failed = EquityRedemption::Failed {
+            chain: Chain::Ethereum,
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(tokenization_request_id("TOK-2")),
+            reason: Some("timeout".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let rollback = trigger
+            .rebuild_redemption_tracking_for_recovery(&redemption_id, &failed)
+            .await
+            .unwrap()
+            .expect_claimed();
+
+        let restored_ethereum_inflight = trigger
+            .inventory
+            .read()
+            .await
+            .onchain_equity_inflight_at(&symbol, Chain::Ethereum);
+        assert_eq!(
+            restored_ethereum_inflight,
+            Some(shares(10)),
+            "the rebuild restores the in-flight on the record's own chain"
+        );
+
+        trigger
+            .rollback_redemption_tracking_for_recovery(&redemption_id, &symbol, rollback)
+            .await
+            .unwrap();
+
+        let (ethereum_inflight, ethereum_available, base_inflight, base_available) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_available_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Base),
+                inventory.onchain_equity_available_at(&symbol, Chain::Base),
+            )
+        };
+        assert_eq!(
+            ethereum_inflight,
+            Some(shares(0)),
+            "the rollback must clear the in-flight it restored on Ethereum"
+        );
+        assert_eq!(ethereum_available, Some(shares(20)));
+        assert_eq!(
+            base_inflight,
+            Some(shares(0)),
+            "the rollback must not touch the trading chain's slot"
+        );
+        assert_eq!(base_available, Some(shares(90)));
+    }
+
+    #[tokio::test]
     async fn rollback_after_explicit_redemption_dispatch_failure_keeps_inflight() {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -7528,6 +7780,7 @@ mod tests {
             .unwrap();
 
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             raindex_withdraw_tx: None,
@@ -7596,6 +7849,7 @@ mod tests {
             .set_active_redemption(symbol.clone(), redemption_id.clone());
 
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             raindex_withdraw_tx: None,
@@ -7642,6 +7896,7 @@ mod tests {
             .unwrap();
 
         let failed = EquityRedemption::Failed {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity: float!(10),
             raindex_withdraw_tx: None,
@@ -7694,6 +7949,7 @@ mod tests {
                 mint_id.clone(),
                 TokenizedEquityMintEvent::MintRequested {
                     issuer_request_id: None,
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(10),
                     wallet: Address::ZERO,
@@ -7759,6 +8015,7 @@ mod tests {
                 success_mint_id.clone(),
                 TokenizedEquityMintEvent::MintRequested {
                     issuer_request_id: None,
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(2),
                     wallet: Address::ZERO,
@@ -7817,6 +8074,7 @@ mod tests {
             .on_redemption(
                 redemption_id.clone(),
                 EquityRedemptionEvent::VaultWithdrawPending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(10),
                     token: Address::ZERO,
@@ -7916,6 +8174,7 @@ mod tests {
                 .on_redemption(
                     redemption_id.clone(),
                     EquityRedemptionEvent::VaultWithdrawPending {
+                        chain: Chain::Base,
                         symbol: symbol.clone(),
                         quantity: float!(10),
                         token: Address::ZERO,
@@ -7988,6 +8247,7 @@ mod tests {
             .recover_redemption_state(
                 &redemption_id,
                 &EquityRedemption::WithdrawnFromRaindex {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: requested_quantity,
                     token: Address::random(),
@@ -9641,6 +9901,7 @@ mod tests {
     fn make_mint_requested(symbol: &Symbol, quantity: Float) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
             issuer_request_id: None,
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity,
             wallet: Address::random(),
@@ -13603,6 +13864,7 @@ mod tests {
 
     fn make_withdrawn_from_raindex(symbol: &Symbol, quantity: Float) -> EquityRedemptionEvent {
         EquityRedemptionEvent::VaultWithdrawPending {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             quantity,
             token: Address::random(),
@@ -13771,6 +14033,51 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// Tracking rebuilt from a chainless event lands on the legacy chain; a
+    /// live redemption on another chain would be debited from the wrong slot,
+    /// so the default must be loud.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn redemption_tracking_from_a_chainless_event_warns_about_the_defaulted_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(
+            symbol.clone(),
+            FractionalShares::new(float!(30)),
+            FractionalShares::new(float!(20)),
+        );
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let id = redemption_aggregate_id("chainless-genesis");
+
+        trigger
+            .on_redemption(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawSubmitted {
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    token: Address::random(),
+                    wrapped_amount: U256::from(10_000_000_000_000_000_000_u128),
+                    tx_hash: TxHash::random(),
+                    submitted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let created = trigger
+            .redemption_tracking
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("tracking must be created from the chainless event");
+        assert_eq!(created.chain, crate::onchain::legacy_chain());
+        assert_eq!(
+            created.stage,
+            RedemptionTrackingStage::VaultWithdrawSubmitted
+        );
+        assert!(logs_contain("carries no chain"));
+    }
+
     #[test]
     fn non_terminal_redemption_events_are_not_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -13800,6 +14107,7 @@ mod tests {
             .on_redemption(
                 id.clone(),
                 EquityRedemptionEvent::VaultWithdrawPending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(28.148),
                     token: Address::random(),
@@ -13880,6 +14188,7 @@ mod tests {
             .on_redemption(
                 id.clone(),
                 EquityRedemptionEvent::VaultWithdrawPending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(28.148),
                     token: Address::random(),
@@ -13956,6 +14265,7 @@ mod tests {
             .on_redemption(
                 id.clone(),
                 EquityRedemptionEvent::VaultWithdrawPending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(28.148),
                     token: Address::random(),
@@ -14030,6 +14340,7 @@ mod tests {
             .on_redemption(
                 id.clone(),
                 EquityRedemptionEvent::VaultWithdrawPending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(28.148),
                     token: Address::random(),
@@ -14122,6 +14433,7 @@ mod tests {
             .on_redemption(
                 id.clone(),
                 EquityRedemptionEvent::VaultWithdrawPending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(28.148),
                     token: Address::random(),
@@ -14207,6 +14519,7 @@ mod tests {
             .on_redemption(
                 id.clone(),
                 EquityRedemptionEvent::VaultWithdrawPending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(28.148),
                     token: Address::random(),
@@ -14292,6 +14605,7 @@ mod tests {
             .on_redemption(
                 id.clone(),
                 EquityRedemptionEvent::VaultWithdrawPending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(30),
                     token: Address::random(),
@@ -14358,6 +14672,7 @@ mod tests {
             .on_redemption(
                 id.clone(),
                 EquityRedemptionEvent::VaultWithdrawPending {
+                    chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(28.148),
                     token: Address::random(),
@@ -16268,6 +16583,7 @@ mod tests {
             .send(
                 mint_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: mint_id.clone(),
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
@@ -16307,6 +16623,7 @@ mod tests {
             .send(
                 mint_id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: mint_id.clone(),
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
@@ -16332,6 +16649,7 @@ mod tests {
             .send(
                 redemption_id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
                     token: Address::ZERO,
@@ -16363,6 +16681,7 @@ mod tests {
             .send(
                 redemption_id,
                 EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
                     token: Address::ZERO,
@@ -16401,6 +16720,7 @@ mod tests {
             .transfer_equity_to_market_making_queue
             .clone()
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16445,6 +16765,7 @@ mod tests {
             .transfer_equity_to_market_making_queue
             .clone()
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16486,6 +16807,7 @@ mod tests {
             .transfer_equity_to_market_making_queue
             .clone()
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: mint_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16551,6 +16873,7 @@ mod tests {
             .transfer_equity_to_hedging_queue
             .clone()
             .push(TransferEquityToHedging {
+                chain: Chain::Base,
                 aggregate_id: redemption_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16614,6 +16937,7 @@ mod tests {
             .transfer_equity_to_market_making_queue
             .clone()
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: mint_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16675,6 +16999,7 @@ mod tests {
             .transfer_equity_to_hedging_queue
             .clone()
             .push(TransferEquityToHedging {
+                chain: Chain::Base,
                 aggregate_id: redemption_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16734,6 +17059,7 @@ mod tests {
             .transfer_equity_to_market_making_queue
             .clone()
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16779,6 +17105,7 @@ mod tests {
             .transfer_equity_to_market_making_queue
             .clone()
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16836,6 +17163,7 @@ mod tests {
             .transfer_equity_to_market_making_queue
             .clone()
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: IssuerRequestId::generate(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16899,6 +17227,7 @@ mod tests {
             .transfer_equity_to_hedging_queue
             .clone()
             .push(TransferEquityToHedging {
+                chain: Chain::Base,
                 aggregate_id: redemption_aggregate_id("corrupt-redemption-payload"),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -16961,6 +17290,7 @@ mod tests {
                 .transfer_equity_to_market_making_queue
                 .clone()
                 .push(TransferEquityToMarketMaking {
+                    chain: Chain::Base,
                     issuer_request_id: zombie_id.clone(),
                     symbol: symbol.clone(),
                     quantity: FractionalShares::new(float!(1)),
@@ -17032,6 +17362,7 @@ mod tests {
             .transfer_equity_to_market_making_queue
             .clone()
             .push(TransferEquityToMarketMaking {
+                chain: Chain::Base,
                 issuer_request_id: zombie_mint_id.clone(),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -17055,6 +17386,7 @@ mod tests {
             .transfer_equity_to_hedging_queue
             .clone()
             .push(TransferEquityToHedging {
+                chain: Chain::Base,
                 aggregate_id: live_redemption_id,
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
@@ -23306,6 +23638,7 @@ mod tests {
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
             RedemptionTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -23474,6 +23807,7 @@ mod tests {
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
             RedemptionTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -23570,6 +23904,7 @@ mod tests {
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
             RedemptionTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: Some(tokenization_request_id.clone()),
@@ -23635,6 +23970,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -23701,6 +24037,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -23777,6 +24114,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -23865,6 +24203,7 @@ mod tests {
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
             RedemptionTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -23945,6 +24284,7 @@ mod tests {
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
             RedemptionTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -23970,6 +24310,91 @@ mod tests {
             "timed-out redemption cleanup must clear the active redemption ID from InventoryView"
         );
         drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn timed_out_redemption_cleanup_clears_the_inflight_on_its_own_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let id = redemption_aggregate_id("timed-out-redemption-ethereum");
+        // Base (the trading chain) carries an unrelated in-flight of 4; the
+        // Ethereum redemption moved 10 of its 20 into flight.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Ethereum,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(4)),
+                now,
+            )
+            .unwrap()
+            .update_equity_at(
+                &symbol,
+                Chain::Ethereum,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(10)),
+                now,
+            )
+            .unwrap();
+        let reactor = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(60)),
+        )
+        .await;
+        let trigger = reactor.clone();
+
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                chain: Chain::Ethereum,
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: now - ChronoDuration::minutes(5),
+            },
+        );
+
+        let cleanup = trigger
+            .cleanup_timed_out_redemption(&id, now)
+            .await
+            .unwrap();
+        assert!(
+            cleanup.is_some(),
+            "cleanup should tombstone the stale redemption"
+        );
+
+        let (ethereum_inflight, ethereum_available, base_inflight, base_available) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_available_at(&symbol, Chain::Ethereum),
+                inventory.onchain_equity_inflight_at(&symbol, Chain::Base),
+                inventory.onchain_equity_available_at(&symbol, Chain::Base),
+            )
+        };
+        assert_eq!(
+            ethereum_inflight,
+            Some(shares(0)),
+            "the timeout must clear the in-flight on the redemption's own chain"
+        );
+        assert_eq!(ethereum_available, Some(shares(10)));
+        assert_eq!(
+            base_inflight,
+            Some(shares(4)),
+            "the timeout must not touch the trading chain's slot"
+        );
+        assert_eq!(base_available, Some(shares(46)));
     }
 
     #[tokio::test]
@@ -24256,6 +24681,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -27653,6 +28079,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -27722,6 +28149,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -27798,6 +28226,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -28040,6 +28469,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -28102,6 +28532,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -28164,6 +28595,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: max_positive,
                 tokenization_request_id: None,
@@ -28245,6 +28677,7 @@ mod tests {
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
             RedemptionTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -28317,6 +28750,7 @@ mod tests {
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
             RedemptionTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,
@@ -28541,6 +28975,7 @@ mod tests {
         trigger.mint_tracking.write().await.insert(
             id.clone(),
             MintTracking {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 quantity: shares(10),
                 tokenization_request_id: None,

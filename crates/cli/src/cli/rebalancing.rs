@@ -339,14 +339,42 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         network,
     } = transfer;
     let chain = Chain::from(network);
-    let primary = ctx.chains.primary().chain;
-    if chain != primary {
-        anyhow::bail!(
-            "transfer-equity on {chain} is refused until mint and redemption records carry \
-             their chain: the server's startup recovery resumes every interrupted transfer \
-             with the primary chain's ({primary}) services. Fund {chain} with alpaca-tokenize, \
-             wrap-equity and vault-deposit --network {chain} instead"
-        );
+
+    // A resume continues the transfer the record describes, so the recorded
+    // chain decides: driving it on another network would use the wrong
+    // orderbook, wrapper and issuer wallet. Only a mint resumes by id; a
+    // redemption always starts fresh, so `to-alpaca` never consults the record.
+    let recorded = match (direction, issuer_request_id) {
+        (TransferDirection::ToRaindex, Some(uuid)) => {
+            let id = IssuerRequestId(uuid);
+            st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &id)
+                .await?
+                .map(|entity| (id, entity.chain()))
+        }
+        (TransferDirection::ToRaindex, None) | (TransferDirection::ToAlpaca, _) => None,
+    };
+
+    match recorded {
+        Some((id, recorded)) if recorded != chain => {
+            anyhow::bail!(
+                "mint {id} was requested on {recorded}; --network {chain} would resume it \
+                 against another chain's orderbook and issuer wallet. Re-run with \
+                 --network {recorded}"
+            );
+        }
+        Some(_) => {}
+        // An id with no record behind it names nothing to resume, so this is a
+        // fresh transfer and the primary-only rule still applies.
+        None => {
+            let primary = ctx.chains.primary().chain;
+            if chain != primary {
+                anyhow::bail!(
+                    "a fresh transfer-equity on {chain} is refused while the transfer saga is \
+                     built for the primary chain ({primary}) only. Fund {chain} with \
+                     alpaca-tokenize, wrap-equity and vault-deposit --network {chain} instead"
+                );
+            }
+        }
     }
 
     let direction_str = match direction {
@@ -392,7 +420,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
             }
 
             equity_transfer
-                .resume_equity_to_market_making(&issuer_request_id, &symbol, quantity)
+                .resume_equity_to_market_making(&issuer_request_id, &symbol, chain, quantity)
                 .await?;
 
             writeln!(stdout, "✅ Mint completed successfully")?;
@@ -403,7 +431,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
             let aggregate_id = RedemptionAggregateId::generate();
             equity_transfer
-                .resume_equity_to_hedging(&aggregate_id, &symbol, quantity)
+                .resume_equity_to_hedging(&aggregate_id, &symbol, chain, quantity)
                 .await?;
 
             writeln!(stdout, "✅ Redemption completed successfully")?;
@@ -3143,11 +3171,10 @@ mod tests {
         );
     }
 
-    /// The mint and redemption aggregates record no chain, and the server's
-    /// startup recovery resumes every interrupted transfer with the primary
-    /// chain's services. A transfer written for another chain would be
-    /// continued on the wrong network after a restart, so it is refused
-    /// before anything reaches the shared database.
+    /// The transfer saga is still wired with one chain's services, so a fresh
+    /// transfer on another chain would be driven against the primary's
+    /// orderbook and wrapper. It is refused before anything reaches the
+    /// shared database.
     #[tokio::test]
     async fn transfer_equity_refuses_a_non_primary_network_until_records_carry_their_chain() {
         let ctx = create_alpaca_ctx_watching_ethereum();
@@ -3174,6 +3201,139 @@ mod tests {
         assert!(
             error.contains("ethereum") && error.contains("primary") && error.contains("base"),
             "expected the refusal to name the chain and the primary, got: {error}"
+        );
+    }
+
+    /// An `--issuer-request-id` with no record behind it is a fresh transfer
+    /// wearing a resume flag: the primary-only rule must still apply, or an
+    /// unused id would smuggle a mint onto a secondary chain.
+    #[tokio::test]
+    async fn transfer_equity_refuses_a_non_primary_network_with_an_unused_issuer_request_id() {
+        let ctx = create_alpaca_ctx_watching_ethereum();
+        let pool = setup_test_db().await;
+
+        let mut stdout = Vec::new();
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+                issuer_request_id: Some(Uuid::from_u128(0x2283)),
+                redemption_wallet: None,
+                network: TokenizationNetwork::Ethereum,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("ethereum") && error.contains("primary") && error.contains("base"),
+            "expected the refusal to name the chain and the primary, got: {error}"
+        );
+    }
+
+    /// Only a mint resumes by id: `to-alpaca` always starts a fresh
+    /// redemption, so a recorded Ethereum mint id must not let one through on
+    /// a non-primary network.
+    #[tokio::test]
+    async fn transfer_equity_to_alpaca_ignores_a_mint_id_and_keeps_the_primary_only_rule() {
+        let ctx = create_alpaca_ctx_watching_ethereum();
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-redeem-with-ethereum-mint-id");
+
+        send_mint_command(
+            &pool,
+            &id,
+            TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: id.clone(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                chain: Chain::Ethereum,
+                quantity: float!(10),
+                wallet: Address::ZERO,
+            },
+        )
+        .await;
+
+        let IssuerRequestId(uuid) = id;
+        let mut stdout = Vec::new();
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToAlpaca,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(10)),
+                issuer_request_id: Some(uuid),
+                redemption_wallet: None,
+                network: TokenizationNetwork::Ethereum,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("ethereum") && error.contains("primary") && error.contains("base"),
+            "expected the refusal to name the chain and the primary, got: {error}"
+        );
+    }
+
+    /// A resume continues the transfer the record describes. Naming another
+    /// network would drive it against the wrong orderbook, wrapper and
+    /// issuer wallet, so the recorded chain decides and a disagreement is
+    /// refused before anything reaches the chain.
+    #[tokio::test]
+    async fn transfer_equity_resume_refuses_a_network_the_record_disagrees_with() {
+        let ctx = create_alpaca_ctx_watching_ethereum();
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-mint-resume-chain-mismatch");
+
+        send_mint_command(
+            &pool,
+            &id,
+            TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: id.clone(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                chain: Chain::Ethereum,
+                quantity: float!(10),
+                wallet: Address::ZERO,
+            },
+        )
+        .await;
+
+        let IssuerRequestId(uuid) = id;
+        let mut stdout = Vec::new();
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(10)),
+                issuer_request_id: Some(uuid),
+                redemption_wallet: None,
+                network: TokenizationNetwork::Base,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.starts_with(&format!(
+                "mint {uuid} was requested on ethereum; --network base would resume it"
+            )),
+            "expected the recorded-chain mismatch refusal, got: {error}"
+        );
+        assert!(
+            error.ends_with("Re-run with --network ethereum"),
+            "expected the refusal to point at the recorded chain, got: {error}"
         );
     }
 
@@ -4600,6 +4760,7 @@ mod tests {
             .send(
                 id,
                 Redeem {
+                    chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
@@ -4894,6 +5055,7 @@ mod tests {
             .send(
                 id,
                 TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
@@ -4954,6 +5116,7 @@ mod tests {
             &pool,
             &id,
             TokenizedEquityMintCommand::RequestMint {
+                chain: Chain::Base,
                 issuer_request_id: id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(10),
@@ -5082,6 +5245,7 @@ mod tests {
                 issuer_request_id: id.clone(),
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(10),
+                chain: Chain::Base,
                 wallet: Address::from([1; 20]),
             },
         )
