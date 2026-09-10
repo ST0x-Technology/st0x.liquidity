@@ -255,7 +255,8 @@ async fn send_initial_state(
 ) -> bool {
     // Without inventory the initial frame would misstate the book, so the
     // socket is closed and the client retries rather than shown a gap.
-    let inventory_dto = match state.inventory.read().await.to_dto() {
+    let inventory = state.inventory.read().await.to_dto();
+    let inventory_dto = match inventory {
         Ok(inventory_dto) => inventory_dto,
         Err(error) => {
             error!(

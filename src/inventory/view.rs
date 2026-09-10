@@ -1026,7 +1026,7 @@ impl InventoryView {
                 let inventory = self.equities.get(symbol);
                 let (onchain_available, onchain_inflight) = inventory.map_or(
                     Ok((FractionalShares::ZERO, FractionalShares::ZERO)),
-                    |item| item.onchain_totals(),
+                    Inventory::onchain_totals,
                 )?;
 
                 let (offchain_available, offchain_inflight) = inventory
