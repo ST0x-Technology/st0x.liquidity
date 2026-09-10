@@ -676,16 +676,10 @@ fn find_equity_addresses<P>(
         .ok_or_else(|| anyhow::anyhow!("missing test equity addresses for {symbol}"))
 }
 
-fn log_recheck_command(
-    config_path: &Path,
-    secrets_path: &Path,
-    transfer_type: TransferType,
-    id: &str,
-) {
-    let transfer_type_arg = match transfer_type {
-        TransferType::Mint => "mint",
-        TransferType::Redemption => "redemption",
-    };
+/// `transfer_type_arg` is the CLI `--kind` value: "mint", "redemption", or
+/// "usdc" (the cli crate's `RecheckTransferType` wire spellings; the e2e
+/// crate has no dependency on the cli crate to name the enum itself).
+fn log_recheck_command(config_path: &Path, secrets_path: &Path, transfer_type_arg: &str, id: &str) {
     let command = format!(
         "nix develop --command cargo run -p st0x-cli --features mock -- \
          --config {} --secrets {} transfer recheck --kind {} --id {}",
@@ -1461,7 +1455,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
     log_recheck_command(
         &config_path,
         &secrets_path,
-        TransferType::Mint,
+        "mint",
         &accepted_mint.issuer_request_id,
     );
 
@@ -1521,7 +1515,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
     log_recheck_command(
         &config_path,
         &secrets_path,
-        TransferType::Redemption,
+        "redemption",
         &rejected_redemption.redemption_id,
     );
 

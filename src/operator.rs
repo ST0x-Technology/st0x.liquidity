@@ -63,6 +63,19 @@ pub mod equity_transfer {
         Redemption,
     }
 
+    /// The transfer kind addressed by an operator recheck.
+    ///
+    /// A superset of [`EquityTransferKind`]: a failed BaseToAlpaca USDC
+    /// deposit is recheckable against Alpaca, while `fail` and the
+    /// aggregate-level recovery commands stay equity-only (a stuck USDC
+    /// transfer is reconciled, never force-failed).
+    #[derive(Debug, Clone, Copy)]
+    pub enum RecheckKind {
+        Mint,
+        Redemption,
+        Usdc,
+    }
+
     fn stale_state_context<Failure: std::error::Error + Send + Sync + 'static>(
         kind: &str,
         id: &str,
@@ -196,10 +209,11 @@ pub mod equity_transfer {
     }
 
     /// Returns the local server endpoint used to re-check a transfer.
-    pub fn recheck_url(ctx: &Ctx, transfer_kind: EquityTransferKind, id: &str) -> String {
+    pub fn recheck_url(ctx: &Ctx, transfer_kind: RecheckKind, id: &str) -> String {
         let kind = match transfer_kind {
-            EquityTransferKind::Mint => "equity_mint",
-            EquityTransferKind::Redemption => "equity_redemption",
+            RecheckKind::Mint => "equity_mint",
+            RecheckKind::Redemption => "equity_redemption",
+            RecheckKind::Usdc => "usdc_bridge",
         };
 
         format!(
@@ -211,7 +225,7 @@ pub mod equity_transfer {
     /// Requests an in-process re-check and returns its operator-facing outcome.
     pub async fn recheck_transfer(
         ctx: &Ctx,
-        transfer_kind: EquityTransferKind,
+        transfer_kind: RecheckKind,
         id: &str,
     ) -> anyhow::Result<String> {
         let url = recheck_url(ctx, transfer_kind, id);

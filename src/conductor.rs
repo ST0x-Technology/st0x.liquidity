@@ -120,8 +120,8 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
-    TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking,
-    TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
+    RecheckUsdcDeposit, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
+    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
 };
 use crate::rebalancing::{
     BaseWallet, ChainWallets, EthereumWallet, RebalancerServices, RebalancingSchedulers,
@@ -779,8 +779,7 @@ fn bounded_http_provider(
 
 async fn setup_instrumentation<E>(
     executor_ctx: impl TryIntoExecutor<Executor = E>,
-    trading_chain: &TradingChain,
-    watched_secondaries: &[TradingChain],
+    ctx: &Ctx,
     pool: SqlitePool,
 ) -> anyhow::Result<(
     InstrumentedExecutor<E>,
@@ -790,8 +789,10 @@ async fn setup_instrumentation<E>(
     TelemetrySender,
 )>
 where
-    E: Executor,
+    E: Executor + Clone,
 {
+    let trading_chain = ctx.chains.primary();
+    let watched_secondaries = watched_secondaries(ctx);
     // Telemetry channel: the RPC layer and instrumented executor emit
     // dependency-call samples through it; the writer task batches them
     // into SQLite in the background.
@@ -820,6 +821,8 @@ where
     // and the returned sender each hold a clone. When all three are dropped,
     // the channel closes and the writer task exits cleanly.
     let telemetry_writer = spawn_dependency_call_writer(pool, telemetry_receiver);
+
+    startup_smoke_checks(&executor, &provider, &watch_providers, ctx).await?;
 
     Ok((
         executor,
@@ -856,8 +859,11 @@ fn publish_recovery_handle(
     recovery_cell: &tokio::sync::OnceCell<crate::api::RecoveryHandle>,
     transfer: Option<Arc<CrossVenueEquityTransfer>>,
     rebalancing_service: Option<Arc<RebalancingService>>,
+    usdc_recheck: Option<Arc<dyn RecheckUsdcDeposit>>,
 ) {
-    let (Some(transfer), Some(rebalancing_service)) = (transfer, rebalancing_service) else {
+    let (Some(transfer), Some(rebalancing_service), Some(usdc_recheck)) =
+        (transfer, rebalancing_service, usdc_recheck)
+    else {
         debug!("Rebalancing disabled: /transfers/resume stays unavailable");
         return;
     };
@@ -865,6 +871,7 @@ fn publish_recovery_handle(
     let _ = recovery_cell.set(crate::api::RecoveryHandle {
         transfer,
         rebalancing_service,
+        usdc_recheck,
     });
 }
 
@@ -904,15 +911,8 @@ impl Conductor {
         crate::offchain::order::JobError: From<E::Error>,
     {
         let (executor, provider, watch_providers, telemetry_writer, telemetry) =
-            setup_instrumentation(
-                executor_ctx,
-                ctx.chains.primary(),
-                &watched_secondaries(&ctx),
-                pool.clone(),
-            )
-            .await?;
+            setup_instrumentation(executor_ctx, &ctx, pool.clone()).await?;
 
-        startup_smoke_checks(&executor, &provider, &watch_providers, &ctx).await?;
         let cache = SymbolCache::default();
 
         let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
@@ -963,6 +963,7 @@ impl Conductor {
             wrapper,
             service: rebalancing_service,
             recovery_transfer,
+            usdc_recheck,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store,
@@ -1130,7 +1131,12 @@ impl Conductor {
             .worker_failure_notifier(notifier)
             .call()?;
 
-        publish_recovery_handle(&recovery_cell, recovery_transfer, recovery_service);
+        publish_recovery_handle(
+            &recovery_cell,
+            recovery_transfer,
+            recovery_service,
+            usdc_recheck,
+        );
 
         conductor
             .run_until_completion(startup_tokens.initialized)
@@ -1762,6 +1768,9 @@ struct RebalancingInfrastructure {
     wrapper: Arc<dyn Wrapper>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
+    /// Operator `transfer recheck` entry point for a failed USDC deposit,
+    /// published on the recovery handle.
+    usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -1813,6 +1822,7 @@ struct PositionAndRebalancing {
     wrapper: Option<Arc<dyn Wrapper>>,
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
+    usdc_recheck: Option<Arc<dyn RecheckUsdcDeposit>>,
     wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
     unwrapped_equity_recovery_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
@@ -2021,6 +2031,7 @@ impl PositionAndRebalancing {
                 wrapper: Some(infra.wrapper),
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
+                usdc_recheck: Some(infra.usdc_recheck),
                 wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
                 unwrapped_equity_recovery_store: Some(infra.unwrapped_equity_recovery_store),
                 mint_store: Some(infra.mint_store),
@@ -2084,6 +2095,7 @@ impl PositionAndRebalancing {
                 wrapper,
                 service: None,
                 recovery_transfer: None,
+                usdc_recheck: None,
                 wrapped_equity_recovery_store: None,
                 unwrapped_equity_recovery_store: None,
                 mint_store: None,
@@ -3143,6 +3155,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             wrapper,
             service: rebalancing_service,
             recovery_transfer,
+            usdc_recheck: usdc_handles.recheck_deposit,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store: built.mint,
