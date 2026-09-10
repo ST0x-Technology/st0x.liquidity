@@ -1637,6 +1637,47 @@ mod tests {
         );
     }
 
+    /// Vault polling is what seeds a chain's inventory slots, so every
+    /// watched chain needs an entry of its own -- keyed on that chain's
+    /// orderbook and vault owner, not the primary's.
+    #[test]
+    fn vault_polling_entries_cover_every_watched_chain() {
+        let ethereum_orderbook = Address::repeat_byte(0xe0);
+        let ethereum_vault_owner = Address::repeat_byte(0xe1);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.insert_secondary(
+            st0x_config::TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ethereum_orderbook)
+                .vault_owner(ethereum_vault_owner)
+                .call(),
+        );
+
+        let entries = vault_polling_entries(
+            &ctx,
+            &ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.chain, entry.orderbook, entry.vault_owner))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Chain::Base,
+                    ctx.chains.primary().orderbook,
+                    ctx.chains.primary().vault_owner
+                ),
+                (Chain::Ethereum, ethereum_orderbook, ethereum_vault_owner),
+            ],
+            "each watched chain must get its own vault-polling entry"
+        );
+    }
+
     #[test]
     fn alerts_require_a_configured_wallet() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
