@@ -3290,6 +3290,58 @@ mod tests {
         assert_eq!(recorded, Chain::Ethereum);
     }
 
+    /// A fresh mint on a non-primary chain records that chain and submits
+    /// through that chain's tokenizer, never the primary's.
+    #[tokio::test]
+    async fn an_ethereum_mint_records_and_follows_ethereum() {
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-ethereum-mint");
+        let base_tokenizer = Arc::new(MockTokenizer::new());
+        let ethereum_tokenizer = Arc::new(MockTokenizer::new());
+
+        let mut services = chain_keyed_redemption_services();
+        services.chains.get_mut(&Chain::Base).unwrap().tokenizer = base_tokenizer.clone();
+        services.chains.get_mut(&Chain::Ethereum).unwrap().tokenizer = ethereum_tokenizer.clone();
+
+        let (store, _projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(services)
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Ethereum,
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(1),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let recorded = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(&pool, &id)
+            .await
+            .unwrap()
+            .expect("the mint record must exist")
+            .chain();
+
+        assert_eq!(recorded, Chain::Ethereum);
+        assert_eq!(ethereum_tokenizer.mint_request_call_count(), 1);
+        assert_eq!(base_tokenizer.mint_request_call_count(), 0);
+    }
+
     /// The gas check runs on the selected chain's wallet against that chain's
     /// `[alerts.low_balance_thresholds]` entry; a chain without one is refused
     /// by name instead of skipping the check.
