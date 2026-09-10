@@ -29,7 +29,7 @@ use st0x_float_macro::float;
 #[cfg(any(test, feature = "test-support"))]
 use crate::InventoryAdapters;
 #[cfg(any(test, feature = "test-support"))]
-use crate::chain::TradingChain;
+use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
@@ -714,7 +714,7 @@ pub struct Ctx {
     pub log_query_url_template: Option<LogQueryUrlTemplate>,
     pub server_port: u16,
     pub board_port: u16,
-    /// Every chain the bot acts on. Read the trading chain out of it with
+    /// Every chain the bot acts on. Read the primary chain out of it with
     /// [`ChainRegistry::primary`].
     pub chains: ChainRegistry,
     pub order_polling_interval_secs: u64,
@@ -2292,7 +2292,7 @@ impl Ctx {
         #[builder(default = InventoryMode::Legacy)]
         inventory_mode: InventoryMode,
         #[builder(default = InventoryAdapters::default())] inventory_adapters: InventoryAdapters,
-        /// What the trading chain lists.
+        /// What the hedged chain lists.
         assets: crate::ChainAssets,
         /// How those symbols hedge. Omitted by most fixtures, which care about
         /// the chain listing; when absent every listed symbol gets an
@@ -2364,8 +2364,8 @@ impl Ctx {
             log_query_url_template: None,
             server_port,
             board_port,
-            chains: ChainRegistry::single_trading_chain(
-                TradingChain::test()
+            chains: ChainRegistry::single_hedged_chain(
+                HedgedChain::test()
                     .rpc_url(rpc_url)
                     .required_confirmations(required_confirmations)
                     .orderbook(orderbook)
@@ -2907,8 +2907,8 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         // Legacy by default: no distinct inventory, so the OPERATOR_ROLE
         // preflight is skipped. Tests exercising the managed path override
         // the trading chain's `inventory` explicitly.
-        chains: ChainRegistry::single_trading_chain(
-            TradingChain::test()
+        chains: ChainRegistry::single_hedged_chain(
+            HedgedChain::test()
                 .required_confirmations(1)
                 .inventory(InventoryMode::Legacy)
                 .vault_owner(order_owner)
@@ -8115,7 +8115,7 @@ mod tests {
             .chains
             .get(&Chain::Base)
             .and_then(|chain| chain.trading.as_ref())
-            .expect("prod config must describe Base as a trading chain");
+            .expect("prod config must describe Base as a hedged chain");
         let global_limit = base.assets.equities.operational_limit.map(Positive::inner);
 
         let broker = config.broker.expect(
@@ -8225,7 +8225,7 @@ mod tests {
             .chains
             .get(&Chain::Base)
             .and_then(|chain| chain.trading.as_ref())
-            .expect("s01-issuer config must describe Base as a trading chain")
+            .expect("s01-issuer config must describe Base as a hedged chain")
             .assets
             .equities
             .symbols
@@ -8490,7 +8490,7 @@ mod tests {
                     .values()
                     .filter_map(|chain_config| chain_config.trading.as_ref())
                     .any(|trading| trading.redemption_wallet.is_some()),
-                "{path:?}: no trading chain carries the required redemption_wallet"
+                "{path:?}: no hedged chain carries the required redemption_wallet"
             );
             assert!(
                 config.bot_gas_valuation.is_some(),
@@ -8679,7 +8679,7 @@ mod tests {
                         }
                     }
                     (InventoryModeTag::Legacy, Some(inventory)) => {
-                        // TradingChain::new rejects this combination at
+                        // HedgedChain::new rejects this combination at
                         // startup (LegacyWithInventory); asserting it here
                         // fails the contradiction in CI instead of at the
                         // deploy gate.

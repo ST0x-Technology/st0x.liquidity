@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use st0x_config::{Ctx, TradingChain};
+use st0x_config::{Ctx, HedgedChain};
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Chain, ReadOnlyEvm};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
@@ -71,7 +71,7 @@ pub struct AccountForDexTrade {
 /// from another chain silently mis-processes the fill (a wrong `vault_owner`
 /// owner-filters every fill out; wrong contracts reconstruct wrong logs).
 pub(crate) struct ChainAccounting<Node> {
-    pub(crate) trading: TradingChain,
+    pub(crate) trading: HedgedChain,
     /// Orderbook and shared `RaindexInventory` addresses on this chain --
     /// the latter is the source contract for `InventoryTrade` events
     /// (`OperatorDeposit`/`OperatorWithdraw`). Used to reconstruct the
@@ -1299,7 +1299,7 @@ mod tests {
             ExecutionThreshold::whole_share(),
         )
         .await;
-        let mut secondary = TradingChain::test().chain(Chain::HyperEvm).call();
+        let mut secondary = HedgedChain::test().chain(Chain::HyperEvm).call();
         secondary.vault_owner = owner;
         secondary.orderbook = Address::repeat_byte(0x96);
         secondary.assets.equities.symbols.insert(

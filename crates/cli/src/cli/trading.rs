@@ -646,7 +646,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     cache: &SymbolCache,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
-    let trading_chain = ctx.chains.primary();
+    let primary_chain = ctx.chains.primary();
     // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by the
     // inventory contract post-migration, the bot EOA before it.
     let actors = RecoveryActors {
@@ -659,7 +659,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     };
     let read_evm = ReadOnlyEvm::new(provider.clone());
 
-    match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await {
+    match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, primary_chain, actors).await {
         Ok(Some(onchain_trade)) => {
             process_found_trade(onchain_trade, ctx, pool, stdout, order_placer).await?;
         }
@@ -1351,8 +1351,8 @@ mod tests {
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        BrokerCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, InventoryMode, LogFormat,
-        LogLevel, OperationMode, TradingChain,
+        BrokerCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, HedgedChain, InventoryMode,
+        LogFormat, LogLevel, OperationMode,
     };
     use st0x_evm::Chain;
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
@@ -1861,8 +1861,8 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(
-                TradingChain::test()
+            chains: ChainRegistry::single_hedged_chain(
+                HedgedChain::test()
                     .orderbook(address!("0x1234567890123456789012345678901234567890"))
                     .inventory(InventoryMode::Managed {
                         inventory: address!("0x1234567890123456789012345678901234567890"),

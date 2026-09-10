@@ -2836,7 +2836,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_config::{
-        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, LogLevel, RestApiCtx, TradingChain,
+        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
         create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
@@ -4603,7 +4603,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let orderbook = ctx.chains.primary().orderbook;
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(orderbook)
                 .call(),

@@ -383,12 +383,12 @@ mod tests {
     }
 
     /// The guard derives the market-making location from the configured
-    /// trading chain: a snapshot captured on a non-Base chain persists
+    /// primary chain: a snapshot captured on a non-Base chain persists
     /// `market_making:<chain>` rows, and a guard hardcoded to
     /// `market_making:base` would miss them and let the repair price vault
     /// shares as underlying.
     #[tokio::test]
-    async fn portfolio_snapshot_repair_refuses_wrapped_rows_on_a_non_base_trading_chain() {
+    async fn portfolio_snapshot_repair_refuses_wrapped_rows_on_a_non_base_primary_chain() {
         let pool = setup_test_db().await;
         let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
         let symbol = Symbol::new("QSEP").unwrap();

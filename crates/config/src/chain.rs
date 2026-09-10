@@ -357,15 +357,15 @@ impl std::fmt::Debug for ChainCtx {
     }
 }
 
-/// The chain the bot trades on: everything a [`ChainCtx`] carries, plus the
-/// orderbook side.
+/// A chain whose onchain fills the bot hedges offchain: everything a
+/// [`ChainCtx`] carries, plus the orderbook side.
 ///
 /// Deliberately flat rather than a `ChainCtx` with a nested orderbook struct.
 /// Every consumer of this reads a mix of both halves -- an RPC url and an
 /// orderbook address in the same call -- so nesting would buy nothing and add
 /// a level of indirection to each of those reads.
 #[derive(Clone)]
-pub struct TradingChain {
+pub struct HedgedChain {
     pub chain: Chain,
     pub rpc_url: Url,
     pub required_confirmations: u64,
@@ -383,7 +383,7 @@ pub struct TradingChain {
 
 #[cfg(any(test, feature = "test-support"))]
 #[bon::bon]
-impl TradingChain {
+impl HedgedChain {
     /// Test fixture builder: every field defaults to the common test shape
     /// (Base, localhost RPC, 0x11.. addresses, managed inventory, safe
     /// cutoff), so fixtures state only the fields their test depends on and
@@ -426,9 +426,9 @@ impl TradingChain {
     }
 }
 
-impl std::fmt::Debug for TradingChain {
+impl std::fmt::Debug for HedgedChain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TradingChain")
+        f.debug_struct("HedgedChain")
             .field("chain", &self.chain)
             .field("rpc_url", &"[REDACTED]")
             .field("required_confirmations", &self.required_confirmations)
@@ -445,7 +445,7 @@ impl std::fmt::Debug for TradingChain {
     }
 }
 
-impl TradingChain {
+impl HedgedChain {
     fn new(
         chain: Chain,
         config: &ChainConfig,
@@ -500,10 +500,10 @@ impl TradingChain {
 /// by every reader; watch-only chains live in `secondary`.
 #[derive(Clone, Debug)]
 pub struct ChainRegistry {
-    primary: TradingChain,
+    primary: HedgedChain,
     /// Watched, non-primary chains: fills are ingested and hedged, but their
     /// inventory is not polled or rebalanced; that stays on the primary.
-    secondary: BTreeMap<Chain, TradingChain>,
+    secondary: BTreeMap<Chain, HedgedChain>,
     transport: BTreeMap<Chain, ChainCtx>,
 }
 
@@ -521,7 +521,7 @@ pub enum ChainRegistryError {
         "no configured chain has a [chains.<name>.trading] table; the bot would have \
          no orderbook to watch and would place no hedges"
     )]
-    NoTradingChain,
+    NoHedgedChain,
     #[error(
         "{} chains configure a [trading] table ({}) but none sets primary = true; \
          exactly one watched chain must be the primary (trading, rebalancing, \
@@ -564,10 +564,10 @@ struct EnabledChains<'config> {
     trading_table: &'config TradingConfig,
 }
 
-/// Drops the disabled chains, picks the primary trading chain, and checks
+/// Drops the disabled chains, picks the primary chain, and checks
 /// that every surviving chain carries the capabilities its lifecycle needs.
 ///
-/// Exactly one trading chain must claim `primary = true`; the rest are
+/// Exactly one hedged chain must claim `primary = true`; the rest are
 /// watch-only secondaries. Transport-only entries are unlimited -- nothing
 /// watches them by design.
 fn enabled_chains(
@@ -589,7 +589,7 @@ fn enabled_chains(
         return Err(ChainRegistryError::NoEnabledChains);
     }
 
-    let trading_chains: Vec<(Chain, &ChainConfig, &TradingConfig)> = enabled
+    let hedged_chains: Vec<(Chain, &ChainConfig, &TradingConfig)> = enabled
         .iter()
         .filter_map(|(chain, config)| {
             config
@@ -599,11 +599,11 @@ fn enabled_chains(
         })
         .collect();
 
-    if trading_chains.is_empty() {
-        return Err(ChainRegistryError::NoTradingChain);
+    if hedged_chains.is_empty() {
+        return Err(ChainRegistryError::NoHedgedChain);
     }
 
-    let primaries: Vec<(Chain, &ChainConfig, &TradingConfig)> = trading_chains
+    let primaries: Vec<(Chain, &ChainConfig, &TradingConfig)> = hedged_chains
         .iter()
         .filter(|(_, _, trading)| trading.primary)
         .copied()
@@ -611,7 +611,7 @@ fn enabled_chains(
     let (primary_chain, chain_config, trading_table) = match primaries.as_slice() {
         [] => {
             return Err(ChainRegistryError::NoPrimaryChain {
-                chains: trading_chains.iter().map(|(chain, _, _)| *chain).collect(),
+                chains: hedged_chains.iter().map(|(chain, _, _)| *chain).collect(),
             });
         }
         [only] => *only,
@@ -716,7 +716,7 @@ impl ChainRegistry {
                 .map(|entry| entry.rpc_url)
         };
 
-        let primary = TradingChain::new(
+        let primary = HedgedChain::new(
             primary_chain,
             chain_config,
             trading_table,
@@ -734,7 +734,7 @@ impl ChainRegistry {
                 Some(trading) => {
                     secondary.insert(
                         *chain,
-                        TradingChain::new(*chain, config, trading, take_rpc_url(*chain)?)?,
+                        HedgedChain::new(*chain, config, trading, take_rpc_url(*chain)?)?,
                     );
                 }
                 None => {
@@ -783,18 +783,18 @@ impl ChainRegistry {
     /// THE primary chain: the one whose inventory the bot polls and rebalances
     /// automatically. Every watched chain (this one included) is reached via
     /// [`Self::watched`].
-    pub fn primary(&self) -> &TradingChain {
+    pub fn primary(&self) -> &HedgedChain {
         &self.primary
     }
 
     /// Every watched chain (primary first, then secondaries): the chains a
     /// fill watcher runs against.
-    pub fn watched(&self) -> impl Iterator<Item = &TradingChain> {
+    pub fn watched(&self) -> impl Iterator<Item = &HedgedChain> {
         self.watched_with_roles().map(|(_, watched)| watched)
     }
 
     /// Every watched chain tagged with its [`ChainRole`], primary first.
-    pub fn watched_with_roles(&self) -> impl Iterator<Item = (ChainRole, &TradingChain)> {
+    pub fn watched_with_roles(&self) -> impl Iterator<Item = (ChainRole, &HedgedChain)> {
         std::iter::once((ChainRole::Primary, &self.primary)).chain(
             self.secondary
                 .values()
@@ -803,24 +803,24 @@ impl ChainRegistry {
     }
 
     /// The watched chain with this id, if any.
-    pub fn watch(&self, chain: Chain) -> Option<&TradingChain> {
+    pub fn watch(&self, chain: Chain) -> Option<&HedgedChain> {
         if self.primary.chain == chain {
             return Some(&self.primary);
         }
         self.secondary.get(&chain)
     }
 
-    /// Mutable access to the trading chain, so a fixture can vary one field
+    /// Mutable access to the primary chain, so a fixture can vary one field
     /// (a settlement mode, an unreachable RPC) without rebuilding the registry.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn primary_mut(&mut self) -> &mut TradingChain {
+    pub fn primary_mut(&mut self) -> &mut HedgedChain {
         &mut self.primary
     }
 
     /// Adds a watched, non-primary chain, so a fixture can exercise the
     /// two-chain paths without assembling config and secrets tables.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn insert_secondary(&mut self, chain: TradingChain) {
+    pub fn insert_secondary(&mut self, chain: HedgedChain) {
         self.secondary.insert(chain.chain, chain);
     }
 
@@ -829,7 +829,7 @@ impl ChainRegistry {
     /// Test and fixture construction only: production registries come from
     /// [`Self::new`], which is what enforces the config/secrets pairing.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn single_trading_chain(primary: TradingChain) -> Self {
+    pub fn single_hedged_chain(primary: HedgedChain) -> Self {
         Self {
             primary,
             secondary: BTreeMap::new(),
@@ -960,8 +960,8 @@ mod tests {
     #[test]
     fn watched_with_roles_tags_the_primary_and_each_secondary() {
         let mut chains =
-            ChainRegistry::single_trading_chain(TradingChain::test().chain(Chain::Base).call());
-        chains.insert_secondary(TradingChain::test().chain(Chain::Ethereum).call());
+            ChainRegistry::single_hedged_chain(HedgedChain::test().chain(Chain::Base).call());
+        chains.insert_secondary(HedgedChain::test().chain(Chain::Ethereum).call());
 
         assert_eq!(
             chains
@@ -1125,7 +1125,7 @@ mod tests {
         )
         .unwrap();
 
-        TradingChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
+        HedgedChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
 
         assert_eq!(
             config
@@ -1195,7 +1195,7 @@ mod tests {
         )
         .unwrap();
 
-        TradingChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
+        HedgedChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
 
         assert_eq!(
             config
@@ -1223,7 +1223,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = TradingChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url())
+        let error = HedgedChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url())
             .unwrap_err();
 
         assert!(matches!(
@@ -1335,13 +1335,13 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_a_config_with_no_trading_chain() {
+    fn registry_rejects_a_config_with_no_hedged_chain() {
         let configs = BTreeMap::from([(Chain::Ethereum, chain_config(None))]);
 
         let error = ChainRegistry::new(&configs, secrets_for(&[Chain::Ethereum])).unwrap_err();
 
         assert!(
-            matches!(error, ChainRegistryError::NoTradingChain),
+            matches!(error, ChainRegistryError::NoHedgedChain),
             "got: {error}"
         );
     }
@@ -1488,7 +1488,7 @@ mod tests {
         assert_eq!(
             registry.rpc_url(Chain::Base),
             Some(&rpc_url_for(Chain::Base)),
-            "the trading chain resolves through its own entry"
+            "the hedged chain resolves through its own entry"
         );
         assert_eq!(
             registry.rpc_url(Chain::Ethereum),
@@ -1532,20 +1532,20 @@ mod tests {
         assert_eq!(
             registry.primary().required_confirmations,
             3,
-            "the trading chain's depth comes from its outer chain entry"
+            "the hedged chain's depth comes from its outer chain entry"
         );
         assert_eq!(registry.required_confirmations(Chain::Base), Some(3));
         assert_eq!(
             registry.required_confirmations(Chain::Ethereum),
             Some(12),
-            "a transport chain resolves its own depth, not the trading chain's"
+            "a transport chain resolves its own depth, not the hedged chain's"
         );
         assert_eq!(registry.required_confirmations(Chain::HyperEvm), None);
     }
 
     #[test]
-    fn trading_chain_new_maps_config_fields_to_their_own_slots() {
-        // Three same-typed Address fields flow through TradingChain::new. A swap in the
+    fn hedged_chain_new_maps_config_fields_to_their_own_slots() {
+        // Three same-typed Address fields flow through HedgedChain::new. A swap in the
         // mapping would compile silently, so assert each distinct address lands
         // in its own slot (and that a managed inventory resolves to itself).
         let config: TradingConfig = toml::from_str(
@@ -1569,7 +1569,7 @@ mod tests {
         .unwrap();
 
         let ctx =
-            TradingChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
+            HedgedChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
 
         assert_eq!(
             ctx.orderbook,
@@ -1600,7 +1600,7 @@ mod tests {
         let coin = ctx
             .assets
             .tokenized_equity(&Symbol::new("COIN").unwrap())
-            .expect("the configured assets table must ride along into TradingChain");
+            .expect("the configured assets table must ride along into HedgedChain");
         assert_eq!(
             coin,
             alloy::primitives::address!("0x6666666666666666666666666666666666666666"),
@@ -1621,7 +1621,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = TradingChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url())
+        let error = HedgedChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url())
             .unwrap_err();
 
         assert!(
@@ -1645,7 +1645,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = TradingChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url())
+        let error = HedgedChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url())
             .unwrap_err();
 
         assert!(
@@ -1671,7 +1671,7 @@ mod tests {
         .unwrap();
 
         let ctx =
-            TradingChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
+            HedgedChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
 
         assert_eq!(ctx.inventory, InventoryMode::Legacy);
         assert_eq!(

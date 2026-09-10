@@ -37,9 +37,9 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use st0x_config::{
-    AlertsCtx, BrokerCtx, ChainAssets, ChainRole, Ctx, CtxError, ExecutionThreshold, HedgingAssets,
-    InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode, OrchestratorAddresses,
-    RebalancingCtx, TradingChain,
+    AlertsCtx, BrokerCtx, ChainAssets, ChainRole, Ctx, CtxError, ExecutionThreshold, HedgedChain,
+    HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
+    OrchestratorAddresses, RebalancingCtx,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -724,7 +724,7 @@ type HttpProvider = FillProvider<
     RootProvider,
 >;
 
-/// Bounds for the trading chain RPC transport. A hung endpoint that accepts
+/// Bounds for the primary chain RPC transport. A hung endpoint that accepts
 /// the connection and never responds otherwise parks every await that runs
 /// through this provider (the fill poll loop, backfill, and all read-only
 /// contract calls) with no error surfaced (RAI-2218). 30s accommodates the
@@ -735,7 +735,7 @@ const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The watched chains beyond the primary: the ones needing their own
 /// providers, watchers, and accounting entries.
-fn watched_secondaries(ctx: &Ctx) -> Vec<TradingChain> {
+fn watched_secondaries(ctx: &Ctx) -> Vec<HedgedChain> {
     ctx.chains
         .watched()
         .filter(|watched| watched.chain != ctx.chains.primary().chain)
@@ -784,7 +784,7 @@ async fn setup_instrumentation<E>(
 where
     E: Executor + Clone,
 {
-    let trading_chain = ctx.chains.primary();
+    let primary_chain = ctx.chains.primary();
     let watched_secondaries = watched_secondaries(ctx);
     // Telemetry channel: the RPC layer and instrumented executor emit
     // dependency-call samples through it; the writer task batches them
@@ -797,7 +797,7 @@ where
     // Single HTTP transport per chain: drives continuous eth_getLogs fill
     // polling (via the OrderFillMonitor + backfill worker) and all read-only
     // contract calls. No WebSocket -- see `monitor::order_fills`.
-    let provider = bounded_http_provider(&trading_chain.rpc_url, &telemetry)?;
+    let provider = bounded_http_provider(&primary_chain.rpc_url, &telemetry)?;
 
     // One provider per watched non-primary chain, bounded and timed exactly
     // like the primary's: a hung secondary RPC must fail its own watcher,
@@ -1732,11 +1732,11 @@ struct PositionAndRebalancing {
 /// Builds one chain's wrapper service on that chain's signer and asset table.
 fn build_wrapper<Signer: Wallet + Clone>(
     wallet: Signer,
-    trading_chain: &TradingChain,
+    hedged_chain: &HedgedChain,
 ) -> Arc<WrapperService<Signer>> {
     Arc::new(WrapperService::new(
         wallet,
-        to_wrapped_equities(&trading_chain.assets.equities.symbols),
+        to_wrapped_equities(&hedged_chain.assets.equities.symbols),
     ))
 }
 
@@ -1845,7 +1845,7 @@ fn build_chain_tokenizations(
 fn build_equity_tokenization_services(
     ctx: &Ctx,
     alpaca_auth: &AlpacaBrokerApiCtx,
-    watched: &TradingChain,
+    watched: &HedgedChain,
     wallet: Arc<dyn Wallet<Provider = RootProvider>>,
 ) -> anyhow::Result<EquityTokenizationServices> {
     let chain = watched.chain;
@@ -2093,7 +2093,7 @@ async fn wire_transfer_admission_guards(
 /// inventory, `market_maker_wallet` signs and appears as the operator.
 fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
     wallet: &Signer,
-    trading: &TradingChain,
+    trading: &HedgedChain,
     market_maker_wallet: Address,
 ) -> Arc<RaindexService<Signer>> {
     Arc::new(RaindexService::new(
@@ -2116,7 +2116,7 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
 /// would route funds by addresses that mean something else there, or nothing
 /// at all. The id comes from the [`Chain`] type rather than from config: a
 /// config-supplied id would be the very value being checked.
-/// The trading chain's id is confirmed inside `setup_instrumentation`; the
+/// The primary chain's id is confirmed inside `setup_instrumentation`; the
 /// transport chains hold funds through their signers, so a signer pointed at
 /// the wrong network must fail startup the same way.
 ///
@@ -2257,7 +2257,7 @@ where
 /// log instead of failing.
 async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
     provider: &P,
-    watched: &TradingChain,
+    watched: &HedgedChain,
 ) -> anyhow::Result<()> {
     let Some((symbol, asset)) = watched
         .assets
@@ -2649,7 +2649,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
 /// The vault-registry lookup for one watched chain. Every id is qualified by
 /// its chain: a vault id means nothing on another network's orderbook.
 fn build_rebalancing_vault_lookup(
-    chain: &TradingChain,
+    chain: &HedgedChain,
     vault_owner: Address,
     projection: Arc<Projection<VaultRegistry>>,
 ) -> (VaultRegistryId, Arc<dyn VaultLookup>) {
@@ -2734,7 +2734,7 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
 
 /// Builds the trigger service from the validated rebalancing config plus the
 /// conductor-owned dependencies (the trigger config is the runtime projection
-/// of `RebalancingCtx` onto the trading chain's asset table).
+/// of `RebalancingCtx` onto the primary chain's asset table).
 fn build_rebalancing_service(
     rebalancing_ctx: &RebalancingCtx,
     deps: &RebalancingDeps,
@@ -5477,7 +5477,7 @@ mod tests {
         );
     }
 
-    fn trading_chain_with_equity(symbol: &str, token: Address) -> TradingChain {
+    fn hedged_chain_with_equity(symbol: &str, token: Address) -> HedgedChain {
         let mut trading = create_test_ctx_with_order_owner(Address::ZERO)
             .chains
             .primary()
@@ -5512,7 +5512,7 @@ mod tests {
             ),
         );
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-        let trading = trading_chain_with_equity(
+        let trading = hedged_chain_with_equity(
             "AAPL",
             address!("0x1111111111111111111111111111111111111111"),
         );
@@ -5530,7 +5530,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("connection reset by peer");
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-        let trading = trading_chain_with_equity(
+        let trading = hedged_chain_with_equity(
             "AAPL",
             address!("0x1111111111111111111111111111111111111111"),
         );
@@ -5589,11 +5589,11 @@ mod tests {
     #[tokio::test]
     async fn asset_canary_runs_on_every_watched_chain() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        *ctx.chains.primary_mut() = trading_chain_with_equity(
+        *ctx.chains.primary_mut() = hedged_chain_with_equity(
             "AAPL",
             address!("0x1111111111111111111111111111111111111111"),
         );
-        let mut secondary = trading_chain_with_equity(
+        let mut secondary = hedged_chain_with_equity(
             "MSFT",
             address!("0x2222222222222222222222222222222222222222"),
         );
@@ -5644,7 +5644,7 @@ mod tests {
             inventory: Address::repeat_byte(0xAA),
         };
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .inventory(InventoryMode::Managed {
                     inventory: Address::repeat_byte(0xBB),
@@ -5682,7 +5682,7 @@ mod tests {
             inventory: Address::repeat_byte(0xAA),
         };
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .inventory(InventoryMode::Managed {
                     inventory: Address::repeat_byte(0xBB),
@@ -5690,7 +5690,7 @@ mod tests {
                 .call(),
         );
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::HyperEvm)
                 .inventory(InventoryMode::Legacy)
                 .call(),
@@ -15715,11 +15715,11 @@ mod tests {
 
     /// A watched Ethereum listing one TSLA that trades, with the given
     /// rebalancing flag and issuer redemption wallet.
-    fn ethereum_trading_chain(
+    fn ethereum_hedged_chain(
         redemption_wallet: Option<Address>,
         rebalancing: OperationMode,
-    ) -> TradingChain {
-        let mut trading = TradingChain::test()
+    ) -> HedgedChain {
+        let mut trading = HedgedChain::test()
             .chain(Chain::Ethereum)
             .orderbook(Address::repeat_byte(0xe0))
             .maybe_redemption_wallet(redemption_wallet)
@@ -15756,7 +15756,7 @@ mod tests {
             },
             cash: None,
         };
-        ctx.chains.insert_secondary(ethereum_trading_chain(
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
             Some(Address::repeat_byte(0xe1)),
             OperationMode::Enabled,
         ));
@@ -15799,7 +15799,7 @@ mod tests {
         ctx.broker = alpaca_broker_ctx();
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
         ctx.chains
-            .insert_secondary(ethereum_trading_chain(None, OperationMode::Enabled));
+            .insert_secondary(ethereum_hedged_chain(None, OperationMode::Enabled));
 
         let Err(error) = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()) else {
             panic!("a watched chain without a redemption wallet must fail startup");
@@ -15822,7 +15822,7 @@ mod tests {
         ctx.broker = alpaca_broker_ctx();
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
         ctx.chains
-            .insert_secondary(ethereum_trading_chain(None, OperationMode::Disabled));
+            .insert_secondary(ethereum_hedged_chain(None, OperationMode::Disabled));
 
         let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
 
@@ -15853,7 +15853,7 @@ mod tests {
             cash: None,
         };
         ctx.chains
-            .insert_secondary(ethereum_trading_chain(None, OperationMode::Disabled));
+            .insert_secondary(ethereum_hedged_chain(None, OperationMode::Disabled));
         ctx
     }
 
@@ -16186,7 +16186,7 @@ mod tests {
     #[test]
     fn startup_approval_targets_follow_a_rebalancing_secondarys_own_contracts() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let mut ethereum = ethereum_trading_chain(None, OperationMode::Enabled);
+        let mut ethereum = ethereum_hedged_chain(None, OperationMode::Enabled);
         ethereum.assets.equities.symbols.insert(
             Symbol::new("NVDA").unwrap(),
             equity_asset(Address::repeat_byte(0xe8), Address::repeat_byte(0xe9)),
@@ -16223,7 +16223,7 @@ mod tests {
     #[test]
     fn startup_approval_targets_use_hyperevm_usdc_and_orderbook() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let mut hyperevm = TradingChain::test().chain(Chain::HyperEvm).call();
+        let mut hyperevm = HedgedChain::test().chain(Chain::HyperEvm).call();
         hyperevm.orderbook = Address::repeat_byte(0x99);
         ctx.chains.insert_secondary(hyperevm);
 
@@ -16258,7 +16258,7 @@ mod tests {
         );
 
         ctx.chains
-            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
+            .insert_secondary(HedgedChain::test().chain(Chain::HyperEvm).call());
 
         let revocations = stale_allowance_revocations(&ctx);
         assert_eq!(revocations[&Chain::HyperEvm], vec![USDC_HYPEREVM]);

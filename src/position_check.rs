@@ -1690,7 +1690,7 @@ mod tests {
             ))
         };
 
-        // The listing lives on the trading chain; the hedging table above only
+        // The listing lives on the hedged chain; the hedging table above only
         // says how those symbols hedge, not that they trade anywhere.
         ctx.chains.primary_mut().assets.equities.symbols = equity_symbols;
         ctx
