@@ -161,7 +161,10 @@ every hedged chain (chain-id identity, cutoff support, and each token address
 the chain's role uses answering `decimals()` on that chain's own endpoint: every
 equity's wrapped share, plus the unwrapped token of each equity the chain
 rebalances) and any failure is fatal; degraded per-chain startup is deferred to
-the chain-disable work.
+the chain-disable work. Each probed equity token must report 18 decimals: every
+equity quantity the bot scales is 18-decimal share-wei, so a token at another
+precision is refused by name rather than honoured. USDC is not probed, so its 6
+decimals are untouched.
 
 HyperEVM supports prefunded fill ingestion and hedging as a hedged secondary
 with manually funded equity, USDC and native HYPE gas. Configuring HyperEVM as

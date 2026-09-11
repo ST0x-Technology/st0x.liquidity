@@ -129,7 +129,9 @@ use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::telemetry::executor::InstrumentedExecutor;
 use crate::telemetry::rpc::RpcTelemetryLayer;
 use crate::telemetry::{TelemetrySender, spawn_dependency_call_writer};
-use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
+use crate::tokenized_equity_mint::{
+    TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, interrupted_mint_ids,
+};
 use crate::trading::offchain::close_flatten::{CloseFlattenCrossRamp, CloseFlattenPolicy};
 use crate::trading::offchain::hedge::{apply_slippage, resolve_extended_hours_reference_price};
 use crate::trading::onchain::inclusion::EmittedOnChain;
@@ -2215,7 +2217,8 @@ where
 }
 
 /// Startup read-path canary: every configured token address must answer a
-/// `decimals()` view call on the chain it is configured for.
+/// `decimals()` view call on the chain it is configured for, and must report
+/// [`TOKENIZED_EQUITY_DECIMALS`].
 ///
 /// Proves the configured addresses are live contracts on the endpoint the
 /// registry entry names -- config, RPC transport, and ABI decoding exercised
@@ -2223,6 +2226,9 @@ where
 /// are read follows the roles they play: see [`asset_read_probes`].
 /// Read-only and cold-start-safe: a chain with no configured equities is the
 /// normal bring-up state and skips with a log instead of failing.
+///
+/// Only equity tokens are read here, so the 18-decimal demand never reaches
+/// the cash side: USDC is 6 decimals and is not probed.
 async fn confirm_configured_assets_respond<P: Provider + Clone + 'static>(
     provider: &P,
     role: ChainRole,
@@ -2254,6 +2260,22 @@ async fn confirm_configured_assets_respond<P: Provider + Clone + 'static>(
                     field = probed.field(),
                 )
             })?;
+
+        // Every equity quantity the bot scales is 18-decimal share-wei: the
+        // mint authorization signs `amount` at 18, a redemption decodes the
+        // unwrapped amount at 18, and a share deposit reaches the vault at 18.
+        // A token at another precision answers this read and then mis-scales
+        // all of them, so a wrong precision is a config error, not a variant
+        // to honour.
+        anyhow::ensure!(
+            decimals == TOKENIZED_EQUITY_DECIMALS,
+            "startup read canary failed: [chains.{chain}] equity {symbol}'s {field} at \
+             {token} reports {decimals} decimals, but every equity amount the bot \
+             scales is {TOKENIZED_EQUITY_DECIMALS}-decimal share-wei; this address is \
+             not the configured equity's token",
+            chain = hedged.chain,
+            field = probed.field(),
+        );
 
         info!(
             target: "startup",
@@ -5548,10 +5570,10 @@ mod tests {
         // A rebalancing role reads both of the equity's tokens, so both
         // answers are queued.
         let asserter = Asserter::new();
-        for decimals in [18u8, 6u8] {
+        for _ in 0..2 {
             asserter.push_success(
                 &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
-                    &decimals,
+                    &TOKENIZED_EQUITY_DECIMALS,
                 ),
             );
         }
@@ -5685,10 +5707,10 @@ mod tests {
         ctx.chains.insert_secondary(secondary);
 
         let primary_asserter = hedged_chain_asserter(Chain::Base);
-        for decimals in [18u8, 6u8] {
+        for _ in 0..2 {
             primary_asserter.push_success(
                 &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
-                    &decimals,
+                    &TOKENIZED_EQUITY_DECIMALS,
                 ),
             );
         }
@@ -5863,10 +5885,10 @@ mod tests {
         // queue empty and fail startup, which is the assertion that no
         // unwrapped token is read here.
         let secondary_asserter = hedged_chain_asserter(Chain::Ethereum);
-        for decimals in [18u8, 6u8] {
+        for _ in 0..2 {
             secondary_asserter.push_success(
                 &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
-                    &decimals,
+                    &TOKENIZED_EQUITY_DECIMALS,
                 ),
             );
         }
