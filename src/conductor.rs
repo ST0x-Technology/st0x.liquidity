@@ -5594,6 +5594,42 @@ mod tests {
         );
     }
 
+    /// Every equity amount the bot scales is 18-decimal share-wei: the mint
+    /// authorization signs at 18, a redemption decodes the unwrapped amount at
+    /// 18, and a share deposit reaches the vault at 18. A token at another
+    /// precision answers `decimals()` happily and then mis-scales all of them,
+    /// so the canary must refuse it instead of only proving it answers.
+    #[tokio::test]
+    async fn asset_canary_refuses_an_equity_token_that_is_not_18_decimals() {
+        let asserter = Asserter::new();
+        asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &6u8,
+            ),
+        );
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let wrapped = address!("0x2222222222222222222222222222222222222222");
+        let hedge_only = hedged_chain_with_equities([(
+            "AAPL",
+            address!("0x1111111111111111111111111111111111111111"),
+            wrapped,
+        )]);
+
+        let error = confirm_configured_assets_respond(&provider, ChainRole::Secondary, &hedge_only)
+            .await
+            .expect_err("a 6-decimal equity token must refuse startup");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("reports 6 decimals"),
+            "the refusal must name the precision the token reported: {message}"
+        );
+        assert!(
+            message.contains("AAPL") && message.contains(&wrapped.to_string()),
+            "the refusal must name the symbol and the token: {message}"
+        );
+    }
+
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn asset_canary_skips_when_no_equities_are_configured() {
