@@ -746,7 +746,7 @@ mod tests {
 
     /// Deterministic deployments put the Raindex orderbook at the same address
     /// on several chains, and poll samples are keyed by orderbook alone. Poll
-    /// health must therefore count each cycle once however many watched chains
+    /// health must therefore count each cycle once however many hedged chains
     /// name that address -- iterating chains instead of distinct orderbooks
     /// would double every figure in the report.
     #[tokio::test]
@@ -754,7 +754,7 @@ mod tests {
         let pool = setup_test_db().await;
         let mut chains = base_only();
         chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(ORDERBOOK)
                 .call(),

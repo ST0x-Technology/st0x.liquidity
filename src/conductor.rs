@@ -1663,7 +1663,7 @@ struct RebalancingInfrastructure {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     tokenizer: Arc<dyn Tokenizer>,
-    /// One ratio source per watched chain that rebalances equity, handed to
+    /// One ratio source per hedged chain that rebalances equity, handed to
     /// the daily portfolio capture so a wrapped balance is valued with the
     /// ratio of the chain it sits on.
     wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
