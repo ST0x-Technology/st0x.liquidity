@@ -178,10 +178,18 @@ struct ConfiguredChainVaults {
     usdc_vaults: Option<BTreeSet<B256>>,
 }
 
-/// Equity symbols the portfolio treats as configured. Shared with the CLI's
-/// snapshot-mark repair so the two cannot drift on what "configured" means.
+/// Equity symbols the portfolio treats as configured: the union over every
+/// watched chain. Hedging is venue-level -- one broker book backs the market
+/// making of every chain -- so a symbol a secondary chain alone trades is
+/// still configured offchain, and an offchain snapshot filtered against the
+/// primary's table alone would drop its broker position and zero its Hedging
+/// slot. Shared with the CLI's snapshot-mark repair so the two cannot drift
+/// on what "configured" means.
 pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
-    chain_equity_symbols(&ctx.chains.primary().assets)
+    ctx.chains
+        .watched()
+        .flat_map(|watched| chain_equity_symbols(&watched.assets))
+        .collect()
 }
 
 /// The equities one chain operates: either switch on counts, both off does
@@ -362,8 +370,6 @@ where
         owner: order_owner,
     };
 
-    let configured_equity_symbols = configured_equity_symbols(&context.ctx);
-
     // The snapshot capture gate below must require exactly the wallet slots
     // this poller populates, so both derive from this single Option: the
     // poller consumes it, the gate reads its presence.
@@ -389,7 +395,7 @@ where
             Some(tokenizer),
             reserved_cash,
         )
-        .with_configured_equity_symbols(configured_equity_symbols.clone())
+        .with_configured_equity_symbols(configured_equity_symbols(&context.ctx))
         .with_divergence_recovery(InventoryDivergenceRecoveryCtx {
             inventory: context.inventory.clone(),
             threshold: context.ctx.inventory_divergence_threshold,
@@ -536,7 +542,7 @@ where
         position_projection: context.frameworks.position_projection.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
         wrappers: context.wrappers.clone(),
-        configured_equity_symbols,
+        configured_equity_symbols: chain_equity_symbols(&context.ctx.chains.primary().assets),
         usdc_tracking_enabled: context.ctx.chains.primary().assets.cash.is_some(),
         // Derived from the same Option the poller consumed, so the gate can
         // never require wallet slots the poller does not populate.

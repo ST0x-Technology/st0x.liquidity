@@ -145,13 +145,12 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// onchain wrapped equity in the first place, so no row would ever need
     /// conversion.
     pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
-    /// Reused from `configured_inventory_vaults` (`src/conductor/builder.rs`)
-    /// rather than recomputed, so the completeness gate and the live
-    /// inventory poller always agree on what "fully hydrated" means. The
-    /// PRIMARY chain's equities alone, which is what the Hedging and
-    /// wallet-transit slots need -- both live on the primary. Row filtering,
-    /// ratio conversion and marking span every hedged chain instead, from
-    /// [`Self::market_making`] (see [`PortfolioSnapshotJob::perform_at`]).
+    /// The PRIMARY chain's equities alone (`src/conductor/builder.rs`): the
+    /// wallet-transit slots are polled from the primary's token map, so
+    /// requiring any other chain's symbol would gate the capture on a slot no
+    /// poll can stamp. Row filtering, ratio conversion and marking span every
+    /// hedged chain instead, from [`Self::market_making`] (see
+    /// [`PortfolioSnapshotJob::perform_at`]).
     pub(crate) configured_equity_symbols: HashSet<Symbol>,
     /// Whether the hedging venue tracks cash at all.
     pub(crate) usdc_tracking_enabled: bool,
