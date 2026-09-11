@@ -702,6 +702,35 @@ mod tests {
         assert_eq!(duration.max_ms, 300);
     }
 
+    /// Poll cycles belong to the chain whose watcher ran them: a sample from
+    /// a chain that is not hedged must not be counted for one that is, even
+    /// when both name the same deterministic orderbook address.
+    #[tokio::test]
+    async fn a_chains_poll_cycles_are_not_counted_for_another_chain() {
+        let pool = setup_test_db().await;
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            Chain::Ethereum,
+            ORDERBOOK,
+            timestamp(10),
+            StdDuration::from_millis(100),
+            4,
+            Err(&"ethereum rpc unreachable"),
+        )
+        .await
+        .unwrap();
+
+        let telemetry = load_monitor_telemetry(&pool, &range(), &base_only())
+            .await
+            .unwrap();
+
+        assert_eq!(telemetry.poll.cycles, 0);
+        assert_eq!(telemetry.poll.errors, 0);
+        assert_eq!(telemetry.poll.skipped_ticks, 0);
+        assert_eq!(telemetry.poll.duration, None);
+    }
+
     /// A secondary chain runs its own fill watcher against its own
     /// orderbook, so its poll cycles belong in the report's poll health --
     /// keyed to the primary alone, an outage there would read as healthy.
