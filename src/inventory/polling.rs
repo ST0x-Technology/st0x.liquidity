@@ -1961,11 +1961,14 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use alloy::providers::{Provider, ProviderBuilder, RootProvider};
     use alloy::rpc::client::RpcClient;
-    use alloy::rpc::types::TransactionReceipt;
-    use alloy::sol_types::SolValue;
+    use alloy::rpc::json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
+    use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+    use alloy::sol_types::{SolCall, SolValue};
+    use alloy::transports::{TransportError, TransportFut};
     use async_trait::async_trait;
     use chrono::Utc;
     use httpmock::prelude::*;
+    use serde_json::value::RawValue;
     use sqlx::{Row, SqlitePool};
     use st0x_config::ExecutionThreshold;
     use st0x_dto::Statement;
@@ -1981,13 +1984,16 @@ mod tests {
     use st0x_tokenization::issuer_request_id;
     use std::convert::Infallible;
     use std::num::NonZeroU32;
+    use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::sync::{Barrier, Notify, broadcast};
     use tokio::time::timeout;
+    use tower::Service;
     use uuid::Uuid;
 
     use super::*;
     use crate::alerts::CapturingNotifier;
+    use crate::bindings::IRaindexV6;
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::inventory::projection::InventoryProjection;
     use crate::inventory::snapshot::InventorySnapshotEvent;
@@ -3521,6 +3527,133 @@ mod tests {
             chains,
             vec![Chain::Ethereum],
             "a chain that failed must not stop the remaining chains from polling"
+        );
+    }
+
+    /// Serves one chain's vault poll from a fixed block, recording the token
+    /// key of every `vaultBalance2` read so a test can assert which token
+    /// each chain was queried with.
+    #[derive(Clone)]
+    struct VaultBalanceTokenRecorder {
+        block_number: u64,
+        tokens: Arc<Mutex<Vec<Address>>>,
+    }
+
+    impl Service<RequestPacket> for VaultBalanceTokenRecorder {
+        type Response = ResponsePacket;
+        type Error = TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), TransportError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: RequestPacket) -> Self::Future {
+            let RequestPacket::Single(request) = request else {
+                panic!("VaultBalanceTokenRecorder serves single requests only");
+            };
+
+            let payload = match request.method() {
+                "eth_blockNumber" => serde_json::to_string(&self.block_number).unwrap(),
+                "eth_call" => {
+                    let params: Vec<serde_json::Value> =
+                        serde_json::from_str(request.params().unwrap().get()).unwrap();
+                    let transaction: TransactionRequest =
+                        serde_json::from_value(params[0].clone()).unwrap();
+                    let calldata = transaction.input.input().unwrap();
+                    let vault_balance =
+                        IRaindexV6::vaultBalance2Call::abi_decode(calldata).unwrap();
+                    self.tokens.lock().unwrap().push(vault_balance.token);
+                    serde_json::to_string(ZERO_FLOAT_HEX).unwrap()
+                }
+                method => panic!("VaultBalanceTokenRecorder got an unexpected method {method}"),
+            };
+
+            let response = Response {
+                id: request.id().clone(),
+                payload: ResponsePayload::Success(RawValue::from_string(payload).unwrap()),
+            };
+
+            Box::pin(async move { Ok(ResponsePacket::Single(response)) })
+        }
+    }
+
+    fn recording_raindex_service(
+        block_number: u64,
+        tokens: &Arc<Mutex<Vec<Address>>>,
+    ) -> Arc<RaindexService<ReadOnlyEvm<impl Provider + Clone + 'static>>> {
+        let recorder = VaultBalanceTokenRecorder {
+            block_number,
+            tokens: Arc::clone(tokens),
+        };
+        create_test_raindex_service(
+            ProviderBuilder::new().connect_client(RpcClient::new(recorder, true)),
+        )
+    }
+
+    /// A secondary chain's USDC vault is keyed by that chain's own USDC
+    /// contract. Reading it under Base's address queries a token the vault
+    /// never held, and that answer is a valid zero which the poll would
+    /// persist and stamp fresh.
+    #[tokio::test]
+    async fn each_chains_usdc_vault_is_read_with_that_chains_own_usdc() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let ethereum_orderbook = address!("0x3333333333333333333333333333333333333333");
+
+        for (chain, chain_orderbook) in [
+            (Chain::Base, orderbook),
+            (Chain::Ethereum, ethereum_orderbook),
+        ] {
+            discover_usdc_vault(&pool, chain, chain_orderbook, order_owner, TEST_VAULT_ID).await;
+        }
+
+        let base_tokens = Arc::new(Mutex::new(Vec::new()));
+        let ethereum_tokens = Arc::new(Mutex::new(Vec::new()));
+
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            vec![
+                ChainVaultPolling::new(
+                    Chain::Base,
+                    recording_raindex_service(100, &base_tokens),
+                    orderbook,
+                    order_owner,
+                ),
+                ChainVaultPolling::new(
+                    Chain::Ethereum,
+                    recording_raindex_service(205, &ethereum_tokens),
+                    ethereum_orderbook,
+                    order_owner,
+                ),
+            ],
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        service.poll_onchain(&snapshot_id).await.unwrap();
+
+        assert_eq!(
+            *base_tokens.lock().unwrap(),
+            vec![Chain::Base.usdc()],
+            "the Base vault must be read under Base's canonical USDC"
+        );
+        assert_eq!(
+            *ethereum_tokens.lock().unwrap(),
+            vec![Chain::Ethereum.usdc()],
+            "the Ethereum vault must be read under Ethereum's canonical USDC"
         );
     }
 
