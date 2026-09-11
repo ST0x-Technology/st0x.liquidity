@@ -1047,13 +1047,13 @@ impl InventoryView {
             })
             .collect();
 
-        // The trading chain's slot alone: the dashboard measures this against
+        // The primary chain's slot alone: the dashboard measures this against
         // the rebalancing target, which governs that chain's vault. Cash
         // prefunded elsewhere is beyond the rebalancer's reach, so totalling it
         // in reads as a healthy allocation while the chain that rebalances is
         // underfunded.
         let (usdc_onchain_available, usdc_onchain_inflight) =
-            venue_balances(self.usdc.onchain.get(&self.trading_chain).copied());
+            venue_balances(self.usdc.onchain.get(&self.primary_chain).copied());
 
         let (usdc_offchain_available, usdc_offchain_inflight) = venue_balances(self.usdc.offchain);
 
@@ -5874,7 +5874,7 @@ mod tests {
         assert_eq!(
             dto.usdc.onchain_available,
             Usdc::from_cents(200_000).unwrap(),
-            "the dashboard cash figure names the trading chain"
+            "the dashboard cash figure names the primary chain"
         );
     }
 

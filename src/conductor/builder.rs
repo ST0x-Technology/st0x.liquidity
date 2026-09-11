@@ -158,7 +158,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) wallet_polling: WalletPollingCtx,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    /// Ratio source for the portfolio-snapshot capture gate, one per watched
+    /// Ratio source for the portfolio-snapshot capture gate, one per hedged
     /// chain: market making holds wrapped vault shares onchain, and the daily
     /// capture job resolves each wrapped balance through the service of the
     /// chain that balance sits on.
@@ -179,7 +179,7 @@ struct ConfiguredChainVaults {
 }
 
 /// Equity symbols the portfolio treats as configured: the union over every
-/// watched chain.
+/// hedged chain.
 ///
 /// Hedging is venue-level -- one broker book backs every chain's market making
 /// -- so filtering an offchain snapshot against the primary's table alone
@@ -188,8 +188,8 @@ struct ConfiguredChainVaults {
 /// what "configured" means.
 pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
     ctx.chains
-        .watched()
-        .flat_map(|watched| chain_equity_symbols(&watched.assets))
+        .hedged()
+        .flat_map(|hedged| chain_equity_symbols(&hedged.assets))
         .collect()
 }
 
@@ -1671,13 +1671,13 @@ mod tests {
     }
 
     /// Hedging is venue-level: one broker book backs the market making of
-    /// every watched chain. A symbol only a secondary chain trades therefore
+    /// every hedged chain. A symbol only a secondary chain trades therefore
     /// has a broker position too, and judging "configured" by the primary's
     /// assets table alone drops it from the offchain snapshot -- which the
     /// view then reads as a complete picture and zeroes the symbol's Hedging
     /// slot.
     #[test]
-    fn configured_equity_symbols_span_every_watched_chain() {
+    fn configured_equity_symbols_span_every_hedged_chain() {
         let secondary_symbol = Symbol::new("NVDA").unwrap();
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().assets = ChainAssets {
@@ -1691,7 +1691,7 @@ mod tests {
             cash: None,
         };
         ctx.chains.insert_secondary(
-            st0x_config::TradingChain::test()
+            st0x_config::HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .assets(ChainAssets {
                     equities: ChainEquities {
