@@ -15,7 +15,8 @@ use axum::http::header::{CACHE_CONTROL, HeaderName};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -31,7 +32,7 @@ use st0x_event_sorcery::{
 };
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
-use st0x_finance::FractionalShares;
+use st0x_finance::{FractionalShares, Positive};
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
@@ -47,6 +48,12 @@ use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
 use crate::iap_auth::{IapVerifier, require_iap};
+use crate::offchain::order::OffchainOrderId;
+use crate::operator::OperatorError;
+use crate::operator::portfolio_snapshot::{EquityMarkCorrection, set_equity_mark};
+use crate::operator::position::{
+    OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
+};
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
@@ -1281,7 +1288,7 @@ async fn raindex_orders(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -2250,6 +2257,219 @@ async fn reconcile_equity_transfer(
     }))
 }
 
+/// Maps a request parse failure to a `400` with the operator-facing reason. The
+/// aggregate-state rejections are mapped by `ops_operator_error` instead.
+fn ops_precondition_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: format!("{error}"),
+        }),
+    )
+}
+
+/// Maps a shared operator command failure to a response: a caller-facing
+/// rejection becomes a `400`, an operational failure a logged `500` carrying
+/// the full error chain.
+fn ops_operator_error(error: OperatorError) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        OperatorError::Rejected(reason) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: reason.to_string(),
+            }),
+        ),
+        OperatorError::Operational(error) => ops_store_error(format!("{error:#}")),
+    }
+}
+
+fn pointer_label(pointer: PointerOutcome) -> &'static str {
+    match pointer {
+        PointerOutcome::ClearedNow => "cleared_now",
+        PointerOutcome::WasAlreadyClear => "was_already_clear",
+    }
+}
+
+fn offchain_order_label(outcome: OffchainOrderOutcome) -> &'static str {
+    match outcome {
+        OffchainOrderOutcome::MarkedFailed => "marked_failed",
+        OffchainOrderOutcome::AlreadyTerminal => "already_terminal",
+        OffchainOrderOutcome::NoAggregate => "no_aggregate",
+        OffchainOrderOutcome::TerminalConcurrently => "terminal_concurrently",
+    }
+}
+
+/// Wire contract for the position release-hedge route.
+#[derive(Deserialize)]
+struct ReleaseHedgeRequest {
+    /// Pending offchain order id recorded on the position.
+    order_id: String,
+    /// Free-text operator audit reason (required; persisted on the event).
+    reason: String,
+}
+
+/// The result of a release-hedge, describing what happened to the pointer and
+/// the orphaned aggregate.
+#[derive(Debug, Serialize)]
+struct ReleaseHedgeResponse {
+    symbol: String,
+    order_id: String,
+    pointer: &'static str,
+    offchain_order: &'static str,
+}
+
+/// Fails a position's pending offchain order pointer and drives the orphaned
+/// `OffchainOrder` aggregate to `Failed`. Safe against the live bot: the order
+/// is failed with `MarkFailedUnfilled`, which the aggregate refuses atomically
+/// once any share has executed, so a fill landing between the handler's read
+/// and the send is rejected with the pointer left set rather than erased.
+/// Mirrors `stox position release-hedge`.
+async fn release_position_hedge(
+    State(state): State<AppState>,
+    Path(symbol): Path<String>,
+    Json(request): Json<ReleaseHedgeRequest>,
+) -> Result<Json<ReleaseHedgeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let symbol = Symbol::new(&symbol).map_err(ops_precondition_error)?;
+    let order_id = OffchainOrderId::from_str(&request.order_id).map_err(ops_precondition_error)?;
+
+    let outcome = release_pending_offchain_order(&state.pool, &symbol, order_id, &request.reason)
+        .await
+        .map_err(ops_operator_error)?;
+
+    Ok(Json(ReleaseHedgeResponse {
+        symbol: symbol.to_string(),
+        order_id: order_id.to_string(),
+        pointer: pointer_label(outcome.pointer),
+        offchain_order: offchain_order_label(outcome.offchain_order),
+    }))
+}
+
+/// Wire contract for the position set route.
+#[derive(Deserialize)]
+struct SetPositionRequest {
+    /// Signed decimal net exposure to set (negative is short).
+    target_net: String,
+    /// USDC price per share, required for nonzero targets under a dollar-value
+    /// threshold; must be strictly positive.
+    price_usdc: Option<String>,
+    /// Free-text operator audit reason (required; persisted on the event).
+    reason: String,
+}
+
+/// The net exposure change a completed set recorded.
+#[derive(Debug, Serialize)]
+struct SetPositionResponse {
+    symbol: String,
+    previous_net: String,
+    target_net: String,
+}
+
+/// Sets a position's net exposure after an operator manual correction. Refuses
+/// while the position holds a pending offchain order. Mirrors `stox position
+/// set`.
+async fn set_position_exposure(
+    State(state): State<AppState>,
+    Path(symbol): Path<String>,
+    Json(request): Json<SetPositionRequest>,
+) -> Result<Json<SetPositionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let symbol = Symbol::new(&symbol).map_err(ops_precondition_error)?;
+    let target_net =
+        FractionalShares::new(Float::parse(request.target_net).map_err(ops_precondition_error)?);
+    let price_usdc = request
+        .price_usdc
+        .map(|price| {
+            let float = Float::parse(price).map_err(ops_precondition_error)?;
+            Positive::new(float)
+                .map(Positive::inner)
+                .map_err(|_| ops_precondition_error("price must be strictly positive"))
+        })
+        .transpose()?;
+    let threshold = state.ctx.execution_threshold;
+
+    let previous_net = set_position(
+        &state.pool,
+        &symbol,
+        target_net,
+        &request.reason,
+        threshold,
+        price_usdc,
+    )
+    .await
+    .map_err(ops_operator_error)?
+    .previous_net;
+
+    Ok(Json(SetPositionResponse {
+        symbol: symbol.to_string(),
+        previous_net: previous_net.to_string(),
+        target_net: target_net.to_string(),
+    }))
+}
+
+/// Wire contract for the portfolio-snapshot mark route.
+#[derive(Deserialize)]
+struct SetEquityMarkRequest {
+    /// ET day of the captured balance snapshot (YYYY-MM-DD).
+    day: String,
+    /// Equity symbol whose mark applies at every captured location.
+    symbol: String,
+    /// Strictly-positive historical USD closing price per share.
+    usd_mark: String,
+    /// Sourced economic timestamp (RFC 3339); an earlier ET day.
+    observed_at: String,
+    /// Source used to verify the historical price (required).
+    source: String,
+    /// Free-text operator audit reason (required; persisted on the event).
+    reason: String,
+}
+
+/// The persisted historical mark.
+#[derive(Debug, Serialize)]
+struct SetEquityMarkResponse {
+    day: String,
+    symbol: String,
+    usd_mark: String,
+    observed_at: String,
+}
+
+/// Sets the audited historical closing-price mark for one captured ET day.
+/// Mirrors `stox portfolio-snapshot set`.
+async fn set_portfolio_snapshot_mark(
+    State(state): State<AppState>,
+    Json(request): Json<SetEquityMarkRequest>,
+) -> Result<Json<SetEquityMarkResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let day = request
+        .day
+        .parse::<NaiveDate>()
+        .map_err(ops_precondition_error)?;
+    let symbol = Symbol::new(&request.symbol).map_err(ops_precondition_error)?;
+    let usd_mark = Positive::new(Float::parse(request.usd_mark).map_err(ops_precondition_error)?)
+        .map_err(|_| ops_precondition_error("usd_mark must be strictly positive"))?;
+    let observed_at = request
+        .observed_at
+        .parse::<DateTime<Utc>>()
+        .map_err(ops_precondition_error)?;
+
+    let correction = EquityMarkCorrection {
+        day,
+        symbol,
+        usd_mark,
+        observed_at,
+        source: request.source,
+        reason: request.reason,
+    };
+    let formatted_mark = set_equity_mark(&state.pool, &state.ctx, &correction)
+        .await
+        .map_err(ops_operator_error)?
+        .formatted_mark;
+
+    Ok(Json(SetEquityMarkResponse {
+        day: correction.day.to_string(),
+        symbol: correction.symbol.to_string(),
+        usd_mark: formatted_mark,
+        observed_at: correction.observed_at.to_rfc3339(),
+    }))
+}
+
 /// The role-gated ops API: the same handlers the dashboard routes use, mounted
 /// under a prefix the load balancer routes to a role-specific IAP backend.
 ///
@@ -2361,6 +2581,18 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .route(
             "/liquidity-write/transfers/{kind}/{id}/reconcile",
             post(reconcile_equity_transfer),
+        )
+        .route(
+            "/liquidity-write/positions/{symbol}/release-hedge",
+            post(release_position_hedge),
+        )
+        .route(
+            "/liquidity-write/positions/{symbol}/set",
+            post(set_position_exposure),
+        )
+        .route(
+            "/liquidity-write/portfolio-snapshot/marks",
+            post(set_portfolio_snapshot_mark),
         )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
@@ -2497,6 +2729,7 @@ mod tests {
     use crate::onchain_trade::{
         InventoryVenue, OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource,
     };
+    use crate::operator::RejectionReason;
     use crate::performance::equity_timing::EquityTimingProjection;
     use crate::performance::reliability::LifecycleFailureProjection;
     use crate::portfolio_snapshot::{
@@ -5381,6 +5614,9 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/equity_redemption/x/reconcile",
             ),
+            ("POST", "/liquidity-write/positions/x/release-hedge"),
+            ("POST", "/liquidity-write/positions/x/set"),
+            ("POST", "/liquidity-write/portfolio-snapshot/marks"),
         ] {
             let response = app
                 .clone()
@@ -5425,6 +5661,9 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/equity_redemption/x/reconcile",
             ),
+            ("POST", "/liquidity-write/positions/x/release-hedge"),
+            ("POST", "/liquidity-write/positions/x/set"),
+            ("POST", "/liquidity-write/portfolio-snapshot/marks"),
         ] {
             let response = app
                 .clone()
@@ -6285,5 +6524,305 @@ mod tests {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn release_hedge_rejects_a_blank_reason() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: ReleaseHedgeRequest = serde_json::from_value(serde_json::json!({
+            "order_id": OffchainOrderId::new().to_string(),
+            "reason": "   ",
+        }))
+        .unwrap();
+
+        let error = release_position_hedge(State(state), Path("MSTR".to_string()), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_position_rejects_a_blank_reason() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: SetPositionRequest = serde_json::from_value(serde_json::json!({
+            "target_net": "0",
+            "reason": "   ",
+        }))
+        .unwrap();
+
+        let error = set_position_exposure(State(state), Path("MSTR".to_string()), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_equity_mark_rejects_a_blank_reason() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: SetEquityMarkRequest = serde_json::from_value(serde_json::json!({
+            "day": "2026-07-20",
+            "symbol": "MSTR",
+            "usd_mark": "150",
+            "observed_at": "2026-07-17T20:00:00Z",
+            "source": "Nasdaq close",
+            "reason": "   ",
+        }))
+        .unwrap();
+
+        let error = set_portfolio_snapshot_mark(State(state), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn operator_error_maps_rejection_to_400_and_operational_to_500() {
+        assert_eq!(
+            ops_operator_error(OperatorError::Rejected(RejectionReason::BlankReason)).0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ops_operator_error(OperatorError::Operational(anyhow::anyhow!("db down"))).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn operator_outcome_labels_are_stable() {
+        assert_eq!(pointer_label(PointerOutcome::ClearedNow), "cleared_now");
+        assert_eq!(
+            pointer_label(PointerOutcome::WasAlreadyClear),
+            "was_already_clear"
+        );
+        assert_eq!(
+            offchain_order_label(OffchainOrderOutcome::MarkedFailed),
+            "marked_failed"
+        );
+        assert_eq!(
+            offchain_order_label(OffchainOrderOutcome::AlreadyTerminal),
+            "already_terminal"
+        );
+        assert_eq!(
+            offchain_order_label(OffchainOrderOutcome::NoAggregate),
+            "no_aggregate"
+        );
+        assert_eq!(
+            offchain_order_label(OffchainOrderOutcome::TerminalConcurrently),
+            "terminal_concurrently"
+        );
+    }
+
+    async fn seed_pending_position(pool: &SqlitePool, symbol: &Symbol, order_id: OffchainOrderId) {
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        position
+            .send(
+                symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(420),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: order_id,
+                    shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_submitted_order(pool: &SqlitePool, order_id: OffchainOrderId, symbol: &Symbol) {
+        st0x_event_sorcery::send_command::<OffchainOrder>(
+            pool,
+            &order_id,
+            crate::offchain::order::OffchainOrderCommand::Place {
+                symbol: symbol.clone(),
+                shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+                client_order_id: st0x_execution::ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                kind: crate::offchain::order::CounterTradeOrderKind::Market,
+            },
+            crate::offchain::order::noop_order_placer(),
+        )
+        .await
+        .unwrap();
+        st0x_event_sorcery::send_command::<OffchainOrder>(
+            pool,
+            &order_id,
+            crate::offchain::order::OffchainOrderCommand::MarkAccepted {
+                executor_order_id: ExecutorOrderId::new("seed-accept"),
+                placed_shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+                submitted_at: chrono::Utc::now(),
+                market_session: st0x_execution::MarketSession::Regular,
+                limit_price: None,
+            },
+            crate::offchain::order::noop_order_placer(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_captured_equity_row(pool: &SqlitePool, day: NaiveDate, symbol: &Symbol) {
+        let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
+            .with(Arc::new(PortfolioSnapshotProjection::new(pool.clone())))
+            .build(())
+            .await
+            .unwrap();
+        store
+            .send(
+                &PortfolioSnapshotId(day),
+                PortfolioSnapshotCommand::Capture {
+                    captured_at: chrono::Utc.with_ymd_and_hms(2026, 7, 20, 4, 5, 0).unwrap(),
+                    rows: vec![PortfolioBalanceRowWithMark {
+                        row: PortfolioBalanceRow {
+                            location: PortfolioLocation::Hedging,
+                            asset: PortfolioAsset::Equity(symbol.clone()),
+                            available: float!(10),
+                            inflight: float!(0),
+                        },
+                        usd_mark: None,
+                        mark_captured_at: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_position_exposure_reports_the_change() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: SetPositionRequest = serde_json::from_value(serde_json::json!({
+            "target_net": "5",
+            "price_usdc": "150",
+            "reason": "manual correction",
+        }))
+        .unwrap();
+
+        let Json(response) =
+            set_position_exposure(State(state), Path("MSTR".to_string()), Json(request))
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({ "symbol": "MSTR", "previous_net": "0", "target_net": "5" })
+        );
+    }
+
+    #[tokio::test]
+    async fn set_portfolio_snapshot_mark_returns_the_recorded_mark() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let day = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let symbol = Symbol::new("MSTR").unwrap();
+        seed_captured_equity_row(&state.pool, day, &symbol).await;
+
+        let request: SetEquityMarkRequest = serde_json::from_value(serde_json::json!({
+            "day": "2026-07-20",
+            "symbol": "MSTR",
+            "usd_mark": "150",
+            "observed_at": "2026-07-17T20:00:00Z",
+            "source": "Nasdaq close",
+            "reason": "backfill",
+        }))
+        .unwrap();
+
+        let Json(response) = set_portfolio_snapshot_mark(State(state), Json(request))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "day": "2026-07-20",
+                "symbol": "MSTR",
+                "usd_mark": "150",
+                "observed_at": "2026-07-17T20:00:00+00:00",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn release_position_hedge_clears_the_pointer_and_fails_the_order() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let symbol = Symbol::new("MSTR").unwrap();
+        let order_id = OffchainOrderId::new();
+        seed_pending_position(&state.pool, &symbol, order_id).await;
+        seed_submitted_order(&state.pool, order_id, &symbol).await;
+
+        let request: ReleaseHedgeRequest = serde_json::from_value(serde_json::json!({
+            "order_id": order_id.to_string(),
+            "reason": "manual release",
+        }))
+        .unwrap();
+
+        let Json(response) =
+            release_position_hedge(State(state), Path("MSTR".to_string()), Json(request))
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "symbol": "MSTR",
+                "order_id": order_id.to_string(),
+                "pointer": "cleared_now",
+                "offchain_order": "marked_failed",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn set_portfolio_snapshot_mark_rejects_a_mark_after_the_capture_boundary() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: SetEquityMarkRequest = serde_json::from_value(serde_json::json!({
+            "day": "2026-07-20",
+            "symbol": "MSTR",
+            "usd_mark": "150",
+            "observed_at": "2026-07-20T05:00:00Z",
+            "source": "Nasdaq close",
+            "reason": "backfill",
+        }))
+        .unwrap();
+
+        let error = set_portfolio_snapshot_mark(State(state), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn release_position_hedge_rejects_an_unknown_position() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let request: ReleaseHedgeRequest = serde_json::from_value(serde_json::json!({
+            "order_id": OffchainOrderId::new().to_string(),
+            "reason": "manual release",
+        }))
+        .unwrap();
+
+        let error = release_position_hedge(State(state), Path("MSTR".to_string()), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 }
