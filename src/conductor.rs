@@ -10370,8 +10370,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(Utc::now() + chrono::Duration::seconds(10))
-            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_extended_session_close_metadata(
+                Utc::now() + chrono::Duration::seconds(10),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
             .with_position_mark(Positive::new(Usd::new(float!(100))).unwrap())
             .with_inventory(ExecutionInventory {
                 positions: Vec::new(),
@@ -10539,8 +10541,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let executor = MockExecutor::new()
             .with_market_session(MarketSession::Extended)
-            .with_extended_session_closes_at(Utc::now() + chrono::Duration::seconds(10))
-            .with_post_close_gap(st0x_execution::PostCloseGap::MultiDayClosure)
+            .with_extended_session_close_metadata(
+                Utc::now() + chrono::Duration::seconds(10),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
             .with_position_mark(Positive::new(Usd::new(float!(100))).unwrap())
             .with_inventory(ExecutionInventory {
                 positions: Vec::new(),

@@ -7,7 +7,7 @@ use metrics::counter;
 use thiserror::Error;
 use tracing::error;
 
-use st0x_execution::{CounterTradeSkipReason, MarketSession, MarketSessionStatus, PostCloseGap};
+use st0x_execution::{CounterTradeSkipReason, MarketSessionStatus, PostCloseGap};
 
 /// Shared close-flatten decision used by position scanning and hedge pricing.
 #[derive(Debug, Clone, Copy)]
@@ -26,22 +26,26 @@ impl CloseFlattenPolicy {
         status: MarketSessionStatus,
         now: DateTime<Utc>,
     ) -> Option<CloseFlattenWindow> {
-        if status.session != MarketSession::Extended
-            || status.post_close_gap == PostCloseGap::OrdinaryOvernight
-        {
+        let (closes_at, post_close_gap) = match status {
+            MarketSessionStatus::Regular
+            | MarketSessionStatus::Overnight
+            | MarketSessionStatus::Closed => return None,
+            MarketSessionStatus::Extended {
+                closes_at,
+                post_close_gap,
+            } => (closes_at, post_close_gap),
+        };
+        if post_close_gap == PostCloseGap::OrdinaryOvernight {
             return None;
         }
 
-        let Some(closes_at) = status.extended_session_closes_at else {
-            counter!(
-                "close_flatten_blocked_total",
-                "reason" => "close_time_unknown"
-            )
-            .increment(1);
+        let Some(closes_at) = closes_at else {
+            counter!("close_flatten_blocked_total", "reason" => "close_metadata_unavailable")
+                .increment(1);
             error!(
-                post_close_gap = ?status.post_close_gap,
-                "extended session close time unknown; skipping close-flattening for this \
-                 non-ordinary post-close gap"
+                ?post_close_gap,
+                "executor cannot provide extended-session close metadata; skipping \
+                 close-flattening"
             );
             return None;
         };
@@ -50,6 +54,7 @@ impl CloseFlattenPolicy {
         (now >= started_at && now < closes_at).then_some(CloseFlattenWindow {
             started_at,
             closes_at,
+            post_close_gap,
         })
     }
 }
@@ -58,6 +63,7 @@ impl CloseFlattenPolicy {
 pub(crate) struct CloseFlattenWindow {
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) closes_at: DateTime<Utc>,
+    pub(crate) post_close_gap: PostCloseGap,
 }
 
 /// How far a close-flatten hedge crosses its resolved reference price, ramped
@@ -161,9 +167,8 @@ mod tests {
     use super::*;
 
     fn status(post_close_gap: PostCloseGap, closes_at: DateTime<Utc>) -> MarketSessionStatus {
-        MarketSessionStatus {
-            session: MarketSession::Extended,
-            extended_session_closes_at: Some(closes_at),
+        MarketSessionStatus::Extended {
+            closes_at: Some(closes_at),
             post_close_gap,
         }
     }
@@ -184,7 +189,21 @@ mod tests {
     }
 
     #[test]
-    fn multi_day_and_unknown_gaps_activate_inside_window() {
+    fn non_extended_sessions_never_activate_close_flattening() {
+        let now = Utc::now();
+        let policy = CloseFlattenPolicy::from_secs(900).unwrap();
+
+        for status in [
+            MarketSessionStatus::Regular,
+            MarketSessionStatus::Overnight,
+            MarketSessionStatus::Closed,
+        ] {
+            assert_eq!(policy.active_window(status, now), None);
+        }
+    }
+
+    #[test]
+    fn non_ordinary_gaps_activate_inside_window() {
         let now = Utc::now();
         let closes_at = now + TimeDelta::minutes(5);
         let policy = CloseFlattenPolicy::from_secs(900).unwrap();
@@ -197,6 +216,11 @@ mod tests {
         assert!(
             policy
                 .active_window(status(PostCloseGap::Unknown, closes_at), now)
+                .is_some()
+        );
+        assert!(
+            policy
+                .active_window(status(PostCloseGap::Unavailable, closes_at), now)
                 .is_some()
         );
     }
@@ -233,21 +257,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_close_time_does_not_activate_close_flattening() {
+    fn unavailable_close_metadata_does_not_activate_close_flattening() {
         let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let now = Utc::now();
         let policy = CloseFlattenPolicy::from_secs(900).unwrap();
-        let status = MarketSessionStatus {
-            session: MarketSession::Extended,
-            extended_session_closes_at: None,
-            post_close_gap: PostCloseGap::MultiDayClosure,
+        let status = MarketSessionStatus::Extended {
+            closes_at: None,
+            post_close_gap: PostCloseGap::Unavailable,
         };
 
         assert_eq!(policy.active_window(status, now), None);
 
         let rendered = metrics_handle.render();
         assert!(rendered.contains("close_flatten_blocked_total{"));
-        assert!(rendered.contains("reason=\"close_time_unknown\""));
+        assert!(rendered.contains("reason=\"close_metadata_unavailable\""));
     }
 
     #[test]
@@ -275,6 +298,7 @@ mod tests {
             CloseFlattenWindow {
                 started_at,
                 closes_at: started_at + chrono::Duration::seconds(900),
+                post_close_gap: PostCloseGap::MultiDayClosure,
             },
         )
     }
@@ -359,6 +383,7 @@ mod tests {
         let window = CloseFlattenWindow {
             started_at,
             closes_at: started_at,
+            post_close_gap: PostCloseGap::MultiDayClosure,
         };
 
         assert_eq!(
@@ -375,6 +400,7 @@ mod tests {
         let window = CloseFlattenWindow {
             started_at,
             closes_at: DateTime::<Utc>::MAX_UTC,
+            post_close_gap: PostCloseGap::MultiDayClosure,
         };
         let halfway = started_at + (window.closes_at - started_at) / 2;
 
@@ -402,6 +428,7 @@ mod tests {
             let window = CloseFlattenWindow {
                 started_at,
                 closes_at: started_at + chrono::Duration::seconds(900),
+                post_close_gap: PostCloseGap::MultiDayClosure,
             };
             let earlier_offset = first_offset_secs.min(second_offset_secs);
             let later_offset = first_offset_secs.max(second_offset_secs);
