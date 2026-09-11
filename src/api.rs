@@ -4461,12 +4461,14 @@ mod tests {
                         "currentLagSampledAt": null,
                         "points": [],
                     }],
-                    "poll": {
+                    // One poll report per hedged chain, likewise.
+                    "poll": [{
+                        "chain": "base",
                         "cycles": 0,
                         "errors": 0,
                         "skippedTicks": 0,
                         "duration": null,
-                    },
+                    }],
                 },
                 "dependencies": [],
             })
@@ -4568,15 +4570,11 @@ mod tests {
             bucket_start <= now && now - bucket_start <= chrono::Duration::days(7),
             "bucket start {bucket_start} must fall inside the default window"
         );
-        assert_eq!(report["monitor"]["poll"]["cycles"], serde_json::json!(1));
-        assert_eq!(
-            report["monitor"]["poll"]["skippedTicks"],
-            serde_json::json!(1)
-        );
-        assert_eq!(
-            report["monitor"]["poll"]["duration"]["p50Ms"],
-            serde_json::json!(40)
-        );
+        let poll = &report["monitor"]["poll"][0];
+        assert_eq!(poll["chain"], serde_json::json!("base"));
+        assert_eq!(poll["cycles"], serde_json::json!(1));
+        assert_eq!(poll["skippedTicks"], serde_json::json!(1));
+        assert_eq!(poll["duration"]["p50Ms"], serde_json::json!(40));
         assert_eq!(
             report["dependencies"][0]["dependency"],
             serde_json::json!("rpc")

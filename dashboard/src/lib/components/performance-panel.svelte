@@ -1191,11 +1191,11 @@
         </Chart.Container>
       {/if}
 
-      {#if chartInfra.current}
-        {@const poll = chartInfra.current.monitor.poll}
+      {#each chartInfra.current?.monitor.poll ?? [] as poll (poll.chain)}
         <div
           class="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t pt-2 text-xs text-muted-foreground"
         >
+          <span class="font-semibold">{CHAIN_LABELS[poll.chain]}</span>
           <span>{poll.cycles} poll cycles</span>
           <span class={poll.errors > 0 ? 'text-red-600 dark:text-red-400' : ''}>
             {poll.errors} errors
@@ -1211,7 +1211,7 @@
             </span>
           {/if}
         </div>
-      {/if}
+      {/each}
     </Card.Content>
   </Card.Root>
 
