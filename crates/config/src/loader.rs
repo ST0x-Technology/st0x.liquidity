@@ -2593,7 +2593,7 @@ pub enum CtxError {
     )]
     MissingRebalancing,
     #[error(
-        "operation requires the trading chain's redemption_wallet \
+        "operation requires the hedged chain's redemption_wallet \
          ([chains.<name>.trading].redemption_wallet)"
     )]
     MissingTokenization,
@@ -2906,7 +2906,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         board_port: 8081,
         // Legacy by default: no distinct inventory, so the OPERATOR_ROLE
         // preflight is skipped. Tests exercising the managed path override
-        // the trading chain's `inventory` explicitly.
+        // the hedged chain's `inventory` explicitly.
         chains: ChainRegistry::single_hedged_chain(
             HedgedChain::test()
                 .required_confirmations(1)
@@ -8461,7 +8461,7 @@ mod tests {
     }
 
     /// `parse_and_validate` requires the `[rebalancing]`, `[wallet]`, and
-    /// `[bot_gas_valuation]` sections and the trading chain's
+    /// `[bot_gas_valuation]` sections and the hedged chain's
     /// `redemption_wallet` at startup. But
     /// `all_repo_config_tomls_are_valid` only exercises `toml::from_str`,
     /// a structural parse that succeeds without them since the fields are
