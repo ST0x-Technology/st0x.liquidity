@@ -1126,6 +1126,47 @@ already started skips fresh admission: persisted state may represent funds
 already in flight, so recovery must continue rather than strand them behind a
 new balance check.
 
+## USDC driver pause for operator write routes
+
+Several operator write routes read aggregate or on-chain state and then send a
+command or a transaction, and must not have a USDC rebalancing job advance the
+same aggregate or spend the same wallet in between. The CLI avoids the race by
+requiring the bot stopped; an HTTP handler cannot. The `usdc_in_progress` latch
+does not help: it only admits the creation of a new transfer by the trigger and
+is neither read nor held by the workers that execute one.
+
+`src/rebalancing/usdc/driver_pause.rs` provides the control. The driver is the
+two apalis workers, `TransferUsdcToHedging` and `TransferUsdcToMarketMaking`,
+each with concurrency one; one execution drives a whole transfer attempt. Each
+worker holds a `UsdcDriverGate` and calls `enter()` at the top of `perform`,
+which parks while a pause is requested and otherwise claims an in-flight slot
+held for the whole attempt (before the hedging per-attempt timeout, so time
+parked is not charged to the attempt). The controller, `UsdcDriverPause`, is
+published on the API `RecoveryHandle` after startup. Its `pause()` raises the
+pause flag, so no new execution can pass a gate, then waits for the in-flight
+count to reach zero: quiescence means the current execution has finished and no
+new one has started. It returns an RAII guard that lowers the flag on drop, so a
+handler resumes the driver on its success, error, and panic paths alike. A
+`pause()` future dropped mid wait, as when the client cancels the request, also
+lowers the flag on the way out, so the driver is never left parked without a
+guard. Pausers are serialized behind the guard so one operation's resume cannot
+free the driver under another.
+
+The wait is bounded (`DRIVER_QUIESCE_TIMEOUT`, 30s). An execution can run for
+the whole per-attempt budget, so a pause requested while a transfer is genuinely
+moving funds is refused with `DriverNotQuiesced`, which the routes map to 503,
+and the driver is left running. That is the intended answer: the operations that
+need a pause target a transfer that is stuck or failed, where no execution is
+running and the pause confirms at once. The trigger's rebalancing check and the
+stuck USDC sweep (`expire_stuck_usdc_rebalances`, reached from the check job,
+the equity check, and inline on the snapshot reactor) claim the driver through
+`try_enter`, which never parks: a pause waits for an active check or sweep to
+finish, and a held pause makes them skip, so neither a fresh transfer row nor a
+relatch, clear, or re-arm lands under an operator operation. Current users:
+`transfer resume --kind usdc` and the `UsdcBridge` arm of `transfer recheck`,
+which executes a resume on the request task and therefore spends the wallet
+itself.
+
 ## Error handling in jobs
 
 > **Known issue**: the current design uses `Ok(())` for permanent business
