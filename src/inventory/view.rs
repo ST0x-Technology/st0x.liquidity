@@ -5846,14 +5846,16 @@ mod tests {
         );
     }
 
-    /// Cash totals across chains -- a dollar is a dollar on every chain --
-    /// while equity does not: a market-making slot holds wrapped ERC-4626
-    /// vault shares, and each chain's vault has its own
-    /// underlying-per-wrapped ratio, so adding two chains' share counts
-    /// yields a number that is no longer a share count. The equity figure
-    /// therefore names one chain, the trading chain.
+    /// Neither cash nor equity is totalled across chains. Equity cannot be:
+    /// a market-making slot holds wrapped ERC-4626 vault shares, and each
+    /// chain's vault has its own underlying-per-wrapped ratio, so adding two
+    /// chains' share counts yields a number that is no longer a share count.
+    /// Cash must not be: the dashboard measures the onchain figure against the
+    /// rebalancing target, which the rebalancer applies to the trading chain's
+    /// slot alone, so cash prefunded on another chain would read as a healthy
+    /// allocation the rebalancer cannot reach.
     #[test]
-    fn to_dto_totals_usdc_across_chains_but_keeps_equity_chain_qualified() {
+    fn to_dto_keeps_usdc_and_equity_chain_qualified() {
         let aapl = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let equity_on = |chain: Chain, amount: i64| InventorySnapshotEvent::OnchainEquity {
@@ -5885,7 +5887,8 @@ mod tests {
         assert_eq!(dto.per_symbol[0].onchain_available, shares(50));
         assert_eq!(
             dto.usdc.onchain_available,
-            Usdc::from_cents(250_000).unwrap()
+            Usdc::from_cents(200_000).unwrap(),
+            "the dashboard cash figure names the trading chain"
         );
     }
 
