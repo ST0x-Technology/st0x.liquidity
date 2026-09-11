@@ -879,8 +879,9 @@ impl InventoryView {
     /// splits or dividends.
     ///
     /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
-    /// The primary chain: the one whose vault inventory is polled and
-    /// rebalanced, and the one venue-addressed operations act on.
+    /// The primary chain: the one the bot rebalances automatically, and
+    /// the one venue-addressed operations act on. Every hedged chain's
+    /// vault inventory is polled.
     pub(crate) fn primary_chain(&self) -> Chain {
         self.primary_chain
     }
