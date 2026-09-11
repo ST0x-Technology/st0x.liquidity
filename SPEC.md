@@ -1516,6 +1516,17 @@ permanently fresh for every later day's capture, even after the venue that fed
 it stops polling entirely -- the same stale-capture hole the gate exists to
 close, just on a longer timescale than a single restart.
 
+The two gates run in a fixed order: freshness first, presence second. Freshness
+reads only the `PollFreshness` tracker, so it is evaluated before the inventory
+view is read at all, and presence is then checked against the rows read after it
+passed. That order is what keeps a captured row from predating the freshness
+observation that admitted it -- reading the rows first would let a poll tick
+land between the two reads and stamp freshness for a view that has since moved
+past the rows already in hand. It also settles what a restart may capture: a
+persisted `InventorySnapshot` hydrates the view and satisfies presence
+immediately, but the fresh process has polled nothing, so the capture still
+waits for this run's own observations on or after the target ET day's midnight.
+
 `perform` applies the boundary-anchored lateness cap before checking freshness:
 once `now` is more than `MAX_FRESHNESS_DEFER` past the capture boundary, it
 abandons `target_et_day` regardless of whether freshness currently passes.
