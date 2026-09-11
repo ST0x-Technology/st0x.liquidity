@@ -259,9 +259,9 @@ pub struct TradingConfig {
     /// Seconds between fill-watch poll cycles on this chain. Required (no
     /// silent default) and non-zero; each hedged chain polls independently.
     pub order_fill_poll_interval_secs: u64,
-    /// Marks THE primary chain: the one whose inventory the bot polls and
-    /// rebalances automatically. Fills are hedged on every hedged chain.
-    /// Exactly one must set it.
+    /// Marks THE primary chain: the one the bot rebalances automatically.
+    /// Fills are hedged and vaults polled on every hedged chain. Exactly
+    /// one must set it.
     #[serde(default)]
     pub primary: bool,
     /// Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption
@@ -782,8 +782,8 @@ impl ChainRegistry {
         Ok(trading_table)
     }
 
-    /// THE primary chain: the one whose inventory the bot polls and rebalances
-    /// automatically. Every hedged chain (this one included) is reached via
+    /// THE primary chain: the one the bot rebalances automatically. Every
+    /// hedged chain (this one included) is polled and reached via
     /// [`Self::hedged`].
     pub fn primary(&self) -> &HedgedChain {
         &self.primary
