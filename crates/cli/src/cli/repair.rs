@@ -1,30 +1,17 @@
 //! Repair CLI commands for manually recovering stuck local CQRS state.
 
-use anyhow::{Context, bail};
-use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
-use chrono_tz::America::New_York;
+use std::io::Write;
+
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::io::Write;
-use std::sync::Arc;
 
 use st0x_config::{Ctx, ExecutionThreshold};
-use st0x_event_sorcery::{AggregateError, LifecycleError, RetryOnBusy, StoreBuilder, load_entity};
-use st0x_execution::{
-    CancellationOutcome, ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, Symbol,
+use st0x_execution::{FractionalShares, Symbol};
+use st0x_hedge::operator::offchain::order::OffchainOrderId;
+use st0x_hedge::operator::portfolio_snapshot::{EquityMarkCorrection, set_equity_mark};
+use st0x_hedge::operator::position::{
+    OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
 };
-use st0x_float_serde::format_float;
-use st0x_hedge::operator::conductor::configured_equity_symbols;
-use st0x_hedge::operator::inventory::PortfolioLocation;
-use st0x_hedge::operator::offchain::order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId, OrderPlacementResult,
-    OrderPlacer,
-};
-use st0x_hedge::operator::portfolio_snapshot::{
-    PortfolioSnapshot, PortfolioSnapshotCommand, PortfolioSnapshotId, PortfolioSnapshotProjection,
-};
-use st0x_hedge::operator::position::{AnchorDisposition, Position, PositionCommand};
 
 use super::{AuditReason, PortfolioSnapshotRecoveryCommand};
 
@@ -43,98 +30,17 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
         reason,
     } = command;
 
-    let capture_boundary = New_York
-        .from_local_datetime(
-            &day.and_hms_opt(0, 5, 0)
-                .context("invalid ET capture time")?,
-        )
-        .single()
-        .context("ambiguous ET capture boundary")?
-        .with_timezone(&Utc);
-    if observed_at >= capture_boundary {
-        bail!(
-            "--observed-at must identify the regular-session close before the {day} 00:05 ET \
-             capture boundary ({capture_boundary})"
-        );
-    }
-
-    // `EquityMarkSet` prices EVERY row of the symbol (the projection's UPDATE
-    // has no location filter). A symbol with no `[chains.<name>.trading.assets.equities]` entry has
-    // no wrapper entry either, so the capture leaves its MarketMaking and
-    // BaseWalletWrapped rows in vault-share units -- applying an underlying
-    // share price to those misvalues the day, which is exactly what the
-    // capture's forced-absent mark prevents. Refuse rather than let one repair
-    // reintroduce it. Rows at those locations exist only when nonzero: the
-    // capture drops the empty ones.
-    if !configured_equity_symbols(ctx).contains(&symbol) {
-        let market_making = PortfolioLocation::MarketMaking(ctx.chains.primary().chain);
-        let unconverted: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM portfolio_snapshot \
-             WHERE et_day = ? AND asset = ? AND location IN (?, ?)",
-        )
-        .bind(day.to_string())
-        .bind(symbol.to_string())
-        .bind(market_making.to_string())
-        .bind(PortfolioLocation::BaseWalletWrapped.to_string())
-        .fetch_one(pool)
-        .await
-        .context("failed to check for unconverted wrapped-equity rows")?;
-
-        if unconverted > 0 {
-            bail!(
-                "{symbol} has no [chains.<name>.trading.assets.equities] entry, so its {unconverted}                  wrapped-location row(s) on {day} hold vault shares, not underlying shares.                  A mark would price them as underlying and misstate the day's capital.                  Reconcile the holding instead, or restore the config entry so the capture                  can resolve a vault ratio."
-            );
-        }
-    }
-
-    let store = StoreBuilder::<PortfolioSnapshot>::new(pool.clone())
-        .with(Arc::new(RetryOnBusy {
-            inner: PortfolioSnapshotProjection::new(pool.clone()),
-        }))
-        .build(())
-        .await
-        .context("failed to build portfolio snapshot store")?;
-
-    store
-        .send(
-            &PortfolioSnapshotId(day),
-            PortfolioSnapshotCommand::SetEquityMark {
-                symbol: symbol.clone(),
-                usd_mark,
-                observed_at,
-                source: source.clone().into(),
-                reason: reason.clone().into(),
-                corrected_at: Utc::now(),
-            },
-        )
-        .await
-        .context("failed to set historical portfolio snapshot mark")?;
-
-    let formatted_mark = format_float(&usd_mark.inner()).context("failed to format USD mark")?;
-    let snapshot = load_entity::<PortfolioSnapshot>(pool, &PortfolioSnapshotId(day))
-        .await
-        .context("failed to reload corrected portfolio snapshot")?
-        .context("corrected portfolio snapshot aggregate is missing")?;
-    let expected_row_count = i64::try_from(snapshot.captured_equity_row_count(&symbol))
-        .context("captured equity row count exceeds SQLite integer range")?;
-    let (row_count, corrected_count): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COUNT(CASE WHEN usd_mark = ? AND mark_captured_at = ? THEN 1 END) \
-         FROM portfolio_snapshot WHERE et_day = ? AND asset = ?",
-    )
-    .bind(&formatted_mark)
-    .bind(observed_at.to_rfc3339())
-    .bind(day.to_string())
-    .bind(symbol.to_string())
-    .fetch_one(pool)
-    .await
-    .context("failed to verify historical portfolio snapshot mark")?;
-    if row_count != expected_row_count || corrected_count != expected_row_count {
-        bail!(
-            "historical mark event committed, but the portfolio-snapshot read model did not \
-             update every {day} {symbol} row; run `view rebuild --aggregate \
-             portfolio-snapshot --all` before retrying"
-        );
-    }
+    let correction = EquityMarkCorrection {
+        day,
+        symbol: symbol.clone(),
+        usd_mark,
+        observed_at,
+        source: source.to_string(),
+        reason: reason.to_string(),
+    };
+    let formatted_mark = set_equity_mark(pool, ctx, &correction)
+        .await?
+        .formatted_mark;
 
     writeln!(
         stdout,
@@ -145,43 +51,13 @@ pub(super) async fn set_portfolio_snapshot_mark_command<W: Write>(
     Ok(())
 }
 
-/// An [`OrderPlacer`] for repair commands that must never place or cancel an
-/// order: `MarkFailed` is a pure terminal transition that never touches the
-/// placer. Returns an error on the unreachable placement/cancellation paths
-/// rather than panicking.
-struct RepairOrderPlacer;
-
-#[async_trait]
-impl OrderPlacer for RepairOrderPlacer {
-    async fn place_market_order(
-        &self,
-        _order: MarketOrder,
-    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        Err("repair must not place offchain orders; MarkFailed is terminal-only".into())
-    }
-
-    async fn place_limit_order(
-        &self,
-        _order: LimitOrder,
-    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        Err("repair must not place offchain orders; MarkFailed is terminal-only".into())
-    }
-
-    async fn cancel_order(
-        &self,
-        _executor_order_id: &ExecutorOrderId,
-    ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        Err("repair must not cancel offchain orders; MarkFailed is terminal-only".into())
-    }
-}
-
 /// Fails a position's pending offchain order pointer and drives the orphaned
-/// `OffchainOrder` aggregate to `Failed`.
+/// `OffchainOrder` aggregate to `Failed`, then reports what happened.
 ///
 /// Operates directly on the database: the operator must ensure the bot is not
 /// concurrently driving the same order (per the recovery CLI execution-mode
 /// contract), since a fill landing between the state read and the commands
-/// here cannot be guarded against.
+/// cannot be guarded against.
 pub(super) async fn fail_pending_offchain_order_command<W: Write>(
     stdout: &mut W,
     pool: &SqlitePool,
@@ -189,333 +65,54 @@ pub(super) async fn fail_pending_offchain_order_command<W: Write>(
     offchain_order_id: OffchainOrderId,
     reason: AuditReason,
 ) -> anyhow::Result<()> {
-    let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
-        .await
-        .context("failed to build position store")?;
+    let outcome =
+        release_pending_offchain_order(pool, symbol, offchain_order_id, reason.as_ref()).await?;
 
-    let Some(view) = projection
-        .load(symbol)
-        .await
-        .context("failed to load position view")?
-    else {
-        bail!("position {symbol} not found");
-    };
-
-    let order = st0x_event_sorcery::load_entity::<OffchainOrder>(pool, &offchain_order_id)
-        .await
-        .context("failed to load offchain order aggregate")?;
-
-    if let Some(existing) = &order {
-        if existing.symbol() != symbol {
-            bail!(
-                "OffchainOrder {offchain_order_id} belongs to {}, not {symbol} -- refusing \
-                 to repair",
-                existing.symbol()
-            );
-        }
-        match existing {
-            OffchainOrder::PartiallyFilled { .. } => {
-                bail!(
-                    "OffchainOrder {offchain_order_id} is PartiallyFilled: shares already \
-                     executed offchain, and failing it would erase that hedge from the \
-                     position. Reconcile the partial fill first."
-                );
-            }
-            OffchainOrder::Filled { .. } => {
-                bail!(
-                    "OffchainOrder {offchain_order_id} is Filled: the hedge executed. This \
-                     command cannot repair a filled order -- reconcile the fill into the \
-                     position instead of failing it."
-                );
-            }
-            OffchainOrder::Cancelling { .. } | OffchainOrder::Cancelled { .. } => {
-                bail!(
-                    "OffchainOrder {offchain_order_id} is in a cancellation lifecycle state: \
-                     this command fails stuck Pending/Submitted orders, not cancellations -- \
-                     refusing. Confirm the intended recovery path for cancellation states."
-                );
-            }
-            OffchainOrder::Pending { .. }
-            | OffchainOrder::Submitted { .. }
-            | OffchainOrder::Failed { .. } => {}
-        }
-    }
-
-    match view.pending_offchain_order_id {
-        Some(pending) if pending == offchain_order_id => {}
-        Some(pending) => {
-            bail!("position {symbol} pending offchain order is {pending}, not {offchain_order_id}");
-        }
-        // The pointer is already clear: either a partial prior run (pointer
-        // cleared, order still live) or a completed one. Skip the Position
-        // command and repair the orphaned order so re-runs are safe.
-        None => {
-            // Re-running a fully successful repair lands here. When the
-            // pointed-at order never had an aggregate (a pointer-only clear),
-            // there is nothing left to fix: the system is already consistent,
-            // so "nothing to repair" is the intended terminal outcome rather
-            // than a silent success.
-            if order.is_none() {
-                bail!(
-                    "position {symbol} has no pending offchain order and no OffchainOrder \
-                     aggregate {offchain_order_id} exists -- nothing to repair"
-                );
-            }
-
+    match outcome.pointer {
+        PointerOutcome::WasAlreadyClear => {
             writeln!(
                 stdout,
                 "Position {symbol} pointer already clear; repairing OffchainOrder \
                  {offchain_order_id}"
             )?;
-            return fail_offchain_order_aggregate(stdout, pool, order, offchain_order_id, reason)
-                .await;
+            write_offchain_order_repair_line(stdout, outcome.offchain_order, offchain_order_id)?;
+        }
+        PointerOutcome::ClearedNow => {
+            write_offchain_order_repair_line(stdout, outcome.offchain_order, offchain_order_id)?;
+            writeln!(
+                stdout,
+                "Failed pending offchain order {offchain_order_id} for {symbol}"
+            )?;
         }
     }
-
-    position
-        .send(
-            symbol,
-            PositionCommand::FailOffChainOrder {
-                offchain_order_id,
-                error: reason.clone().into(),
-                // The repaired order is typically still live at the broker
-                // (this command force-fails stuck Pending/Submitted orders,
-                // not confirmed broker-terminal ones); releasing here would
-                // re-arm the double-hedge the anchor exists to prevent.
-                anchor: AnchorDisposition::Preserve,
-            },
-        )
-        .await
-        .context("failed to fail pending offchain order")?;
-
-    // Pointer-first: the position's pending pointer is cleared above. Now drive
-    // the OffchainOrder aggregate itself to its Failed terminal so it does not
-    // linger as a live-looking order in the view. The two aggregates are not
-    // transactionally atomic (separate CQRS boundaries); this second step is
-    // idempotent -- an already-terminal or absent order is left as-is.
-    fail_offchain_order_aggregate(stdout, pool, order, offchain_order_id, reason).await?;
-
-    // Print the pointer-clear summary only after both steps succeed: if the
-    // aggregate step errors (for example a fill detected on re-load), the
-    // command exits non-zero without ever having shown the operator a success
-    // line -- misleading mid-incident output that masks the cleared pointer.
-    writeln!(
-        stdout,
-        "Failed pending offchain order {offchain_order_id} for {symbol}"
-    )?;
 
     Ok(())
 }
 
-/// What the repair must do with a freshly re-loaded `OffchainOrder` state.
-/// The "executed shares always escalate" rule is the load-bearing
-/// financial-safety invariant of this command; classifying the state in one
-/// place keeps the pre-send guard and the post-send `AlreadyCompleted`
-/// recovery from encoding it differently and silently diverging.
-enum ReloadOutcome {
-    /// Executed shares present (`Filled`/`PartiallyFilled`): failing the order
-    /// would erase a hedge the position no longer accounts for. The caller must
-    /// refuse and route the operator to manual reconciliation.
-    Escalate,
-    /// Already `Failed`: a benign concurrent terminal transition. Report it and
-    /// leave the existing failure record untouched.
-    BenignTerminal,
-    /// No executed shares and not terminal (`Pending`/`Submitted`/absent). The
-    /// pre-send guard proceeds to `MarkFailed`; the post-`AlreadyCompleted` site
-    /// treats it as an unreachable invariant violation.
-    Proceed,
-}
-
-/// Single source of the executed-shares-escalate rule shared by both re-load
-/// sites in [`fail_offchain_order_aggregate`].
-fn classify_reloaded_state(state: Option<&OffchainOrder>) -> ReloadOutcome {
-    use OffchainOrder::{
-        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
-    };
-
-    match state {
-        // Executed shares (Filled/PartiallyFilled) would erase a hedge; and a
-        // concurrent transition into a cancellation lifecycle state during a
-        // fail must route to manual reconciliation rather than being failed
-        // blind (a Cancelled order may carry a partial fill). Confirm the
-        // intended recovery path for cancellation states.
-        Some(Filled { .. } | PartiallyFilled { .. } | Cancelling { .. } | Cancelled { .. }) => {
-            ReloadOutcome::Escalate
-        }
-        Some(Failed { .. }) => ReloadOutcome::BenignTerminal,
-        Some(Pending { .. } | Submitted { .. }) | None => ReloadOutcome::Proceed,
-    }
-}
-
-/// Drives the standalone `OffchainOrder` aggregate (pre-loaded by the caller)
-/// to its `Failed` terminal via `MarkFailed`, after its position pointer has
-/// been cleared. Routed through the wired store so `offchain_order_view`
-/// updates immediately. Idempotent: an already-`Failed` or absent order is
-/// reported and left untouched rather than erroring, so a partial prior run
-/// can be re-run safely; `Filled`/`PartiallyFilled` orders are refused because
-/// failing them would erase executed hedge shares.
-async fn fail_offchain_order_aggregate<W: Write>(
+/// Renders the operator-facing line describing what the repair did with the
+/// orphaned `OffchainOrder` aggregate.
+fn write_offchain_order_repair_line<W: Write>(
     stdout: &mut W,
-    pool: &SqlitePool,
-    order: Option<OffchainOrder>,
+    outcome: OffchainOrderOutcome,
     offchain_order_id: OffchainOrderId,
-    reason: AuditReason,
-) -> anyhow::Result<()> {
-    use OffchainOrder::{
-        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
-    };
-
-    let Some(order) = order else {
-        writeln!(
+) -> std::io::Result<()> {
+    match outcome {
+        OffchainOrderOutcome::MarkedFailed => writeln!(
+            stdout,
+            "Also marked OffchainOrder {offchain_order_id} as failed"
+        ),
+        OffchainOrderOutcome::AlreadyTerminal => writeln!(
+            stdout,
+            "OffchainOrder {offchain_order_id} already terminal; left as-is"
+        ),
+        OffchainOrderOutcome::NoAggregate => writeln!(
             stdout,
             "No OffchainOrder aggregate {offchain_order_id} found; pointer cleared only"
-        )?;
-        return Ok(());
-    };
-
-    match order {
-        Failed { .. } => {
-            writeln!(
-                stdout,
-                "OffchainOrder {offchain_order_id} already terminal; left as-is"
-            )?;
-            return Ok(());
-        }
-        // The caller refuses executed orders before clearing the pointer;
-        // refuse here too so the invariant cannot rot if a new caller skips
-        // that check.
-        Filled { .. } | PartiallyFilled { .. } => {
-            bail!(
-                "OffchainOrder {offchain_order_id} has executed shares (state {order:?}) -- \
-                 refusing to erase the executed hedge"
-            );
-        }
-        Cancelling { .. } | Cancelled { .. } => {
-            bail!(
-                "OffchainOrder {offchain_order_id} is in a cancellation lifecycle state \
-                 (state {order:?}): this command fails Pending/Submitted orders, not \
-                 cancellations -- refusing. Confirm the intended recovery path."
-            );
-        }
-        Pending { .. } | Submitted { .. } => {}
-    }
-
-    // Re-load immediately before sending: the caller's snapshot may be stale,
-    // and MarkFailed is a legal transition from PartiallyFilled at the
-    // aggregate level (the bot's own post-partial-fill rejection path needs
-    // it), so a partial fill landing since the snapshot would otherwise be
-    // erased SILENTLY. This narrows the race window to the load->send gap.
-    //
-    // CONTRACT: this command requires that the bot is not concurrently driving
-    // this order (see the module docstring). Honoring that contract means no
-    // event can land in the load->send gap, so the re-load is exact. The
-    // defenses for a contract violation are best-effort and ASYMMETRIC:
-    //   - a complete fill in the gap makes MarkFailed return AlreadyCompleted,
-    //     which the post-send handler below escalates;
-    //   - a PARTIAL fill in the gap does NOT -- MarkFailed succeeds from
-    //     PartiallyFilled -- so it would be erased silently and is UNGUARDED.
-    // That sliver is closed only by honoring the no-concurrent-bot contract;
-    // there is no in-process guard for it because the aggregate must keep
-    // MarkFailed legal from PartiallyFilled for the bot's own rejection path.
-    let current = st0x_event_sorcery::load_entity::<OffchainOrder>(pool, &offchain_order_id)
-        .await
-        .context("failed to re-load offchain order before MarkFailed")?;
-    match classify_reloaded_state(current.as_ref()) {
-        ReloadOutcome::Escalate => {
-            bail!(
-                "OffchainOrder {offchain_order_id} acquired executed shares concurrently; \
-                 the position pointer may already be cleared -- reconcile the position \
-                 manually instead of failing the order"
-            );
-        }
-        ReloadOutcome::BenignTerminal => {
-            writeln!(
-                stdout,
-                "OffchainOrder {offchain_order_id} reached a terminal state concurrently; \
-                 left as-is"
-            )?;
-            return Ok(());
-        }
-        ReloadOutcome::Proceed => {}
-    }
-
-    // The wired store (not bare send_command) so the offchain_order_view
-    // projection updates immediately -- a stale 'Submitted' row in the view is
-    // the very symptom this command exists to repair.
-    let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-        .build(Arc::new(RepairOrderPlacer))
-        .await
-        .context("failed to build offchain order store")?;
-    let send_result = store
-        .send(
-            &offchain_order_id,
-            OffchainOrderCommand::MarkFailed {
-                error: reason.into(),
-                filled_shares: None,
-                failed_at: chrono::Utc::now(),
-            },
-        )
-        .await;
-
-    match send_result {
-        Ok(()) => {
-            writeln!(
-                stdout,
-                "Also marked OffchainOrder {offchain_order_id} as failed"
-            )?;
-            Ok(())
-        }
-        // The bot can transition the order to a terminal state in the sliver
-        // between the re-load above and this command; a concurrent FAIL is
-        // equivalent to finding it terminal up front, but a concurrent FILL
-        // means the pointer was cleared for an order that actually executed --
-        // surface that as a hard error so the operator reconciles the
-        // position instead of trusting a clean exit.
-        Err(AggregateError::UserError(LifecycleError::Apply(
-            OffchainOrderError::AlreadyCompleted,
-        ))) => {
-            let terminal =
-                st0x_event_sorcery::load_entity::<OffchainOrder>(pool, &offchain_order_id)
-                    .await
-                    .context("failed to re-load offchain order after concurrent transition")?;
-            match classify_reloaded_state(terminal.as_ref()) {
-                // Executed shares always escalate: PartiallyFilled cannot
-                // produce AlreadyCompleted today, but if it ever does, the
-                // same pointer-cleared-without-accounting hazard applies.
-                ReloadOutcome::Escalate => {
-                    bail!(
-                        "OffchainOrder {offchain_order_id} acquired executed shares \
-                         concurrently: the position pointer was cleared without accounting \
-                         the fill -- reconcile the position manually"
-                    );
-                }
-                ReloadOutcome::BenignTerminal => {
-                    writeln!(
-                        stdout,
-                        "OffchainOrder {offchain_order_id} reached a terminal state \
-                         concurrently; left as-is"
-                    )?;
-                    Ok(())
-                }
-                // MarkFailed only returns AlreadyCompleted from a terminal
-                // aggregate (Filled or Failed), so a non-terminal or absent
-                // state here means the order regressed out of a terminal state
-                // -- impossible under the append-only lifecycle. Bail loudly as
-                // an invariant violation rather than silently reporting a clean
-                // "left as-is".
-                ReloadOutcome::Proceed => {
-                    bail!(
-                        "OffchainOrder {offchain_order_id} returned AlreadyCompleted from \
-                         MarkFailed but re-loaded as a non-terminal state -- aggregate \
-                         lifecycle invariant violated"
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            Err(anyhow::Error::new(error).context("failed to mark offchain order failed"))
-        }
+        ),
+        OffchainOrderOutcome::TerminalConcurrently => writeln!(
+            stdout,
+            "OffchainOrder {offchain_order_id} reached a terminal state concurrently; left as-is"
+        ),
     }
 }
 
@@ -528,43 +125,16 @@ pub(super) async fn set_position_command<W: Write>(
     threshold: ExecutionThreshold,
     price_usdc: Option<Float>,
 ) -> anyhow::Result<()> {
-    let (position, projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
-        .await
-        .context("failed to build position store")?;
-
-    let current = projection
-        .load(symbol)
-        .await
-        .context("failed to load position view")?;
-
-    if let Some(view) = &current
-        && let Some(pending) = view.pending_offchain_order_id.as_ref()
-    {
-        bail!(
-            "position {symbol} has pending offchain order {pending}; \
-             run position release-hedge before setting position"
-        );
-    }
-
-    let previous_net = current
-        .as_ref()
-        .map_or(FractionalShares::ZERO, |view| view.net);
-
-    position
-        .send(
-            symbol,
-            PositionCommand::ManuallyAdjustPosition {
-                symbol: symbol.clone(),
-                target_net,
-                reason: reason.clone().into(),
-                threshold,
-                expected_net: Some(previous_net),
-                price_usdc,
-            },
-        )
-        .await
-        .context("failed to set position")?;
+    let previous_net = set_position(
+        pool,
+        symbol,
+        target_net,
+        reason.as_ref(),
+        threshold,
+        price_usdc,
+    )
+    .await?
+    .previous_net;
 
     writeln!(
         stdout,
@@ -576,18 +146,26 @@ pub(super) async fn set_position_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::TxHash;
+    use std::sync::Arc;
 
+    use alloy::primitives::TxHash;
+    use chrono::{TimeZone, Utc};
     use st0x_config::ExecutionThreshold;
+    use st0x_event_sorcery::StoreBuilder;
     use st0x_evm::Chain;
     use st0x_execution::{ClientOrderId, Direction, ExecutorOrderId, FractionalShares};
     use st0x_finance::{Positive, Usd};
     use st0x_float_macro::float;
     use st0x_hedge::operator::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
+    use st0x_hedge::operator::offchain::order::{OffchainOrder, OffchainOrderCommand, OrderPlacer};
     use st0x_hedge::operator::portfolio_snapshot::{
-        PortfolioBalanceRowWithMark, PortfolioSnapshotId,
+        PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotCommand,
+        PortfolioSnapshotId, PortfolioSnapshotProjection,
     };
-    use st0x_hedge::operator::position::TradeId;
+    use st0x_hedge::operator::position::{
+        AnchorDisposition, Position, PositionCommand, ReloadOutcome, RepairOrderPlacer, TradeId,
+        classify_reloaded_state, fail_offchain_order_aggregate,
+    };
     use st0x_hedge::operator::test_utils::{
         try_positive_shares, try_rebalancing_enabled_equities, try_setup_test_db,
     };
@@ -1252,16 +830,9 @@ mod tests {
         .await
         .unwrap();
 
-        let mut stdout_buffer = Vec::new();
-        let error = fail_offchain_order_aggregate(
-            &mut stdout_buffer,
-            &pool,
-            stale,
-            order_id,
-            "operator repair".parse().unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let error = fail_offchain_order_aggregate(&pool, stale, order_id, "operator repair")
+            .await
+            .unwrap_err();
 
         assert!(
             error
@@ -1271,24 +842,29 @@ mod tests {
         );
     }
 
-    /// The in-contract guarantee for partial fills: a partial fill that lands
-    /// before the pre-send re-load must be caught. MarkFailed is legal from
-    /// PartiallyFilled at the aggregate level, so without the re-load the
-    /// executed shares would be erased silently. The remaining load->send
-    /// sliver is UNGUARDED by design -- it is closed only by honoring the
-    /// no-concurrent-bot contract (documented at the re-load site), since the
-    /// aggregate must keep MarkFailed legal from PartiallyFilled for the bot.
+    /// The exact interleaving the live route must survive: the bot commits a
+    /// PARTIAL fill after the repair's last read of the order and before its
+    /// `MarkFailedUnfilled` send. The fill must be refused by the aggregate
+    /// (evaluated on the state the store loads for the send, not on the stale
+    /// snapshot), the partial fill must survive, and because the repair is
+    /// aggregate-first the position pointer must still be set so the fill is
+    /// accounted through the normal flow. This is the case the bot's own
+    /// `MarkFailed` would erase silently.
     #[tokio::test]
-    async fn fail_offchain_order_aggregate_errors_on_concurrent_partial_fill() {
+    async fn fail_offchain_order_aggregate_refuses_a_partial_fill_landing_after_the_read() {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("MSTR").unwrap();
         let order_id = OffchainOrderId::new();
+        seed_pending_position(&pool, &symbol, order_id).await;
         seed_offchain_order(&pool, order_id, &symbol).await;
 
+        // The repair's last read of the order, while still Submitted...
         let stale = st0x_event_sorcery::load_entity::<OffchainOrder>(&pool, &order_id)
             .await
             .unwrap();
+        assert!(matches!(stale, Some(OffchainOrder::Submitted { .. })));
 
+        // ...then the bot commits a partial fill through its own store.
         st0x_event_sorcery::send_command::<OffchainOrder>(
             &pool,
             &order_id,
@@ -1302,16 +878,9 @@ mod tests {
         .await
         .unwrap();
 
-        let mut stdout_buffer = Vec::new();
-        let error = fail_offchain_order_aggregate(
-            &mut stdout_buffer,
-            &pool,
-            stale,
-            order_id,
-            "operator repair".parse().unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let error = fail_offchain_order_aggregate(&pool, stale, order_id, "operator repair")
+            .await
+            .unwrap_err();
 
         assert!(
             error
@@ -1320,22 +889,41 @@ mod tests {
             "expected the concurrent-execution error; got: {error}"
         );
 
-        // The partial fill must survive untouched.
         let order = st0x_event_sorcery::load_entity::<OffchainOrder>(&pool, &order_id)
             .await
             .unwrap()
             .unwrap();
         assert!(
-            matches!(order, OffchainOrder::PartiallyFilled { .. }),
+            matches!(
+                order,
+                OffchainOrder::PartiallyFilled { shares_filled, .. }
+                    if shares_filled == FractionalShares::new(float!(0.25))
+            ),
             "the partial fill must not be erased, got {order:?}"
+        );
+
+        let (_position, projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_offchain_order_id,
+            Some(order_id),
+            "the pointer must stay set so the fill is accounted through the normal flow",
         );
     }
 
     /// The escalation classifier is the single source of the executed-shares
-    /// rule shared by both re-load sites; every state must map to the right
-    /// outcome so the two sites cannot silently diverge. Covers all three
-    /// `ReloadOutcome` variants -- the branches the `AlreadyCompleted` recovery
-    /// arm depends on but cannot exercise deterministically in situ.
+    /// rule shared by the `AlreadyCompleted` and `AggregateConflict` recovery
+    /// arms; every state must map to the right outcome so the two cannot
+    /// silently diverge. Covers all three `ReloadOutcome` variants -- the
+    /// branches those arms depend on but cannot exercise deterministically in
+    /// situ.
     #[tokio::test]
     async fn classify_reloaded_state_routes_every_variant() {
         let pool = setup_test_db().await;
@@ -1511,21 +1099,14 @@ mod tests {
         .await
         .unwrap();
 
-        let mut stdout_buffer = Vec::new();
-        fail_offchain_order_aggregate(
-            &mut stdout_buffer,
-            &pool,
-            stale,
-            order_id,
-            "operator repair".parse().unwrap(),
-        )
-        .await
-        .unwrap();
+        let outcome = fail_offchain_order_aggregate(&pool, stale, order_id, "operator repair")
+            .await
+            .unwrap();
 
-        let output = String::from_utf8(stdout_buffer).unwrap();
-        assert!(
-            output.contains("reached a terminal state concurrently"),
-            "unexpected output: {output}"
+        assert_eq!(
+            outcome,
+            OffchainOrderOutcome::TerminalConcurrently,
+            "a concurrent fail must be reported as a benign terminal outcome"
         );
 
         // The bot's own failure record must be untouched by the repair.
