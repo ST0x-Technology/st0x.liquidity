@@ -1010,14 +1010,14 @@ impl InventoryView {
             .sorted()
             .map(|symbol| {
                 let inventory = self.equities.get(symbol);
-                // The trading chain's slot alone, never a cross-chain total:
+                // The primary chain's slot alone, never a cross-chain total:
                 // a wrapped share is worth its own chain's underlying, so the
                 // chains cannot be added. Surfacing the other chains needs a
                 // chain-qualified field the dashboard can render per chain,
                 // not a wider sum here.
                 let (onchain_available, onchain_inflight) = inventory
                     .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
-                        venue_balances(item.onchain.get(&self.trading_chain).copied())
+                        venue_balances(item.onchain.get(&self.primary_chain).copied())
                     });
 
                 let (offchain_available, offchain_inflight) = inventory
@@ -5837,7 +5837,7 @@ mod tests {
     /// chain's vault has its own underlying-per-wrapped ratio, so adding two
     /// chains' share counts yields a number that is no longer a share count.
     /// Cash must not be: the dashboard measures the onchain figure against the
-    /// rebalancing target, which the rebalancer applies to the trading chain's
+    /// rebalancing target, which the rebalancer applies to the primary chain's
     /// slot alone, so cash prefunded on another chain would read as a healthy
     /// allocation the rebalancer cannot reach.
     #[test]
