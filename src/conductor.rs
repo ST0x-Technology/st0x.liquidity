@@ -838,11 +838,15 @@ where
 fn publish_recovery_handle(
     recovery_cell: &tokio::sync::OnceCell<crate::api::RecoveryHandle>,
     transfer: Arc<CrossVenueEquityTransfer>,
+    mint_store: Arc<Store<TokenizedEquityMint>>,
+    redemption_store: Arc<Store<EquityRedemption>>,
     rebalancing_service: Arc<RebalancingService>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
 ) {
     let _ = recovery_cell.set(crate::api::RecoveryHandle {
         transfer,
+        mint_store,
+        redemption_store,
         rebalancing_service,
         usdc_recheck,
     });
@@ -1050,6 +1054,8 @@ impl Conductor {
         // Clone before the builder consumes it; the recovery handle needs the
         // rebalancing service to rebuild tracking during recheck recovery.
         let recovery_service = rebalancing_service.clone();
+        let recovery_mint_store = mint_store.clone();
+        let recovery_redemption_store = redemption_store.clone();
 
         let resume_tokenization_ctx = Arc::new(ResumeTokenizationCtx {
             transfer: recovery_transfer.clone(),
@@ -1103,6 +1109,8 @@ impl Conductor {
         publish_recovery_handle(
             &recovery_cell,
             recovery_transfer,
+            recovery_mint_store,
+            recovery_redemption_store,
             recovery_service,
             usdc_recheck,
         );
@@ -15537,8 +15545,8 @@ mod tests {
         let redemption_store = Arc::new(test_store(pool, services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             services,
-            mint_store,
-            redemption_store,
+            mint_store.clone(),
+            redemption_store.clone(),
         ));
         let rebalancing_service = freeze_guard_test_service().await;
         let usdc_recheck: Arc<dyn RecheckUsdcDeposit> = Arc::new(NeverCalledUsdcRecheck);
@@ -15548,6 +15556,8 @@ mod tests {
         publish_recovery_handle(
             &recovery_cell,
             transfer.clone(),
+            mint_store.clone(),
+            redemption_store.clone(),
             rebalancing_service.clone(),
             usdc_recheck,
         );
@@ -15559,6 +15569,8 @@ mod tests {
             Arc::ptr_eq(&handle.transfer, &transfer),
             "the cell must hold the published transfer"
         );
+        assert!(Arc::ptr_eq(&handle.mint_store, &mint_store));
+        assert!(Arc::ptr_eq(&handle.redemption_store, &redemption_store));
         assert!(
             Arc::ptr_eq(&handle.rebalancing_service, &rebalancing_service),
             "the cell must hold the published rebalancing service"

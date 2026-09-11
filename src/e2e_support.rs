@@ -12,7 +12,8 @@ use st0x_tokenization::{IssuerRequestId, tokenization_request_id};
 
 pub use crate::operator::equity_transfer::EquityTransferKind as TransferType;
 use crate::operator::equity_transfer::{
-    RecheckKind, fail_transfer as fail_equity_transfer, recheck_transfer as recheck_equity_transfer,
+    RecheckKind, fail_transfer_in_database as fail_equity_transfer,
+    recheck_transfer as recheck_equity_transfer,
 };
 use crate::test_utils::try_persist_event;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
@@ -23,6 +24,7 @@ pub async fn fail_transfer(
     id: &str,
     reason: &str,
 ) -> anyhow::Result<()> {
+    // Fixture setup runs before the bot starts, so no live reactor exists yet.
     fail_equity_transfer(pool, transfer_type, id, reason).await
 }
 
