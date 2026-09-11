@@ -25,6 +25,13 @@ pub(super) async fn wrap_equity_command<Writer: Write>(
     registry: Option<PathBuf>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    if matches!(network, TokenizationNetwork::Robinhood) {
+        anyhow::bail!(
+            "Robinhood does not support wrap/unwrap: its tokens are minted and \
+             redeemed through Alpaca, not wrapped through an ERC-4626 vault"
+        );
+    }
+
     let WrapContext { wallet, equities } = wrap_context(ctx, network, registry.as_ref(), &symbol)?;
     let owner = wallet.address();
     let wrapper = WrapperService::new(wallet, equities);
@@ -87,6 +94,13 @@ pub(super) async fn unwrap_equity_command<Writer: Write>(
     registry: Option<PathBuf>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    if matches!(network, TokenizationNetwork::Robinhood) {
+        anyhow::bail!(
+            "Robinhood does not support wrap/unwrap: its tokens are minted and \
+             redeemed through Alpaca, not wrapped through an ERC-4626 vault"
+        );
+    }
+
     let WrapContext { wallet, equities } = wrap_context(ctx, network, registry.as_ref(), &symbol)?;
     let owner = wallet.address();
     let wrapper = WrapperService::new(wallet, equities);
@@ -224,10 +238,18 @@ pub(super) fn wrap_context(
             "--registry only applies to non Base networks: Base resolves \
              from [chains.<name>.trading.assets.equities]"
         ),
-        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, Some(path)) => {
-            load_wrapped_equities(path, Chain::from(network).chain_id())?
-        }
-        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, None) => anyhow::bail!(
+        (
+            TokenizationNetwork::Ethereum
+            | TokenizationNetwork::HyperEvm
+            | TokenizationNetwork::Robinhood,
+            Some(path),
+        ) => load_wrapped_equities(path, Chain::from(network).chain_id())?,
+        (
+            TokenizationNetwork::Ethereum
+            | TokenizationNetwork::HyperEvm
+            | TokenizationNetwork::Robinhood,
+            None,
+        ) => anyhow::bail!(
             "pass --registry with the st0x.registry token list for the \
              selected network (token-lists/<network>.json)"
         ),
@@ -436,6 +458,97 @@ mod tests {
         assert!(
             error.to_string().contains("RKLB"),
             "error must list available symbols, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_on_robinhood_is_rejected_before_touching_the_registry() {
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        // A registry path that does not exist: reaching the loader would
+        // surface a file error, so the robinhood rejection proves the
+        // short-circuit runs before any registry data is read.
+        let error = wrap_equity_command(
+            &mut stdout,
+            Symbol::new("RKLB").unwrap(),
+            positive_shares("0.1"),
+            TokenizationNetwork::Robinhood,
+            Some(std::path::PathBuf::from("/nonexistent/robinhood.json")),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("does not support wrap/unwrap"),
+            "expected robinhood rejection, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_on_robinhood_without_a_registry_is_rejected() {
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        let error = wrap_equity_command(
+            &mut stdout,
+            Symbol::new("RKLB").unwrap(),
+            positive_shares("0.1"),
+            TokenizationNetwork::Robinhood,
+            None,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("does not support wrap/unwrap"),
+            "expected robinhood rejection, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unwrap_on_robinhood_is_rejected_before_touching_the_registry() {
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        let error = unwrap_equity_command(
+            &mut stdout,
+            Symbol::new("RKLB").unwrap(),
+            positive_shares("0.1"),
+            TokenizationNetwork::Robinhood,
+            Some(std::path::PathBuf::from("/nonexistent/robinhood.json")),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("does not support wrap/unwrap"),
+            "expected robinhood rejection, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unwrap_on_robinhood_without_a_registry_is_rejected() {
+        let ctx = create_ctx_with_stub_wallet();
+        let mut stdout = Vec::new();
+
+        let error = unwrap_equity_command(
+            &mut stdout,
+            Symbol::new("RKLB").unwrap(),
+            positive_shares("0.1"),
+            TokenizationNetwork::Robinhood,
+            None,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("does not support wrap/unwrap"),
+            "expected robinhood rejection, got: {error}"
         );
     }
 

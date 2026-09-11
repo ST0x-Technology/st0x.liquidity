@@ -94,7 +94,7 @@ where
 {
     let (block_number, block_id) = match chain {
         Chain::Base => (receipt_block_number, BlockId::hash(receipt_block_hash)),
-        Chain::Ethereum => {
+        Chain::Ethereum | Chain::Robinhood => {
             let latest = base_provider.get_block_number().await?;
             (latest, BlockId::number(latest))
         }

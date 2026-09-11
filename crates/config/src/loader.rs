@@ -1511,6 +1511,7 @@ fn validate_wallet_inputs(
                 base: signing_chain(Chain::Base)?,
                 ethereum: signing_chain(Chain::Ethereum)?,
                 hyperevm: signing_chain(Chain::HyperEvm)?,
+                robinhood: signing_chain(Chain::Robinhood)?,
             };
 
             let wallet_meta = WalletMeta::deserialize(wallet_config.clone()).map_err(|source| {
@@ -3137,6 +3138,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
@@ -3181,25 +3186,29 @@ mod tests {
     }
 
     /// The enablement predicate has to run on the real load path, not just as
-    /// a unit. HyperEVM supports prefunded trading but lacks gas valuation,
-    /// so raising it to "active" must still be refused.
+    /// a unit. HyperEVM supports prefunded trading and Robinhood signs only;
+    /// neither wires a gas-valuation source, so raising either from
+    /// "observe-only" to "active" must still be refused, naming the chain and
+    /// its missing capability.
     #[tokio::test]
-    async fn hyperevm_cannot_be_raised_to_active() {
-        let config = toml_file(
-            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
-                "[chains.hyperevm]\n            lifecycle = \"observe-only\"",
-                "[chains.hyperevm]\n            lifecycle = \"active\"",
-            ),
-        );
-        let secrets = alpaca_secrets_toml();
+    async fn observe_only_chains_cannot_be_raised_to_active() {
+        for chain in ["hyperevm", "robinhood"] {
+            let from = format!("[chains.{chain}]\n            lifecycle = \"observe-only\"");
+            let to = format!("[chains.{chain}]\n            lifecycle = \"active\"");
+            let config = toml_file(
+                &String::from_utf8_lossy(minimal_config_toml_bytes())
+                    .replace(from.as_str(), to.as_str()),
+            );
+            let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
-        let message = error.to_string();
+            let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+            let message = error.to_string();
 
-        assert!(
-            message.contains("hyperevm") && message.contains("gas valuation"),
-            "expected the predicate to name hyperevm and its missing capability, got: {message}"
-        );
+            assert!(
+                message.contains(chain) && message.contains("gas valuation"),
+                "expected the predicate to name {chain} and its missing capability, got: {message}"
+            );
+        }
     }
 
     /// A disabled chain is dropped from the registry, so a wallet that signs
@@ -3222,6 +3231,9 @@ mod tests {
             rpc_url = "http://localhost:8545"
 
             [chains.ethereum]
+            rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
             rpc_url = "http://localhost:8545"
 
             [broker]
@@ -3311,6 +3323,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [assets.equities]
             retired_symbols = []
 
@@ -3364,6 +3380,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -3438,6 +3458,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
@@ -3471,6 +3495,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -3526,6 +3553,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -3553,6 +3584,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -3645,6 +3679,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
@@ -3700,6 +3738,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -3796,6 +3837,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -3855,6 +3900,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -3922,6 +3971,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
@@ -3974,6 +4027,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -4048,6 +4105,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
@@ -4099,6 +4160,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -4182,6 +4246,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -4428,6 +4495,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -4481,6 +4552,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
         "#,
@@ -4608,6 +4683,10 @@ mod tests {
             [chains.hyperevm]
             lifecycle = "observe-only"
             required_confirmations = 1
+
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -4664,6 +4743,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -4717,6 +4800,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -4786,6 +4873,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -4839,6 +4930,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -4920,6 +5015,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
@@ -4994,6 +5093,10 @@ mod tests {
                 lifecycle = "observe-only"
                 required_confirmations = 1
 
+                [chains.robinhood]
+                lifecycle = "observe-only"
+                required_confirmations = 1
+
                 [wallet]
                 kind = "private-key"
                 address = "0x0000000000000000000000000000000000000001"
@@ -5030,6 +5133,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -5081,6 +5187,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -5172,6 +5282,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -5308,6 +5422,9 @@ mod tests {
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+
 
             [broker]
             type = "schwab"
@@ -5353,6 +5470,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
             [rebalancing]
@@ -5477,6 +5598,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [issuance]
             base_url = "http://issuance.test:8000"
 
@@ -5512,6 +5637,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -5899,6 +6027,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -5946,6 +6078,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -6001,6 +6136,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -6051,6 +6190,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -6106,6 +6248,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [wallet]
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -6158,6 +6304,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -6220,6 +6369,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [wallet]
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -6275,6 +6428,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -6501,6 +6657,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -6528,6 +6688,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -6589,6 +6752,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
@@ -6615,6 +6782,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -6667,6 +6837,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -6747,6 +6921,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -6867,6 +7045,9 @@ mod tests {
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
 
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -6935,6 +7116,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -6955,6 +7140,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -7179,6 +7367,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -7201,6 +7393,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -7260,6 +7455,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -7283,6 +7482,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -7345,6 +7547,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 0
             {REQUIRED_TOPOLOGY_SECTIONS}
@@ -7360,6 +7566,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -7427,6 +7636,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 10000
             extended_hours_reprice_timeout_secs = 300
@@ -7446,6 +7659,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -7509,6 +7725,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -7646,6 +7866,9 @@ mod tests {
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -7680,6 +7903,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -7719,6 +7945,9 @@ mod tests {
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -7757,6 +7986,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -7799,6 +8031,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -7977,6 +8212,9 @@ mod tests {
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+
 
             [broker]
             type = "alpaca-broker-api"
@@ -8024,6 +8262,9 @@ mod tests {
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+
 
             [broker]
             type = "schwab"
@@ -8069,6 +8310,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
             [rebalancing]
@@ -8760,6 +9005,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -8810,6 +9059,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -8875,6 +9128,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -8927,6 +9184,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -8953,6 +9214,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
             extra_secret = "surprise"
 
@@ -8986,6 +9250,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
             extra_secret = "surprise"
 
@@ -9052,6 +9319,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -9081,6 +9352,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -9117,6 +9391,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
             [broker]
             type = "alpaca-broker-api-jwt"
@@ -9160,6 +9437,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
             [broker]
             type = "alpaca-broker-api-jwt"
@@ -9277,6 +9557,9 @@ mod tests {
                 [chains.hyperevm]
                 rpc_url = "http://localhost:8545"
 
+                [chains.robinhood]
+                rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+
 
                 [broker]
                 type = "{kebab_value}"
@@ -9317,6 +9600,9 @@ mod tests {
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
 
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+
             [broker]
             type = "alpaca-broker-api"
             api_key = "test-key"
@@ -9325,7 +9611,7 @@ mod tests {
         "#;
 
         let secrets = toml::from_str::<Secrets>(per_chain).unwrap();
-        assert_eq!(secrets.chains.len(), 3);
+        assert_eq!(secrets.chains.len(), 4);
         assert_eq!(
             secrets.chains[&Chain::Base].rpc_url.as_str(),
             "http://localhost:8545/"
@@ -9366,6 +9652,9 @@ mod tests {
 
                 [chains.hyperevm]
                 rpc_url = "http://localhost:8545"
+
+                [chains.robinhood]
+                rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
                 [broker]
@@ -9532,6 +9821,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [wallet]
             kind = "turnkey"
             address = "0x6666666666666666666666666666666666666666"
@@ -9585,6 +9878,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://hyperevm.example.com"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -9703,6 +9999,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [alerts]
             poll_interval = 300
             realert_interval = 3600
@@ -9756,6 +10056,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://hyperevm.example.com"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
             [broker]
             type = "alpaca-broker-api"
@@ -9877,6 +10180,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [wallet]
             kind = "private-key"
             address = "0x0000000000000000000000000000000000000001"
@@ -9946,6 +10253,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             extended_hours_reprice_timeout_secs = 300
@@ -10000,6 +10311,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
         "#,
         );
         let secrets = alpaca_secrets_toml();
@@ -10024,6 +10339,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
             extra_secret = "surprise"
 
@@ -10080,6 +10398,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -10102,6 +10424,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -10157,6 +10482,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -10183,6 +10512,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "http://localhost:8545"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -10238,6 +10570,10 @@ mod tests {
             lifecycle = "observe-only"
             required_confirmations = 1
 
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
             [broker]
             counter_trade_slippage_bps = 100
             close_flatten_cross_max_bps = 400
@@ -10288,6 +10624,9 @@ mod tests {
 
             [chains.hyperevm]
             rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+            [chains.robinhood]
+            rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
 
             [broker]
@@ -10343,6 +10682,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 
@@ -10412,6 +10755,10 @@ mod tests {
             required_confirmations = 12
 
             [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
 

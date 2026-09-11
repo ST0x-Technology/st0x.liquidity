@@ -182,6 +182,8 @@ pub enum TokenizationNetwork {
     /// HyperEVM mainnet
     #[value(name = "hyperevm")]
     HyperEvm,
+    /// Robinhood Chain mainnet
+    Robinhood,
 }
 
 impl From<TokenizationNetwork> for Chain {
@@ -190,6 +192,7 @@ impl From<TokenizationNetwork> for Chain {
             TokenizationNetwork::Base => Self::Base,
             TokenizationNetwork::Ethereum => Self::Ethereum,
             TokenizationNetwork::HyperEvm => Self::HyperEvm,
+            TokenizationNetwork::Robinhood => Self::Robinhood,
         }
     }
 }
@@ -4471,6 +4474,10 @@ mod tests {
                 lifecycle = "observe-only"
                 required_confirmations = 1
 
+                [chains.robinhood]
+                lifecycle = "observe-only"
+                required_confirmations = 1
+
                 [broker]
                 counter_trade_slippage_bps = 100
                 close_flatten_cross_max_bps = 400
@@ -4527,6 +4534,9 @@ mod tests {
                 [chains.hyperevm]
                 rpc_url = "https://rpc.hyperliquid.xyz/evm"
 
+                [chains.robinhood]
+                rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+
                 [broker]
                 type = "alpaca-broker-api"
                 api_key = "test-key"
@@ -4571,5 +4581,11 @@ mod tests {
         );
         assert_eq!(ctx.chains.primary().ingestion_cutoff, IngestionCutoff::Safe);
         assert!(matches!(ctx.broker, BrokerCtx::AlpacaBrokerApi(_)));
+        assert_eq!(ctx.chains.required_confirmations(Chain::Robinhood), Some(1));
+        let robinhood_rpc = ctx.chains.rpc_url(Chain::Robinhood).unwrap();
+        assert_eq!(
+            robinhood_rpc.as_str(),
+            "https://rpc.mainnet.chain.robinhood.com/"
+        );
     }
 }
