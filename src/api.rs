@@ -20,6 +20,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
+use st0x_bridge::BridgeDirection;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -71,7 +72,8 @@ use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
 };
 use crate::rebalancing::usdc::{
-    DriverNotQuiesced, RecheckUsdcDeposit, UsdcDriverPause, UsdcDriverPauseGuard, UsdcRecheckError,
+    CctpMintRecoveryError, DriverNotQuiesced, RecheckUsdcDeposit, RecoverCctpMint, UsdcDriverPause,
+    UsdcDriverPauseGuard, UsdcRecheckError,
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
@@ -81,6 +83,7 @@ use crate::usdc_rebalance::{
     PreBurnFailEligibility, RebalanceDirection, ReconcileReason, UsdcRebalance,
     UsdcRebalanceCommand, UsdcRebalanceId,
 };
+use crate::view_rebuild::{RebuildScope, RebuildableView, rebuild_view};
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
@@ -1318,6 +1321,10 @@ pub(crate) struct RecoveryHandle {
     /// Runs in the bot process, so the recovery events reach the live
     /// trigger reactor and clear the in-progress guard without a restart.
     pub(crate) usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    /// Operator `cctp complete-mint` entry point: polls the attestation for a
+    /// burn and submits the destination mint through the bot's own bridge and
+    /// wallet, under the driver pause so no worker drives the same mint.
+    pub(crate) cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     /// Pause control for the USDC rebalancing driver. A write route that must
     /// read then mutate a USDC rebalance, or spend the rebalancing wallet,
     /// quiesces the workers through it first and resumes them on every exit.
@@ -2454,6 +2461,206 @@ async fn fail_pre_burn_usdc_transfer(
     })
 }
 
+/// Wire contract for the view rebuild route: exactly one of `id` (one
+/// aggregate's view) or `all: true` (every row).
+#[derive(Deserialize)]
+struct RebuildViewRequest {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RebuildViewResponse {
+    view: &'static str,
+    /// The rebuilt aggregate id, or `null` for a whole-view rebuild.
+    id: Option<String>,
+    /// Events replayed; reported by the read models only.
+    replayed: Option<u64>,
+}
+
+/// Rebuilds a materialized view or read model by deleting its rows and
+/// replaying the event log, the escape hatch for a view corrupted by a lost
+/// update. Store only: no service, lock, or driver pause is involved, and a
+/// live write racing the rebuild lands in the same lost-update class the next
+/// catch-up repairs (see `view_rebuild`).
+///
+/// Mirrors `stox view rebuild`; the `{view}` segment is the CLI's
+/// `--aggregate` value (`position`, `offchain-order`, `vault-registry`,
+/// `rebalance-timing`, `equity-timing`, `lifecycle-failure`,
+/// `portfolio-snapshot`).
+async fn rebuild_materialized_view(
+    State(state): State<AppState>,
+    Path(view): Path<String>,
+    Json(request): Json<RebuildViewRequest>,
+) -> Result<Json<RebuildViewResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let view = <RebuildableView as clap::ValueEnum>::from_str(&view, false).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Unknown view {view:?}"),
+            }),
+        )
+    })?;
+
+    let scope = match (request.id, request.all) {
+        (Some(id), false) => RebuildScope::Id(id),
+        (None, true) => RebuildScope::All,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "pass exactly one of id or all: true".to_string(),
+                }),
+            ));
+        }
+    };
+
+    let rebuilt = rebuild_view(&state.pool, view, scope)
+        .await
+        .map_err(|error| {
+            if error.is_caller_error() {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: error.to_string(),
+                    }),
+                )
+            } else {
+                ops_store_error(error)
+            }
+        })?;
+
+    let id = match rebuilt.scope {
+        RebuildScope::Id(id) => Some(id),
+        RebuildScope::All => None,
+    };
+    info!(view = %rebuilt.view, ?id, replayed = ?rebuilt.replayed, "View rebuilt via API");
+    Ok(Json(RebuildViewResponse {
+        view: rebuilt.view.name(),
+        id,
+        replayed: rebuilt.replayed,
+    }))
+}
+
+/// Wire contract for the CCTP mint recovery route.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteCctpMintRequest {
+    /// Transaction hash of the burn on the source chain.
+    burn_tx: String,
+    /// Chain the burn happened on; the mint lands on the other one.
+    source_chain: CctpSourceChain,
+}
+
+/// The burn's chain, kebab-cased on the wire (`ethereum`, `base`), matching
+/// the CLI's `--source-chain` value.
+#[derive(Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "kebab-case")]
+enum CctpSourceChain {
+    Ethereum,
+    Base,
+}
+
+impl CctpSourceChain {
+    const fn bridge_direction(self) -> BridgeDirection {
+        match self {
+            Self::Ethereum => BridgeDirection::EthereumToBase,
+            Self::Base => BridgeDirection::BaseToEthereum,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteCctpMintResponse {
+    mint_tx: String,
+    /// USDC minted to the recipient, net of the fee.
+    amount_received: String,
+    fee_collected: String,
+}
+
+/// Completes the destination mint of a CCTP burn whose mint never landed
+/// (attestation polling interrupted, bot crashed after the burn). Polls
+/// Circle for the attestation and submits `receiveMessage` through the bot's
+/// own bridge and wallet. Live RPC only; touches no aggregate. After the mint
+/// lands, bring the stuck `UsdcRebalance` back in sync with `resume-usdc`
+/// (non-terminal: adopts the mint) or `reconcile-usdc` (post-burn terminal).
+///
+/// Runs under the resume lock and with the USDC driver quiesced for its whole
+/// duration, so no worker can drive the same mint concurrently. Attestation
+/// polling is bounded (60 attempts, 5s apart); a burn Circle has not attested
+/// yet is reported as 502 and is retryable.
+///
+/// Mirrors `stox cctp complete-mint`.
+async fn complete_cctp_mint(
+    State(state): State<AppState>,
+    Json(request): Json<CompleteCctpMintRequest>,
+) -> Result<Json<CompleteCctpMintResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let burn_tx: TxHash = request.burn_tx.parse().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid burn tx hash: {error}"),
+            }),
+        )
+    })?;
+    let direction = request.source_chain.bridge_direction();
+
+    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A resume or recheck operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause).await?;
+
+    let recovered = handle
+        .cctp_mint_recovery
+        .recover_cctp_mint(direction, burn_tx)
+        .await
+        .map_err(|error| {
+            error!(?error, %burn_tx, ?direction, "CCTP mint recovery failed");
+            let (status, message) = cctp_mint_recovery_error_response(&error);
+            (status, Json(ErrorResponse { error: message }))
+        })?;
+
+    info!(%burn_tx, ?direction, mint_tx = %recovered.mint_tx, "CCTP mint recovered via API");
+    Ok(Json(CompleteCctpMintResponse {
+        mint_tx: recovered.mint_tx.to_string(),
+        amount_received: recovered.amount_received.to_string(),
+        fee_collected: recovered.fee_collected.to_string(),
+    }))
+}
+
+/// Maps a [`CctpMintRecoveryError`]: an unavailable attestation is an
+/// upstream (Circle) condition the operator retries later, so 502 with the
+/// typed message; a mint failure, amount decode, or gas-ledger enqueue is an
+/// internal failure whose detail is logged at the call site.
+fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCode, String) {
+    match error {
+        CctpMintRecoveryError::Attestation { .. } => (StatusCode::BAD_GATEWAY, error.to_string()),
+        CctpMintRecoveryError::Mint { .. } | CctpMintRecoveryError::Transfer(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CCTP mint recovery failed".to_string(),
+        ),
+    }
+}
+
 /// Wire contract for the equity reconcile route (mint or redemption).
 #[derive(Deserialize)]
 struct ReconcileEquityRequest {
@@ -3063,6 +3270,14 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .route(
             "/liquidity-write/transactions/{tx_hash}/process",
             post(process_transaction),
+        )
+        .route(
+            "/liquidity-write/views/{view}/rebuild",
+            post(rebuild_materialized_view),
+        )
+        .route(
+            "/liquidity-write/cctp/complete-mint",
+            post(complete_cctp_mint),
         )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
@@ -6173,6 +6388,8 @@ mod tests {
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
             ("POST", "/liquidity-write/transactions/x/process"),
+            ("POST", "/liquidity-write/views/position/rebuild"),
+            ("POST", "/liquidity-write/cctp/complete-mint"),
         ] {
             let response = app
                 .clone()
@@ -6223,6 +6440,8 @@ mod tests {
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
             ("POST", "/liquidity-write/transactions/x/process"),
+            ("POST", "/liquidity-write/views/position/rebuild"),
+            ("POST", "/liquidity-write/cctp/complete-mint"),
         ] {
             let response = app
                 .clone()
@@ -7179,6 +7398,207 @@ mod tests {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_replays_one_position_from_its_events() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let symbol: Symbol = "AAPL".parse().unwrap();
+        seed_position_pnl_fill(&state.pool, &symbol).await;
+        // Corrupt the view so the rebuild is observable: an empty payload the
+        // replay must replace with the folded position.
+        sqlx::query("UPDATE position_view SET payload = '{}' WHERE view_id = ?1")
+            .bind(symbol.to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let resp = rebuild_materialized_view(
+            State(state.clone()),
+            Path("position".to_string()),
+            Json(RebuildViewRequest {
+                id: Some("AAPL".to_string()),
+                all: false,
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("a seeded position must rebuild");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "view": "position", "id": "AAPL", "replayed": null }),
+        );
+        let (payload,): (String,) =
+            sqlx::query_as("SELECT payload FROM position_view WHERE view_id = ?1")
+                .bind(symbol.to_string())
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_ne!(payload, "{}", "the replay must rewrite the corrupted row");
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_reports_the_replay_count_for_a_read_model() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let resp = rebuild_materialized_view(
+            State(state.clone()),
+            Path("rebalance-timing".to_string()),
+            Json(RebuildViewRequest {
+                id: None,
+                all: true,
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("a whole-model rebuild must succeed on an empty store");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "view": "rebalance-timing", "id": null, "replayed": 0 }),
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_refuses_a_single_id_for_a_read_model() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let resp = rebuild_materialized_view(
+            State(state.clone()),
+            Path("equity-timing".to_string()),
+            Json(RebuildViewRequest {
+                id: Some("x".to_string()),
+                all: false,
+            }),
+        )
+        .await;
+
+        let Err((status, Json(error))) = resp else {
+            panic!("a read model must refuse a single id");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("whole read model"), "{}", error.error);
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_refuses_an_ambiguous_scope_and_an_unknown_view() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        for (view, request) in [
+            (
+                "position",
+                RebuildViewRequest {
+                    id: Some("AAPL".to_string()),
+                    all: true,
+                },
+            ),
+            (
+                "position",
+                RebuildViewRequest {
+                    id: None,
+                    all: false,
+                },
+            ),
+            (
+                "not-a-view",
+                RebuildViewRequest {
+                    id: None,
+                    all: true,
+                },
+            ),
+        ] {
+            let resp = rebuild_materialized_view(
+                State(state.clone()),
+                Path(view.to_string()),
+                Json(request),
+            )
+            .await;
+            let Err((status, _)) = resp else {
+                panic!("{view}: expected a refusal");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{view}");
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_cctp_mint_returns_503_before_conductor_ready() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let resp = complete_cctp_mint(
+            State(state.clone()),
+            Json(CompleteCctpMintRequest {
+                burn_tx: TxHash::repeat_byte(0x33).to_string(),
+                source_chain: CctpSourceChain::Base,
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn complete_cctp_mint_rejects_a_malformed_burn_hash_before_the_readiness_gate() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let resp = complete_cctp_mint(
+            State(state.clone()),
+            Json(CompleteCctpMintRequest {
+                burn_tx: "not-a-hash".to_string(),
+                source_chain: CctpSourceChain::Ethereum,
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn cctp_source_chain_maps_to_the_mint_destination() {
+        assert_eq!(
+            CctpSourceChain::Ethereum.bridge_direction(),
+            BridgeDirection::EthereumToBase
+        );
+        assert_eq!(
+            CctpSourceChain::Base.bridge_direction(),
+            BridgeDirection::BaseToEthereum
+        );
+        let parsed: CctpSourceChain = serde_json::from_str("\"base\"").unwrap();
+        assert!(matches!(parsed, CctpSourceChain::Base));
+    }
+
+    #[test]
+    fn cctp_mint_recovery_error_response_distinguishes_recoverability() {
+        let burn_tx = TxHash::repeat_byte(0x33);
+        let attestation = CctpMintRecoveryError::Attestation {
+            burn_tx,
+            source: st0x_bridge::cctp::CctpError::PlaceholderNonce,
+        };
+        let (status, message) = cctp_mint_recovery_error_response(&attestation);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(message.contains(&burn_tx.to_string()), "{message}");
+
+        let mint = CctpMintRecoveryError::Mint {
+            burn_tx,
+            source: st0x_bridge::cctp::CctpError::MintAndWithdrawEventNotFound,
+        };
+        let (status, message) = cctp_mint_recovery_error_response(&mint);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "CCTP mint recovery failed");
     }
 
     #[tokio::test]

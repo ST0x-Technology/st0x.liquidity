@@ -13,7 +13,8 @@ use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
 use crate::cli::{
-    Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read, UsdcDirection,
+    Cctp, CctpSourceChain, Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position,
+    Read, RebuildableView, UsdcDirection, View,
 };
 use crate::output::OutputError;
 use crate::target::Auth;
@@ -266,6 +267,44 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post(&format!("/transactions/{tx_hash}/process"))
                 .await?
         }
+        Command::Debug(Debug::View(View::Rebuild(args))) => {
+            let view = match args.view {
+                RebuildableView::Position => "position",
+                RebuildableView::OffchainOrder => "offchain-order",
+                RebuildableView::VaultRegistry => "vault-registry",
+                RebuildableView::RebalanceTiming => "rebalance-timing",
+                RebuildableView::EquityTiming => "equity-timing",
+                RebuildableView::LifecycleFailure => "lifecycle-failure",
+                RebuildableView::PortfolioSnapshot => "portfolio-snapshot",
+            };
+            client
+                .post_json(
+                    &format!("/views/{view}/rebuild"),
+                    &wire::RebuildViewRequest {
+                        id: args.id,
+                        all: args.all,
+                    },
+                )
+                .await?
+        }
+        Command::Debug(Debug::Cctp(Cctp::CompleteMint {
+            burn_tx,
+            source_chain,
+        })) => {
+            let source_chain = match source_chain {
+                CctpSourceChain::Ethereum => "ethereum",
+                CctpSourceChain::Base => "base",
+            };
+            client
+                .post_json(
+                    "/cctp/complete-mint",
+                    &wire::CompleteCctpMintRequest {
+                        burn_tx,
+                        source_chain,
+                    },
+                )
+                .await?
+        }
     };
     output::print(&value).map_err(ApiError::from)
 }
@@ -281,9 +320,9 @@ mod tests {
     use super::{ApiError, dispatch};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
-        Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read, ReadResource,
-        ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs, TradeEventsArgs,
-        TransferEventsArgs, UsdcDirection,
+        Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position,
+        Read, ReadResource, RebuildViewArgs, RebuildableView, ReleaseHedgeArgs, ResourceArgs,
+        SetMarkArgs, SetPositionArgs, TradeEventsArgs, TransferEventsArgs, UsdcDirection, View,
     };
     use crate::output::OutputError;
     use crate::transport::{Client, TransportError};
@@ -636,6 +675,65 @@ mod tests {
             request_line(&request),
             "POST /liquidity-write/transactions/0xabc/process HTTP/1.1"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cctp_complete_mint_posts_the_burn_and_source_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::Cctp(Cctp::CompleteMint {
+            burn_tx: "0xabc".to_owned(),
+            source_chain: CctpSourceChain::Base,
+        })))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/cctp/complete-mint HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "burnTx": "0xabc", "sourceChain": "base" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn view_rebuild_posts_one_id() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::View(View::Rebuild(
+            RebuildViewArgs {
+                view: RebuildableView::Position,
+                id: Some("AAPL".to_owned()),
+                all: false,
+            },
+        ))))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/views/position/rebuild HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "id": "AAPL", "all": false })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn view_rebuild_posts_a_whole_model_without_an_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::View(View::Rebuild(
+            RebuildViewArgs {
+                view: RebuildableView::RebalanceTiming,
+                id: None,
+                all: true,
+            },
+        ))))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/views/rebalance-timing/rebuild HTTP/1.1"
+        );
+        assert_eq!(request_body(&request), serde_json::json!({ "all": true }));
         Ok(())
     }
 

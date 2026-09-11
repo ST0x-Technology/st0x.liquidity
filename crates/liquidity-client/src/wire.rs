@@ -40,6 +40,22 @@ pub(crate) struct FailUsdcTransferRequest {
     pub(crate) reason: String,
 }
 
+/// Body of `POST /views/{view}/rebuild`: exactly one of `id` or `all`.
+#[derive(Serialize)]
+pub(crate) struct RebuildViewRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
+    pub(crate) all: bool,
+}
+
+/// Body of `POST /cctp/complete-mint`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CompleteCctpMintRequest {
+    pub(crate) burn_tx: String,
+    pub(crate) source_chain: &'static str,
+}
+
 /// Body of `POST /positions/{symbol}/set`.
 #[derive(Serialize)]
 pub(crate) struct SetPositionRequest {
