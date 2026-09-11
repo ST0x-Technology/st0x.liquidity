@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use chrono::{DateTime, Days, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Days, NaiveDate, NaiveTime, Timelike, Utc};
 use chrono_tz::America::New_York;
 use serde::Deserialize;
 use tracing::{debug, warn};
@@ -28,11 +28,16 @@ const NEXT_SESSION_LOOKAHEAD_DAYS: u64 = 14;
 /// exactly the window in which Alpaca accepts `extended_hours: true` limit
 /// orders, i.e. the 4:00-9:30/16:00-20:00 windows described in
 /// https://docs.alpaca.markets/docs/orders-at-alpaca#extended-hours-trading.
-/// If Alpaca redefines the session bounds (e.g. for 24/5 overnight trading),
-/// `Extended` classification may cover times where extended-hours limit
-/// orders are rejected; the failure mode is broker rejections of the hedge
-/// order, retried by the hedge job, not silent misclassification of money
-/// amounts.
+/// If Alpaca redefines the session bounds, `Extended` classification may
+/// cover times where extended-hours limit orders are rejected; the failure
+/// mode is broker rejections of the hedge order, retried by the hedge job,
+/// not silent misclassification of money amounts.
+///
+/// The calendar does NOT model the 24/5 overnight session. Its fixed
+/// 20:00-04:00 ET window is derived from adjacent trading days instead: the
+/// evening leg (20:00-24:00 on day D) exists iff D+1 is a trading day, the
+/// morning leg (00:00-04:00 on day D) exists iff D is a trading day. See
+/// SPEC "External contract (Alpaca 24/5 overnight)".
 #[derive(Debug, Clone, Deserialize)]
 struct CalendarDay {
     date: NaiveDate,
@@ -63,7 +68,8 @@ pub(super) async fn is_market_open(
     is_market_open_at(client, Utc::now()).await
 }
 
-/// Returns the current market session (regular, extended, or closed).
+/// Returns the current market session (regular, extended, overnight, or
+/// closed).
 pub(super) async fn market_session(
     client: &AlpacaBrokerApiClient,
 ) -> Result<MarketSession, AlpacaBrokerApiError> {
@@ -83,7 +89,7 @@ pub(super) async fn market_session_status(
 /// function conditionally performs a second calendar HTTP round trip (the
 /// post-close-gap lookahead) whenever the session is Extended. Plain session
 /// callers -- `is_market_open`, and the per-symbol readiness/cancellation
-/// checks that only need Regular/Extended/Closed -- never consume that
+/// checks that only need the session value -- never consume that
 /// metadata, so routing them through the status path would pay for an
 /// avoidable broker call on every extended-hours tick. Only
 /// `market_session_status_at` (consumed by the close-flatten path) needs it.
@@ -143,10 +149,8 @@ async fn session_and_close_at(
     let now_et = now.with_timezone(&New_York);
     let today = now_et.date_naive();
 
-    let calendar = get_calendar(client, today, today).await?;
-
-    let Some(today_calendar) = calendar.into_iter().next() else {
-        debug!("Today is not a trading day");
+    let Some(tomorrow) = today.checked_add_days(Days::new(1)) else {
+        warn!(%today, "Could not compute next calendar day; classifying the session as closed");
         return Ok(SessionAndClose {
             session: MarketSession::Closed,
             extended_session_closes_at: None,
@@ -154,35 +158,67 @@ async fn session_and_close_at(
         });
     };
 
+    // One request answers both overnight legs: today's entry classifies the
+    // regular/extended windows and the morning leg, tomorrow's presence
+    // decides the evening leg.
+    let calendar = get_calendar(client, today, tomorrow).await?;
+
     // The broker may answer a non-trading-day query with the NEAREST trading
-    // day instead of an empty list. A LATER date is positive evidence the
-    // queried day has no trading session, so classify it Closed -- erroring
-    // here would turn every weekend/holiday tick into a multi-day error storm
-    // (failed scans, burned hedge-job retries) instead of the spec'd
+    // day instead of only the days in range. A date PAST the queried window
+    // is positive evidence that neither queried day trades, so ignore it --
+    // erroring would turn every weekend/holiday tick into a multi-day error
+    // storm (failed scans, burned hedge-job retries) instead of the spec'd
     // "Closed: leave the exposure for the next scan". An EARLIER date proves
-    // nothing about today and indicates a broken response, so fail fast
-    // rather than classify against another day's session windows.
-    match today_calendar.date.cmp(&today) {
-        Ordering::Greater => {
-            debug!(
-                queried = %today,
-                returned = %today_calendar.date,
-                "Calendar returned a later trading day; queried day is not a trading day"
-            );
+    // nothing about the queried days and indicates a broken response, so
+    // fail fast rather than classify against another day's session windows.
+    let mut today_calendar = None;
+    let mut tomorrow_is_trading_day = false;
+    for day in calendar {
+        match day.date.cmp(&today) {
+            Ordering::Less => {
+                return Err(AlpacaBrokerApiError::CalendarDateMismatch {
+                    queried: today,
+                    returned: day.date,
+                });
+            }
+            Ordering::Equal => today_calendar = Some(day),
+            Ordering::Greater if day.date == tomorrow => tomorrow_is_trading_day = true,
+            Ordering::Greater => {
+                debug!(
+                    queried = %today,
+                    returned = %day.date,
+                    "Calendar returned a trading day past the queried window"
+                );
+            }
+        }
+    }
+
+    let now_time = now_et.time();
+    // The overnight session spans fixed clock times -- 20:00-04:00 ET -- by
+    // Alpaca's 24/5 contract; it is not described by any calendar field (see
+    // the CalendarDay doc). An early close therefore leaves a Closed gap
+    // between `session_close` and 20:00 rather than starting overnight early.
+    let in_overnight_evening_leg = now_time.hour() >= 20;
+    let in_overnight_morning_leg = now_time.hour() < 4;
+
+    let Some(today_calendar) = today_calendar else {
+        // The evening leg needs only tomorrow to trade: Sunday 20:00 and a
+        // holiday's own 20:00 both start the next trading day's overnight
+        // session even though today itself never traded.
+        if in_overnight_evening_leg && tomorrow_is_trading_day {
             return Ok(SessionAndClose {
-                session: MarketSession::Closed,
+                session: MarketSession::Overnight,
                 extended_session_closes_at: None,
                 today,
             });
         }
-        Ordering::Less => {
-            return Err(AlpacaBrokerApiError::CalendarDateMismatch {
-                queried: today,
-                returned: today_calendar.date,
-            });
-        }
-        Ordering::Equal => {}
-    }
+        debug!("Today is not a trading day");
+        return Ok(SessionAndClose {
+            session: MarketSession::Closed,
+            extended_session_closes_at: None,
+            today,
+        });
+    };
 
     // Detect a silent redefinition of the undocumented session bounds (see
     // the CONTRACT RISK note on `CalendarDay`). A NARROWED window is the
@@ -213,13 +249,18 @@ async fn session_and_close_at(
         );
     }
 
-    let now_time = now_et.time();
     let extended_session_closes_at = local_market_time_to_utc(today, today_calendar.session_close)?;
 
     let session = if now_time >= today_calendar.open && now_time < today_calendar.close {
         MarketSession::Regular
     } else if now_time >= today_calendar.session_open && now_time < today_calendar.session_close {
         MarketSession::Extended
+    } else if in_overnight_evening_leg && tomorrow_is_trading_day {
+        MarketSession::Overnight
+    } else if in_overnight_morning_leg {
+        // Today's calendar entry exists, so today is a trading day and its
+        // overnight morning leg (00:00-04:00) is open.
+        MarketSession::Overnight
     } else {
         MarketSession::Closed
     };
@@ -230,13 +271,25 @@ async fn session_and_close_at(
         session_open = %today_calendar.session_open,
         session_close = %today_calendar.session_close,
         now = %now_time,
+        tomorrow_is_trading_day,
         ?session,
         "Checked market session"
     );
 
+    // During Overnight, today's extended close is already in the past, and
+    // the calendar-less Overnight legs (Sunday, a holiday's own evening)
+    // report None -- keep the field consistent per session rather than
+    // dependent on whether today happened to trade.
+    let extended_session_closes_at = match session {
+        MarketSession::Overnight => None,
+        MarketSession::Regular | MarketSession::Extended | MarketSession::Closed => {
+            Some(extended_session_closes_at)
+        }
+    };
+
     Ok(SessionAndClose {
         session,
-        extended_session_closes_at: Some(extended_session_closes_at),
+        extended_session_closes_at,
         today,
     })
 }
@@ -330,6 +383,7 @@ async fn get_calendar(
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
     use httpmock::prelude::*;
     use serde_json::json;
     use uuid::uuid;
@@ -470,47 +524,78 @@ mod tests {
         );
     }
 
-    fn mock_calendar_day(
-        server: &MockServer,
+    fn calendar_entry(
         date: &str,
         open: &str,
         close: &str,
         session_open: &str,
         session_close: &str,
-    ) {
+    ) -> serde_json::Value {
+        json!({
+            "date": date,
+            "open": open,
+            "close": close,
+            "session_open": session_open,
+            "session_close": session_close
+        })
+    }
+
+    fn trading_day_entry(date: &str) -> serde_json::Value {
+        calendar_entry(date, "09:30", "16:00", "0400", "2000")
+    }
+
+    fn next_date(date: &str) -> String {
+        NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .unwrap()
+            .checked_add_days(Days::new(1))
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    /// Mocks the classification window `[date, date+1]` with the given
+    /// calendar entries.
+    fn mock_calendar_window(server: &MockServer, date: &str, entries: serde_json::Value) {
+        let end = next_date(date);
         server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/calendar")
                 .query_param("start", date)
-                .query_param("end", date);
+                .query_param("end", &end);
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "date": date,
-                        "open": open,
-                        "close": close,
-                        "session_open": session_open,
-                        "session_close": session_close
-                    }
-                ]));
+                .json_body(entries);
         });
     }
 
+    /// An ordinary trading day followed by another trading day (a weekday
+    /// pair like Monday/Tuesday).
     fn mock_trading_day(server: &MockServer, date: &str) {
-        mock_calendar_day(server, date, "09:30", "16:00", "0400", "2000");
+        let tomorrow = next_date(date);
+        mock_calendar_window(
+            server,
+            date,
+            json!([trading_day_entry(date), trading_day_entry(&tomorrow)]),
+        );
     }
 
+    /// A trading day whose NEXT day does not trade (a Friday, or the eve of
+    /// a full holiday).
+    fn mock_last_trading_day_before_gap(server: &MockServer, date: &str) {
+        mock_calendar_window(server, date, json!([trading_day_entry(date)]));
+    }
+
+    /// A non-trading day whose next day trades (a Sunday, or a holiday whose
+    /// following day is a trading day).
+    fn mock_non_trading_day_before_trading_day(server: &MockServer, date: &str) {
+        let tomorrow = next_date(date);
+        mock_calendar_window(server, date, json!([trading_day_entry(&tomorrow)]));
+    }
+
+    /// A non-trading day whose next day does not trade either (a Saturday,
+    /// or a holiday followed by a weekend).
     fn mock_non_trading_day(server: &MockServer, date: &str) {
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/calendar")
-                .query_param("start", date)
-                .query_param("end", date);
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([]));
-        });
+        mock_calendar_window(server, date, json!([]));
     }
 
     fn mock_next_trading_day(
@@ -623,27 +708,15 @@ mod tests {
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         // Saturday query answered with Monday's entry (the nearest trading
-        // day). A later date is positive evidence Saturday has no trading
-        // session, so the session is Closed -- NOT an error, which would
-        // storm every weekend tick, and NOT a classification against
-        // Monday's session windows.
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/calendar")
-                .query_param("start", "2025-01-04")
-                .query_param("end", "2025-01-04");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "date": "2025-01-06",
-                        "open": "09:30",
-                        "close": "16:00",
-                        "session_open": "0400",
-                        "session_close": "2000"
-                    }
-                ]));
-        });
+        // day). A date past the queried [Saturday, Sunday] window is positive
+        // evidence neither day trades, so the session is Closed -- NOT an
+        // error, which would storm every weekend tick, and NOT a
+        // classification against Monday's session windows.
+        mock_calendar_window(
+            &server,
+            "2025-01-04",
+            json!([trading_day_entry("2025-01-06")]),
+        );
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         // 18:00 ET Saturday would classify Extended against Monday's
@@ -663,23 +736,11 @@ mod tests {
         // An EARLIER date proves nothing about the queried day -- the
         // response is broken, so classification must fail fast rather than
         // trust another day's session windows.
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/calendar")
-                .query_param("start", "2025-01-07")
-                .query_param("end", "2025-01-07");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "date": "2025-01-06",
-                        "open": "09:30",
-                        "close": "16:00",
-                        "session_open": "0400",
-                        "session_close": "2000"
-                    }
-                ]));
-        });
+        mock_calendar_window(
+            &server,
+            "2025-01-07",
+            json!([trading_day_entry("2025-01-06")]),
+        );
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let tuesday_midday = et_time_as_utc("2025-01-07", 12, 0);
@@ -704,27 +765,15 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
-        // Saturday answered with Monday's entry: a later trading day means
-        // the queried day is closed, so the regular-hours predicate is
-        // false -- 12:00 ET would be inside Monday's regular hours if the
-        // date guard were missing.
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/calendar")
-                .query_param("start", "2025-01-04")
-                .query_param("end", "2025-01-04");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "date": "2025-01-06",
-                        "open": "09:30",
-                        "close": "16:00",
-                        "session_open": "0400",
-                        "session_close": "2000"
-                    }
-                ]));
-        });
+        // Saturday answered with Monday's entry: a trading day past the
+        // queried window means the queried day is closed, so the
+        // regular-hours predicate is false -- 12:00 ET would be inside
+        // Monday's regular hours if the date guard were missing.
+        mock_calendar_window(
+            &server,
+            "2025-01-04",
+            json!([trading_day_entry("2025-01-06")]),
+        );
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let saturday_noon = et_time_as_utc("2025-01-04", 12, 0);
@@ -954,7 +1003,18 @@ mod tests {
     async fn market_session_status_uses_early_close_session_close() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-        mock_calendar_day(&server, "2025-07-03", "09:30", "13:00", "0400", "1700");
+        // July 3 half-day; July 4 is a full holiday, so no tomorrow entry.
+        mock_calendar_window(
+            &server,
+            "2025-07-03",
+            json!([calendar_entry(
+                "2025-07-03",
+                "09:30",
+                "13:00",
+                "0400",
+                "1700"
+            )]),
+        );
         mock_next_trading_day(&server, "2025-07-04", "2025-07-17", Some("2025-07-07"));
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
@@ -973,7 +1033,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_session_closed_before_extended_session() {
+    async fn market_session_overnight_before_extended_session() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         mock_trading_day(&server, "2025-01-06");
@@ -983,13 +1043,13 @@ mod tests {
 
         assert_eq!(
             market_session_at(&client, overnight).await.unwrap(),
-            MarketSession::Closed,
-            "3:00 AM ET is before session_open (4:00), should be Closed"
+            MarketSession::Overnight,
+            "3:00 AM ET on a trading day is the overnight morning leg"
         );
     }
 
     #[tokio::test]
-    async fn market_session_closed_after_extended_session() {
+    async fn market_session_overnight_after_extended_session() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         mock_trading_day(&server, "2025-01-06");
@@ -999,16 +1059,47 @@ mod tests {
 
         assert_eq!(
             market_session_at(&client, late_night).await.unwrap(),
-            MarketSession::Closed,
-            "9:00 PM ET is after session_close (20:00), should be Closed"
+            MarketSession::Overnight,
+            "9:00 PM ET on a weeknight before a trading day is the overnight evening leg"
         );
+    }
+
+    #[tokio::test]
+    async fn weeknight_overnight_reports_no_extended_close_like_the_sunday_leg() {
+        // A weeknight Overnight evening takes the today-calendar branch,
+        // where today's 20:00 close is already in the past; the Sunday
+        // and holiday Overnight legs report None. The field must be
+        // consistent per session, not depend on whether today traded.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+        mock_next_trading_day(&server, "2025-01-07", "2025-01-20", Some("2025-01-07"));
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let status = market_session_status_at(&client, et_time_as_utc("2025-01-06", 21, 0))
+            .await
+            .unwrap();
+
+        assert_eq!(status.session, MarketSession::Overnight);
+        assert_eq!(status.extended_session_closes_at, None);
     }
 
     #[tokio::test]
     async fn market_session_uses_early_close_calendar_boundaries() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-        mock_calendar_day(&server, "2025-07-03", "09:30", "13:00", "0400", "1700");
+        // July 3 half-day; July 4 is a full holiday, so no tomorrow entry.
+        mock_calendar_window(
+            &server,
+            "2025-07-03",
+            json!([calendar_entry(
+                "2025-07-03",
+                "09:30",
+                "13:00",
+                "0400",
+                "1700"
+            )]),
+        );
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let after_regular_close = et_time_as_utc("2025-07-03", 13, 1);
@@ -1092,10 +1183,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_session_closed_at_session_close_boundary() {
+    async fn market_session_overnight_at_session_close_boundary() {
         // The extended window is half-open: `now < session_close`, so 20:00 ET
-        // exactly (the documented after-hours close) is already Closed. Pins the
-        // top edge of the session so a `<=` regression would be caught.
+        // exactly (the documented after-hours close) is no longer Extended --
+        // it is the first instant of the overnight evening leg when the next
+        // day trades. Pins the 20:00 hand-over edge.
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         mock_trading_day(&server, "2025-01-06");
@@ -1105,8 +1197,385 @@ mod tests {
 
         assert_eq!(
             market_session_at(&client, at_session_close).await.unwrap(),
+            MarketSession::Overnight,
+            "Exactly at session_close (20:00 ET) the overnight session begins"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_overnight_at_morning_leg_end_boundary() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let just_before_session_open = et_time_as_utc("2025-01-06", 3, 59);
+
+        assert_eq!(
+            market_session_at(&client, just_before_session_open)
+                .await
+                .unwrap(),
+            MarketSession::Overnight,
+            "3:59 AM ET is still the overnight morning leg; 4:00 hands over to Extended"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_sunday_evening_is_overnight() {
+        // Sunday is not a trading day, but Monday is: the overnight evening
+        // leg opens at 20:00 because the NEXT day trades. 2025-01-05 is a
+        // Sunday, 2025-01-06 a Monday.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_non_trading_day_before_trading_day(&server, "2025-01-05");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-01-05", 20, 0))
+                .await
+                .unwrap(),
+            MarketSession::Overnight,
+            "Sunday 20:00 ET starts the trading week's first overnight session"
+        );
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-01-05", 19, 59))
+                .await
+                .unwrap(),
             MarketSession::Closed,
-            "Exactly at session_close (20:00 ET) the extended session has ended -> Closed"
+            "Sunday 19:59 ET is still the weekend"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_friday_evening_is_closed() {
+        // 2025-01-10 is a Friday; Saturday does not trade, so no overnight
+        // session follows the Friday extended close.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_last_trading_day_before_gap(&server, "2025-01-10");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-01-10", 20, 0))
+                .await
+                .unwrap(),
+            MarketSession::Closed,
+            "Friday 20:00 ET has no overnight session (Saturday does not trade)"
+        );
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-01-10", 21, 0))
+                .await
+                .unwrap(),
+            MarketSession::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_saturday_overnight_hours_are_closed() {
+        // Saturday trades on neither leg: Friday evening never opened an
+        // overnight session (morning leg needs Saturday to trade) and
+        // Saturday evening does not lead into a trading Sunday.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_non_trading_day(&server, "2025-01-04");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-01-04", 3, 0))
+                .await
+                .unwrap(),
+            MarketSession::Closed
+        );
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-01-04", 21, 0))
+                .await
+                .unwrap(),
+            MarketSession::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_holiday_evening_is_overnight() {
+        // Thanksgiving 2025-11-27 (Thursday) is a full holiday, but Friday
+        // 2025-11-28 trades: the holiday's own 20:00 starts the next trading
+        // day's overnight session, exactly like a Sunday evening.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_non_trading_day_before_trading_day(&server, "2025-11-27");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-11-27", 21, 0))
+                .await
+                .unwrap(),
+            MarketSession::Overnight,
+            "a holiday evening trades overnight when the next day is a trading day"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_holiday_eve_evening_is_closed() {
+        // 2025-11-26 (Wednesday) trades, but Thanksgiving follows: the
+        // overnight session immediately preceding a full holiday does not
+        // run.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_last_trading_day_before_gap(&server, "2025-11-26");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-11-26", 20, 30))
+                .await
+                .unwrap(),
+            MarketSession::Closed,
+            "no overnight session on the eve of a full holiday"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_holiday_morning_is_closed() {
+        // The holiday's own morning leg (00:00-04:00) is closed: the morning
+        // leg belongs to the current day's trade date, and a holiday has
+        // none. (The preceding eve at 20:00 never opened it either.)
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_non_trading_day_before_trading_day(&server, "2025-11-27");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-11-27", 3, 0))
+                .await
+                .unwrap(),
+            MarketSession::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_early_close_gap_is_closed_then_overnight() {
+        // An early close narrows session_close (here 17:00) but the overnight
+        // session still opens at the fixed 20:00 ET: the 17:00-20:00 gap is
+        // Closed, then Overnight when the next day trades.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_calendar_window(
+            &server,
+            "2025-01-06",
+            json!([
+                calendar_entry("2025-01-06", "09:30", "13:00", "0400", "1700"),
+                trading_day_entry("2025-01-07"),
+            ]),
+        );
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-01-06", 17, 30))
+                .await
+                .unwrap(),
+            MarketSession::Closed,
+            "the gap between an early session_close and 20:00 ET is Closed"
+        );
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-01-06", 20, 0))
+                .await
+                .unwrap(),
+            MarketSession::Overnight,
+            "the overnight session opens at the fixed 20:00 ET even after an early close"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_status_skips_post_close_gap_lookahead_when_overnight() {
+        // Overnight ticks must stay as cheap as Regular/Closed ones: the
+        // post-close-gap lookahead is close-flatten metadata and close
+        // flattening only activates during Extended.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-01-06");
+        let lookahead_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/calendar")
+                .query_param("start", "2025-01-07")
+                .query_param("end", "2025-01-20");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([trading_day_entry("2025-01-07")]));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let status = market_session_status_at(&client, et_time_as_utc("2025-01-06", 21, 0))
+            .await
+            .unwrap();
+
+        assert_eq!(status.session, MarketSession::Overnight);
+        assert_eq!(status.post_close_gap, PostCloseGap::Unknown);
+        lookahead_mock.assert_calls(0);
+    }
+
+    #[tokio::test]
+    async fn market_session_overnight_boundaries_hold_on_dst_fall_back_sunday() {
+        // 2025-11-02 is the DST fall-back Sunday in America/New_York: clocks
+        // leave EDT (UTC-4) during the night and 20:00 ET that evening is
+        // already EST (UTC-5). The 19:59/20:00 boundary must land on the
+        // post-transition offset -- a classifier doing fixed-offset math
+        // would place 20:00 EST an hour off.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_non_trading_day_before_trading_day(&server, "2025-11-02");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-11-02", 19, 59))
+                .await
+                .unwrap(),
+            MarketSession::Closed,
+            "19:59 EST on the fall-back Sunday is still the weekend"
+        );
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-11-02", 20, 0))
+                .await
+                .unwrap(),
+            MarketSession::Overnight,
+            "20:00 EST on the fall-back Sunday starts the week's overnight session"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_morning_leg_boundaries_hold_after_dst_fall_back() {
+        // The Monday after the 2025-11-02 fall-back trades on EST. The
+        // overnight morning leg must still hand over to Extended exactly at
+        // 04:00 local, now one UTC hour later than the preceding Friday.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2025-11-03");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-11-03", 3, 59))
+                .await
+                .unwrap(),
+            MarketSession::Overnight
+        );
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2025-11-03", 4, 0))
+                .await
+                .unwrap(),
+            MarketSession::Extended
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_overnight_boundaries_hold_on_dst_spring_forward_sunday() {
+        // 2026-03-08 is the spring-forward Sunday: 02:00-03:00 EST never
+        // occurs and the evening runs on EDT (UTC-4). The Sunday-open rule
+        // must hold at the new offset.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_non_trading_day_before_trading_day(&server, "2026-03-08");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2026-03-08", 19, 59))
+                .await
+                .unwrap(),
+            MarketSession::Closed
+        );
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2026-03-08", 20, 0))
+                .await
+                .unwrap(),
+            MarketSession::Overnight,
+            "20:00 EDT on the spring-forward Sunday starts the week's overnight session"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_morning_leg_boundaries_hold_after_dst_spring_forward() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_trading_day(&server, "2026-03-09");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2026-03-09", 3, 59))
+                .await
+                .unwrap(),
+            MarketSession::Overnight
+        );
+        assert_eq!(
+            market_session_at(&client, et_time_as_utc("2026-03-09", 4, 0))
+                .await
+                .unwrap(),
+            MarketSession::Extended
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_classifies_both_passes_of_the_repeated_fall_back_hour() {
+        // During the 2025-11-02 fall-back, the wall-clock times 01:00-02:00
+        // ET occur twice: once as EDT (05:00-06:00 UTC) and once as EST
+        // (06:00-07:00 UTC). Classification consumes a UTC instant, so both
+        // passes are distinct, unambiguous inputs -- `et_time_as_utc` cannot
+        // even construct them, hence the raw UTC timestamps. Both land on a
+        // non-trading Sunday morning and classify Closed.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        mock_non_trading_day_before_trading_day(&server, "2025-11-02");
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let first_pass_edt = Utc.with_ymd_and_hms(2025, 11, 2, 5, 30, 0).unwrap();
+        let second_pass_est = Utc.with_ymd_and_hms(2025, 11, 2, 6, 30, 0).unwrap();
+
+        assert_eq!(
+            market_session_at(&client, first_pass_edt).await.unwrap(),
+            MarketSession::Closed
+        );
+        assert_eq!(
+            market_session_at(&client, second_pass_est).await.unwrap(),
+            MarketSession::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_propagates_a_calendar_http_failure() {
+        // A failed calendar response must fail closed AND be observable: the
+        // classifier returns the error to its caller (which defers the
+        // hedge and logs) rather than silently classifying against unknown
+        // session bounds.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/calendar");
+            then.status(503)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "temporarily unavailable" }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let error = market_session_at(&client, et_time_as_utc("2025-01-06", 12, 0))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AlpacaBrokerApiError::ApiError { status, .. }
+                    if *status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "expected the 503 to propagate as ApiError, got: {error:?}"
         );
     }
 
