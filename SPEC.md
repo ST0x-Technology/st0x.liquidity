@@ -190,17 +190,15 @@ orphan-recovery aggregates consume the primary chain's entry until the global
 rebalancer owns chain selection; the sets exist so that selection is a lookup
 rather than a rewire. A mint or redemption transfer is not among them: it
 resolves the entry of the chain its record names (see below), so only the
-orphan-recovery aggregates still borrow the primary's. A managed secondary
-chain's vault inventory is not polled until per-chain polling lands: the
-operator funds and watches it by hand, and startup warns once per such chain.
-The tokenization preflight (below) runs once per hedged chain with that chain's
-wallet, orderbook and canonical USDC, as does the stale-allowance revoke on each
-chain in managed inventory mode. The startup MAX approvals run on every hedged
-chain in either mode, but only the USDC-to-orderbook grant is unconditional: the
-equity grants (underlying to wrapper vault, wrapped token to orderbook) are made
-only on chains that rebalance equity, since a hedge-only secondary has no
-wrapper to approve. A hedged chain for which this build has no pinned USDC fails
-startup rather than borrowing another chain's address.
+orphan-recovery aggregates still borrow the primary's. The tokenization
+preflight (below) runs once per hedged chain with that chain's wallet, orderbook
+and canonical USDC, as does the stale-allowance revoke on each chain in managed
+inventory mode. The startup MAX approvals run on every hedged chain in either
+mode, but only the USDC-to-orderbook grant is unconditional: the equity grants
+(underlying to wrapper vault, wrapped token to orderbook) are made only on
+chains that rebalance equity, since a hedge-only secondary has no wrapper to
+approve. A hedged chain for which this build has no pinned USDC fails startup
+rather than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that

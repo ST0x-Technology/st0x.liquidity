@@ -134,10 +134,10 @@ than skipping the chain:
   supplying its `rpc_url`, and vice versa. Acting on a chain with no endpoint,
   and holding an endpoint for a chain with no addresses, both leave fund routing
   undefined.
-- Exactly one chain may carry a `[trading]` table. The shape admits more, but
-  the runtime drives a single fill watcher, so a second trading chain would be
-  fully described and never read -- unhedged exposure presenting as a working
-  config.
+- Any number of chains may carry a `[trading]` table -- each hedged chain drives
+  its own fill watcher and its own vault polling -- but exactly one of them must
+  set `primary = true`. Zero or several primary claimants leave the chain the
+  rebalancing and cash paths read undefined, so startup fails naming them.
 - At least one chain must be configured, and at least one of those must trade.
 - Every `[chains.<name>]` entry must declare `required_confirmations` directly
   on the chain table (not inside `[trading]`). There is no default: the depth
