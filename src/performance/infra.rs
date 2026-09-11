@@ -744,6 +744,56 @@ mod tests {
         assert_eq!(telemetry.poll.duration.unwrap().max_ms, 400);
     }
 
+    /// Deterministic deployments put the Raindex orderbook at the same address
+    /// on several chains, and poll samples are keyed by orderbook alone. Poll
+    /// health must therefore count each cycle once however many watched chains
+    /// name that address -- iterating chains instead of distinct orderbooks
+    /// would double every figure in the report.
+    #[tokio::test]
+    async fn poll_health_counts_a_shared_orderbooks_cycles_once() {
+        let pool = setup_test_db().await;
+        let mut chains = base_only();
+        chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ORDERBOOK)
+                .call(),
+        );
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            ORDERBOOK,
+            timestamp(10),
+            StdDuration::from_millis(100),
+            0,
+            Ok::<(), &Infallible>(()),
+        )
+        .await
+        .unwrap();
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            ORDERBOOK,
+            timestamp(20),
+            StdDuration::from_millis(400),
+            3,
+            Err(&"rpc unreachable"),
+        )
+        .await
+        .unwrap();
+
+        let telemetry = load_monitor_telemetry(&pool, &range(), &chains)
+            .await
+            .unwrap();
+
+        assert_eq!(telemetry.poll.cycles, 2);
+        assert_eq!(telemetry.poll.errors, 1);
+        assert_eq!(telemetry.poll.skipped_ticks, 3);
+        let duration = telemetry.poll.duration.unwrap();
+        assert_eq!(duration.sample_count, 2);
+        assert_eq!(duration.max_ms, 400);
+    }
+
     async fn insert_call(
         pool: &SqlitePool,
         seconds: i64,
