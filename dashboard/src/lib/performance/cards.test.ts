@@ -340,7 +340,12 @@ describe('blockLagCards per chain', () => {
   it("gives each chain's card the skipped ticks of its own watcher", () => {
     const report = infra({}, { skippedTicks: 3 })
     report.monitor.blockLag.push(lagSeries({ chain: 'ethereum' }))
-    report.monitor.poll.push(pollHealth({ chain: 'ethereum', skippedTicks: 7 }))
+    report.monitor.poll.push(
+      pollHealth({
+        chain: 'ethereum',
+        skippedTicks: 7,
+      }),
+    )
 
     const [base, ethereum] = blockLagCards(report, freshNow)
 
