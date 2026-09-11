@@ -1820,8 +1820,9 @@ fn build_chain_tokenizations(
                     target: "tokenization",
                     %chain,
                     "Hedged chain is hedge-only (no equity opts into rebalancing): it needs \
-                     no wrapper vault, issuer client or redemption wallet, so none is built \
-                     or preflighted"
+                     no issuer client, redemption wallet or mint authorizer, so none is built \
+                     or preflighted. It still gets a wrapper ratio reader, to value the \
+                     wrapped shares its own vaults hold"
                 );
                 EquityTokenization::HedgeOnly
             };
