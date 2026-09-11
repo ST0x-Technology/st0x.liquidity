@@ -4581,5 +4581,11 @@ mod tests {
         );
         assert_eq!(ctx.chains.primary().ingestion_cutoff, IngestionCutoff::Safe);
         assert!(matches!(ctx.broker, BrokerCtx::AlpacaBrokerApi(_)));
+        assert_eq!(ctx.chains.required_confirmations(Chain::Robinhood), Some(1));
+        let robinhood_rpc = ctx.chains.rpc_url(Chain::Robinhood).unwrap();
+        assert_eq!(
+            robinhood_rpc.as_str(),
+            "https://rpc.mainnet.chain.robinhood.com/"
+        );
     }
 }
