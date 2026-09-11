@@ -3254,19 +3254,11 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     /// Only the primary chain's assets table feeds the wallet-transit symbol
-    /// set, but the capture reads every watched chain's market-making
-    /// balances. A symbol traded on a secondary chain alone must still be
-    /// marked: left unmarked, its nonzero row excludes the whole day with
-    /// `MissingMark` and the capital series loses that day entirely.
-=======
-    /// Only the primary chain's assets table feeds `configured_equity_symbols`,
-    /// but the capture reads every hedged chain's market-making balances. A
-    /// symbol traded on a secondary chain alone must still be marked: left
+    /// set, but the capture reads every hedged chain's market-making balances.
+    /// A symbol traded on a secondary chain alone must still be marked: left
     /// unmarked, its nonzero row excludes the whole day with `MissingMark` and
     /// the capital series loses that day entirely.
->>>>>>> cd1afefa (refactor: the newest per-chain test and docs name the hedged chain)
     #[tokio::test]
     async fn a_secondary_only_symbol_is_marked_for_the_portfolio_capture() {
         let (pool, apalis_pool) = setup_test_pools().await;
