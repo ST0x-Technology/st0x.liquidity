@@ -3181,6 +3181,111 @@ mod tests {
         );
     }
 
+    /// Only the primary chain's assets table feeds `configured_equity_symbols`,
+    /// but the capture reads every watched chain's market-making balances. A
+    /// symbol traded on a secondary chain alone must still be marked: left
+    /// unmarked, its nonzero row excludes the whole day with `MissingMark` and
+    /// the capital series loses that day entirely.
+    #[tokio::test]
+    async fn a_secondary_only_symbol_is_marked_for_the_portfolio_capture() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let nvda = Symbol::new("NVDA").unwrap();
+        let now = Utc::now();
+
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        )
+        .apply_equity_snapshot(
+            Venue::MarketMaking,
+            Chain::Ethereum,
+            [(&nvda, &FractionalShares::new(float!(4)))],
+            now,
+            None,
+            now,
+        )
+        .unwrap();
+
+        let (mut ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Ethereum,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::from([nvda.clone()]),
+                usdc_tracking_enabled: false,
+            },
+        );
+        mark_all_required_fresh(&ctx);
+
+        for (symbol, price_usdc) in [(aapl(), float!(150)), (nvda.clone(), float!(25))] {
+            position
+                .send(
+                    &symbol,
+                    PositionCommand::AcknowledgeOnChainFillAt {
+                        symbol: symbol.clone(),
+                        threshold: ExecutionThreshold::whole_share(),
+                        trade_id: TradeId {
+                            chain: Chain::Base,
+                            tx_hash: TxHash::ZERO,
+                            log_index: 0,
+                        },
+                        amount: FractionalShares::new(float!(1)),
+                        direction: Direction::Buy,
+                        price_usdc,
+                        block_timestamp: now,
+                        block_number: None,
+                        seen_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let today = et_day(Utc::now());
+        let days = load_portfolio_days(
+            &pool,
+            EtDayRange {
+                from: Some(today),
+                to: Some(today),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(days.len(), 1);
+        assert_eq!(
+            days[0].capital,
+            // AAPL 15 shares * 150 + USDC 1500 at par + NVDA 4 shares * 25.
+            DayCapital::Included(float!(3850)),
+            "the secondary chain's only symbol must be marked, so the day is computable"
+        );
+    }
+
     /// Onchain MarketMaking equity and BaseWalletWrapped-transit equity are
     /// WRAPPED ERC-4626 vault shares, not underlying shares. With a non-1:1
     /// ratio (1.5, simulating vault NAV accrual from dividends/splits), both
