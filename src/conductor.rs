@@ -5943,6 +5943,48 @@ mod tests {
         );
     }
 
+    /// Wrapped-equity recovery moves the unwrapped token whatever the role
+    /// says: its wallet balance is polled and scaled as 18-decimal share-wei,
+    /// and the recovery job wraps it. A recovery-only equity -- recovery
+    /// enabled while trading and rebalancing both stay off -- is outside the
+    /// role's rebalanced set, so selecting by role alone leaves that address
+    /// unread until the first poll reaches it.
+    #[tokio::test]
+    async fn asset_canary_probes_the_unwrapped_token_of_a_recovery_only_equity() {
+        let unwrapped = Address::repeat_byte(0x11);
+        let wrapped = Address::repeat_byte(0x22);
+        let mut recovery_only = hedged_chain_with_equities([("AAPL", unwrapped, wrapped)]);
+        for equity in recovery_only.assets.equities.symbols.values_mut() {
+            equity.trading = OperationMode::Disabled;
+            equity.rebalancing = OperationMode::Disabled;
+            equity.wrapped_equity_recovery = OperationMode::Enabled;
+        }
+
+        // The wrapped share answers first, so the refusal can only come from
+        // the unwrapped read recovery owes.
+        let asserter = Asserter::new();
+        push_wrapped_share_reads(&asserter, unwrapped);
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error =
+            confirm_configured_assets_respond(&provider, ChainRole::Primary, &recovery_only)
+                .await
+                .expect_err(
+                    "a recovery-only equity with a dead unwrapped token must refuse startup",
+                );
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&format!("AAPL's tokenized_equity at {unwrapped}")),
+            "the refusal must name the symbol, the config field and the token: {message}"
+        );
+        assert!(
+            message.contains("did not answer decimals()"),
+            "the refusal must name the canary read: {message}"
+        );
+    }
+
     /// Every equity on the chain is probed, not just the first by symbol, and
     /// a hedge-only chain reads no unwrapped token at all: nothing there mints,
     /// redeems, wraps or unwraps, so that address plays no part.
