@@ -1530,6 +1530,23 @@ impl TokenizedEquityMint {
         }
     }
 
+    /// True only in the terminal `Failed` state that `Reconcile` resolves. The
+    /// exhaustive `match` forces a new variant to be classified rather than
+    /// silently treated as not failed.
+    pub(crate) fn is_failed(&self) -> bool {
+        match self {
+            Self::Failed { .. } => true,
+            Self::MintRequested { .. }
+            | Self::MintAccepted { .. }
+            | Self::TokensReceived { .. }
+            | Self::WrapSubmitted { .. }
+            | Self::TokensWrapped { .. }
+            | Self::VaultDepositSubmitted { .. }
+            | Self::DepositedIntoRaindex { .. }
+            | Self::Reconciled { .. } => false,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &IssuerRequestId) -> TransferOperation {
         use EquityMintStatus::*;
 

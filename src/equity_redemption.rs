@@ -1208,6 +1208,26 @@ impl EquityRedemption {
         }
     }
 
+    /// True only in the terminal `Failed` state that `Reconcile` resolves. The
+    /// exhaustive `match` forces a new variant to be classified rather than
+    /// silently treated as not failed.
+    pub(crate) fn is_failed(&self) -> bool {
+        match self {
+            Self::Failed { .. } => true,
+            Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitted { .. }
+            | Self::WithdrawnFromRaindex { .. }
+            | Self::UnwrapPending { .. }
+            | Self::UnwrapSubmitted { .. }
+            | Self::TokensUnwrapped { .. }
+            | Self::SendPending { .. }
+            | Self::TokensSent { .. }
+            | Self::Pending { .. }
+            | Self::Completed { .. }
+            | Self::Reconciled { .. } => false,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
         match self {
             Self::VaultWithdrawPending {
