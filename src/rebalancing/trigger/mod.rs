@@ -2481,8 +2481,8 @@ impl Reactor for RebalancingService {
                         // that provably already contains it: a vaultBalance2
                         // read at block N includes every fill at a block <= N
                         // (ADR 0018). The same reasoning covers a secondary
-                        // chain's slot no snapshot has seeded yet (a hedged
-                        // secondary is not polled): its first snapshot
+                        // chain's slot no snapshot has seeded yet (that
+                        // chain's first poll has not landed): its first snapshot
                         // contains the fill, so the leg waits rather than
                         // debiting an empty slot or inventing one that holds
                         // only the delta. The primary chain is different: its
@@ -12130,7 +12130,7 @@ mod tests {
         }
     }
 
-    /// A hedged secondary chain is not polled, so no snapshot has seeded its
+    /// Before a hedged secondary's first poll, no snapshot has seeded its
     /// slots. Debiting an unseeded slot would fail and crediting one would
     /// invent a balance holding only the delta; the chain's first snapshot
     /// contains the fill anyway (ADR 0018), so both legs wait for it.

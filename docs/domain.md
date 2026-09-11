@@ -97,10 +97,11 @@ and confusing.
   hands them out through `ChainRegistry::hedged`. The TOML key stays `trading`.
 - **Transport chain**: a chain with no trading table -- RPC and confirmations
   only, used as a cash corridor endpoint.
-- **Primary chain**: THE hedged chain that sets `primary = true`. Its vault
-  inventory is the one the bot polls and rebalances automatically.
+- **Primary chain**: THE hedged chain that sets `primary = true`. It is the
+  chain the bot rebalances automatically and the endpoint of the cash corridor.
+  Its vault inventory is polled like every hedged chain's.
 - **Secondary chain**: any other hedged chain. Prefunded: its fills are hedged
-  and its inventory is polled, but it is not rebalanced.
+  and its vault inventory is polled, but it is not rebalanced.
 
 ### Trading Venue
 
