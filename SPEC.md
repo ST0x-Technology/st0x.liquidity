@@ -2174,6 +2174,13 @@ The source of truth for all table schemas is the `migrations/` directory.
 `equity_redemption_view`. Some views use SQLite generated columns to expose JSON
 fields as queryable columns for Grafana dashboards.
 
+One-time projection compatibility repairs persist a versioned completion
+checkpoint after their validation scan finds the projection clean or their full
+rebuild completes successfully. Later startups consult that bounded checkpoint
+instead of rescanning an ever-growing projection. A failed or interrupted
+validation/rebuild must leave the checkpoint absent so the next startup retries
+the repair.
+
 ### Architecture Decision: Position as Aggregate
 
 In DDD, entities are objects defined by their identity and continuity rather

@@ -339,10 +339,29 @@ where
     Ok((offchain_order, offchain_order_projection))
 }
 
+const OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR: &str = "offchain_order_quantity_provenance_v1";
+
 async fn rebuild_stale_offchain_order_projection(
     pool: &SqlitePool,
     projection: &Projection<OffchainOrder>,
 ) -> Result<(), st0x_event_sorcery::ProjectionError<OffchainOrder>> {
+    let repair_complete: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM projection_repair_checkpoint WHERE repair = ? \
+         )",
+    )
+    .bind(OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR)
+    .fetch_one(pool)
+    .await?;
+
+    if repair_complete {
+        warn!(
+            repair = OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR,
+            "Skipping the offchain order projection repair scan because its checkpoint is complete"
+        );
+        return Ok(());
+    }
+
     // StoreBuilder records the aggregate schema version before its catch-up,
     // which intentionally skips projection rows already at the latest event
     // sequence. Detect the old serialized shape itself so an interruption
@@ -378,6 +397,14 @@ async fn rebuild_stale_offchain_order_projection(
         );
         projection.rebuild_all().await?;
     }
+
+    sqlx::query(
+        "INSERT INTO projection_repair_checkpoint (repair) VALUES (?) \
+         ON CONFLICT (repair) DO NOTHING",
+    )
+    .bind(OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR)
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -6027,6 +6054,87 @@ mod tests {
         ));
     }
 
+    async fn projection_repair_complete(pool: &SqlitePool) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM projection_repair_checkpoint \
+                 WHERE repair = ? \
+             )",
+        )
+        .bind(OFFCHAIN_ORDER_QUANTITY_PROVENANCE_REPAIR)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn clean_offchain_order_projection_records_completed_legacy_repair() {
+        let pool = setup_test_db().await;
+        let (_, projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+
+        rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .unwrap();
+
+        assert!(
+            projection_repair_complete(&pool).await,
+            "a clean projection must durably complete the legacy repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_legacy_repair_skips_the_projection_scan() {
+        let pool = setup_test_db().await;
+        let (_, projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+
+        rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE offchain_order_view")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .expect("a completed repair must return before accessing the projection");
+    }
+
+    #[tokio::test]
+    async fn failed_legacy_projection_rebuild_does_not_record_completion() {
+        let pool = setup_test_db().await;
+        let (store, projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let id = OffchainOrderId::new();
+
+        place_and_accept_projection_order(&store, &id).await;
+        remove_projection_field(&pool, &id, "$.Live.Submitted.requested_shares").await;
+        sqlx::query("DROP TABLE events")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = rebuild_stale_offchain_order_projection(&pool, &projection)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ProjectionError::Sqlx(_)),
+            "the missing event source must produce a SQL query error, got {error:?}"
+        );
+        assert!(
+            !projection_repair_complete(&pool).await,
+            "a failed rebuild must remain eligible for retry on the next startup"
+        );
+    }
+
     #[tokio::test]
     async fn interrupted_schema_change_rebuilds_existing_offchain_order_projection_rows() {
         let pool = setup_test_db().await;
@@ -6208,6 +6316,14 @@ mod tests {
         let requested_shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
 
         remove_projection_field(&pool, &submitted_id, "$.Live.Submitted.requested_shares").await;
+        remove_projection_field(
+            &pool,
+            &partially_filled_id,
+            "$.Live.PartiallyFilled.requested_shares",
+        )
+        .await;
+        remove_projection_field(&pool, &cancelling_id, "$.Live.Cancelling.requested_shares").await;
+
         assert!(matches!(
             projection.load(&submitted_id).await.unwrap().unwrap(),
             OffchainOrder::Submitted {
@@ -6215,24 +6331,6 @@ mod tests {
                 ..
             }
         ));
-
-        rebuild_stale_offchain_order_projection(&pool, &projection)
-            .await
-            .unwrap();
-        assert!(matches!(
-            projection.load(&submitted_id).await.unwrap().unwrap(),
-            OffchainOrder::Submitted {
-                requested_shares: Some(requested),
-                ..
-            } if requested == requested_shares
-        ));
-
-        remove_projection_field(
-            &pool,
-            &partially_filled_id,
-            "$.Live.PartiallyFilled.requested_shares",
-        )
-        .await;
         assert!(matches!(
             projection
                 .load(&partially_filled_id)
@@ -6244,10 +6342,25 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            projection.load(&cancelling_id).await.unwrap().unwrap(),
+            OffchainOrder::Cancelling {
+                requested_shares: None,
+                ..
+            }
+        ));
 
         rebuild_stale_offchain_order_projection(&pool, &projection)
             .await
             .unwrap();
+
+        assert!(matches!(
+            projection.load(&submitted_id).await.unwrap().unwrap(),
+            OffchainOrder::Submitted {
+                requested_shares: Some(requested),
+                ..
+            } if requested == requested_shares
+        ));
         assert!(matches!(
             projection
                 .load(&partially_filled_id)
@@ -6261,19 +6374,6 @@ mod tests {
             } if requested == requested_shares
                 && shares_filled == FractionalShares::new(float!(0.25))
         ));
-
-        remove_projection_field(&pool, &cancelling_id, "$.Live.Cancelling.requested_shares").await;
-        assert!(matches!(
-            projection.load(&cancelling_id).await.unwrap().unwrap(),
-            OffchainOrder::Cancelling {
-                requested_shares: None,
-                ..
-            }
-        ));
-
-        rebuild_stale_offchain_order_projection(&pool, &projection)
-            .await
-            .unwrap();
         assert!(matches!(
             projection.load(&cancelling_id).await.unwrap().unwrap(),
             OffchainOrder::Cancelling {

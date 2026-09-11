@@ -314,6 +314,13 @@ Bump `SCHEMA_VERSION` when the entity's state, event, or projection schema
 changes. On startup, the wiring infrastructure (via `StoreBuilder::build()`)
 detects version mismatches and automatically clears stale snapshots.
 
+A bespoke compatibility repair that must inspect an existing projection after
+the schema reconciler runs cannot use schema registration alone as its progress
+signal: registration may commit before the repair finishes. Record a versioned
+key in `projection_repair_checkpoint` only after the projection validates clean
+or its rebuild succeeds. The absent key makes an interrupted repair retryable;
+the present key keeps later startups from rescanning the full projection.
+
 ### Adding Optional Fields to Events
 
 When adding a new field to an existing event variant that has a sensible default
