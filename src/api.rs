@@ -2649,12 +2649,12 @@ async fn complete_cctp_mint(
 
 /// Maps a [`CctpMintRecoveryError`]: an unavailable attestation is an
 /// upstream (Circle) condition the operator retries later, so 502 with the
-/// typed message; a mint failure or amount decode is an internal failure
-/// whose detail is logged at the call site.
+/// typed message; a mint failure, amount decode, or gas-ledger enqueue is an
+/// internal failure whose detail is logged at the call site.
 fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCode, String) {
     match error {
         CctpMintRecoveryError::Attestation { .. } => (StatusCode::BAD_GATEWAY, error.to_string()),
-        CctpMintRecoveryError::Mint { .. } | CctpMintRecoveryError::Amount(_) => (
+        CctpMintRecoveryError::Mint { .. } | CctpMintRecoveryError::Transfer(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "CCTP mint recovery failed".to_string(),
         ),

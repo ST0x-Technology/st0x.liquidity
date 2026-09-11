@@ -230,6 +230,15 @@ impl AttestationResponse {
             nonce,
         })
     }
+
+    /// Test-only constructor: builds a response through the same validating
+    /// `from_parts` path a fresh poll uses, so tests in other crates
+    /// can hand a mock bridge a concrete attestation without depending on the
+    /// private representation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(message: Bytes, attestation: Bytes) -> Result<Self, CctpError> {
+        Self::from_parts(message, attestation)
+    }
 }
 
 // CCTP V2 message layout (see Circle's evm-cctp-contracts: src/messages/v2/MessageV2.sol):
