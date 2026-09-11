@@ -231,9 +231,9 @@ mod tests {
     use st0x_evm::{Chain, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_hedge::operator::inventory::ImbalanceThreshold;
 
     use super::*;
-    use st0x_hedge::operator::inventory::ImbalanceThreshold;
 
     fn create_base_test_ctx() -> Ctx {
         Ctx {
