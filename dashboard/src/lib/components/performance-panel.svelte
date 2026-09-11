@@ -379,7 +379,8 @@
   const CHAIN_LAG_COLORS: Record<ChainName, string> = {
     base: 'var(--chart-sky)',
     ethereum: 'var(--chart-purple)',
-    hyperevm: 'var(--chart-emerald)'
+    hyperevm: 'var(--chart-emerald)',
+    robinhood: 'var(--chart-orange)'
   }
 
   const STAGE_COLORS: Record<RebalanceStageName, string> = {

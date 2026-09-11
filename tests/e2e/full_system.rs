@@ -145,6 +145,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
     let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(
         base_wallet,
         ethereum_wallet.clone(),
+        ethereum_wallet.clone(),
         ethereum_wallet,
     );
 

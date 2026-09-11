@@ -124,7 +124,7 @@ impl GasMonitor {
     /// state. A read failure is logged and leaves the state unchanged.
     async fn poll_once(&self, state: AlertState, now: Instant) -> AlertState {
         let native_token = match self.chain {
-            Chain::Base | Chain::Ethereum => "ETH",
+            Chain::Base | Chain::Ethereum | Chain::Robinhood => "ETH",
             Chain::HyperEvm => "HYPE",
         };
 
@@ -160,7 +160,7 @@ impl GasMonitor {
     /// outcomes (`StillHealthy`, `StillLowSuppressed`) produce no output.
     async fn act_on_outcome(&self, outcome: PollOutcome, balance: U256) {
         let native_token = match self.chain {
-            Chain::Base | Chain::Ethereum => "ETH",
+            Chain::Base | Chain::Ethereum | Chain::Robinhood => "ETH",
             Chain::HyperEvm => "HYPE",
         };
 
@@ -225,7 +225,7 @@ impl GasMonitor {
 impl SupervisedTask for GasMonitor {
     async fn run(&mut self) -> TaskResult {
         let native_token = match self.chain {
-            Chain::Base | Chain::Ethereum => "ETH",
+            Chain::Base | Chain::Ethereum | Chain::Robinhood => "ETH",
             Chain::HyperEvm => "HYPE",
         };
 

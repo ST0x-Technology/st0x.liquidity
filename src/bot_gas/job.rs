@@ -304,7 +304,7 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
                 ctx.ethereum_wallet.provider(),
                 ctx.ethereum_wallet.address(),
             ),
-            Chain::HyperEvm => {
+            Chain::HyperEvm | Chain::Robinhood => {
                 return Err(RecordBotGasReceiptCostError::UnwiredChain { chain: self.chain });
             }
         };
@@ -454,7 +454,9 @@ async fn fetch_receipt(
             .await
             .map(|receipt| receipt.map(|receipt| (receipt, L1DataFeeWei::ZERO)))
             .map_err(Into::into),
-        Chain::HyperEvm => Err(RecordBotGasReceiptCostError::UnwiredChain { chain }),
+        Chain::HyperEvm | Chain::Robinhood => {
+            Err(RecordBotGasReceiptCostError::UnwiredChain { chain })
+        }
     }
 }
 

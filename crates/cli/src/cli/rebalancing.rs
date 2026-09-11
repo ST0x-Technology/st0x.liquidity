@@ -157,6 +157,7 @@ pub(super) fn tokenization_network_context(
         Chain::Base => wallet_ctx.base_wallet(),
         Chain::Ethereum => wallet_ctx.ethereum_wallet(),
         Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
+        Chain::Robinhood => wallet_ctx.robinhood_wallet(),
     };
 
     (wallet.clone(), chain)
@@ -3005,17 +3006,19 @@ mod tests {
     /// One match yields both the wallet and the wire value, so the pairing is
     /// pinned here for every network: ethereum selects the ethereum wallet and
     /// the "ethereum" wire value, base the base pair, hyperevm the hyperevm
-    /// pair.
+    /// pair, and robinhood the robinhood pair.
     #[cfg(feature = "test-support")]
     #[test]
     fn tokenization_network_context_pairs_wallet_and_wire() {
         let base_address = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let ethereum_address = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let hyperevm_address = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        let robinhood_address = address!("0xdddddddddddddddddddddddddddddddddddddddd");
         let wallet_ctx = OnchainWalletCtx::from_wallets(
             StubWallet::stub(base_address),
             StubWallet::stub(ethereum_address),
             StubWallet::stub(hyperevm_address),
+            StubWallet::stub(robinhood_address),
         );
 
         let (base_wallet, base_chain) =
@@ -3032,6 +3035,11 @@ mod tests {
             tokenization_network_context(&wallet_ctx, TokenizationNetwork::HyperEvm);
         assert_eq!(hyperevm_wallet.address(), hyperevm_address);
         assert_eq!(hyperevm_chain, Chain::HyperEvm);
+
+        let (robinhood_wallet, robinhood_chain) =
+            tokenization_network_context(&wallet_ctx, TokenizationNetwork::Robinhood);
+        assert_eq!(robinhood_wallet.address(), robinhood_address);
+        assert_eq!(robinhood_chain, Chain::Robinhood);
     }
 
     const ETHEREUM_ORDERBOOK: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");

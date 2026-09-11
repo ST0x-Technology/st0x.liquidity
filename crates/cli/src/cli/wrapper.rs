@@ -224,10 +224,18 @@ pub(super) fn wrap_context(
             "--registry only applies to non Base networks: Base resolves \
              from [chains.<name>.trading.assets.equities]"
         ),
-        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, Some(path)) => {
-            load_wrapped_equities(path, Chain::from(network).chain_id())?
-        }
-        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, None) => anyhow::bail!(
+        (
+            TokenizationNetwork::Ethereum
+            | TokenizationNetwork::HyperEvm
+            | TokenizationNetwork::Robinhood,
+            Some(path),
+        ) => load_wrapped_equities(path, Chain::from(network).chain_id())?,
+        (
+            TokenizationNetwork::Ethereum
+            | TokenizationNetwork::HyperEvm
+            | TokenizationNetwork::Robinhood,
+            None,
+        ) => anyhow::bail!(
             "pass --registry with the st0x.registry token list for the \
              selected network (token-lists/<network>.json)"
         ),

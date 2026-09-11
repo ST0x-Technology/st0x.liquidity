@@ -876,7 +876,7 @@ fn generate_batch_ranges(
     end_block: u64,
 ) -> impl Iterator<Item = (u64, u64)> {
     let batch_size = match chain {
-        Chain::Base | Chain::Ethereum => 1_000,
+        Chain::Base | Chain::Ethereum | Chain::Robinhood => 1_000,
         Chain::HyperEvm => 50,
     };
     let mut next_start = (start_block <= end_block).then_some(start_block);
