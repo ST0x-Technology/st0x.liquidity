@@ -102,7 +102,15 @@ const perChainPoll = (response: InfraResponse): InfraReport => {
     ...response,
     monitor: {
       blockLag,
-      poll: primary === undefined ? [] : [{ chain: primary.chain, ...poll }],
+      poll:
+        primary === undefined
+          ? []
+          : [
+              {
+                chain: primary.chain,
+                ...poll,
+              },
+            ],
     },
   }
 }
