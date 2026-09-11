@@ -781,7 +781,7 @@ mod tests {
     use std::time::Duration;
 
     use st0x_config::{
-        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
+        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode, TradingChain,
         create_test_ctx_with_order_owner,
     };
 
@@ -1805,6 +1805,76 @@ mod tests {
             registry.primary_usdc_vault_id(),
             Some(test_usdc_vault_id()),
             "the seeded registry must be readable under the primary chain's id",
+        );
+    }
+
+    /// Vault polling loads one registry per watched chain, keyed by that
+    /// chain's own `(chain, orderbook, vault_owner)`. A hedged chain with no
+    /// registry records neither balances nor poll freshness, while its
+    /// market-making slots stay required -- so startup must seed a registry
+    /// for every hedged chain, from the vaults that chain's own table names.
+    #[tokio::test]
+    async fn startup_seeds_a_vault_registry_for_every_hedged_chain() {
+        let ethereum_token = Address::repeat_byte(0xe0);
+        let ethereum_vault_id = B256::repeat_byte(0xe1);
+        let ethereum_usdc_vault_id = B256::repeat_byte(0xe2);
+        let ethereum_orderbook = Address::repeat_byte(0xe3);
+        let ethereum_vault_owner = Address::repeat_byte(0xe4);
+
+        let pool = setup_test_db().await;
+        let mut ctx = ctx_with_seeded_assets();
+        ctx.chains.insert_secondary(
+            TradingChain::test()
+                .chain(st0x_evm::Chain::Ethereum)
+                .orderbook(ethereum_orderbook)
+                .vault_owner(ethereum_vault_owner)
+                .assets(ChainAssets {
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            test_symbol(),
+                            ChainEquityAsset {
+                                tokenized_equity: Address::ZERO,
+                                tokenized_equity_derivative: ethereum_token,
+                                vault_ids: vec![ethereum_vault_id],
+                                trading: OperationMode::Enabled,
+                                rebalancing: OperationMode::Disabled,
+                                wrapped_equity_recovery: OperationMode::Disabled,
+                                operational_limit: None,
+                            },
+                        )]),
+                    },
+                    cash: Some(ChainCashAsset {
+                        vault_ids: vec![ethereum_usdc_vault_id],
+                        rebalancing: OperationMode::Disabled,
+                        operational_limit: None,
+                    }),
+                })
+                .call(),
+        );
+        let seed_ctx = seed_ctx_from(pool, &ctx).await;
+
+        SeedVaultRegistry.perform(&seed_ctx).await.unwrap();
+
+        let registry = loaded_registry(
+            &seed_ctx.vault_registry,
+            &VaultRegistryId {
+                chain: st0x_evm::Chain::Ethereum,
+                orderbook: ethereum_orderbook,
+                owner: ethereum_vault_owner,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            registry.primary_vault_id_by_token(ethereum_token),
+            Some(ethereum_vault_id),
+            "the secondary chain's equity vault must be seeded under its own registry",
+        );
+        assert_eq!(
+            registry.primary_usdc_vault_id(),
+            Some(ethereum_usdc_vault_id),
+            "the secondary chain's cash vault must be seeded under its own registry",
         );
     }
 
