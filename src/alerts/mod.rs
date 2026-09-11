@@ -185,6 +185,9 @@ mod tests {
     /// A single-line alert, which is most of them, must be untouched.
     #[test]
     fn flatten_leaves_a_single_line_alert_alone() {
-        assert_eq!(flatten("gas balance low on base"), "gas balance low on base");
+        assert_eq!(
+            flatten("gas balance low on base"),
+            "gas balance low on base"
+        );
     }
 }
