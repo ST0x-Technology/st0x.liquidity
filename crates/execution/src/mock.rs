@@ -60,8 +60,7 @@ pub struct MockExecutor {
     market_session_override: Option<MarketSession>,
     market_session_status_calls: Arc<AtomicU64>,
     market_session_status_failure: Option<String>,
-    extended_session_closes_at_override: Option<DateTime<Utc>>,
-    post_close_gap_override: PostCloseGap,
+    extended_session_close_metadata_override: Option<(DateTime<Utc>, PostCloseGap)>,
     primary_limit_quote_override: Option<LatestQuote>,
     latest_quote_override: Option<LatestQuote>,
     position_mark_override: Option<Positive<Usd>>,
@@ -78,8 +77,7 @@ impl MockExecutor {
             market_session_override: None,
             market_session_status_calls: Arc::new(AtomicU64::new(0)),
             market_session_status_failure: None,
-            extended_session_closes_at_override: None,
-            post_close_gap_override: PostCloseGap::Unknown,
+            extended_session_close_metadata_override: None,
             primary_limit_quote_override: None,
             latest_quote_override: None,
             position_mark_override: None,
@@ -144,14 +142,12 @@ impl MockExecutor {
     }
 
     #[must_use]
-    pub fn with_extended_session_closes_at(mut self, closes_at: DateTime<Utc>) -> Self {
-        self.extended_session_closes_at_override = Some(closes_at);
-        self
-    }
-
-    #[must_use]
-    pub fn with_post_close_gap(mut self, post_close_gap: PostCloseGap) -> Self {
-        self.post_close_gap_override = post_close_gap;
+    pub fn with_extended_session_close_metadata(
+        mut self,
+        closes_at: DateTime<Utc>,
+        post_close_gap: PostCloseGap,
+    ) -> Self {
+        self.extended_session_close_metadata_override = Some((closes_at, post_close_gap));
         self
     }
 
@@ -416,11 +412,18 @@ impl Executor for MockExecutor {
             });
         }
 
-        Ok(MarketSessionStatus {
-            session: self.market_session().await?,
-            extended_session_closes_at: self.extended_session_closes_at_override,
-            post_close_gap: self.post_close_gap_override,
-        })
+        let session = self.market_session().await?;
+        let status = match (session, self.extended_session_close_metadata_override) {
+            (MarketSession::Extended, Some((closes_at, post_close_gap))) => {
+                MarketSessionStatus::Extended {
+                    closes_at: Some(closes_at),
+                    post_close_gap,
+                }
+            }
+            (session, _) => MarketSessionStatus::without_close_metadata(session),
+        };
+
+        Ok(status)
     }
 
     async fn fetch_position_mark(
@@ -725,6 +728,33 @@ mod tests {
             ExecutionError::MockFailure { message } if message == "broker down"
         ));
         assert_eq!(executor.market_session_status_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn market_session_status_keeps_close_metadata_on_extended_sessions() {
+        let closes_at = Utc::now();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_extended_session_close_metadata(closes_at, PostCloseGap::MultiDayClosure);
+
+        assert_eq!(
+            executor.market_session_status().await.unwrap(),
+            MarketSessionStatus::Extended {
+                closes_at: Some(closes_at),
+                post_close_gap: PostCloseGap::MultiDayClosure,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_status_cannot_attach_close_metadata_to_regular_sessions() {
+        let executor = MockExecutor::new()
+            .with_extended_session_close_metadata(Utc::now(), PostCloseGap::MultiDayClosure);
+
+        assert_eq!(
+            executor.market_session_status().await.unwrap(),
+            MarketSessionStatus::Regular
+        );
     }
 
     #[tokio::test]
