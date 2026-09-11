@@ -1335,7 +1335,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
         ctx.market_making.insert(
@@ -1370,6 +1370,12 @@ mod tests {
         );
     }
 
+    /// The wrapper map a single-chain fixture needs: the primary chain's
+    /// ratio source and nothing else.
+    fn base_wrapper(wrapper: MockWrapper) -> BTreeMap<Chain, Arc<dyn Wrapper>> {
+        BTreeMap::from([(Chain::Base, Arc::new(wrapper) as Arc<dyn Wrapper>)])
+    }
+
     async fn build_ctx(
         pool: SqlitePool,
         apalis_pool: apalis_sqlite::SqlitePool,
@@ -1377,7 +1383,7 @@ mod tests {
         configured_equity_symbols: HashSet<Symbol>,
         usdc_tracking_enabled: bool,
         wallet_polling_enabled: bool,
-        wrapper: Option<Arc<dyn Wrapper>>,
+        wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     ) -> (PortfolioSnapshotCtx, Arc<Store<Position>>) {
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -1403,7 +1409,9 @@ mod tests {
             inventory: broadcasting(inventory),
             position_projection,
             portfolio_snapshot,
-            wrapper,
+            // The production field still holds one wrapper for every chain,
+            // so the fixture hands it the primary chain's entry.
+            wrapper: wrappers.get(&Chain::Base).cloned(),
             configured_equity_symbols,
             usdc_tracking_enabled,
             wallet_polling_enabled,
@@ -1471,7 +1479,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
 
@@ -1582,7 +1590,7 @@ mod tests {
             HashSet::new(),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -1691,7 +1699,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -1817,7 +1825,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -1868,7 +1876,7 @@ mod tests {
             HashSet::from([aapl()]),
             false,
             true,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -1910,7 +1918,7 @@ mod tests {
             HashSet::from([aapl()]),
             false,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -1941,7 +1949,7 @@ mod tests {
             HashSet::new(),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -1964,7 +1972,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
 
@@ -2432,7 +2440,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -2523,7 +2531,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         // Deliberately no `mark_all_required_fresh`: presence passes (the
@@ -2561,7 +2569,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -2912,7 +2920,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             true,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
 
@@ -2954,7 +2962,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -3014,7 +3022,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -3105,7 +3113,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -3210,7 +3218,7 @@ mod tests {
             HashSet::from([aapl()]),
             false,
             true,
-            Some(Arc::new(MockWrapper::with_ratio(ratio_1_5))),
+            base_wrapper(MockWrapper::with_ratio(ratio_1_5)),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -3268,6 +3276,92 @@ mod tests {
         );
     }
 
+    /// Each chain's ERC-4626 vault accrues on its own, so the same symbol's
+    /// wrapped-to-underlying ratio differs per chain. A market-making row must
+    /// therefore be valued with the ratio of the chain it sits on -- borrowing
+    /// the primary's ratio misprices every secondary chain's capital.
+    #[tokio::test]
+    async fn a_wrapped_row_converts_with_its_own_chains_ratio() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(
+                aapl(),
+                FractionalShares::new(float!(10)),
+                FractionalShares::new(float!(5)),
+            )
+            .apply_equity_snapshot(
+                Venue::MarketMaking,
+                Chain::Ethereum,
+                [(&aapl(), &FractionalShares::new(float!(4)))],
+                now,
+                None,
+                now,
+            )
+            .unwrap();
+
+        let base_ratio = U256::from(1_500_000_000_000_000_000u64);
+        let ethereum_ratio = U256::from(2_000_000_000_000_000_000u64);
+        let (mut ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            false,
+            false,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::with_ratio(base_ratio)) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Ethereum,
+                    Arc::new(MockWrapper::with_ratio(ethereum_ratio)) as Arc<dyn Wrapper>,
+                ),
+            ]),
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::from([aapl()]),
+                usdc_tracking_enabled: false,
+            },
+        );
+        mark_all_required_fresh(&ctx);
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let et_day = et_day(Utc::now()).to_string();
+
+        async fn available_balance(pool: &SqlitePool, et_day: &str, location: &str) -> String {
+            sqlx::query_scalar(
+                "SELECT available_balance FROM portfolio_snapshot \
+                 WHERE et_day = ? AND asset = 'AAPL' AND location = ?",
+            )
+            .bind(et_day)
+            .bind(location)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        assert_eq!(
+            available_balance(&pool, &et_day, "market_making:base").await,
+            "15",
+            "10 wrapped shares * Base's own 1.5 ratio"
+        );
+        assert_eq!(
+            available_balance(&pool, &et_day, "market_making:ethereum").await,
+            "8",
+            "4 wrapped shares * Ethereum's own 2.0 ratio, not Base's 1.5"
+        );
+    }
+
     /// Proves `perform_at` checks `freshness_gap` before it ever reads
     /// `ctx.inventory` (the fix for the restart-stale race: reading `rows`
     /// first would let a poll tick land in the gap between the read and the
@@ -3288,7 +3382,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
         // Deliberately no `mark_all_required_fresh`: freshness_gap must fail
@@ -3320,7 +3414,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -3346,7 +3440,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -3374,7 +3468,7 @@ mod tests {
             HashSet::from([aapl()]),
             false,
             true,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -3513,7 +3607,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         // Deliberately no `mark_all_required_fresh`: presence passes (the
@@ -3574,7 +3668,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         // Deliberately no `mark_all_required_fresh` yet: presence passes but
@@ -3761,7 +3855,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         // Deliberately no `mark_all_required_fresh`.
