@@ -604,7 +604,7 @@ impl SeedVaultRegistryCtx {
     ) -> Result<Self, Box<CtxError>> {
         let chains = ctx
             .chains
-            .watched()
+            .hedged()
             .map(ChainVaultSeeds::from_chain)
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -614,7 +614,7 @@ impl SeedVaultRegistryCtx {
         })
     }
 
-    /// The primary chain's registry id: `ChainRegistry::watched` yields the
+    /// The primary chain's registry id: `ChainRegistry::hedged` yields the
     /// primary first, so it is the leading entry.
     #[cfg(test)]
     fn primary_id(&self) -> &VaultRegistryId {
@@ -627,13 +627,13 @@ impl SeedVaultRegistryCtx {
 }
 
 impl ChainVaultSeeds {
-    /// Reads the seeds from `watched`'s own tables: its orderbook and vault
+    /// Reads the seeds from `hedged`'s own tables: its orderbook and vault
     /// owner key the registry, and its assets table names the vaults. Nothing
     /// is borrowed from the primary -- the same `(orderbook, owner)` pair is
     /// real on several chains, and each chain's vault ids are its own.
-    fn from_chain(watched: &st0x_config::TradingChain) -> Result<Self, Box<CtxError>> {
-        for (symbol, equity_config) in &watched.assets.equities.symbols {
-            if equity_config.vault_ids.is_empty() && watched.assets.is_rebalancing_enabled(symbol) {
+    fn from_chain(hedged: &st0x_config::HedgedChain) -> Result<Self, Box<CtxError>> {
+        for (symbol, equity_config) in &hedged.assets.equities.symbols {
+            if equity_config.vault_ids.is_empty() && hedged.assets.is_rebalancing_enabled(symbol) {
                 return Err(Box::new(CtxError::MissingEquityVaultId {
                     symbol: symbol.clone(),
                 }));
@@ -641,12 +641,12 @@ impl ChainVaultSeeds {
         }
 
         let id = VaultRegistryId {
-            chain: watched.chain,
-            orderbook: watched.orderbook,
-            owner: watched.vault_owner,
+            chain: hedged.chain,
+            orderbook: hedged.orderbook,
+            owner: hedged.vault_owner,
         };
 
-        let equity_seeds = watched
+        let equity_seeds = hedged
             .assets
             .equities
             .symbols
@@ -663,7 +663,7 @@ impl ChainVaultSeeds {
             })
             .collect();
 
-        let equity_primary_seeds = watched
+        let equity_primary_seeds = hedged
             .assets
             .equities
             .symbols
@@ -681,14 +681,14 @@ impl ChainVaultSeeds {
             })
             .collect();
 
-        let usdc_vault_ids = watched
+        let usdc_vault_ids = hedged
             .assets
             .cash
             .as_ref()
             .map(|cash| cash.vault_ids.clone())
             .unwrap_or_default();
 
-        let usdc_primary_vault_id = watched
+        let usdc_primary_vault_id = hedged
             .assets
             .cash
             .as_ref()
@@ -828,7 +828,7 @@ mod tests {
     use std::time::Duration;
 
     use st0x_config::{
-        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode, TradingChain,
+        ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, HedgedChain, OperationMode,
         create_test_ctx_with_order_owner,
     };
 
@@ -1855,7 +1855,7 @@ mod tests {
         );
     }
 
-    /// Vault polling loads one registry per watched chain, keyed by that
+    /// Vault polling loads one registry per hedged chain, keyed by that
     /// chain's own `(chain, orderbook, vault_owner)`. A hedged chain with no
     /// registry records neither balances nor poll freshness, while its
     /// market-making slots stay required -- so startup must seed a registry
@@ -1871,7 +1871,7 @@ mod tests {
         let pool = setup_test_db().await;
         let mut ctx = ctx_with_seeded_assets();
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(st0x_evm::Chain::Ethereum)
                 .orderbook(ethereum_orderbook)
                 .vault_owner(ethereum_vault_owner)
