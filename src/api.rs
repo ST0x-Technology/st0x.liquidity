@@ -6101,6 +6101,7 @@ mod tests {
                 TokenizedEquityMintCommand::RequestMint {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
                     quantity: float!(10),
                     wallet: Address::ZERO,
                 },
@@ -6131,6 +6132,7 @@ mod tests {
                 TokenizedEquityMintCommand::RequestMint {
                     issuer_request_id: id.clone(),
                     symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
                     quantity: float!(10),
                     wallet: Address::ZERO,
                 },
@@ -6151,6 +6153,7 @@ mod tests {
                 id,
                 EquityRedemptionCommand::Redeem {
                     symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
                     quantity: float!(10),
                     token: Address::ZERO,
                     amount: U256::from(1000u64),
@@ -6181,6 +6184,7 @@ mod tests {
                 id,
                 EquityRedemptionCommand::Redeem {
                     symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
                     quantity: float!(10),
                     token: Address::ZERO,
                     amount: U256::from(1000u64),
