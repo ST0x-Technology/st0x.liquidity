@@ -6,9 +6,8 @@
 //! time bucket; plus poll-cycle duration/error/skipped-tick aggregates.
 //! Strictly read-only.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use alloy::primitives::Address;
 use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sqlx::SqlitePool;
 use tracing::warn;
@@ -26,9 +25,9 @@ use crate::telemetry::{Monitor, PollOutcome, sqlite_timestamp};
 /// Load the monitors' ingestion-health telemetry for `range`: one block-lag
 /// series per hedged chain (primary first), each scoped to that chain and
 /// its orderbook so a database reused across configs, or two chains sharing
-/// an orderbook address, never mix lag series. Poll health covers every
-/// hedged chain's orderbook: each runs its own fill watcher, so a report
-/// scoped to the primary would read as healthy through a secondary's
+/// an orderbook address, never mix lag series. Poll health is scoped the same
+/// way and covers every hedged chain: each runs its own fill watcher, so a
+/// report scoped to the primary would read as healthy through a secondary's
 /// outage.
 ///
 /// The current block lag reflects the latest sample regardless of the
@@ -156,21 +155,17 @@ async fn poll_health(
     range: &ReportRange,
     chains: &ChainRegistry,
 ) -> Result<PollHealth, PerformanceError> {
-    // Deduplicated because deterministic deployments put the same orderbook
-    // address on several chains, and its samples must be counted once.
-    let orderbooks: BTreeSet<Address> = chains.hedged().map(|hedged| hedged.orderbook).collect();
-
     let mut cycles = 0_i64;
     let mut errors = 0_i64;
     let mut skipped_ticks = 0_i64;
     let mut durations = Vec::new();
 
-    for orderbook in orderbooks {
-        let aggregate = orderbook_poll_aggregate(pool, range, orderbook).await?;
+    for hedged_chain in chains.hedged() {
+        let aggregate = chain_poll_aggregate(pool, range, hedged_chain).await?;
         cycles += aggregate.cycles;
         errors += aggregate.errors.unwrap_or(0);
         skipped_ticks += aggregate.skipped_ticks_sum.unwrap_or(0);
-        durations.extend(orderbook_poll_durations(pool, range, orderbook).await?);
+        durations.extend(chain_poll_durations(pool, range, hedged_chain).await?);
     }
 
     Ok(PollHealth {
@@ -181,46 +176,51 @@ async fn poll_health(
     })
 }
 
-/// One orderbook's cycle, error and skipped-tick counts. Aggregated in SQL to
-/// avoid materializing potentially large row sets into the heap. The error
-/// count uses the canonical [`PollOutcome`] discriminator so writer and reader
-/// cannot drift.
-async fn orderbook_poll_aggregate(
+/// One hedged chain's cycle, error and skipped-tick counts. Aggregated in SQL
+/// to avoid materializing potentially large row sets into the heap. Scoped to
+/// the chain as well as its orderbook, so two chains sharing a deterministic
+/// orderbook address keep their own counts. The error count uses the canonical
+/// [`PollOutcome`] discriminator so writer and reader cannot drift.
+async fn chain_poll_aggregate(
     pool: &SqlitePool,
     range: &ReportRange,
-    orderbook: Address,
+    hedged_chain: &HedgedChain,
 ) -> Result<AggregateRow, PerformanceError> {
     Ok(sqlx::query_as(
         "SELECT COUNT(*) AS cycles, \
-                SUM(CASE WHEN outcome = $5 THEN 1 ELSE 0 END) AS errors, \
+                SUM(CASE WHEN outcome = $6 THEN 1 ELSE 0 END) AS errors, \
                 SUM(skipped_ticks) AS skipped_ticks_sum \
          FROM poll_cycle_samples \
-         WHERE sampled_at BETWEEN $1 AND $2 AND monitor = $3 AND orderbook = $4",
+         WHERE sampled_at BETWEEN $1 AND $2 AND monitor = $3 AND chain = $4 \
+           AND orderbook = $5",
     )
     .bind(sqlite_timestamp(range.from))
     .bind(sqlite_timestamp(range.to))
     .bind(Monitor::OrderFill.as_str())
-    .bind(orderbook.to_string())
+    .bind(hedged_chain.chain.as_str())
+    .bind(hedged_chain.orderbook.to_string())
     .bind(PollOutcome::Error.as_str())
     .fetch_one(pool)
     .await?)
 }
 
-/// One orderbook's individual cycle durations: percentiles need the raw
+/// One hedged chain's individual cycle durations: percentiles need the raw
 /// values, so this column alone comes back row by row.
-async fn orderbook_poll_durations(
+async fn chain_poll_durations(
     pool: &SqlitePool,
     range: &ReportRange,
-    orderbook: Address,
+    hedged_chain: &HedgedChain,
 ) -> Result<Vec<i64>, PerformanceError> {
     Ok(sqlx::query_scalar(
         "SELECT duration_ms FROM poll_cycle_samples \
-         WHERE sampled_at BETWEEN $1 AND $2 AND monitor = $3 AND orderbook = $4",
+         WHERE sampled_at BETWEEN $1 AND $2 AND monitor = $3 AND chain = $4 \
+           AND orderbook = $5",
     )
     .bind(sqlite_timestamp(range.from))
     .bind(sqlite_timestamp(range.to))
     .bind(Monitor::OrderFill.as_str())
-    .bind(orderbook.to_string())
+    .bind(hedged_chain.chain.as_str())
+    .bind(hedged_chain.orderbook.to_string())
     .fetch_all(pool)
     .await?)
 }
@@ -368,7 +368,7 @@ mod tests {
     use std::convert::Infallible;
     use std::time::Duration as StdDuration;
 
-    use alloy::primitives::address;
+    use alloy::primitives::{Address, address};
     use chrono::TimeZone;
 
     use st0x_config::{ChainRegistry, HedgedChain};
