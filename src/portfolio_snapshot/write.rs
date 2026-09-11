@@ -145,13 +145,12 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// onchain wrapped equity in the first place, so no row would ever need
     /// conversion.
     pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
-    /// The PRIMARY chain's equities alone (`src/conductor/builder.rs`): the
-    /// wallet-transit slots are polled from the primary's token map, so
-    /// requiring any other chain's symbol would gate the capture on a slot no
-    /// poll can stamp. Row filtering, ratio conversion and marking span every
-    /// hedged chain instead, from [`Self::market_making`] (see
-    /// [`PortfolioSnapshotJob::perform_at`]).
-    pub(crate) configured_equity_symbols: HashSet<Symbol>,
+    /// The PRIMARY chain's equities alone (`src/conductor/builder.rs`), which
+    /// is all the wallet-transit slots may require: those balances are polled
+    /// from the primary's token map, so any other chain's symbol would gate
+    /// the capture on a slot no poll can stamp. Every venue-level requirement
+    /// reads [`Self::hedged_equity_symbols`] instead.
+    pub(crate) wallet_transit_equity_symbols: HashSet<Symbol>,
     /// Whether the hedging venue tracks cash at all.
     pub(crate) usdc_tracking_enabled: bool,
     /// The market-making slots each watched chain contributes to the
@@ -628,6 +627,19 @@ async fn alert_unusable_marks(
 }
 
 impl PortfolioSnapshotCtx {
+    /// Every hedged chain's equities, deduplicated. Hedging is venue-level --
+    /// one broker book backs the market making of every chain -- so this union
+    /// is exactly the set of symbols with a broker row. Derived from
+    /// [`Self::market_making`] rather than stored beside it, so the venue-level
+    /// requirement can never disagree with the per-chain one.
+    fn hedged_equity_symbols(&self) -> BTreeSet<Symbol> {
+        self.market_making
+            .values()
+            .flat_map(|slots| slots.equity_symbols.iter())
+            .cloned()
+            .collect()
+    }
+
     /// Enqueues the follow-up job for `target_et_day` after `delay`. Used
     /// both for hydration retries (same `target_et_day`, short backoff) and
     /// for the next day's capture (the next `target_et_day`, computed by
@@ -754,11 +766,16 @@ fn next_capture_delay(now: DateTime<Utc>) -> (Duration, NaiveDate) {
 
 /// Enumerates every `(location, asset)` slot the daily portfolio snapshot
 /// capture requires to have been observed before it may capture, driven by
-/// `configured_equity_symbols`, `usdc_tracking_enabled`, and
+/// the per-venue equity sets below, `usdc_tracking_enabled`, and
 /// `wallet_polling_enabled`. Shared by both [`hydration_gap`] (PRESENCE --
 /// the slot has a row in the live `InventoryView`) and [`freshness_gap`]
 /// (FRESHNESS -- the slot has been observed by a poll THIS process run,
 /// membership) so the two gates can never diverge on what "complete" means.
+///
+/// The equity set differs by venue: the broker book backs every hedged chain's
+/// market making, so Hedging requires [`PortfolioSnapshotCtx::hedged_equity_symbols`],
+/// while the wallet-transit locations require the primary's symbols alone
+/// (`wallet_transit_equity_symbols`) -- the only ones their polls can stamp.
 fn required_slots(
     ctx: &PortfolioSnapshotCtx,
 ) -> impl Iterator<Item = (PortfolioLocation, PortfolioAsset)> + '_ {
@@ -775,12 +792,10 @@ fn required_slots(
         equities.chain(usdc)
     });
 
-    let equity_pairs = ctx.configured_equity_symbols.iter().map(|symbol| {
-        (
-            PortfolioLocation::Hedging,
-            PortfolioAsset::Equity(symbol.clone()),
-        )
-    });
+    let equity_pairs = ctx
+        .hedged_equity_symbols()
+        .into_iter()
+        .map(|symbol| (PortfolioLocation::Hedging, PortfolioAsset::Equity(symbol)));
 
     let usdc_pairs = ctx
         .usdc_tracking_enabled
@@ -799,7 +814,7 @@ fn required_slots(
 
     let wallet_equity_pairs = ctx
         .wallet_polling_enabled
-        .then(|| ctx.configured_equity_symbols.iter())
+        .then(|| ctx.wallet_transit_equity_symbols.iter())
         .into_iter()
         .flatten()
         .flat_map(|symbol| {
@@ -980,11 +995,9 @@ impl<'ctx> ConfiguredEquities<'ctx> {
         Self {
             market_making: &ctx.market_making,
             hedged: ctx
-                .market_making
-                .values()
-                .flat_map(|slots| slots.equity_symbols.iter())
-                .chain(ctx.configured_equity_symbols.iter())
-                .cloned()
+                .hedged_equity_symbols()
+                .into_iter()
+                .chain(ctx.wallet_transit_equity_symbols.iter().cloned())
                 .collect(),
         }
     }
@@ -1076,8 +1089,8 @@ fn drop_empty_unconfigured_equity_rows(
 /// from 1:1 (dividends, splits, NAV accrual).
 ///
 /// The ratio is resolved once per distinct `(chain, symbol)` that actually
-/// needs conversion (not once per `configured_equity_symbols`), so a symbol
-/// with no MarketMaking/BaseWalletWrapped row this tick costs no RPC call. The
+/// needs conversion (not once per configured symbol), so a symbol with no
+/// MarketMaking/BaseWalletWrapped row this tick costs no RPC call. The
 /// chain is part of the key because each chain's vault accrues independently:
 /// the same symbol's wrapped share is worth a different amount of underlying
 /// on every chain it is wrapped on.
@@ -1389,7 +1402,8 @@ mod tests {
 
     /// The capture must wait for every chain the poller reads, so each
     /// watched chain's own market-making slots are required -- and only the
-    /// assets that chain declares.
+    /// assets that chain declares. Hedging is the exception: one broker book
+    /// backs every chain, so it requires the union.
     #[tokio::test]
     async fn required_slots_cover_each_watched_chains_market_making_slots() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -1427,12 +1441,14 @@ mod tests {
                 ),
                 (
                     PortfolioLocation::MarketMaking(Chain::Ethereum),
-                    PortfolioAsset::Equity(nvda)
+                    PortfolioAsset::Equity(nvda.clone())
                 ),
                 (PortfolioLocation::Hedging, PortfolioAsset::Equity(aapl())),
+                (PortfolioLocation::Hedging, PortfolioAsset::Equity(nvda)),
                 (PortfolioLocation::Hedging, PortfolioAsset::Usdc),
             ]),
-            "each watched chain gates on its own market-making slots"
+            "each watched chain gates on its own market-making slots, and on the broker row \
+             backing them all"
         );
     }
 
@@ -1446,7 +1462,7 @@ mod tests {
         pool: SqlitePool,
         apalis_pool: apalis_sqlite::SqlitePool,
         inventory: InventoryView,
-        configured_equity_symbols: HashSet<Symbol>,
+        primary_equity_symbols: HashSet<Symbol>,
         usdc_tracking_enabled: bool,
         wallet_polling_enabled: bool,
         wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
@@ -1468,7 +1484,7 @@ mod tests {
             market_making: BTreeMap::from([(
                 Chain::Base,
                 MarketMakingSlots {
-                    equity_symbols: configured_equity_symbols.clone(),
+                    equity_symbols: primary_equity_symbols.clone(),
                     usdc_tracking_enabled,
                 },
             )]),
@@ -1476,7 +1492,7 @@ mod tests {
             position_projection,
             portfolio_snapshot,
             wrappers,
-            configured_equity_symbols,
+            wallet_transit_equity_symbols: primary_equity_symbols,
             usdc_tracking_enabled,
             wallet_polling_enabled,
             // Always starts empty, mirroring a fresh process boot: callers
@@ -3238,11 +3254,11 @@ mod tests {
         );
     }
 
-    /// Only the primary chain's assets table feeds `configured_equity_symbols`,
-    /// but the capture reads every watched chain's market-making balances. A
-    /// symbol traded on a secondary chain alone must still be marked: left
-    /// unmarked, its nonzero row excludes the whole day with `MissingMark` and
-    /// the capital series loses that day entirely.
+    /// Only the primary chain's assets table feeds the wallet-transit symbol
+    /// set, but the capture reads every watched chain's market-making
+    /// balances. A symbol traded on a secondary chain alone must still be
+    /// marked: left unmarked, its nonzero row excludes the whole day with
+    /// `MissingMark` and the capital series loses that day entirely.
     #[tokio::test]
     async fn a_secondary_only_symbol_is_marked_for_the_portfolio_capture() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -3260,6 +3276,20 @@ mod tests {
             Venue::MarketMaking,
             Chain::Ethereum,
             [(&nvda, &FractionalShares::new(float!(4)))],
+            now,
+            None,
+            now,
+        )
+        .unwrap()
+        // The broker book covers every hedged chain's symbols, so a real
+        // offchain poll reports NVDA too -- at zero until the hedge fills.
+        .apply_equity_snapshot(
+            Venue::Hedging,
+            Chain::Base,
+            [
+                (&aapl(), &FractionalShares::new(float!(5))),
+                (&nvda, &FractionalShares::ZERO),
+            ],
             now,
             None,
             now,

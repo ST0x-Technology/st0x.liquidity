@@ -543,7 +543,7 @@ where
         position_projection: context.frameworks.position_projection.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
         wrappers: context.wrappers.clone(),
-        configured_equity_symbols: chain_equity_symbols(&context.ctx.chains.primary().assets),
+        wallet_transit_equity_symbols: chain_equity_symbols(&context.ctx.chains.primary().assets),
         usdc_tracking_enabled: context.ctx.chains.primary().assets.cash.is_some(),
         // Derived from the same Option the poller consumed, so the gate can
         // never require wallet slots the poller does not populate.
