@@ -25,10 +25,10 @@ use crate::telemetry::{Monitor, PollOutcome, sqlite_timestamp};
 /// Load the monitors' ingestion-health telemetry for `range`: one block-lag
 /// series per hedged chain (primary first), each scoped to that chain and
 /// its orderbook so a database reused across configs, or two chains sharing
-/// an orderbook address, never mix lag series. Poll health is scoped the same
-/// way and covers every hedged chain: each runs its own fill watcher, so a
-/// report scoped to the primary would read as healthy through a secondary's
-/// outage.
+/// an orderbook address, never mix lag series. Poll health is scoped and
+/// ordered the same way, one report per hedged chain: each runs its own fill
+/// watcher, so a report scoped to the primary would read as healthy through a
+/// secondary's outage.
 ///
 /// The current block lag reflects the latest sample regardless of the
 /// range: it answers "how far behind is detection right now", while the
@@ -150,34 +150,30 @@ async fn block_lag_buckets(
         .collect())
 }
 
-/// Poll health as one report per hedged chain. The list still holds a single
-/// entry -- the primary chain's, carrying every hedged chain's cycles -- until
-/// the counts are split per chain.
+/// One poll report per hedged chain, primary first: each chain runs its own
+/// fill watcher on its own cadence, and a chain with no samples in range
+/// still gets a zeroed report so a silent watcher is visible rather than
+/// absent.
 async fn poll_health(
     pool: &SqlitePool,
     range: &ReportRange,
     chains: &ChainRegistry,
 ) -> Result<Vec<ChainPollHealth>, PerformanceError> {
-    let mut cycles = 0_i64;
-    let mut errors = 0_i64;
-    let mut skipped_ticks = 0_i64;
-    let mut durations = Vec::new();
-
+    let mut reports = Vec::new();
     for hedged_chain in chains.hedged() {
         let aggregate = chain_poll_aggregate(pool, range, hedged_chain).await?;
-        cycles += aggregate.cycles;
-        errors += aggregate.errors.unwrap_or(0);
-        skipped_ticks += aggregate.skipped_ticks_sum.unwrap_or(0);
-        durations.extend(chain_poll_durations(pool, range, hedged_chain).await?);
+        let mut durations = chain_poll_durations(pool, range, hedged_chain).await?;
+
+        reports.push(ChainPollHealth {
+            chain: chain_name(hedged_chain.chain),
+            cycles: count(aggregate.cycles),
+            errors: count(aggregate.errors.unwrap_or(0)),
+            skipped_ticks: count(aggregate.skipped_ticks_sum.unwrap_or(0)),
+            duration: latency_stats(&mut durations),
+        });
     }
 
-    Ok(vec![ChainPollHealth {
-        chain: chain_name(chains.primary().chain),
-        cycles: count(cycles),
-        errors: count(errors),
-        skipped_ticks: count(skipped_ticks),
-        duration: latency_stats(&mut durations),
-    }])
+    Ok(reports)
 }
 
 /// One hedged chain's cycle, error and skipped-tick counts. Aggregated in SQL
