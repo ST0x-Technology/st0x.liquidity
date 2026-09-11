@@ -179,9 +179,12 @@ when the section carries one; without the entry the chain's mint authorizer is
 disabled with a startup warning and only an orchestrator-mode mint fails (see
 Mint Recipient Authorization). Such a chain must have its own redemption wallet,
 or startup fails naming the chain. A **hedge-only** secondary -- a trading table
-whose equities all have `rebalancing = "disabled"` -- needs no wrapper
-deployment, issuer client or redemption wallet: only its signer is kept, for the
-startup allowance work, and startup logs the chain as hedge-only. The
+whose equities all have `rebalancing = "disabled"` -- needs no issuer client,
+redemption wallet or mint authorizer: only its signer is kept, for the startup
+allowance work, and startup logs the chain as hedge-only. It still gets the
+read-only ERC-4626 ratio reader over its own asset table, because vault polling
+reads its market-making vaults like any watched chain's and those hold wrapped
+vault shares the daily portfolio capture values in underlying units. The
 rebalancer, the portfolio snapshot and the wrapped- and unwrapped-equity
 orphan-recovery aggregates consume the primary chain's entry until the global
 rebalancer owns chain selection; the sets exist so that selection is a lookup

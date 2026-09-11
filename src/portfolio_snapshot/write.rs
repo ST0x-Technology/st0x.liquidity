@@ -139,9 +139,11 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// underlying-equivalent units before being persisted (see
     /// [`convert_wrapped_equity_rows`]). Keyed by chain because each chain's
     /// vault accrues on its own, so one chain's ratio can never value
-    /// another's balance. Empty only when no wallet is configured at all --
-    /// the bot can then never hold onchain wrapped equity in the first place,
-    /// so no row would ever need conversion.
+    /// another's balance. One entry per watched chain, hedge-only chains
+    /// included: their market-making vaults hold wrapped shares too. Empty
+    /// only when no wallet is configured at all -- the bot can then never hold
+    /// onchain wrapped equity in the first place, so no row would ever need
+    /// conversion.
     pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     /// Reused from `configured_inventory_vaults` (`src/conductor/builder.rs`)
     /// rather than recomputed, so the completeness gate and the live
