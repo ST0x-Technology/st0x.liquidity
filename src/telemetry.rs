@@ -151,6 +151,9 @@ pub(crate) async fn record_block_lag(
 pub(crate) async fn record_poll_cycle(
     pool: &SqlitePool,
     monitor: Monitor,
+    // The chain whose fill watcher ran the cycle: each hedged chain polls on
+    // its own cadence and reports its own poll health.
+    chain: Chain,
     orderbook: Address,
     sampled_at: DateTime<Utc>,
     duration: Duration,
@@ -166,11 +169,12 @@ pub(crate) async fn record_poll_cycle(
 
     sqlx::query(
         "INSERT INTO poll_cycle_samples \
-         (sampled_at, monitor, orderbook, duration_ms, skipped_ticks, outcome, error) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         (sampled_at, monitor, chain, orderbook, duration_ms, skipped_ticks, outcome, error) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(sqlite_timestamp(sampled_at))
     .bind(monitor.as_str())
+    .bind(chain.as_str())
     .bind(orderbook.to_string())
     .bind(i64::try_from(duration.as_millis())?)
     .bind(i64::try_from(skipped_ticks)?)
@@ -712,6 +716,8 @@ mod tests {
         );
     }
 
+    /// The sample is filed under the chain the caller polled, not under the
+    /// primary: one fill watcher runs per hedged chain.
     #[tokio::test]
     async fn record_poll_cycle_stores_outcome_and_error() {
         let pool = setup_test_db().await;
@@ -719,6 +725,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Ethereum,
             ORDERBOOK,
             timestamp(0),
             Duration::from_millis(250),
@@ -728,19 +735,20 @@ mod tests {
         .await
         .unwrap();
 
-        let row: (String, String, i64, i64, String, Option<String>) = sqlx::query_as(
-            "SELECT monitor, orderbook, duration_ms, skipped_ticks, outcome, error \
+        let row: (String, String, String, i64, i64, String, Option<String>) = sqlx::query_as(
+            "SELECT monitor, chain, orderbook, duration_ms, skipped_ticks, outcome, error \
              FROM poll_cycle_samples",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(row.0, "order_fill");
-        assert_eq!(row.1, ORDERBOOK.to_string());
-        assert_eq!(row.2, 250);
-        assert_eq!(row.3, 2);
-        assert_eq!(row.4, PollOutcome::Error.as_str());
-        assert_eq!(row.5, Some("rpc unreachable".to_string()));
+        assert_eq!(row.1, Chain::Ethereum.as_str());
+        assert_eq!(row.2, ORDERBOOK.to_string());
+        assert_eq!(row.3, 250);
+        assert_eq!(row.4, 2);
+        assert_eq!(row.5, PollOutcome::Error.as_str());
+        assert_eq!(row.6, Some("rpc unreachable".to_string()));
     }
 
     #[tokio::test]
@@ -751,6 +759,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(0),
             Duration::from_millis(100),
@@ -799,6 +808,7 @@ mod tests {
             record_poll_cycle(
                 &pool,
                 Monitor::OrderFill,
+                Chain::Base,
                 ORDERBOOK,
                 sampled_at,
                 Duration::ZERO,

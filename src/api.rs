@@ -4518,6 +4518,7 @@ mod tests {
         crate::telemetry::record_poll_cycle(
             &state.pool,
             crate::telemetry::Monitor::OrderFill,
+            Chain::Base,
             orderbook,
             now,
             std::time::Duration::from_millis(40),
