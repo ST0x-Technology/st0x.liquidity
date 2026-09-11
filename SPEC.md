@@ -157,9 +157,19 @@ per-chain enable/disable flags. The periodic position check sweeps a symbol when
 any hedged chain enables it and sizes the hedge with the tightest operational
 limit among those chains (one `Position` per symbol cannot say which chain its
 fills came from; the remainder is hedged on a later tick). Startup verifies
-every hedged chain (chain-id identity, cutoff support, and one configured asset
-answering `decimals()` on that chain's own endpoint) and any failure is fatal;
-degraded per-chain startup is deferred to the chain-disable work.
+every hedged chain (chain-id identity, cutoff support, and each token address
+the chain's role uses answering `decimals()` on that chain's own endpoint: every
+equity's wrapped share, plus the unwrapped token of each equity the chain
+rebalances) and any failure is fatal; degraded per-chain startup is deferred to
+the chain-disable work. Each probed equity token must report 18 decimals: every
+equity quantity the bot scales is 18-decimal share-wei, so a token at another
+precision is refused by name rather than honoured. USDC is not probed, so its 6
+decimals are untouched. Each wrapped share must additionally report the equity's
+configured unwrapped token as its ERC-4626 `asset()` — the same attestation the
+tokenization preflight makes, which a hedge-only chain never reaches and a
+rebalancing secondary makes only for the equities that opt in — so a typo
+landing on another live token refuses startup instead of surfacing as the first
+unresolvable fill.
 
 HyperEVM supports prefunded fill ingestion and hedging as a hedged secondary
 with manually funded equity, USDC and native HYPE gas. Configuring HyperEVM as
