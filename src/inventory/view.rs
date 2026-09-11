@@ -3392,6 +3392,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_event_sorcery::TestHarness;
+    use st0x_evm::Chain;
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
     use st0x_wrapper::RATIO_ONE;
@@ -3399,7 +3400,6 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotCommand};
     use crate::offchain::order::OffchainOrderId;
-    use st0x_evm::Chain;
 
     fn shares(amount: i64) -> FractionalShares {
         FractionalShares::new(float!(&amount.to_string()))

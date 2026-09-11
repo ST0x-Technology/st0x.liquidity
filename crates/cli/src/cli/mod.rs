@@ -2194,11 +2194,6 @@ mod tests {
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_float_macro::float;
-    use st0x_tokenization::IssuerRequestId;
-    use st0x_tokenization::mock::MockTokenizer;
-    use st0x_wrapper::MockWrapper;
-
-    use super::*;
     use st0x_hedge::operator::mint_authorization::ConfiguredMintAuthorizer;
     use st0x_hedge::operator::native_gas::ConfiguredGasReadiness;
     use st0x_hedge::operator::offchain::order::OffchainOrderEvent;
@@ -2209,6 +2204,11 @@ mod tests {
         TokenizedEquityMint, TokenizedEquityMintCommand,
     };
     use st0x_hedge::operator::vault_lookup::MockVaultLookup;
+    use st0x_tokenization::IssuerRequestId;
+    use st0x_tokenization::mock::MockTokenizer;
+    use st0x_wrapper::MockWrapper;
+
+    use super::*;
 
     fn positive_shares(value: &str) -> Positive<FractionalShares> {
         try_positive_shares(value).expect("test shares must be valid and positive")
