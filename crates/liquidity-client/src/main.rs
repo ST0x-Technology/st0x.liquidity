@@ -6,12 +6,15 @@ mod cli;
 mod output;
 mod target;
 mod transport;
+mod wire;
 
 use clap::Parser;
 use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
-use crate::cli::{Cli, Command, Debug, Read};
+use crate::cli::{
+    Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read, UsdcDirection,
+};
 use crate::output::OutputError;
 use crate::target::Auth;
 use crate::transport::{Client, TransportError, encode_segment};
@@ -167,6 +170,102 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post(&format!("/transfers/recheck/{kind}/{id}"))
                 .await?
         }
+        Command::Debug(Debug::ResumeUsdc { direction, id }) => {
+            let direction = match direction {
+                UsdcDirection::AlpacaToBase => "alpaca_to_base",
+                UsdcDirection::BaseToAlpaca => "base_to_alpaca",
+            };
+            let id = encode_segment(&id);
+            client
+                .post(&format!("/transfers/usdc/resume/{direction}/{id}"))
+                .await?
+        }
+        Command::Debug(Debug::ReconcileUsdc { id, reason }) => {
+            let id = encode_segment(&id);
+            client
+                .post_json(
+                    &format!("/transfers/usdc/{id}/reconcile"),
+                    &wire::ReconcileUsdcRequest { reason },
+                )
+                .await?
+        }
+        Command::Debug(Debug::ReconcileEquity { kind, id, reason }) => {
+            let kind = match kind {
+                EquityTransferKind::Mint => "equity_mint",
+                EquityTransferKind::Redemption => "equity_redemption",
+            };
+            let id = encode_segment(&id);
+            client
+                .post_json(
+                    &format!("/transfers/{kind}/{id}/reconcile"),
+                    &wire::ReconcileEquityRequest { reason },
+                )
+                .await?
+        }
+        Command::Debug(Debug::ClearPendingBurn { id, reason }) => {
+            let id = encode_segment(&id);
+            client
+                .post_json(
+                    &format!("/transfers/usdc/{id}/clear-pending-burn"),
+                    &wire::ClearPendingBurnRequest { reason },
+                )
+                .await?
+        }
+        Command::Debug(Debug::FailUsdcTransfer { id, reason }) => {
+            let id = encode_segment(&id);
+            client
+                .post_json(
+                    &format!("/transfers/usdc/{id}/fail"),
+                    &wire::FailUsdcTransferRequest { reason },
+                )
+                .await?
+        }
+        Command::Debug(Debug::Position(Position::Set(args))) => {
+            let symbol = encode_segment(&args.symbol);
+            client
+                .post_json(
+                    &format!("/positions/{symbol}/set"),
+                    &wire::SetPositionRequest {
+                        target_net: args.target_net,
+                        price_usdc: args.price_usdc,
+                        reason: args.reason,
+                    },
+                )
+                .await?
+        }
+        Command::Debug(Debug::Position(Position::ReleaseHedge(args))) => {
+            let symbol = encode_segment(&args.symbol);
+            client
+                .post_json(
+                    &format!("/positions/{symbol}/release-hedge"),
+                    &wire::ReleaseHedgeRequest {
+                        order_id: args.order_id,
+                        reason: args.reason,
+                    },
+                )
+                .await?
+        }
+        Command::Debug(Debug::PortfolioSnapshot(PortfolioSnapshot::SetMark(args))) => {
+            client
+                .post_json(
+                    "/portfolio-snapshot/marks",
+                    &wire::SetEquityMarkRequest {
+                        day: args.day,
+                        symbol: args.symbol,
+                        usd_mark: args.usd_mark,
+                        observed_at: args.observed_at,
+                        source: args.source,
+                        reason: args.reason,
+                    },
+                )
+                .await?
+        }
+        Command::Debug(Debug::ProcessTx { tx_hash }) => {
+            let tx_hash = encode_segment(&tx_hash);
+            client
+                .post(&format!("/transactions/{tx_hash}/process"))
+                .await?
+        }
     };
     output::print(&value).map_err(ApiError::from)
 }
@@ -182,10 +281,13 @@ mod tests {
     use super::{ApiError, dispatch};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
-        Command, Debug, Read, ReadResource, ResourceArgs, TradeEventsArgs, TransferEventsArgs,
+        Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read, ReadResource,
+        ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs, TradeEventsArgs,
+        TransferEventsArgs, UsdcDirection,
     };
     use crate::output::OutputError;
     use crate::transport::{Client, TransportError};
+    use crate::wire::ReconcileUsdcReason;
 
     /// Accepts one connection, captures the raw request bytes, and replies with
     /// an empty JSON object.
@@ -198,6 +300,13 @@ mod tests {
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
                 while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => request.extend_from_slice(&buffer[..count]),
+                    }
+                }
+                let expected = header_end(&request) + content_length(&request);
+                while request.len() < expected {
                     match stream.read(&mut buffer) {
                         Ok(0) | Err(_) => break,
                         Ok(count) => request.extend_from_slice(&buffer[..count]),
@@ -225,6 +334,34 @@ mod tests {
     /// The HTTP request line (method, target, version) of a captured request.
     fn request_line(request: &str) -> &str {
         request.lines().next().unwrap_or_default()
+    }
+
+    /// Byte offset just past the header terminator, or the buffer length when
+    /// the headers never completed.
+    fn header_end(request: &[u8]) -> usize {
+        request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map_or(request.len(), |at| at + 4)
+    }
+
+    /// Declared body length, zero when absent (GETs and bodiless POSTs).
+    fn content_length(request: &[u8]) -> usize {
+        String::from_utf8_lossy(request)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+    }
+
+    /// The JSON body of a captured request, parsed.
+    fn request_body(request: &str) -> serde_json::Value {
+        let (_, body) = request.split_once("\r\n\r\n").unwrap_or_default();
+        serde_json::from_str(body).expect("request body must be JSON")
     }
 
     /// Dispatches one command against the capture server and returns the raw
@@ -300,6 +437,204 @@ mod tests {
         assert_eq!(
             request_line(&request),
             "POST /liquidity-write/transfers/recheck/mint/abc HTTP/1.1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_usdc_posts_the_direction_segment() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::ResumeUsdc {
+            direction: UsdcDirection::BaseToAlpaca,
+            id: "r/1".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/usdc/resume/base_to_alpaca/r%2F1 HTTP/1.1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_usdc_posts_the_kebab_case_reason() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let request = request_for(Command::Debug(Debug::ReconcileUsdc {
+            id: "abc".to_owned(),
+            reason: ReconcileUsdcReason::DepositCreditedOffline,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/usdc/abc/reconcile HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "reason": "deposit-credited-offline" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_posts_the_kind_segment_and_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::ReconcileEquity {
+            kind: EquityTransferKind::Redemption,
+            id: "abc".to_owned(),
+            reason: "settled by hand".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/equity_redemption/abc/reconcile HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "reason": "settled by hand" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_pending_burn_posts_the_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::ClearPendingBurn {
+            id: "abc".to_owned(),
+            reason: "burn never landed".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/usdc/abc/clear-pending-burn HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "reason": "burn never landed" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_posts_the_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::FailUsdcTransfer {
+            id: "abc".to_owned(),
+            reason: "pre-burn crash, burn not attempted".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/usdc/abc/fail HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "reason": "pre-burn crash, burn not attempted" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn position_set_omits_an_absent_price() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::Position(Position::Set(
+            SetPositionArgs {
+                symbol: "AAPL".to_owned(),
+                target_net: "-1.5".to_owned(),
+                price_usdc: None,
+                reason: "manual correction".to_owned(),
+            },
+        ))))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/positions/AAPL/set HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "target_net": "-1.5", "reason": "manual correction" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn position_set_sends_the_price_when_given() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::Position(Position::Set(
+            SetPositionArgs {
+                symbol: "AAPL".to_owned(),
+                target_net: "2".to_owned(),
+                price_usdc: Some("150.25".to_owned()),
+                reason: "manual correction".to_owned(),
+            },
+        ))))
+        .await?;
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "target_net": "2",
+                "price_usdc": "150.25",
+                "reason": "manual correction"
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_hedge_posts_the_order_id() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::Position(Position::ReleaseHedge(
+            ReleaseHedgeArgs {
+                symbol: "AAPL".to_owned(),
+                order_id: "ord-1".to_owned(),
+                reason: "broker cancelled".to_owned(),
+            },
+        ))))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/positions/AAPL/release-hedge HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "order_id": "ord-1", "reason": "broker cancelled" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_mark_posts_every_field() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::PortfolioSnapshot(
+            PortfolioSnapshot::SetMark(SetMarkArgs {
+                day: "2026-09-01".to_owned(),
+                symbol: "AAPL".to_owned(),
+                usd_mark: "150.25".to_owned(),
+                observed_at: "2026-09-01T20:00:00Z".to_owned(),
+                source: "nasdaq".to_owned(),
+                reason: "stale mark".to_owned(),
+            }),
+        )))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/portfolio-snapshot/marks HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "day": "2026-09-01",
+                "symbol": "AAPL",
+                "usd_mark": "150.25",
+                "observed_at": "2026-09-01T20:00:00Z",
+                "source": "nasdaq",
+                "reason": "stale mark"
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_tx_posts_the_hash_segment() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::ProcessTx {
+            tx_hash: "0xabc".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transactions/0xabc/process HTTP/1.1"
         );
         Ok(())
     }

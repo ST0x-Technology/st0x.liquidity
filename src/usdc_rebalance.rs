@@ -946,6 +946,21 @@ pub enum UsdcRebalance {
     },
 }
 
+/// How `fail-usdc-transfer` may act on a rebalance in a given state; see
+/// [`UsdcRebalance::pre_burn_fail_eligibility`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreBurnFailEligibility {
+    /// `WithdrawalComplete` or `BridgingSubmitting` with no recorded burn:
+    /// `FailBridging` lands the guard-clearing pre-burn terminal.
+    Eligible,
+    /// Already `BridgingFailed` with no burn evidence; nothing to do.
+    AlreadyFailedPreBurn,
+    /// A CCTP burn may already be on-chain; failing would strand the funds.
+    PostBurn,
+    /// Before the bridge boundary; `FailBridging` does not apply here.
+    NotAtBridgeBoundary,
+}
+
 impl UsdcRebalance {
     /// The state's variant name, for operator-facing diagnostics (e.g. the
     /// `transfer recheck` refusal naming the state it cannot recover).
@@ -1027,6 +1042,74 @@ impl UsdcRebalance {
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
             | Self::Reconciled { .. } => false,
+        }
+    }
+
+    /// Classifies the state for `fail-usdc-transfer`, the operator command
+    /// that drives a stranded pre-burn rebalance to the guard-clearing
+    /// `BridgingFailed { burn_tx_hash: None }` terminal.
+    ///
+    /// The SINGLE source of that rule for the CLI preflight and the ops API
+    /// route. It is the authoritative post-burn guard: the aggregate's
+    /// `FailBridging` transition ACCEPTS post-burn `Bridging` / `Attested`
+    /// (emitting a guard-HOLDING `BridgingFailed`), so nothing downstream
+    /// stops an operator from failing a transfer whose CCTP burn is already
+    /// on-chain. The match is exhaustive, so a new state forces a conscious
+    /// classification here at compile time.
+    pub fn pre_burn_fail_eligibility(&self) -> PreBurnFailEligibility {
+        match self {
+            // The two states `FailBridging` accepts from before any burn.
+            // `BridgingSubmitting` with no recorded burn is the only genuinely
+            // pre-burn form; the operator still verifies on-chain that no
+            // unrecorded burn was broadcast before using it.
+            Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting {
+                pending_burn_tx: None,
+                ..
+            } => PreBurnFailEligibility::Eligible,
+            // Already the pre-burn failed terminal: the guard is already in
+            // its cleared state and will not re-arm on restart.
+            Self::BridgingFailed {
+                burn_tx_hash: None,
+                cctp_nonce: None,
+                ..
+            } => PreBurnFailEligibility::AlreadyFailedPreBurn,
+            // A recorded pending burn means a CCTP burn was broadcast and
+            // durably recorded before its receipt was confirmed: post-burn, so
+            // the guard must not be cleared while the burn may be on-chain
+            // (use `transfer resume`, which adopts / waits / pages, or
+            // `clear-pending-burn` after verifying the burn never landed).
+            // A BaseToAlpaca `ConversionFailed` is post-deposit, hence
+            // post-burn; an AlpacaToBase one is pre-withdrawal.
+            Self::BridgingSubmitting {
+                pending_burn_tx: Some(_),
+                ..
+            }
+            | Self::BridgingFailed { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. }
+            | Self::ConversionFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            } => PreBurnFailEligibility::PostBurn,
+            // Pre-burn but before the bridge boundary: `FailBridging` rejects
+            // these (`BridgingNotInitiated`), and the withdrawal leg has its
+            // own failure path.
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalFailed { .. } => PreBurnFailEligibility::NotAtBridgeBoundary,
         }
     }
 

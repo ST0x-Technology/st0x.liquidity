@@ -4310,7 +4310,8 @@ pub mod trading {
 
 pub mod usdc_rebalance {
     pub use crate::usdc_rebalance::{
-        RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
+        PreBurnFailEligibility, RebalanceDirection, ReconcileReason, UsdcRebalance,
+        UsdcRebalanceCommand, UsdcRebalanceId,
     };
 
     #[cfg(feature = "test-support")]
