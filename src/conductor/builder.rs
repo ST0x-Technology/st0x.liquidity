@@ -1668,6 +1668,51 @@ mod tests {
         );
     }
 
+    /// Hedging is venue-level: one broker book backs the market making of
+    /// every watched chain. A symbol only a secondary chain trades therefore
+    /// has a broker position too, and judging "configured" by the primary's
+    /// assets table alone drops it from the offchain snapshot -- which the
+    /// view then reads as a complete picture and zeroes the symbol's Hedging
+    /// slot.
+    #[test]
+    fn configured_equity_symbols_span_every_watched_chain() {
+        let secondary_symbol = Symbol::new("NVDA").unwrap();
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                operational_limit: None,
+                symbols: HashMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                )]),
+            },
+            cash: None,
+        };
+        ctx.chains.insert_secondary(
+            st0x_config::TradingChain::test()
+                .chain(Chain::Ethereum)
+                .assets(ChainAssets {
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            secondary_symbol.clone(),
+                            equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                        )]),
+                    },
+                    cash: None,
+                })
+                .call(),
+        );
+
+        let symbols = configured_equity_symbols(&ctx);
+
+        assert_eq!(
+            symbols,
+            HashSet::from([Symbol::new("AAPL").unwrap(), secondary_symbol]),
+            "a symbol a secondary chain alone trades is still configured"
+        );
+    }
+
     /// Vault polling is what seeds a chain's inventory slots, so every
     /// watched chain needs an entry of its own -- keyed on that chain's
     /// orderbook and vault owner, not the primary's.
