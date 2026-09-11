@@ -400,26 +400,13 @@ impl PortfolioSnapshotJob {
                 .await;
         }
 
-        // Every hedged chain's equities, not just the primary's: a symbol
-        // traded on a secondary chain alone still produces a market-making row
-        // there, and row filtering, ratio conversion and marking all key off
-        // "configured". Judged against the primary's table alone, such a row
-        // reaches `evaluate_day` unmarked and excludes the whole day with
-        // `MissingMark`. The primary-only set stays where it belongs: the
-        // Hedging and wallet-transit slots, which exist on the primary alone.
-        let hedged_equity_symbols: HashSet<Symbol> = ctx
-            .market_making
-            .values()
-            .flat_map(|slots| slots.equity_symbols.iter())
-            .chain(ctx.configured_equity_symbols.iter())
-            .cloned()
-            .collect();
+        let configured_equities = ConfiguredEquities::of(ctx);
 
         let rows = {
             let view = ctx.inventory.read().await;
             view.to_portfolio_snapshot_rows()?
         };
-        let rows = drop_empty_unconfigured_equity_rows(rows, &hedged_equity_symbols)
+        let rows = drop_empty_unconfigured_equity_rows(rows, &configured_equities)
             .map_err(PortfolioSnapshotJobError::UnconfiguredRowTotal)?;
 
         if let Some(gap) = hydration_gap(&rows, ctx) {
@@ -439,9 +426,9 @@ impl PortfolioSnapshotJob {
                 .await;
         }
 
-        let rows = convert_wrapped_equity_rows(rows, &ctx.wrappers, &hedged_equity_symbols).await?;
+        let rows = convert_wrapped_equity_rows(rows, &ctx.wrappers, &configured_equities).await?;
         let marked_rows =
-            resolve_marks(&ctx.position_projection, now, rows, &hedged_equity_symbols).await?;
+            resolve_marks(&ctx.position_projection, now, rows, &configured_equities).await?;
 
         match ctx
             .portfolio_snapshot
@@ -966,6 +953,57 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
         })
 }
 
+/// Which equities config still lists, as every row-judging stage of the
+/// capture reads it.
+///
+/// Market-making membership is chain-qualified: the same symbol on two chains
+/// is two configured pairs, so a durable row whose `(chain, symbol)` pair was
+/// removed or moved is retired even while another chain still lists the
+/// symbol. Flattening to a symbol set hides exactly that case -- the row would
+/// be kept, valued at a ratio config no longer has, and priced at an
+/// underlying mark.
+///
+/// Every other location exists on the primary chain alone, but a symbol any
+/// hedged chain trades is hedged and held there, so those rows are judged
+/// against the union.
+struct ConfiguredEquities<'ctx> {
+    market_making: &'ctx BTreeMap<Chain, MarketMakingSlots>,
+    /// Every hedged chain's equities, not just the primary's: a symbol traded
+    /// on a secondary chain alone is still hedged and still parked in the
+    /// primary's wallets, so judging its Hedging row against the primary's
+    /// table alone would strand it unmarked and exclude the whole day with
+    /// `MissingMark`.
+    hedged: HashSet<Symbol>,
+}
+
+impl<'ctx> ConfiguredEquities<'ctx> {
+    fn of(ctx: &'ctx PortfolioSnapshotCtx) -> Self {
+        Self {
+            market_making: &ctx.market_making,
+            hedged: ctx
+                .market_making
+                .values()
+                .flat_map(|slots| slots.equity_symbols.iter())
+                .chain(ctx.configured_equity_symbols.iter())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn contains(&self, location: PortfolioLocation, symbol: &Symbol) -> bool {
+        match location {
+            PortfolioLocation::MarketMaking(chain) => self
+                .market_making
+                .get(&chain)
+                .is_some_and(|slots| slots.equity_symbols.contains(symbol)),
+            PortfolioLocation::Hedging
+            | PortfolioLocation::EthereumWallet
+            | PortfolioLocation::BaseWalletUnwrapped
+            | PortfolioLocation::BaseWalletWrapped => self.hedged.contains(symbol),
+        }
+    }
+}
+
 /// Drops the EMPTY rows of a symbol absent from `[chains.<name>.trading.assets.equities]`; USDC and
 /// held rows pass through.
 ///
@@ -977,7 +1015,7 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
 /// unpriceable instead, excluding the day visibly.
 fn drop_empty_unconfigured_equity_rows(
     rows: Vec<PortfolioBalanceRow>,
-    configured_equity_symbols: &HashSet<Symbol>,
+    configured_equities: &ConfiguredEquities<'_>,
 ) -> Result<Vec<PortfolioBalanceRow>, rain_math_float::FloatError> {
     let mut kept = Vec::with_capacity(rows.len());
     let mut dropped_empty: BTreeSet<String> = BTreeSet::new();
@@ -988,7 +1026,7 @@ fn drop_empty_unconfigured_equity_rows(
             kept.push(row);
             continue;
         };
-        if configured_equity_symbols.contains(symbol) {
+        if configured_equities.contains(row.location, symbol) {
             kept.push(row);
             continue;
         }
@@ -1047,7 +1085,7 @@ fn drop_empty_unconfigured_equity_rows(
 async fn convert_wrapped_equity_rows(
     mut rows: Vec<PortfolioBalanceRow>,
     wrappers: &BTreeMap<Chain, Arc<dyn Wrapper>>,
-    configured_equity_symbols: &HashSet<Symbol>,
+    configured_equities: &ConfiguredEquities<'_>,
 ) -> Result<Vec<PortfolioBalanceRow>, PortfolioSnapshotJobError> {
     let mut ratios: HashMap<(Chain, Symbol), UnderlyingPerWrapped> = HashMap::new();
 
@@ -1058,8 +1096,9 @@ async fn convert_wrapped_equity_rows(
         // No config entry means no wrapper entry, and asking anyway is the
         // `Symbol not configured` failure that used to lose the day. The
         // balance stays in wrapped units, which is safe only because
-        // `resolve_marks` forces it unpriceable.
-        if !configured_equity_symbols.contains(symbol) {
+        // `resolve_marks` forces it unpriceable -- so that call must read
+        // membership exactly the same way this one does.
+        if !configured_equities.contains(row.location, symbol) {
             continue;
         }
         // The chain whose vault issued the wrapped share this row holds: a
@@ -1118,7 +1157,7 @@ async fn resolve_marks(
     position_projection: &Projection<Position>,
     captured_at: DateTime<Utc>,
     rows: Vec<PortfolioBalanceRow>,
-    configured_equity_symbols: &HashSet<Symbol>,
+    configured_equities: &ConfiguredEquities<'_>,
 ) -> Result<Vec<PortfolioBalanceRowWithMark>, PortfolioSnapshotJobError> {
     let mut marked_rows = Vec::with_capacity(rows.len());
     let mut equity_marks = HashMap::new();
@@ -1130,8 +1169,12 @@ async fn resolve_marks(
             // rows were left unconverted above -- pricing one with the other
             // values wrapped shares at an underlying price. Forcing None
             // excludes the day deterministically, not once the price goes
-            // stale.
-            PortfolioAsset::Equity(symbol) if !configured_equity_symbols.contains(symbol) => {
+            // stale. Retired is judged per row, so a market-making row whose
+            // own chain dropped the symbol is unpriceable even while the
+            // symbol's other rows keep their mark.
+            PortfolioAsset::Equity(symbol)
+                if !configured_equities.contains(row.location, symbol) =>
+            {
                 (None, None)
             }
             PortfolioAsset::Equity(symbol) => {
