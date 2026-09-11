@@ -5754,6 +5754,54 @@ mod tests {
         );
     }
 
+    /// A secondary rebalances only the equities that opt in, and an opted-in
+    /// equity there mints, redeems, wraps and unwraps just as on the primary,
+    /// so its unwrapped token owes the same read. Only a run through
+    /// `startup_smoke_checks` proves the secondary is probed under its own
+    /// role and against its own endpoint.
+    #[tokio::test]
+    async fn asset_canary_probes_the_unwrapped_token_on_a_rebalancing_secondary() {
+        let unwrapped = Address::repeat_byte(0x55);
+        let wrapped = Address::repeat_byte(0x66);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary = hedged_chain_with_equities([("MSFT", unwrapped, wrapped)]);
+        secondary.chain = Chain::Ethereum;
+        for equity in secondary.assets.equities.symbols.values_mut() {
+            equity.rebalancing = OperationMode::Enabled;
+        }
+        ctx.chains.insert_secondary(secondary);
+
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Base));
+        // The wrapped share answers first, so the refusal can only come from
+        // the unwrapped read the rebalancing role adds.
+        let secondary_asserter = hedged_chain_asserter(Chain::Ethereum);
+        secondary_asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &18u8,
+            ),
+        );
+        secondary_asserter.push_failure_msg("connection reset by peer");
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(secondary_asserter),
+        )]);
+
+        let error = startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .expect_err("a rebalancing secondary with a dead unwrapped token must refuse startup");
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&unwrapped.to_string()),
+            "the refusal must name the unwrapped token that did not answer: {message}"
+        );
+        assert!(
+            message.contains("MSFT") && message.contains("ethereum"),
+            "the refusal must name the chain and the symbol: {message}"
+        );
+    }
+
     /// Every equity on the chain is probed, not just the first by symbol, and
     /// a hedge-only chain reads no unwrapped token at all: nothing there mints,
     /// redeems, wraps or unwraps, so that address plays no part.
