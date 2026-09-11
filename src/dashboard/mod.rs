@@ -920,7 +920,7 @@ mod tests {
             // without ever writing a frame: a clean Close, an abrupt reset, or
             // a stream that has already ended. None carries a payload, so none
             // can be a `current_state` the client would render.
-            None | Some(Ok(ClientMessage::Close(_))) | Some(Err(_)) => {}
+            None | Some(Ok(ClientMessage::Close(_)) | Err(_)) => {}
             Some(other) => panic!(
                 "no current_state frame may be sent when the inventory cannot be rendered, \
                  got {other:?}"
