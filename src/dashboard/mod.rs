@@ -10,7 +10,7 @@ use futures_util::stream::{SplitSink, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
-use tracing::{error, info, trace, warn};
+use tracing::{info, trace, warn};
 
 use st0x_config::{ExecutionThreshold, OperationMode};
 use st0x_dto::{
@@ -253,20 +253,7 @@ async fn send_initial_state(
     state: &AppState,
     trade_protocol: TradeProtocol,
 ) -> bool {
-    // Without inventory the initial frame would misstate the book, so the
-    // socket is closed and the client retries rather than shown a gap.
-    let inventory = state.inventory.read().await.to_dto();
-    let inventory_dto = match inventory {
-        Ok(inventory_dto) => inventory_dto,
-        Err(error) => {
-            error!(
-                target: "dashboard",
-                %error,
-                "Failed to render inventory for the initial dashboard frame"
-            );
-            return false;
-        }
-    };
+    let inventory_dto = state.inventory.read().await.to_dto();
     let transfers = transfer_loader::load_transfers(&state.pool).await;
     let mut warnings = transfers.warnings;
     let trades = match query_trades(&state.pool, &TradeQuery::newest(trade_protocol)).await {
@@ -495,13 +482,12 @@ async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::address;
     use futures_util::StreamExt;
     use futures_util::future::join_all;
     use serde_json::json;
     use std::sync::Arc;
     use tokio::net::TcpListener;
-    use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
     use st0x_config::{ChainAssets, ChainEquityAsset, create_test_ctx_with_order_owner};
@@ -511,7 +497,6 @@ mod tests {
         ClientOrderId, ExecutorOrderId, FractionalShares, MarketSession, Positive,
         SupportedExecutor, Symbol, Usd,
     };
-    use st0x_finance::Usdc;
     use st0x_float_macro::float;
 
     use super::*;
@@ -863,70 +848,6 @@ mod tests {
         assert!(parsed["data"]["trades"].is_array());
         assert!(parsed["data"]["inventory"].is_object());
         assert_eq!(parsed["data"]["equityPrices"], json!([]));
-
-        server.shutdown().await;
-    }
-
-    /// `send_initial_state` returns `false` when the inventory view cannot be
-    /// rendered, and `handle_socket` then closes the socket instead of sending
-    /// a frame: a `current_state` missing its inventory would misstate the
-    /// book, so the client must reconnect rather than render a gap. The view
-    /// here totals cash across two chains -- the one onchain figure `to_dto`
-    /// still sums, a dollar being a dollar on every chain -- and the two
-    /// max-exponent operands overflow that sum, a genuine `to_dto` failure
-    /// rather than an injected one.
-    #[tokio::test]
-    async fn websocket_closes_without_a_frame_when_inventory_cannot_be_rendered() {
-        // Rain's Float packs a big-endian int32 exponent in the top four bytes
-        // and an int224 coefficient in the low twenty-eight. `i32::MAX` beside
-        // the largest positive coefficient leaves no exponent room to
-        // renormalize into, so summing two of these reverts.
-        let unsummable = Usdc::new(rain_math_float::Float::from_raw(b256!(
-            "0x7fffffff7fffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-        )));
-        let now = chrono::Utc::now();
-        let onchain_usdc = |chain| inventory::snapshot::InventorySnapshotEvent::OnchainUsdc {
-            chain,
-            usdc_balance: unsummable,
-            fetched_at: now,
-            block_number: None,
-        };
-
-        let view = inventory::InventoryView::default()
-            .apply_snapshot_event(&onchain_usdc(st0x_evm::Chain::Base), now)
-            .unwrap()
-            .apply_snapshot_event(&onchain_usdc(st0x_evm::Chain::Ethereum), now)
-            .unwrap();
-        let error = view.to_dto().unwrap_err();
-        assert!(
-            matches!(error, inventory::InventoryViewError::Float(_)),
-            "the fixture must make to_dto fail on the cross-chain cash total, got {error:?}"
-        );
-
-        let mut state = create_test_state().await;
-        state.inventory = Arc::new(BroadcastingInventory::new(view, state.event_sender.clone()));
-        let mut server = start_test_server_with_state(state).await;
-
-        let (mut ws_stream, _response) =
-            connect_async(&format!("ws://127.0.0.1:{}/api/ws", server.port))
-                .await
-                .expect("WebSocket connection failed");
-
-        let first = tokio::time::timeout(std::time::Duration::from_secs(5), ws_stream.next())
-            .await
-            .expect("the socket must close rather than stay open with no initial frame");
-
-        match first {
-            // One fact in three shapes -- the handler dropped the send half
-            // without ever writing a frame: a clean Close, an abrupt reset, or
-            // a stream that has already ended. None carries a payload, so none
-            // can be a `current_state` the client would render.
-            None | Some(Ok(ClientMessage::Close(_)) | Err(_)) => {}
-            Some(other) => panic!(
-                "no current_state frame may be sent when the inventory cannot be rendered, \
-                 got {other:?}"
-            ),
-        }
 
         server.shutdown().await;
     }

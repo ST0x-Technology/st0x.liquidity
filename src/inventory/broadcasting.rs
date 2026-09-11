@@ -8,7 +8,7 @@
 use chrono::Utc;
 use std::ops::{Deref, DerefMut};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, broadcast};
-use tracing::{error, warn};
+use tracing::warn;
 
 use st0x_dto::{InventorySnapshot, Statement};
 
@@ -74,18 +74,8 @@ impl DerefMut for BroadcastingWriteGuard<'_> {
 
 impl Drop for BroadcastingWriteGuard<'_> {
     fn drop(&mut self) {
-        // A frame that cannot be totalled is dropped, not faked: the next
-        // mutation broadcasts the view again, and the dashboard keeps the
-        // last good figures rather than a silently wrong one.
-        let inventory = match self.guard.to_dto() {
-            Ok(inventory) => inventory,
-            Err(error) => {
-                error!(target: "inventory", %error, "Failed to render inventory snapshot for broadcast");
-                return;
-            }
-        };
         let snapshot = InventorySnapshot {
-            inventory,
+            inventory: self.guard.to_dto(),
             fetched_at: Utc::now(),
         };
 
@@ -121,7 +111,7 @@ mod tests {
     #[tokio::test]
     async fn read_returns_default_inventory() {
         let (inventory, _receiver) = create_broadcasting_inventory();
-        let dto = inventory.read().await.to_dto().unwrap();
+        let dto = inventory.read().await.to_dto();
 
         assert!(dto.per_symbol.is_empty());
     }
@@ -139,7 +129,7 @@ mod tests {
             *guard = std::mem::take(&mut *guard).with_equity(symbol.clone(), onchain, offchain);
         }
 
-        let dto = inventory.read().await.to_dto().unwrap();
+        let dto = inventory.read().await.to_dto();
 
         assert_eq!(dto.per_symbol.len(), 1);
         assert_eq!(dto.per_symbol[0].symbol, symbol);
@@ -260,7 +250,7 @@ mod tests {
             *guard = std::mem::take(&mut *guard).with_equity(symbol.clone(), onchain, offchain);
         }
 
-        let dto = inventory.read().await.to_dto().unwrap();
+        let dto = inventory.read().await.to_dto();
 
         assert_eq!(dto.per_symbol.len(), 1);
         assert_eq!(dto.per_symbol[0].symbol, symbol);
