@@ -101,7 +101,8 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         1,
     )?);
 
-    let wallet_ctx = OnchainWalletCtx::from_wallets(wallet.clone(), wallet.clone(), wallet);
+    let wallet_ctx =
+        OnchainWalletCtx::from_wallets(wallet.clone(), wallet.clone(), wallet.clone(), wallet);
 
     let rebalancing_ctx = RebalancingCtx::with_wallets()
         .equity(ImbalanceThreshold::new(float!(0.5), float!(0.1))?)

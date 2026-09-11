@@ -98,6 +98,9 @@ impl fmt::Display for ChainCapability {
 ///   but no wrapper.
 /// - HyperEVM signs, watches fills and hedges prefunded inventory. It has no
 ///   CCTP domain or wrapper, and the ETH/USD feed cannot value its HYPE gas.
+/// - Robinhood is a signer only: it pays gas in ETH but has no fill watcher,
+///   wrapper, CCTP domain, or gas-valuation feed wired here, so the only
+///   capability it claims is signing the tokenization mint/redeem legs.
 pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
     use ChainCapability::*;
 
@@ -118,6 +121,7 @@ pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
             GasValuation,
         ]),
         Chain::HyperEvm => BTreeSet::from([FillIngestion, Hedging, WalletSigning]),
+        Chain::Robinhood => BTreeSet::from([WalletSigning]),
     }
 }
 

@@ -90,6 +90,7 @@ pub struct OnchainWalletCtx {
     base: Arc<dyn Wallet<Provider = RootProvider>>,
     ethereum: Arc<dyn Wallet<Provider = RootProvider>>,
     hyperevm: Arc<dyn Wallet<Provider = RootProvider>>,
+    robinhood: Arc<dyn Wallet<Provider = RootProvider>>,
 }
 
 /// What one chain's signer is built from: its endpoint and the confirmation
@@ -112,6 +113,7 @@ pub struct SigningChains {
     pub base: SigningChain,
     pub ethereum: SigningChain,
     pub hyperevm: SigningChain,
+    pub robinhood: SigningChain,
 }
 
 impl OnchainWalletCtx {
@@ -134,15 +136,17 @@ impl OnchainWalletCtx {
             base,
             ethereum,
             hyperevm,
+            robinhood,
         } = chains;
 
         require_secure_wallet_rpc_url(&base.rpc_url, Chain::Base)?;
         require_secure_wallet_rpc_url(&ethereum.rpc_url, Chain::Ethereum)?;
         require_secure_wallet_rpc_url(&hyperevm.rpc_url, Chain::HyperEvm)?;
+        require_secure_wallet_rpc_url(&robinhood.rpc_url, Chain::Robinhood)?;
 
         let WalletKindTag { kind } = WalletKindTag::deserialize(wallet_config.clone())?;
 
-        let (base_wallet, ethereum_wallet, hyperevm_wallet) = tokio::try_join!(
+        let (base_wallet, ethereum_wallet, hyperevm_wallet, robinhood_wallet) = tokio::try_join!(
             build_wallet(
                 &kind,
                 wallet_config.clone(),
@@ -159,23 +163,31 @@ impl OnchainWalletCtx {
             ),
             build_wallet(
                 &kind,
-                wallet_config,
-                wallet_secrets,
+                wallet_config.clone(),
+                wallet_secrets.clone(),
                 hyperevm.rpc_url,
                 hyperevm.required_confirmations,
+            ),
+            build_wallet(
+                &kind,
+                wallet_config,
+                wallet_secrets,
+                robinhood.rpc_url,
+                robinhood.required_confirmations,
             ),
         )?;
 
         info!(
             target: "wallet",
             wallet = %base_wallet.address(),
-            "Initialized onchain wallet (Base + Ethereum + HyperEVM)"
+            "Initialized onchain wallet (Base + Ethereum + HyperEVM + Robinhood)"
         );
 
         Ok(Self {
             base: base_wallet,
             ethereum: ethereum_wallet,
             hyperevm: hyperevm_wallet,
+            robinhood: robinhood_wallet,
         })
     }
 
@@ -194,6 +206,10 @@ impl OnchainWalletCtx {
 
     pub fn hyperevm_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.hyperevm
+    }
+
+    pub fn robinhood_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
+        &self.robinhood
     }
 }
 
@@ -262,6 +278,9 @@ impl OnchainWalletCtx {
             hyperevm: st0x_evm::StubWallet::stub(address!(
                 "0x0000000000000000000000000000000000000999"
             )),
+            robinhood: st0x_evm::StubWallet::stub(address!(
+                "0x0000000000000000000000000000000000004663"
+            )),
         }
     }
 }
@@ -273,11 +292,13 @@ impl OnchainWalletCtx {
         base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
         ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
         hyperevm_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+        robinhood_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     ) -> Self {
         Self {
             base: base_wallet,
             ethereum: ethereum_wallet,
             hyperevm: hyperevm_wallet,
+            robinhood: robinhood_wallet,
         }
     }
 }

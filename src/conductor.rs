@@ -1747,6 +1747,7 @@ fn chain_wallet(
         Chain::Base => wallet_ctx.base_wallet(),
         Chain::Ethereum => wallet_ctx.ethereum_wallet(),
         Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
+        Chain::Robinhood => wallet_ctx.robinhood_wallet(),
     }
 }
 
@@ -2711,7 +2712,7 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
     let primary_wallet = match primary_chain {
         Chain::Base => &base_wallet,
         Chain::Ethereum => &ethereum_wallet,
-        Chain::HyperEvm => anyhow::bail!(
+        Chain::HyperEvm | Chain::Robinhood => anyhow::bail!(
             "the transfer gas readiness has no {primary_chain} wallet: \
              only the Base and Ethereum signers are wired"
         ),

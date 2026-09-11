@@ -557,6 +557,7 @@ pub enum ChainName {
     Ethereum,
     #[serde(rename = "hyperevm")]
     HyperEvm,
+    Robinhood,
 }
 
 /// Block lag of one watched chain's fill watcher.

@@ -1681,7 +1681,9 @@ mod tests {
             let idle_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
             let (primary_provider, secondary_provider) = match chain {
                 Chain::Base => (fill_chain_provider, None),
-                Chain::Ethereum | Chain::HyperEvm => (idle_provider, Some(fill_chain_provider)),
+                Chain::Ethereum | Chain::HyperEvm | Chain::Robinhood => {
+                    (idle_provider, Some(fill_chain_provider))
+                }
             };
             let executor = MockExecutorCtx.try_into_executor().await.unwrap();
             let ctx = create_test_ctx_with_order_owner(Address::ZERO);

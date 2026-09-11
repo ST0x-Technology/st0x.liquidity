@@ -182,6 +182,8 @@ pub enum TokenizationNetwork {
     /// HyperEVM mainnet
     #[value(name = "hyperevm")]
     HyperEvm,
+    /// Robinhood Chain mainnet
+    Robinhood,
 }
 
 impl From<TokenizationNetwork> for Chain {
@@ -190,6 +192,7 @@ impl From<TokenizationNetwork> for Chain {
             TokenizationNetwork::Base => Self::Base,
             TokenizationNetwork::Ethereum => Self::Ethereum,
             TokenizationNetwork::HyperEvm => Self::HyperEvm,
+            TokenizationNetwork::Robinhood => Self::Robinhood,
         }
     }
 }
@@ -4471,6 +4474,10 @@ mod tests {
                 lifecycle = "observe-only"
                 required_confirmations = 1
 
+                [chains.robinhood]
+                lifecycle = "observe-only"
+                required_confirmations = 1
+
                 [broker]
                 counter_trade_slippage_bps = 100
                 close_flatten_cross_max_bps = 400
@@ -4526,6 +4533,9 @@ mod tests {
 
                 [chains.hyperevm]
                 rpc_url = "https://rpc.hyperliquid.xyz/evm"
+
+                [chains.robinhood]
+                rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 
                 [broker]
                 type = "alpaca-broker-api"

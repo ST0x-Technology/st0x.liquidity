@@ -135,6 +135,7 @@ export const CHAIN_LABELS: Record<ChainName, string> = {
   base: 'Base',
   ethereum: 'Ethereum',
   hyperevm: 'HyperEVM',
+  robinhood: 'Robinhood',
 }
 
 /**
