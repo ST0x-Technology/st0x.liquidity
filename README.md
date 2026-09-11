@@ -16,7 +16,7 @@ The system enables efficient price discovery for onchain tokenized equity
 markets by providing continuous two-sided liquidity.
 
 HyperEVM supports prefunded fill ingestion and hedging with canonical USDC.
-Operators fund its equity, USDC and HYPE gas manually. An enabled watched
+Operators fund its equity, USDC and HYPE gas manually. An enabled hedged
 HyperEVM chain requires an explicit HYPE threshold in
 `[alerts.low_balance_thresholds]`; transport-only entries retain their existing
 configuration. Active mode, gas valuation and automated rebalancing on HyperEVM
@@ -99,12 +99,12 @@ nonzero, as must `inventory_divergence_threshold` (the number of consecutive
 offchain polls that must diverge from the inventory view before the poller
 escalates a forced snapshot reconciliation).
 
-Each watched chain requires its own `order_fill_poll_interval_secs`. Fill
-polling and catch-up use fixed inclusive `eth_getLogs` limits: 1000 blocks on
-Base and Ethereum, 50 on HyperEVM. These constants require no extra config.
-Catch-up queues are independent per chain; checkpoints advance after a whole
-range succeeds. See [OrderFillMonitor](docs/conductor.md#orderfillmonitor) for
-retry behavior and the catch-up throughput check required before go-live.
+Each hedged chain requires its own `order_fill_poll_interval_secs`. Fill polling
+and catch-up use fixed inclusive `eth_getLogs` limits: 1000 blocks on Base and
+Ethereum, 50 on HyperEVM. These constants require no extra config. Catch-up
+queues are independent per chain; checkpoints advance after a whole range
+succeeds. See [OrderFillMonitor](docs/conductor.md#orderfillmonitor) for retry
+behavior and the catch-up throughput check required before go-live.
 
 When equities are configured, `[pricing].ws_url` and the encrypted
 `[pricing].api_key` are also required. Remote endpoints must use `wss://`;
@@ -134,10 +134,10 @@ than skipping the chain:
   supplying its `rpc_url`, and vice versa. Acting on a chain with no endpoint,
   and holding an endpoint for a chain with no addresses, both leave fund routing
   undefined.
-- Exactly one chain may carry a `[trading]` table. The shape admits more, but
-  the runtime drives a single fill watcher, so a second trading chain would be
-  fully described and never read -- unhedged exposure presenting as a working
-  config.
+- Any number of chains may carry a `[trading]` table -- each hedged chain drives
+  its own fill watcher and its own vault polling -- but exactly one of them must
+  set `primary = true`. Zero or several primary claimants leave the chain the
+  rebalancing and cash paths read undefined, so startup fails naming them.
 - At least one chain must be configured, and at least one of those must trade.
 - Every `[chains.<name>]` entry must declare `required_confirmations` directly
   on the chain table (not inside `[trading]`). There is no default: the depth

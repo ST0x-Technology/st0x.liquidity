@@ -8,7 +8,7 @@
 //! tunes the gas monitor.
 //!
 //! The plaintext `[alerts]` section is required because its thresholds gate
-//! fresh transfers. Enabled watched HyperEVM additionally requires a HYPE
+//! fresh transfers. Enabled hedged HyperEVM additionally requires a HYPE
 //! threshold. The section must fully specify every field -- there are no silent
 //! threshold defaults, per the financial-integrity rule.
 
@@ -27,7 +27,7 @@ use crate::loader::StartupNotice;
 
 /// Chains monitored whenever alerting is configured.
 ///
-/// Enabled watched HyperEVM additionally requires its own threshold.
+/// Enabled hedged HyperEVM additionally requires its own threshold.
 pub const LEGACY_GAS_MONITORED_CHAINS: [Chain; 2] = [Chain::Base, Chain::Ethereum];
 
 /// Non-secret alerting settings deserialized from the plaintext config TOML.
@@ -66,7 +66,7 @@ pub struct AlertsConfig {
 #[derive(Debug, Clone)]
 pub struct AlertsCtx {
     /// Low-balance threshold in wei, per monitored chain. Validated at
-    /// construction to hold the legacy chains plus enabled watched HyperEVM.
+    /// construction to hold the legacy chains plus enabled hedged HyperEVM.
     low_balance_thresholds_wei: BTreeMap<Chain, U256>,
     pub poll_interval: std::time::Duration,
     pub realert_interval: std::time::Duration,
@@ -216,7 +216,7 @@ fn parse_threshold(chain: Chain, value: &str) -> Result<U256, AlertsAssemblyErro
 
 #[derive(Debug, Error)]
 pub enum AlertsAssemblyError {
-    #[error("enabled watched hyperevm requires [alerts] for native-gas monitoring")]
+    #[error("enabled hedged hyperevm requires [alerts] for native-gas monitoring")]
     HyperEvmRequiresAlerts,
     #[error("[alerts.low_balance_thresholds] {chain} has more than 18 decimal places")]
     ExcessThresholdPrecision { chain: Chain },
@@ -256,8 +256,8 @@ mod tests {
 
     use super::*;
 
-    fn hyper_config(lifecycle: &str, watched: bool) -> BTreeMap<Chain, crate::chain::ChainConfig> {
-        let trading = if watched {
+    fn hyper_config(lifecycle: &str, hedged: bool) -> BTreeMap<Chain, crate::chain::ChainConfig> {
+        let trading = if hedged {
             r#"[trading]
 orderbook = "0x1111111111111111111111111111111111111111"
 inventory_mode = "legacy"
@@ -280,7 +280,7 @@ order_fill_poll_interval_secs = 1
     }
 
     #[test]
-    fn watched_hyperevm_requires_alerts_and_its_own_positive_threshold() {
+    fn hedged_hyperevm_requires_alerts_and_its_own_positive_threshold() {
         for lifecycle in ["prefunded", "observe-only", "active"] {
             let chains = hyper_config(lifecycle, true);
             assert!(matches!(
@@ -326,7 +326,7 @@ order_fill_poll_interval_secs = 1
     }
 
     #[test]
-    fn unwatched_hyperevm_preserves_optional_alerts_and_rejects_unused_thresholds() {
+    fn unhedged_hyperevm_preserves_optional_alerts_and_rejects_unused_thresholds() {
         for chains in [
             BTreeMap::new(),
             hyper_config("disabled", true),

@@ -360,7 +360,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         }
     };
 
-    // One row per symbol the trading chain lists, joined with that symbol's
+    // One row per symbol the primary chain lists, joined with that symbol's
     // hedging policy. The two halves live in different tables now: what a
     // symbol is on-chain is a chain fact, how it hedges is not.
     let assets = ctx

@@ -2836,7 +2836,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_config::{
-        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, LogLevel, RestApiCtx, TradingChain,
+        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
         create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
@@ -4454,7 +4454,7 @@ mod tests {
             report,
             serde_json::json!({
                 "monitor": {
-                    // One series per watched chain, empty until it samples.
+                    // One series per hedged chain, empty until it samples.
                     "blockLag": [{
                         "chain": "base",
                         "currentLagBlocks": null,
@@ -4599,11 +4599,11 @@ mod tests {
     /// A secondary chain's watcher shares the primary's orderbook address;
     /// the report still shows it as its own series under its own chain.
     #[tokio::test]
-    async fn performance_infra_reports_one_lag_series_per_watched_chain() {
+    async fn performance_infra_reports_one_lag_series_per_hedged_chain() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let orderbook = ctx.chains.primary().orderbook;
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(orderbook)
                 .call(),
@@ -4643,7 +4643,7 @@ mod tests {
         let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         let series = report["monitor"]["blockLag"]
             .as_array()
-            .expect("one block-lag series per watched chain");
+            .expect("one block-lag series per hedged chain");
         assert_eq!(series.len(), 2);
         assert_eq!(series[0]["chain"], serde_json::json!("base"));
         assert_eq!(series[0]["currentLagBlocks"], serde_json::json!(17));

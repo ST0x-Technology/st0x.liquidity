@@ -39,11 +39,11 @@ pub use trade::{OnchainTrade, TradeValidationError};
 /// The single conversion point keeps every construction site in sync should
 /// the struct grow a field.
 pub fn raindex_contracts(
-    trading_chain: &st0x_config::TradingChain,
+    hedged_chain: &st0x_config::HedgedChain,
 ) -> st0x_raindex::RaindexContracts {
     st0x_raindex::RaindexContracts {
-        inventory: trading_chain.inventory_address(),
-        orderbook: trading_chain.orderbook,
+        inventory: hedged_chain.inventory_address(),
+        orderbook: hedged_chain.orderbook,
     }
 }
 
@@ -51,8 +51,8 @@ pub fn raindex_contracts(
 /// Provides error mapping between layers while maintaining separation of concerns.
 #[derive(Debug, thiserror::Error)]
 pub enum OnChainError {
-    #[error("job addressed to chain {chain}, which no watched chain matches")]
-    UnwatchedChain { chain: st0x_evm::Chain },
+    #[error("job addressed to chain {chain}, which no hedged chain matches")]
+    UnhedgedChain { chain: st0x_evm::Chain },
     #[error("Trade validation error: {0}")]
     Validation(#[from] TradeValidationError),
     #[error("Database persistence error: {0}")]
@@ -121,7 +121,7 @@ mod tests {
 
     use alloy::primitives::address;
 
-    use st0x_config::{InventoryMode, TradingChain};
+    use st0x_config::{HedgedChain, InventoryMode};
 
     use super::raindex_contracts;
 
@@ -133,7 +133,7 @@ mod tests {
     fn managed_mode_maps_each_address_to_its_own_slot() {
         let inventory = address!("0x2222222222222222222222222222222222222222");
         let contracts = raindex_contracts(
-            &TradingChain::test()
+            &HedgedChain::test()
                 .required_confirmations(1)
                 .inventory(InventoryMode::Managed { inventory })
                 .vault_owner(address!("0x3333333333333333333333333333333333333333"))
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn legacy_mode_points_both_slots_at_the_orderbook() {
         let contracts = raindex_contracts(
-            &TradingChain::test()
+            &HedgedChain::test()
                 .required_confirmations(1)
                 .inventory(InventoryMode::Legacy)
                 .vault_owner(address!("0x3333333333333333333333333333333333333333"))

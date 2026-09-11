@@ -29,7 +29,7 @@ use st0x_float_macro::float;
 #[cfg(any(test, feature = "test-support"))]
 use crate::InventoryAdapters;
 #[cfg(any(test, feature = "test-support"))]
-use crate::chain::TradingChain;
+use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
@@ -184,7 +184,7 @@ pub fn load_deployment_symbol_policy(
     )
 }
 
-/// One watched chain's approval surface: the orderbook and asset table its
+/// One hedged chain's approval surface: the orderbook and asset table its
 /// startup MAX approvals target, and the role that decides whether its
 /// equities' wrap and deposit grants are targeted at all.
 #[cfg(feature = "wallet-turnkey")]
@@ -197,7 +197,7 @@ pub struct ChainApprovalInputs {
 }
 
 /// Validated, network-free inputs required by the deploy-time Turnkey approval
-/// policy coverage check: one approval surface per watched chain, since
+/// policy coverage check: one approval surface per hedged chain, since
 /// startup grants approvals on every one of them.
 #[cfg(feature = "wallet-turnkey")]
 #[derive(Clone, Debug)]
@@ -206,7 +206,7 @@ pub struct TurnkeyApprovalPolicyInputs {
     pub kms_api_key: Option<st0x_evm::turnkey::TurnkeyKmsApiKey>,
     pub api_private_key: Option<st0x_evm::turnkey::TurnkeyApiPrivateKey>,
     pub wallet_address: Address,
-    pub watched: Vec<ChainApprovalInputs>,
+    pub hedged: Vec<ChainApprovalInputs>,
 }
 
 /// Non-secret settings deserialized from the plaintext config TOML.
@@ -714,7 +714,7 @@ pub struct Ctx {
     pub log_query_url_template: Option<LogQueryUrlTemplate>,
     pub server_port: u16,
     pub board_port: u16,
-    /// Every chain the bot acts on. Read the trading chain out of it with
+    /// Every chain the bot acts on. Read the primary chain out of it with
     /// [`ChainRegistry::primary`].
     pub chains: ChainRegistry,
     pub order_polling_interval_secs: u64,
@@ -2188,14 +2188,14 @@ impl Ctx {
             kms_api_key,
             api_private_key,
             wallet_address,
-            watched: parts
+            hedged: parts
                 .chains
-                .watched_with_roles()
-                .map(|(role, watched)| ChainApprovalInputs {
-                    chain: watched.chain,
+                .hedged_with_roles()
+                .map(|(role, hedged)| ChainApprovalInputs {
+                    chain: hedged.chain,
                     role,
-                    orderbook: watched.orderbook,
-                    assets: watched.assets.clone(),
+                    orderbook: hedged.orderbook,
+                    assets: hedged.assets.clone(),
                 })
                 .collect(),
         }))
@@ -2214,7 +2214,7 @@ impl Ctx {
     /// primary's: tokens sent to another chain's issuer address are lost.
     pub fn redemption_wallet(&self, chain: Chain) -> Result<Address, CtxError> {
         self.chains
-            .watch(chain)
+            .hedged_chain(chain)
             .and_then(|trading| trading.redemption_wallet)
             .ok_or(CtxError::RedemptionWalletNotConfigured { chain })
     }
@@ -2292,7 +2292,7 @@ impl Ctx {
         #[builder(default = InventoryMode::Legacy)]
         inventory_mode: InventoryMode,
         #[builder(default = InventoryAdapters::default())] inventory_adapters: InventoryAdapters,
-        /// What the trading chain lists.
+        /// What the hedged chain lists.
         assets: crate::ChainAssets,
         /// How those symbols hedge. Omitted by most fixtures, which care about
         /// the chain listing; when absent every listed symbol gets an
@@ -2364,8 +2364,8 @@ impl Ctx {
             log_query_url_template: None,
             server_port,
             board_port,
-            chains: ChainRegistry::single_trading_chain(
-                TradingChain::test()
+            chains: ChainRegistry::single_hedged_chain(
+                HedgedChain::test()
                     .rpc_url(rpc_url)
                     .required_confirmations(required_confirmations)
                     .orderbook(orderbook)
@@ -2593,7 +2593,7 @@ pub enum CtxError {
     )]
     MissingRebalancing,
     #[error(
-        "operation requires the trading chain's redemption_wallet \
+        "operation requires the hedged chain's redemption_wallet \
          ([chains.<name>.trading].redemption_wallet)"
     )]
     MissingTokenization,
@@ -2906,9 +2906,9 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         board_port: 8081,
         // Legacy by default: no distinct inventory, so the OPERATOR_ROLE
         // preflight is skipped. Tests exercising the managed path override
-        // the trading chain's `inventory` explicitly.
-        chains: ChainRegistry::single_trading_chain(
-            TradingChain::test()
+        // the hedged chain's `inventory` explicitly.
+        chains: ChainRegistry::single_hedged_chain(
+            HedgedChain::test()
                 .required_confirmations(1)
                 .inventory(InventoryMode::Legacy)
                 .vault_owner(order_owner)
@@ -8115,7 +8115,7 @@ mod tests {
             .chains
             .get(&Chain::Base)
             .and_then(|chain| chain.trading.as_ref())
-            .expect("prod config must describe Base as a trading chain");
+            .expect("prod config must describe Base as a hedged chain");
         let global_limit = base.assets.equities.operational_limit.map(Positive::inner);
 
         let broker = config.broker.expect(
@@ -8225,7 +8225,7 @@ mod tests {
             .chains
             .get(&Chain::Base)
             .and_then(|chain| chain.trading.as_ref())
-            .expect("s01-issuer config must describe Base as a trading chain")
+            .expect("s01-issuer config must describe Base as a hedged chain")
             .assets
             .equities
             .symbols
@@ -8461,7 +8461,7 @@ mod tests {
     }
 
     /// `parse_and_validate` requires the `[rebalancing]`, `[wallet]`, and
-    /// `[bot_gas_valuation]` sections and the trading chain's
+    /// `[bot_gas_valuation]` sections and the hedged chain's
     /// `redemption_wallet` at startup. But
     /// `all_repo_config_tomls_are_valid` only exercises `toml::from_str`,
     /// a structural parse that succeeds without them since the fields are
@@ -8490,7 +8490,7 @@ mod tests {
                     .values()
                     .filter_map(|chain_config| chain_config.trading.as_ref())
                     .any(|trading| trading.redemption_wallet.is_some()),
-                "{path:?}: no trading chain carries the required redemption_wallet"
+                "{path:?}: no hedged chain carries the required redemption_wallet"
             );
             assert!(
                 config.bot_gas_valuation.is_some(),
@@ -8565,7 +8565,7 @@ mod tests {
     }
 
     #[test]
-    fn prefunded_watched_hyperevm_loads_with_hype_monitoring() {
+    fn prefunded_hedged_hyperevm_loads_with_hype_monitoring() {
         let mut config = prefunded_hyperevm_config();
         let validated =
             validate_config(&config, Path::new("example.config.toml"), &mut Vec::new()).unwrap();
@@ -8679,7 +8679,7 @@ mod tests {
                         }
                     }
                     (InventoryModeTag::Legacy, Some(inventory)) => {
-                        // TradingChain::new rejects this combination at
+                        // HedgedChain::new rejects this combination at
                         // startup (LegacyWithInventory); asserting it here
                         // fails the contradiction in CI instead of at the
                         // deploy gate.
@@ -9614,14 +9614,14 @@ mod tests {
             inputs.wallet_address,
             address!("0x6666666666666666666666666666666666666666")
         );
-        assert_eq!(inputs.watched.len(), 1);
-        assert_eq!(inputs.watched[0].chain, Chain::Base);
+        assert_eq!(inputs.hedged.len(), 1);
+        assert_eq!(inputs.hedged[0].chain, Chain::Base);
         assert_eq!(
-            inputs.watched[0].orderbook,
+            inputs.hedged[0].orderbook,
             address!("0x1111111111111111111111111111111111111111")
         );
         assert!(
-            inputs.watched[0]
+            inputs.hedged[0]
                 .assets
                 .is_trading_enabled(&Symbol::new("AAPL").unwrap())
         );
@@ -9631,11 +9631,11 @@ mod tests {
     }
 
     /// The deploy gate proves coverage for every chain startup grants
-    /// approvals on, so the inputs list each watched chain with its own
+    /// approvals on, so the inputs list each hedged chain with its own
     /// orderbook and asset table -- not only the primary's.
     #[cfg(feature = "wallet-turnkey")]
     #[test]
-    fn load_turnkey_approval_policy_inputs_list_every_watched_chain() {
+    fn load_turnkey_approval_policy_inputs_list_every_hedged_chain() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
@@ -9781,7 +9781,7 @@ mod tests {
 
         assert_eq!(
             inputs
-                .watched
+                .hedged
                 .iter()
                 .map(|chain| (chain.chain, chain.role, chain.orderbook))
                 .collect::<Vec<_>>(),
@@ -9799,7 +9799,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            inputs.watched[1]
+            inputs.hedged[1]
                 .assets
                 .equities
                 .symbols

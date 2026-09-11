@@ -544,12 +544,12 @@ pub struct DependencyBucket {
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MonitorTelemetry {
-    /// One block-lag series per watched chain, the primary chain first.
+    /// One block-lag series per hedged chain, the primary chain first.
     pub block_lag: Vec<ChainBlockLag>,
     pub poll: PollHealth,
 }
 
-/// A watched chain, by the wire name `st0x_evm::Chain` pins.
+/// A hedged chain, by the wire name `st0x_evm::Chain` pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ChainName {
@@ -559,7 +559,7 @@ pub enum ChainName {
     HyperEvm,
 }
 
-/// Block lag of one watched chain's fill watcher.
+/// Block lag of one hedged chain's fill watcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainBlockLag {

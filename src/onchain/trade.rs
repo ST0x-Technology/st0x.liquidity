@@ -14,7 +14,7 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use st0x_config::{ChainAssets, InventoryAdapterVenue, InventoryAdapters, TradingChain};
+use st0x_config::{ChainAssets, HedgedChain, InventoryAdapterVenue, InventoryAdapters};
 use st0x_evm::{Chain, Evm, EvmError, IERC20, OpenChainErrorRegistry};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
@@ -516,7 +516,7 @@ impl OnchainTrade {
         tx_hash: TxHash,
         evm: &EvmImpl,
         cache: &SymbolCache,
-        ctx: &TradingChain,
+        ctx: &HedgedChain,
         actors: RecoveryActors,
     ) -> Result<Option<Self>, OnChainError> {
         let receipt = evm
@@ -570,7 +570,7 @@ impl OnchainTrade {
         // re-fetch the same receipt via a second `eth_getTransactionReceipt`.
         let recovery_config = InventoryRecoveryConfig {
             cache,
-            trading_chain: ctx,
+            hedged_chain: ctx,
         };
 
         Self::try_inventory_trade_from_receipt_logs(
@@ -602,7 +602,7 @@ impl OnchainTrade {
         let inventory_logs: Vec<Log> = logs
             .iter()
             .filter(|log| {
-                log.address() == config.trading_chain.inventory_address()
+                log.address() == config.hedged_chain.inventory_address()
                     && (log.topic0() == Some(&OperatorDeposit::SIGNATURE_HASH)
                         || log.topic0() == Some(&OperatorWithdraw::SIGNATURE_HASH))
             })
@@ -633,11 +633,11 @@ impl OnchainTrade {
         };
 
         Self::try_from_inventory_trade(
-            config.trading_chain.chain,
+            config.hedged_chain.chain,
             config.cache,
             evm,
-            &config.trading_chain.assets,
-            &config.trading_chain.inventory_adapters,
+            &config.hedged_chain.assets,
+            &config.hedged_chain.inventory_adapters,
             &inv,
             withdraw_log,
             Some(receipt_metadata),
@@ -650,7 +650,7 @@ impl OnchainTrade {
 /// keeping its argument count under the clippy threshold.
 struct InventoryRecoveryConfig<'config> {
     cache: &'config SymbolCache,
-    trading_chain: &'config TradingChain,
+    hedged_chain: &'config HedgedChain,
 }
 
 fn inventory_trade_source(
@@ -821,7 +821,7 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
     log: &Log,
     evm: &EvmImpl,
     cache: &SymbolCache,
-    ctx: &TradingChain,
+    ctx: &HedgedChain,
     receipt_metadata: ReceiptMetadata,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
@@ -999,8 +999,8 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_config::{
-        ChainEquities, ChainEquityAsset, InventoryAdapter, InventoryAdapterVenue,
-        InventoryAdapters, InventoryMode, OperationMode, TradingChain,
+        ChainEquities, ChainEquityAsset, HedgedChain, InventoryAdapter, InventoryAdapterVenue,
+        InventoryAdapters, InventoryMode, OperationMode,
     };
     use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::ReadOnlyEvm;
@@ -1266,7 +1266,7 @@ mod tests {
         asserter.push_success(&serde_json::Value::Null);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
-        let ctx = TradingChain::test()
+        let ctx = HedgedChain::test()
             .orderbook(Address::ZERO)
             .inventory(InventoryMode::Managed {
                 inventory: Address::ZERO,
@@ -1358,7 +1358,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         seed_get_test_order_token_symbols(&cache);
-        let ctx = TradingChain::test()
+        let ctx = HedgedChain::test()
             .orderbook(orderbook)
             .inventory(InventoryMode::Managed {
                 inventory: Address::ZERO,
@@ -1468,7 +1468,7 @@ mod tests {
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let ctx = TradingChain::test()
+        let ctx = HedgedChain::test()
             .orderbook(orderbook)
             .inventory(InventoryMode::Managed { inventory })
             .inventory_adapters(inventory_adapters(
@@ -1477,7 +1477,7 @@ mod tests {
             ))
             .vault_owner(inventory)
             .call();
-        let ctx = TradingChain {
+        let ctx = HedgedChain {
             assets: assets_config_with_equity("COIN", REAL_WTCOIN_BASE),
             ..ctx
         };
@@ -1508,7 +1508,7 @@ mod tests {
                 operator: venue_operator,
                 venue: InventoryVenue::Bebop,
             },
-            "the recovered source must come from the trading chain's own adapter registry"
+            "the recovered source must come from the hedged chain's own adapter registry"
         );
     }
 
@@ -1607,7 +1607,7 @@ mod tests {
         asserter.push_success(&receipt); // get_transaction_receipt
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let ctx = TradingChain::test()
+        let ctx = HedgedChain::test()
             .orderbook(orderbook)
             .inventory(InventoryMode::Managed { inventory })
             .vault_owner(inventory)
@@ -1711,7 +1711,7 @@ mod tests {
         asserter.push_success(&receipt); // get_transaction_receipt
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let ctx = TradingChain::test()
+        let ctx = HedgedChain::test()
             .orderbook(orderbook)
             .inventory(InventoryMode::Managed { inventory })
             .vault_owner(inventory)
@@ -2418,7 +2418,7 @@ mod tests {
         preload_on_all_chains(&cache, REAL_USDC_BASE, "USDC");
         preload_on_all_chains(&cache, REAL_WTCOIN_BASE, "wtCOIN");
 
-        let ctx = TradingChain::test()
+        let ctx = HedgedChain::test()
             .chain(Chain::Base)
             .inventory(InventoryMode::Managed { inventory })
             .inventory_adapters(inventory_adapters(

@@ -113,7 +113,7 @@ pub(crate) struct CqrsFrameworks {
 #[derive(Debug, Error)]
 pub(crate) enum ConductorSpawnError {
     #[error(
-        "watched chain {chain} has no {what} wired; the provider, queue, and \
+        "hedged chain {chain} has no {what} wired; the provider, queue, and \
          token maps must all be derived from the same chain registry"
     )]
     MissingWatchWiring {
@@ -138,7 +138,7 @@ pub(crate) enum ConductorSpawnError {
 /// Everything needed to construct a running [`Conductor`].
 pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) ctx: Ctx,
-    /// Providers for watched, non-primary chains (the primary's fill watcher
+    /// Providers for hedged, non-primary chains (the primary's fill watcher
     /// reuses `provider`). Keyed by chain; derived from the same registry as
     /// the queue and token maps.
     pub(crate) watch_providers: std::collections::BTreeMap<st0x_evm::Chain, Prov>,
@@ -158,7 +158,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) wallet_polling: WalletPollingCtx,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    /// Ratio source for the portfolio-snapshot capture gate, one per watched
+    /// Ratio source for the portfolio-snapshot capture gate, one per hedged
     /// chain: market making holds wrapped vault shares onchain, and the daily
     /// capture job resolves each wrapped balance through the service of the
     /// chain that balance sits on.
@@ -170,7 +170,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) failure_injector: FailureInjector,
 }
 
-/// The equity and USDC vaults one watched chain's assets table configures.
+/// The equity and USDC vaults one hedged chain's assets table configures.
 /// The inventory poller checks its retired-vault warnings against these: a
 /// registered vault outside the set is one the config no longer names.
 struct ConfiguredChainVaults {
@@ -179,7 +179,7 @@ struct ConfiguredChainVaults {
 }
 
 /// Equity symbols the portfolio treats as configured: the union over every
-/// watched chain.
+/// hedged chain.
 ///
 /// Hedging is venue-level -- one broker book backs every chain's market making
 /// -- so filtering an offchain snapshot against the primary's table alone
@@ -188,8 +188,8 @@ struct ConfiguredChainVaults {
 /// what "configured" means.
 pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
     ctx.chains
-        .watched()
-        .flat_map(|watched| chain_equity_symbols(&watched.assets))
+        .hedged()
+        .flat_map(|hedged| chain_equity_symbols(&hedged.assets))
         .collect()
 }
 
@@ -212,29 +212,29 @@ fn chain_equity_symbols(assets: &st0x_config::ChainAssets) -> HashSet<Symbol> {
 /// actually stamp for that chain and nothing more.
 fn market_making_slots(ctx: &Ctx) -> BTreeMap<Chain, MarketMakingSlots> {
     ctx.chains
-        .watched()
-        .map(|watched| {
+        .hedged()
+        .map(|hedged| {
             (
-                watched.chain,
+                hedged.chain,
                 MarketMakingSlots {
-                    equity_symbols: chain_equity_symbols(&watched.assets),
-                    usdc_tracking_enabled: watched.assets.cash.is_some(),
+                    equity_symbols: chain_equity_symbols(&hedged.assets),
+                    usdc_tracking_enabled: hedged.assets.cash.is_some(),
                 },
             )
         })
         .collect()
 }
 
-fn configured_chain_vaults(watched: &st0x_config::TradingChain) -> ConfiguredChainVaults {
+fn configured_chain_vaults(hedged: &st0x_config::HedgedChain) -> ConfiguredChainVaults {
     let mut equity_vaults: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
-    for equity_config in watched.assets.equities.symbols.values() {
+    for equity_config in hedged.assets.equities.symbols.values() {
         equity_vaults
             .entry(equity_config.tokenized_equity_derivative)
             .or_default()
             .extend(equity_config.vault_ids.iter().copied());
     }
 
-    let usdc_vaults = watched
+    let usdc_vaults = hedged
         .assets
         .cash
         .as_ref()
@@ -246,7 +246,7 @@ fn configured_chain_vaults(watched: &st0x_config::TradingChain) -> ConfiguredCha
     }
 }
 
-/// The vault-reading leg of the inventory poller, one entry per watched
+/// The vault-reading leg of the inventory poller, one entry per hedged
 /// chain. Each entry carries that chain's own Raindex service on that chain's
 /// own provider, its own orderbook and vault owner (which key its
 /// chain-qualified vault registry), and the vaults its own assets table
@@ -266,9 +266,9 @@ where
     let primary_chain = ctx.chains.primary().chain;
 
     ctx.chains
-        .watched()
-        .map(|watched| {
-            let chain = watched.chain;
+        .hedged()
+        .map(|hedged| {
+            let chain = hedged.chain;
             let provider = if chain == primary_chain {
                 primary_provider.clone()
             } else {
@@ -282,17 +282,17 @@ where
             let ConfiguredChainVaults {
                 equity_vaults,
                 usdc_vaults,
-            } = configured_chain_vaults(watched);
+            } = configured_chain_vaults(hedged);
 
             Ok(ChainVaultPolling::new(
                 chain,
                 Arc::new(RaindexService::new(
                     ReadOnlyEvm::new(provider),
-                    crate::onchain::raindex_contracts(watched),
+                    crate::onchain::raindex_contracts(hedged),
                     ctx.order_owner(),
                 )),
-                watched.orderbook,
-                watched.vault_owner,
+                hedged.orderbook,
+                hedged.vault_owner,
             )
             .with_configured_vaults(equity_vaults, usdc_vaults))
         })
@@ -572,26 +572,26 @@ where
 
     let maintenance_interval = context.executor.maintenance_interval();
 
-    // One accounting entry per watched chain: the primary reuses the main
+    // One accounting entry per hedged chain: the primary reuses the main
     // provider; secondaries take theirs from `watch_providers` (shared with
     // the per-chain monitors below).
     let mut chain_accounting = std::collections::BTreeMap::new();
-    for watched in context.ctx.chains.watched() {
-        let provider = if watched.chain == context.ctx.chains.primary().chain {
+    for hedged in context.ctx.chains.hedged() {
+        let provider = if hedged.chain == context.ctx.chains.primary().chain {
             context.provider.clone()
         } else {
-            watch_providers.get(&watched.chain).cloned().ok_or(
+            watch_providers.get(&hedged.chain).cloned().ok_or(
                 ConductorSpawnError::MissingWatchWiring {
-                    chain: watched.chain,
+                    chain: hedged.chain,
                     what: "accounting provider",
                 },
             )?
         };
         chain_accounting.insert(
-            watched.chain,
+            hedged.chain,
             crate::trading::onchain::trade_accountant::ChainAccounting {
-                trading: watched.clone(),
-                contracts: crate::onchain::raindex_contracts(watched),
+                trading: hedged.clone(),
+                contracts: crate::onchain::raindex_contracts(hedged),
                 evm: ReadOnlyEvm::new(provider),
             },
         );
@@ -633,16 +633,16 @@ where
         .with_base_restart_delay(std::time::Duration::from_secs(1))
         .with_dead_tasks_threshold(Some(0.0));
 
-    // One fill watcher per watched chain, each with its own provider, poll
+    // One fill watcher per hedged chain, each with its own provider, poll
     // interval, namespaced scan queue, and readiness token. The primary
     // reuses the conductor's main provider; secondaries take theirs from
     // `watch_providers` (absent entries are a startup bug: the token map,
     // queue map, and provider map are all derived from the same registry).
     let primary_chain = context.ctx.chains.primary().chain;
-    let watched_chains: Vec<st0x_config::TradingChain> =
-        context.ctx.chains.watched().cloned().collect();
-    for watched in watched_chains {
-        let chain = watched.chain;
+    let hedged_chains: Vec<st0x_config::HedgedChain> =
+        context.ctx.chains.hedged().cloned().collect();
+    for hedged in hedged_chains {
+        let chain = hedged.chain;
         let provider = if chain == primary_chain {
             context.provider.clone()
         } else {
@@ -668,14 +668,9 @@ where
             },
         )?;
 
-        let poll_interval = watched.order_fill_poll_interval;
-        let monitor = OrderFillMonitor::new(
-            watched,
-            queue,
-            context.pool.clone(),
-            provider,
-            poll_interval,
-        );
+        let poll_interval = hedged.order_fill_poll_interval;
+        let monitor =
+            OrderFillMonitor::new(hedged, queue, context.pool.clone(), provider, poll_interval);
 
         supervisor_builder = supervisor_builder.with_task(
             &format!("order-fill-monitor-{chain}"),
@@ -965,7 +960,7 @@ where
 
         tokio::spawn(startup_token.wrap(async move {
             // Supervised: an incomplete backfill can omit onchain trades. One
-            // worker per watched chain, each on its own namespaced queue, so
+            // worker per hedged chain, each on its own namespaced queue, so
             // one chain's scan backlog never occupies another chain's worker.
             let mut monitor = Monitor::new();
             for (worker_chain, chain_queue) in backfill_queues.iter() {
@@ -1676,13 +1671,13 @@ mod tests {
     }
 
     /// Hedging is venue-level: one broker book backs the market making of
-    /// every watched chain. A symbol only a secondary chain trades therefore
+    /// every hedged chain. A symbol only a secondary chain trades therefore
     /// has a broker position too, and judging "configured" by the primary's
     /// assets table alone drops it from the offchain snapshot -- which the
     /// view then reads as a complete picture and zeroes the symbol's Hedging
     /// slot.
     #[test]
-    fn configured_equity_symbols_span_every_watched_chain() {
+    fn configured_equity_symbols_span_every_hedged_chain() {
         let secondary_symbol = Symbol::new("NVDA").unwrap();
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().assets = ChainAssets {
@@ -1696,7 +1691,7 @@ mod tests {
             cash: None,
         };
         ctx.chains.insert_secondary(
-            st0x_config::TradingChain::test()
+            st0x_config::HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .assets(ChainAssets {
                     equities: ChainEquities {
@@ -1721,15 +1716,15 @@ mod tests {
     }
 
     /// Vault polling is what seeds a chain's inventory slots, so every
-    /// watched chain needs an entry of its own -- keyed on that chain's
+    /// hedged chain needs an entry of its own -- keyed on that chain's
     /// orderbook and vault owner, not the primary's.
     #[test]
-    fn vault_polling_entries_cover_every_watched_chain() {
+    fn vault_polling_entries_cover_every_hedged_chain() {
         let ethereum_orderbook = Address::repeat_byte(0xe0);
         let ethereum_vault_owner = Address::repeat_byte(0xe1);
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.insert_secondary(
-            st0x_config::TradingChain::test()
+            st0x_config::HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(ethereum_orderbook)
                 .vault_owner(ethereum_vault_owner)
@@ -1759,15 +1754,15 @@ mod tests {
                 ),
                 (Chain::Ethereum, ethereum_orderbook, ethereum_vault_owner),
             ],
-            "each watched chain must get its own vault-polling entry"
+            "each hedged chain must get its own vault-polling entry"
         );
     }
 
-    /// A watched chain's balances are captured in the daily snapshot, so its
+    /// A hedged chain's balances are captured in the daily snapshot, so its
     /// market-making slots must gate the capture too -- with only the assets
     /// that chain's own table declares.
     #[test]
-    fn market_making_slots_cover_every_watched_chain() {
+    fn market_making_slots_cover_every_hedged_chain() {
         let secondary_symbol = Symbol::new("NVDA").unwrap();
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().assets = ChainAssets {
@@ -1785,7 +1780,7 @@ mod tests {
             }),
         };
         ctx.chains.insert_secondary(
-            st0x_config::TradingChain::test()
+            st0x_config::HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .assets(ChainAssets {
                     equities: ChainEquities {
@@ -1819,7 +1814,7 @@ mod tests {
                 ),
                 (Chain::Ethereum, HashSet::from([secondary_symbol]), false),
             ],
-            "each watched chain contributes the slots its own assets table declares"
+            "each hedged chain contributes the slots its own assets table declares"
         );
     }
 

@@ -11,7 +11,7 @@ use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet}
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
-use super::rebalancing::{TradingChainContext, trading_chain_context};
+use super::rebalancing::{HedgedChainContext, hedged_chain_context};
 use super::{CctpChain, TokenizationNetwork};
 
 impl CctpChain {
@@ -189,11 +189,11 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
     network: TokenizationNetwork,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let TradingChainContext {
+    let HedgedChainContext {
         chain,
         wallet: caller,
         trading,
-    } = trading_chain_context(ctx, network)?;
+    } = hedged_chain_context(ctx, network)?;
     let usdc_address = chain.usdc();
     let spender = trading.orderbook;
     let owner = caller.address();
@@ -244,7 +244,7 @@ mod tests {
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{CtxError, LogFormat, LogLevel};
-    use st0x_config::{InventoryMode, TradingChain};
+    use st0x_config::{HedgedChain, InventoryMode};
     use st0x_evm::Chain;
     use st0x_evm::OpenChainErrorRegistry;
     use st0x_finance::Usdc;
@@ -260,8 +260,8 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(
-                TradingChain::test()
+            chains: ChainRegistry::single_hedged_chain(
+                HedgedChain::test()
                     .orderbook(address!("0x1234567890123456789012345678901234567890"))
                     .inventory(InventoryMode::Managed {
                         inventory: address!("0x1234567890123456789012345678901234567890"),
@@ -360,7 +360,7 @@ mod tests {
     async fn reset_allowance_on_ethereum_targets_that_chains_orderbook_and_usdc() {
         let mut ctx = create_ctx_with_stub_wallet();
         ctx.chains.insert_secondary(
-            TradingChain::test()
+            HedgedChain::test()
                 .chain(Chain::Ethereum)
                 .orderbook(ETHEREUM_ORDERBOOK)
                 .call(),
@@ -424,7 +424,7 @@ mod tests {
     async fn reset_allowance_on_hyperevm_uses_canonical_usdc() {
         let mut ctx = create_ctx_with_stub_wallet();
         ctx.chains
-            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
+            .insert_secondary(HedgedChain::test().chain(Chain::HyperEvm).call());
 
         let mut stdout = Vec::new();
         reset_allowance_command::<OpenChainErrorRegistry, _>(
