@@ -3186,25 +3186,29 @@ mod tests {
     }
 
     /// The enablement predicate has to run on the real load path, not just as
-    /// a unit. HyperEVM supports prefunded trading but lacks gas valuation,
-    /// so raising it to "active" must still be refused.
+    /// a unit. HyperEVM supports prefunded trading and Robinhood signs only;
+    /// neither wires a gas-valuation source, so raising either from
+    /// "observe-only" to "active" must still be refused, naming the chain and
+    /// its missing capability.
     #[tokio::test]
-    async fn hyperevm_cannot_be_raised_to_active() {
-        let config = toml_file(
-            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
-                "[chains.hyperevm]\n            lifecycle = \"observe-only\"",
-                "[chains.hyperevm]\n            lifecycle = \"active\"",
-            ),
-        );
-        let secrets = alpaca_secrets_toml();
+    async fn observe_only_chains_cannot_be_raised_to_active() {
+        for chain in ["hyperevm", "robinhood"] {
+            let from = format!("[chains.{chain}]\n            lifecycle = \"observe-only\"");
+            let to = format!("[chains.{chain}]\n            lifecycle = \"active\"");
+            let config = toml_file(
+                &String::from_utf8_lossy(minimal_config_toml_bytes())
+                    .replace(from.as_str(), to.as_str()),
+            );
+            let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
-        let message = error.to_string();
+            let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+            let message = error.to_string();
 
-        assert!(
-            message.contains("hyperevm") && message.contains("gas valuation"),
-            "expected the predicate to name hyperevm and its missing capability, got: {message}"
-        );
+            assert!(
+                message.contains(chain) && message.contains("gas valuation"),
+                "expected the predicate to name {chain} and its missing capability, got: {message}"
+            );
+        }
     }
 
     /// A disabled chain is dropped from the registry, so a wallet that signs
