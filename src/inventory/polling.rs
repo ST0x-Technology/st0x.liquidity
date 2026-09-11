@@ -786,6 +786,7 @@ where
                 .raindex_service
                 .get_usdc_balance::<OpenChainErrorRegistry>(
                     vault_polling.vault_owner,
+                    vault_polling.chain.usdc(),
                     RaindexVaultId(vault.vault_id),
                     block_number,
                 )
