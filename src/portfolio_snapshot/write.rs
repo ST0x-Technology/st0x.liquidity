@@ -3343,6 +3343,78 @@ mod tests {
         );
     }
 
+    /// Hedging is venue-level: one broker book backs the market making of
+    /// every hedged chain, so a symbol a secondary chain alone trades still
+    /// has a broker position the capture must wait for. Captured without it,
+    /// the day carries that chain's onchain balance with no offsetting broker
+    /// leg -- an incomplete portfolio no later capture can amend.
+    #[tokio::test]
+    async fn a_secondary_only_symbols_missing_hedging_row_defers_capture() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let nvda = Symbol::new("NVDA").unwrap();
+        let now = Utc::now();
+
+        // AAPL and USDC are polled at both venues; NVDA is polled at its own
+        // chain's market making alone, so its Hedging row is still absent.
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        )
+        .apply_equity_snapshot(
+            Venue::MarketMaking,
+            Chain::Ethereum,
+            [(&nvda, &FractionalShares::new(float!(4)))],
+            now,
+            None,
+            now,
+        )
+        .unwrap();
+
+        let (mut ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Ethereum,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::from([nvda]),
+                usdc_tracking_enabled: false,
+            },
+        );
+        mark_all_required_fresh(&ctx);
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let et_day = et_day(Utc::now()).to_string();
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &et_day).await,
+            0,
+            "the secondary chain's only symbol has no broker position polled yet, so the \
+             portfolio is incomplete and capture must wait"
+        );
+    }
+
     /// Onchain MarketMaking equity and BaseWalletWrapped-transit equity are
     /// WRAPPED ERC-4626 vault shares, not underlying shares. With a non-1:1
     /// ratio (1.5, simulating vault NAV accrual from dividends/splits), both
