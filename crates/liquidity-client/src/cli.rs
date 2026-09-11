@@ -149,29 +149,11 @@ pub(crate) enum UsdcDirection {
     BaseToAlpaca,
 }
 
-impl UsdcDirection {
-    pub(crate) fn segment(self) -> &'static str {
-        match self {
-            Self::AlpacaToBase => "alpaca_to_base",
-            Self::BaseToAlpaca => "base_to_alpaca",
-        }
-    }
-}
-
 /// Equity transfer kind, spelled as the bot's reconcile path segment.
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum EquityTransferKind {
     Mint,
     Redemption,
-}
-
-impl EquityTransferKind {
-    pub(crate) fn segment(self) -> &'static str {
-        match self {
-            Self::Mint => "equity_mint",
-            Self::Redemption => "equity_redemption",
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -187,7 +169,7 @@ pub(crate) struct SetPositionArgs {
     /// Equity symbol.
     pub(crate) symbol: String,
     /// Signed decimal net exposure to set (negative is short).
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     pub(crate) target_net: String,
     /// USDC price per share; required for nonzero targets under a dollar
     /// value threshold.
@@ -287,8 +269,12 @@ mod tests {
     //! Tests for CLI argument parsing and the key=value parameter parser.
     use clap::Parser as _;
 
-    use super::{Cli, parse_key_value};
+    use super::{
+        Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, UsdcDirection,
+        parse_key_value,
+    };
     use crate::target::Env;
+    use crate::wire::ReconcileUsdcReason;
 
     #[test]
     fn parses_key_and_value() {
@@ -335,5 +321,208 @@ mod tests {
         ])
         .map(|cli| cli.env);
         assert!(matches!(parsed, Ok(Env::Staging)));
+    }
+
+    /// Parses a full argv (after `--env staging`) into the debug command.
+    fn debug(args: &[&str]) -> Result<Debug, clap::Error> {
+        let full = ["st0x-liquidity-client", "--env", "staging", "debug"]
+            .into_iter()
+            .chain(args.iter().copied());
+        Cli::try_parse_from(full).map(|cli| match cli.command {
+            Command::Debug(debug) => debug,
+            Command::Read(_) => panic!("expected a debug command"),
+        })
+    }
+
+    /// The verbs whose only inputs are positionals and a `--reason`: the
+    /// command name, the argument order, and the reason requirement are the
+    /// operator-facing contract.
+    #[test]
+    fn parses_reason_bearing_debug_verbs() {
+        assert!(matches!(
+            debug(&["reconcile-usdc", "abc", "--reason", "funds-moved-manually"]).unwrap(),
+            Debug::ReconcileUsdc {
+                id,
+                reason: ReconcileUsdcReason::FundsMovedManually,
+            } if id == "abc"
+        ));
+        assert!(matches!(
+            debug(&["reconcile-equity", "redemption", "abc", "--reason", "settled"]).unwrap(),
+            Debug::ReconcileEquity {
+                kind: EquityTransferKind::Redemption,
+                id,
+                reason,
+            } if id == "abc" && reason == "settled"
+        ));
+        assert!(matches!(
+            debug(&["clear-pending-burn", "abc", "--reason", "dropped"]).unwrap(),
+            Debug::ClearPendingBurn { id, reason } if id == "abc" && reason == "dropped"
+        ));
+        assert!(matches!(
+            debug(&["fail-usdc-transfer", "abc", "--reason", "pre-burn crash"]).unwrap(),
+            Debug::FailUsdcTransfer { id, reason } if id == "abc" && reason == "pre-burn crash"
+        ));
+
+        for verb in ["reconcile-usdc", "clear-pending-burn", "fail-usdc-transfer"] {
+            let Err(error) = debug(&[verb, "abc"]) else {
+                panic!("{verb} must require --reason");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{verb} must require --reason"
+            );
+        }
+    }
+
+    /// Value enums are validated by clap before any network call, with the
+    /// kebab-case spellings the help text advertises.
+    #[test]
+    fn value_enums_accept_their_spellings_and_reject_others() {
+        assert!(matches!(
+            debug(&["resume-usdc", "alpaca-to-base", "abc"]).unwrap(),
+            Debug::ResumeUsdc {
+                direction: UsdcDirection::AlpacaToBase,
+                ..
+            }
+        ));
+        assert!(matches!(
+            debug(&["resume-usdc", "base-to-alpaca", "abc"]).unwrap(),
+            Debug::ResumeUsdc {
+                direction: UsdcDirection::BaseToAlpaca,
+                ..
+            }
+        ));
+        assert!(matches!(
+            debug(&["reconcile-equity", "mint", "abc", "--reason", "x"]).unwrap(),
+            Debug::ReconcileEquity {
+                kind: EquityTransferKind::Mint,
+                ..
+            }
+        ));
+        assert!(matches!(
+            debug(&[
+                "reconcile-usdc",
+                "abc",
+                "--reason",
+                "deposit-credited-offline"
+            ])
+            .unwrap(),
+            Debug::ReconcileUsdc {
+                reason: ReconcileUsdcReason::DepositCreditedOffline,
+                ..
+            }
+        ));
+
+        for argv in [
+            &["resume-usdc", "sideways", "abc"][..],
+            &["reconcile-equity", "usdc", "abc", "--reason", "x"][..],
+            &["reconcile-usdc", "abc", "--reason", "typo"][..],
+        ] {
+            let Err(error) = debug(argv) else {
+                panic!("{argv:?} must be refused");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidValue,
+                "{argv:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_process_tx() {
+        assert!(matches!(
+            debug(&["process-tx", "0xabc"]).unwrap(),
+            Debug::ProcessTx { tx_hash } if tx_hash == "0xabc"
+        ));
+    }
+
+    /// The nested groups: every flag on `position set` / `release-hedge` and
+    /// `portfolio-snapshot set-mark` is required except the optional price.
+    #[test]
+    fn parses_nested_position_and_snapshot_verbs() {
+        let Debug::Position(Position::Set(set)) = debug(&[
+            "position",
+            "set",
+            "AAPL",
+            "--target-net",
+            "-1.5",
+            "--reason",
+            "manual",
+        ])
+        .unwrap() else {
+            panic!("expected position set");
+        };
+        assert_eq!(set.symbol, "AAPL");
+        assert_eq!(set.target_net, "-1.5");
+        assert_eq!(set.price_usdc, None);
+
+        let Debug::Position(Position::Set(set)) = debug(&[
+            "position",
+            "set",
+            "AAPL",
+            "--target-net",
+            "2",
+            "--price-usdc",
+            "150.25",
+            "--reason",
+            "manual",
+        ])
+        .unwrap() else {
+            panic!("expected position set");
+        };
+        assert_eq!(set.price_usdc.as_deref(), Some("150.25"));
+
+        let Debug::Position(Position::ReleaseHedge(release)) = debug(&[
+            "position",
+            "release-hedge",
+            "AAPL",
+            "--order-id",
+            "ord-1",
+            "--reason",
+            "cancelled",
+        ])
+        .unwrap() else {
+            panic!("expected position release-hedge");
+        };
+        assert_eq!(release.order_id, "ord-1");
+
+        let Debug::PortfolioSnapshot(PortfolioSnapshot::SetMark(mark)) = debug(&[
+            "portfolio-snapshot",
+            "set-mark",
+            "--day",
+            "2026-09-01",
+            "--symbol",
+            "AAPL",
+            "--usd-mark",
+            "150.25",
+            "--observed-at",
+            "2026-09-01T20:00:00Z",
+            "--source",
+            "nasdaq",
+            "--reason",
+            "stale",
+        ])
+        .unwrap() else {
+            panic!("expected portfolio-snapshot set-mark");
+        };
+        assert_eq!(mark.day, "2026-09-01");
+        assert_eq!(mark.source, "nasdaq");
+
+        for argv in [
+            &["position", "set", "AAPL", "--reason", "manual"][..],
+            &["position", "release-hedge", "AAPL", "--reason", "cancelled"][..],
+            &["portfolio-snapshot", "set-mark", "--day", "2026-09-01"][..],
+        ] {
+            let Err(error) = debug(argv) else {
+                panic!("{argv:?} must require its flags");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{argv:?} must require its flags"
+            );
+        }
     }
 }
