@@ -438,6 +438,16 @@
                     bun run lint
                     bun run check
                   '
+
+                  # Turnkey public-message utility: frozen deps, tests, types, format
+                  nix develop .#ci-dashboard -c bash -c '
+                    set -euxo pipefail
+                    cd scripts/turnkey-message
+                    bun install --frozen-lockfile
+                    bun test
+                    bun run typecheck
+                    bun run format:check
+                  '
                 '';
               };
 

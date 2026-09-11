@@ -41,6 +41,11 @@ remain unavailable.
   directional exposure from onchain fills
 - **Operator Vault Controls**: CLI supports generic ERC20 deposits to and
   withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
+- **Public Incident Messaging**: The
+  [`scripts/turnkey-message`](scripts/turnkey-message/README.md) utility
+  prepares, signs, verifies, sends, and reads zero-value Base messages from an
+  explicitly selected Turnkey wallet, with inventory representation optional for
+  throwaway-wallet testing
 - **Orchestrator-Mode Mint Authorization**: For assets issuance serves through
   an `ST0xOrchestrator` vault, signs an EIP-712 MintAuthV1 recipient
   authorization (nonce persisted before delivery, byte-identical retries) and
