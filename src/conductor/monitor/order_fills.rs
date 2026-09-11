@@ -158,6 +158,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> SupervisedTask for OrderFillMo
             if let Err(error) = record_poll_cycle(
                 &self.pool,
                 Monitor::OrderFill,
+                self.evm_ctx.chain,
                 self.evm_ctx.orderbook,
                 sampled_at,
                 poll_duration,

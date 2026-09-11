@@ -629,6 +629,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(10),
             StdDuration::from_millis(100),
@@ -640,6 +641,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(20),
             StdDuration::from_millis(300),
@@ -652,6 +654,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(-100),
             StdDuration::from_millis(900),
@@ -663,10 +666,11 @@ mod tests {
         // A different monitor's samples must not pollute the aggregates.
         sqlx::query(
             "INSERT INTO poll_cycle_samples \
-             (sampled_at, monitor, orderbook, duration_ms, skipped_ticks, outcome, error) \
-             VALUES ($1, 'other_monitor', $2, 9000, 9, 'ok', NULL)",
+             (sampled_at, monitor, chain, orderbook, duration_ms, skipped_ticks, outcome, error) \
+             VALUES ($1, 'other_monitor', $2, $3, 9000, 9, 'ok', NULL)",
         )
         .bind(sqlite_timestamp(timestamp(30)))
+        .bind(Chain::Base.as_str())
         .bind(ORDERBOOK.to_string())
         .execute(&pool)
         .await
@@ -676,6 +680,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             address!("0x2222222222222222222222222222222222222222"),
             timestamp(40),
             StdDuration::from_millis(7_000),
@@ -714,6 +719,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(10),
             StdDuration::from_millis(100),
@@ -725,6 +731,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Ethereum,
             ethereum_orderbook,
             timestamp(20),
             StdDuration::from_millis(400),
@@ -762,6 +769,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(10),
             StdDuration::from_millis(100),
@@ -773,6 +781,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Ethereum,
             ORDERBOOK,
             timestamp(20),
             StdDuration::from_millis(400),
