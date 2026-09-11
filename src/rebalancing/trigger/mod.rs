@@ -3444,10 +3444,12 @@ impl RebalancingService {
     fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>, Option<Usd>)> {
         let threshold = self.config.usdc.as_ref()?;
 
-        let cash = self.config.assets.cash.as_ref();
-        let usdc_limit = cash
-            .and_then(|cash| cash.operational_limit)
-            .map(Positive::inner);
+        let cash = self.config.assets.cash.as_ref()?;
+        if cash.rebalancing != OperationMode::Enabled {
+            return None;
+        }
+
+        let usdc_limit = cash.operational_limit.map(Positive::inner);
         let reserved = self.config.cash_reserved.map(Positive::inner);
 
         Some((*threshold, usdc_limit, reserved))
@@ -23113,6 +23115,21 @@ mod tests {
             trigger.usdc_rebalancing_params().is_none(),
             "Expected usdc_rebalancing_params to be None when cash ratio is absent"
         );
+    }
+
+    #[tokio::test]
+    async fn usdc_rebalancing_disabled_when_cash_asset_disables_it() {
+        let mut trigger = make_trigger().await;
+        Arc::get_mut(&mut trigger)
+            .unwrap()
+            .config
+            .assets
+            .cash
+            .as_mut()
+            .unwrap()
+            .rebalancing = OperationMode::Disabled;
+
+        assert!(trigger.usdc_rebalancing_params().is_none());
     }
 
     /// Spy reactor that records all dispatched events for verification.

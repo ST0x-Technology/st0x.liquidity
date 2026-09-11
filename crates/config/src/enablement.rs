@@ -13,7 +13,7 @@ use thiserror::Error;
 use st0x_evm::Chain;
 use st0x_execution::Symbol;
 
-use crate::assets::{ChainAssets, OperationMode};
+use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode};
 
 /// How far along a chain is in its bring-up.
 ///
@@ -48,6 +48,22 @@ impl fmt::Display for ChainLifecycle {
             Self::Prefunded => "prefunded",
             Self::Active => "active",
         })
+    }
+}
+
+impl ChainLifecycle {
+    fn allows_asset_trading(self) -> bool {
+        match self {
+            Self::Disabled | Self::ObserveOnly => false,
+            Self::Prefunded | Self::Active => true,
+        }
+    }
+
+    fn allows_rebalancing(self) -> bool {
+        match self {
+            Self::Disabled | Self::ObserveOnly | Self::Prefunded => false,
+            Self::Active => true,
+        }
     }
 }
 
@@ -192,11 +208,31 @@ pub enum ChainEnablementError {
         missing: MissingCapabilities,
     },
     #[error(
-        "[chains.{chain}] is \"observe-only\" while {symbol} has trading = \"enabled\": \
-         its fills would be recorded and never hedged, which is exactly the exposure \
-         observe-only exists to avoid"
+        "[chains.{chain}] is \"{lifecycle}\" while {symbol} has trading = \"enabled\": \
+         only a prefunded or active chain may trade"
     )]
-    ObserveOnlyWithTrading { chain: Chain, symbol: Symbol },
+    TradingExceedsLifecycle {
+        chain: Chain,
+        lifecycle: ChainLifecycle,
+        symbol: Symbol,
+    },
+    #[error(
+        "[chains.{chain}] is \"{lifecycle}\" while {symbol} has rebalancing = \"enabled\": \
+         only an active chain may rebalance equity"
+    )]
+    EquityRebalancingExceedsLifecycle {
+        chain: Chain,
+        lifecycle: ChainLifecycle,
+        symbol: Symbol,
+    },
+    #[error(
+        "[chains.{chain}] is \"{lifecycle}\" while cash has rebalancing = \"enabled\": \
+         only an active chain may rebalance cash"
+    )]
+    CashRebalancingExceedsLifecycle {
+        chain: Chain,
+        lifecycle: ChainLifecycle,
+    },
 }
 
 /// The capabilities a chain asked for and did not get, rendered as a list.
@@ -230,18 +266,40 @@ pub fn check_enablement(
     is_trading: bool,
     assets: Option<&ChainAssets>,
 ) -> Result<(), ChainEnablementError> {
-    if lifecycle == ChainLifecycle::ObserveOnly
+    if lifecycle != ChainLifecycle::Disabled
+        && !lifecycle.allows_asset_trading()
         && let Some(assets) = assets
-        && let Some((symbol, _)) = assets
-            .equities
-            .symbols
-            .iter()
-            .find(|(_, equity)| equity.trading == OperationMode::Enabled)
+        && let Some(symbol) =
+            first_equity_matching(assets, |equity| equity.trading == OperationMode::Enabled)
     {
-        return Err(ChainEnablementError::ObserveOnlyWithTrading {
+        return Err(ChainEnablementError::TradingExceedsLifecycle {
             chain,
+            lifecycle,
             symbol: symbol.clone(),
         });
+    }
+
+    if lifecycle != ChainLifecycle::Disabled
+        && !lifecycle.allows_rebalancing()
+        && let Some(assets) = assets
+    {
+        if let Some(symbol) = first_equity_matching(assets, |equity| {
+            equity.rebalancing == OperationMode::Enabled
+        }) {
+            return Err(ChainEnablementError::EquityRebalancingExceedsLifecycle {
+                chain,
+                lifecycle,
+                symbol: symbol.clone(),
+            });
+        }
+
+        if assets
+            .cash
+            .as_ref()
+            .is_some_and(|cash| cash.rebalancing == OperationMode::Enabled)
+        {
+            return Err(ChainEnablementError::CashRebalancingExceedsLifecycle { chain, lifecycle });
+        }
     }
 
     let provided = provided_capabilities(chain);
@@ -259,6 +317,21 @@ pub fn check_enablement(
         lifecycle,
         missing: MissingCapabilities(missing),
     })
+}
+
+/// Returns the lexicographically first matching symbol so startup errors do
+/// not depend on `HashMap` iteration order.
+fn first_equity_matching(
+    assets: &ChainAssets,
+    predicate: impl Fn(&ChainEquityAsset) -> bool,
+) -> Option<&Symbol> {
+    assets
+        .equities
+        .symbols
+        .iter()
+        .filter(|(_, equity)| predicate(equity))
+        .map(|(symbol, _)| symbol)
+        .min()
 }
 
 #[cfg(test)]
@@ -395,11 +468,128 @@ mod tests {
         )
         .unwrap_err();
 
-        let ChainEnablementError::ObserveOnlyWithTrading { chain, symbol } = error else {
-            panic!("expected ObserveOnlyWithTrading, got: {error:?}")
+        let ChainEnablementError::TradingExceedsLifecycle {
+            chain,
+            lifecycle,
+            symbol,
+        } = error
+        else {
+            panic!("expected TradingExceedsLifecycle, got: {error:?}")
         };
         assert_eq!(chain, Chain::Base);
+        assert_eq!(lifecycle, ChainLifecycle::ObserveOnly);
         assert_eq!(symbol, Symbol::new("AAPL").unwrap());
+    }
+
+    #[test]
+    fn lifecycle_error_selects_the_first_symbol_deterministically() {
+        let mut assets = ChainAssets::default();
+        for symbol in ["TSLA", "AAPL"] {
+            assets.equities.symbols.insert(
+                Symbol::new(symbol).unwrap(),
+                crate::ChainEquityAsset {
+                    tokenized_equity: alloy::primitives::Address::ZERO,
+                    tokenized_equity_derivative: alloy::primitives::Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+        }
+
+        let error = check_enablement(
+            Chain::Base,
+            ChainLifecycle::ObserveOnly,
+            true,
+            Some(&assets),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ChainEnablementError::TradingExceedsLifecycle { symbol, .. }
+                if symbol == Symbol::new("AAPL").unwrap()
+        ));
+    }
+
+    #[test]
+    fn non_active_lifecycles_refuse_equity_rebalancing_by_name() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut assets = ChainAssets::default();
+        assets.equities.symbols.insert(
+            symbol.clone(),
+            crate::ChainEquityAsset {
+                tokenized_equity: alloy::primitives::Address::ZERO,
+                tokenized_equity_derivative: alloy::primitives::Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        for lifecycle in [ChainLifecycle::ObserveOnly, ChainLifecycle::Prefunded] {
+            let error = check_enablement(Chain::Base, lifecycle, true, Some(&assets)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "[chains.base] is \"{lifecycle}\" while AAPL has rebalancing = \
+                     \"enabled\": only an active chain may rebalance equity"
+                )
+            );
+
+            let ChainEnablementError::EquityRebalancingExceedsLifecycle {
+                chain,
+                lifecycle: actual_lifecycle,
+                symbol: actual_symbol,
+            } = error
+            else {
+                panic!("expected EquityRebalancingExceedsLifecycle, got: {error:?}")
+            };
+            assert_eq!(chain, Chain::Base);
+            assert_eq!(actual_lifecycle, lifecycle);
+            assert_eq!(actual_symbol, symbol);
+        }
+
+        check_enablement(Chain::Base, ChainLifecycle::Active, true, Some(&assets)).unwrap();
+    }
+
+    #[test]
+    fn non_active_lifecycles_refuse_cash_rebalancing() {
+        let assets = ChainAssets {
+            cash: Some(crate::ChainCashAsset {
+                vault_ids: Vec::new(),
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            }),
+            ..ChainAssets::default()
+        };
+
+        for lifecycle in [ChainLifecycle::ObserveOnly, ChainLifecycle::Prefunded] {
+            let error = check_enablement(Chain::Base, lifecycle, true, Some(&assets)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "[chains.base] is \"{lifecycle}\" while cash has rebalancing = \
+                     \"enabled\": only an active chain may rebalance cash"
+                )
+            );
+
+            let ChainEnablementError::CashRebalancingExceedsLifecycle {
+                chain,
+                lifecycle: actual_lifecycle,
+            } = error
+            else {
+                panic!("expected CashRebalancingExceedsLifecycle, got: {error:?}")
+            };
+            assert_eq!(chain, Chain::Base);
+            assert_eq!(actual_lifecycle, lifecycle);
+        }
+
+        check_enablement(Chain::Base, ChainLifecycle::Active, true, Some(&assets)).unwrap();
     }
 
     /// The rebalancing capabilities are driven by the per-asset flags: an
