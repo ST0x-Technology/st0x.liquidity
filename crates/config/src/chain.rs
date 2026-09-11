@@ -502,7 +502,7 @@ impl HedgedChain {
 pub struct ChainRegistry {
     primary: HedgedChain,
     /// The hedged chains other than the primary: their fills are ingested and
-    /// hedged, but their inventory is not polled or rebalanced; that stays on
+    /// hedged and their vault inventory is polled, but rebalancing stays on
     /// the primary.
     secondary: BTreeMap<Chain, HedgedChain>,
     transport: BTreeMap<Chain, ChainCtx>,
@@ -694,11 +694,12 @@ impl ChainRole {
 impl ChainRegistry {
     /// Pairs each configured chain with its secrets entry.
     ///
-    /// Refuses more than one trading chain: the config shape admits several,
-    /// but the runtime still drives a single fill watcher, so a second one
-    /// would be fully described and never read. Failing here is what keeps
-    /// that gap from presenting as silently unhedged exposure. Transport-only
-    /// entries are unlimited -- nothing watches them by design.
+    /// Admits any number of trading chains -- each hedged chain drives its own
+    /// fill watcher and its own vault polling -- but refuses anything other
+    /// than exactly one of them claiming `primary = true`. Zero or several
+    /// claimants leave the chain the rebalancing and cash paths read
+    /// undefined. Transport-only entries are unlimited -- nothing watches them
+    /// by design.
     pub fn new(
         configs: &BTreeMap<Chain, ChainConfig>,
         mut secrets: BTreeMap<Chain, ChainSecrets>,
