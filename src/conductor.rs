@@ -100,6 +100,7 @@ use crate::onchain_trade::{
     OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId, OnChainTradeSource,
     SourceAttributionDecision,
 };
+use crate::operator::process_tx::ProcessTxStores;
 use crate::performance::HedgeLatencyProjection;
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
@@ -731,8 +732,8 @@ type HttpProvider = FillProvider<
 /// contract calls) with no error surfaced (RAI-2218). 30s accommodates the
 /// heavy eth_getLogs range scans backfill issues; the wallet transport uses
 /// 20s for its smaller payloads.
-const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The watched chains beyond the primary: the ones needing their own
 /// providers, watchers, and accounting entries.
@@ -852,6 +853,21 @@ fn publish_recovery_handle(
     });
 }
 
+/// Publishes the process-tx handle backing the in-bot process-tx route, set
+/// after startup so the endpoint returns 503 until the conductor is ready.
+fn publish_process_tx_handle(
+    process_tx_cell: &tokio::sync::OnceCell<crate::api::ProcessTxHandle>,
+    order_placer: Arc<dyn OrderPlacer>,
+    counter_trade_submission_lock: Arc<Mutex<()>>,
+    stores: ProcessTxStores,
+) {
+    let _ = process_tx_cell.set(crate::api::ProcessTxHandle {
+        order_placer,
+        counter_trade_submission_lock,
+        stores,
+    });
+}
+
 /// Handles the conductor shares with the axum server's `AppState`: the
 /// dashboard event stream, the broadcasting inventory, the recovery cell the
 /// conductor populates for `/transfers/resume`, and the PnL ledger whose
@@ -860,10 +876,16 @@ pub(crate) struct ServerHandles {
     pub(crate) event_sender: broadcast::Sender<Statement>,
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
+    pub(crate) process_tx_cell: Arc<tokio::sync::OnceCell<crate::api::ProcessTxHandle>>,
     pub(crate) pnl_ledger: Arc<PnlLedger>,
 }
 
 impl Conductor {
+    // `run` is the bot's startup wiring: it threads the store, queue, and
+    // rebalancing setup values into the conductor builder in one place.
+    // Extracting a phase moves those values through a helper struct without
+    // reducing complexity, so it stays one function.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
         ctx: Ctx,
@@ -875,6 +897,7 @@ impl Conductor {
             event_sender,
             inventory,
             recovery_cell,
+            process_tx_cell,
             pnl_ledger,
         }: ServerHandles,
         shutdown_token: CancellationToken,
@@ -891,6 +914,12 @@ impl Conductor {
             setup_instrumentation(executor_ctx, &ctx, pool.clone()).await?;
 
         let cache = SymbolCache::default();
+
+        // Shared with every placement path so the in-bot process-tx route
+        // serializes its broker submission against live hedging (ADR 0014).
+        let counter_trade_submission_lock = Arc::new(Mutex::new(()));
+        let process_tx_order_placer: Arc<dyn OrderPlacer> =
+            Arc::new(ExecutorOrderPlacer(executor.clone()));
 
         let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
             setup_apalis_queues(&pool, &apalis_pool, event_sender, &ctx.chains).await?;
@@ -993,6 +1022,15 @@ impl Conductor {
             portfolio_snapshot,
         };
 
+        // The in-bot process-tx route writes through these wired stores so the
+        // fill's events reach the running reactors, not a detached copy.
+        let process_tx_stores = ProcessTxStores {
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
+            position_projection: frameworks.position_projection.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
+        };
+
         let TradingJobQueues {
             hedge_queue,
             poll_status_queue,
@@ -1064,6 +1102,7 @@ impl Conductor {
 
         let conductor = builder::spawn()
             .context(conductor_ctx)
+            .counter_trade_submission_lock(counter_trade_submission_lock.clone())
             .job_queue(job_queue)
             .backfill_queues(backfill_queues)
             .dashboard_trade_delivery_queue(dashboard_delivery.queue)
@@ -1113,6 +1152,13 @@ impl Conductor {
             recovery_redemption_store,
             recovery_service,
             usdc_recheck,
+        );
+
+        publish_process_tx_handle(
+            &process_tx_cell,
+            process_tx_order_placer,
+            counter_trade_submission_lock,
+            process_tx_stores,
         );
 
         conductor

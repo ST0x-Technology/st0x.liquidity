@@ -224,6 +224,7 @@ fn configured_inventory_vaults(ctx: &Ctx) -> ConfiguredInventoryVaults {
 #[bon::builder]
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
+    counter_trade_submission_lock: Arc<tokio::sync::Mutex<()>>,
     job_queue: DexTradeAccountingJobQueue,
     backfill_queues: BackfillQueues,
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
@@ -395,8 +396,6 @@ where
         offchain_order: context.frameworks.offchain_order.clone(),
         position: context.frameworks.position.clone(),
     });
-
-    let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     // The broker placement capability, lifted out of the (now pure)
     // `OffchainOrder::Place` handler: both the rebalancing hedge job and the

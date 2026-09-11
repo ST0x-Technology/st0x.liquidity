@@ -11,30 +11,16 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use st0x_config::{BrokerCtx, Ctx};
-use st0x_event_sorcery::{Store, StoreBuilder};
-use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
     ALPACA_MAX_DECIMAL_PLACES, AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, Direction,
-    Executor, ExecutorOrderId, FractionalShares, MarketOrder, MarketSession, MockExecutor,
+    Executor, ExecutorOrderId, FractionalShares, MarketOrder, MarketSession,
     OrderFailureTerminality, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
     TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
-use st0x_hedge::operator::conductor::{
-    FillAccountingOutcome, account_for_onchain_fill, execute_mark_acknowledged,
-    execute_settle_fill, is_expected_place_offchain_order_rejection,
-};
-use st0x_hedge::operator::offchain::order::{
-    OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacementResult, OrderPlacer,
-    TerminalPositionFinalization, client_order_id_for_placement, place_offchain_order_at_broker,
-    position_command_for_finalization, terminal_position_finalization,
-};
-use st0x_hedge::operator::onchain::accumulator::check_execution_readiness;
-use st0x_hedge::operator::onchain::trade::{BotOperator, RecoveryActors};
-use st0x_hedge::operator::onchain::{OnChainError, OnchainTrade, TradeValidationError};
-use st0x_hedge::operator::onchain_trade::{OnChainTrade, OnChainTradeId};
-use st0x_hedge::operator::position::{AnchorDisposition, Position, PositionCommand};
+use st0x_hedge::operator::offchain::order::{OrderPlacementResult, OrderPlacer};
+use st0x_hedge::operator::process_tx::{HedgeDisposition, ProcessTxOutcome};
 use st0x_registry::SymbolCache;
 
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
@@ -646,46 +632,94 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     cache: &SymbolCache,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
-    let trading_chain = ctx.chains.primary();
-    // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by the
-    // inventory contract post-migration, the bot EOA before it.
-    let actors = RecoveryActors {
-        // Matches ClearV3/TakeOrderV3 fills to our Raindex orders -- owned by
-        // the inventory contract post-migration, the bot EOA before it.
-        order_owner: ctx.vault_owner(),
-        // Filters the bot's own inventory rebalancing legs out of an
-        // InventoryTrade settlement recovery, same as the backfill path.
-        bot_operator: BotOperator(ctx.order_owner()),
-    };
-    let read_evm = ReadOnlyEvm::new(provider.clone());
+    // The CLI runs outside the bot: no reactors to reach, so standalone stores.
+    let stores =
+        st0x_hedge::operator::process_tx::ProcessTxStores::standalone(pool, order_placer.clone())
+            .await?;
+    let outcome = st0x_hedge::operator::process_tx::process_tx(
+        tx_hash,
+        ctx,
+        pool,
+        provider,
+        cache,
+        &stores,
+        order_placer,
+        None,
+    )
+    .await?;
+    render_process_tx_outcome(tx_hash, &outcome, stdout)
+}
 
-    match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await {
-        Ok(Some(onchain_trade)) => {
-            process_found_trade(onchain_trade, ctx, pool, stdout, order_placer).await?;
-        }
-        Ok(None) => {
+fn render_process_tx_outcome<W: Write>(
+    tx_hash: TxHash,
+    outcome: &ProcessTxOutcome,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    match outcome {
+        ProcessTxOutcome::NoTradeableEvents => {
+            writeln!(stdout, "No tradeable events found in transaction {tx_hash}")?;
             writeln!(
                 stdout,
-                "❌ No tradeable events found in transaction {tx_hash}"
-            )?;
-            writeln!(
-                stdout,
-                "   This transaction may not contain orderbook events matching the configured order hash."
+                "This transaction may not contain orderbook events matching the configured order hash."
             )?;
         }
-        Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(hash))) => {
-            writeln!(stdout, "❌ Transaction not found: {hash}")?;
+        ProcessTxOutcome::TransactionNotFound { tx_hash } => {
+            writeln!(stdout, "Transaction not found: {tx_hash}")?;
+        }
+        ProcessTxOutcome::AlreadyAccounted => {
             writeln!(
                 stdout,
-                "   Please verify the transaction hash and ensure the RPC endpoint is correct."
+                "Fill is already fully accounted. Nothing to do; the normal pipeline will hedge any unhedged position exposure."
             )?;
         }
-        Err(error) => {
-            writeln!(stdout, "❌ Error processing transaction: {error}")?;
-            return Err(error.into());
+        ProcessTxOutcome::PendingHedgeInFlight => {
+            writeln!(
+                stdout,
+                "An existing pending hedge is in flight; settled the fill without placing a new hedge."
+            )?;
+        }
+        ProcessTxOutcome::BelowExecutionThreshold => {
+            writeln!(
+                stdout,
+                "Trade accumulated but did not trigger execution yet (waiting to accumulate enough shares for a whole share execution)."
+            )?;
+        }
+        ProcessTxOutcome::TradingDisabled { symbol } => {
+            writeln!(stdout, "Trading disabled by configuration for {symbol}")?;
+        }
+        ProcessTxOutcome::PlacementRejected { symbol } => {
+            writeln!(
+                stdout,
+                "Placement for {symbol} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill."
+            )?;
+        }
+        ProcessTxOutcome::HedgePlaced {
+            symbol,
+            offchain_order_id,
+            shares,
+            direction,
+            disposition,
+        } => {
+            writeln!(
+                stdout,
+                "Placed {direction:?} hedge for {shares} {symbol} (order {offchain_order_id})"
+            )?;
+            match disposition {
+                HedgeDisposition::InFlight => writeln!(
+                    stdout,
+                    "Order submitted; it will be reconciled to a terminal state by the order-status recovery sweep on the next bot startup."
+                )?,
+                HedgeDisposition::ClearedForRetry => writeln!(
+                    stdout,
+                    "Hedge placement failed or the order vanished; pending order cleared so the normal pipeline can re-hedge."
+                )?,
+                HedgeDisposition::Finalized => writeln!(
+                    stdout,
+                    "The order reached a terminal broker state and the position was finalized."
+                )?,
+            }
         }
     }
-
     Ok(())
 }
 
@@ -867,475 +901,9 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
     anyhow::bail!("timed out waiting for the buy order to fill")
 }
 
-pub(super) async fn process_found_trade<W: Write>(
-    onchain_trade: OnchainTrade,
-    ctx: &Ctx,
-    pool: &SqlitePool,
-    stdout: &mut W,
-    order_placer: Arc<dyn OrderPlacer>,
-) -> anyhow::Result<()> {
-    display_trade_details(&onchain_trade, stdout)?;
-
-    writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
-
-    let trade_id = OnChainTradeId::new(
-        onchain_trade.chain,
-        onchain_trade.tx_hash,
-        onchain_trade.log_index,
-    );
-
-    // Build stores. CLI path: per-invocation instances are fine (single-instance
-    // rule applies to the server path only; see AGENTS.md).
-    let (onchain_trade_store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
-        .build(())
-        .await?;
-    let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-        .build(())
-        .await?;
-    let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-        .build(order_placer.clone())
-        .await?;
-
-    let Some(block_number) = onchain_trade.block_number else {
-        anyhow::bail!("Fill {trade_id}: missing block_number, cannot witness fill");
-    };
-
-    let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
-        pool,
-        &onchain_trade_store,
-        &position_store,
-        &onchain_trade,
-        block_number,
-        ctx.execution_threshold,
-    )
-    .await?
-    else {
-        writeln!(
-            stdout,
-            "Fill {trade_id} is already fully accounted. Nothing to do; \
-             the normal pipeline will hedge any unhedged position exposure."
-        )?;
-        return Ok(());
-    };
-
-    let executor_type = ctx.broker.to_supported_executor();
-    let base_symbol = onchain_trade.symbol();
-
-    match reconcile_existing_pending_order(
-        &offchain_order_store,
-        &position_store,
-        base_symbol,
-        stdout,
-    )
-    .await?
-    {
-        CliPendingReconciliation::NoPending | CliPendingReconciliation::Cleared => {}
-        CliPendingReconciliation::InFlight => {
-            mark_and_settle_fill(
-                &onchain_trade_store,
-                &position_store,
-                &trade_id,
-                &onchain_trade,
-            )
-            .await?;
-            return Ok(());
-        }
-    }
-
-    let trading_enabled = ctx.chains.primary().assets.is_trading_enabled(base_symbol);
-
-    if !trading_enabled {
-        writeln!(
-            stdout,
-            "Trading disabled by configuration for {base_symbol}"
-        )?;
-        mark_and_settle_fill(
-            &onchain_trade_store,
-            &position_store,
-            &trade_id,
-            &onchain_trade,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let executor = MockExecutor::new();
-    let Some(params) = check_execution_readiness(
-        &executor,
-        &position_projection,
-        base_symbol,
-        executor_type,
-        &ctx.chains.primary().assets,
-        &ctx.assets,
-        trading_enabled,
-    )
-    .await?
-    else {
-        writeln!(
-            stdout,
-            "Trade accumulated but did not trigger execution yet."
-        )?;
-        writeln!(
-            stdout,
-            "   (Waiting to accumulate enough shares for a whole share execution)"
-        )?;
-        mark_and_settle_fill(
-            &onchain_trade_store,
-            &position_store,
-            &trade_id,
-            &onchain_trade,
-        )
-        .await?;
-        return Ok(());
-    };
-
-    let offchain_order_id = OffchainOrderId::new();
-
-    writeln!(
-        stdout,
-        "Trade triggered execution for {executor_type:?} (ID: {offchain_order_id})"
-    )?;
-
-    let anchor = position_store
-        .load(&params.symbol)
-        .await
-        .inspect_err(|error| {
-            error!(
-                %offchain_order_id,
-                symbol = %params.symbol,
-                %error,
-                "Failed to load position for the idempotency anchor; refusing \
-                 placement until it can be read"
-            );
-        })?
-        .and_then(|position| position.last_failed_offchain_order_id);
-
-    match position_store
-        .send(
-            &params.symbol,
-            PositionCommand::PlaceOffChainOrder {
-                offchain_order_id,
-                shares: params.shares,
-                direction: params.direction,
-                executor: params.executor,
-                threshold: ctx.execution_threshold,
-            },
-        )
-        .await
-    {
-        Ok(()) => {}
-        Err(error) if is_expected_place_offchain_order_rejection(&error) => {
-            info!(
-                %offchain_order_id,
-                symbol = %params.symbol,
-                "Position::PlaceOffChainOrder rejected by domain state: {error}"
-            );
-            mark_and_settle_fill(
-                &onchain_trade_store,
-                &position_store,
-                &trade_id,
-                &onchain_trade,
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    }
-
-    let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
-
-    place_offchain_order_at_broker(
-        &offchain_order_store,
-        order_placer.as_ref(),
-        &offchain_order_id,
-        OffchainOrderPlacement::market(
-            params.symbol.clone(),
-            params.shares,
-            params.direction,
-            params.executor,
-            client_order_id,
-        ),
-    )
-    .await?;
-
-    reconcile_post_place_state(
-        &offchain_order_store,
-        &position_store,
-        &params.symbol,
-        offchain_order_id,
-        stdout,
-    )
-    .await?;
-
-    mark_and_settle_fill(
-        &onchain_trade_store,
-        &position_store,
-        &trade_id,
-        &onchain_trade,
-    )
-    .await?;
-    Ok(())
-}
-
-async fn mark_and_settle_fill(
-    onchain_trade_store: &Store<OnChainTrade>,
-    position_store: &Store<Position>,
-    trade_id: &OnChainTradeId,
-    onchain_trade: &OnchainTrade,
-) -> anyhow::Result<()> {
-    execute_mark_acknowledged(onchain_trade_store, trade_id).await?;
-    execute_settle_fill(position_store, onchain_trade).await?;
-
-    Ok(())
-}
-
-enum CliPendingReconciliation {
-    NoPending,
-    InFlight,
-    Cleared,
-}
-
-#[derive(Clone, Copy)]
-enum CliPendingClearNextStep {
-    ContinueThisRun,
-    NormalPipelineNextCycle,
-}
-
-async fn reconcile_existing_pending_order<W: Write>(
-    offchain_order_store: &Store<OffchainOrder>,
-    position_store: &Store<Position>,
-    symbol: &Symbol,
-    stdout: &mut W,
-) -> anyhow::Result<CliPendingReconciliation> {
-    let Some(position) = position_store.load(symbol).await? else {
-        return Ok(CliPendingReconciliation::NoPending);
-    };
-
-    let Some(offchain_order_id) = position.pending_offchain_order_id else {
-        return Ok(CliPendingReconciliation::NoPending);
-    };
-
-    let loaded_order = offchain_order_store
-        .load(&offchain_order_id)
-        .await
-        .inspect_err(|error| {
-            error!(
-                %offchain_order_id,
-                %symbol,
-                %error,
-                "Failed to load existing pending offchain order; cannot safely acknowledge fill"
-            );
-        })?;
-
-    reconcile_loaded_post_place_state(
-        loaded_order,
-        position_store,
-        symbol,
-        offchain_order_id,
-        CliPendingClearNextStep::ContinueThisRun,
-        stdout,
-    )
-    .await
-}
-
-// Mirrors dispatch_post_place_state in the normal pipeline: inspect the
-// persisted offchain order state and clear the position pending marker on
-// failure so the normal pipeline can re-hedge on its next cycle.
-async fn reconcile_post_place_state<W: Write>(
-    offchain_order_store: &Store<OffchainOrder>,
-    position_store: &Store<Position>,
-    symbol: &Symbol,
-    offchain_order_id: OffchainOrderId,
-    stdout: &mut W,
-) -> anyhow::Result<()> {
-    let loaded_order = offchain_order_store
-        .load(&offchain_order_id)
-        .await
-        .inspect_err(|error| {
-            error!(
-                %offchain_order_id,
-                %symbol,
-                %error,
-                "Failed to load offchain order after Place; cannot determine post-broker state"
-            );
-        })?;
-
-    reconcile_loaded_post_place_state(
-        loaded_order,
-        position_store,
-        symbol,
-        offchain_order_id,
-        CliPendingClearNextStep::NormalPipelineNextCycle,
-        stdout,
-    )
-    .await
-    .map(|_| ())
-}
-
-async fn reconcile_loaded_post_place_state<W: Write>(
-    loaded_order: Option<OffchainOrder>,
-    position_store: &Store<Position>,
-    symbol: &Symbol,
-    offchain_order_id: OffchainOrderId,
-    next_step: CliPendingClearNextStep,
-    stdout: &mut W,
-) -> anyhow::Result<CliPendingReconciliation> {
-    match loaded_order {
-        Some(OffchainOrder::Failed { error, .. }) => {
-            // Broker placement failed: clear pending_offchain_order_id so the
-            // position is not permanently stuck and the normal pipeline can retry.
-            // No broker terminality classification available here; fail-safe
-            // preserves.
-            position_store
-                .send(
-                    symbol,
-                    PositionCommand::FailOffChainOrder {
-                        offchain_order_id,
-                        error,
-                        anchor: AnchorDisposition::Preserve,
-                    },
-                )
-                .await?;
-            write_pending_clear_message(stdout, "Hedge placement failed", next_step)?;
-            Ok(CliPendingReconciliation::Cleared)
-        }
-        Some(OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. }) => {
-            // Order submitted to the broker. The CLI does not enqueue a live
-            // polling job; the order will be reconciled to a terminal state by
-            // the order-status recovery sweep on the next bot startup.
-            writeln!(stdout, "Trade processing completed!")?;
-            Ok(CliPendingReconciliation::InFlight)
-        }
-        Some(OffchainOrder::Cancelling { .. }) => {
-            writeln!(
-                stdout,
-                "Pending hedge cancellation is still in progress; not placing another hedge."
-            )?;
-            Ok(CliPendingReconciliation::InFlight)
-        }
-        None => {
-            position_store
-                .send(
-                    symbol,
-                    PositionCommand::FailOffChainOrder {
-                        offchain_order_id,
-                        error: "Offchain order missing after Place".to_owned(),
-                        anchor: AnchorDisposition::Preserve,
-                    },
-                )
-                .await?;
-            write_pending_clear_message(
-                stdout,
-                "Hedge placement produced unexpected state",
-                next_step,
-            )?;
-            Ok(CliPendingReconciliation::Cleared)
-        }
-        Some(OffchainOrder::Pending { .. }) => {
-            anyhow::bail!(
-                "offchain order {offchain_order_id} for {symbol} is in an unexpected \
-                 post-placement state; refusing to clear the position claim"
-            );
-        }
-        Some(order @ (OffchainOrder::Filled { .. } | OffchainOrder::Cancelled { .. })) => {
-            reconcile_terminal_post_place_state(
-                &order,
-                position_store,
-                symbol,
-                offchain_order_id,
-                next_step,
-                stdout,
-            )
-            .await
-        }
-    }
-}
-
-async fn reconcile_terminal_post_place_state<W: Write>(
-    order: &OffchainOrder,
-    position_store: &Store<Position>,
-    symbol: &Symbol,
-    offchain_order_id: OffchainOrderId,
-    next_step: CliPendingClearNextStep,
-    stdout: &mut W,
-) -> anyhow::Result<CliPendingReconciliation> {
-    let Some(finalization) = terminal_position_finalization(order) else {
-        anyhow::bail!(
-            "offchain order {offchain_order_id} for {symbol} is terminal but did not \
-             produce a position finalization; refusing to clear the position claim"
-        );
-    };
-
-    let command = match finalization {
-        TerminalPositionFinalization::UnpricedFill { shares_filled } => {
-            anyhow::bail!(
-                "offchain order {offchain_order_id} for {symbol} has {shares_filled} filled \
-                 shares without an average price; refusing to clear the position claim"
-            );
-        }
-        finalization => {
-            let Some(command) = position_command_for_finalization(finalization, offchain_order_id)
-            else {
-                anyhow::bail!(
-                    "offchain order {offchain_order_id} for {symbol} could not be mapped to a \
-                     position finalization command; refusing to clear the position claim"
-                );
-            };
-            command
-        }
-    };
-
-    position_store.send(symbol, command).await?;
-    write_pending_clear_message(stdout, "Existing pending hedge finalized", next_step)?;
-
-    Ok(CliPendingReconciliation::Cleared)
-}
-
-fn write_pending_clear_message<W: Write>(
-    stdout: &mut W,
-    reason: &str,
-    next_step: CliPendingClearNextStep,
-) -> anyhow::Result<()> {
-    let next_step_message = match next_step {
-        CliPendingClearNextStep::ContinueThisRun => {
-            "process-tx will re-evaluate the position in this run."
-        }
-        CliPendingClearNextStep::NormalPipelineNextCycle => {
-            "The normal pipeline will re-hedge on the next cycle."
-        }
-    };
-
-    writeln!(
-        stdout,
-        "{reason}; pending order cleared. {next_step_message}"
-    )?;
-
-    Ok(())
-}
-
-fn display_trade_details<W: Write>(
-    onchain_trade: &OnchainTrade,
-    stdout: &mut W,
-) -> anyhow::Result<()> {
-    let ticker = onchain_trade.symbol().to_string();
-
-    writeln!(stdout, "✅ Found opposite-side trade opportunity:")?;
-    writeln!(stdout, "   Transaction: {}", onchain_trade.tx_hash)?;
-    writeln!(stdout, "   Log Index: {}", onchain_trade.log_index)?;
-    writeln!(stdout, "   Symbol: {ticker}")?;
-    writeln!(stdout, "   Direction: {:?}", onchain_trade.direction)?;
-    writeln!(stdout, "   Quantity: {}", onchain_trade.amount)?;
-    writeln!(
-        stdout,
-        "   Price per Share: ${}",
-        format_float_with_fallback(&onchain_trade.price())
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, U256, address};
+    use alloy::primitives::{Address, address};
     use chrono::Utc;
     use httpmock::MockServer;
     use proptest::prelude::*;
@@ -1344,41 +912,24 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Mutex;
     use uuid::uuid;
 
     use st0x_config::ChainRegistry;
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
-        BrokerCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, InventoryMode, LogFormat,
-        LogLevel, OperationMode, TradingChain,
+        BrokerCtx, ExecutionThreshold, InventoryMode, LogFormat, LogLevel, TradingChain,
     };
-    use st0x_evm::Chain;
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, CancellationOutcome,
-        CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, Positive,
+        CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, MockExecutor, Positive,
         SupportedExecutor, Usd,
     };
-    use st0x_hedge::operator::bindings::IRaindexV6::{ClearConfigV2, ClearV3};
-    use st0x_hedge::operator::conductor::{
-        TradeProcessingCqrs, execute_acknowledge_fill, execute_mark_acknowledged,
-        process_queued_trade,
-    };
-    use st0x_hedge::operator::offchain::order::{
-        CancellationReason, PollOrderStatusJobQueue, noop_order_placer,
-    };
-    use st0x_hedge::operator::onchain::trade::RaindexTradeEvent;
-    use st0x_hedge::operator::onchain_trade::{
-        InventoryVenue, OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand, OnChainTradeSource,
-    };
+    use st0x_hedge::operator::offchain::order::OffchainOrderId;
     use st0x_hedge::operator::test_utils::{
-        OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, mock_alpaca_broker_ctx,
-        try_positive_shares, try_setup_test_db, try_setup_test_pools,
+        mock_alpaca_broker_ctx, try_positive_shares, try_setup_test_db,
     };
-    use st0x_hedge::operator::trading::onchain::inclusion::EmittedOnChain;
-    use st0x_hedge::operator::trading::onchain::trade_accountant::TradeAccountingError;
 
     use super::*;
 
@@ -1390,10 +941,6 @@ mod tests {
         try_setup_test_db()
             .await
             .expect("test database setup must succeed")
-    }
-
-    fn onchain_trade_builder() -> OnchainTradeBuilder {
-        OnchainTradeBuilder::try_new().expect("default onchain trade fixture must be valid")
     }
 
     fn positive_fractional(value: &str) -> Positive<FractionalShares> {
@@ -1670,73 +1217,6 @@ mod tests {
             .unwrap();
         }
     }
-
-    /// `OrderPlacer` that always returns a broker error, used to drive the
-    /// `OffchainOrder::Failed` path in `process_found_trade` tests.
-    struct FailingOrderPlacer;
-
-    #[async_trait]
-    impl OrderPlacer for FailingOrderPlacer {
-        async fn place_market_order(
-            &self,
-            _order: MarketOrder,
-        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-            Err("broker rejected the order".into())
-        }
-
-        async fn place_limit_order(
-            &self,
-            _order: LimitOrder,
-        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-            Err("broker rejected the order".into())
-        }
-
-        async fn cancel_order(
-            &self,
-            _executor_order_id: &ExecutorOrderId,
-        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
-            Err("broker rejected the cancellation".into())
-        }
-    }
-
-    /// `OrderPlacer` that always returns a successful placement, used to drive
-    /// the `OffchainOrder::Submitted` happy-path in `process_found_trade` tests.
-    struct SucceedingOrderPlacer;
-
-    #[async_trait]
-    impl OrderPlacer for SucceedingOrderPlacer {
-        async fn place_market_order(
-            &self,
-            order: MarketOrder,
-        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(OrderPlacementResult {
-                executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
-                placed_shares: order.shares,
-                is_extended_hours: false,
-                limit_price: None,
-            })
-        }
-
-        async fn place_limit_order(
-            &self,
-            order: LimitOrder,
-        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(OrderPlacementResult {
-                executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
-                placed_shares: order.shares,
-                is_extended_hours: order.extended_hours,
-                limit_price: Some(order.limit_price),
-            })
-        }
-
-        async fn cancel_order(
-            &self,
-            _executor_order_id: &ExecutorOrderId,
-        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
-            Err("unexpected cancellation from CLI test order placer".into())
-        }
-    }
-
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
@@ -3061,1488 +2541,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------ //
-    // ADR-0005 exactly-once fill accounting tests for process_found_trade  //
-    // ------------------------------------------------------------------ //
-
-    /// `process-tx` on an acknowledged fill must fail closed: output the "already
-    /// fully accounted" message, return immediately, and place NO broker order.
-    /// Position-level exposure is the normal pipeline's responsibility.
-    #[tokio::test]
-    async fn process_tx_skips_accounting_on_acknowledged_fill() {
-        let pool = setup_test_db().await;
-
-        // Enable trading so check_execution_readiness would trigger if we fell
-        // through — confirming that the early return fires before hedge placement.
-        let mut ctx = create_base_test_ctx();
-        ctx.chains.primary_mut().assets.equities.symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        let source = OnChainTradeSource::Inventory {
-            operator: Address::repeat_byte(0x8b),
-            venue: InventoryVenue::Bebop,
-        };
-        let onchain_trade = onchain_trade_builder().with_source(source).build();
-        let block_timestamp = onchain_trade.block_timestamp.unwrap();
-
-        let trade_id =
-            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
-
-        // Pre-seed 1: witness + acknowledge the OnChainTrade aggregate.
-        let (onchain_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        onchain_store
-            .send(
-                &trade_id,
-                OnChainTradeCommand::WitnessAt {
-                    source: OnChainTradeSource::Legacy,
-                    symbol: onchain_trade.symbol().clone(),
-                    amount: onchain_trade.amount.inner(),
-                    direction: onchain_trade.direction,
-                    price_usdc: onchain_trade.price(),
-                    block_number: 1,
-                    block_timestamp,
-                    filled_at: block_timestamp,
-                },
-            )
-            .await
-            .unwrap();
-
-        onchain_store
-            .send(&trade_id, OnChainTradeCommand::Acknowledge)
-            .await
-            .unwrap();
-
-        // Pre-seed 2: apply the fill to the Position aggregate so there is live
-        // unhedged exposure that could trigger hedge placement if we fell through.
-        let (pre_position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        execute_acknowledge_fill(
-            &pre_position_store,
-            &onchain_trade,
-            ctx.execution_threshold,
-            block_timestamp,
-        )
-        .await
-        .unwrap();
-
-        let mut stdout = Vec::new();
-        process_found_trade(onchain_trade, &ctx, &pool, &mut stdout, order_placer)
-            .await
-            .unwrap();
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("already fully accounted"),
-            "acknowledged fill must output the already-accounted message, got: {output}"
-        );
-
-        // No second OnChainOrderFilled event: the pre-seeded fill must not be
-        // re-counted by the re-run.
-        let (fill_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind("PositionEvent::OnChainOrderFilled")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            fill_count, 1,
-            "re-running process-tx on an acknowledged fill must not emit a second fill event"
-        );
-
-        // No OffchainOrder placed: fail-closed must not place a spurious hedge
-        // driven by the live position exposure.
-        let (order_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM events WHERE event_type LIKE 'OffchainOrderEvent%'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            order_count, 0,
-            "re-running process-tx on an acknowledged fill must place no broker order"
-        );
-
-        let repaired = onchain_store
-            .load(&trade_id)
-            .await
-            .unwrap()
-            .expect("the acknowledged legacy trade must still exist");
-        assert_eq!(
-            repaired.source(),
-            source,
-            "process-tx must append chain-backed venue attribution without re-accounting the fill"
-        );
-        let (attribution_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind("OnChainTradeEvent::SourceAttributed")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            attribution_count, 1,
-            "source repair must append exactly one CQRS attribution event"
-        );
-    }
-
-    /// `process-tx` must resume the acknowledge step when the fill was witnessed
-    /// but not yet acknowledged (crash-recovery window). After the call, the
-    /// `OnChainTrade` record must be acknowledged and exactly one position fill
-    /// event must exist. Trading is disabled in this test context so hedge
-    /// placement is not reached.
-    #[tokio::test]
-    async fn process_tx_resumes_witnessed_but_unacknowledged_fill() {
-        let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        let onchain_trade = onchain_trade_builder().with_block_number(1).build();
-        let block_timestamp = onchain_trade.block_timestamp.unwrap();
-
-        let trade_id =
-            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
-
-        // Pre-seed: witness only (not acknowledged — simulates crash window).
-        let (store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        store
-            .send(
-                &trade_id,
-                OnChainTradeCommand::Witness {
-                    source: onchain_trade.source,
-                    symbol: onchain_trade.symbol().clone(),
-                    amount: onchain_trade.amount.inner(),
-                    direction: onchain_trade.direction,
-                    price_usdc: onchain_trade.price(),
-                    block_number: 1,
-                    block_timestamp,
-                },
-            )
-            .await
-            .unwrap();
-
-        // Call process_found_trade: must resume and complete the acknowledge step.
-        process_found_trade(
-            onchain_trade,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-            order_placer,
-        )
-        .await
-        .unwrap();
-
-        // Verify the trade is now fully acknowledged.
-        let state = store
-            .load(&trade_id)
-            .await
-            .unwrap()
-            .expect("OnChainTrade record must exist after resume");
-        assert!(
-            state.is_acknowledged(),
-            "Fill must be acknowledged after process_found_trade resumes the crash-recovery path"
-        );
-
-        // Exactly one OnChainOrderFilled event must exist — the fill accounting
-        // ran once during resume, not zero times (dropped) or twice (double-counted).
-        let (fill_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind("PositionEvent::OnChainOrderFilled")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            fill_count, 1,
-            "Resume must apply exactly one fill to the position aggregate"
-        );
-    }
-
-    /// `process-tx` on a genuinely new fill must witness it in the
-    /// `OnChainTrade` aggregate, acknowledge it in the `Position` aggregate,
-    /// and mark it acknowledged — leaving exactly one position fill event.
-    #[tokio::test]
-    async fn process_tx_witnesses_and_acknowledges_new_fill() {
-        let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        // block_number is required for the Witness step on a new fill.
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-
-        let trade_id =
-            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
-
-        process_found_trade(
-            onchain_trade,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-            order_placer,
-        )
-        .await
-        .unwrap();
-
-        // The OnChainTrade aggregate must be acknowledged.
-        let (store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        let state = store
-            .load(&trade_id)
-            .await
-            .unwrap()
-            .expect("OnChainTrade record must exist after processing a new fill");
-        assert!(
-            state.is_acknowledged(),
-            "Fill must be acknowledged in the OnChainTrade aggregate"
-        );
-
-        // Exactly one OnChainOrderFilled position event must be in the DB.
-        let (fill_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind("PositionEvent::OnChainOrderFilled")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            fill_count, 1,
-            "Exactly one fill must be applied to the position for a new fill"
-        );
-    }
-
-    /// After the CLI applies a fill via `process_found_trade`, the normal
-    /// pipeline re-detecting the same fill (via `process_queued_trade`) must
-    /// return `Ok(None)` — skipping cleanly — and must NOT emit a second
-    /// `OnChainOrderFilled` event. This is the primary double-count guard test.
-    #[tokio::test]
-    async fn process_tx_then_normal_path_does_not_double_count() {
-        let (pool, apalis_pool) = try_setup_test_pools().await.unwrap();
-        let ctx = create_base_test_ctx();
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-
-        // Step 1: CLI applies the fill.
-        process_found_trade(
-            onchain_trade.clone(),
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-            order_placer.clone(),
-        )
-        .await
-        .unwrap();
-
-        // Step 2: Construct TradeProcessingCqrs backed by the same pool so the
-        // acknowledged OnChainTrade record written by the CLI is visible.
-        let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
-            .await
-            .unwrap();
-
-        let cqrs = TradeProcessingCqrs {
-            hedging: HedgingAssets::default(),
-            pool: pool.clone(),
-            onchain_trade: onchain_trade_store,
-            position: position_store,
-            position_projection,
-            offchain_order: offchain_order_store,
-            order_placer,
-            execution_threshold: ExecutionThreshold::whole_share(),
-            counter_trade_submission_lock: Arc::new(Mutex::new(())),
-            close_flatten_policy:
-                st0x_hedge::operator::trading::offchain::close_flatten::CloseFlattenPolicy::from_secs(900).unwrap(),
-            close_flatten_ramp:
-                st0x_hedge::operator::trading::offchain::close_flatten::CloseFlattenCrossRamp::new(100, 400)
-                    .unwrap(),
-            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
-            hedge_queue: st0x_hedge::operator::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
-            poll_interval: TEST_POLL_INTERVAL,
-        };
-
-        // The trade_event payload is never accessed because process_queued_trade
-        // returns Ok(None) immediately at the is_acknowledged() guard, before
-        // reaching the witness step that would use block_number.
-        let trade_event = EmittedOnChain {
-            chain: Chain::Base,
-            event: RaindexTradeEvent::ClearV3(Box::new(ClearV3 {
-                sender: alloy::primitives::Address::ZERO,
-                alice: get_test_order(),
-                bob: get_test_order(),
-                clearConfig: ClearConfigV2 {
-                    aliceInputIOIndex: U256::ZERO,
-                    aliceOutputIOIndex: U256::ZERO,
-                    bobInputIOIndex: U256::ZERO,
-                    bobOutputIOIndex: U256::ZERO,
-                    aliceBountyVaultId: B256::ZERO,
-                    bobBountyVaultId: B256::ZERO,
-                },
-            })),
-            tx_hash: onchain_trade.tx_hash,
-            log_index: onchain_trade.log_index,
-            block_number: 42,
-            block_timestamp: onchain_trade.block_timestamp,
-        };
-
-        // Step 3: Normal pipeline re-detects the same fill.
-        let result = process_queued_trade(
-            &st0x_execution::MockExecutor::new(),
-            &trade_event,
-            onchain_trade,
-            &cqrs,
-            &ChainAssets::default(),
-            true,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result, None,
-            "Normal pipeline must skip an already-acknowledged fill"
-        );
-
-        // Exactly one OnChainOrderFilled position event: CLI + pipeline together
-        // must not double-count.
-        let (fill_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind("PositionEvent::OnChainOrderFilled")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            fill_count, 1,
-            "CLI then normal pipeline must produce exactly one position fill event, not two"
-        );
-    }
-
-    /// A new fill with no `block_number` must return an error containing
-    /// "missing block_number" so the operator sees a loud failure rather than
-    /// a silent skip.
-    #[tokio::test]
-    async fn process_tx_fails_on_missing_block_number() {
-        let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        let onchain_trade = onchain_trade_builder().with_block_number(None).build();
-
-        let error = process_found_trade(
-            onchain_trade,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-            order_placer,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("missing block_number"),
-            "missing block_number must produce an explicit error, got: {error}"
-        );
-    }
-
-    /// A new fill with no `block_timestamp` must return an error so the operator
-    /// sees a loud failure rather than a silent skip.
-    #[tokio::test]
-    async fn process_tx_fails_on_missing_block_timestamp() {
-        let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        // block_number is set so the new-fill branch is reached; block_timestamp
-        // is None so the bail fires before the witness step.
-        let onchain_trade = onchain_trade_builder()
-            .with_block_number(42)
-            .with_block_timestamp(None)
-            .build();
-        let expected_trade_id =
-            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
-
-        let error = process_found_trade(
-            onchain_trade,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-            order_placer,
-        )
-        .await
-        .unwrap_err();
-
-        let trade_accounting_error = error
-            .downcast_ref::<TradeAccountingError>()
-            .expect("missing block_timestamp should bubble up as TradeAccountingError");
-        assert!(
-            matches!(
-                trade_accounting_error,
-                TradeAccountingError::MissingBlockTimestamp { trade_id }
-                    if trade_id == &expected_trade_id
-            ),
-            "missing block_timestamp must produce \
-             TradeAccountingError::MissingBlockTimestamp for {expected_trade_id}, \
-             got: {trade_accounting_error}"
-        );
-    }
-
-    /// When broker placement fails (resulting in `OffchainOrder::Failed`),
-    /// `process_found_trade` must send `PositionCommand::FailOffChainOrder` to
-    /// clear `pending_offchain_order_id`, leaving the position unpending so
-    /// the normal pipeline can re-hedge on its next cycle.
-    #[tokio::test]
-    async fn process_tx_clears_pending_order_on_failed_placement() {
-        let pool = setup_test_db().await;
-
-        // Enable trading so check_execution_readiness can trigger hedge placement.
-        let mut ctx = create_base_test_ctx();
-        ctx.chains.primary_mut().assets.equities.symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        let order_placer: Arc<dyn OrderPlacer> = Arc::new(FailingOrderPlacer);
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-
-        let mut stdout = Vec::new();
-        process_found_trade(onchain_trade, &ctx, &pool, &mut stdout, order_placer)
-            .await
-            .unwrap();
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("Hedge placement failed"),
-            "failed placement must report the outcome to the operator, got: {output}"
-        );
-        assert!(
-            output.contains("The normal pipeline will re-hedge on the next cycle."),
-            "post-place cleanup should defer re-hedging to the normal pipeline, got: {output}"
-        );
-
-        // pending_offchain_order_id must be cleared: the position must not be
-        // permanently stuck after a failed broker placement.
-        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        let position = position_store
-            .load(&Symbol::new("AAPL").unwrap())
-            .await
-            .unwrap()
-            .expect("Position must exist after fill accounting");
-
-        assert!(
-            position.pending_offchain_order_id.is_none(),
-            "pending_offchain_order_id must be cleared after a failed broker placement"
-        );
-    }
-
-    #[tokio::test]
-    async fn existing_pending_cleanup_reports_process_tx_continues_this_run() {
-        let pool = setup_test_db().await;
-        let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
-        let block_timestamp = Utc::now();
-
-        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        let onchain_trade = onchain_trade_builder()
-            .with_block_number(42)
-            .with_block_timestamp(Some(block_timestamp))
-            .build();
-
-        execute_acknowledge_fill(
-            &position_store,
-            &onchain_trade,
-            ExecutionThreshold::whole_share(),
-            block_timestamp,
-        )
-        .await
-        .unwrap();
-
-        position_store
-            .send(
-                &symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id,
-                    shares: positive_shares("1"),
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::DryRun,
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-
-        let failed_order = OffchainOrder::Failed {
-            symbol: symbol.clone(),
-            shares: positive_shares("1"),
-            requested_shares: None,
-            direction: Direction::Sell,
-            executor: SupportedExecutor::DryRun,
-            retained_fill: None,
-            filled_shares: None,
-            executor_order_id: None,
-            error: "previous placement failed".to_string(),
-            placed_at: block_timestamp,
-            failed_at: block_timestamp,
-        };
-
-        let mut stdout = Vec::new();
-        reconcile_loaded_post_place_state(
-            Some(failed_order),
-            &position_store,
-            &symbol,
-            offchain_order_id,
-            CliPendingClearNextStep::ContinueThisRun,
-            &mut stdout,
-        )
-        .await
-        .unwrap();
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("process-tx will re-evaluate the position in this run."),
-            "existing pending cleanup should report that process-tx continues, got: {output}"
-        );
-        assert!(
-            !output.contains("normal pipeline"),
-            "existing pending cleanup should not imply re-hedging waits for the normal pipeline, \
-             got: {output}"
-        );
-
-        let position = position_store
-            .load(&symbol)
-            .await
-            .unwrap()
-            .expect("position should exist");
-        assert_eq!(
-            position.last_failed_offchain_order_id,
-            Some(offchain_order_id),
-            "a fresh placement failure with no broker order id must preserve \
-             the anchor"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconcile_loaded_post_place_state_failed_with_executor_id_preserves_the_anchor() {
-        let pool = setup_test_db().await;
-        let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
-        let block_timestamp = Utc::now();
-
-        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        let onchain_trade = onchain_trade_builder()
-            .with_block_number(42)
-            .with_block_timestamp(Some(block_timestamp))
-            .build();
-
-        execute_acknowledge_fill(
-            &position_store,
-            &onchain_trade,
-            ExecutionThreshold::whole_share(),
-            block_timestamp,
-        )
-        .await
-        .unwrap();
-
-        position_store
-            .send(
-                &symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id,
-                    shares: positive_shares("1"),
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::DryRun,
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-
-        let failed_order = OffchainOrder::Failed {
-            symbol: symbol.clone(),
-            shares: positive_shares("1"),
-            requested_shares: None,
-            direction: Direction::Sell,
-            executor: SupportedExecutor::DryRun,
-            retained_fill: None,
-            filled_shares: None,
-            executor_order_id: Some(ExecutorOrderId::new("already-poll-failed")),
-            error: "previous placement failed".to_string(),
-            placed_at: block_timestamp,
-            failed_at: block_timestamp,
-        };
-
-        let mut stdout = Vec::new();
-        reconcile_loaded_post_place_state(
-            Some(failed_order),
-            &position_store,
-            &symbol,
-            offchain_order_id,
-            CliPendingClearNextStep::ContinueThisRun,
-            &mut stdout,
-        )
-        .await
-        .unwrap();
-
-        let position = position_store
-            .load(&symbol)
-            .await
-            .unwrap()
-            .expect("position should exist");
-        assert_eq!(
-            position.last_failed_offchain_order_id,
-            Some(offchain_order_id),
-            "this path has no broker-terminality classification to derive \
-             from, so a broker order id alone must not release the anchor"
-        );
-    }
-
-    #[tokio::test]
-    async fn process_tx_clears_pending_order_when_post_place_order_missing() {
-        let pool = setup_test_db().await;
-        let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-        let block_timestamp = onchain_trade
-            .block_timestamp
-            .expect("test trade should have a block timestamp");
-
-        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
-            .await
-            .unwrap();
-
-        execute_acknowledge_fill(
-            &position_store,
-            &onchain_trade,
-            ExecutionThreshold::whole_share(),
-            block_timestamp,
-        )
-        .await
-        .unwrap();
-
-        position_store
-            .send(
-                &symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id,
-                    shares: positive_shares("1"),
-                    direction: Direction::Sell,
-                    executor: st0x_execution::SupportedExecutor::DryRun,
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-
-        let mut stdout = Vec::new();
-        reconcile_post_place_state(
-            &offchain_order_store,
-            &position_store,
-            &symbol,
-            offchain_order_id,
-            &mut stdout,
-        )
-        .await
-        .unwrap();
-
-        let position = position_store
-            .load(&symbol)
-            .await
-            .unwrap()
-            .expect("position should exist after setup");
-        assert_eq!(
-            position.pending_offchain_order_id, None,
-            "missing OffchainOrder state must clear the position's pending id"
-        );
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("pending order cleared"),
-            "missing order cleanup must report the cleared pending marker, got: {output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn existing_cancelling_pending_order_remains_in_flight() {
-        let pool = setup_test_db().await;
-        let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-        let block_timestamp = onchain_trade
-            .block_timestamp
-            .expect("test trade should have a block timestamp");
-
-        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        execute_acknowledge_fill(
-            &position_store,
-            &onchain_trade,
-            ExecutionThreshold::whole_share(),
-            block_timestamp,
-        )
-        .await
-        .unwrap();
-
-        position_store
-            .send(
-                &symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id,
-                    shares: positive_shares("1"),
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::DryRun,
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-
-        let cancelling_order = OffchainOrder::Cancelling {
-            symbol: symbol.clone(),
-            shares: positive_shares("1"),
-            requested_shares: None,
-            retained_fill: None,
-            direction: Direction::Sell,
-            executor: SupportedExecutor::DryRun,
-            executor_order_id: ExecutorOrderId::new("broker-order-id"),
-            reason: CancellationReason::MarketOpenReplacement,
-            placed_at: block_timestamp,
-            submitted_at: block_timestamp,
-            cancel_requested_at: block_timestamp,
-            market_session: st0x_execution::MarketSession::Regular,
-            close_flatten: false,
-        };
-
-        let mut stdout = Vec::new();
-        let outcome = reconcile_loaded_post_place_state(
-            Some(cancelling_order),
-            &position_store,
-            &symbol,
-            offchain_order_id,
-            CliPendingClearNextStep::ContinueThisRun,
-            &mut stdout,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            matches!(outcome, CliPendingReconciliation::InFlight),
-            "cancelling orders must remain in flight until broker cancellation confirms"
-        );
-
-        let position = position_store
-            .load(&symbol)
-            .await
-            .unwrap()
-            .expect("position should exist after setup");
-        assert_eq!(
-            position.pending_offchain_order_id,
-            Some(offchain_order_id),
-            "Cancelling must leave the position claim in place"
-        );
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("cancellation is still in progress"),
-            "cancelling order reconciliation must explain why no new hedge is placed, \
-             got: {output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn existing_cancelled_pending_order_clears_position_claim() {
-        let pool = setup_test_db().await;
-        let symbol = Symbol::new("AAPL").unwrap();
-        let offchain_order_id = OffchainOrderId::new();
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-        let block_timestamp = onchain_trade
-            .block_timestamp
-            .expect("test trade should have a block timestamp");
-
-        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        execute_acknowledge_fill(
-            &position_store,
-            &onchain_trade,
-            ExecutionThreshold::whole_share(),
-            block_timestamp,
-        )
-        .await
-        .unwrap();
-
-        position_store
-            .send(
-                &symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id,
-                    shares: positive_shares("1"),
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::DryRun,
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-
-        let cancelled_order = OffchainOrder::Cancelled {
-            symbol: symbol.clone(),
-            shares: positive_shares("1"),
-            requested_shares: Some(positive_shares("1")),
-            retained_fill: None,
-            filled_shares: Some(FractionalShares::ZERO),
-            direction: Direction::Sell,
-            executor: SupportedExecutor::DryRun,
-            executor_order_id: ExecutorOrderId::new("broker-order-id"),
-            reason: CancellationReason::MarketOpenReplacement,
-            placed_at: block_timestamp,
-            cancelled_at: block_timestamp,
-        };
-
-        let mut stdout = Vec::new();
-        let outcome = reconcile_loaded_post_place_state(
-            Some(cancelled_order),
-            &position_store,
-            &symbol,
-            offchain_order_id,
-            CliPendingClearNextStep::ContinueThisRun,
-            &mut stdout,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            matches!(outcome, CliPendingReconciliation::Cleared),
-            "cancelled orders with no retained fill must clear the pending claim"
-        );
-
-        let position = position_store
-            .load(&symbol)
-            .await
-            .unwrap()
-            .expect("position should exist after setup");
-        assert_eq!(
-            position.pending_offchain_order_id, None,
-            "Cancelled must clear the position claim through CancelOffChainOrder"
-        );
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("Existing pending hedge finalized"),
-            "cancelled order reconciliation must report the finalized pending order, \
-             got: {output}"
-        );
-    }
-
-    /// When a second client shares the same pool and witnesses the fill first,
-    /// `process_found_trade` must resume the acknowledge step and complete it —
-    /// not silently drop the fill. The fill must be accounted exactly once.
-    ///
-    /// This covers the concurrent-witnessed sub-path: the outer load sees
-    /// `Some(Witnessed)` from the peer writer's record and resumes.
-    #[tokio::test]
-    async fn process_tx_concurrent_witness_resumes_acknowledge() {
-        let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-        let block_timestamp = onchain_trade.block_timestamp.unwrap();
-
-        let trade_id =
-            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
-
-        // Simulate a concurrent writer (e.g. the normal pipeline) that witnesses
-        // the fill via its own store instance backed by the same pool. When
-        // process_found_trade's internal store loads the aggregate, it will see
-        // Some(Witnessed) and resume rather than re-witness.
-        let (store_a, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        store_a
-            .send(
-                &trade_id,
-                OnChainTradeCommand::Witness {
-                    source: onchain_trade.source,
-                    symbol: onchain_trade.symbol().clone(),
-                    amount: onchain_trade.amount.inner(),
-                    direction: onchain_trade.direction,
-                    price_usdc: onchain_trade.price(),
-                    block_number: 42,
-                    block_timestamp,
-                },
-            )
-            .await
-            .unwrap();
-
-        // Call process_found_trade: must resume the acknowledge step and complete
-        // it rather than silently dropping the fill.
-        process_found_trade(
-            onchain_trade,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-            order_placer,
-        )
-        .await
-        .unwrap();
-
-        // The trade must be fully acknowledged after the resume.
-        let state = store_a
-            .load(&trade_id)
-            .await
-            .unwrap()
-            .expect("OnChainTrade record must exist after concurrent resume");
-        assert!(
-            state.is_acknowledged(),
-            "Fill must be acknowledged after process_found_trade resumes from concurrent witness"
-        );
-
-        // Exactly one fill event: the concurrent write-then-resume must not
-        // double-count or drop the fill.
-        let (fill_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind("PositionEvent::OnChainOrderFilled")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            fill_count, 1,
-            "Concurrent witness + resume must apply exactly one fill to the position"
-        );
-    }
-
-    /// When a concurrent writer has already fully acknowledged the fill,
-    /// `process_found_trade` must fail closed: return early without placing a
-    /// hedge or emitting a second fill event.
-    ///
-    /// This covers the concurrent-acknowledged sub-path: the outer load sees
-    /// `Some(Acknowledged)` from the peer writer's record and exits immediately.
-    #[tokio::test]
-    async fn process_tx_concurrent_acknowledged_fails_closed() {
-        let pool = setup_test_db().await;
-
-        // Enable trading so that if we fell through to hedge placement we would
-        // know — confirming the early return fires before any of that.
-        let mut ctx = create_base_test_ctx();
-        ctx.chains.primary_mut().assets.equities.symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-        let block_timestamp = onchain_trade.block_timestamp.unwrap();
-
-        let trade_id =
-            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
-
-        // Simulate a concurrent writer that has fully processed the fill.
-        let (store_a, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        store_a
-            .send(
-                &trade_id,
-                OnChainTradeCommand::Witness {
-                    source: onchain_trade.source,
-                    symbol: onchain_trade.symbol().clone(),
-                    amount: onchain_trade.amount.inner(),
-                    direction: onchain_trade.direction,
-                    price_usdc: onchain_trade.price(),
-                    block_number: 42,
-                    block_timestamp,
-                },
-            )
-            .await
-            .unwrap();
-
-        store_a
-            .send(&trade_id, OnChainTradeCommand::Acknowledge)
-            .await
-            .unwrap();
-
-        // Apply the fill to the position so there is live unhedged exposure that
-        // could trigger hedge placement if we fell through.
-        let (pre_position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        execute_acknowledge_fill(
-            &pre_position_store,
-            &onchain_trade,
-            ctx.execution_threshold,
-            block_timestamp,
-        )
-        .await
-        .unwrap();
-
-        let mut stdout = Vec::new();
-        process_found_trade(onchain_trade, &ctx, &pool, &mut stdout, order_placer)
-            .await
-            .unwrap();
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("already fully accounted"),
-            "concurrent-acknowledged fill must output the already-accounted message, got: {output}"
-        );
-
-        // No second fill event and no spurious hedge order from the concurrent path.
-        let (fill_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind("PositionEvent::OnChainOrderFilled")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            fill_count, 1,
-            "Concurrent acknowledged + second process-tx must not emit a second fill event"
-        );
-
-        let (order_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM events WHERE event_type LIKE 'OffchainOrderEvent%'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            order_count, 0,
-            "Fail-closed on concurrent-acknowledged fill must place no broker order"
-        );
-    }
-
-    /// Regression test for the crash-window double-count bug:
-    ///
-    /// 1. Fill A is witnessed and acknowledged in Position (slot = A), but the
-    ///    process crashes BEFORE `mark_acknowledged` runs — OnChainTrade A stays
-    ///    Witnessed.
-    /// 2. Fill B arrives and is fully processed (slot advances to B).
-    /// 3. `process-tx` is retried for A.
-    ///
-    /// Without the durable `position_fill_already_recorded` guard, the resume
-    /// path would call `execute_acknowledge_fill(A)` again. Because the slot now
-    /// holds B (not A), `PositionError::DuplicateTrade` does NOT fire and A is
-    /// counted a second time — corrupting the net position.
-    ///
-    /// After the fix, the retry must:
-    /// - Apply fill A exactly once (total fill events = 2: one A + one B).
-    /// - Mark OnChainTrade A acknowledged.
-    #[tokio::test]
-    async fn process_tx_does_not_double_count_witnessed_fill_after_newer_fill_acknowledged() {
-        let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        // Fill A and fill B: same tx_hash, different log_index so they have
-        // distinct (tx_hash, log_index) identities.
-        let fill_a = onchain_trade_builder().with_block_number(10).build();
-        let fill_b = onchain_trade_builder()
-            .with_log_index(2)
-            .with_block_number(11)
-            .build();
-
-        let block_timestamp_a = fill_a.block_timestamp.unwrap();
-        let block_timestamp_b = fill_b.block_timestamp.unwrap();
-
-        let trade_id_a = OnChainTradeId::new(Chain::Base, fill_a.tx_hash, fill_a.log_index);
-        let trade_id_b = OnChainTradeId::new(Chain::Base, fill_b.tx_hash, fill_b.log_index);
-
-        let (onchain_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        // Step 1: Witness fill A in OnChainTrade.
-        onchain_store
-            .send(
-                &trade_id_a,
-                OnChainTradeCommand::Witness {
-                    source: fill_a.source,
-                    symbol: fill_a.symbol().clone(),
-                    amount: fill_a.amount.inner(),
-                    direction: fill_a.direction,
-                    price_usdc: fill_a.price(),
-                    block_number: 10,
-                    block_timestamp: block_timestamp_a,
-                },
-            )
-            .await
-            .unwrap();
-
-        // Step 2: Acknowledge fill A in Position (slot = A).
-        execute_acknowledge_fill(
-            &position_store,
-            &fill_a,
-            ctx.execution_threshold,
-            block_timestamp_a,
-        )
-        .await
-        .unwrap();
-
-        // Simulate crash: do NOT call execute_mark_acknowledged for fill A.
-        // OnChainTrade A stays Witnessed; Position already has A applied.
-
-        // Step 3: Fully process fill B (witness + acknowledge + mark).
-        onchain_store
-            .send(
-                &trade_id_b,
-                OnChainTradeCommand::Witness {
-                    source: fill_b.source,
-                    symbol: fill_b.symbol().clone(),
-                    amount: fill_b.amount.inner(),
-                    direction: fill_b.direction,
-                    price_usdc: fill_b.price(),
-                    block_number: 11,
-                    block_timestamp: block_timestamp_b,
-                },
-            )
-            .await
-            .unwrap();
-
-        execute_acknowledge_fill(
-            &position_store,
-            &fill_b,
-            ctx.execution_threshold,
-            block_timestamp_b,
-        )
-        .await
-        .unwrap();
-
-        execute_mark_acknowledged(&onchain_store, &trade_id_b)
-            .await
-            .unwrap();
-
-        // At this point:
-        // - Position has fill_a and fill_b applied (last_slot = fill_b's trade_id).
-        // - OnChainTrade fill_a is Witnessed (not Acknowledged).
-        // - OnChainTrade fill_b is Acknowledged.
-        // Without the durable guard, retrying process-tx for fill_a would
-        // re-apply it: last_slot (B) != A, so DuplicateTrade does NOT fire.
-
-        // Step 4: Retry process-tx for fill A (crash-recovery scenario).
-        process_found_trade(fill_a, &ctx, &pool, &mut std::io::sink(), order_placer)
-            .await
-            .unwrap();
-
-        // Assertion 1: OnChainTrade A must now be acknowledged.
-        let state_a = onchain_store
-            .load(&trade_id_a)
-            .await
-            .unwrap()
-            .expect("OnChainTrade fill_a must exist after process_tx retry");
-        assert!(
-            state_a.is_acknowledged(),
-            "fill_a must be acknowledged after process_tx retry"
-        );
-
-        // Assertion 2: Exactly two OnChainOrderFilled events — fill_a once and
-        // fill_b once. Any value other than 2 means double-counting or a dropped
-        // fill.
-        let (fill_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM events WHERE event_type = 'PositionEvent::OnChainOrderFilled'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            fill_count, 2,
-            "process_tx retry on a crash-window fill must not double-count: \
-             expected exactly 2 fill events (fill_a once + fill_b once), got {fill_count}"
-        );
-    }
-
-    /// Regression test for the None-path (fresh-witness) double-count hole:
-    ///
-    /// A legacy fill whose Position record was written (e.g. via a prior direct
-    /// `execute_acknowledge_fill` call) but whose OnChainTrade record was NEVER
-    /// created causes `process_found_trade` to take the `None` branch. Without
-    /// the unified durable guard the fresh-witness arm would call
-    /// `execute_acknowledge_fill` again; because the Position slot already
-    /// advanced to a newer fill (B), `DuplicateTrade` does NOT fire and fill A
-    /// is counted a second time.
-    ///
-    /// After the fix the unified `position_fill_already_recorded` guard runs on
-    /// every path — including the `None` path — and blocks the re-apply.
-    #[tokio::test]
-    async fn process_tx_none_path_does_not_recount_legacy_position_fill() {
-        let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
-        let order_placer = create_order_placer(&ctx, &pool);
-
-        // Fill A and fill B have distinct (tx_hash, log_index) identities.
-        let fill_a = onchain_trade_builder().with_block_number(10).build();
-        let fill_b = onchain_trade_builder()
-            .with_log_index(2)
-            .with_block_number(11)
-            .build();
-
-        let block_timestamp_a = fill_a.block_timestamp.unwrap();
-        let block_timestamp_b = fill_b.block_timestamp.unwrap();
-
-        let trade_id_a = OnChainTradeId::new(Chain::Base, fill_a.tx_hash, fill_a.log_index);
-        let trade_id_b = OnChainTradeId::new(Chain::Base, fill_b.tx_hash, fill_b.log_index);
-
-        let (onchain_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        // Step 1: Apply fill A to Position ONLY — no OnChainTrade witness record.
-        // This simulates a legacy fill whose OnChainTrade record was never created.
-        // process_found_trade will load None for trade_id_a and take the None path.
-        execute_acknowledge_fill(
-            &position_store,
-            &fill_a,
-            ctx.execution_threshold,
-            block_timestamp_a,
-        )
-        .await
-        .unwrap();
-
-        // Step 2: Fully process fill B so the Position slot advances beyond A.
-        // Now last_acknowledged_trade_id = B, so a re-apply of A bypasses the
-        // single-slot DuplicateTrade guard without the durable check.
-        onchain_store
-            .send(
-                &trade_id_b,
-                OnChainTradeCommand::Witness {
-                    source: fill_b.source,
-                    symbol: fill_b.symbol().clone(),
-                    amount: fill_b.amount.inner(),
-                    direction: fill_b.direction,
-                    price_usdc: fill_b.price(),
-                    block_number: 11,
-                    block_timestamp: block_timestamp_b,
-                },
-            )
-            .await
-            .unwrap();
-
-        execute_acknowledge_fill(
-            &position_store,
-            &fill_b,
-            ctx.execution_threshold,
-            block_timestamp_b,
-        )
-        .await
-        .unwrap();
-
-        execute_mark_acknowledged(&onchain_store, &trade_id_b)
-            .await
-            .unwrap();
-
-        // Step 3: Run process_found_trade for fill A. It takes the None branch
-        // (no OnChainTrade record), witnesses A, then the authoritative guard must
-        // detect A already in Position and skip the re-apply.
-        process_found_trade(fill_a, &ctx, &pool, &mut std::io::sink(), order_placer)
-            .await
-            .unwrap();
-
-        // Assertion 1: OnChainTrade A must be acknowledged (witness + mark ran).
-        let state_a = onchain_store
-            .load(&trade_id_a)
-            .await
-            .unwrap()
-            .expect("OnChainTrade fill_a must exist after process_found_trade");
-        assert!(
-            state_a.is_acknowledged(),
-            "fill_a must be acknowledged after process_found_trade takes the None path"
-        );
-
-        // Assertion 2: Exactly two fill events — fill_a once + fill_b once. Any
-        // value other than 2 means fill_a was double-counted on the None path.
-        let (fill_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM events \
-             WHERE event_type = 'PositionEvent::OnChainOrderFilled'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            fill_count, 2,
-            "None-path process_tx must not re-apply a fill already in Position: \
-             expected 2 fill events (fill_a once + fill_b once), got {fill_count}"
-        );
-    }
-
-    /// The happy path: a new fill with trading enabled and a broker that accepts
-    /// the order must print 'Trade processing completed!' and leave the position
-    /// with `pending_offchain_order_id` set (order submitted, not cleared).
-    ///
-    /// This is the only test that exercises the
-    /// `Some(OffchainOrder::Submitted | PartiallyFilled)` arm in
-    /// `process_found_trade`.
-    #[tokio::test]
-    async fn process_tx_submitted_hedge_sets_pending_order_id() {
-        let pool = setup_test_db().await;
-
-        // Enable trading so check_execution_readiness can trigger hedge placement.
-        let mut ctx = create_base_test_ctx();
-        ctx.chains.primary_mut().assets.equities.symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-            },
-        );
-
-        let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
-
-        // 1 share buy -> net +1 -> is_ready_for_execution returns (Sell, 1).
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-
-        let mut stdout = Vec::new();
-        process_found_trade(onchain_trade, &ctx, &pool, &mut stdout, order_placer)
-            .await
-            .unwrap();
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("Trade processing completed!"),
-            "successful broker submission must print the completion message, got: {output}"
-        );
-
-        // pending_offchain_order_id must be set: the order is submitted to the
-        // broker and in flight; only the order-status sweep will clear it.
-        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-            .build(())
-            .await
-            .unwrap();
-
-        let position = position_store
-            .load(&Symbol::new("AAPL").unwrap())
-            .await
-            .unwrap()
-            .expect("Position must exist after fill accounting");
-
-        let pending_order_id = position
-            .pending_offchain_order_id
-            .expect("pending_offchain_order_id must be set after successful broker submission");
-
-        let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(noop_order_placer())
-            .await
-            .unwrap();
-        let offchain_order = offchain_order_store
-            .load(&pending_order_id)
-            .await
-            .unwrap()
-            .expect("pending_offchain_order_id must refer to a persisted offchain order");
-        assert!(
-            matches!(offchain_order, OffchainOrder::Submitted { .. }),
-            "pending_offchain_order_id must point to the submitted broker order, got: {offchain_order:?}"
-        );
-
-        let (offchain_event_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM events \
-             WHERE aggregate_id = ? AND event_type LIKE 'OffchainOrderEvent%'",
-        )
-        .bind(pending_order_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            offchain_event_count >= 1,
-            "submitted hedge should persist at least one OffchainOrder event for {pending_order_id}"
-        );
-
-        let (fill_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind(
-                    st0x_hedge::operator::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE,
-                )
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            fill_count, 1,
-            "successful broker submission must account the onchain fill exactly once"
-        );
-    }
-
     #[tokio::test]
     async fn market_buy_fails_when_the_broker_cancels_the_order() {
         let broker = MockExecutor::new().with_order_status(OrderState::Cancelled {
@@ -4735,5 +2733,86 @@ mod tests {
             "a NotTerminal failure must tell the operator the order may still \
              resolve, got: {output}"
         );
+    }
+
+    #[test]
+    fn render_process_tx_outcome_covers_every_arm() {
+        let tx_hash = TxHash::repeat_byte(0x11);
+        let not_found = TxHash::repeat_byte(0x22);
+        let symbol = || Symbol::new("MSTR").expect("test symbol must be valid");
+
+        let mut cases: Vec<(ProcessTxOutcome, String)> = vec![
+            (
+                ProcessTxOutcome::NoTradeableEvents,
+                format!("No tradeable events found in transaction {tx_hash}\nThis transaction may not contain orderbook events matching the configured order hash.\n"),
+            ),
+            (
+                ProcessTxOutcome::TransactionNotFound { tx_hash: not_found },
+                format!("Transaction not found: {not_found}\n"),
+            ),
+            (
+                ProcessTxOutcome::AlreadyAccounted,
+                "Fill is already fully accounted. Nothing to do; the normal pipeline will hedge any unhedged position exposure.\n".to_string(),
+            ),
+            (
+                ProcessTxOutcome::PendingHedgeInFlight,
+                "An existing pending hedge is in flight; settled the fill without placing a new hedge.\n".to_string(),
+            ),
+            (
+                ProcessTxOutcome::BelowExecutionThreshold,
+                "Trade accumulated but did not trigger execution yet (waiting to accumulate enough shares for a whole share execution).\n".to_string(),
+            ),
+            (
+                ProcessTxOutcome::TradingDisabled { symbol: symbol() },
+                format!("Trading disabled by configuration for {}\n", symbol()),
+            ),
+            (
+                ProcessTxOutcome::PlacementRejected { symbol: symbol() },
+                format!("Placement for {} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill.\n", symbol()),
+            ),
+        ];
+
+        for (disposition, disposition_line) in [
+            (
+                HedgeDisposition::InFlight,
+                "Order submitted; it will be reconciled to a terminal state by the order-status recovery sweep on the next bot startup.",
+            ),
+            (
+                HedgeDisposition::ClearedForRetry,
+                "Hedge placement failed or the order vanished; pending order cleared so the normal pipeline can re-hedge.",
+            ),
+            (
+                HedgeDisposition::Finalized,
+                "The order reached a terminal broker state and the position was finalized.",
+            ),
+        ] {
+            let order_id = OffchainOrderId::new();
+            let shares = positive_shares("1.5");
+            let expected = format!(
+                "Placed {:?} hedge for {shares} {} (order {order_id})\n{disposition_line}\n",
+                Direction::Buy,
+                symbol()
+            );
+            cases.push((
+                ProcessTxOutcome::HedgePlaced {
+                    symbol: symbol(),
+                    offchain_order_id: order_id,
+                    shares,
+                    direction: Direction::Buy,
+                    disposition,
+                },
+                expected,
+            ));
+        }
+
+        for (outcome, expected) in cases {
+            let mut buf = Vec::new();
+            render_process_tx_outcome(tx_hash, &outcome, &mut buf).expect("render must succeed");
+            assert_eq!(
+                String::from_utf8(buf).expect("output must be valid UTF-8"),
+                expected,
+                "unexpected output for {outcome:?}"
+            );
+        }
     }
 }
