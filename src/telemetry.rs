@@ -151,6 +151,9 @@ pub(crate) async fn record_block_lag(
 pub(crate) async fn record_poll_cycle(
     pool: &SqlitePool,
     monitor: Monitor,
+    // The chain whose fill watcher ran the cycle: each hedged chain polls on
+    // its own cadence and reports its own poll health.
+    chain: Chain,
     orderbook: Address,
     sampled_at: DateTime<Utc>,
     duration: Duration,
@@ -166,11 +169,12 @@ pub(crate) async fn record_poll_cycle(
 
     sqlx::query(
         "INSERT INTO poll_cycle_samples \
-         (sampled_at, monitor, orderbook, duration_ms, skipped_ticks, outcome, error) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         (sampled_at, monitor, chain, orderbook, duration_ms, skipped_ticks, outcome, error) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(sqlite_timestamp(sampled_at))
     .bind(monitor.as_str())
+    .bind(chain.as_str())
     .bind(orderbook.to_string())
     .bind(i64::try_from(duration.as_millis())?)
     .bind(i64::try_from(skipped_ticks)?)
@@ -573,12 +577,17 @@ mod tests {
     /// `block_lag_samples` shape (orderbook, no chain).
     const LAST_MIGRATION_BEFORE_PER_CHAIN_LAG_SAMPLES: i64 = 20_260_904_214_951;
 
-    async fn pool_migrated_before_per_chain_lag_samples() -> SqlitePool {
+    /// Version of the last migration shipped before poll-cycle samples were
+    /// keyed by chain, reproducing the legacy `poll_cycle_samples` shape
+    /// (monitor and orderbook, no chain).
+    const LAST_MIGRATION_BEFORE_PER_CHAIN_POLL_SAMPLES: i64 = 20_260_910_124_753;
+
+    async fn pool_migrated_up_to(version: i64) -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         let migrator = sqlx::migrate!();
         let legacy_migrations: Vec<Migration> = migrator
             .iter()
-            .filter(|migration| migration.version <= LAST_MIGRATION_BEFORE_PER_CHAIN_LAG_SAMPLES)
+            .filter(|migration| migration.version <= version)
             .cloned()
             .collect();
         Migrator {
@@ -597,7 +606,7 @@ mod tests {
     /// under Base rather than leaving them unattributable.
     #[tokio::test]
     async fn legacy_lag_samples_are_filed_under_base_by_the_per_chain_migration() {
-        let pool = pool_migrated_before_per_chain_lag_samples().await;
+        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_PER_CHAIN_LAG_SAMPLES).await;
         sqlx::query(
             "INSERT INTO block_lag_samples \
              (sampled_at, orderbook, chain_tip, cutoff_block, last_processed_block, lag_blocks) \
@@ -644,6 +653,71 @@ mod tests {
         );
     }
 
+    /// Poll-cycle samples written before they were keyed by chain came from
+    /// the Base watcher, the only one that existed: the migration files them
+    /// under Base rather than leaving them unattributable.
+    #[tokio::test]
+    async fn legacy_poll_samples_are_filed_under_base_by_the_per_chain_migration() {
+        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_PER_CHAIN_POLL_SAMPLES).await;
+        sqlx::query(
+            "INSERT INTO poll_cycle_samples \
+             (sampled_at, monitor, orderbook, duration_ms, skipped_ticks, outcome, error) \
+             VALUES ($1, $2, $3, 250, 2, 'error', 'rpc unreachable')",
+        )
+        .bind(sqlite_timestamp(timestamp(0)))
+        .bind(Monitor::OrderFill.as_str())
+        .bind(ORDERBOOK.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let (chain, monitor, orderbook, skipped_ticks, error): (
+            String,
+            String,
+            String,
+            i64,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT chain, monitor, orderbook, skipped_ticks, error FROM poll_cycle_samples",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chain, Chain::Base.as_str());
+        assert_eq!(monitor, Monitor::OrderFill.as_str());
+        assert_eq!(orderbook, ORDERBOOK.to_string());
+        assert_eq!(skipped_ticks, 2);
+        assert_eq!(error, Some("rpc unreachable".to_string()));
+    }
+
+    /// A poll-cycle sample that names no chain is refused rather than silently
+    /// filed under Base: the writer must always say which watcher polled.
+    #[tokio::test]
+    async fn poll_sample_without_a_chain_is_refused() {
+        let pool = setup_test_db().await;
+
+        let error = sqlx::query(
+            "INSERT INTO poll_cycle_samples \
+             (sampled_at, monitor, orderbook, duration_ms, skipped_ticks, outcome, error) \
+             VALUES ($1, $2, $3, 250, 2, 'ok', NULL)",
+        )
+        .bind(sqlite_timestamp(timestamp(0)))
+        .bind(Monitor::OrderFill.as_str())
+        .bind(ORDERBOOK.to_string())
+        .execute(&pool)
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.as_database_error().unwrap().message(),
+            "NOT NULL constraint failed: poll_cycle_samples.chain"
+        );
+    }
+
+    /// The sample is filed under the chain the caller polled, not under the
+    /// primary: one fill watcher runs per hedged chain.
     #[tokio::test]
     async fn record_poll_cycle_stores_outcome_and_error() {
         let pool = setup_test_db().await;
@@ -651,6 +725,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Ethereum,
             ORDERBOOK,
             timestamp(0),
             Duration::from_millis(250),
@@ -660,19 +735,20 @@ mod tests {
         .await
         .unwrap();
 
-        let row: (String, String, i64, i64, String, Option<String>) = sqlx::query_as(
-            "SELECT monitor, orderbook, duration_ms, skipped_ticks, outcome, error \
+        let row: (String, String, String, i64, i64, String, Option<String>) = sqlx::query_as(
+            "SELECT monitor, chain, orderbook, duration_ms, skipped_ticks, outcome, error \
              FROM poll_cycle_samples",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(row.0, "order_fill");
-        assert_eq!(row.1, ORDERBOOK.to_string());
-        assert_eq!(row.2, 250);
-        assert_eq!(row.3, 2);
-        assert_eq!(row.4, PollOutcome::Error.as_str());
-        assert_eq!(row.5, Some("rpc unreachable".to_string()));
+        assert_eq!(row.1, Chain::Ethereum.as_str());
+        assert_eq!(row.2, ORDERBOOK.to_string());
+        assert_eq!(row.3, 250);
+        assert_eq!(row.4, 2);
+        assert_eq!(row.5, PollOutcome::Error.as_str());
+        assert_eq!(row.6, Some("rpc unreachable".to_string()));
     }
 
     #[tokio::test]
@@ -683,6 +759,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(0),
             Duration::from_millis(100),
@@ -731,6 +808,7 @@ mod tests {
             record_poll_cycle(
                 &pool,
                 Monitor::OrderFill,
+                Chain::Base,
                 ORDERBOOK,
                 sampled_at,
                 Duration::ZERO,

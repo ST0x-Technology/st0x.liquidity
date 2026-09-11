@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ChainBlockLag } from '$lib/api/ChainBlockLag'
+import type { ChainPollHealth } from '$lib/api/ChainPollHealth'
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
 import type { InfraReport } from '$lib/api/InfraReport'
 import type { JobQueueHealth } from '$lib/api/JobQueueHealth'
 import type { LatencyStats } from '$lib/api/LatencyStats'
-import type { PollHealth } from '$lib/api/PollHealth'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 
 import {
@@ -197,18 +197,24 @@ const lagSeries = (overrides: Partial<ChainBlockLag>): ChainBlockLag => ({
 })
 
 /** A Base-only infra report; `poll` overrides the primary chain's poll health. */
-const infra = (overrides: Partial<ChainBlockLag>, poll?: Partial<PollHealth>): InfraReport => ({
+const infra = (
+  overrides: Partial<ChainBlockLag>,
+  poll?: Partial<ChainPollHealth>,
+): InfraReport => ({
   monitor: {
     blockLag: [lagSeries(overrides)],
-    poll: {
-      cycles: 100,
-      errors: 0,
-      skippedTicks: 0,
-      duration: null,
-      ...poll,
-    },
+    poll: [pollHealth(poll)],
   },
   dependencies: [],
+})
+
+const pollHealth = (overrides?: Partial<ChainPollHealth>): ChainPollHealth => ({
+  chain: 'base',
+  cycles: 100,
+  errors: 0,
+  skippedTicks: 0,
+  duration: null,
+  ...overrides,
 })
 
 /** The one card a single-chain report renders. */
@@ -331,13 +337,28 @@ describe('blockLagCards per chain', () => {
     expect(cards[1]?.primary).toBe('2000 blocks')
   })
 
-  it('attributes skipped ticks to the primary chain only', () => {
+  it("gives each chain's card the skipped ticks of its own watcher", () => {
     const report = infra({}, { skippedTicks: 3 })
     report.monitor.blockLag.push(lagSeries({ chain: 'ethereum' }))
+    report.monitor.poll.push(
+      pollHealth({
+        chain: 'ethereum',
+        skippedTicks: 7,
+      }),
+    )
 
     const [base, ethereum] = blockLagCards(report, freshNow)
 
     expect(base?.secondary).toContain('3 skipped ticks')
+    expect(ethereum?.secondary).toContain('7 skipped ticks')
+  })
+
+  it('omits skipped ticks for a chain with no poll report', () => {
+    const report = infra({}, { skippedTicks: 3 })
+    report.monitor.blockLag.push(lagSeries({ chain: 'ethereum' }))
+
+    const [, ethereum] = blockLagCards(report, freshNow)
+
     expect(ethereum?.secondary).not.toContain('skipped ticks')
   })
 })

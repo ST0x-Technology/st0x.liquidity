@@ -546,7 +546,8 @@ pub struct DependencyBucket {
 pub struct MonitorTelemetry {
     /// One block-lag series per hedged chain, the primary chain first.
     pub block_lag: Vec<ChainBlockLag>,
-    pub poll: PollHealth,
+    /// One poll-cycle report per hedged chain, the primary chain first.
+    pub poll: Vec<ChainPollHealth>,
 }
 
 /// A hedged chain, by the wire name `st0x_evm::Chain` pins.
@@ -584,10 +585,12 @@ pub struct BlockLagPoint {
     pub max_lag_blocks: i64,
 }
 
-/// Poll-cycle health of the order-fill monitor within the report range.
+/// Poll-cycle health of one hedged chain's order-fill monitor within the
+/// report range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub struct PollHealth {
+pub struct ChainPollHealth {
+    pub chain: ChainName,
     #[ts(type = "number")]
     pub cycles: usize,
     #[ts(type = "number")]
@@ -921,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn monitor_telemetry_serializes_one_block_lag_series_per_chain() {
+    fn monitor_telemetry_serializes_one_lag_and_poll_series_per_chain() {
         let telemetry = MonitorTelemetry {
             block_lag: vec![
                 ChainBlockLag {
@@ -940,12 +943,22 @@ mod tests {
                     points: vec![],
                 },
             ],
-            poll: PollHealth {
-                cycles: 1,
-                errors: 0,
-                skipped_ticks: 0,
-                duration: None,
-            },
+            poll: vec![
+                ChainPollHealth {
+                    chain: ChainName::Base,
+                    cycles: 1,
+                    errors: 0,
+                    skipped_ticks: 2,
+                    duration: None,
+                },
+                ChainPollHealth {
+                    chain: ChainName::Ethereum,
+                    cycles: 4,
+                    errors: 1,
+                    skipped_ticks: 0,
+                    duration: None,
+                },
+            ],
         };
 
         let json = serde_json::to_value(&telemetry).expect("serialization should succeed");
@@ -964,6 +977,13 @@ mod tests {
         assert_eq!(json["blockLag"][1]["currentLagBlocks"], json!(null));
         assert_eq!(json["blockLag"][1]["currentLagSampledAt"], json!(null));
         assert_eq!(json["blockLag"][1]["points"], json!([]));
+        assert_eq!(json["poll"][0]["chain"], json!("base"));
+        assert_eq!(json["poll"][0]["cycles"], json!(1));
+        assert_eq!(json["poll"][0]["skippedTicks"], json!(2));
+        assert_eq!(json["poll"][0]["duration"], json!(null));
+        assert_eq!(json["poll"][1]["chain"], json!("ethereum"));
+        assert_eq!(json["poll"][1]["cycles"], json!(4));
+        assert_eq!(json["poll"][1]["errors"], json!(1));
     }
 
     /// The wire names are the chain names pinned by `st0x_evm::Chain`, which

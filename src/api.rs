@@ -4461,12 +4461,14 @@ mod tests {
                         "currentLagSampledAt": null,
                         "points": [],
                     }],
-                    "poll": {
+                    // One poll report per hedged chain, likewise.
+                    "poll": [{
+                        "chain": "base",
                         "cycles": 0,
                         "errors": 0,
                         "skippedTicks": 0,
                         "duration": null,
-                    },
+                    }],
                 },
                 "dependencies": [],
             })
@@ -4518,6 +4520,7 @@ mod tests {
         crate::telemetry::record_poll_cycle(
             &state.pool,
             crate::telemetry::Monitor::OrderFill,
+            Chain::Base,
             orderbook,
             now,
             std::time::Duration::from_millis(40),
@@ -4567,15 +4570,11 @@ mod tests {
             bucket_start <= now && now - bucket_start <= chrono::Duration::days(7),
             "bucket start {bucket_start} must fall inside the default window"
         );
-        assert_eq!(report["monitor"]["poll"]["cycles"], serde_json::json!(1));
-        assert_eq!(
-            report["monitor"]["poll"]["skippedTicks"],
-            serde_json::json!(1)
-        );
-        assert_eq!(
-            report["monitor"]["poll"]["duration"]["p50Ms"],
-            serde_json::json!(40)
-        );
+        let poll = &report["monitor"]["poll"][0];
+        assert_eq!(poll["chain"], serde_json::json!("base"));
+        assert_eq!(poll["cycles"], serde_json::json!(1));
+        assert_eq!(poll["skippedTicks"], serde_json::json!(1));
+        assert_eq!(poll["duration"]["p50Ms"], serde_json::json!(40));
         assert_eq!(
             report["dependencies"][0]["dependency"],
             serde_json::json!("rpc")
@@ -4597,9 +4596,10 @@ mod tests {
     }
 
     /// A secondary chain's watcher shares the primary's orderbook address;
-    /// the report still shows it as its own series under its own chain.
+    /// the report still shows its lag and its poll health as its own series
+    /// under its own chain.
     #[tokio::test]
-    async fn performance_infra_reports_one_lag_series_per_hedged_chain() {
+    async fn performance_infra_reports_one_series_per_hedged_chain() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let orderbook = ctx.chains.primary().orderbook;
         ctx.chains.insert_secondary(
@@ -4626,6 +4626,18 @@ mod tests {
             .await
             .unwrap();
         }
+        crate::telemetry::record_poll_cycle(
+            &state.pool,
+            crate::telemetry::Monitor::OrderFill,
+            Chain::Ethereum,
+            orderbook,
+            now,
+            std::time::Duration::from_millis(70),
+            2,
+            Err(&"secondary rpc unreachable"),
+        )
+        .await
+        .unwrap();
 
         let app = build_app(state);
         let response = app
@@ -4654,6 +4666,20 @@ mod tests {
         assert_eq!(series[1]["chain"], serde_json::json!("ethereum"));
         assert_eq!(series[1]["currentLagBlocks"], serde_json::json!(7));
         assert_eq!(series[1]["points"][0]["maxLagBlocks"], serde_json::json!(7));
+        // Only the Ethereum watcher polled, so the primary's report is empty
+        // rather than carrying the secondary's cycle.
+        let poll = report["monitor"]["poll"]
+            .as_array()
+            .expect("one poll report per hedged chain");
+        assert_eq!(poll.len(), 2);
+        assert_eq!(poll[0]["chain"], serde_json::json!("base"));
+        assert_eq!(poll[0]["cycles"], serde_json::json!(0));
+        assert_eq!(poll[0]["duration"], serde_json::json!(null));
+        assert_eq!(poll[1]["chain"], serde_json::json!("ethereum"));
+        assert_eq!(poll[1]["cycles"], serde_json::json!(1));
+        assert_eq!(poll[1]["errors"], serde_json::json!(1));
+        assert_eq!(poll[1]["skippedTicks"], serde_json::json!(2));
+        assert_eq!(poll[1]["duration"]["p50Ms"], serde_json::json!(70));
     }
 
     #[tokio::test]
