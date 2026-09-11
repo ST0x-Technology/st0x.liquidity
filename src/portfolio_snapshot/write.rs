@@ -145,7 +145,11 @@ pub(crate) struct PortfolioSnapshotCtx {
     pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     /// Reused from `configured_inventory_vaults` (`src/conductor/builder.rs`)
     /// rather than recomputed, so the completeness gate and the live
-    /// inventory poller always agree on what "fully hydrated" means.
+    /// inventory poller always agree on what "fully hydrated" means. The
+    /// PRIMARY chain's equities alone, which is what the Hedging and
+    /// wallet-transit slots need -- both live on the primary. Row filtering,
+    /// ratio conversion and marking span every hedged chain instead, from
+    /// [`Self::market_making`] (see [`PortfolioSnapshotJob::perform_at`]).
     pub(crate) configured_equity_symbols: HashSet<Symbol>,
     /// Whether the hedging venue tracks cash at all.
     pub(crate) usdc_tracking_enabled: bool,
@@ -394,11 +398,26 @@ impl PortfolioSnapshotJob {
                 .await;
         }
 
+        // Every hedged chain's equities, not just the primary's: a symbol
+        // traded on a secondary chain alone still produces a market-making row
+        // there, and row filtering, ratio conversion and marking all key off
+        // "configured". Judged against the primary's table alone, such a row
+        // reaches `evaluate_day` unmarked and excludes the whole day with
+        // `MissingMark`. The primary-only set stays where it belongs: the
+        // Hedging and wallet-transit slots, which exist on the primary alone.
+        let hedged_equity_symbols: HashSet<Symbol> = ctx
+            .market_making
+            .values()
+            .flat_map(|slots| slots.equity_symbols.iter())
+            .chain(ctx.configured_equity_symbols.iter())
+            .cloned()
+            .collect();
+
         let rows = {
             let view = ctx.inventory.read().await;
             view.to_portfolio_snapshot_rows()?
         };
-        let rows = drop_empty_unconfigured_equity_rows(rows, &ctx.configured_equity_symbols)
+        let rows = drop_empty_unconfigured_equity_rows(rows, &hedged_equity_symbols)
             .map_err(PortfolioSnapshotJobError::UnconfiguredRowTotal)?;
 
         if let Some(gap) = hydration_gap(&rows, ctx) {
@@ -418,15 +437,9 @@ impl PortfolioSnapshotJob {
                 .await;
         }
 
-        let rows = convert_wrapped_equity_rows(rows, &ctx.wrappers, &ctx.configured_equity_symbols)
-            .await?;
-        let marked_rows = resolve_marks(
-            &ctx.position_projection,
-            now,
-            rows,
-            &ctx.configured_equity_symbols,
-        )
-        .await?;
+        let rows = convert_wrapped_equity_rows(rows, &ctx.wrappers, &hedged_equity_symbols).await?;
+        let marked_rows =
+            resolve_marks(&ctx.position_projection, now, rows, &hedged_equity_symbols).await?;
 
         match ctx
             .portfolio_snapshot
