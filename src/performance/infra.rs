@@ -2,9 +2,9 @@
 //!
 //! Surfaces the order-fill monitors' block-lag and poll-cycle samples
 //! (recorded by `crate::telemetry`) as the dashboard's ingestion-health
-//! report: per hedged chain, the current block lag and the worst lag per
-//! time bucket; plus poll-cycle duration/error/skipped-tick aggregates.
-//! Strictly read-only.
+//! report: per hedged chain, the current block lag, the worst lag per time
+//! bucket, and that chain's poll-cycle duration/error/skipped-tick
+//! aggregates. Strictly read-only.
 
 use std::collections::BTreeMap;
 
