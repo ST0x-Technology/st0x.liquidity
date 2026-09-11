@@ -1,6 +1,8 @@
+import type { ChainPollHealth } from '$lib/api/ChainPollHealth'
 import type { EquityTimings } from '$lib/api/EquityTimings'
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
 import type { InfraReport } from '$lib/api/InfraReport'
+import type { MonitorTelemetry } from '$lib/api/MonitorTelemetry'
 import type { RebalanceTimings } from '$lib/api/RebalanceTimings'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 import { getApiBaseUrl } from '$lib/env'
@@ -65,6 +67,45 @@ export const fetchReliabilityReport = async (
   range: PerformanceRange = {},
 ): Promise<ReliabilityReport> => fetchPerformanceJson('/performance/reliability', range)
 
-export const fetchInfraReport = async (
-  range: PerformanceRange = {},
-): Promise<InfraReport> => fetchPerformanceJson('/performance/infra', range)
+/** The pre-rollout shape of `monitor.poll`: one report, with no chain on it. */
+type PreRolloutPollHealth = Omit<ChainPollHealth, 'chain'>
+
+type InfraResponse = Omit<InfraReport, 'monitor'> & {
+  monitor: Omit<MonitorTelemetry, 'poll'> & {
+    poll: ChainPollHealth[] | PreRolloutPollHealth
+  }
+}
+
+/**
+ * Rollout shim: the dashboard profile activates before st0x-hedge, so a fresh
+ * page can read a backend that still sends one poll report for the whole bot.
+ * Attribute that report to the primary chain -- the first block-lag series --
+ * so the per-chain readers only ever see the list. Delete once every
+ * environment runs a backend that sends the list.
+ */
+const perChainPoll = (response: InfraResponse): InfraReport => {
+  const { blockLag, poll } = response.monitor
+
+  if (Array.isArray(poll)) {
+    return {
+      ...response,
+      monitor: {
+        blockLag,
+        poll,
+      },
+    }
+  }
+
+  const primary = blockLag[0]
+
+  return {
+    ...response,
+    monitor: {
+      blockLag,
+      poll: primary === undefined ? [] : [{ chain: primary.chain, ...poll }],
+    },
+  }
+}
+
+export const fetchInfraReport = async (range: PerformanceRange = {}): Promise<InfraReport> =>
+  perChainPoll(await fetchPerformanceJson<InfraResponse>('/performance/infra', range))
