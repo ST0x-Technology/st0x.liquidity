@@ -59,6 +59,27 @@ nothing enqueued). The `backfill-worker` fetches the logs and pushes an
 success. The cutoff tag is unrelated to `required_confirmations`, which governs
 only transaction-submission paths.
 
+Each watched chain has its own required `order_fill_poll_interval_secs` and
+independent backfill queue. All fill scans, including startup catch-up and
+durable retries, split inclusive block ranges using explicit chain constants:
+Base and Ethereum use 1000 blocks per request; HyperEVM uses 50. This applies to
+both OrderBook filters and the combined inventory settlement filter. The
+partition iterator is lazy and handles the full unsigned block-number range
+without arithmetic overflow.
+
+The 50-block HyperEVM cap follows the
+[official JSON-RPC contract](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/json-rpc).
+The 1000-block Base and Ethereum policy retains the existing request size; it is
+not a claim about every RPC provider's maximum. Verify the selected endpoint
+accepts these ranges before enabling a chain.
+
+The checkpoint advances only after the entire queued range succeeds. A failure
+in a later batch leaves the checkpoint unchanged, so retries rescan the range;
+downstream trade accounting deduplicates already-enqueued fills. HyperEVM's
+smaller batches require more RPC calls for the same block count. Before go-live,
+measure catch-up throughput on the selected endpoint and verify the expected
+outage backlog fits the existing two-hour backfill-job timeout.
+
 `ingestion_cutoff = "safe"` (recommended): On OP Stack chains like Base, `safe`
 is the latest L2 block whose sequencer batch has been posted to L1 -- typically
 only a few blocks behind the chain tip. Cuts hedging lag from ~20 min to

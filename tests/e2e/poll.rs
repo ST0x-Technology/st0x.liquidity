@@ -4,6 +4,7 @@
 //! managing the bot task, and `poll_for_events*` for waiting on CQRS
 //! events to appear in the database.
 
+use rain_math_float::Float;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use std::time::Duration;
@@ -12,11 +13,16 @@ use tokio::task::JoinHandle;
 
 use st0x_config::Ctx;
 use st0x_dto::Statement;
-use st0x_execution::FractionalShares;
+use st0x_event_sorcery::Projection;
 use st0x_execution::alpaca_broker_api::OrderStatus;
+use st0x_execution::{FractionalShares, Symbol};
 use st0x_hedge::{
-    FailureInjector, run_bot_session, run_bot_session_with_event_channel,
+    FailureInjector, Position, run_bot_session, run_bot_session_with_event_channel,
     run_bot_session_with_injector,
+};
+
+use crate::assert::{
+    ExpectedPosition, count_offchain_orders_for_symbol, truncation_epsilon, within_epsilon,
 };
 
 /// Returns an available TCP port by binding to port 0 and reading the assigned
@@ -337,21 +343,40 @@ pub async fn poll_for_snapshot_field(
     }
 }
 
-/// Polls the Position projection view until the given symbol has no
-/// pending offchain order (hedge cycle completed).
+/// Polls the Position projection until `expected.symbol` carries every
+/// expected onchain fill and its hedges have brought `net` back to zero.
 ///
-/// Uses `pending_offchain_order_id == null` instead of `net == 0`
-/// because Float precision truncation at the broker API boundary
-/// can leave a tiny non-zero residual that never reaches exact zero.
+/// The position row appears with the first acknowledged fill, before that
+/// fill's hedge is placed, so an empty `pending_offchain_order_id` alone does
+/// not prove the hedge cycle ran. Matching the accumulated fills rules out a
+/// read before a later fill landed; `net == 0` rules out an unfilled hedge.
+///
+/// The quantities match within [`truncation_epsilon`], because the broker
+/// truncates every fill to nine decimal places and an exact comparison would
+/// never see the dust that leaves behind. The tolerance is the same bound the
+/// post-poll assertions use, and stays orders of magnitude below one fill, so
+/// a missing fill still holds the poll.
 pub async fn poll_for_hedge_completion(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
-    symbol: &str,
+    expected: &ExpectedPosition,
     timeout: Duration,
 ) {
     let connect_opts = SqliteConnectOptions::new().filename(db_path);
     let deadline = tokio::time::Instant::now() + timeout;
+    let symbol = Symbol::new(expected.symbol.to_owned()).unwrap();
     let context = format!("Position({symbol}) hedge completed");
+    let is_hedged = |position: &Position, epsilon: Float| {
+        within_epsilon(
+            position.accumulated_long.inner(),
+            expected.expected_accumulated_long,
+            epsilon,
+        ) && within_epsilon(
+            position.accumulated_short.inner(),
+            expected.expected_accumulated_short,
+            epsilon,
+        ) && within_epsilon(position.net.inner(), expected.expected_net, epsilon)
+    };
 
     loop {
         sleep_or_crash(bot, &context).await;
@@ -364,44 +389,48 @@ pub async fn poll_for_hedge_completion(
             continue;
         };
 
-        let query_result =
-            sqlx::query_as::<_, (String,)>("SELECT payload FROM position_view WHERE view_id = ?")
-                .bind(symbol)
-                .fetch_optional(&pool)
-                .await;
+        let loaded = Projection::<Position>::sqlite(pool.clone())
+            .load(&symbol)
+            .await;
+        let hedge_count = fetch_all_domain_events(&pool)
+            .await
+            .map(|events| count_offchain_orders_for_symbol(&events, expected.symbol));
 
         pool.close().await;
 
-        match query_result {
-            Ok(Some((payload,))) => {
-                if let Ok(lifecycle) = serde_json::from_str::<serde_json::Value>(&payload)
-                    && let Some(live) = lifecycle.get("Live")
-                {
-                    let pending = live
-                        .get("pending_offchain_order_id")
-                        .and_then(|value| value.as_str());
+        let epsilon = match hedge_count {
+            // A read can race the first placement, so the count floors at the
+            // one hedge every expected position needs.
+            Ok(count) => truncation_epsilon(count.max(1)),
 
-                    if pending.is_none() {
-                        return;
-                    }
-                }
-
+            Err(query_error) => {
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "Timed out after {timeout:?} waiting for {context}",
+                    "Timed out after {timeout:?} waiting for {context} \
+                     (hedge count query failed: {query_error})",
                 );
+                continue;
             }
+        };
+
+        match loaded {
+            Ok(Some(position)) if is_hedged(&position, epsilon) => return,
+
+            Ok(Some(position)) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} \
+                 (net={}, long={}, short={})",
+                position.net,
+                position.accumulated_long,
+                position.accumulated_short,
+            ),
 
             Ok(None) => assert!(
                 tokio::time::Instant::now() < deadline,
                 "Timed out after {timeout:?} waiting for {context} (position not found)",
             ),
 
-            Err(query_error) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out after {timeout:?} waiting for {context} \
-                 (query failed: {query_error})",
-            ),
+            Err(load_error) => panic!("failed to load Position projection: {load_error}"),
         }
     }
 }
@@ -659,6 +688,10 @@ pub async fn fetch_all_domain_events(
 /// Polls the broker mock until the total filled quantity for a symbol/side
 /// reaches the expected amount. This asserts on the actual external
 /// interaction (broker orders) rather than internal event counts.
+///
+/// The total matches within [`truncation_epsilon`] of the filled order count,
+/// since each fill is truncated to the broker's nine decimal places and the
+/// sum carries that dust once per order.
 pub async fn poll_for_broker_fills(
     bot: &mut JoinHandle<anyhow::Result<()>>,
     broker: &st0x_execution::alpaca_broker_api::AlpacaBrokerMock,
@@ -673,17 +706,25 @@ pub async fn poll_for_broker_fills(
     loop {
         sleep_or_crash(bot, &context).await;
 
-        let filled_total: FractionalShares = broker
+        let filled_orders: Vec<_> = broker
             .orders()
-            .iter()
+            .into_iter()
             .filter(|order| {
                 order.symbol == symbol && order.side == side && order.status == OrderStatus::Filled
             })
+            .collect();
+
+        let filled_total = filled_orders
+            .iter()
             .fold(FractionalShares::ZERO, |acc, order| {
                 (acc + FractionalShares::new(order.quantity)).unwrap()
             });
 
-        if filled_total == expected_total {
+        if within_epsilon(
+            filled_total.inner(),
+            expected_total.inner(),
+            truncation_epsilon(filled_orders.len()),
+        ) {
             return;
         }
 

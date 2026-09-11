@@ -476,6 +476,21 @@ pub(crate) async fn setup_file_backed_test_db(
     (pool, apalis_pool, db_path, dir)
 }
 
+/// Exercises a read-model replay while another connection owns the WAL writer.
+#[cfg(test)]
+pub(crate) async fn replay_after_competing_writer<T: std::fmt::Debug>(
+    pool: &SqlitePool,
+    replay: impl std::future::Future<Output = T>,
+) -> T {
+    let blocker = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    tokio::pin!(replay);
+    let _elapsed = tokio::time::timeout(Duration::from_millis(50), &mut replay)
+        .await
+        .expect_err("replay must wait for the writer before reading its snapshot");
+    blocker.commit().await.unwrap();
+    replay.await
+}
+
 /// Shared constructor for positive share quantities in tests.
 pub fn try_positive_shares(value: &str) -> anyhow::Result<Positive<FractionalShares>> {
     let value = Float::parse(value.to_string())?;

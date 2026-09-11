@@ -34,7 +34,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use st0x_finance::{FractionalShares, Positive, Usd};
+use st0x_finance::{FractionalShares, Positive, Symbol, Usd};
 use st0x_float_macro::float;
 use st0x_hedge::ImbalanceThreshold;
 use st0x_hedge::OperationMode;
@@ -749,6 +749,14 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .expected_net(float!(0))
         .build()];
 
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
+
     let redemption_wallet_balance_after =
         crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
             .balanceOf(REDEMPTION_WALLET)
@@ -857,12 +865,6 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
     )
     .await;
 
-    // Redemption is driven by the inventory poller observing the
-    // post-take vault balance, so it can complete before the bot has
-    // processed the TakeOrderV3 event and placed its hedge. Wait for
-    // the position to settle so broker assertions are deterministic.
-    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(trade_amount)
@@ -873,6 +875,18 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
         .expected_accumulated_short(float!(0))
         .expected_net(float!(0))
         .build()];
+
+    // Redemption is driven by the inventory poller observing the
+    // post-take vault balance, so it can complete before the bot has
+    // processed the TakeOrderV3 event and placed its hedge. Wait for
+    // the position to settle so broker assertions are deterministic.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     let redemption_wallet_balance_after =
         crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
@@ -1155,8 +1169,6 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 
     let total_amount = (amount_per_trade * float!(3)).unwrap();
 
-    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(total_amount)
@@ -1167,6 +1179,14 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         .expected_accumulated_short(float!(0))
         .expected_net(float!(0))
         .build()];
+
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     assert_usdc_rebalancing_flow()
         .expected_positions(&expected_positions)
@@ -1352,12 +1372,6 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
 
     let total_amount = (amount_per_trade * float!(3)).unwrap();
 
-    // CheckPositions batches hedges across scan cycles. The
-    // last onchain fill may arrive during the USDC rebalance, so
-    // its hedge completes after the rebalance event. Wait for all
-    // hedges to fill by polling until the position net reaches zero.
-    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(total_amount)
@@ -1368,6 +1382,18 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .expected_accumulated_short(total_amount)
         .expected_net(float!(0))
         .build()];
+
+    // CheckPositions batches hedges across scan cycles. The
+    // last onchain fill may arrive during the USDC rebalance, so
+    // its hedge completes after the rebalance event. Wait for all
+    // hedges to fill by polling until the position net reaches zero.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     assert_usdc_rebalancing_flow()
         .expected_positions(&expected_positions)
@@ -1393,18 +1419,11 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Redemption rejected by Alpaca preserves inflight via sticky marker.
-///
-/// When a redemption request is rejected by Alpaca, the bot marks the
-/// `(symbol, MarketMaking)` pair as sticky inflight. Subsequent
-/// `InflightEquity` polls that find no pending requests for that symbol
-/// must NOT zero the inflight -- the tokens are physically in Alpaca's
-/// redemption wallet with no snapshot source tracking them.
-///
-/// Without sticky inflight, the system would lose track of those assets
-/// entirely and make incorrect rebalancing decisions.
+/// Rejection releases runtime inflight so new imbalances can rebalance while
+/// the failed transfer retains its stranded quantity and rejection history.
 #[test_log::test(tokio::test)]
-async fn redemption_rejected_preserves_inflight_via_sticky() -> anyhow::Result<()> {
+async fn redemption_rejected_releases_inflight_and_preserves_failed_transfer() -> anyhow::Result<()>
+{
     let onchain_price = float!("112.50");
     let broker_fill_price = float!("113.60");
     let trade_amount = float!("12.5");
@@ -1478,22 +1497,67 @@ async fn redemption_rejected_preserves_inflight_via_sticky() -> anyhow::Result<(
     )
     .await;
 
-    // Wait for 2+ full poll cycles (15s each) after the rejection.
-    //
-    // We intentionally do NOT wait for new InflightEquity events here: the
-    // snapshot aggregate deduplicates — it only emits an event when
-    // inflight_redemptions changes. The sticky mechanism keeps the rejected
-    // request in the inflight list, so the aggregate sees the same
-    // {AAPL: 6.25} every poll and emits nothing new. Waiting on a count
-    // increase would time out. A plain sleep is the correct approach: we
-    // need enough time for any duplicate redemption to surface if sticky
-    // fails, not evidence that inflight changed.
-    tokio::time::sleep(Duration::from_secs(50)).await;
+    let pool = connect_db(&infra.db_path).await?;
+    let first_events = fetch_events_by_type(&pool, "EquityRedemption").await?;
+    let first_id =
+        aggregate_id_for_event(&first_events, "EquityRedemptionEvent::RedemptionRejected");
+    let first_quantity = first_events
+        .iter()
+        .find(|event| {
+            event.aggregate_id == first_id
+                && event.event_type == "EquityRedemptionEvent::VaultWithdrawPending"
+        })
+        .expect("Rejected redemption must retain its withdrawal intent")
+        .payload["VaultWithdrawPending"]["quantity"]
+        .as_str()
+        .expect("Withdrawal intent must retain the quantity")
+        .to_owned();
+    pool.close().await;
+
+    let expected_position = ExpectedPosition::builder()
+        .symbol("AAPL")
+        .amount(trade_amount)
+        .direction(TakeDirection::BuyEquity)
+        .onchain_price(onchain_price)
+        .broker_fill_price(broker_fill_price)
+        .expected_accumulated_long(trade_amount)
+        .expected_accumulated_short(float!(0))
+        .expected_net(float!(0))
+        .build();
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_position,
+        Duration::from_secs(30),
+    )
+    .await;
+    let broker_quantity = infra
+        .broker_service
+        .positions()
+        .into_iter()
+        .find(|position| position.symbol == "AAPL")
+        .expect("The broker must retain the hedged AAPL position")
+        .quantity;
+    infra
+        .broker_service
+        .adjust_position(&Symbol::new("AAPL")?, (float!(0) - broker_quantity)?)?;
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "EquityRedemptionEvent::RedemptionRejected",
+        2,
+        Duration::from_secs(120),
+    )
+    .await;
 
     let pool = connect_db(&infra.db_path).await?;
 
     // Verify the redemption event sequence includes RedemptionRejected.
-    let redeem_events = fetch_events_by_type(&pool, "EquityRedemption").await?;
+    let redeem_events: Vec<_> = fetch_events_by_type(&pool, "EquityRedemption")
+        .await?
+        .into_iter()
+        .filter(|event| event.aggregate_id == first_id)
+        .collect();
     assert_event_subsequence(
         &redeem_events,
         &[
@@ -1508,21 +1572,24 @@ async fn redemption_rejected_preserves_inflight_via_sticky() -> anyhow::Result<(
         ],
     );
 
-    // The critical assertion: no second WithdrawnFromRaindex event should
-    // exist. After RedemptionRejected, the sticky marker prevents
-    // InflightEquity polls from zeroing inflight for the symbol. Without
-    // sticky, the poll would zero inflight, the system would see a new
-    // imbalance, and trigger another (incorrect) redemption.
-    let withdrawn_count = redeem_events
+    let first_withdrawals = redeem_events
         .iter()
         .filter(|event| event.event_type == "EquityRedemptionEvent::WithdrawnFromRaindex")
         .count();
     assert_eq!(
-        withdrawn_count, 1,
-        "Expected exactly 1 WithdrawnFromRaindex event (sticky inflight should prevent \
-         the system from seeing a new imbalance and triggering another redemption), \
-         got {withdrawn_count}",
+        first_withdrawals, 1,
+        "The failed transfer must not withdraw twice"
     );
+    let (retained_quantity, retained_reason): (String, String) = sqlx::query_as(
+        "SELECT json_extract(payload, '$.Live.Failed.quantity'), \
+         json_extract(payload, '$.Live.Failed.reason') \
+         FROM equity_redemption_view WHERE view_id = ?",
+    )
+    .bind(&first_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(retained_quantity, first_quantity);
+    assert_eq!(retained_reason, "Alpaca rejected the redemption request");
 
     // Verify the mock shows the rejected redemption request.
     let redeem_requests: Vec<_> = infra
@@ -1531,15 +1598,13 @@ async fn redemption_rejected_preserves_inflight_via_sticky() -> anyhow::Result<(
         .into_iter()
         .filter(|req| req.request_type == TokenizationRequestType::Redeem && req.symbol == "AAPL")
         .collect();
-    assert_eq!(
-        redeem_requests.len(),
-        1,
-        "Expected exactly 1 redeem request for AAPL"
-    );
-    assert_eq!(
-        redeem_requests[0].status,
-        st0x_hedge::mock_api::TokenizationStatus::Rejected,
-        "Redeem request should have Rejected status"
+    assert!(
+        redeem_requests
+            .iter()
+            .filter(|request| request.status == st0x_hedge::mock_api::TokenizationStatus::Rejected)
+            .count()
+            >= 2,
+        "Rebalancing must resume after the first rejection"
     );
 
     pool.close().await;
@@ -2036,6 +2101,14 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         .expected_net(float!(0))
         .build()];
 
+    poll_for_hedge_completion(
+        &mut bot2,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
+
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
         .take_results(&take_results)
@@ -2236,6 +2309,14 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
         .expected_accumulated_short(float!(0))
         .expected_net(float!(0))
         .build()];
+
+    poll_for_hedge_completion(
+        &mut bot2,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     let redemption_wallet_balance_after =
         crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)

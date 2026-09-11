@@ -97,6 +97,8 @@ async fn transient_empty_get_logs_during_backfill_does_not_drop_events() -> anyh
     )
     .await;
 
+    poll_for_hedged_position(&mut bot, &infra.db_path, equity_symbol).await;
+
     assert_full_hedging_flow(
         &[expected_position],
         &[take_result],
@@ -185,6 +187,8 @@ async fn delayed_get_logs_responses_do_not_drop_or_duplicate_events() -> anyhow:
         Duration::from_secs(120),
     )
     .await;
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, equity_symbol).await;
 
     assert_full_hedging_flow(
         &[expected_position],
@@ -468,6 +472,8 @@ async fn rpc_outage_resumes_from_checkpoint_without_losing_fills() -> anyhow::Re
         .expected_accumulated_short(sell_amount)
         .expected_net(float!(0))
         .build();
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, equity_symbol).await;
 
     assert_full_hedging_flow(
         &[expected_position],

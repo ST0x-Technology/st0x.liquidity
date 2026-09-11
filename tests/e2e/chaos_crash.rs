@@ -196,6 +196,8 @@ async fn crash_during_in_flight_placement_recovers_without_double_submit() -> an
         .expected_net(float!(0))
         .build();
 
+    poll_for_hedged_position(&mut bot2, &infra.db_path, equity_symbol).await;
+
     assert_full_hedging_flow(
         &[expected_position],
         &[take_result],
@@ -362,6 +364,8 @@ async fn crash_while_order_submitted_resumes_polling_and_fills() -> anyhow::Resu
         .expected_net(float!(0))
         .build();
 
+    poll_for_hedged_position(&mut bot2, &infra.db_path, equity_symbol).await;
+
     assert_full_hedging_flow(
         &[expected_position],
         &[take_result],
@@ -512,6 +516,8 @@ async fn crash_mid_accounting_job_recovers_the_fill_after_restart() -> anyhow::R
         .expected_accumulated_short(sell_amount)
         .expected_net(float!(0))
         .build();
+
+    poll_for_hedged_position(&mut bot2, &infra.db_path, equity_symbol).await;
 
     assert_full_hedging_flow(
         &[expected_position],

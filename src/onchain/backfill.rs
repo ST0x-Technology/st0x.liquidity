@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::iter::from_fn;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 
@@ -88,8 +89,8 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
 /// `OperatorDeposit` / `OperatorWithdraw` logs from the shared
 /// `RaindexInventory` in `[from_block, to_block]`, pushes an
 /// `AccountForDexTrade` job for each (inventory legs first paired into a single
-/// `InventoryTrade` per settlement tx), and advances the backfill checkpoint to
-/// `to_block` on success.
+/// `InventoryTrade` per settlement tx), advancing the backfill checkpoint after
+/// each batch is fully enqueued so a failed range keeps the progress it made.
 ///
 /// Skips RPC calls when `from_block > to_block` (already caught up),
 /// but still moves the checkpoint forward so a stale row does not
@@ -121,7 +122,7 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
         return Ok(());
     }
 
-    let total_blocks = to_block - from_block + 1;
+    let total_blocks = u128::from(to_block) - u128::from(from_block) + 1;
 
     info!(
         target: "orderbook",
@@ -129,7 +130,7 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
         from_block, to_block, total_blocks
     );
 
-    let batch_ranges = generate_batch_ranges(from_block, to_block);
+    let batch_ranges = generate_batch_ranges(evm_ctx.chain, from_block, to_block);
 
     let mut total_enqueued: usize = 0;
     for (batch_start, batch_end) in batch_ranges {
@@ -144,11 +145,21 @@ pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clon
         )
         .await?;
         total_enqueued += enqueued;
+
+        // Commit each batch as it lands rather than the whole range at the end.
+        // The batches are contiguous and ascending from `from_block`
+        // (= checkpoint + 1), and are processed strictly in order, so
+        // `batch_end` is genuinely the last fully enqueued block -- committing
+        // it leaves no gap. This is what lets a range too large for one job
+        // attempt make progress: a timed-out or failed attempt resumes at the
+        // first unscanned block instead of restarting from `from_block` and
+        // never converging. The queue push is durable before the checkpoint
+        // moves, so a crash in between only costs a re-scan, which the pipeline
+        // dedupes on `(chain, tx_hash, log_index)`.
+        save_backfill_checkpoint(pool, evm_ctx, batch_end).await?;
     }
 
     info!(target: "orderbook", total_enqueued, "Backfill completed");
-
-    save_backfill_checkpoint(pool, evm_ctx, to_block).await?;
 
     Ok(())
 }
@@ -251,11 +262,12 @@ where
     const WORKER_NAME: &'static str = "backfill-worker";
 
     /// A range covering a long outage legitimately spends far longer than the
-    /// default bound working through batched log scans, and the checkpoint
-    /// only advances after the whole range completes, so a timed-out attempt
-    /// re-scans the range from the start (safe: downstream dedupes by
-    /// `(tx_hash, log_index)`, but not incremental). The generous bound keeps
-    /// the timeout a hang detector, not a cap on legitimate catch-up work.
+    /// default bound working through batched log scans, so the generous bound
+    /// keeps the timeout a hang detector, not a cap on legitimate catch-up
+    /// work. `backfill_range` checkpoints every batch it finishes, so an
+    /// attempt that still times out resumes at the first unscanned block
+    /// rather than restarting the range -- which on HyperEVM's 50-block
+    /// batches is what keeps a day-long backlog converging.
     const PERFORM_TIMEOUT: Option<std::time::Duration> =
         Some(std::time::Duration::from_secs(2 * 60 * 60));
 
@@ -858,18 +870,27 @@ async fn fetch_logs_with_tip_check<P: Provider>(
     Ok(logs)
 }
 
-fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
-    const BACKFILL_BATCH_SIZE: usize = 1_000;
+fn generate_batch_ranges(
+    chain: Chain,
+    start_block: u64,
+    end_block: u64,
+) -> impl Iterator<Item = (u64, u64)> {
+    let batch_size = match chain {
+        Chain::Base | Chain::Ethereum => 1_000,
+        Chain::HyperEvm => 50,
+    };
+    let mut next_start = (start_block <= end_block).then_some(start_block);
 
-    (start_block..=end_block)
-        .step_by(BACKFILL_BATCH_SIZE)
-        .map(|batch_start| {
-            let batch_end = (batch_start + u64::try_from(BACKFILL_BATCH_SIZE).unwrap_or(u64::MAX)
-                - 1)
-            .min(end_block);
-            (batch_start, batch_end)
-        })
-        .collect()
+    from_fn(move || {
+        let start = next_start?;
+        let end = start + (end_block - start).min(batch_size - 1);
+        next_start = if end == end_block {
+            None
+        } else {
+            Some(end + 1)
+        };
+        Some((start, end))
+    })
 }
 
 #[cfg(test)]
@@ -881,6 +902,8 @@ mod tests {
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
+    use httpmock::{Mock, MockServer};
+    use proptest::prelude::*;
     use rain_math_float::Float;
 
     use st0x_config::{InventoryMode, TradingChain};
@@ -1047,6 +1070,177 @@ mod tests {
             .with_max_times(2) // Only 2 retries for tests (3 attempts total)
             .with_min_delay(Duration::from_millis(1))
             .with_max_delay(Duration::from_millis(10))
+    }
+
+    fn mock_scan_batch<'a>(
+        server: &'a MockServer,
+        trading: &TradingChain,
+        start: u64,
+        end: u64,
+        fail_clear: bool,
+    ) -> Vec<Mock<'a>> {
+        [
+            (trading.orderbook, vec![ClearV3::SIGNATURE_HASH]),
+            (trading.orderbook, vec![TakeOrderV3::SIGNATURE_HASH]),
+            (
+                trading.inventory_address(),
+                vec![
+                    OperatorDeposit::SIGNATURE_HASH,
+                    OperatorWithdraw::SIGNATURE_HASH,
+                ],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (address, topics))| {
+            let filter = Filter::new()
+                .address(address)
+                .from_block(start)
+                .to_block(end)
+                .event_signature(topics);
+            server.mock(|when, then| {
+                when.json_body_includes(r#"{"method":"eth_getLogs"}"#)
+                    .is_true(move |request| {
+                        serde_json::from_slice::<serde_json::Value>(request.body_ref())
+                            .ok()
+                            .and_then(|body| {
+                                serde_json::from_value::<Filter>(body["params"][0].clone()).ok()
+                            })
+                            .is_some_and(|actual| actual == filter)
+                    });
+                let response = if fail_clear && index == 0 {
+                    serde_json::json!({"jsonrpc": "2.0", "id": 0,
+                        "error": {"code": -32603, "message": "temporarily unavailable"}})
+                } else {
+                    serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": []})
+                };
+                then.json_body(response);
+            })
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn backfill_uses_each_chains_inclusive_rpc_limit_for_every_filter() {
+        for (chain, ranges) in [
+            (Chain::HyperEvm, vec![(100, 149), (150, 150)]),
+            (Chain::Base, vec![(100, 150)]),
+            (Chain::Ethereum, vec![(100, 150)]),
+        ] {
+            let (pool, apalis_pool) = setup_test_pools().await;
+            let trading = TradingChain::test().chain(chain).call();
+            let server = MockServer::start();
+            let tip = server.mock(|when, then| {
+                when.json_body_includes(r#"{"method":"eth_blockNumber"}"#);
+                then.json_body(serde_json::json!({
+                    "jsonrpc": "2.0", "id": 0, "result": "0x96",
+                }));
+            });
+            let batches: Vec<_> = ranges
+                .iter()
+                .flat_map(|&(start, end)| mock_scan_batch(&server, &trading, start, end, false))
+                .collect();
+            let provider = ProviderBuilder::new().connect_http(server.base_url().parse().unwrap());
+
+            backfill_range(
+                &provider,
+                &trading,
+                BotOperator(TEST_BOT_OPERATOR),
+                &pool,
+                100,
+                150,
+                test_retry_strategy(),
+                setup_job_queue(&apalis_pool),
+            )
+            .await
+            .unwrap();
+
+            for batch in batches {
+                batch.assert_calls(1);
+            }
+            tip.assert_calls(ranges.len() * 3);
+            assert_eq!(
+                load_backfill_checkpoint(&pool, &trading).await.unwrap(),
+                Some(150)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hyperevm_batch_failure_checkpoints_the_last_completed_batch() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let trading = TradingChain::test().chain(Chain::HyperEvm).call();
+        save_backfill_checkpoint(&pool, &trading, 99).await.unwrap();
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.json_body_includes(r#"{"method":"eth_blockNumber"}"#);
+            then.json_body(serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": "0x96"}));
+        });
+        let first = mock_scan_batch(&server, &trading, 100, 149, false);
+        let mut second = mock_scan_batch(&server, &trading, 150, 150, true);
+        let provider = ProviderBuilder::new().connect_http(server.base_url().parse().unwrap());
+
+        let result = backfill_range(
+            &provider,
+            &trading,
+            BotOperator(TEST_BOT_OPERATOR),
+            &pool,
+            100,
+            150,
+            test_retry_strategy(),
+            setup_job_queue(&apalis_pool),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, OnChainError::RpcTransport(rpc)
+                if rpc.as_error_resp().is_some_and(|payload|
+                    payload.code == -32603 && payload.message == "temporarily unavailable")),
+            "expected the second batch's RPC error, got: {error:?}"
+        );
+        for batch in &first {
+            batch.assert_calls(1);
+        }
+        second[0].assert_calls(3);
+        for batch in &second[1..] {
+            batch.assert_calls(1);
+        }
+        // The first batch was fully enqueued, so its blocks are committed even
+        // though the range as a whole failed: a retry resumes at 150 instead of
+        // re-scanning from 100. Without this a long HyperEVM catch-up that
+        // exceeds PERFORM_TIMEOUT never converges.
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &trading).await.unwrap(),
+            Some(149)
+        );
+
+        for batch in &mut second {
+            batch.delete();
+        }
+        let recovered = mock_scan_batch(&server, &trading, 150, 150, false);
+        backfill_range(
+            &provider,
+            &trading,
+            BotOperator(TEST_BOT_OPERATOR),
+            &pool,
+            100,
+            150,
+            test_retry_strategy(),
+            setup_job_queue(&apalis_pool),
+        )
+        .await
+        .unwrap();
+        for batch in first {
+            batch.assert_calls(2);
+        }
+        for batch in recovered {
+            batch.assert_calls(1);
+        }
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &trading).await.unwrap(),
+            Some(150)
+        );
     }
 
     fn setup_job_queue(apalis_pool: &apalis_sqlite::SqlitePool) -> DexTradeAccountingJobQueue {
@@ -1229,26 +1423,100 @@ mod tests {
     }
 
     #[test]
+    fn chain_batch_ranges_cover_boundaries_and_residuals() {
+        for (chain, cap) in [
+            (Chain::Base, 1000),
+            (Chain::Ethereum, 1000),
+            (Chain::HyperEvm, 50),
+        ] {
+            for start in [0, 100, u64::MAX - 3 * cap] {
+                assert_eq!(
+                    generate_batch_ranges(chain, start, start + cap - 1).collect::<Vec<_>>(),
+                    vec![(start, start + cap - 1)]
+                );
+                assert_eq!(
+                    generate_batch_ranges(chain, start, start + cap).collect::<Vec<_>>(),
+                    vec![(start, start + cap - 1), (start + cap, start + cap)]
+                );
+                assert_eq!(
+                    generate_batch_ranges(chain, start, start + 2 * cap + 4).collect::<Vec<_>>(),
+                    vec![
+                        (start, start + cap - 1),
+                        (start + cap, start + 2 * cap - 1),
+                        (start + 2 * cap, start + 2 * cap + 4)
+                    ]
+                );
+            }
+            assert_eq!(
+                generate_batch_ranges(chain, u64::MAX, u64::MAX).collect::<Vec<_>>(),
+                vec![(u64::MAX, u64::MAX)]
+            );
+            assert_eq!(
+                generate_batch_ranges(chain, u64::MAX - cap, u64::MAX).collect::<Vec<_>>(),
+                vec![(u64::MAX - cap, u64::MAX - 1), (u64::MAX, u64::MAX)]
+            );
+            assert_eq!(generate_batch_ranges(chain, u64::MAX, 0).next(), None);
+            assert_eq!(
+                generate_batch_ranges(chain, 0, u64::MAX)
+                    .take(2)
+                    .collect::<Vec<_>>(),
+                vec![(0, cap - 1), (cap, cap * 2 - 1)]
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn chain_batch_ranges_are_complete_contiguous_and_capped(
+            start in any::<u64>(),
+            length in 0_u64..5000,
+            policy in prop::sample::select(vec![(Chain::Base, 1000_u64),
+                (Chain::Ethereum, 1000), (Chain::HyperEvm, 50)]),
+        ) {
+            let (chain, cap) = policy;
+            let end = start + length.min(u64::MAX - start);
+            let ranges: Vec<_> = generate_batch_ranges(chain, start, end).collect();
+            prop_assert_eq!(ranges.first().unwrap().0, start);
+            prop_assert_eq!(ranges.last().unwrap().1, end);
+            for &(from, to) in &ranges {
+                prop_assert!(from <= to);
+                prop_assert!(to - from < cap);
+            }
+            for adjacent in ranges.windows(2) {
+                prop_assert_eq!(adjacent[0].1 + 1, adjacent[1].0);
+            }
+        }
+    }
+
+    #[test]
+    fn batch_ranges_near_max_preserve_inclusive_coverage() {
+        assert_eq!(
+            generate_batch_ranges(Chain::Base, u64::MAX - 50, u64::MAX).collect::<Vec<_>>(),
+            vec![(u64::MAX - 50, u64::MAX)]
+        );
+    }
+
+    #[test]
     fn test_generate_batch_ranges_single_batch() {
-        let ranges = generate_batch_ranges(100, 500);
+        let ranges: Vec<_> = generate_batch_ranges(Chain::Base, 100, 500).collect();
         assert_eq!(ranges, vec![(100, 500)]);
     }
 
     #[test]
     fn test_generate_batch_ranges_exact_batch_size() {
-        let ranges = generate_batch_ranges(100, 1099);
+        let ranges: Vec<_> = generate_batch_ranges(Chain::Base, 100, 1099).collect();
         assert_eq!(ranges, vec![(100, 1099)]);
     }
 
     #[test]
     fn test_generate_batch_ranges_multiple_batches() {
-        let ranges = generate_batch_ranges(100, 2500);
+        let ranges: Vec<_> = generate_batch_ranges(Chain::Base, 100, 2500).collect();
         assert_eq!(ranges, vec![(100, 1099), (1100, 2099), (2100, 2500)]);
     }
 
     #[test]
     fn test_generate_batch_ranges_large_range() {
-        let ranges = generate_batch_ranges(5000, 25000);
+        let ranges: Vec<_> = generate_batch_ranges(Chain::Base, 5000, 25000).collect();
         assert_eq!(
             ranges,
             vec![
@@ -1279,7 +1547,7 @@ mod tests {
 
     #[test]
     fn test_generate_batch_ranges_boundary() {
-        let ranges = generate_batch_ranges(100, 25000);
+        let ranges: Vec<_> = generate_batch_ranges(Chain::Base, 100, 25000).collect();
         assert_eq!(
             ranges,
             vec![
@@ -1314,14 +1582,13 @@ mod tests {
 
     #[test]
     fn test_generate_batch_ranges_single_block() {
-        let ranges = generate_batch_ranges(42, 42);
+        let ranges: Vec<_> = generate_batch_ranges(Chain::Base, 42, 42).collect();
         assert_eq!(ranges, vec![(42, 42)]);
     }
 
     #[test]
     fn test_generate_batch_ranges_empty() {
-        let ranges = generate_batch_ranges(100, 99);
-        assert_eq!(ranges.len(), 0);
+        assert_eq!(generate_batch_ranges(Chain::Base, 100, 99).count(), 0);
     }
 
     #[tokio::test]
@@ -2226,9 +2493,11 @@ mod tests {
         .await;
 
         assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
+        // The first 1000-block batch completed before the second one failed, so
+        // its blocks stay committed and the retry resumes at 1001.
         assert_eq!(
             load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
-            None
+            Some(1000)
         );
     }
 

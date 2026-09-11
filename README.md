@@ -92,6 +92,13 @@ nonzero, as must `inventory_divergence_threshold` (the number of consecutive
 offchain polls that must diverge from the inventory view before the poller
 escalates a forced snapshot reconciliation).
 
+Each watched chain requires its own `order_fill_poll_interval_secs`. Fill
+polling and catch-up use fixed inclusive `eth_getLogs` limits: 1000 blocks on
+Base and Ethereum, 50 on HyperEVM. These constants require no extra config.
+Catch-up queues are independent per chain; checkpoints advance after a whole
+range succeeds. See [OrderFillMonitor](docs/conductor.md#orderfillmonitor) for
+retry behavior and the catch-up throughput check required before go-live.
+
 When equities are configured, `[pricing].ws_url` and the encrypted
 `[pricing].api_key` are also required. Remote endpoints must use `wss://`;
 plaintext `ws://` is limited to `st0x-pricing` and loopback. The server

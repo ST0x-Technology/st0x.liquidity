@@ -380,6 +380,10 @@ pub enum EquityRedemptionCommand {
     RecoverProviderCompletion {
         tokenization_request_id: TokenizationRequestId,
     },
+    /// Waits for all earlier commands and their inline reactors to finish
+    /// before provider-completion recovery rebuilds live tracking. Emits no
+    /// event and is valid only for a failed redemption whose tokens were sent.
+    SynchronizeProviderCompletionRecovery,
     /// Operator or timeout-driven failure from `WithdrawnFromRaindex` or
     /// `TokensUnwrapped` states.
     FailTransfer { reason: String },
@@ -2040,6 +2044,7 @@ impl EventSourced for EquityRedemption {
             | Complete
             | RejectRedemption { .. }
             | RecoverProviderCompletion { .. }
+            | SynchronizeProviderCompletionRecovery
             | Reconcile { .. }
             | FailTransfer { .. } => Err(EquityRedemptionError::NotStarted),
             #[cfg(any(test, feature = "test-support"))]
@@ -2199,6 +2204,16 @@ impl EventSourced for EquityRedemption {
                     tokenization_request_id,
                     recovered_at: Utc::now(),
                 }]),
+                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+                _ => Err(EquityRedemptionError::TokensNotSent),
+            },
+
+            SynchronizeProviderCompletionRecovery => match self {
+                Self::Failed {
+                    redemption_tx: Some(_),
+                    ..
+                } => Ok(vec![]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::TokensNotSent),
@@ -5975,6 +5990,67 @@ mod tests {
             ),
             "a reconciled redemption must report AlreadyReconciled, not recover, got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn synchronize_provider_completion_recovery_emits_no_event_for_sent_failure() {
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(failed_redemption_history())
+            .when(EquityRedemptionCommand::SynchronizeProviderCompletionRecovery)
+            .await
+            .events();
+
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn synchronize_provider_completion_recovery_rejects_ineligible_states() {
+        let mut completed = vec![
+            withdrawn_from_raindex_event(),
+            tokens_sent_event(),
+            detected_event(),
+        ];
+        completed.push(EquityRedemptionEvent::Completed {
+            completed_at: Utc::now(),
+        });
+        let mut reconciled = failed_redemption_history();
+        reconciled.push(EquityRedemptionEvent::OperatorReconciled {
+            reason: "handled manually".to_string(),
+            reconciled_at: Utc::now(),
+        });
+        let cases = vec![
+            (
+                vec![withdrawn_from_raindex_event()],
+                EquityRedemptionError::TokensNotSent,
+            ),
+            (
+                vec![
+                    withdrawn_from_raindex_event(),
+                    EquityRedemptionEvent::TransferFailed {
+                        tx_hash: None,
+                        reason: Some("send failed".to_string()),
+                        failed_at: Utc::now(),
+                    },
+                ],
+                EquityRedemptionError::TokensNotSent,
+            ),
+            (completed, EquityRedemptionError::AlreadyCompleted),
+            (reconciled, EquityRedemptionError::AlreadyReconciled),
+        ];
+
+        for (history, expected) in cases {
+            let error = TestHarness::<EquityRedemption>::with(mock_services())
+                .given(history)
+                .when(EquityRedemptionCommand::SynchronizeProviderCompletionRecovery)
+                .await
+                .then_expect_error();
+
+            let LifecycleError::Apply(actual) = error else {
+                panic!("expected domain error, got {error:?}");
+            };
+
+            assert_eq!(actual, expected);
+        }
     }
 
     #[tokio::test]

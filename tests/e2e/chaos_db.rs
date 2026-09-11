@@ -64,18 +64,21 @@ async fn transient_write_lock_within_busy_timeout_rides_through() -> anyhow::Res
     // pool's 10s busy timeout, so every blocked write must ride it out.
     let lock = DbLock::acquire(&infra.db_path).await?;
 
-    let take_result = infra
+    let take = infra
         .base_chain
         .take_order()
         .symbol(equity_symbol)
         .amount(sell_amount)
         .price(onchain_price)
         .direction(TakeDirection::SellEquity)
-        .call()
-        .await?;
-
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    lock.release().await?;
+        .call();
+    let release_lock = async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        lock.release().await
+    };
+    let (take_result, release_result) = tokio::join!(take, release_lock);
+    release_result?;
+    let take_result = take_result?;
 
     poll_for_events_with_timeout(
         &mut bot,
@@ -96,6 +99,8 @@ async fn transient_write_lock_within_busy_timeout_rides_through() -> anyhow::Res
         .expected_accumulated_short(sell_amount)
         .expected_net(float!(0))
         .build();
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, equity_symbol).await;
 
     assert_full_hedging_flow(
         &[expected_position],
@@ -241,6 +246,8 @@ async fn sustained_lock_at_startup_fails_fast_and_restart_resumes() -> anyhow::R
         .expected_accumulated_short(cumulative_short)
         .expected_net(float!(0))
         .build();
+
+    poll_for_hedged_position(&mut bot3, &infra.db_path, equity_symbol).await;
 
     assert_full_hedging_flow(
         &[expected_position],

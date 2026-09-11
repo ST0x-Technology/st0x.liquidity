@@ -151,3 +151,7 @@ let logs = provider.get_logs(&filter).await?;
 3. **Don't parse literals at runtime** - use `address!()`, `b256!()` macros
 4. **Don't construct Filters manually** - use generated `*_filter()` builders
 5. **Mock responses are FIFO** - push them in the order RPC calls happen
+6. **OR-topic ordering is not stable** - `Filter` stores topic alternatives in a
+   set. HTTP tests must compare the deserialized request filter or topic sets,
+   rather than matching the serialized OR-topic array in a fixed order. Two
+   equivalent filters can serialize their alternatives in different orders.

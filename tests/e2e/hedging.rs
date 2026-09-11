@@ -71,6 +71,8 @@ async fn e2e_hedging_via_launch() -> anyhow::Result<()> {
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
 
+    poll_for_hedged_position(&mut bot, &infra.db_path, equity_symbol).await;
+
     assert_full_hedging_flow(
         &[expected_position],
         &[take_result],
@@ -124,6 +126,8 @@ async fn direct_high_precision_sell_price_still_hedges() -> anyhow::Result<()> {
         .await?;
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
 
     let pool = connect_db(&infra.db_path).await?;
 
@@ -247,6 +251,10 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
     }
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 3).await;
+
+    for expected_position in &expected_positions {
+        poll_for_hedged_position(&mut bot, &infra.db_path, expected_position.symbol).await;
+    }
 
     assert_full_hedging_flow(
         &expected_positions,
@@ -376,6 +384,8 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
 
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
+
     let pool = connect_db(&infra.db_path).await?;
     let pre_shutdown_onchain_events = count_events(&pool, "OnChainTrade").await?;
     let pre_shutdown_position_events = count_events(&pool, "Position").await?;
@@ -409,6 +419,17 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     let mut bot2 = spawn_bot(ctx2);
 
     poll_for_events(&mut bot2, &infra.db_path, "OffchainOrderEvent::Filled", 2).await;
+
+    let pool = connect_db(&infra.db_path).await?;
+    poll_for_accumulated_short(
+        &mut bot2,
+        &pool,
+        &Symbol::new("AAPL")?,
+        FractionalShares::new((sell_amount + sell_amount)?),
+    )
+    .await?;
+    pool.close().await;
+    poll_for_hedged_position(&mut bot2, &infra.db_path, "AAPL").await;
 
     // Restart should process new events (the take-order while bot was down)
     let pool = connect_db(&infra.db_path).await?;
@@ -545,6 +566,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     )
     .await;
 
+    for expected_position in &expected_positions {
+        poll_for_hedged_position(&mut ref_bot, &ref_infra.db_path, expected_position.symbol).await;
+    }
+
     // Abort the bot immediately after the pipeline completes to stop
     // background tasks (inventory poller) from emitting additional
     // events that would inflate the reference count non-deterministically.
@@ -644,6 +669,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     )
     .await;
 
+    for expected_position in &expected_positions {
+        poll_for_hedged_position(&mut bot2, &crash_infra.db_path, expected_position.symbol).await;
+    }
+
     // Abort immediately to stop background events from accumulating
     bot2.abort();
     let _ = bot2.await;
@@ -732,10 +761,13 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
     poll_for_events(&mut bot, &infra.db_path, "OnChainTradeEvent::Filled", 1).await;
 
     let pool = connect_db(&infra.db_path).await?;
-    let position = Projection::<Position>::sqlite(pool.clone())
-        .load(&Symbol::new("AAPL")?)
-        .await?
-        .expect("Position should exist even when market is closed");
+    let position = poll_for_accumulated_short(
+        &mut bot,
+        &pool,
+        &Symbol::new("AAPL")?,
+        FractionalShares::new(sell_amount),
+    )
+    .await?;
     assert_eq!(
         position.accumulated_short,
         FractionalShares::new(sell_amount),
@@ -779,6 +811,8 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         .expected_accumulated_short(sell_amount)
         .expected_net(float!(0))
         .build();
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
 
     assert_full_hedging_flow(
         &[expected_position],
@@ -872,6 +906,8 @@ async fn opposing_trades_no_hedge() -> anyhow::Result<()> {
     )
     .await;
 
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
+
     assert_full_hedging_flow(
         &[expected_position],
         &[take_result_sell, take_result_buy],
@@ -942,9 +978,24 @@ async fn broker_placement_fails() -> anyhow::Result<()> {
     // At least one offchain order should exist, all in Failed state.
     // The position checker retries placement every cycle (2s in tests),
     // so multiple failed orders may accumulate during the wait window.
-    let offchain_orders = Projection::<OffchainOrder>::sqlite(pool.clone())
-        .load_all()
-        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let projection = Projection::<OffchainOrder>::sqlite(pool.clone());
+    let offchain_orders = loop {
+        let orders = projection.load_all().await?;
+        if !orders.is_empty()
+            && orders
+                .iter()
+                .all(|(_, order)| matches!(order, OffchainOrder::Failed { .. }))
+        {
+            break orders;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for failed order projections"
+        );
+        sleep_or_crash(&mut bot, "failed order projections").await;
+    };
     assert!(
         !offchain_orders.is_empty(),
         "At least one offchain order should be created"
@@ -956,13 +1007,14 @@ async fn broker_placement_fails() -> anyhow::Result<()> {
         );
     }
 
-    // Each failed order produces 2 events (Placed + Failed)
-    let offchain_order_events = count_events(&pool, "OffchainOrder").await?;
-    let expected_events = i64::try_from(offchain_orders.len())? * 2;
-    assert_eq!(
-        offchain_order_events, expected_events,
-        "Each failed order should have Placed + Failed events"
-    );
+    for (order_id, _) in &offchain_orders {
+        assert_offchain_order_event_sequence(
+            &pool,
+            order_id,
+            &["OffchainOrderEvent::Placed", "OffchainOrderEvent::Failed"],
+        )
+        .await?;
+    }
 
     let broker_orders = infra.broker_service.orders();
     assert!(
@@ -1030,43 +1082,60 @@ async fn broker_order_rejected() -> anyhow::Result<()> {
 
     // Offchain order(s) should exist in Failed state. The position checker
     // may retry placement each cycle, producing multiple failed orders.
-    let offchain_orders = Projection::<OffchainOrder>::sqlite(pool.clone())
-        .load_all()
-        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let projection = Projection::<OffchainOrder>::sqlite(pool.clone());
+    let offchain_orders = loop {
+        let orders = projection.load_all().await?;
+        if !orders.is_empty()
+            && orders
+                .iter()
+                .all(|(_, order)| matches!(order, OffchainOrder::Failed { .. }))
+        {
+            break orders;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for rejected order projections"
+        );
+        sleep_or_crash(&mut bot, "rejected order projections").await;
+    };
     assert!(
         !offchain_orders.is_empty(),
         "At least one offchain order should be created"
     );
-    for (order_id, order) in &offchain_orders {
-        assert!(
-            matches!(order, OffchainOrder::Failed { .. }),
-            "Offchain order {order_id} should be in Failed state, got: {order:?}"
-        );
-    }
-
-    // Unlike PlacementFails, here orders ARE placed on the broker. The mock
-    // accepts placement (returning "new") then rejects on polling.
     let broker_orders = infra.broker_service.orders();
-    assert!(
-        !broker_orders.is_empty(),
-        "Broker orders should exist (placement succeeded before rejection)"
-    );
-    for order in &broker_orders {
+    for (order_id, order) in &offchain_orders {
+        let OffchainOrder::Failed {
+            executor_order_id, ..
+        } = order
+        else {
+            panic!("Offchain order {order_id} should be Failed, got: {order:?}");
+        };
+        let executor_order_id = executor_order_id
+            .as_ref()
+            .expect("A broker-rejected order must retain its executor order id");
+        let broker_order = broker_orders
+            .iter()
+            .find(|order| order.order_id == executor_order_id.as_ref())
+            .expect("The rejected offchain order must exist on the broker");
         assert_eq!(
-            order.status,
+            broker_order.status,
             OrderStatus::Rejected,
             "Broker order {} should be rejected",
-            order.order_id
+            broker_order.order_id
         );
+        assert_offchain_order_event_sequence(
+            &pool,
+            order_id,
+            &[
+                "OffchainOrderEvent::Placed",
+                "OffchainOrderEvent::Accepted",
+                "OffchainOrderEvent::Failed",
+            ],
+        )
+        .await?;
     }
-
-    // Each rejected order goes through Placed -> Submitted -> Failed (3 events)
-    let offchain_order_events = count_events(&pool, "OffchainOrder").await?;
-    let expected_events = i64::try_from(offchain_orders.len())? * 3;
-    assert_eq!(
-        offchain_order_events, expected_events,
-        "Each rejected order should have Placed + Submitted + Failed events"
-    );
 
     pool.close().await;
     bot.abort();
@@ -1122,9 +1191,23 @@ async fn broker_order_cancelled_after_partial_fill() -> anyhow::Result<()> {
     // The position checker re-hedges the unfilled remainder each cycle, so
     // several cancelled orders can accumulate; every one of them must carry
     // the partial fill the broker reported at cancellation.
-    let offchain_orders = Projection::<OffchainOrder>::sqlite(pool.clone())
-        .load_all()
-        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECS);
+    let projection = Projection::<OffchainOrder>::sqlite(pool.clone());
+    let offchain_orders = loop {
+        let orders = projection.load_all().await?;
+        if orders.iter().any(|(_, order)| {
+            matches!(order, OffchainOrder::Cancelled { shares, .. }
+                if shares.inner() == FractionalShares::new(sell_amount))
+        }) {
+            break orders;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for the full onchain hedge's Cancelled projection"
+        );
+        sleep_or_crash(&mut bot, "cancelled order projection").await;
+    };
+
     let cancelled: Vec<_> = offchain_orders
         .iter()
         .filter_map(|(order_id, order)| match order {
@@ -1212,6 +1295,8 @@ async fn delayed_fill() -> anyhow::Result<()> {
         1,
     )
     .await;
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
 
     let pool = connect_db(&infra.db_path).await?;
 
@@ -1334,6 +1419,8 @@ async fn small_fractional_amounts() -> anyhow::Result<()> {
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
 
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
+
     assert_full_hedging_flow(
         &[expected_position],
         &[take_result],
@@ -1421,6 +1508,10 @@ async fn out_of_order_fills() -> anyhow::Result<()> {
     }
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 2).await;
+
+    for expected_position in &expected_positions {
+        poll_for_hedged_position(&mut bot, &infra.db_path, expected_position.symbol).await;
+    }
 
     assert_full_hedging_flow(
         &expected_positions,
@@ -1518,6 +1609,8 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
         .await?;
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
 
     bot.abort();
     let _ = bot.await;
@@ -1790,6 +1883,8 @@ async fn e2e_inventory_trade_settlement_hedges() -> anyhow::Result<()> {
     .await?;
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
+
+    poll_for_hedged_position(&mut bot, &infra.db_path, "AAPL").await;
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol(equity_symbol)

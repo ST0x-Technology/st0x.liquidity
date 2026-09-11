@@ -835,3 +835,14 @@ different ID before provider lookup or submission. Legacy mint events have no
 stored ID; they remain replayable and use the caller's aggregate ID with an
 explicit warning. Snapshot schema version 6 ensures replay retains the new
 field.
+
+### Startup read-model replay and SQLite writers
+
+Startup replay can overlap the dependency telemetry writer, which starts before
+conductor maintenance. A replay that reads and then writes in one SQLite
+transaction must reserve the writer with `pool.begin_with("BEGIN IMMEDIATE")`
+before reading its snapshot. A deferred transaction can fail immediately when
+upgrading from reader to writer; the busy timeout cannot resolve that conflict.
+The reservation preserves the configured busy timeout and error propagation
+without retrying a partially read snapshot. Lifecycle failure, rebalance timing,
+equity timing, and portfolio snapshot startup replays follow this rule.

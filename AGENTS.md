@@ -37,6 +37,9 @@ the limit:
   `test-support` vs `cfg(test)`, common pitfalls with dead code warnings
 - [docs/ttdd.md](docs/ttdd.md) - Type-driven TDD workflow: scientific method
   applied to software, failing tests before implementation
+- [docs/redemption-failure-inflight.md](docs/redemption-failure-inflight.md) -
+  Redemption failure vs. startup inflight contracts, terminal-reactor
+  synchronization, provider-completion recovery claims and rollback
 
 **Update at the end:**
 
