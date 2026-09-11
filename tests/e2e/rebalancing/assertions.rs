@@ -324,6 +324,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(
         base_wallet.clone(),
         base_wallet.clone(),
+        base_wallet.clone(),
         base_wallet,
     );
 
@@ -429,6 +430,7 @@ where
 
     let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(
         base_wallet,
+        ethereum_wallet.clone(),
         ethereum_wallet.clone(),
         ethereum_wallet,
     );

@@ -13,3 +13,8 @@ pub const USDC_ETHEREUM_SEPOLIA: Address = address!("0x1c7D4B196Cb0C7B01d743Fbc6
 
 /// USDC on HyperEVM mainnet.
 pub const USDC_HYPEREVM: Address = address!("0xb88339CB7199b77E23DB6E890353E22632Ba630f");
+
+/// USDC on Robinhood Chain (chain 4663), the standard Arbitrum-bridged token
+/// (`L2GatewayRouter.calculateL2TokenAddress` of L1 USDC). Verified on-chain
+/// to answer `symbol() == "USDC"` with 6 decimals.
+pub const USDC_ROBINHOOD: Address = address!("0x80e0e24718dbFcad49ECAA6F1e6C89A190586cA8");

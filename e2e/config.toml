@@ -68,6 +68,11 @@ required_confirmations = 12
 lifecycle = "observe-only"
 required_confirmations = 1
 
+# Robinhood Chain, same shape as HyperEVM.
+[chains.robinhood]
+lifecycle = "observe-only"
+required_confirmations = 1
+
 [rest_api]
 url = "http://localhost:8099"
 
