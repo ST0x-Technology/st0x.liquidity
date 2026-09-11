@@ -4109,13 +4109,19 @@ pub mod process_tx {
                     },
                 },
                 vault_registry,
-                VaultRegistryId {
-                    chain: Chain::Base,
-                    orderbook: Address::ZERO,
-                    owner: Address::ZERO,
-                },
+                std::collections::BTreeMap::from([(
+                    Chain::Base,
+                    VaultRegistryId {
+                        chain: Chain::Base,
+                        orderbook: Address::ZERO,
+                        owner: Address::ZERO,
+                    },
+                )]),
                 inventory.clone(),
-                Arc::new(st0x_wrapper::MockWrapper::new()),
+                std::collections::BTreeMap::from([(
+                    Chain::Base,
+                    Arc::new(st0x_wrapper::MockWrapper::new()) as Arc<dyn st0x_wrapper::Wrapper>,
+                )]),
                 RebalancingSchedulers::new(&apalis_pool),
                 Arc::new(crate::alerts::LogNotifier),
             ));
