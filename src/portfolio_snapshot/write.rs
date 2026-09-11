@@ -3489,6 +3489,103 @@ mod tests {
         );
     }
 
+    /// A market-making row outlives the `(chain, symbol)` pair that created
+    /// it. Drop AAPL from Ethereum's assets table while Base still lists it,
+    /// and the durable Ethereum row must be judged by its own pair: kept
+    /// (it holds a balance), left in wrapped units, and forced unpriceable so
+    /// the day is excluded visibly. Judged by a flattened symbol set it still
+    /// looks configured, so the capture demands a live ratio for a pair that
+    /// config no longer has.
+    #[tokio::test]
+    async fn a_market_making_row_of_a_removed_pair_is_retired_not_configured() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(
+                aapl(),
+                FractionalShares::new(float!(10)),
+                FractionalShares::new(float!(5)),
+            )
+            .apply_equity_snapshot(
+                Venue::MarketMaking,
+                Chain::Ethereum,
+                [(&aapl(), &FractionalShares::new(float!(4)))],
+                now,
+                None,
+                now,
+            )
+            .unwrap();
+
+        let base_ratio = U256::from(1_500_000_000_000_000_000u64);
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            false,
+            false,
+            base_wrapper(MockWrapper::with_ratio(base_ratio)),
+        )
+        .await;
+        // `ctx.market_making` lists Base alone: Ethereum's AAPL pair is the
+        // one config dropped, while Base's keeps the symbol in play.
+        mark_all_required_fresh(&ctx);
+
+        position
+            .send(
+                &aapl(),
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: aapl(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    block_number: None,
+                    seen_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let et_day = et_day(Utc::now()).to_string();
+
+        async fn row(pool: &SqlitePool, et_day: &str, location: &str) -> (String, Option<String>) {
+            sqlx::query_as(
+                "SELECT available_balance, usd_mark FROM portfolio_snapshot \
+                 WHERE et_day = ? AND asset = 'AAPL' AND location = ?",
+            )
+            .bind(et_day)
+            .bind(location)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        assert_eq!(
+            row(&pool, &et_day, "market_making:ethereum").await,
+            ("4".to_string(), None),
+            "the retired pair's balance stays in wrapped units and unpriced, so the day is \
+             excluded rather than valued at an underlying mark"
+        );
+        assert_eq!(
+            row(&pool, &et_day, "market_making:base").await,
+            ("15".to_string(), Some("150".to_string())),
+            "the pair config still lists is converted with Base's 1.5 ratio and marked"
+        );
+    }
+
     /// Proves `perform_at` checks `freshness_gap` before it ever reads
     /// `ctx.inventory` (the fix for the restart-stale race: reading `rows`
     /// first would let a poll tick land in the gap between the read and the
