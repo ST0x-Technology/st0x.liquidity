@@ -2,7 +2,7 @@
 
 use rain_math_float::Float;
 use serde::Deserialize;
-use st0x_finance::{HasZero, Usdc};
+use st0x_finance::{HasZero, NotPositive, Usdc};
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 use tracing::{debug, error, trace, warn};
@@ -270,16 +270,27 @@ pub(super) async fn fetch_position_mark(
         return Ok(None);
     };
 
-    match Positive::new(Usd::new(current_price)) {
+    classify_position_mark(symbol, Positive::new(Usd::new(current_price)))
+}
+
+/// Converts the shared positive-value validation result into position-mark
+/// semantics, preserving comparison failures while treating ordinary
+/// non-positive marks as unavailable.
+fn classify_position_mark(
+    symbol: &Symbol,
+    mark: Result<Positive<Usd>, NotPositive<Usd>>,
+) -> Result<Option<Positive<Usd>>, AlpacaBrokerApiError> {
+    match mark {
         Ok(mark) => Ok(Some(mark)),
-        Err(error) => {
+        Err(NotPositive::Constraint { value }) => {
             warn!(
                 %symbol,
-                mark = %error.value,
+                mark = %value,
                 "Broker position reported a non-positive mark; no mark available"
             );
             Ok(None)
         }
+        Err(NotPositive::Comparison { source, .. }) => Err(source.into()),
     }
 }
 
@@ -340,15 +351,17 @@ fn to_cash_value_cents(cash: Float) -> Result<i64, AlpacaBrokerApiError> {
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
+    use rain_math_float::FloatError;
     use serde_json::json;
     use uuid::uuid;
+
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::alpaca_broker_api::TimeInForce;
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
-    use st0x_float_macro::float;
 
     fn shares(value: &str) -> FractionalShares {
         FractionalShares::new(float!(value))
@@ -1305,6 +1318,25 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn position_mark_preserves_float_comparison_failure() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let error = classify_position_mark(
+            &symbol,
+            Err(NotPositive::Comparison {
+                value: Usd::ZERO,
+                source: FloatError::InvalidHex("comparison failed".to_owned()),
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::FloatConversion(FloatError::InvalidHex(message))
+                if message == "comparison failed"
+        ));
     }
 
     /// USDCUSD is Alpaca's crypto pair. It is excluded from equity everywhere

@@ -415,6 +415,13 @@ async fn run_bot_session_inner(
     Ok(())
 }
 
+fn transfer_id<Tag>(id: uuid::Uuid) -> st0x_finance::Id<Tag> {
+    let Ok(id) = st0x_finance::Id::new(id.to_string()) else {
+        unreachable!("UUIDs always format as non-blank strings");
+    };
+    id
+}
+
 /// Drop guard that aborts the conductor task and shuts the runtime supervisors
 /// down when a bot session is cancelled before [`await_shutdown`] runs.
 ///

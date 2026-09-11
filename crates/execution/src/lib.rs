@@ -449,9 +449,11 @@ pub enum InvalidSharesError {
 impl From<SharesConversionError> for InvalidSharesError {
     fn from(error: SharesConversionError) -> Self {
         match error {
-            SharesConversionError::NegativeValue(value) => Self::NotPositive(NotPositive {
-                value: FractionalShares::new(value),
-            }),
+            SharesConversionError::NegativeValue(value) => {
+                Self::NotPositive(NotPositive::Constraint {
+                    value: FractionalShares::new(value),
+                })
+            }
             SharesConversionError::FloatConversion(error) => Self::FloatConversion(error),
         }
     }
