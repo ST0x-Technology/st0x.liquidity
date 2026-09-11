@@ -1030,7 +1030,7 @@ impl InventoryView {
             .sorted()
             .map(|symbol| {
                 let inventory = self.equities.get(symbol);
-                // The trading chain's slot alone, never a cross-chain total:
+                // The primary chain's slot alone, never a cross-chain total:
                 // a wrapped share is worth its own chain's underlying, so
                 // the chains cannot be added (see
                 // [`Inventory::onchain_totals`]). Surfacing the other chains
@@ -1038,7 +1038,7 @@ impl InventoryView {
                 // per chain, not a wider sum here.
                 let (onchain_available, onchain_inflight) = inventory
                     .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
-                        venue_balances(item.onchain.get(&self.trading_chain).copied())
+                        venue_balances(item.onchain.get(&self.primary_chain).copied())
                     });
 
                 let (offchain_available, offchain_inflight) = inventory
@@ -5852,7 +5852,7 @@ mod tests {
     /// vault shares, and each chain's vault has its own
     /// underlying-per-wrapped ratio, so adding two chains' share counts
     /// yields a number that is no longer a share count. The equity figure
-    /// therefore names one chain, the trading chain.
+    /// therefore names one chain, the primary chain.
     #[test]
     fn to_dto_totals_usdc_across_chains_but_keeps_equity_chain_qualified() {
         let aapl = Symbol::new("AAPL").unwrap();
