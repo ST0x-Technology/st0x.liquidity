@@ -224,10 +224,14 @@ struct Config {
     /// One table per chain the bot acts on. Replaces the single unnamed
     /// `[raindex]` section, which could only ever describe one chain.
     chains: BTreeMap<Chain, ChainConfig>,
-    order_polling_interval: Option<u64>,
-    order_polling_max_jitter: Option<u64>,
-    position_check_interval: Option<u64>,
-    inventory_poll_interval: Option<u64>,
+    #[serde(alias = "order_polling_interval")]
+    order_polling_interval_secs: Option<u64>,
+    #[serde(alias = "order_polling_max_jitter")]
+    order_polling_max_jitter_secs: Option<u64>,
+    #[serde(alias = "position_check_interval")]
+    position_check_interval_secs: Option<u64>,
+    #[serde(alias = "inventory_poll_interval")]
+    inventory_poll_interval_secs: Option<u64>,
     inventory_divergence_threshold: NonZeroU32,
     #[serde(default = "default_hedge_order_gate_reconciliation_timeout_secs")]
     hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
@@ -713,10 +717,10 @@ pub struct Ctx {
     /// Every chain the bot acts on. Read the trading chain out of it with
     /// [`ChainRegistry::primary`].
     pub chains: ChainRegistry,
-    pub order_polling_interval: u64,
-    pub order_polling_max_jitter: u64,
-    pub position_check_interval: u64,
-    pub inventory_poll_interval: u64,
+    pub order_polling_interval_secs: u64,
+    pub order_polling_max_jitter_secs: u64,
+    pub position_check_interval_secs: u64,
+    pub inventory_poll_interval_secs: u64,
     /// Consecutive offchain polls that must diverge from the inventory view's
     /// Hedging balance for a symbol before the poller escalates a forced
     /// snapshot reconciliation. Required and nonzero: a missing value must
@@ -1254,10 +1258,22 @@ impl std::fmt::Debug for Ctx {
             .field("server_port", &self.server_port)
             .field("board_port", &self.board_port)
             .field("chains", &self.chains)
-            .field("order_polling_interval", &self.order_polling_interval)
-            .field("order_polling_max_jitter", &self.order_polling_max_jitter)
-            .field("position_check_interval", &self.position_check_interval)
-            .field("inventory_poll_interval", &self.inventory_poll_interval)
+            .field(
+                "order_polling_interval_secs",
+                &self.order_polling_interval_secs,
+            )
+            .field(
+                "order_polling_max_jitter_secs",
+                &self.order_polling_max_jitter_secs,
+            )
+            .field(
+                "position_check_interval_secs",
+                &self.position_check_interval_secs,
+            )
+            .field(
+                "inventory_poll_interval_secs",
+                &self.inventory_poll_interval_secs,
+            )
             .field(
                 "inventory_divergence_threshold",
                 &self.inventory_divergence_threshold,
@@ -1399,10 +1415,10 @@ struct ValidatedParts {
     server_port: u16,
     board_port: u16,
     chains: ChainRegistry,
-    order_polling_interval: u64,
-    order_polling_max_jitter: u64,
-    position_check_interval: u64,
-    inventory_poll_interval: u64,
+    order_polling_interval_secs: u64,
+    order_polling_max_jitter_secs: u64,
+    position_check_interval_secs: u64,
+    inventory_poll_interval_secs: u64,
     inventory_divergence_threshold: NonZeroU32,
     hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
     extended_hours_reprice_timeout_secs: Option<NonZeroU64>,
@@ -1589,27 +1605,27 @@ fn validate_asset_tables(
 
 /// The poll cadences with defaults applied, each rejected at zero -- a zero
 /// interval would spin the corresponding poller in a hot loop.
-struct PollingIntervals {
-    order_polling_interval: u64,
-    position_check_interval: u64,
-    inventory_poll_interval: u64,
-    apalis_finished_job_cleanup_interval_secs: u64,
+struct PollingIntervalsSecs {
+    order_polling: u64,
+    position_check: u64,
+    inventory_poll: u64,
+    apalis_finished_job_cleanup: u64,
 }
 
-fn validated_polling_intervals(config: &Config) -> Result<PollingIntervals, CtxError> {
-    let intervals = PollingIntervals {
-        order_polling_interval: config.order_polling_interval.unwrap_or(15),
-        position_check_interval: config.position_check_interval.unwrap_or(60),
-        inventory_poll_interval: config.inventory_poll_interval.unwrap_or(60),
-        apalis_finished_job_cleanup_interval_secs: config.apalis_finished_job_cleanup_interval_secs,
+fn validated_polling_intervals(config: &Config) -> Result<PollingIntervalsSecs, CtxError> {
+    let intervals = PollingIntervalsSecs {
+        order_polling: config.order_polling_interval_secs.unwrap_or(15),
+        position_check: config.position_check_interval_secs.unwrap_or(60),
+        inventory_poll: config.inventory_poll_interval_secs.unwrap_or(60),
+        apalis_finished_job_cleanup: config.apalis_finished_job_cleanup_interval_secs,
     };
 
     for (value, field) in [
-        (intervals.order_polling_interval, "order_polling_interval"),
-        (intervals.position_check_interval, "position_check_interval"),
-        (intervals.inventory_poll_interval, "inventory_poll_interval"),
+        (intervals.order_polling, "order_polling_interval_secs"),
+        (intervals.position_check, "position_check_interval_secs"),
+        (intervals.inventory_poll, "inventory_poll_interval_secs"),
         (
-            intervals.apalis_finished_job_cleanup_interval_secs,
+            intervals.apalis_finished_job_cleanup,
             "apalis_finished_job_cleanup_interval_secs",
         ),
     ] {
@@ -1625,7 +1641,7 @@ fn validated_polling_intervals(config: &Config) -> Result<PollingIntervals, CtxE
 /// [`parse_and_validate`] reuses it instead of rebuilding it (and drifting
 /// from it).
 struct ValidatedConfigParts {
-    polling_intervals: PollingIntervals,
+    polling_intervals: PollingIntervalsSecs,
     alerts: Option<AlertsCtx>,
     file_logging: Option<crate::FileLogging>,
     log_query_url_template: Option<LogQueryUrlTemplate>,
@@ -1856,10 +1872,10 @@ fn parse_and_validate(
         server_port: config.server_port,
         board_port: config.board_port,
         chains,
-        order_polling_interval: polling_intervals.order_polling_interval,
-        order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
-        position_check_interval: polling_intervals.position_check_interval,
-        inventory_poll_interval: polling_intervals.inventory_poll_interval,
+        order_polling_interval_secs: polling_intervals.order_polling,
+        order_polling_max_jitter_secs: config.order_polling_max_jitter_secs.unwrap_or(5),
+        position_check_interval_secs: polling_intervals.position_check,
+        inventory_poll_interval_secs: polling_intervals.inventory_poll,
         inventory_divergence_threshold: config.inventory_divergence_threshold,
         hedge_order_gate_reconciliation_timeout_secs: config
             .hedge_order_gate_reconciliation_timeout_secs,
@@ -1867,8 +1883,7 @@ fn parse_and_validate(
         close_flatten_reprice_timeout_secs,
         extended_hours_close_flatten_window_secs,
         close_flatten_cross_max_bps,
-        apalis_finished_job_cleanup_interval_secs: polling_intervals
-            .apalis_finished_job_cleanup_interval_secs,
+        apalis_finished_job_cleanup_interval_secs: polling_intervals.apalis_finished_job_cleanup,
         broker,
         telemetry,
         alerts,
@@ -2025,10 +2040,10 @@ impl Ctx {
             server_port: parts.server_port,
             board_port: parts.board_port,
             chains: parts.chains,
-            order_polling_interval: parts.order_polling_interval,
-            order_polling_max_jitter: parts.order_polling_max_jitter,
-            position_check_interval: parts.position_check_interval,
-            inventory_poll_interval: parts.inventory_poll_interval,
+            order_polling_interval_secs: parts.order_polling_interval_secs,
+            order_polling_max_jitter_secs: parts.order_polling_max_jitter_secs,
+            position_check_interval_secs: parts.position_check_interval_secs,
+            inventory_poll_interval_secs: parts.inventory_poll_interval_secs,
             inventory_divergence_threshold: parts.inventory_divergence_threshold,
             hedge_order_gate_reconciliation_timeout_secs: parts
                 .hedge_order_gate_reconciliation_timeout_secs,
@@ -2205,7 +2220,7 @@ impl Ctx {
     }
 
     pub const fn order_polling_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.order_polling_interval)
+        std::time::Duration::from_secs(self.order_polling_interval_secs)
     }
 
     /// Returns the bot's signing wallet address (the `[wallet]` EOA).
@@ -2284,7 +2299,7 @@ impl Ctx {
         /// extended-hours-disabled policy, matching what the config validator
         /// requires of a real file.
         hedging: Option<HedgingAssets>,
-        #[builder(default = 2)] inventory_poll_interval: u64,
+        #[builder(default = 2)] inventory_poll_interval_secs: u64,
         #[builder(default = const { NonZeroU32::new(10).unwrap() })]
         inventory_divergence_threshold: NonZeroU32,
         #[builder(default = const { NonZeroU64::new(10).unwrap() })]
@@ -2362,10 +2377,10 @@ impl Ctx {
                     .assets(assets)
                     .call(),
             ),
-            order_polling_interval: 1,
-            order_polling_max_jitter: 0,
-            position_check_interval: 2,
-            inventory_poll_interval,
+            order_polling_interval_secs: 1,
+            order_polling_max_jitter_secs: 0,
+            position_check_interval_secs: 2,
+            inventory_poll_interval_secs,
             inventory_divergence_threshold,
             hedge_order_gate_reconciliation_timeout_secs,
             extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
@@ -2900,10 +2915,10 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
                 .deployment_block(1)
                 .call(),
         ),
-        order_polling_interval: 15,
-        order_polling_max_jitter: 5,
-        position_check_interval: 60,
-        inventory_poll_interval: 60,
+        order_polling_interval_secs: 15,
+        order_polling_max_jitter_secs: 5,
+        position_check_interval_secs: 60,
+        inventory_poll_interval_secs: 60,
         inventory_divergence_threshold: NonZeroU32::MIN,
         hedge_order_gate_reconciliation_timeout_secs: NonZeroU64::MIN,
         extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
@@ -4305,10 +4320,10 @@ mod tests {
         let parts = parse_and_validate_files(&config, &secrets).unwrap();
         assert!(matches!(parts.log_level, LogLevel::Debug));
         assert!(matches!(parts.log_format, LogFormat::Text));
-        assert_eq!(parts.order_polling_interval, 15);
-        assert_eq!(parts.order_polling_max_jitter, 5);
-        assert_eq!(parts.position_check_interval, 60);
-        assert_eq!(parts.inventory_poll_interval, 60);
+        assert_eq!(parts.order_polling_interval_secs, 15);
+        assert_eq!(parts.order_polling_max_jitter_secs, 5);
+        assert_eq!(parts.position_check_interval_secs, 60);
+        assert_eq!(parts.inventory_poll_interval_secs, 60);
         assert_eq!(parts.hedge_order_gate_reconciliation_timeout_secs.get(), 10);
     }
 
@@ -5130,10 +5145,10 @@ mod tests {
             log_format = "json"
             log_query_url_template = "https://logs.example/query?id={id}"
             server_port = 9090
-            order_polling_interval = 30
-            order_polling_max_jitter = 10
-            position_check_interval = 120
-            inventory_poll_interval = 90
+            order_polling_interval_secs = 30
+            order_polling_max_jitter_secs = 10
+            position_check_interval_secs = 120
+            inventory_poll_interval_secs = 90
 
             [chains.base.trading.assets.equities]
 
@@ -5216,10 +5231,31 @@ mod tests {
             "https://logs.example/query?id=abc-123"
         );
         assert_eq!(parts.server_port, 9090);
-        assert_eq!(parts.order_polling_interval, 30);
-        assert_eq!(parts.order_polling_max_jitter, 10);
-        assert_eq!(parts.position_check_interval, 120);
-        assert_eq!(parts.inventory_poll_interval, 90);
+        assert_eq!(parts.order_polling_interval_secs, 30);
+        assert_eq!(parts.order_polling_max_jitter_secs, 10);
+        assert_eq!(parts.position_check_interval_secs, 120);
+        assert_eq!(parts.inventory_poll_interval_secs, 90);
+    }
+
+    #[test]
+    fn legacy_polling_interval_keys_remain_accepted() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "            database_url = \":memory:\"",
+                "            database_url = \":memory:\"\n\
+                 order_polling_interval = 30\n\
+                 order_polling_max_jitter = 10\n\
+                 position_check_interval = 120\n\
+                 inventory_poll_interval = 90",
+            ),
+        );
+        let secrets = alpaca_secrets_toml();
+
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
+        assert_eq!(parts.order_polling_interval_secs, 30);
+        assert_eq!(parts.order_polling_max_jitter_secs, 10);
+        assert_eq!(parts.position_check_interval_secs, 120);
+        assert_eq!(parts.inventory_poll_interval_secs, 90);
     }
 
     /// A template without the `{id}` placeholder can never carry the id it
@@ -10266,7 +10302,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs = 3600
             inventory_divergence_threshold = 10
             hedge_order_gate_reconciliation_timeout_secs = 10
-            position_check_interval = 0
+            position_check_interval_secs = 0
 
             [chains.base.trading.assets.equities]
 

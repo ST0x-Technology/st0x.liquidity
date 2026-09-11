@@ -1028,7 +1028,7 @@ placement:
   `close_flatten_reprice_timeout_secs` is configured to 60 seconds. An unfilled
   aggressive hedge is repeatedly cancelled, reconciled, and repriced from a
   fresh reference before close. Replacement occurs on a later position scan,
-  whose cadence is the separately configured `position_check_interval` (60
+  whose cadence is the separately configured `position_check_interval_secs` (60
   seconds in the shipped deployments), so the timeout alone does not determine
   the number of attempts inside a window. Each later reprice samples the time
   ramp further along, so it crosses wider than the one before it. Both timeout

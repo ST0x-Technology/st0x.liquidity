@@ -451,7 +451,7 @@ where
             }),
         })
         .hedging(hedging_with_reserve(&equities, reserved))
-        .inventory_poll_interval(15)
+        .inventory_poll_interval_secs(15)
         .redemption_wallet(Address::random())
         .bot_gas_valuation(st0x_hedge::BotGasValuationConfig {
             chainlink_feed: base_chain.mock_chainlink_feed,

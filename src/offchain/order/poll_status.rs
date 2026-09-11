@@ -5011,7 +5011,7 @@ mod tests {
 
         assert!(
             matches!(error, JobError::StaleAfterOverflow),
-            "an oversized order_polling_interval must fail fast with a typed overflow error \
+            "an oversized order_polling_interval_secs must fail fast with a typed overflow error \
              rather than panicking inside Duration's checked_mul"
         );
     }

@@ -152,12 +152,12 @@ combination to watch for: each tick that finds an item still open forks a
 brand-new, independent, self-perpetuating chain in addition to whatever chain(s)
 already exist for it, so the live population grows without bound the longer the
 item stays open. This bit `PollOrderStatus`: `recover_submitted_offchain_orders`
-(`src/offchain/order/poll_status.rs`) polled every `position_check_interval`
-(~60s) for each non-terminal offchain order and pushed a new poll job every
-time, while `PollOrderStatus::perform` independently self-rescheduled via
-`reschedule_self` on every non-terminal broker response -- production
-accumulated tens of thousands of `Pending` rows for orders that stayed open for
-hours. The fix (`reconcile_live_poll_jobs`, wrapped by
+(`src/offchain/order/poll_status.rs`) polled every
+`position_check_interval_secs` (~60s) for each non-terminal offchain order and
+pushed a new poll job every time, while `PollOrderStatus::perform` independently
+self-rescheduled via `reschedule_self` on every non-terminal broker response --
+production accumulated tens of thousands of `Pending` rows for orders that
+stayed open for hours. The fix (`reconcile_live_poll_jobs`, wrapped by
 `reconcile_and_check_live_poll_job` and consolidated for every push site by
 `push_poll_job_if_absent`) is an application-layer check before the push: query
 whether a live row already exists for that specific order id via
@@ -877,7 +877,7 @@ pending order, and enqueues an independent `PlaceHedge` job for every symbol
 whose net exposure has crossed the execution threshold. Per-symbol scan errors
 are logged and swallowed so one symbol's failure cannot block the others; only
 failures of the loop itself propagate. After each scan the job re-enqueues
-itself with a delay of the configured `position_check_interval`.
+itself with a delay of the configured `position_check_interval_secs`.
 
 Each tick also re-drives orders stuck `Pending` between broker acceptance and
 the outcome commit (ADR 0014), serialized against live placements via the shared
@@ -1008,13 +1008,13 @@ initial close-flatten cancellation remains independent of both timeouts: it
 targets any live extended-hours order placed before the window. Each confirmed
 cancellation releases the position after applying any partial fill, so a later
 scan retries the broker-executable residual using a fresh reference and a later
-point on the cross ramp. That retry also waits for `position_check_interval`.
-The shipped deployments use 60 seconds, but cancellation confirmation and job
-execution add variable delay, so neither that interval nor the reprice timeout
-defines a fixed attempt count. This produces repeated bounded-loss attempts
-until the session closes, while the existing buying-power, equity-inventory,
-operational-limit, and broker-minimum checks continue to block invalid or
-leveraged orders.
+point on the cross ramp. That retry also waits for
+`position_check_interval_secs`. The shipped deployments use 60 seconds, but
+cancellation confirmation and job execution add variable delay, so neither that
+interval nor the reprice timeout defines a fixed attempt count. This produces
+repeated bounded-loss attempts until the session closes, while the existing
+buying-power, equity-inventory, operational-limit, and broker-minimum checks
+continue to block invalid or leveraged orders.
 
 ## Conductor assembly
 

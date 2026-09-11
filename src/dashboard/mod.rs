@@ -433,8 +433,8 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         orderbook: format!("{:#x}", ctx.chains.primary().orderbook),
         deployment_block: ctx.chains.primary().deployment_block,
         broker: broker.to_string(),
-        order_polling_interval: ctx.order_polling_interval,
-        inventory_poll_interval: ctx.inventory_poll_interval,
+        order_polling_interval: ctx.order_polling_interval_secs,
+        inventory_poll_interval: ctx.inventory_poll_interval_secs,
     }
 }
 
