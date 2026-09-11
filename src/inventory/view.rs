@@ -5835,11 +5835,14 @@ mod tests {
         );
     }
 
-    /// Funds held on a secondary chain are still the bot's funds: the
-    /// dashboard's single onchain figure must total every chain's slot, not
-    /// report the primary's alone.
+    /// Cash totals across chains -- a dollar is a dollar on every chain --
+    /// while equity does not: a market-making slot holds wrapped ERC-4626
+    /// vault shares, and each chain's vault has its own
+    /// underlying-per-wrapped ratio, so adding two chains' share counts
+    /// yields a number that is no longer a share count. The equity figure
+    /// therefore names one chain, the trading chain.
     #[test]
-    fn to_dto_totals_onchain_balances_across_chains() {
+    fn to_dto_totals_usdc_across_chains_but_keeps_equity_chain_qualified() {
         let aapl = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let equity_on = |chain: Chain, amount: i64| InventorySnapshotEvent::OnchainEquity {
@@ -5868,7 +5871,7 @@ mod tests {
         let dto = view.to_dto().unwrap();
 
         assert_eq!(dto.per_symbol.len(), 1);
-        assert_eq!(dto.per_symbol[0].onchain_available, shares(57));
+        assert_eq!(dto.per_symbol[0].onchain_available, shares(50));
         assert_eq!(
             dto.usdc.onchain_available,
             Usdc::from_cents(250_000).unwrap()
