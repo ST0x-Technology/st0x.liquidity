@@ -14,8 +14,8 @@ use tracing::warn;
 
 use st0x_config::{ChainRegistry, HedgedChain};
 use st0x_dto::{
-    BlockLagPoint, ChainBlockLag, ChainName, DependencyBucket, DependencyName, DependencyStats,
-    MonitorTelemetry, PollHealth,
+    BlockLagPoint, ChainBlockLag, ChainName, ChainPollHealth, DependencyBucket, DependencyName,
+    DependencyStats, MonitorTelemetry,
 };
 use st0x_evm::Chain;
 
@@ -150,11 +150,14 @@ async fn block_lag_buckets(
         .collect())
 }
 
+/// Poll health as one report per hedged chain. The list still holds a single
+/// entry -- the primary chain's, carrying every hedged chain's cycles -- until
+/// the counts are split per chain.
 async fn poll_health(
     pool: &SqlitePool,
     range: &ReportRange,
     chains: &ChainRegistry,
-) -> Result<PollHealth, PerformanceError> {
+) -> Result<Vec<ChainPollHealth>, PerformanceError> {
     let mut cycles = 0_i64;
     let mut errors = 0_i64;
     let mut skipped_ticks = 0_i64;
@@ -168,12 +171,13 @@ async fn poll_health(
         durations.extend(chain_poll_durations(pool, range, hedged_chain).await?);
     }
 
-    Ok(PollHealth {
+    Ok(vec![ChainPollHealth {
+        chain: chain_name(chains.primary().chain),
         cycles: count(cycles),
         errors: count(errors),
         skipped_ticks: count(skipped_ticks),
         duration: latency_stats(&mut durations),
-    })
+    }])
 }
 
 /// One hedged chain's cycle, error and skipped-tick counts. Aggregated in SQL
@@ -372,7 +376,7 @@ mod tests {
     use chrono::TimeZone;
 
     use st0x_config::{ChainRegistry, HedgedChain};
-    use st0x_dto::{ChainBlockLag, ChainName};
+    use st0x_dto::{ChainBlockLag, ChainName, ChainPollHealth};
     use st0x_evm::Chain;
 
     use crate::telemetry::{BlockLagSample, record_block_lag, record_poll_cycle};
@@ -448,6 +452,15 @@ mod tests {
         };
         assert_eq!(series.chain, ChainName::Base);
         series
+    }
+
+    /// The one poll report a Base-only report carries.
+    fn base_poll(telemetry: &MonitorTelemetry) -> &ChainPollHealth {
+        let [poll] = telemetry.poll.as_slice() else {
+            panic!("expected exactly one poll report, got {:?}", telemetry.poll);
+        };
+        assert_eq!(poll.chain, ChainName::Base);
+        poll
     }
 
     /// Two hedged chains keep separate lag series even when the Raindex
@@ -694,10 +707,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(telemetry.poll.cycles, 2);
-        assert_eq!(telemetry.poll.errors, 1);
-        assert_eq!(telemetry.poll.skipped_ticks, 2);
-        let duration = telemetry.poll.duration.unwrap();
+        assert_eq!(base_poll(&telemetry).cycles, 2);
+        assert_eq!(base_poll(&telemetry).errors, 1);
+        assert_eq!(base_poll(&telemetry).skipped_ticks, 2);
+        let duration = base_poll(&telemetry).duration.as_ref().unwrap();
         assert_eq!(duration.sample_count, 2);
         assert_eq!(duration.max_ms, 300);
     }
@@ -725,10 +738,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(telemetry.poll.cycles, 0);
-        assert_eq!(telemetry.poll.errors, 0);
-        assert_eq!(telemetry.poll.skipped_ticks, 0);
-        assert_eq!(telemetry.poll.duration, None);
+        assert_eq!(base_poll(&telemetry).cycles, 0);
+        assert_eq!(base_poll(&telemetry).errors, 0);
+        assert_eq!(base_poll(&telemetry).skipped_ticks, 0);
+        assert_eq!(base_poll(&telemetry).duration, None);
     }
 
     /// A secondary chain runs its own fill watcher against its own
@@ -774,10 +787,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(telemetry.poll.cycles, 2);
-        assert_eq!(telemetry.poll.errors, 1);
-        assert_eq!(telemetry.poll.skipped_ticks, 3);
-        assert_eq!(telemetry.poll.duration.unwrap().max_ms, 400);
+        assert_eq!(base_poll(&telemetry).cycles, 2);
+        assert_eq!(base_poll(&telemetry).errors, 1);
+        assert_eq!(base_poll(&telemetry).skipped_ticks, 3);
+        assert_eq!(base_poll(&telemetry).duration.as_ref().unwrap().max_ms, 400);
     }
 
     /// Deterministic deployments put the Raindex orderbook at the same address
@@ -824,10 +837,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(telemetry.poll.cycles, 2);
-        assert_eq!(telemetry.poll.errors, 1);
-        assert_eq!(telemetry.poll.skipped_ticks, 3);
-        let duration = telemetry.poll.duration.unwrap();
+        assert_eq!(base_poll(&telemetry).cycles, 2);
+        assert_eq!(base_poll(&telemetry).errors, 1);
+        assert_eq!(base_poll(&telemetry).skipped_ticks, 3);
+        let duration = base_poll(&telemetry).duration.as_ref().unwrap();
         assert_eq!(duration.sample_count, 2);
         assert_eq!(duration.max_ms, 400);
     }
@@ -917,12 +930,13 @@ mod tests {
         assert_eq!(base_series(&telemetry).points, vec![]);
         assert_eq!(
             telemetry.poll,
-            PollHealth {
+            vec![ChainPollHealth {
+                chain: ChainName::Base,
                 cycles: 0,
                 errors: 0,
                 skipped_ticks: 0,
                 duration: None,
-            }
+            }]
         );
     }
 }

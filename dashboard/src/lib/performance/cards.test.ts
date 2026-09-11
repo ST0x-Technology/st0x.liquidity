@@ -5,7 +5,7 @@ import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
 import type { InfraReport } from '$lib/api/InfraReport'
 import type { JobQueueHealth } from '$lib/api/JobQueueHealth'
 import type { LatencyStats } from '$lib/api/LatencyStats'
-import type { PollHealth } from '$lib/api/PollHealth'
+import type { ChainPollHealth } from '$lib/api/ChainPollHealth'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 
 import {
@@ -197,18 +197,21 @@ const lagSeries = (overrides: Partial<ChainBlockLag>): ChainBlockLag => ({
 })
 
 /** A Base-only infra report; `poll` overrides the primary chain's poll health. */
-const infra = (overrides: Partial<ChainBlockLag>, poll?: Partial<PollHealth>): InfraReport => ({
+const infra = (overrides: Partial<ChainBlockLag>, poll?: Partial<ChainPollHealth>): InfraReport => ({
   monitor: {
     blockLag: [lagSeries(overrides)],
-    poll: {
-      cycles: 100,
-      errors: 0,
-      skippedTicks: 0,
-      duration: null,
-      ...poll,
-    },
+    poll: [pollHealth(poll)],
   },
   dependencies: [],
+})
+
+const pollHealth = (overrides?: Partial<ChainPollHealth>): ChainPollHealth => ({
+  chain: 'base',
+  cycles: 100,
+  errors: 0,
+  skippedTicks: 0,
+  duration: null,
+  ...overrides,
 })
 
 /** The one card a single-chain report renders. */
