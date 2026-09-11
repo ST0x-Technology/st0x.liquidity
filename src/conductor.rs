@@ -2144,22 +2144,6 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The hedged secondaries whose vaults are managed but never read: the
-/// inventory poller runs on the primary chain alone, so nothing keeps these
-/// chains' slots current. Sorted by [`ChainRegistry::hedged`]'s own order so
-/// the startup warnings come out deterministically.
-fn unpolled_managed_secondaries(ctx: &Ctx) -> Vec<Chain> {
-    ctx.chains
-        .hedged()
-        .filter(|hedged| hedged.chain != ctx.chains.primary().chain)
-        .filter(|hedged| match hedged.inventory {
-            InventoryMode::Legacy => false,
-            InventoryMode::Managed { .. } => true,
-        })
-        .map(|hedged| hedged.chain)
-        .collect()
-}
-
 /// Every startup smoke check, in one place, all read-only. `/health` reports
 /// healthy only after these pass AND every run loop has acknowledged the
 /// startup barrier, so a deploy probe cannot see a 200 from a bot that failed
@@ -2215,19 +2199,6 @@ where
         }
 
         confirm_configured_asset_responds(chain_provider, hedged).await?;
-    }
-
-    // Not a refusal: a prefunded secondary is a valid rollout state, and
-    // refusing would block it. The operator tops these vaults up by hand
-    // and reads their balances offchain until per-chain polling lands.
-    for chain in unpolled_managed_secondaries(ctx) {
-        warn!(
-            target: "startup",
-            %chain,
-            "This chain's vault inventory is not polled: inventory polling runs on the \
-             primary chain only, so the chain's balances must be funded and watched by \
-             hand"
-        );
     }
 
     confirm_transport_chain_ids(ctx).await?;
@@ -5628,74 +5599,6 @@ mod tests {
             "the error must name the secondary chain and its symbol: {message}"
         );
     }
-
-    /// Inventory polling runs on the primary chain only, so a managed
-    /// secondary's vaults are nobody's job until per-chain polling lands.
-    /// Startup must say so out loud rather than let the operator read an
-    /// inventory view that silently omits that chain.
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn startup_warns_about_an_unpolled_managed_secondary() {
-        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
-            inventory: Address::repeat_byte(0xAA),
-        };
-        ctx.chains.insert_secondary(
-            HedgedChain::test()
-                .chain(Chain::Ethereum)
-                .inventory(InventoryMode::Managed {
-                    inventory: Address::repeat_byte(0xBB),
-                })
-                .call(),
-        );
-
-        let provider =
-            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Base));
-        let watch_providers = BTreeMap::from([(
-            Chain::Ethereum,
-            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Ethereum)),
-        )]);
-
-        startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
-            .await
-            .unwrap();
-
-        assert!(
-            logs_contain("vault inventory is not polled"),
-            "an unpolled managed secondary must be warned about at startup"
-        );
-        assert!(
-            logs_contain("chain=ethereum"),
-            "the warning must name the chain the operator has to manage by hand"
-        );
-    }
-
-    /// The warning is owed by a managed secondary alone: the primary is
-    /// polled, and a legacy chain has no managed vaults to be missed.
-    #[test]
-    fn unpolled_managed_secondaries_selects_only_managed_non_primary_chains() {
-        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
-            inventory: Address::repeat_byte(0xAA),
-        };
-        ctx.chains.insert_secondary(
-            HedgedChain::test()
-                .chain(Chain::Ethereum)
-                .inventory(InventoryMode::Managed {
-                    inventory: Address::repeat_byte(0xBB),
-                })
-                .call(),
-        );
-        ctx.chains.insert_secondary(
-            HedgedChain::test()
-                .chain(Chain::HyperEvm)
-                .inventory(InventoryMode::Legacy)
-                .call(),
-        );
-
-        assert_eq!(unpolled_managed_secondaries(&ctx), vec![Chain::Ethereum]);
-    }
-
     /// The durable double-hedge guard keys on the full chain-qualified fill
     /// identity: the same (tx_hash, log_index) on another chain is a distinct
     /// fill, never a duplicate (SPEC multi-chain invariant 3), while the same
