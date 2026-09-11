@@ -139,7 +139,7 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// underlying-equivalent units before being persisted (see
     /// [`convert_wrapped_equity_rows`]). Keyed by chain because each chain's
     /// vault accrues on its own, so one chain's ratio can never value
-    /// another's balance. One entry per watched chain, hedge-only chains
+    /// another's balance. One entry per hedged chain, hedge-only chains
     /// included: their market-making vaults hold wrapped shares too. Empty
     /// only when no wallet is configured at all -- the bot can then never hold
     /// onchain wrapped equity in the first place, so no row would ever need
@@ -3240,7 +3240,7 @@ mod tests {
     }
 
     /// Only the primary chain's assets table feeds `configured_equity_symbols`,
-    /// but the capture reads every watched chain's market-making balances. A
+    /// but the capture reads every hedged chain's market-making balances. A
     /// symbol traded on a secondary chain alone must still be marked: left
     /// unmarked, its nonzero row excludes the whole day with `MissingMark` and
     /// the capital series loses that day entirely.
