@@ -2353,8 +2353,11 @@ impl ProbedToken {
 /// The token reads one chain owes at startup, matching the roles each address
 /// plays there: every equity's wrapped share, because every fill on any hedged
 /// chain resolves through it, then the unwrapped token of each equity the
-/// chain's role rebalances, because only there is it minted, redeemed, wrapped
-/// or unwrapped. Both halves run in symbol order, so which read fails first is
+/// chain's role rebalances or that opts into wrapped-equity recovery, because
+/// those are the equities whose unwrapped token is minted, redeemed, wrapped,
+/// unwrapped or polled. Recovery is independent of rebalancing, so a
+/// recovery-only equity owes the unwrapped read that its role alone would not
+/// ask for. Both halves run in symbol order, so which read fails first is
 /// deterministic.
 fn asset_read_probes(
     role: ChainRole,
@@ -2376,16 +2379,22 @@ fn asset_read_probes(
         .collect::<Vec<_>>();
     wrapped.sort_by_key(|(symbol, _, _)| *symbol);
 
+    // Collected through a map so an equity that both rebalances and opts into
+    // recovery is read once, in symbol order.
     let unwrapped = role
         .rebalanced_equities(assets)
         .into_iter()
-        .map(|(symbol, equity)| {
-            (
-                symbol,
-                ProbedToken::UnwrappedEquity,
-                equity.tokenized_equity,
-            )
-        });
+        .chain(
+            assets
+                .equities
+                .symbols
+                .iter()
+                .filter(|(symbol, _)| assets.is_wrapped_equity_recovery_enabled(symbol)),
+        )
+        .map(|(symbol, equity)| (symbol, equity.tokenized_equity))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .map(|(symbol, token)| (symbol, ProbedToken::UnwrappedEquity, token));
 
     wrapped.into_iter().chain(unwrapped).collect()
 }
