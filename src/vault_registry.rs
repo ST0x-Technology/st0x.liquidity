@@ -574,6 +574,15 @@ pub(crate) type SeedVaultRegistryJobQueue = JobQueue<SeedVaultRegistry>;
 /// by hand-rolling the fields.
 pub(crate) struct SeedVaultRegistryCtx {
     vault_registry: Arc<Store<VaultRegistry>>,
+    chains: Vec<ChainVaultSeeds>,
+}
+
+/// The vaults one hedged chain's own assets table declares, under that chain's
+/// own registry id. One per hedged chain: the inventory poller loads a
+/// registry keyed on `(chain, orderbook, vault_owner)` for every chain it
+/// reads, and a chain with no registry records neither balances nor poll
+/// freshness while its market-making slots stay required by the daily capture.
+struct ChainVaultSeeds {
     id: VaultRegistryId,
     equity_seeds: Vec<EquityVaultSeed>,
     equity_primary_seeds: Vec<EquityVaultSeed>,
@@ -582,7 +591,8 @@ pub(crate) struct SeedVaultRegistryCtx {
 }
 
 impl SeedVaultRegistryCtx {
-    /// Builds a seeding context from configuration.
+    /// Builds a seeding context from configuration, one entry per hedged
+    /// chain.
     ///
     /// Validates that every rebalancing-enabled equity has at least
     /// one configured `vault_id`. Returns [`CtxError::MissingEquityVaultId`]
@@ -592,10 +602,38 @@ impl SeedVaultRegistryCtx {
         vault_registry: Arc<Store<VaultRegistry>>,
         ctx: &Ctx,
     ) -> Result<Self, Box<CtxError>> {
-        for (symbol, equity_config) in &ctx.chains.primary().assets.equities.symbols {
-            if equity_config.vault_ids.is_empty()
-                && ctx.chains.primary().assets.is_rebalancing_enabled(symbol)
-            {
+        let chains = ctx
+            .chains
+            .watched()
+            .map(ChainVaultSeeds::from_chain)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            vault_registry,
+            chains,
+        })
+    }
+
+    /// The primary chain's registry id: `ChainRegistry::watched` yields the
+    /// primary first, so it is the leading entry.
+    #[cfg(test)]
+    fn primary_id(&self) -> &VaultRegistryId {
+        &self
+            .chains
+            .first()
+            .expect("every registry watches at least the primary chain")
+            .id
+    }
+}
+
+impl ChainVaultSeeds {
+    /// Reads the seeds from `watched`'s own tables: its orderbook and vault
+    /// owner key the registry, and its assets table names the vaults. Nothing
+    /// is borrowed from the primary -- the same `(orderbook, owner)` pair is
+    /// real on several chains, and each chain's vault ids are its own.
+    fn from_chain(watched: &st0x_config::TradingChain) -> Result<Self, Box<CtxError>> {
+        for (symbol, equity_config) in &watched.assets.equities.symbols {
+            if equity_config.vault_ids.is_empty() && watched.assets.is_rebalancing_enabled(symbol) {
                 return Err(Box::new(CtxError::MissingEquityVaultId {
                     symbol: symbol.clone(),
                 }));
@@ -603,14 +641,12 @@ impl SeedVaultRegistryCtx {
         }
 
         let id = VaultRegistryId {
-            chain: ctx.chains.primary().chain,
-            orderbook: ctx.chains.primary().orderbook,
-            owner: ctx.vault_owner(),
+            chain: watched.chain,
+            orderbook: watched.orderbook,
+            owner: watched.vault_owner,
         };
 
-        let equity_seeds = ctx
-            .chains
-            .primary()
+        let equity_seeds = watched
             .assets
             .equities
             .symbols
@@ -627,9 +663,7 @@ impl SeedVaultRegistryCtx {
             })
             .collect();
 
-        let equity_primary_seeds = ctx
-            .chains
-            .primary()
+        let equity_primary_seeds = watched
             .assets
             .equities
             .symbols
@@ -647,25 +681,20 @@ impl SeedVaultRegistryCtx {
             })
             .collect();
 
-        let usdc_vault_ids = ctx
-            .chains
-            .primary()
+        let usdc_vault_ids = watched
             .assets
             .cash
             .as_ref()
             .map(|cash| cash.vault_ids.clone())
             .unwrap_or_default();
 
-        let usdc_primary_vault_id = ctx
-            .chains
-            .primary()
+        let usdc_primary_vault_id = watched
             .assets
             .cash
             .as_ref()
             .and_then(|cash| cash.vault_ids.first().copied());
 
         Ok(Self {
-            vault_registry,
             id,
             equity_seeds,
             equity_primary_seeds,
@@ -698,17 +727,34 @@ impl Job<SeedVaultRegistryCtx> for SeedVaultRegistry {
     }
 
     async fn perform(&self, ctx: &SeedVaultRegistryCtx) -> Result<Self::Output, Self::Error> {
-        for seed in &ctx.equity_seeds {
+        for chain_seeds in &ctx.chains {
+            chain_seeds.seed(&ctx.vault_registry).await?;
+        }
+
+        Ok(())
+    }
+}
+
+impl ChainVaultSeeds {
+    /// Replays this chain's configured vaults into its own registry. Every
+    /// command is idempotent, so a retry after a partial failure re-sends only
+    /// what did not land (see [`SeedVaultRegistry`]).
+    async fn seed(
+        &self,
+        vault_registry: &Store<VaultRegistry>,
+    ) -> Result<(), SeedVaultRegistryError> {
+        for seed in &self.equity_seeds {
             debug!(
+                chain = %self.id.chain,
                 symbol = %seed.symbol,
                 vault_id = %seed.vault_id,
                 token = %seed.token,
                 "Seeding equity vault from config",
             );
 
-            ctx.vault_registry
+            vault_registry
                 .send(
-                    &ctx.id,
+                    &self.id,
                     VaultRegistryCommand::SeedEquityVaultFromConfig {
                         token: seed.token,
                         vault_id: seed.vault_id,
@@ -718,17 +764,18 @@ impl Job<SeedVaultRegistryCtx> for SeedVaultRegistry {
                 .await?;
         }
 
-        for seed in &ctx.equity_primary_seeds {
+        for seed in &self.equity_primary_seeds {
             info!(
+                chain = %self.id.chain,
                 symbol = %seed.symbol,
                 vault_id = %seed.vault_id,
                 token = %seed.token,
                 "Setting configured primary equity vault",
             );
 
-            ctx.vault_registry
+            vault_registry
                 .send(
-                    &ctx.id,
+                    &self.id,
                     VaultRegistryCommand::SetPrimaryEquityVaultFromConfig {
                         token: seed.token,
                         vault_id: seed.vault_id,
@@ -738,12 +785,12 @@ impl Job<SeedVaultRegistryCtx> for SeedVaultRegistry {
                 .await?;
         }
 
-        for vault_id in &ctx.usdc_vault_ids {
-            info!(%vault_id, "Seeding USDC vault from config");
+        for vault_id in &self.usdc_vault_ids {
+            info!(chain = %self.id.chain, %vault_id, "Seeding USDC vault from config");
 
-            ctx.vault_registry
+            vault_registry
                 .send(
-                    &ctx.id,
+                    &self.id,
                     VaultRegistryCommand::SeedUsdcVaultFromConfig {
                         vault_id: *vault_id,
                     },
@@ -751,12 +798,12 @@ impl Job<SeedVaultRegistryCtx> for SeedVaultRegistry {
                 .await?;
         }
 
-        if let Some(vault_id) = ctx.usdc_primary_vault_id {
-            info!(%vault_id, "Setting configured primary USDC vault");
+        if let Some(vault_id) = self.usdc_primary_vault_id {
+            info!(chain = %self.id.chain, %vault_id, "Setting configured primary USDC vault");
 
-            ctx.vault_registry
+            vault_registry
                 .send(
-                    &ctx.id,
+                    &self.id,
                     VaultRegistryCommand::SetPrimaryUsdcVaultFromConfig { vault_id },
                 )
                 .await?;
@@ -1764,7 +1811,7 @@ mod tests {
 
         SeedVaultRegistry.perform(&seed_ctx).await.unwrap();
 
-        let registry = loaded_registry(&seed_ctx.vault_registry, &seed_ctx.id).await;
+        let registry = loaded_registry(&seed_ctx.vault_registry, seed_ctx.primary_id()).await;
 
         assert_eq!(
             registry.primary_vault_id_by_token(TEST_TOKEN),
@@ -1901,8 +1948,11 @@ mod tests {
         let updated_seed_ctx = seed_ctx_from(pool, &updated_ctx).await;
         SeedVaultRegistry.perform(&updated_seed_ctx).await.unwrap();
 
-        let registry =
-            loaded_registry(&updated_seed_ctx.vault_registry, &updated_seed_ctx.id).await;
+        let registry = loaded_registry(
+            &updated_seed_ctx.vault_registry,
+            updated_seed_ctx.primary_id(),
+        )
+        .await;
 
         assert_eq!(
             registry.primary_vault_id_by_token(TEST_TOKEN),
@@ -1938,8 +1988,11 @@ mod tests {
         let updated_seed_ctx = seed_ctx_from(pool, &updated_ctx).await;
         SeedVaultRegistry.perform(&updated_seed_ctx).await.unwrap();
 
-        let registry =
-            loaded_registry(&updated_seed_ctx.vault_registry, &updated_seed_ctx.id).await;
+        let registry = loaded_registry(
+            &updated_seed_ctx.vault_registry,
+            updated_seed_ctx.primary_id(),
+        )
+        .await;
 
         assert_eq!(
             registry.primary_usdc_vault_id(),
@@ -1964,7 +2017,7 @@ mod tests {
         // duplicate events accrue.
         SeedVaultRegistry.perform(&seed_ctx).await.unwrap();
 
-        let registry = loaded_registry(&seed_ctx.vault_registry, &seed_ctx.id).await;
+        let registry = loaded_registry(&seed_ctx.vault_registry, seed_ctx.primary_id()).await;
         assert_eq!(
             registry.all_vault_ids_by_token(TEST_TOKEN),
             vec![TEST_VAULT_ID]
@@ -2048,7 +2101,7 @@ mod tests {
         assert!(
             seed_ctx
                 .vault_registry
-                .load(&seed_ctx.id)
+                .load(seed_ctx.primary_id())
                 .await
                 .unwrap()
                 .is_none(),
