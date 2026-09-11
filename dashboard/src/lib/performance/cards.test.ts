@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ChainBlockLag } from '$lib/api/ChainBlockLag'
+import type { ChainPollHealth } from '$lib/api/ChainPollHealth'
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
 import type { InfraReport } from '$lib/api/InfraReport'
 import type { JobQueueHealth } from '$lib/api/JobQueueHealth'
 import type { LatencyStats } from '$lib/api/LatencyStats'
-import type { ChainPollHealth } from '$lib/api/ChainPollHealth'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 
 import {
@@ -197,7 +197,10 @@ const lagSeries = (overrides: Partial<ChainBlockLag>): ChainBlockLag => ({
 })
 
 /** A Base-only infra report; `poll` overrides the primary chain's poll health. */
-const infra = (overrides: Partial<ChainBlockLag>, poll?: Partial<ChainPollHealth>): InfraReport => ({
+const infra = (
+  overrides: Partial<ChainBlockLag>,
+  poll?: Partial<ChainPollHealth>,
+): InfraReport => ({
   monitor: {
     blockLag: [lagSeries(overrides)],
     poll: [pollHealth(poll)],
