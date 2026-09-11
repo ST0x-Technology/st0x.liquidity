@@ -4883,8 +4883,9 @@ pub(crate) enum CctpMintRecoveryError {
         #[source]
         source: CctpError,
     },
+    /// An amount decode or a bot-gas-cost enqueue failed.
     #[error(transparent)]
-    Amount(#[from] Box<UsdcTransferError>),
+    Transfer(#[from] Box<UsdcTransferError>),
 }
 
 /// Trait-erased entry point for the operator `cctp complete-mint` recovery
@@ -4902,9 +4903,10 @@ pub(crate) trait RecoverCctpMint: Send + Sync + 'static {
 }
 
 #[async_trait::async_trait]
-impl<Chain> RecoverCctpMint for CrossVenueCashTransfer<Chain>
+impl<Signer, B> RecoverCctpMint for CrossVenueCashTransfer<Signer, B>
 where
-    Chain: Wallet + Send + Sync + 'static,
+    Signer: Wallet + Send + Sync + 'static,
+    B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
 {
     async fn recover_cctp_mint(
         &self,
@@ -4921,6 +4923,17 @@ where
             .mint(direction, &attestation)
             .await
             .map_err(|source| CctpMintRecoveryError::Mint { burn_tx, source })?;
+
+        // Record the mint's gas for ADR 0017 accounting, as every other CCTP
+        // mint site does; the mint lands on the chain opposite the burn.
+        let mint_chain = match direction {
+            BridgeDirection::EthereumToBase => Chain::Base,
+            BridgeDirection::BaseToEthereum => Chain::Ethereum,
+        };
+        self.enqueue_bot_gas_cost(mint_chain, receipt.tx, BotGasOperationCategory::CctpMint)
+            .await
+            .map_err(Box::new)?;
+
         Ok(RecoveredCctpMint {
             mint_tx: receipt.tx,
             amount_received: u256_to_usdc(receipt.amount).map_err(Box::new)?,
@@ -4994,6 +5007,15 @@ mod tests {
         // `send_alpaca_deposit_enqueues_wallet_transfer_bot_gas_job` opts in via
         // `with_send_usdc_tx`.
         send_usdc_tx: Option<TxHash>,
+        // Opt-in for the operator `recover_cctp_mint` path: the attestation the
+        // poll returns and the receipt the mint returns. Every other test
+        // leaves these `None`, so an unexpected walk into either method still
+        // panics loudly. Gated with the constructor it feeds, which needs the
+        // bridge crate's test-support attestation builder.
+        #[cfg(feature = "test-support")]
+        recover_attestation_message: Option<Vec<u8>>,
+        #[cfg(feature = "test-support")]
+        recover_mint_receipt: Option<st0x_bridge::MintReceipt>,
     }
 
     impl MockBridge {
@@ -5006,6 +5028,10 @@ mod tests {
                 confirm_revert_count: 1,
                 burn_status: None,
                 send_usdc_tx: None,
+                #[cfg(feature = "test-support")]
+                recover_attestation_message: None,
+                #[cfg(feature = "test-support")]
+                recover_mint_receipt: None,
             }
         }
 
@@ -5031,6 +5057,17 @@ mod tests {
 
         fn with_send_usdc_tx(mut self, tx_hash: TxHash) -> Self {
             self.send_usdc_tx = Some(tx_hash);
+            self
+        }
+
+        #[cfg(feature = "test-support")]
+        fn with_recover_mint(
+            mut self,
+            message: Vec<u8>,
+            receipt: st0x_bridge::MintReceipt,
+        ) -> Self {
+            self.recover_attestation_message = Some(message);
+            self.recover_mint_receipt = Some(receipt);
             self
         }
     }
@@ -5109,6 +5146,13 @@ mod tests {
             _direction: BridgeDirection,
             _burn_tx: TxHash,
         ) -> Result<AttestationResponse, CctpError> {
+            #[cfg(feature = "test-support")]
+            if let Some(message) = &self.recover_attestation_message {
+                return AttestationResponse::for_test(
+                    Bytes::from(message.clone()),
+                    Bytes::from(vec![0xabu8; 65]),
+                );
+            }
             unimplemented!("MockBridge: poll_attestation not used in this test")
         }
 
@@ -5117,6 +5161,14 @@ mod tests {
             _direction: BridgeDirection,
             _attestation: &AttestationResponse,
         ) -> Result<st0x_bridge::MintReceipt, CctpError> {
+            #[cfg(feature = "test-support")]
+            if let Some(receipt) = &self.recover_mint_receipt {
+                return Ok(st0x_bridge::MintReceipt {
+                    tx: receipt.tx,
+                    amount: receipt.amount,
+                    fee: receipt.fee,
+                });
+            }
             unimplemented!("MockBridge: mint not used in this test")
         }
 
@@ -17160,6 +17212,49 @@ mod tests {
         assert_eq!(jobs[0].category, BotGasOperationCategory::WalletTransfer);
         assert_eq!(jobs[0].chain, Chain::Ethereum);
         assert_eq!(jobs[0].tx_hash, send_tx);
+        assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// The operator `cctp complete-mint` recovery must record the mint's gas on
+    /// the bot-gas ledger, like every other CCTP mint site, so the operator's
+    /// action stays visible to gas-cost/P&L reconciliation (ADR 0017). The mint
+    /// lands on the chain opposite the burn.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn recover_cctp_mint_enqueues_bot_gas_cost() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let mint_tx =
+            fixed_bytes!("0xeeee000000000000000000000000000000000000000000000000000000000001");
+        let (manager, apalis_pool, _server) = manager_with_bot_gas_queue(
+            cqrs,
+            wallet,
+            MockBridge::new().with_recover_mint(
+                valid_cctp_message(),
+                st0x_bridge::MintReceipt {
+                    tx: mint_tx,
+                    amount: usdc_to_u256(usdc("100")).unwrap(),
+                    fee: usdc_to_u256(usdc("1")).unwrap(),
+                },
+            ),
+        )
+        .await;
+
+        let recovered = manager
+            .recover_cctp_mint(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
+            .await
+            .unwrap();
+        assert_eq!(recovered.mint_tx, mint_tx);
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::CctpMint);
+        // BaseToEthereum burns on Base and mints on Ethereum.
+        assert_eq!(jobs[0].chain, Chain::Ethereum);
+        assert_eq!(jobs[0].tx_hash, mint_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
     }
 
