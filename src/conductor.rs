@@ -5652,6 +5652,45 @@ mod tests {
         );
     }
 
+    /// `decimals()` proves a contract answers, not that it is the configured
+    /// symbol's wrapper: a typo landing on another 18-decimal token passes
+    /// every read above and is only found when the first fill on the chain
+    /// cannot resolve its symbol. The ERC-4626 `asset()` is what ties a vault
+    /// to its equity, and a hedge-only chain has no other attestation.
+    #[tokio::test]
+    async fn asset_canary_refuses_a_wrapped_share_that_wraps_another_token() {
+        let unwrapped = address!("0x1111111111111111111111111111111111111111");
+        let wrapped = address!("0x2222222222222222222222222222222222222222");
+        let stranger = address!("0x3333333333333333333333333333333333333333");
+        let asserter = Asserter::new();
+        asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &TOKENIZED_EQUITY_DECIMALS,
+            ),
+        );
+        asserter.push_success(
+            &<crate::bindings::IERC4626::assetCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &stranger,
+            ),
+        );
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let hedge_only = hedged_chain_with_equities([("AAPL", unwrapped, wrapped)]);
+
+        let error = confirm_configured_assets_respond(&provider, ChainRole::Secondary, &hedge_only)
+            .await
+            .expect_err("a wrapped share reporting another asset() must refuse startup");
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&stranger.to_string()) && message.contains(&unwrapped.to_string()),
+            "the refusal must name both the attested and the configured token: {message}"
+        );
+        assert!(
+            message.contains("AAPL") && message.contains(&wrapped.to_string()),
+            "the refusal must name the symbol and the vault: {message}"
+        );
+    }
+
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn asset_canary_skips_when_no_equities_are_configured() {
