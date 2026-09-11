@@ -745,10 +745,10 @@ mod tests {
     }
 
     /// A secondary chain runs its own fill watcher against its own
-    /// orderbook, so its poll cycles belong in the report's poll health --
-    /// keyed to the primary alone, an outage there would read as healthy.
+    /// orderbook, so it gets its own poll report -- folded into the
+    /// primary's, an outage there would read as healthy.
     #[tokio::test]
-    async fn poll_health_aggregates_every_hedged_chain() {
+    async fn poll_health_reports_every_hedged_chain() {
         let ethereum_orderbook = address!("0x3333333333333333333333333333333333333333");
         let pool = setup_test_db().await;
         let mut chains = base_only();
@@ -787,19 +787,31 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(base_poll(&telemetry).cycles, 2);
-        assert_eq!(base_poll(&telemetry).errors, 1);
-        assert_eq!(base_poll(&telemetry).skipped_ticks, 3);
-        assert_eq!(base_poll(&telemetry).duration.as_ref().unwrap().max_ms, 400);
+        let [base, ethereum] = telemetry.poll.as_slice() else {
+            panic!(
+                "expected one poll report per hedged chain, got {:?}",
+                telemetry.poll
+            );
+        };
+        assert_eq!(base.chain, ChainName::Base);
+        assert_eq!(base.cycles, 1);
+        assert_eq!(base.errors, 0);
+        assert_eq!(base.skipped_ticks, 0);
+        assert_eq!(base.duration.as_ref().unwrap().max_ms, 100);
+        assert_eq!(ethereum.chain, ChainName::Ethereum);
+        assert_eq!(ethereum.cycles, 1);
+        assert_eq!(ethereum.errors, 1);
+        assert_eq!(ethereum.skipped_ticks, 3);
+        assert_eq!(ethereum.duration.as_ref().unwrap().max_ms, 400);
     }
 
     /// Deterministic deployments put the Raindex orderbook at the same address
-    /// on several chains, and poll samples are keyed by orderbook alone. Poll
-    /// health must therefore count each cycle once however many hedged chains
-    /// name that address -- iterating chains instead of distinct orderbooks
-    /// would double every figure in the report.
+    /// on several chains. Each chain's watcher still polls on its own, so its
+    /// cycles are reported under its own chain and counted once: scoped to the
+    /// orderbook alone, both chains would read every cycle taken at that
+    /// address.
     #[tokio::test]
-    async fn poll_health_counts_a_shared_orderbooks_cycles_once() {
+    async fn a_shared_orderbooks_cycles_are_reported_per_chain() {
         let pool = setup_test_db().await;
         let mut chains = base_only();
         chains.insert_secondary(
@@ -823,7 +835,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
-            Chain::Ethereum,
+            Chain::Base,
             ORDERBOOK,
             timestamp(20),
             StdDuration::from_millis(400),
@@ -832,17 +844,43 @@ mod tests {
         )
         .await
         .unwrap();
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            Chain::Ethereum,
+            ORDERBOOK,
+            timestamp(30),
+            StdDuration::from_millis(900),
+            1,
+            Ok::<(), &Infallible>(()),
+        )
+        .await
+        .unwrap();
 
         let telemetry = load_monitor_telemetry(&pool, &range(), &chains)
             .await
             .unwrap();
 
-        assert_eq!(base_poll(&telemetry).cycles, 2);
-        assert_eq!(base_poll(&telemetry).errors, 1);
-        assert_eq!(base_poll(&telemetry).skipped_ticks, 3);
-        let duration = base_poll(&telemetry).duration.as_ref().unwrap();
-        assert_eq!(duration.sample_count, 2);
-        assert_eq!(duration.max_ms, 400);
+        let [base, ethereum] = telemetry.poll.as_slice() else {
+            panic!(
+                "expected one poll report per hedged chain, got {:?}",
+                telemetry.poll
+            );
+        };
+        assert_eq!(base.chain, ChainName::Base);
+        assert_eq!(base.cycles, 2);
+        assert_eq!(base.errors, 1);
+        assert_eq!(base.skipped_ticks, 3);
+        let base_duration = base.duration.as_ref().unwrap();
+        assert_eq!(base_duration.sample_count, 2);
+        assert_eq!(base_duration.max_ms, 400);
+        assert_eq!(ethereum.chain, ChainName::Ethereum);
+        assert_eq!(ethereum.cycles, 1);
+        assert_eq!(ethereum.errors, 0);
+        assert_eq!(ethereum.skipped_ticks, 1);
+        let ethereum_duration = ethereum.duration.as_ref().unwrap();
+        assert_eq!(ethereum_duration.sample_count, 1);
+        assert_eq!(ethereum_duration.max_ms, 900);
     }
 
     async fn insert_call(
