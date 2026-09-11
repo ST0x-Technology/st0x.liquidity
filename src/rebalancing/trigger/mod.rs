@@ -6118,7 +6118,8 @@ mod tests {
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
-        EntityList, Never, Reactor, ReactorHarness, TestStore, deps, send_command, test_store,
+        EntityList, Never, Reactor, ReactorHarness, StoreBuilder, TestStore, deps, send_command,
+        test_store,
     };
     use st0x_evm::Chain;
     use st0x_execution::{
@@ -16861,6 +16862,98 @@ mod tests {
                 Arc::new(test_store::<UsdcRebalance>(pool, ())),
             )
             .await;
+    }
+
+    /// An operator failure dispatched through the conductor-owned store must
+    /// reach this live reactor and release a requested mint's symbol guard.
+    /// The timeout sweeper intentionally never expires this stage, so a
+    /// reactor-less database write would leave the guard stuck until restart.
+    #[tokio::test]
+    async fn in_process_operator_failure_releases_requested_mint_guard() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = issuer_request_id("operator-fail-requested-mint");
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(services)
+            .await
+            .unwrap();
+        service
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool, ())),
+            )
+            .await;
+
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        service.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer {
+                generation: equity::GuardGeneration::default(),
+            },
+        );
+        assert!(
+            service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol)
+        );
+
+        let id_string = id.to_string();
+        crate::operator::equity_transfer::fail_transfer_in_process(
+            &mint_store,
+            &redemption_store,
+            crate::operator::equity_transfer::EquityTransferKind::Mint,
+            &id_string,
+            "provider request abandoned",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "the live reactor must release the requested mint guard"
+        );
     }
 
     #[tokio::test]

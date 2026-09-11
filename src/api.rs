@@ -40,8 +40,11 @@ use crate::dashboard::transfer_loader::{
     InvalidTransferKind, TransferHistoryQuery, TransferKind, query_transfer_history,
 };
 use crate::dashboard::{TradePage, TradeProtocol, TradeQuery, query_trades};
-use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
 use crate::iap_auth::{IapVerifier, require_iap};
+use crate::operator::equity_transfer::{
+    EquityTransferKind, FailTransferError, validate_failure_reason,
+};
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
@@ -52,7 +55,7 @@ use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performan
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
 use crate::rebalancing::usdc::{RecheckUsdcDeposit, UsdcRecheckError};
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
-use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
+use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
 
 /// Comma-separated filter for transfer kinds in query parameters.
@@ -1275,11 +1278,14 @@ struct ErrorResponse {
     error: String,
 }
 
-/// Shared handle for resuming interrupted tokenization transfers and
-/// re-checking failed ones at runtime, set by the conductor after startup
-/// completes.
+/// Shared handle for operating on tokenization transfers at runtime, set by
+/// the conductor after startup completes.
 pub(crate) struct RecoveryHandle {
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
+    /// The conductor-owned stores whose reactors update live inventory and
+    /// transfer tracking when an operator force-fails an aggregate.
+    pub(crate) mint_store: Arc<st0x_event_sorcery::Store<TokenizedEquityMint>>,
+    pub(crate) redemption_store: Arc<st0x_event_sorcery::Store<EquityRedemption>>,
     /// Needed by `recheck` recovery to rebuild in-memory tracking before the
     /// recovery event is dispatched, so the reactor applies its inventory
     /// effect on the live bot.
@@ -1290,8 +1296,8 @@ pub(crate) struct RecoveryHandle {
     pub(crate) usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
 }
 
-/// Prevents concurrent `/transfers/resume` requests from racing through
-/// duplicate mint/redemption recovery flows.
+/// Serializes operator transfer-recovery requests so they cannot race through
+/// duplicate or conflicting mint/redemption flows.
 pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
 
 #[derive(Serialize)]
@@ -1438,6 +1444,130 @@ async fn resume_transfers(
 #[serde(rename_all = "camelCase")]
 struct RecheckResponse {
     outcome: RecheckOutcome,
+}
+
+#[derive(Deserialize)]
+struct FailTransferRequest {
+    reason: String,
+}
+
+/// Force-fails one equity transfer through the conductor-owned CQRS store so
+/// the terminal event reaches the live transfer reactor before this request
+/// returns.
+async fn fail_transfer(
+    State(state): State<AppState>,
+    Path((kind_str, id)): Path<(String, String)>,
+    Json(request): Json<FailTransferRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    validate_failure_reason(&request.reason).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+    })?;
+
+    let kind = match TransferKind::from_str(&kind_str).map_err(|error| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Unknown transfer kind: {error}"),
+            }),
+        )
+    })? {
+        TransferKind::EquityMint => EquityTransferKind::Mint,
+        TransferKind::EquityRedemption => EquityTransferKind::Redemption,
+        TransferKind::UsdcBridge => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "USDC transfers cannot be force-failed through this endpoint"
+                        .to_string(),
+                }),
+            ));
+        }
+    };
+
+    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A transfer recovery operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    crate::operator::equity_transfer::fail_transfer_in_process(
+        &handle.mint_store,
+        &handle.redemption_store,
+        kind,
+        &id,
+        &request.reason,
+    )
+    .await
+    .map_err(|error| {
+        warn!(?error, %id, "Operator transfer failure was rejected");
+        let (status, message) = fail_transfer_error_response(&error);
+        (status, Json(ErrorResponse { error: message }))
+    })?;
+
+    info!(%id, "Transfer force-failed via API");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Maps force-failure errors by recoverability while keeping infrastructure
+/// details out of the network-visible response.
+fn fail_transfer_error_response(error: &FailTransferError) -> (StatusCode, String) {
+    use FailTransferError::{
+        InvalidMintId, InvalidReason, InvalidRedemptionId, MintAlreadyCompleted, MintAlreadyFailed,
+        MintAlreadyReconciled, MintNotFound, MintStore, RedemptionAlreadyCompleted,
+        RedemptionAlreadyFailed, RedemptionAlreadyReconciled, RedemptionNotFound, RedemptionStore,
+    };
+
+    match error {
+        InvalidReason(_) | InvalidMintId(_) | InvalidRedemptionId(_) => {
+            (StatusCode::BAD_REQUEST, error.to_string())
+        }
+        MintNotFound(_) | RedemptionNotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
+        MintAlreadyCompleted(_)
+        | MintAlreadyFailed(_)
+        | MintAlreadyReconciled(_)
+        | RedemptionAlreadyCompleted(_)
+        | RedemptionAlreadyFailed(_)
+        | RedemptionAlreadyReconciled(_) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        MintStore(source) if is_failure_command_refusal(source) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
+        }
+        RedemptionStore(source) if is_failure_command_refusal(source) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
+        }
+        MintStore(_) | RedemptionStore(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to force-fail transfer".to_string(),
+        ),
+    }
+}
+
+fn is_failure_command_refusal<Entity: st0x_event_sorcery::EventSourced>(
+    error: &st0x_event_sorcery::SendError<Entity>,
+) -> bool {
+    match error {
+        st0x_event_sorcery::AggregateError::UserError(_)
+        | st0x_event_sorcery::AggregateError::AggregateConflict => true,
+        st0x_event_sorcery::AggregateError::DatabaseConnectionError(_)
+        | st0x_event_sorcery::AggregateError::DeserializationError(_)
+        | st0x_event_sorcery::AggregateError::UnexpectedError(_) => false,
+    }
 }
 
 /// Re-checks a single failed (or active) transfer against the tokenization
@@ -1949,13 +2079,17 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             async move { require_iap(verifier, request, next).await }
         }));
 
-    // `recheck` re-drives a transfer and completes it if the provider has
-    // settled it, and `resume` re-drives EVERY interrupted transfer: both
-    // move real state and belong to the narrower group. Resume must be here
-    // because the bare mounts below are loopback-only -- without this mount,
-    // bulk resume would have no network route at all and an incident with
-    // SSH unavailable could not recover interrupted transfers.
+    // `fail` forces a terminal event, `recheck` completes a provider-settled
+    // transfer, and `resume` re-drives EVERY interrupted transfer: all move
+    // real state and belong to the narrower group. Resume must be here because
+    // the bare mounts below are loopback-only -- without this mount, bulk
+    // resume would have no network route at all and an incident with SSH
+    // unavailable could not recover interrupted transfers.
     let write = Router::new()
+        .route(
+            "/liquidity-write/transfers/fail/{kind}/{id}",
+            post(fail_transfer),
+        )
         .route(
             "/liquidity-write/transfers/recheck/{kind}/{id}",
             post(recheck_transfer),
@@ -2020,6 +2154,7 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
     // The IAP-gated `/liquidity-write` mount is the network route to the same
     // handlers.
     let loopback_only = Router::new()
+        .route("/transfers/fail/{kind}/{id}", post(fail_transfer))
         .route("/transfers/resume", post(resume_transfers))
         .route(
             "/transfers/usdc/resume/{direction}/{id}",
@@ -4902,6 +5037,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fail_transfer_returns_503_before_conductor_ready() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transfers/fail/equity_mint/some-id")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                    .body(Body::from(r#"{"reason":"provider incident 42"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = body_to_string(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"],
+            "Recovery not ready yet (conductor still starting)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_rejects_blank_reason_before_dispatch() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transfers/fail/equity_mint/some-id")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                    .body(Body::from(r#"{"reason":"  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_to_string(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"],
+            "--reason must not be blank; it is persisted as the audit record"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_rejects_usdc_transfers() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transfers/fail/usdc_bridge/some-id")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))))
+                    .body(Body::from(r#"{"reason":"provider incident 42"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_to_string(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"],
+            "USDC transfers cannot be force-failed through this endpoint"
+        );
+    }
+
     /// The bare mutation mounts exist for the in-container CLI alone. A
     /// caller that arrived over the published port carries the bridge
     /// interface's peer address, and one with no recorded peer at all is
@@ -4970,6 +5186,7 @@ mod tests {
             ("GET", "/liquidity-read/transfers/interrupted"),
             ("GET", "/liquidity-read/pnl"),
             ("GET", "/liquidity-read/health"),
+            ("POST", "/liquidity-write/transfers/fail/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/resume"),
         ] {
@@ -5004,6 +5221,7 @@ mod tests {
             ("GET", "/liquidity-read/transfers/interrupted"),
             ("GET", "/liquidity-read/pnl"),
             ("GET", "/liquidity-read/health"),
+            ("POST", "/liquidity-write/transfers/fail/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/recheck/equity_mint/x"),
             ("POST", "/liquidity-write/transfers/resume"),
         ] {
@@ -5094,6 +5312,42 @@ mod tests {
             }));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
+    }
+
+    #[test]
+    fn fail_transfer_error_response_distinguishes_recoverability() {
+        let invalid_id = "not-a-uuid".parse::<IssuerRequestId>().unwrap_err();
+        let (status, message) =
+            fail_transfer_error_response(&FailTransferError::InvalidMintId(invalid_id));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(message, "invalid mint id");
+
+        let mint_id = issuer_request_id("missing-mint");
+        let (status, message) =
+            fail_transfer_error_response(&FailTransferError::MintNotFound(mint_id.clone()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(message, format!("mint aggregate not found: {mint_id}"));
+
+        let (status, message) =
+            fail_transfer_error_response(&FailTransferError::MintAlreadyCompleted(mint_id.clone()));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, format!("mint {mint_id} already completed"));
+
+        let refusal = FailTransferError::MintStore(Box::new(
+            st0x_event_sorcery::AggregateError::AggregateConflict,
+        ));
+        let (status, message) = fail_transfer_error_response(&refusal);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, "aggregate conflict");
+
+        let infrastructure = FailTransferError::MintStore(Box::new(
+            st0x_event_sorcery::AggregateError::UnexpectedError(Box::new(std::io::Error::other(
+                "private database detail",
+            ))),
+        ));
+        let (status, message) = fail_transfer_error_response(&infrastructure);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "Failed to force-fail transfer");
     }
 
     /// The USDC resume endpoint must refuse with 503 until the conductor

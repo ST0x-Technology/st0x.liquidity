@@ -449,9 +449,11 @@ Not covered by `transfer recheck` yet:
 ### Force-Failing Stuck Mint or Redemption Transfers
 
 Use `transfer fail` to force a stuck mint or redemption to the terminal `Failed`
-state when no automatic recovery path applies. Operates directly on the local
-CQRS state; the bot need not be running, but must not be concurrently driving
-the same id. `--reason` is required and persisted as the audit record.
+state when no automatic recovery path applies. The command calls the running
+bot's loopback `POST /transfers/fail/<kind>/<id>` endpoint, which dispatches
+through the live CQRS store so inventory, transfer tracking, and the symbol
+guard update immediately. The bot must be running. `--reason` is required and
+persisted as the audit record.
 
 ```
 # Force-fail a mint stuck at MintRequested (provider never accepted it)
