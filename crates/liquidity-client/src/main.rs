@@ -12,7 +12,9 @@ use clap::Parser;
 use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
-use crate::cli::{Cli, Command, Debug, PortfolioSnapshot, Position, Read};
+use crate::cli::{
+    Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read, UsdcDirection,
+};
 use crate::output::OutputError;
 use crate::target::Auth;
 use crate::transport::{Client, TransportError, encode_segment};
@@ -169,7 +171,10 @@ async fn dispatch<A: TokenSource + Sync>(
                 .await?
         }
         Command::Debug(Debug::ResumeUsdc { direction, id }) => {
-            let direction = direction.segment();
+            let direction = match direction {
+                UsdcDirection::AlpacaToBase => "alpaca_to_base",
+                UsdcDirection::BaseToAlpaca => "base_to_alpaca",
+            };
             let id = encode_segment(&id);
             client
                 .post(&format!("/transfers/usdc/resume/{direction}/{id}"))
@@ -185,7 +190,10 @@ async fn dispatch<A: TokenSource + Sync>(
                 .await?
         }
         Command::Debug(Debug::ReconcileEquity { kind, id, reason }) => {
-            let kind = kind.segment();
+            let kind = match kind {
+                EquityTransferKind::Mint => "equity_mint",
+                EquityTransferKind::Redemption => "equity_redemption",
+            };
             let id = encode_segment(&id);
             client
                 .post_json(
