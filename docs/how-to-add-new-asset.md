@@ -167,10 +167,16 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   a `redemption_wallet` (the issuer's wallet on that chain). Startup builds that
   chain's tokenization services and refuses, naming the chain, without it. A
   hedge-only secondary, where every equity has `rebalancing = "disabled"`, needs
-  neither the wallet nor a wrapper vault.
+  no redemption wallet, issuer client or mint authorizer, and gets no wrap or
+  deposit approvals.
+- Every chain that lists the asset, hedge-only secondaries included, needs its
+  own `tokenized_equity_derivative`: that address is the token its vaults hold
+  and the one its fills are checked against, and the daily portfolio capture
+  reads that chain's vault ratio to value those balances in underlying shares.
 - The vault at `tokenized_equity_derivative` reports `tokenized_equity` as its
-  `asset()`. Startup attests this for every trading- or rebalancing-enabled
-  equity on every hedged chain and fails naming the chain and symbol otherwise.
+  `asset()`. Startup attests this on each redemption-capable chain -- every
+  trading- or rebalancing-enabled equity on the primary, the rebalancing-enabled
+  ones on a secondary -- and fails naming the chain and symbol otherwise.
 - The Turnkey policies allow the startup approvals on that chain's id: the
   approvals (underlying to vault, vault to that chain's orderbook, that chain's
   USDC to its orderbook) are granted per hedged chain, and the deploy gate
@@ -231,11 +237,15 @@ For adding asset **XYZ**:
 - [ ] Test a mint via the liquidity bot CLI:
       `stox alpaca-tokenize -t <token_addr> -s XYZ -q 1 -r <receiving_wallet>`
 - [ ] Add config entry to `config/staging/st0x-hedge.toml` (disabled first)
-- [ ] On each hedged chain where the asset is listed: `redemption_wallet`,
-      Turnkey approval policies for that chain's id, and, before the asset is
-      cut over to orchestrator mode, the orchestrator entry for that chain (see
-      step 4a) and the Turnkey `MintAuth` policy for that chain's id and
-      orchestrator; the first orchestrator-mode mint fails at signing without it
+- [ ] On each hedged chain where the asset is listed: that chain's own
+      `tokenized_equity_derivative`, and Turnkey approval policies for that
+      chain's id
+- [ ] On each redemption-capable chain that lists it -- the primary, and a
+      secondary where at least one equity sets `rebalancing = "enabled"` --
+      `redemption_wallet` and, before the asset is cut over to orchestrator
+      mode, the orchestrator entry for that chain (see step 4a) and the Turnkey
+      `MintAuth` policy for that chain's id and orchestrator; the first
+      orchestrator-mode mint fails at signing without it
 - [ ] Deploy to staging, verify bot sees the asset
 - [ ] Enable trading in config, deploy again
 - [ ] Repeat for production when staging looks good
