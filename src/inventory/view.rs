@@ -167,9 +167,14 @@ where
         + std::fmt::Display
         + std::fmt::Debug,
 {
-    /// Available and inflight totalled over every chain slot: the bot's
-    /// onchain holding of this asset is what all its chains hold together,
-    /// and a display that named one chain would understate the rest.
+    /// Available and inflight totalled over every chain slot.
+    ///
+    /// Sound only for an asset denominated the same way on every chain, i.e.
+    /// USDC. Equity slots hold wrapped ERC-4626 vault shares, and each
+    /// chain's vault has its own underlying-per-wrapped ratio (see
+    /// [`Self::check_equity_imbalance`], which converts before comparing
+    /// venues), so adding two chains' share counts yields a number that is
+    /// no longer a share count.
     fn onchain_totals(&self) -> Result<(T, T), FloatError> {
         self.onchain
             .values()
@@ -1024,10 +1029,16 @@ impl InventoryView {
             .sorted()
             .map(|symbol| {
                 let inventory = self.equities.get(symbol);
-                let (onchain_available, onchain_inflight) = inventory.map_or(
-                    Ok((FractionalShares::ZERO, FractionalShares::ZERO)),
-                    Inventory::onchain_totals,
-                )?;
+                // The trading chain's slot alone, never a cross-chain total:
+                // a wrapped share is worth its own chain's underlying, so
+                // the chains cannot be added (see
+                // [`Inventory::onchain_totals`]). Surfacing the other chains
+                // needs a chain-qualified field the dashboard can render
+                // per chain, not a wider sum here.
+                let (onchain_available, onchain_inflight) = inventory
+                    .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
+                        venue_balances(item.onchain.get(&self.trading_chain).copied())
+                    });
 
                 let (offchain_available, offchain_inflight) = inventory
                     .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
