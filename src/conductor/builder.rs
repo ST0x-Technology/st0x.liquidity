@@ -179,12 +179,13 @@ struct ConfiguredChainVaults {
 }
 
 /// Equity symbols the portfolio treats as configured: the union over every
-/// watched chain. Hedging is venue-level -- one broker book backs the market
-/// making of every chain -- so a symbol a secondary chain alone trades is
-/// still configured offchain, and an offchain snapshot filtered against the
-/// primary's table alone would drop its broker position and zero its Hedging
-/// slot. Shared with the CLI's snapshot-mark repair so the two cannot drift
-/// on what "configured" means.
+/// watched chain.
+///
+/// Hedging is venue-level -- one broker book backs every chain's market making
+/// -- so filtering an offchain snapshot against the primary's table alone
+/// drops a secondary-only symbol's broker position and zeroes its Hedging
+/// slot. Shared with the CLI's snapshot-mark repair so the two cannot drift on
+/// what "configured" means.
 pub fn configured_equity_symbols(ctx: &Ctx) -> HashSet<Symbol> {
     ctx.chains
         .watched()
