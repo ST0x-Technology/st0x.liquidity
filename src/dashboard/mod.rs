@@ -511,6 +511,7 @@ mod tests {
         ClientOrderId, ExecutorOrderId, FractionalShares, MarketSession, Positive,
         SupportedExecutor, Symbol, Usd,
     };
+    use st0x_finance::Usdc;
     use st0x_float_macro::float;
 
     use super::*;
@@ -870,36 +871,36 @@ mod tests {
     /// rendered, and `handle_socket` then closes the socket instead of sending
     /// a frame: a `current_state` missing its inventory would misstate the
     /// book, so the client must reconnect rather than render a gap. The view
-    /// here totals one symbol's balance across two chains, and the two
-    /// max-exponent operands overflow that sum -- a genuine `to_dto` failure,
-    /// not an injected one.
+    /// here totals cash across two chains -- the one onchain figure `to_dto`
+    /// still sums, a dollar being a dollar on every chain -- and the two
+    /// max-exponent operands overflow that sum, a genuine `to_dto` failure
+    /// rather than an injected one.
     #[tokio::test]
     async fn websocket_closes_without_a_frame_when_inventory_cannot_be_rendered() {
         // Rain's Float packs a big-endian int32 exponent in the top four bytes
         // and an int224 coefficient in the low twenty-eight. `i32::MAX` beside
         // the largest positive coefficient leaves no exponent room to
         // renormalize into, so summing two of these reverts.
-        let unsummable = FractionalShares::new(rain_math_float::Float::from_raw(b256!(
+        let unsummable = Usdc::new(rain_math_float::Float::from_raw(b256!(
             "0x7fffffff7fffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         )));
-        let symbol = Symbol::new("AAPL").unwrap();
         let now = chrono::Utc::now();
-        let onchain_equity = |chain| inventory::snapshot::InventorySnapshotEvent::OnchainEquity {
+        let onchain_usdc = |chain| inventory::snapshot::InventorySnapshotEvent::OnchainUsdc {
             chain,
-            balances: std::collections::BTreeMap::from([(symbol.clone(), unsummable)]),
+            usdc_balance: unsummable,
             fetched_at: now,
             block_number: None,
         };
 
         let view = inventory::InventoryView::default()
-            .apply_snapshot_event(&onchain_equity(st0x_evm::Chain::Base), now)
+            .apply_snapshot_event(&onchain_usdc(st0x_evm::Chain::Base), now)
             .unwrap()
-            .apply_snapshot_event(&onchain_equity(st0x_evm::Chain::Ethereum), now)
+            .apply_snapshot_event(&onchain_usdc(st0x_evm::Chain::Ethereum), now)
             .unwrap();
         let error = view.to_dto().unwrap_err();
         assert!(
             matches!(error, inventory::InventoryViewError::Float(_)),
-            "the fixture must make to_dto fail on the cross-chain sum, got {error:?}"
+            "the fixture must make to_dto fail on the cross-chain cash total, got {error:?}"
         );
 
         let mut state = create_test_state().await;
