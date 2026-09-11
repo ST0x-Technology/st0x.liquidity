@@ -694,9 +694,9 @@ impl ChainRole {
 impl ChainRegistry {
     /// Pairs each configured chain with its secrets entry.
     ///
-    /// Admits any number of trading chains -- each hedged chain drives its own
-    /// fill watcher and its own vault polling -- but refuses anything other
-    /// than exactly one of them claiming `primary = true`. Zero or several
+    /// Admits any number of hedged chains -- each one drives its own fill
+    /// watcher and its own vault polling -- but refuses anything other than
+    /// exactly one of them claiming `primary = true`. Zero or several
     /// claimants leave the chain the rebalancing and cash paths read
     /// undefined. Transport-only entries are unlimited -- nothing watches them
     /// by design.
