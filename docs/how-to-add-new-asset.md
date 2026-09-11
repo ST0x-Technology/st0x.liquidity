@@ -162,8 +162,12 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 `[orchestrator.addresses]` entry. On each hedged chain where the asset is listed
 (Base included), check before enabling the asset:
 
-- `[chains.<name>.trading]` carries a `redemption_wallet` (the issuer's wallet
-  on that chain). Startup refuses, naming the chain, without it.
+- On a redemption-capable chain -- the primary, and a secondary where at least
+  one equity sets `rebalancing = "enabled"` -- `[chains.<name>.trading]` carries
+  a `redemption_wallet` (the issuer's wallet on that chain). Startup builds that
+  chain's tokenization services and refuses, naming the chain, without it. A
+  hedge-only secondary, where every equity has `rebalancing = "disabled"`, needs
+  neither the wallet nor a wrapper vault.
 - The vault at `tokenized_equity_derivative` reports `tokenized_equity` as its
   `asset()`. Startup attests this for every trading- or rebalancing-enabled
   equity on every hedged chain and fails naming the chain and symbol otherwise.
