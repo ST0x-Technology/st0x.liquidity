@@ -334,13 +334,23 @@ describe('blockLagCards per chain', () => {
     expect(cards[1]?.primary).toBe('2000 blocks')
   })
 
-  it('attributes skipped ticks to the primary chain only', () => {
+  it("gives each chain's card the skipped ticks of its own watcher", () => {
     const report = infra({}, { skippedTicks: 3 })
     report.monitor.blockLag.push(lagSeries({ chain: 'ethereum' }))
+    report.monitor.poll.push(pollHealth({ chain: 'ethereum', skippedTicks: 7 }))
 
     const [base, ethereum] = blockLagCards(report, freshNow)
 
     expect(base?.secondary).toContain('3 skipped ticks')
+    expect(ethereum?.secondary).toContain('7 skipped ticks')
+  })
+
+  it('omits skipped ticks for a chain with no poll report', () => {
+    const report = infra({}, { skippedTicks: 3 })
+    report.monitor.blockLag.push(lagSeries({ chain: 'ethereum' }))
+
+    const [, ethereum] = blockLagCards(report, freshNow)
+
     expect(ethereum?.secondary).not.toContain('skipped ticks')
   })
 })
