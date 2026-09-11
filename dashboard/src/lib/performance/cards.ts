@@ -2,9 +2,9 @@
 
 import type { ChainBlockLag } from '$lib/api/ChainBlockLag'
 import type { ChainName } from '$lib/api/ChainName'
+import type { ChainPollHealth } from '$lib/api/ChainPollHealth'
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
 import type { InfraReport } from '$lib/api/InfraReport'
-import type { ChainPollHealth } from '$lib/api/ChainPollHealth'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 import {
   BLOCK_LAG_THRESHOLDS,
