@@ -15849,6 +15849,34 @@ mod tests {
         ])
     }
 
+    /// Vault polling reads every watched chain's market-making vaults, and
+    /// those hold that chain's `tokenized_equity_derivative` -- wrapped vault
+    /// shares -- so the daily portfolio capture needs the ratio reader of the
+    /// chain each balance sits on. A hedge-only chain is exempt from the
+    /// issuing half of the equity leg, not from reading its own vault's
+    /// ratio, and the reader must read that chain's own asset table rather
+    /// than the primary's.
+    #[test]
+    fn watched_chain_wrappers_cover_a_hedge_only_secondary() {
+        let ctx = ctx_with_base_and_ethereum_trading();
+        let tokenizations = base_and_hedge_only_ethereum_tokenizations(MockWrapper::new());
+
+        let wrappers = watched_chain_wrappers(&ctx, &tokenizations).unwrap();
+
+        assert_eq!(
+            wrappers.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base, Chain::Ethereum],
+            "every watched chain needs a ratio reader for its market-making shares"
+        );
+        assert_eq!(
+            wrappers[&Chain::Ethereum]
+                .lookup_underlying(&Symbol::new("TSLA").unwrap())
+                .unwrap(),
+            Address::repeat_byte(0xe5),
+            "the hedge-only chain's reader must resolve its own tokenized equity"
+        );
+    }
+
     /// Startup with a hedge-only Ethereum next to the Base primary: the
     /// secondary is skipped with a log line and never asked about vault
     /// modes, while the primary is still attested, so a primary vault that
