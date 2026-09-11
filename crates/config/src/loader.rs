@@ -751,8 +751,8 @@ pub struct Ctx {
     pub apalis_finished_job_cleanup_interval_secs: u64,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
-    /// Gas-balance alerting and transfer-readiness context. Optional in
-    /// standalone mode and required in rebalancing mode.
+    /// Gas-balance alerting and transfer-readiness context, required by
+    /// production configuration validation.
     pub alerts: Option<AlertsCtx>,
     /// Notices collected during parsing, before any tracing subscriber
     /// existed. Emit via [`Ctx::emit_startup_notices`] once logging is up.
@@ -1708,7 +1708,7 @@ fn validate_config(
         .clone()
         .map(LogQueryUrlTemplate::parse)
         .transpose()?;
-    let alerts = AlertsCtx::new(config.alerts.clone(), startup_notices)?;
+    let alerts = AlertsCtx::new(config.alerts.clone(), &config.chains, startup_notices)?;
 
     {
         let Some(rebalancing) = &config.rebalancing else {
@@ -2948,15 +2948,15 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address};
-    use st0x_finance::Positive;
+    use alloy::primitives::{Address, U256, address};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    use st0x_finance::Positive;
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::{ExecutionThreshold, InventoryModeTag};
+    use crate::{ChainLifecycle, ExecutionThreshold, InventoryModeTag};
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -3181,9 +3181,8 @@ mod tests {
     }
 
     /// The enablement predicate has to run on the real load path, not just as
-    /// a unit. HyperEVM is the case that matters: the chain exists, a signer
-    /// is built for it, and nothing else is -- so a config raising it to
-    /// "active" reads as reasonable and must still be refused.
+    /// a unit. HyperEVM supports prefunded trading but lacks gas valuation,
+    /// so raising it to "active" must still be refused.
     #[tokio::test]
     async fn hyperevm_cannot_be_raised_to_active() {
         let config = toml_file(
@@ -8500,6 +8499,92 @@ mod tests {
         }
     }
 
+    fn prefunded_hyperevm_config() -> Config {
+        let mut config: Config =
+            toml::from_str(&String::from_utf8_lossy(minimal_config_toml_bytes())).unwrap();
+        let mut template: Config =
+            toml::from_str(&String::from_utf8_lossy(minimal_config_toml_bytes())).unwrap();
+        let mut trading = template
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .trading
+            .take()
+            .unwrap();
+        trading.primary = false;
+        let hyper = config.chains.get_mut(&Chain::HyperEvm).unwrap();
+        hyper.lifecycle = ChainLifecycle::Prefunded;
+        hyper.trading = Some(trading);
+        config.alerts = Some(crate::AlertsConfig {
+            low_balance_thresholds: BTreeMap::from([
+                (Chain::Base, "0.05".to_owned()),
+                (Chain::Ethereum, "0.01".to_owned()),
+                (Chain::HyperEvm, "0.5".to_owned()),
+            ]),
+            poll_interval: 300,
+            realert_interval: 3600,
+            chat_id: None,
+            message_thread_id: None,
+        });
+        config
+    }
+
+    #[test]
+    fn prefunded_hyperevm_primary_fails_config_validation() {
+        let mut config = prefunded_hyperevm_config();
+        config
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .trading
+            .as_mut()
+            .unwrap()
+            .primary = false;
+        config
+            .chains
+            .get_mut(&Chain::HyperEvm)
+            .unwrap()
+            .trading
+            .as_mut()
+            .unwrap()
+            .primary = true;
+        let error = validate_config(&config, Path::new("example.config.toml"), &mut Vec::new())
+            .err()
+            .expect("HyperEVM primary must fail configuration validation");
+        assert!(
+            matches!(
+                error,
+                CtxError::ChainRegistry(
+                    crate::chain::ChainRegistryError::UnsupportedPrimaryChain {
+                        chain: Chain::HyperEvm
+                    }
+                )
+            ),
+            "expected unsupported HyperEVM primary, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn prefunded_watched_hyperevm_loads_with_hype_monitoring() {
+        let mut config = prefunded_hyperevm_config();
+        let validated =
+            validate_config(&config, Path::new("example.config.toml"), &mut Vec::new()).unwrap();
+        assert_eq!(
+            validated
+                .alerts
+                .unwrap()
+                .low_balance_threshold_wei(Chain::HyperEvm),
+            Some(U256::from(500_000_000_000_000_000_u64))
+        );
+        config.alerts = None;
+        assert!(matches!(
+            validate_config(&config, Path::new("example.config.toml"), &mut Vec::new()),
+            Err(CtxError::Alerts(
+                crate::AlertsAssemblyError::HyperEvmRequiresAlerts
+            ))
+        ));
+    }
+
     #[test]
     fn repo_config_rebalancing_requires_alert_thresholds() {
         for path in repo_config_paths() {
@@ -8510,9 +8595,10 @@ mod tests {
                 continue;
             }
 
-            let alerts = AlertsCtx::new(config.alerts, &mut Vec::new()).unwrap_or_else(|error| {
-                panic!("{path:?}: invalid [alerts] gas thresholds: {error}")
-            });
+            let alerts = AlertsCtx::new(config.alerts, &config.chains, &mut Vec::new())
+                .unwrap_or_else(|error| {
+                    panic!("{path:?}: invalid [alerts] gas thresholds: {error}")
+                });
 
             assert!(
                 alerts.is_some(),

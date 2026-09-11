@@ -13,7 +13,7 @@ use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
 
 use super::TokenizationNetwork;
-use super::rebalancing::{TradingChainContext, chain_usdc, trading_chain_context};
+use super::rebalancing::{TradingChainContext, trading_chain_context};
 
 pub(super) struct Deposit {
     pub(super) amount: Float,
@@ -180,7 +180,7 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let TradingChainContext { chain, trading, .. } = trading_chain_context(ctx, network)?;
-    let token = chain_usdc(chain)?;
+    let token = chain.usdc();
 
     let cash = trading.assets.cash.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -798,10 +798,8 @@ mod tests {
         assert_prints_ethereum_not_base(&output, &ctx, "Recipient wallet");
     }
 
-    /// No USDC is pinned for HyperEVM: the withdrawal is refused by name
-    /// rather than sent against another chain's contract.
     #[tokio::test]
-    async fn withdraw_usdc_refuses_a_chain_without_a_pinned_usdc() {
+    async fn withdraw_usdc_on_hyperevm_uses_canonical_usdc() {
         let mut ctx = create_ctx_with_rebalancing(None);
         ctx.chains.insert_secondary(
             TradingChain::test()
@@ -819,16 +817,20 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let err_msg =
-            vault_withdraw_usdc_command(&mut stdout, amount, TokenizationNetwork::HyperEvm, &ctx)
-                .await
-                .unwrap_err()
-                .to_string();
-
+        vault_withdraw_usdc_command(&mut stdout, amount, TokenizationNetwork::HyperEvm, &ctx)
+            .await
+            .unwrap_err();
+        let output = String::from_utf8(stdout).unwrap();
         assert!(
-            err_msg.contains("hyperevm") && err_msg.contains("USDC"),
-            "expected the unpinned chain named, got: {err_msg}"
+            output.contains(&format!("Token: {}", st0x_evm::USDC_HYPEREVM)),
+            "{output}"
         );
+        assert!(
+            output.contains(&format!("Vault ID: {TEST_VAULT_ID}")),
+            "{output}"
+        );
+        assert!(!output.contains(&USDC_BASE.to_string()), "{output}");
+        assert!(!output.contains(&USDC_ETHEREUM.to_string()), "{output}");
     }
 
     #[test]

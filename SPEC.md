@@ -158,6 +158,13 @@ the remainder is hedged on a later tick). Startup verifies every watched chain
 `decimals()` on that chain's own endpoint) and any failure is fatal; degraded
 per-chain startup is deferred to the chain-disable work.
 
+HyperEVM supports prefunded fill ingestion and hedging as a watched secondary
+with manually funded equity, USDC and native HYPE gas. Configuring HyperEVM as
+the primary chain fails validation. Its canonical USDC is
+`0xb88339CB7199b77E23DB6E890353E22632Ba630f` (6 decimals). HyperEVM does not
+provide gas valuation or automated rebalancing capabilities; `active` remains
+unavailable. Automated inventory polling and rebalancing remain on Base.
+
 The tokenization services are built per watched chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
 one rebalancing-enabled equity (the same per-asset flags that make the chain
@@ -590,6 +597,9 @@ empty checkpoint; after a successful backfill, the service records the last
 processed block and the next startup begins at the following block. The
 checkpoint is updated only after the full backfill range succeeds, so a partial
 failure cannot skip unprocessed history.
+
+Every supported chain pins its canonical USDC contract in code, so adding a
+chain requires pinning its USDC before the code compiles.
 
 Completed apalis jobs are operational queue records, not audit history. The
 runtime periodically deletes terminal job rows and vacuums SQLite at the
@@ -6011,24 +6021,24 @@ requests to the backend.
 The bot raises out-of-band alerts for conditions an operator must react to
 quickly. Every alert is emitted as a structured ERROR log (see "Structured log
 channel" below). The `[alerts]` config section is optional only in standalone
-mode. Automated rebalancing requires it because its thresholds gate fresh
-transfers; in standalone mode, omitting it disables only the gas monitor while
-all other alert sources still log.
+mode without an enabled watched HyperEVM chain. Automated rebalancing requires
+it because its thresholds gate fresh transfers; enabled watched HyperEVM
+requires it for native-gas monitoring. Where omission is permitted, it disables
+only the gas monitors while all other alert sources still log.
 
 ### Gas balance monitoring
 
-The bot pays gas in native ETH for every on-chain transaction (vault ops, CCTP
-bridging, token wrapping, hedge rebalancing). If the market-maker wallet runs
-dry, those transactions silently stop succeeding. To surface this before it
-halts operations, a supervised **gas monitor** watches the wallet's native-ETH
-balance.
+The bot pays gas in the chain's native token: ETH on Base and Ethereum, HYPE on
+HyperEVM. A supervised gas monitor watches the signing wallet's native balance
+to alert the operator before insufficient gas stops transactions.
 
-**Scope.** Two independently supervised monitors watch the bot's signing wallet
-on Base and Ethereum. Each monitor uses the wallet and RPC provider for its own
-chain: Base monitoring never reads through the Ethereum provider, and Ethereum
-monitoring never reads through the Base provider. The two monitors share the
-configured polling and re-alert intervals but keep separate de-duplication and
-recovery state.
+**Scope.** With `[alerts]` configured, independently supervised monitors watch
+Base and Ethereum. HyperEVM also has a monitor whenever its chain config has a
+lifecycle other than `disabled` and a trading table (a watched chain), including
+observe-only watched use. Absent, disabled or transport-only HyperEVM has no
+monitor. Each monitor reads its own chain's RPC provider and signing wallet; no
+chain borrows another's provider or wallet. Monitors share polling and re-alert
+intervals but retain independent de-duplication and recovery state.
 
 The checked-in production and staging configurations intentionally use a
 `0.05 ETH` threshold on both chains. On Ethereum, that is about 1,450 times the
@@ -6039,18 +6049,22 @@ observed usage.
 **Behavior.**
 
 - Every `poll_interval` seconds the monitor reads the wallet's native balance.
-- When the balance drops **below** that chain's explicit threshold
-  (`base_low_balance_threshold` or `ethereum_low_balance_threshold`, each a
-  decimal-ETH amount parsed to wei at startup — a missing, malformed, or zero
-  value fails fast with no cross-chain fallback), it raises an alert: a
-  structured `error!` log (target `gas`) carrying the wallet, chain, current
-  balance and threshold, plus an operational-alert notification (see "Structured
-  log channel" below).
+- When the balance drops **below** that chain's explicit entry in
+  `[alerts.low_balance_thresholds]`, it raises a structured `error!` log (target
+  `gas`) with wallet, chain, balance, threshold and native token, plus an
+  operational-alert notification. Thresholds are decimal native-token amounts
+  parsed exactly to 18-decimal base units at startup. Missing, malformed or zero
+  thresholds fail startup; there is no cross-chain fallback. Base and Ethereum
+  entries remain required whenever `[alerts]` exists; HyperEVM is required only
+  when enabled and watched. Thresholds for unselected chains are rejected.
+  HyperEVM balances and thresholds are reported as HYPE.
+
 - **De-duplication.** The monitor alerts once on the transition into the low
   state, then re-alerts at most once per `realert_interval` while the balance
   stays low. It never notifies on every poll.
 - **Recovery.** When the balance returns to at or above the threshold, the
-  monitor emits a single `info!` log and recovery notification, then resets.
+  monitor emits a single `info!` log, then resets its alert state.
+
 - A transient RPC read failure is logged and swallowed (it does not advance the
   de-dup state and does not raise an alert); the supervised task keeps polling.
 - **Restart behavior.** The de-dup state is held in memory and resets on
@@ -6079,11 +6093,12 @@ trigger can retry after the wallet is funded. Once a transfer has started, its
 persisted lifecycle state controls recovery; resuming it does not rerun the
 fresh-transfer admission check or strand funds that are already in flight.
 
-Because rebalancing consumes the gas thresholds as a safety boundary, `[alerts]`
-remains optional only when automated rebalancing is disabled. A configuration
-that enables rebalancing without `[alerts]` fails at startup. Automatic funding
-from another wallet is not part of this behavior; prolonged low balances
-continue to use the monitor's repeated operational alerts.
+Because rebalancing consumes gas thresholds as a safety boundary and enabled
+watched HyperEVM requires gas monitoring, `[alerts]` is optional only when
+automated rebalancing is disabled and HyperEVM is absent, disabled or
+transport-only. Automatic funding from another wallet is not part of this
+behavior; prolonged low balances continue to use the monitor's repeated
+operational alerts.
 
 ### Structured log channel
 

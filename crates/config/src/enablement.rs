@@ -96,8 +96,8 @@ impl fmt::Display for ChainCapability {
 ///   fill watcher whose fills are accounted and hedged against its own asset
 ///   table (the position check backstop sweeps every watched chain's table),
 ///   but no wrapper.
-/// - HyperEVM has a signer and nothing else: no CCTP domain is known for it,
-///   and its native token is HYPE, which the ETH/USD feed cannot value.
+/// - HyperEVM signs, watches fills and hedges prefunded inventory. It has no
+///   CCTP domain or wrapper, and the ETH/USD feed cannot value its HYPE gas.
 pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
     use ChainCapability::*;
 
@@ -117,7 +117,7 @@ pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
             CashRebalancing,
             GasValuation,
         ]),
-        Chain::HyperEvm => BTreeSet::from([WalletSigning]),
+        Chain::HyperEvm => BTreeSet::from([FillIngestion, Hedging, WalletSigning]),
     }
 }
 
@@ -321,18 +321,15 @@ mod tests {
     }
 
     #[test]
-    fn hyperevm_cannot_trade_because_no_watcher_is_wired_for_it() {
-        let error =
-            check_enablement(Chain::HyperEvm, ChainLifecycle::Prefunded, true, None).unwrap_err();
-
-        let ChainEnablementError::MissingCapabilities { missing, .. } = error else {
-            panic!("expected MissingCapabilities, got: {error:?}")
-        };
-
+    fn hyperevm_can_trade_prefunded_without_rebalancing_or_gas_valuation() {
+        check_enablement(Chain::HyperEvm, ChainLifecycle::Prefunded, true, None).unwrap();
         assert_eq!(
-            missing.into_inner(),
-            vec![ChainCapability::FillIngestion, ChainCapability::Hedging],
-            "a trading HyperEVM is refused for both gaps"
+            provided_capabilities(Chain::HyperEvm),
+            BTreeSet::from([
+                ChainCapability::FillIngestion,
+                ChainCapability::Hedging,
+                ChainCapability::WalletSigning,
+            ])
         );
     }
 

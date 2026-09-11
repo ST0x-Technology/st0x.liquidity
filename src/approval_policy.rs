@@ -83,10 +83,6 @@ pub enum ApprovalPolicyVerificationError {
 pub enum ChainCoverageError {
     #[error(transparent)]
     MissingCoverage(#[from] MissingPolicyCoverage),
-    /// This build pins no canonical USDC for the chain, so its USDC grant has
-    /// no target to prove covered; fails closed.
-    #[error("[chains.{chain}] has no canonical USDC pinned in this build")]
-    UsdcNotPinned { chain: Chain },
 }
 
 /// Validates deploy inputs, lists Turnkey policies, and fails unless every
@@ -125,14 +121,11 @@ fn verify_watched_chains(
 
     for chain_inputs in watched {
         let chain = chain_inputs.chain;
-        let usdc = chain
-            .usdc()
-            .ok_or(ChainCoverageError::UsdcNotPinned { chain })?;
         let targets = build_approval_targets(
             chain_inputs.role,
             &chain_inputs.assets,
             chain_inputs.orderbook,
-            usdc,
+            chain.usdc(),
         );
         let context = ApprovalPolicyContext {
             user_id: &snapshot.user_id,
@@ -493,8 +486,8 @@ mod tests {
     use std::collections::HashMap;
 
     use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, ChainRole, OperationMode};
-    use st0x_evm::USDC_ETHEREUM;
     use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect, TurnkeyPolicySnapshot};
+    use st0x_evm::{USDC_ETHEREUM, USDC_HYPEREVM};
 
     use super::*;
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
@@ -962,9 +955,7 @@ mod tests {
         )
         .unwrap_err();
 
-        let ChainCoverageError::MissingCoverage(missing) = error else {
-            panic!("an uncovered chain must fail as missing coverage, got: {error}");
-        };
+        let ChainCoverageError::MissingCoverage(missing) = error;
         assert_eq!(missing.chain, Chain::Ethereum);
         assert_eq!(
             missing
@@ -977,22 +968,47 @@ mod tests {
         );
     }
 
-    /// A watched chain this build pins no USDC for fails the gate closed
-    /// before any policy is consulted: there is no target to prove covered.
     #[test]
-    fn watched_chain_without_pinned_usdc_fails_the_gate_closed() {
-        let error = verify_watched_chains(
-            &[chain_inputs(Chain::HyperEvm, ChainRole::Secondary)],
-            &snapshot(vec![allow(None)]),
-            address!("0x52908400098527886E0F7030069857D2E4169EE7"),
-        )
-        .unwrap_err();
+    fn watched_hyperevm_requires_policy_for_its_canonical_usdc() {
+        let watched = [chain_inputs(Chain::HyperEvm, ChainRole::Secondary)];
+        let wallet_address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
+        let condition = format!(
+            "eth.tx.chain_id == 999 && eth.tx.to == '{USDC_HYPEREVM:#x}' && \
+             eth.tx.data[2..10] == '095ea7b3'"
+        );
 
-        assert!(matches!(
-            error,
-            ChainCoverageError::UsdcNotPinned {
-                chain: Chain::HyperEvm
-            }
-        ));
+        for policies in [
+            Vec::new(),
+            vec![allow(Some(&condition.replace("999", "8453")))],
+            vec![allow(Some(&condition.replace(
+                &format!("{USDC_HYPEREVM:#x}"),
+                &format!("{USDC_ETHEREUM:#x}"),
+            )))],
+        ] {
+            let error =
+                verify_watched_chains(&watched, &snapshot(policies), wallet_address).unwrap_err();
+            let ChainCoverageError::MissingCoverage(missing) = error;
+
+            assert_eq!(missing.chain, Chain::HyperEvm);
+            assert_eq!(
+                missing.missing,
+                vec![ApprovalTarget {
+                    token: USDC_HYPEREVM,
+                    spender: watched[0].orderbook,
+                    symbol: None,
+                    purpose: ApprovalPurpose::DepositUsdc,
+                }]
+            );
+        }
+
+        assert_eq!(
+            verify_watched_chains(
+                &watched,
+                &snapshot(vec![allow(Some(&condition))]),
+                wallet_address,
+            )
+            .unwrap(),
+            1
+        );
     }
 }

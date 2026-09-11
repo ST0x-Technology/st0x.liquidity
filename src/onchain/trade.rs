@@ -708,9 +708,7 @@ fn validate_inventory_token_addresses(
     assets: &ChainAssets,
     trade_details: &TradeDetails,
 ) -> Result<(), TradeValidationError> {
-    let expected_usdc = chain
-        .usdc()
-        .ok_or(TradeValidationError::UsdcUnknownOnChain { chain })?;
+    let expected_usdc = chain.usdc();
     let usdc_token = trade_details.usdc_token();
     if usdc_token != expected_usdc {
         return Err(TradeValidationError::UnrecognizedInventoryToken {
@@ -987,11 +985,6 @@ pub enum TradeValidationError {
         token: Address,
         claimed_symbol: String,
     },
-    /// This build does not pin a canonical USDC address for the fill's
-    /// chain, so the USDC leg cannot be validated; refuse rather than accept
-    /// another chain's address.
-    #[error("no canonical USDC address is pinned for chain {chain}")]
-    UsdcUnknownOnChain { chain: Chain },
 }
 
 #[cfg(test)]

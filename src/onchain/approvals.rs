@@ -23,7 +23,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use futures_util::{StreamExt, TryStreamExt, stream};
 
 use st0x_config::{ChainAssets, ChainRole};
-use st0x_evm::{Chain, IERC20, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 
 /// High watermark above which an existing allowance is treated as "already
@@ -105,11 +105,6 @@ impl ApprovalPurpose {
 /// while wrap/deposit would revert with `ERC20InsufficientAllowance`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StartupApprovalError {
-    /// This build pins no canonical USDC for a watched chain, so its USDC
-    /// grant has no token to target; refused rather than approving another
-    /// chain's USDC address there.
-    #[error("[chains.{chain}] has no canonical USDC pinned in this build")]
-    UsdcNotPinned { chain: Chain },
     #[error(
         "failed to read allowance for token {token} spender {spender} \
          (symbol {symbol:?})"

@@ -279,7 +279,7 @@ where
                 .await;
                 return Ok(());
             }
-            Err(err) => return Err(err.into()),
+            Err(error) => return Err(error.into()),
         };
 
         let Some(trade) = onchain_trade else {
@@ -871,6 +871,7 @@ mod tests {
     use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
     use st0x_evm::IERC20::{decimalsCall, symbolCall};
+    use st0x_evm::{Chain, USDC_HYPEREVM};
     use st0x_execution::{
         CancellationOutcome, FractionalShares, InventoryResult, MockExecutor, MockExecutorCtx,
         Positive, SupportedExecutor, Symbol, TryIntoExecutor,
@@ -892,7 +893,6 @@ mod tests {
     use crate::test_utils::{
         TEST_POLL_INTERVAL, get_test_log, get_test_order, panic_revert_payload, setup_test_pools,
     };
-    use st0x_evm::Chain;
 
     /// Builds the CQRS stores, job queue, and `AccountantCtx` shared by every
     /// `perform()` test in this module -- callers supply only what actually
@@ -1255,6 +1255,117 @@ mod tests {
         job.perform(&accountant_ctx).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn perform_hedges_hyperevm_raindex_fill_and_discovers_its_usdc_vault() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let usdc = USDC_HYPEREVM;
+        let equity = Address::repeat_byte(0x98);
+        let mut order = get_test_order();
+        order.validInputs[0].token = usdc;
+        order.validOutputs[1].token = equity;
+        let owner = order.owner;
+        let event = RaindexTradeEvent::TakeOrderV3(Box::new(TakeOrderV3Event {
+            sender: Address::repeat_byte(0x97),
+            config: TakeOrderConfigV4 {
+                order,
+                inputIOIndex: U256::ZERO,
+                outputIOIndex: U256::from(1),
+                signedContext: vec![],
+            },
+            input: float!(2).get_inner(),
+            output: float!(300).get_inner(),
+        }));
+        let mut log = get_test_log();
+        log.block_timestamp = Some(1_782_850_177);
+        let job = AccountForDexTrade {
+            trade: EmittedOnChain::from_log(Chain::HyperEvm, event, &log).unwrap(),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        // Both symbols are preloaded below and TakeOrderV3 amounts are already
+        // Float-encoded, so no token introspection reaches either provider.
+        let secondary_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let primary_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let cache = SymbolCache::default();
+        cache.preload_symbol(Chain::HyperEvm, usdc, "USDC");
+        cache.preload_symbol(Chain::HyperEvm, equity, "wtCOIN");
+        let mut ctx = build_test_accountant_ctx(
+            pool.clone(),
+            &apalis_pool,
+            create_test_ctx_with_order_owner(Address::ZERO),
+            cache,
+            primary_provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+        let mut secondary = TradingChain::test().chain(Chain::HyperEvm).call();
+        secondary.vault_owner = owner;
+        secondary.orderbook = Address::repeat_byte(0x96);
+        secondary.assets.equities.symbols.insert(
+            Symbol::new("COIN").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: equity,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        let registry_id = crate::vault_registry::VaultRegistryId {
+            chain: Chain::HyperEvm,
+            orderbook: secondary.orderbook,
+            owner,
+        };
+        ctx.chains.insert(
+            Chain::HyperEvm,
+            ChainAccounting {
+                contracts: crate::onchain::raindex_contracts(&secondary),
+                trading: secondary,
+                evm: ReadOnlyEvm::new(secondary_provider),
+            },
+        );
+
+        job.perform(&ctx).await.unwrap();
+
+        let position = ctx
+            .cqrs
+            .position_projection
+            .load(&Symbol::new("COIN").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.net, FractionalShares::new(float!(-2)));
+        assert_eq!(position.accumulated_short, FractionalShares::new(float!(2)));
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'OffchainOrderEvent::Placed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        let registry = ctx
+            .vault_registry
+            .load(&registry_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.usdc_vaults.len(), 1);
+        assert_eq!(
+            ctx.vault_registry
+                .load(&crate::vault_registry::VaultRegistryId {
+                    chain: Chain::Base,
+                    ..registry_id
+                })
+                .await
+                .unwrap()
+                .map(|registry| registry.usdc_vaults.len()),
+            None
+        );
+    }
+
     /// A TakeOrderV3 event with a non-hedgeable token pair (e.g. tNVDA/wtNVDA)
     /// should be skipped gracefully instead of causing a fatal error.
     #[tokio::test]
@@ -1525,75 +1636,104 @@ mod tests {
     }
 
     /// An `InventoryTrade` whose USDC leg address does not match the
-    /// configured canonical `USDC_BASE` -- even though its `symbol()`
+    /// chain's canonical USDC -- even though its `symbol()`
     /// reports "USDC" -- must be classified as `UnrecognizedInventoryToken`
     /// and skipped gracefully through `perform()`, never hedged as if it
     /// were real USDC.
     #[tokio::test]
     async fn perform_skips_inventory_trade_with_unrecognized_token() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let asserter = Asserter::new();
+        for chain in [Chain::Base, Chain::HyperEvm] {
+            let (pool, apalis_pool) = setup_test_pools().await;
+            let asserter = Asserter::new();
 
-        // 0xaaaa... resolves to "USDC" via the seeded cache but is NOT the
-        // configured canonical USDC_BASE address -- a spoof.
-        let spoof_usdc = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let equity_token = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let inventory_trade = InventoryTrade {
-            deposit: OperatorDeposit {
-                operator: Address::ZERO,
-                token: spoof_usdc,
-                vaultId: B256::ZERO,
-                amount: alloy::primitives::uint!(160000000_U256),
-            },
-            withdraw: OperatorWithdraw {
-                operator: Address::ZERO,
-                token: equity_token,
-                vaultId: B256::ZERO,
-                amount: alloy::primitives::uint!(2000000000000000000_U256),
-            },
-        };
+            // Ethereum USDC cannot serve as the quote token on either chain.
+            let spoof_usdc = st0x_evm::USDC_ETHEREUM;
+            let equity_token = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            let inventory_trade = InventoryTrade {
+                deposit: OperatorDeposit {
+                    operator: Address::ZERO,
+                    token: spoof_usdc,
+                    vaultId: B256::ZERO,
+                    amount: alloy::primitives::uint!(160000000_U256),
+                },
+                withdraw: OperatorWithdraw {
+                    operator: Address::ZERO,
+                    token: equity_token,
+                    vaultId: B256::ZERO,
+                    amount: alloy::primitives::uint!(2000000000000000000_U256),
+                },
+            };
 
-        let log = get_test_log();
-        let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
-        let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(Chain::Base, event, &log).unwrap(),
-            backpressure_streak: BackpressureStreak::default(),
-        };
+            let log = get_test_log();
+            let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
+            let job = AccountForDexTrade {
+                trade: EmittedOnChain::from_log(chain, event, &log).unwrap(),
+                backpressure_streak: BackpressureStreak::default(),
+            };
 
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+            asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+            asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
 
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let cache = SymbolCache::default();
-        crate::test_utils::seed_get_test_order_token_symbols(&cache);
+            // Base stays the primary: a fill on another chain is routed to
+            // that chain's own secondary accounting entry, which is the only
+            // shape config validation admits for HyperEVM.
+            let fill_chain_provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let idle_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+            let (primary_provider, secondary_provider) = match chain {
+                Chain::Base => (fill_chain_provider, None),
+                Chain::Ethereum | Chain::HyperEvm => (idle_provider, Some(fill_chain_provider)),
+            };
+            let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+            let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+            let cache = SymbolCache::default();
+            cache.preload_symbol(chain, spoof_usdc, "USDC");
+            cache.preload_symbol(chain, equity_token, "wtAAPL");
 
-        let accountant_ctx = build_test_accountant_ctx(
-            pool.clone(),
-            &apalis_pool,
-            ctx,
-            cache,
-            provider,
-            executor,
-            ExecutionThreshold::whole_share(),
-        )
-        .await;
+            let mut accountant_ctx = build_test_accountant_ctx(
+                pool.clone(),
+                &apalis_pool,
+                ctx,
+                cache,
+                primary_provider,
+                executor,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+            if let Some(secondary_provider) = secondary_provider {
+                let mut secondary = accountant_ctx.ctx.chains.primary().clone();
+                secondary.chain = chain;
+                accountant_ctx.chains.insert(
+                    chain,
+                    ChainAccounting {
+                        contracts: crate::onchain::raindex_contracts(&secondary),
+                        trading: secondary,
+                        evm: ReadOnlyEvm::new(secondary_provider),
+                    },
+                );
+            }
 
-        // Should succeed (skip) rather than error -- a spoofed token address
-        // must not trip the fail-stop.
-        job.perform(&accountant_ctx).await.unwrap();
+            // Should succeed (skip) rather than error -- a spoofed token address
+            // must not trip the fail-stop.
+            job.perform(&accountant_ctx).await.unwrap_or_else(|error| {
+                panic!("spoofed USDC on {chain} must skip, not fail: {error:?}")
+            });
 
-        let recorded = sqlx::query!(
-            "SELECT tx_hash, log_index, event_type, reason, detail FROM skipped_fills \
-             ORDER BY log_index"
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].event_type, "InventoryTrade");
-        assert_eq!(recorded[0].reason, "unrecognized_inventory_token");
+            let recorded: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT chain, event_type, reason FROM skipped_fills ORDER BY log_index",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                recorded,
+                vec![(
+                    chain.to_string(),
+                    "InventoryTrade".to_owned(),
+                    "unrecognized_inventory_token".to_owned()
+                )],
+                "exactly one fill, recorded on {chain}, skipped as an unrecognized token"
+            );
+        }
     }
 
     /// An `InventoryTrade` whose deposit token fails `decimals()`
@@ -1907,120 +2047,138 @@ mod tests {
         assert_eq!(order_count, 1, "the hedge order must be placed");
     }
 
-    /// Hedge sizing reads the fill chain's asset table: Ethereum caps COIN at
-    /// 0.01 shares while the primary (Base) table has no cap, so an Ethereum
-    /// fill above the cap must place a 0.01-share hedge, not the full amount.
+    /// Secondary chains cap COIN at 0.01 shares while the primary Base table
+    /// has no cap. The fill chain's limit must size the shared Position hedge.
     #[tokio::test]
     async fn hedge_sizing_reads_the_fill_chains_asset_table() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let asserter = Asserter::new();
+        for chain in [Chain::Ethereum, Chain::HyperEvm] {
+            let (pool, apalis_pool) = setup_test_pools().await;
+            let asserter = Asserter::new();
 
-        let usdc_token = st0x_evm::USDC_ETHEREUM;
-        let equity_token = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
-        let operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
+            let usdc_token = chain.usdc();
+            let equity_token = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
+            let operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
 
-        let inventory_trade = InventoryTrade {
-            deposit: OperatorDeposit {
-                operator,
-                token: usdc_token,
-                vaultId: alloy::primitives::b256!(
-                    "0x0000000000000000000000000000000000000000000000000000000000000004"
+            let inventory_trade = InventoryTrade {
+                deposit: OperatorDeposit {
+                    operator,
+                    token: usdc_token,
+                    vaultId: alloy::primitives::b256!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000004"
+                    ),
+                    amount: alloy::primitives::uint!(5_000_000_U256),
+                },
+                withdraw: OperatorWithdraw {
+                    operator,
+                    token: equity_token,
+                    vaultId: alloy::primitives::b256!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000003"
+                    ),
+                    amount: alloy::primitives::uint!(34_172_366_621_067_031_U256),
+                },
+            };
+            let mut log = crate::test_utils::create_log(0x97);
+            log.transaction_hash = Some(alloy::primitives::fixed_bytes!(
+                "0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9"
+            ));
+            log.block_number = Some(48_030_415);
+            log.block_timestamp = Some(1_782_850_177);
+            let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
+            let job = AccountForDexTrade {
+                trade: EmittedOnChain::from_log(chain, event, &log).unwrap(),
+                backpressure_streak: BackpressureStreak::default(),
+            };
+
+            asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+            asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+            let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+
+            let assets_with = |operational_limit| ChainAssets {
+                equities: ChainEquities {
+                    operational_limit: None,
+                    symbols: HashMap::from([(
+                        Symbol::new("COIN").unwrap(),
+                        ChainEquityAsset {
+                            tokenized_equity: Address::ZERO,
+                            tokenized_equity_derivative: equity_token,
+                            vault_ids: Vec::new(),
+                            trading: OperationMode::Enabled,
+                            rebalancing: OperationMode::Disabled,
+                            wrapped_equity_recovery: OperationMode::Disabled,
+                            operational_limit,
+                        },
+                    )]),
+                },
+                cash: None,
+            };
+            ctx.chains.primary_mut().assets = assets_with(None);
+            let mut secondary = ctx.chains.primary().clone();
+            secondary.chain = chain;
+            secondary.assets = assets_with(Some(
+                Positive::new(FractionalShares::new(float!(0.01))).unwrap(),
+            ));
+
+            let cache = SymbolCache::default();
+            cache.preload_symbol(chain, usdc_token, "USDC");
+            cache.preload_symbol(chain, equity_token, "wtCOIN");
+
+            let mut accountant_ctx = build_test_accountant_ctx(
+                pool.clone(),
+                &apalis_pool,
+                ctx,
+                cache,
+                ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+                executor,
+                ExecutionThreshold::shares(
+                    Positive::new(FractionalShares::new(float!(0.01))).unwrap(),
                 ),
-                amount: alloy::primitives::uint!(5_000_000_U256),
-            },
-            withdraw: OperatorWithdraw {
-                operator,
-                token: equity_token,
-                vaultId: alloy::primitives::b256!(
-                    "0x0000000000000000000000000000000000000000000000000000000000000003"
-                ),
-                amount: alloy::primitives::uint!(34_172_366_621_067_031_U256),
-            },
-        };
-        let mut log = crate::test_utils::create_log(0x97);
-        log.transaction_hash = Some(alloy::primitives::fixed_bytes!(
-            "0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9"
-        ));
-        log.block_number = Some(48_030_415);
-        log.block_timestamp = Some(1_782_850_177);
-        let event = RaindexTradeEvent::InventoryTrade(Box::new(inventory_trade));
-        let job = AccountForDexTrade {
-            trade: EmittedOnChain::from_log(Chain::Ethereum, event, &log).unwrap(),
-            backpressure_streak: BackpressureStreak::default(),
-        };
+            )
+            .await;
+            accountant_ctx.chains.insert(
+                chain,
+                ChainAccounting {
+                    contracts: crate::onchain::raindex_contracts(&secondary),
+                    trading: secondary,
+                    evm: st0x_evm::ReadOnlyEvm::new(provider),
+                },
+            );
 
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+            job.perform(&accountant_ctx).await.unwrap();
+            let position = accountant_ctx
+                .cqrs
+                .position_projection
+                .load(&Symbol::new("COIN").unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                position.net,
+                FractionalShares::new(float!(-0.034172366621067031))
+            );
+            assert_eq!(
+                position.accumulated_short,
+                FractionalShares::new(float!(0.034172366621067031))
+            );
 
-        let assets_with = |operational_limit| ChainAssets {
-            equities: ChainEquities {
-                operational_limit: None,
-                symbols: HashMap::from([(
-                    Symbol::new("COIN").unwrap(),
-                    ChainEquityAsset {
-                        tokenized_equity: Address::ZERO,
-                        tokenized_equity_derivative: equity_token,
-                        vault_ids: Vec::new(),
-                        trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
-                        wrapped_equity_recovery: OperationMode::Disabled,
-                        operational_limit,
-                    },
-                )]),
-            },
-            cash: None,
-        };
-        ctx.chains.primary_mut().assets = assets_with(None);
-        let mut ethereum = ctx.chains.primary().clone();
-        ethereum.chain = Chain::Ethereum;
-        ethereum.assets = assets_with(Some(
-            Positive::new(FractionalShares::new(float!(0.01))).unwrap(),
-        ));
-
-        let cache = SymbolCache::default();
-        cache.preload_symbol(Chain::Ethereum, usdc_token, "USDC");
-        cache.preload_symbol(Chain::Ethereum, equity_token, "wtCOIN");
-
-        let mut accountant_ctx = build_test_accountant_ctx(
-            pool.clone(),
-            &apalis_pool,
-            ctx,
-            cache,
-            provider.clone(),
-            executor,
-            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(0.01))).unwrap()),
-        )
-        .await;
-        accountant_ctx.chains.insert(
-            Chain::Ethereum,
-            ChainAccounting {
-                contracts: crate::onchain::raindex_contracts(&ethereum),
-                trading: ethereum,
-                evm: st0x_evm::ReadOnlyEvm::new(provider),
-            },
-        );
-
-        job.perform(&accountant_ctx).await.unwrap();
-
-        let (payload,): (String,) = sqlx::query_as(
-            "SELECT payload FROM events WHERE event_type = 'OffchainOrderEvent::Placed'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let placed: crate::offchain::order::OffchainOrderEvent =
-            serde_json::from_str(&payload).unwrap();
-        let crate::offchain::order::OffchainOrderEvent::Placed { shares, .. } = placed else {
-            panic!("expected a Placed event, got {placed:?}");
-        };
-        assert_eq!(
-            shares,
-            Positive::new(FractionalShares::new(float!(0.01))).unwrap(),
-            "the hedge must be capped by Ethereum's operational limit"
-        );
+            let (payload,): (String,) = sqlx::query_as(
+                "SELECT payload FROM events WHERE event_type = 'OffchainOrderEvent::Placed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let placed: crate::offchain::order::OffchainOrderEvent =
+                serde_json::from_str(&payload).unwrap();
+            let crate::offchain::order::OffchainOrderEvent::Placed { shares, .. } = placed else {
+                panic!("expected a Placed event, got {placed:?}");
+            };
+            assert_eq!(
+                shares,
+                Positive::new(FractionalShares::new(float!(0.01))).unwrap(),
+                "the hedge must be capped by the fill chain's operational limit"
+            );
+        }
     }
 
     /// Executor whose `preflight_counter_trade` always fails with a
