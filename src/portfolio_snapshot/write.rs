@@ -139,7 +139,7 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// underlying-equivalent units before being persisted (see
     /// [`convert_wrapped_equity_rows`]). Keyed by chain because each chain's
     /// vault accrues on its own, so one chain's ratio can never value
-    /// another's balance. One entry per watched chain, hedge-only chains
+    /// another's balance. One entry per hedged chain, hedge-only chains
     /// included: their market-making vaults hold wrapped shares too. Empty
     /// only when no wallet is configured at all -- the bot can then never hold
     /// onchain wrapped equity in the first place, so no row would ever need
@@ -3254,11 +3254,19 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     /// Only the primary chain's assets table feeds the wallet-transit symbol
     /// set, but the capture reads every watched chain's market-making
     /// balances. A symbol traded on a secondary chain alone must still be
     /// marked: left unmarked, its nonzero row excludes the whole day with
     /// `MissingMark` and the capital series loses that day entirely.
+=======
+    /// Only the primary chain's assets table feeds `configured_equity_symbols`,
+    /// but the capture reads every hedged chain's market-making balances. A
+    /// symbol traded on a secondary chain alone must still be marked: left
+    /// unmarked, its nonzero row excludes the whole day with `MissingMark` and
+    /// the capital series loses that day entirely.
+>>>>>>> cd1afefa (refactor: the newest per-chain test and docs name the hedged chain)
     #[tokio::test]
     async fn a_secondary_only_symbol_is_marked_for_the_portfolio_capture() {
         let (pool, apalis_pool) = setup_test_pools().await;

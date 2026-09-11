@@ -183,7 +183,7 @@ whose equities all have `rebalancing = "disabled"` -- needs no issuer client,
 redemption wallet or mint authorizer: only its signer is kept, for the startup
 allowance work, and startup logs the chain as hedge-only. It still gets the
 read-only ERC-4626 ratio reader over its own asset table, because vault polling
-reads its market-making vaults like any watched chain's and those hold wrapped
+reads its market-making vaults like any hedged chain's and those hold wrapped
 vault shares the daily portfolio capture values in underlying units. The
 rebalancer, the portfolio snapshot and the wrapped- and unwrapped-equity
 orphan-recovery aggregates consume the primary chain's entry until the global
