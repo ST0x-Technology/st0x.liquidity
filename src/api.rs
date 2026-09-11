@@ -2409,6 +2409,13 @@ async fn fail_pre_burn_usdc_transfer(
              on-chain, or reconcile-usdc for a confirmed post-burn failure.",
             rebalance.state_name()
         )),
+        PreBurnFailEligibility::AlreadyFailedPreBurn if rebalance.holds_rebalance_guard() => {
+            Some(format!(
+                "Transfer {id} is already in pre-burn BridgingFailed, but the rebalancing \
+                 guard is still held because the withdrawn funds left Alpaca; settle them \
+                 with reconcile-usdc to release the guard."
+            ))
+        }
         PreBurnFailEligibility::AlreadyFailedPreBurn => Some(format!(
             "Transfer {id} is already in pre-burn BridgingFailed; the rebalancing guard \
              is already in its cleared state and will not re-arm on restart."
@@ -7130,19 +7137,36 @@ mod tests {
     #[tokio::test]
     async fn fail_pre_burn_usdc_transfer_is_not_repeatable() {
         let pool = crate::test_utils::setup_test_db().await;
-        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
-        seed_usdc_bridging_submitting(&pool, &id, false).await;
-        fail_pre_burn_usdc_transfer(&pool, &id, "first".to_string())
+
+        // BaseToAlpaca: the guard is already cleared, nothing left to do.
+        let cleared = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&pool, &cleared, false).await;
+        fail_pre_burn_usdc_transfer(&pool, &cleared, "first".to_string())
             .await
             .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
-
         let Err((status, Json(error))) =
-            fail_pre_burn_usdc_transfer(&pool, &id, "second".to_string()).await
+            fail_pre_burn_usdc_transfer(&pool, &cleared, "second".to_string()).await
         else {
             panic!("an already-failed pre-burn transfer must be refused");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(error.error.contains("already"), "{}", error.error);
+        assert!(error.error.contains("cleared state"), "{}", error.error);
+
+        // AlpacaToBase: the failure still holds the guard, so the refusal must
+        // send the operator to reconcile rather than claim nothing is needed.
+        let held = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_alpaca_to_base_withdrawal_complete(&pool, &held).await;
+        fail_pre_burn_usdc_transfer(&pool, &held, "first".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+        let Err((status, Json(error))) =
+            fail_pre_burn_usdc_transfer(&pool, &held, "second".to_string()).await
+        else {
+            panic!("an already-failed pre-burn transfer must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("reconcile-usdc"), "{}", error.error);
+        assert!(!error.error.contains("cleared state"), "{}", error.error);
     }
 
     #[tokio::test]

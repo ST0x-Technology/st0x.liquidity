@@ -1,7 +1,7 @@
-//! Typed request bodies for the write routes. Each mirrors the bot's request
-//! contract in `src/api.rs` field for field, so the client sends exactly the
-//! JSON the route deserializes and a contract change is a compile-time edit
-//! here rather than a runtime 400.
+//! Typed request bodies for the write routes. Each is a hand-written mirror
+//! of the bot's request contract in `src/api.rs`; nothing links the two at
+//! compile time, so a contract change on the bot must be reflected here by
+//! hand. The request-body tests in `main.rs` pin the JSON each body produces.
 
 use serde::Serialize;
 

@@ -933,11 +933,20 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
                  `transfer reconcile` for a confirmed post-burn failure."
             );
         }
-        // The guard is already cleared (holds_rebalance_guard() returns false
-        // for burn_tx_hash: None) and will not re-arm on restart. Re-running
-        // would be a no-op at best; return a clear error so the operator knows
-        // the state is good.
+        // Already the pre-burn failed terminal, so there is nothing to fail
+        // again. Whether the operator is done depends on the direction: an
+        // AlpacaToBase failure still holds the guard (the withdrawn funds are
+        // off Alpaca) until `transfer reconcile` settles them, whereas a
+        // BaseToAlpaca failure is already in its cleared state.
         PreBurnFailEligibility::AlreadyFailedPreBurn => {
+            if state.holds_rebalance_guard() {
+                anyhow::bail!(
+                    "fail-usdc-transfer: transfer {id} is already in pre-burn BridgingFailed \
+                     (burn_tx_hash: None), but the rebalancing guard is still held because the \
+                     withdrawn funds left Alpaca. Settle them with `transfer reconcile --kind \
+                     usdc` to release the guard."
+                );
+            }
             anyhow::bail!(
                 "fail-usdc-transfer: transfer {id} is already in pre-burn BridgingFailed \
                  (burn_tx_hash: None). The rebalancing guard is already in its cleared state \
