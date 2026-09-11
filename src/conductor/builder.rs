@@ -158,10 +158,11 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) wallet_polling: WalletPollingCtx,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    /// Ratio source for the portfolio-snapshot capture gate: market making
-    /// holds wrapped vault shares onchain, and the daily capture job resolves
-    /// each wrapped balance through this service.
-    pub(crate) wrapper: Arc<dyn Wrapper>,
+    /// Ratio source for the portfolio-snapshot capture gate, one per watched
+    /// chain: market making holds wrapped vault shares onchain, and the daily
+    /// capture job resolves each wrapped balance through the service of the
+    /// chain that balance sits on.
+    pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) startup_token: StartupToken,
     pub(crate) supervisor_startup: SupervisorStartupTokens,
@@ -534,7 +535,7 @@ where
         inventory: context.inventory.clone(),
         position_projection: context.frameworks.position_projection.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
-        wrapper: Some(context.wrapper.clone()),
+        wrappers: context.wrappers.clone(),
         configured_equity_symbols,
         usdc_tracking_enabled: context.ctx.chains.primary().assets.cash.is_some(),
         // Derived from the same Option the poller consumed, so the gate can

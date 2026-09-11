@@ -137,10 +137,12 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// Resolves each configured equity's live vault ratio so wrapped onchain
     /// balances (MarketMaking, BaseWalletWrapped) can be valued in
     /// underlying-equivalent units before being persisted (see
-    /// [`convert_wrapped_equity_rows`]). `None` only when no wallet is
-    /// configured at all -- the bot can then never hold onchain wrapped
-    /// equity in the first place, so no row would ever need conversion.
-    pub(crate) wrapper: Option<Arc<dyn Wrapper>>,
+    /// [`convert_wrapped_equity_rows`]). Keyed by chain because each chain's
+    /// vault accrues on its own, so one chain's ratio can never value
+    /// another's balance. Empty only when no wallet is configured at all --
+    /// the bot can then never hold onchain wrapped equity in the first place,
+    /// so no row would ever need conversion.
+    pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     /// Reused from `configured_inventory_vaults` (`src/conductor/builder.rs`)
     /// rather than recomputed, so the completeness gate and the live
     /// inventory poller always agree on what "fully hydrated" means.
@@ -203,8 +205,8 @@ pub(crate) enum PortfolioSnapshotJobError {
     #[error("failed to load portfolio-snapshot ids for alert recovery: {0}")]
     SnapshotIds(#[from] LoadAllIdsError),
     #[error(
-        "wrapped equity balance present for {symbol} at {location} but no wallet/Wrapper is \
-         configured to resolve its vault ratio"
+        "wrapped equity balance present for {symbol} at {location} but that chain has no \
+         Wrapper configured to resolve its vault ratio"
     )]
     MissingWrapper {
         symbol: Symbol,
@@ -416,12 +418,8 @@ impl PortfolioSnapshotJob {
                 .await;
         }
 
-        let rows = convert_wrapped_equity_rows(
-            rows,
-            ctx.wrapper.as_deref(),
-            &ctx.configured_equity_symbols,
-        )
-        .await?;
+        let rows = convert_wrapped_equity_rows(rows, &ctx.wrappers, &ctx.configured_equity_symbols)
+            .await?;
         let marked_rows = resolve_marks(
             &ctx.position_projection,
             now,
@@ -1025,15 +1023,18 @@ fn drop_empty_unconfigured_equity_rows(
 /// share == 1 underlying share, silently wrong once a vault's ratio departs
 /// from 1:1 (dividends, splits, NAV accrual).
 ///
-/// The ratio is resolved once per distinct symbol that actually needs
-/// conversion (not once per `configured_equity_symbols`), so a symbol with no
-/// MarketMaking/BaseWalletWrapped row this tick costs no RPC call.
+/// The ratio is resolved once per distinct `(chain, symbol)` that actually
+/// needs conversion (not once per `configured_equity_symbols`), so a symbol
+/// with no MarketMaking/BaseWalletWrapped row this tick costs no RPC call. The
+/// chain is part of the key because each chain's vault accrues independently:
+/// the same symbol's wrapped share is worth a different amount of underlying
+/// on every chain it is wrapped on.
 async fn convert_wrapped_equity_rows(
     mut rows: Vec<PortfolioBalanceRow>,
-    wrapper: Option<&dyn Wrapper>,
+    wrappers: &BTreeMap<Chain, Arc<dyn Wrapper>>,
     configured_equity_symbols: &HashSet<Symbol>,
 ) -> Result<Vec<PortfolioBalanceRow>, PortfolioSnapshotJobError> {
-    let mut ratios: HashMap<Symbol, UnderlyingPerWrapped> = HashMap::new();
+    let mut ratios: HashMap<(Chain, Symbol), UnderlyingPerWrapped> = HashMap::new();
 
     for row in &mut rows {
         let PortfolioAsset::Equity(symbol) = &row.asset else {
@@ -1046,22 +1047,30 @@ async fn convert_wrapped_equity_rows(
         if !configured_equity_symbols.contains(symbol) {
             continue;
         }
-        if !matches!(
-            row.location,
-            PortfolioLocation::MarketMaking(_) | PortfolioLocation::BaseWalletWrapped
-        ) {
-            continue;
-        }
+        // The chain whose vault issued the wrapped share this row holds: a
+        // market-making slot names its own, and the wrapped transit leg is a
+        // Base wallet balance by construction (`PortfolioLocation`). Every
+        // other location is already denominated in underlying units.
+        let chain = match row.location {
+            PortfolioLocation::MarketMaking(chain) => chain,
+            PortfolioLocation::BaseWalletWrapped => Chain::Base,
+            PortfolioLocation::Hedging
+            | PortfolioLocation::EthereumWallet
+            | PortfolioLocation::BaseWalletUnwrapped => continue,
+        };
 
-        let ratio = if let Some(ratio) = ratios.get(symbol) {
+        let ratio = if let Some(ratio) = ratios.get(&(chain, symbol.clone())) {
             *ratio
         } else {
-            let wrapper = wrapper.ok_or_else(|| PortfolioSnapshotJobError::MissingWrapper {
-                symbol: symbol.clone(),
-                location: row.location,
-            })?;
+            let wrapper =
+                wrappers
+                    .get(&chain)
+                    .ok_or_else(|| PortfolioSnapshotJobError::MissingWrapper {
+                        symbol: symbol.clone(),
+                        location: row.location,
+                    })?;
             let ratio = wrapper.get_ratio_for_symbol(symbol).await?;
-            ratios.insert(symbol.clone(), ratio);
+            ratios.insert((chain, symbol.clone()), ratio);
             ratio
         };
 
@@ -1409,9 +1418,7 @@ mod tests {
             inventory: broadcasting(inventory),
             position_projection,
             portfolio_snapshot,
-            // The production field still holds one wrapper for every chain,
-            // so the fixture hands it the primary chain's entry.
-            wrapper: wrappers.get(&Chain::Base).cloned(),
+            wrappers,
             configured_equity_symbols,
             usdc_tracking_enabled,
             wallet_polling_enabled,

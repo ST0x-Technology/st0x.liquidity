@@ -934,7 +934,7 @@ impl Conductor {
             portfolio_snapshot,
             wallet_polling,
             tokenizer,
-            wrapper,
+            wrappers,
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck,
@@ -1042,7 +1042,7 @@ impl Conductor {
             inventory: inventory.clone(),
             wallet_polling,
             tokenizer,
-            wrapper,
+            wrappers,
             shutdown_token: shutdown_token.clone(),
             startup_token: startup_tokens.apalis_monitor,
             supervisor_startup: startup_tokens.supervisor,
@@ -1663,7 +1663,10 @@ struct RebalancingInfrastructure {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     tokenizer: Arc<dyn Tokenizer>,
-    wrapper: Arc<dyn Wrapper>,
+    /// One ratio source per watched chain that rebalances equity, handed to
+    /// the daily portfolio capture so a wrapped balance is valued with the
+    /// ratio of the chain it sits on.
+    wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     /// Operator `transfer recheck` entry point for a failed USDC deposit,
@@ -1709,7 +1712,7 @@ struct PositionAndRebalancing {
     portfolio_snapshot: Arc<Store<PortfolioSnapshot>>,
     wallet_polling: crate::inventory::WalletPollingCtx,
     tokenizer: Arc<dyn Tokenizer>,
-    wrapper: Arc<dyn Wrapper>,
+    wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
@@ -1914,7 +1917,7 @@ impl PositionAndRebalancing {
             portfolio_snapshot,
             wallet_polling,
             tokenizer: infra.tokenizer,
-            wrapper: infra.wrapper,
+            wrappers: infra.wrappers,
             service: infra.service,
             recovery_transfer: infra.recovery_transfer,
             usdc_recheck: infra.usdc_recheck,
@@ -2918,7 +2921,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         preflight_tokenization(&deps.ctx, &tokenizations, issuance_client.as_ref()).await?;
 
         let tokenizer = primary_equity.tokenizer.clone();
-        let wrapper = primary_equity.wrapper.clone();
 
         let mint_authorization =
             build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
@@ -2951,7 +2953,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let notifier = deps.notifier.clone();
 
         let rebalancing_service =
-            build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers);
+            build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
 
         wire_transfer_admission_guards(
             &rebalancing_service,
@@ -3095,7 +3097,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             position_projection: built.position_projection,
             snapshot: built.snapshot,
             tokenizer,
-            wrapper,
+            wrappers,
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck: usdc_handles.recheck_deposit,
