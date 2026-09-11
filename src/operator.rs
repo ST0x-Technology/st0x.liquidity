@@ -1608,9 +1608,9 @@ pub mod process_tx {
     ///
     /// Run inside the bot process, pass the conductor's wired `stores` (so the
     /// fill reaches the running reactors) and the live `submission_lock` so the
-    /// broker placement serializes against the trading loop (ADR 0014); the
-    /// shared `Position` aggregate's pending-order gate and the event store's
-    /// per-aggregate sequence already prevent a racing tick from double-placing
+    /// pending-hedge inspection and the broker placement serialize against the
+    /// trading loop (ADR 0014); under the lock, the shared `Position`
+    /// aggregate's pending-order gate prevents a racing tick from double-placing
     /// the hedge. The CLI runs in a separate process with standalone stores, no
     /// shared lock, and passes `None`.
     pub async fn process_tx<P: Provider + Clone + 'static>(
@@ -1691,6 +1691,19 @@ pub mod process_tx {
 
         let base_symbol = onchain_trade.symbol();
 
+        // Serialize against the live trading loop (ADR 0014) from here on.
+        // The lock must cover the pending-hedge inspection below, not just
+        // the placement: a concurrent placement holds the lock across
+        // `Position::PlaceOffChainOrder` (the claim) and `OffchainOrder::Place`
+        // (the aggregate), so an absent aggregate observed under the lock is a
+        // genuine orphan, whereas one observed outside it may be a live claim
+        // whose aggregate is about to exist. Held only on the in-bot path;
+        // released when this scope ends.
+        let _submission_guard = match submission_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
         match reconcile_existing_pending_order(offchain_order_store, position_store, base_symbol)
             .await?
         {
@@ -1766,13 +1779,8 @@ pub mod process_tx {
             .context("failed to load position for the idempotency anchor")?
             .and_then(|position| position.last_failed_offchain_order_id);
 
-        // Serialize the aggregate claim and the broker placement against the
-        // live trading loop (ADR 0014). Held only on the in-bot path; released
-        // when this scope ends.
-        let _submission_guard = match submission_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
+        // `_submission_guard` above is still held here, so the aggregate claim
+        // and the broker placement are serialized against the trading loop.
 
         match position_store
             .send(
@@ -3956,6 +3964,13 @@ pub mod process_tx {
         /// `counter_trade_submission` lock, so the loser is rejected before it
         /// reaches the broker. The second concurrent placement stands in for the
         /// live trading loop, which drives the identical gate and lock.
+        ///
+        /// The lock must also cover the pre-placement inspection of an existing
+        /// pending hedge: without it, the loser can observe the winner's Position
+        /// claim before the winner's `OffchainOrder` aggregate exists, misread
+        /// the absence as an orphaned pointer, clear the claim, and place a
+        /// second hedge. Reproducible under CPU contention (six parallel module
+        /// runs) at roughly 5% per run before the lock was widened.
         #[tokio::test]
         async fn concurrent_process_tx_and_tick_place_one_hedge() {
             let pool = setup_test_db().await;
