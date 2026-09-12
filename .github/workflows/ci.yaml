@@ -315,6 +315,14 @@ jobs:
           nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun install --frozen-lockfile
           nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun run lint
 
+      - name: Turnkey message utility
+        working-directory: scripts/turnkey-message
+        run: |
+          nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun install --frozen-lockfile
+          nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun test
+          nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun run typecheck
+          nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun run format:check
+
       - name: Dashboard
         run: nix build .#st0x-dashboard
 

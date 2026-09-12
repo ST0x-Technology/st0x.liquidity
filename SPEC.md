@@ -254,6 +254,39 @@ Raindex becomes the inventory, so `vault_owner` must be flipped to the
 `inventory` address in the same change that switches `inventory_mode` to
 `"managed"` and grants the bot `OPERATOR_ROLE`.
 
+##### Public Incident Messaging
+
+Operators can use the configured Turnkey EOA to represent an affected managed
+inventory in a public incident discussion. A message is strict UTF-8 encoded as
+the calldata of a zero-value Base transaction to an operator-selected address.
+It must be non-empty and at most 4,096 UTF-8 bytes (`MAX_MESSAGE_BYTES`). A
+reply is a new zero-value transaction to the configured Turnkey EOA with new
+UTF-8 calldata. Utility-prepared outbound transactions use EIP-1559 envelopes
+with empty access lists and independently selected nonce, gas, and fee fields;
+inbox classification does not require those envelope fields. An EOA recipient
+can send that reply directly. A contract recipient cannot originate a
+transaction, so its controller must reply from an EOA; the inbox marks that
+address untrusted unless it is the configured counterparty. The zero-value
+message call can execute a recipient contract's fallback, mutate its state, or
+revert. Contract recipients therefore require an explicit command-line opt-in
+after the operator reviews their execution behavior. The inventory contract
+itself does not sign messages. Before signing, the utility proves that the
+configured EOA administers and operates the inventory, binds the exact
+transaction and estimated maximum Base fee to a short-lived operator approval,
+and verifies the Turnkey-signed envelope before broadcast. The fee estimate
+includes L2 execution, L1 data, and Base operator fees. The utility re-estimates
+the total before signing and refuses an estimate above the approved cap; Base
+does not expose a transaction-level cap for fee changes after signing. Turnkey
+requests authenticate with an explicitly identified local Turnkey API user and
+verify that the credential belongs to the operator-approved user. Signing
+follows the Turnkey organization's root quorum; the utility persists the pending
+activity and resumes it after approval. It writes intent state before
+submission. If Turnkey may have accepted a request but returns no activity ID,
+the utility preserves that intent, fails closed, and requires manual inspection
+before any retry. Inbox discovery reads confirmed Base transactions and
+preserves untrusted senders as visibly untrusted records. Turnkey policy changes
+and private chat services are outside this messaging protocol.
+
 #### Dividend Freeze
 
 A dividend (or other corporate action) bumps a tokenized equity's wrapper NAV.
