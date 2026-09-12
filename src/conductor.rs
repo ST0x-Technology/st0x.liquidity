@@ -49,8 +49,8 @@ use st0x_event_sorcery::{
 use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
-    CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
-    MarketOrder, MarketSession, Positive, Symbol, TryIntoExecutor, Usd,
+    CounterTradeReservation, CounterTradeSkipReason, EligibilitySnapshots, ExecutionError,
+    Executor, FractionalShares, MarketOrder, MarketSession, Positive, Symbol, TryIntoExecutor, Usd,
 };
 use st0x_issuance_client::IssuanceClient;
 use st0x_issuance_dto::VaultModeTag;
@@ -170,6 +170,7 @@ pub(crate) struct SupervisorStartupTokens {
     pub(crate) base_gas_monitor: StartupToken,
     pub(crate) ethereum_gas_monitor: StartupToken,
     pub(crate) hyperevm_gas_monitor: StartupToken,
+    pub(crate) asset_eligibility_monitor: StartupToken,
 }
 
 /// Opens an apalis-side pool (sqlx 0.8) against the same database as the
@@ -1030,6 +1031,7 @@ impl Conductor {
         );
 
         let conductor_ctx = builder::ConductorCtx {
+            asset_eligibility_monitor: build_asset_eligibility_monitor(&ctx, &notifier).await?,
             ctx: ctx.clone(),
             watch_providers,
             poll_freshness,
@@ -2593,6 +2595,27 @@ async fn build_query_frameworks(
     );
 
     manifest.build(pool.clone(), equity_transfer_services).await
+}
+
+/// Builds the overnight asset-eligibility monitor for an Alpaca broker.
+///
+/// Alpaca-specific on purpose: overnight eligibility is an Alpaca
+/// surface, so the monitor gets its own concrete broker handle from the
+/// ctx instead of widening the generic `Executor` bound.
+async fn build_asset_eligibility_monitor(
+    ctx: &Ctx,
+    notifier: &Arc<dyn Notifier>,
+) -> anyhow::Result<Option<monitor::asset_eligibility::AssetEligibilityMonitor>> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_ctx) = &ctx.broker;
+
+    Ok(Some(monitor::asset_eligibility::AssetEligibilityMonitor {
+        broker: Arc::new(AlpacaBrokerApi::try_from_ctx(alpaca_ctx.clone()).await?),
+        symbols: builder::configured_equity_symbols(ctx)
+            .into_iter()
+            .collect(),
+        store: EligibilitySnapshots::default(),
+        notifier: notifier.clone(),
+    }))
 }
 
 /// Builds the Alpaca wallet client, instrumented broker, and CCTP/raindex
