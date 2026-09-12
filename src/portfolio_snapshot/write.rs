@@ -120,6 +120,16 @@ const EARLY_WAKE_BACKOFF: Duration = HYDRATION_RETRY_BACKOFF;
 const MAX_FRESHNESS_DEFER: chrono::Duration = chrono::Duration::hours(6);
 
 /// Shared dependencies for the [`PortfolioSnapshotJob`].
+/// What one watched chain contributes to the daily snapshot's completeness
+/// gates: the equities its own assets table configures, and whether it holds
+/// a cash vault there. Derived per chain rather than from the primary alone,
+/// because a chain the poller reads is a chain whose balances the capture
+/// must wait for.
+pub(crate) struct MarketMakingSlots {
+    pub(crate) equity_symbols: HashSet<Symbol>,
+    pub(crate) usdc_tracking_enabled: bool,
+}
+
 pub(crate) struct PortfolioSnapshotCtx {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) position_projection: Arc<Projection<Position>>,
@@ -127,17 +137,25 @@ pub(crate) struct PortfolioSnapshotCtx {
     /// Resolves each configured equity's live vault ratio so wrapped onchain
     /// balances (MarketMaking, BaseWalletWrapped) can be valued in
     /// underlying-equivalent units before being persisted (see
-    /// [`convert_wrapped_equity_rows`]). `None` only when no wallet is
-    /// configured at all -- the bot can then never hold onchain wrapped
-    /// equity in the first place, so no row would ever need conversion.
-    pub(crate) wrapper: Option<Arc<dyn Wrapper>>,
-    /// Reused from `configured_inventory_vaults` (`src/conductor/builder.rs`)
-    /// rather than recomputed, so the completeness gate and the live
-    /// inventory poller always agree on what "fully hydrated" means.
-    pub(crate) configured_equity_symbols: HashSet<Symbol>,
+    /// [`convert_wrapped_equity_rows`]). Keyed by chain because each chain's
+    /// vault accrues on its own, so one chain's ratio can never value
+    /// another's balance. One entry per watched chain, hedge-only chains
+    /// included: their market-making vaults hold wrapped shares too. Empty
+    /// only when no wallet is configured at all -- the bot can then never hold
+    /// onchain wrapped equity in the first place, so no row would ever need
+    /// conversion.
+    pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
+    /// The PRIMARY chain's equities alone (`src/conductor/builder.rs`), which
+    /// is all the wallet-transit slots may require: those balances are polled
+    /// from the primary's token map, so any other chain's symbol would gate
+    /// the capture on a slot no poll can stamp. Every venue-level requirement
+    /// reads [`Self::hedged_equity_symbols`] instead.
+    pub(crate) wallet_transit_equity_symbols: HashSet<Symbol>,
+    /// Whether the hedging venue tracks cash at all.
     pub(crate) usdc_tracking_enabled: bool,
-    /// Chain whose market-making slots the completeness gates require.
-    pub(crate) trading_chain: Chain,
+    /// The market-making slots each watched chain contributes to the
+    /// completeness gates, keyed by chain.
+    pub(crate) market_making: BTreeMap<Chain, MarketMakingSlots>,
     /// Mirrors whether `[wallet_polling]` is configured (the same source the
     /// live inventory poller reads, `crate::inventory::WalletPollingCtx`):
     /// when `true`, [`hydration_gap`] also requires the wallet-transit
@@ -191,8 +209,8 @@ pub(crate) enum PortfolioSnapshotJobError {
     #[error("failed to load portfolio-snapshot ids for alert recovery: {0}")]
     SnapshotIds(#[from] LoadAllIdsError),
     #[error(
-        "wrapped equity balance present for {symbol} at {location} but no wallet/Wrapper is \
-         configured to resolve its vault ratio"
+        "wrapped equity balance present for {symbol} at {location} but that chain has no \
+         Wrapper configured to resolve its vault ratio"
     )]
     MissingWrapper {
         symbol: Symbol,
@@ -380,11 +398,13 @@ impl PortfolioSnapshotJob {
                 .await;
         }
 
+        let configured_equities = ConfiguredEquities::of(ctx);
+
         let rows = {
             let view = ctx.inventory.read().await;
             view.to_portfolio_snapshot_rows()?
         };
-        let rows = drop_empty_unconfigured_equity_rows(rows, &ctx.configured_equity_symbols)
+        let rows = drop_empty_unconfigured_equity_rows(rows, &configured_equities)
             .map_err(PortfolioSnapshotJobError::UnconfiguredRowTotal)?;
 
         if let Some(gap) = hydration_gap(&rows, ctx) {
@@ -404,19 +424,9 @@ impl PortfolioSnapshotJob {
                 .await;
         }
 
-        let rows = convert_wrapped_equity_rows(
-            rows,
-            ctx.wrapper.as_deref(),
-            &ctx.configured_equity_symbols,
-        )
-        .await?;
-        let marked_rows = resolve_marks(
-            &ctx.position_projection,
-            now,
-            rows,
-            &ctx.configured_equity_symbols,
-        )
-        .await?;
+        let rows = convert_wrapped_equity_rows(rows, &ctx.wrappers, &configured_equities).await?;
+        let marked_rows =
+            resolve_marks(&ctx.position_projection, now, rows, &configured_equities).await?;
 
         match ctx
             .portfolio_snapshot
@@ -617,6 +627,19 @@ async fn alert_unusable_marks(
 }
 
 impl PortfolioSnapshotCtx {
+    /// Every hedged chain's equities, deduplicated. Hedging is venue-level --
+    /// one broker book backs the market making of every chain -- so this union
+    /// is exactly the set of symbols with a broker row. Derived from
+    /// [`Self::market_making`] rather than stored beside it, so the venue-level
+    /// requirement can never disagree with the per-chain one.
+    fn hedged_equity_symbols(&self) -> BTreeSet<Symbol> {
+        self.market_making
+            .values()
+            .flat_map(|slots| slots.equity_symbols.iter())
+            .cloned()
+            .collect()
+    }
+
     /// Enqueues the follow-up job for `target_et_day` after `delay`. Used
     /// both for hydration retries (same `target_et_day`, short backoff) and
     /// for the next day's capture (the next `target_et_day`, computed by
@@ -743,32 +766,41 @@ fn next_capture_delay(now: DateTime<Utc>) -> (Duration, NaiveDate) {
 
 /// Enumerates every `(location, asset)` slot the daily portfolio snapshot
 /// capture requires to have been observed before it may capture, driven by
-/// `configured_equity_symbols`, `usdc_tracking_enabled`, and
+/// the per-venue equity sets below, `usdc_tracking_enabled`, and
 /// `wallet_polling_enabled`. Shared by both [`hydration_gap`] (PRESENCE --
 /// the slot has a row in the live `InventoryView`) and [`freshness_gap`]
 /// (FRESHNESS -- the slot has been observed by a poll THIS process run,
 /// membership) so the two gates can never diverge on what "complete" means.
+///
+/// The equity set differs by venue: the broker book backs every hedged chain's
+/// market making, so Hedging requires [`PortfolioSnapshotCtx::hedged_equity_symbols`],
+/// while the wallet-transit locations require the primary's symbols alone
+/// (`wallet_transit_equity_symbols`) -- the only ones their polls can stamp.
 fn required_slots(
     ctx: &PortfolioSnapshotCtx,
 ) -> impl Iterator<Item = (PortfolioLocation, PortfolioAsset)> + '_ {
-    let equity_pairs = ctx.configured_equity_symbols.iter().flat_map(|symbol| {
-        [
-            PortfolioLocation::MarketMaking(ctx.trading_chain),
-            PortfolioLocation::Hedging,
-        ]
-        .into_iter()
-        .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
+    let market_making_pairs = ctx.market_making.iter().flat_map(|(chain, slots)| {
+        let location = PortfolioLocation::MarketMaking(*chain);
+        let equities = slots
+            .equity_symbols
+            .iter()
+            .map(move |symbol| (location, PortfolioAsset::Equity(symbol.clone())));
+        let usdc = slots
+            .usdc_tracking_enabled
+            .then_some((location, PortfolioAsset::Usdc));
+
+        equities.chain(usdc)
     });
+
+    let equity_pairs = ctx
+        .hedged_equity_symbols()
+        .into_iter()
+        .map(|symbol| (PortfolioLocation::Hedging, PortfolioAsset::Equity(symbol)));
 
     let usdc_pairs = ctx
         .usdc_tracking_enabled
-        .then_some([
-            PortfolioLocation::MarketMaking(ctx.trading_chain),
-            PortfolioLocation::Hedging,
-        ])
-        .into_iter()
-        .flatten()
-        .map(|location| (location, PortfolioAsset::Usdc));
+        .then_some((PortfolioLocation::Hedging, PortfolioAsset::Usdc))
+        .into_iter();
 
     let wallet_usdc_pairs = ctx
         .wallet_polling_enabled
@@ -782,7 +814,7 @@ fn required_slots(
 
     let wallet_equity_pairs = ctx
         .wallet_polling_enabled
-        .then(|| ctx.configured_equity_symbols.iter())
+        .then(|| ctx.wallet_transit_equity_symbols.iter())
         .into_iter()
         .flatten()
         .flat_map(|symbol| {
@@ -794,7 +826,8 @@ fn required_slots(
             .map(move |location| (location, PortfolioAsset::Equity(symbol.clone())))
         });
 
-    equity_pairs
+    market_making_pairs
+        .chain(equity_pairs)
         .chain(usdc_pairs)
         .chain(wallet_usdc_pairs)
         .chain(wallet_equity_pairs)
@@ -934,6 +967,55 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
         })
 }
 
+/// Which equities config still lists, as every row-judging stage of the
+/// capture reads it.
+///
+/// Market-making membership is chain-qualified: the same symbol on two chains
+/// is two configured pairs, so a durable row whose `(chain, symbol)` pair was
+/// removed or moved is retired even while another chain still lists the
+/// symbol. Flattening to a symbol set hides exactly that case -- the row would
+/// be kept, valued at a ratio config no longer has, and priced at an
+/// underlying mark.
+///
+/// Every other location exists on the primary chain alone, but a symbol any
+/// hedged chain trades is hedged and held there, so those rows are judged
+/// against the union.
+struct ConfiguredEquities<'ctx> {
+    market_making: &'ctx BTreeMap<Chain, MarketMakingSlots>,
+    /// Every hedged chain's equities, not just the primary's: a symbol traded
+    /// on a secondary chain alone is still hedged and still parked in the
+    /// primary's wallets, so judging its Hedging row against the primary's
+    /// table alone would strand it unmarked and exclude the whole day with
+    /// `MissingMark`.
+    hedged: HashSet<Symbol>,
+}
+
+impl<'ctx> ConfiguredEquities<'ctx> {
+    fn of(ctx: &'ctx PortfolioSnapshotCtx) -> Self {
+        Self {
+            market_making: &ctx.market_making,
+            hedged: ctx
+                .hedged_equity_symbols()
+                .into_iter()
+                .chain(ctx.wallet_transit_equity_symbols.iter().cloned())
+                .collect(),
+        }
+    }
+
+    fn contains(&self, location: PortfolioLocation, symbol: &Symbol) -> bool {
+        match location {
+            PortfolioLocation::MarketMaking(chain) => self
+                .market_making
+                .get(&chain)
+                .is_some_and(|slots| slots.equity_symbols.contains(symbol)),
+            PortfolioLocation::Hedging
+            | PortfolioLocation::EthereumWallet
+            | PortfolioLocation::BaseWalletUnwrapped
+            | PortfolioLocation::BaseWalletWrapped => self.hedged.contains(symbol),
+        }
+    }
+}
+
 /// Drops the EMPTY rows of a symbol absent from `[chains.<name>.trading.assets.equities]`; USDC and
 /// held rows pass through.
 ///
@@ -945,7 +1027,7 @@ fn capped_retry_backoff(boundary: Option<DateTime<Utc>>, now: DateTime<Utc>) -> 
 /// unpriceable instead, excluding the day visibly.
 fn drop_empty_unconfigured_equity_rows(
     rows: Vec<PortfolioBalanceRow>,
-    configured_equity_symbols: &HashSet<Symbol>,
+    configured_equities: &ConfiguredEquities<'_>,
 ) -> Result<Vec<PortfolioBalanceRow>, rain_math_float::FloatError> {
     let mut kept = Vec::with_capacity(rows.len());
     let mut dropped_empty: BTreeSet<String> = BTreeSet::new();
@@ -956,7 +1038,7 @@ fn drop_empty_unconfigured_equity_rows(
             kept.push(row);
             continue;
         };
-        if configured_equity_symbols.contains(symbol) {
+        if configured_equities.contains(row.location, symbol) {
             kept.push(row);
             continue;
         }
@@ -1006,15 +1088,18 @@ fn drop_empty_unconfigured_equity_rows(
 /// share == 1 underlying share, silently wrong once a vault's ratio departs
 /// from 1:1 (dividends, splits, NAV accrual).
 ///
-/// The ratio is resolved once per distinct symbol that actually needs
-/// conversion (not once per `configured_equity_symbols`), so a symbol with no
-/// MarketMaking/BaseWalletWrapped row this tick costs no RPC call.
+/// The ratio is resolved once per distinct `(chain, symbol)` that actually
+/// needs conversion (not once per configured symbol), so a symbol with no
+/// MarketMaking/BaseWalletWrapped row this tick costs no RPC call. The
+/// chain is part of the key because each chain's vault accrues independently:
+/// the same symbol's wrapped share is worth a different amount of underlying
+/// on every chain it is wrapped on.
 async fn convert_wrapped_equity_rows(
     mut rows: Vec<PortfolioBalanceRow>,
-    wrapper: Option<&dyn Wrapper>,
-    configured_equity_symbols: &HashSet<Symbol>,
+    wrappers: &BTreeMap<Chain, Arc<dyn Wrapper>>,
+    configured_equities: &ConfiguredEquities<'_>,
 ) -> Result<Vec<PortfolioBalanceRow>, PortfolioSnapshotJobError> {
-    let mut ratios: HashMap<Symbol, UnderlyingPerWrapped> = HashMap::new();
+    let mut ratios: HashMap<(Chain, Symbol), UnderlyingPerWrapped> = HashMap::new();
 
     for row in &mut rows {
         let PortfolioAsset::Equity(symbol) = &row.asset else {
@@ -1023,26 +1108,35 @@ async fn convert_wrapped_equity_rows(
         // No config entry means no wrapper entry, and asking anyway is the
         // `Symbol not configured` failure that used to lose the day. The
         // balance stays in wrapped units, which is safe only because
-        // `resolve_marks` forces it unpriceable.
-        if !configured_equity_symbols.contains(symbol) {
+        // `resolve_marks` forces it unpriceable -- so that call must read
+        // membership exactly the same way this one does.
+        if !configured_equities.contains(row.location, symbol) {
             continue;
         }
-        if !matches!(
-            row.location,
-            PortfolioLocation::MarketMaking(_) | PortfolioLocation::BaseWalletWrapped
-        ) {
-            continue;
-        }
+        // The chain whose vault issued the wrapped share this row holds: a
+        // market-making slot names its own, and the wrapped transit leg is a
+        // Base wallet balance by construction (`PortfolioLocation`). Every
+        // other location is already denominated in underlying units.
+        let chain = match row.location {
+            PortfolioLocation::MarketMaking(chain) => chain,
+            PortfolioLocation::BaseWalletWrapped => Chain::Base,
+            PortfolioLocation::Hedging
+            | PortfolioLocation::EthereumWallet
+            | PortfolioLocation::BaseWalletUnwrapped => continue,
+        };
 
-        let ratio = if let Some(ratio) = ratios.get(symbol) {
+        let ratio = if let Some(ratio) = ratios.get(&(chain, symbol.clone())) {
             *ratio
         } else {
-            let wrapper = wrapper.ok_or_else(|| PortfolioSnapshotJobError::MissingWrapper {
-                symbol: symbol.clone(),
-                location: row.location,
-            })?;
+            let wrapper =
+                wrappers
+                    .get(&chain)
+                    .ok_or_else(|| PortfolioSnapshotJobError::MissingWrapper {
+                        symbol: symbol.clone(),
+                        location: row.location,
+                    })?;
             let ratio = wrapper.get_ratio_for_symbol(symbol).await?;
-            ratios.insert(symbol.clone(), ratio);
+            ratios.insert((chain, symbol.clone()), ratio);
             ratio
         };
 
@@ -1075,7 +1169,7 @@ async fn resolve_marks(
     position_projection: &Projection<Position>,
     captured_at: DateTime<Utc>,
     rows: Vec<PortfolioBalanceRow>,
-    configured_equity_symbols: &HashSet<Symbol>,
+    configured_equities: &ConfiguredEquities<'_>,
 ) -> Result<Vec<PortfolioBalanceRowWithMark>, PortfolioSnapshotJobError> {
     let mut marked_rows = Vec::with_capacity(rows.len());
     let mut equity_marks = HashMap::new();
@@ -1087,8 +1181,12 @@ async fn resolve_marks(
             // rows were left unconverted above -- pricing one with the other
             // values wrapped shares at an underlying price. Forcing None
             // excludes the day deterministically, not once the price goes
-            // stale.
-            PortfolioAsset::Equity(symbol) if !configured_equity_symbols.contains(symbol) => {
+            // stale. Retired is judged per row, so a market-making row whose
+            // own chain dropped the symbol is unpriceable even while the
+            // symbol's other rows keep their mark.
+            PortfolioAsset::Equity(symbol)
+                if !configured_equities.contains(row.location, symbol) =>
+            {
                 (None, None)
             }
             PortfolioAsset::Equity(symbol) => {
@@ -1302,14 +1400,72 @@ mod tests {
         Arc::new(BroadcastingInventory::new(inventory, sender))
     }
 
+    /// The capture must wait for every chain the poller reads, so each
+    /// watched chain's own market-making slots are required -- and only the
+    /// assets that chain declares. Hedging is the exception: one broker book
+    /// backs every chain, so it requires the union.
+    #[tokio::test]
+    async fn required_slots_cover_each_watched_chains_market_making_slots() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let nvda = Symbol::new("NVDA").unwrap();
+        let (mut ctx, _position) = build_ctx(
+            pool,
+            apalis_pool,
+            InventoryView::default(),
+            HashSet::from([aapl()]),
+            true,
+            false,
+            BTreeMap::new(),
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::from([nvda.clone()]),
+                usdc_tracking_enabled: false,
+            },
+        );
+
+        let slots: HashSet<_> = required_slots(&ctx).collect();
+
+        assert_eq!(
+            slots,
+            HashSet::from([
+                (
+                    PortfolioLocation::MarketMaking(Chain::Base),
+                    PortfolioAsset::Equity(aapl())
+                ),
+                (
+                    PortfolioLocation::MarketMaking(Chain::Base),
+                    PortfolioAsset::Usdc
+                ),
+                (
+                    PortfolioLocation::MarketMaking(Chain::Ethereum),
+                    PortfolioAsset::Equity(nvda.clone())
+                ),
+                (PortfolioLocation::Hedging, PortfolioAsset::Equity(aapl())),
+                (PortfolioLocation::Hedging, PortfolioAsset::Equity(nvda)),
+                (PortfolioLocation::Hedging, PortfolioAsset::Usdc),
+            ]),
+            "each watched chain gates on its own market-making slots, and on the broker row \
+             backing them all"
+        );
+    }
+
+    /// The wrapper map a single-chain fixture needs: the primary chain's
+    /// ratio source and nothing else.
+    fn base_wrapper(wrapper: MockWrapper) -> BTreeMap<Chain, Arc<dyn Wrapper>> {
+        BTreeMap::from([(Chain::Base, Arc::new(wrapper) as Arc<dyn Wrapper>)])
+    }
+
     async fn build_ctx(
         pool: SqlitePool,
         apalis_pool: apalis_sqlite::SqlitePool,
         inventory: InventoryView,
-        configured_equity_symbols: HashSet<Symbol>,
+        primary_equity_symbols: HashSet<Symbol>,
         usdc_tracking_enabled: bool,
         wallet_polling_enabled: bool,
-        wrapper: Option<Arc<dyn Wrapper>>,
+        wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     ) -> (PortfolioSnapshotCtx, Arc<Store<Position>>) {
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -1325,12 +1481,18 @@ mod tests {
         let queue = PortfolioSnapshotJobQueue::new(&apalis_pool);
 
         let ctx = PortfolioSnapshotCtx {
-            trading_chain: Chain::Base,
+            market_making: BTreeMap::from([(
+                Chain::Base,
+                MarketMakingSlots {
+                    equity_symbols: primary_equity_symbols.clone(),
+                    usdc_tracking_enabled,
+                },
+            )]),
             inventory: broadcasting(inventory),
             position_projection,
             portfolio_snapshot,
-            wrapper,
-            configured_equity_symbols,
+            wrappers,
+            wallet_transit_equity_symbols: primary_equity_symbols,
             usdc_tracking_enabled,
             wallet_polling_enabled,
             // Always starts empty, mirroring a fresh process boot: callers
@@ -1397,7 +1559,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
 
@@ -1508,7 +1670,7 @@ mod tests {
             HashSet::new(),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -1617,7 +1779,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -1743,7 +1905,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -1794,7 +1956,7 @@ mod tests {
             HashSet::from([aapl()]),
             false,
             true,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -1836,7 +1998,7 @@ mod tests {
             HashSet::from([aapl()]),
             false,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -1867,7 +2029,7 @@ mod tests {
             HashSet::new(),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -1890,7 +2052,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
 
@@ -2358,7 +2520,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -2449,7 +2611,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         // Deliberately no `mark_all_required_fresh`: presence passes (the
@@ -2487,7 +2649,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -2838,7 +3000,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             true,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
 
@@ -2880,7 +3042,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -2940,7 +3102,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -3031,7 +3193,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -3092,6 +3254,197 @@ mod tests {
         );
     }
 
+    /// Only the primary chain's assets table feeds the wallet-transit symbol
+    /// set, but the capture reads every watched chain's market-making
+    /// balances. A symbol traded on a secondary chain alone must still be
+    /// marked: left unmarked, its nonzero row excludes the whole day with
+    /// `MissingMark` and the capital series loses that day entirely.
+    #[tokio::test]
+    async fn a_secondary_only_symbol_is_marked_for_the_portfolio_capture() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let nvda = Symbol::new("NVDA").unwrap();
+        let now = Utc::now();
+
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        )
+        .apply_equity_snapshot(
+            Venue::MarketMaking,
+            Chain::Ethereum,
+            [(&nvda, &FractionalShares::new(float!(4)))],
+            now,
+            None,
+            now,
+        )
+        .unwrap()
+        // The broker book covers every hedged chain's symbols, so a real
+        // offchain poll reports NVDA too -- at zero until the hedge fills.
+        .apply_equity_snapshot(
+            Venue::Hedging,
+            Chain::Base,
+            [
+                (&aapl(), &FractionalShares::new(float!(5))),
+                (&nvda, &FractionalShares::ZERO),
+            ],
+            now,
+            None,
+            now,
+        )
+        .unwrap();
+
+        let (mut ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Ethereum,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::from([nvda.clone()]),
+                usdc_tracking_enabled: false,
+            },
+        );
+        mark_all_required_fresh(&ctx);
+
+        for (symbol, price_usdc) in [(aapl(), float!(150)), (nvda.clone(), float!(25))] {
+            position
+                .send(
+                    &symbol,
+                    PositionCommand::AcknowledgeOnChainFillAt {
+                        symbol: symbol.clone(),
+                        threshold: ExecutionThreshold::whole_share(),
+                        trade_id: TradeId {
+                            chain: Chain::Base,
+                            tx_hash: TxHash::ZERO,
+                            log_index: 0,
+                        },
+                        amount: FractionalShares::new(float!(1)),
+                        direction: Direction::Buy,
+                        price_usdc,
+                        block_timestamp: now,
+                        block_number: None,
+                        seen_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let today = et_day(Utc::now());
+        let days = load_portfolio_days(
+            &pool,
+            EtDayRange {
+                from: Some(today),
+                to: Some(today),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(days.len(), 1);
+        assert_eq!(
+            days[0].capital,
+            // AAPL 15 shares * 150 + USDC 1500 at par + NVDA 4 shares * 25.
+            DayCapital::Included(float!(3850)),
+            "the secondary chain's only symbol must be marked, so the day is computable"
+        );
+    }
+
+    /// Hedging is venue-level: one broker book backs the market making of
+    /// every hedged chain, so a symbol a secondary chain alone trades still
+    /// has a broker position the capture must wait for. Captured without it,
+    /// the day carries that chain's onchain balance with no offsetting broker
+    /// leg -- an incomplete portfolio no later capture can amend.
+    #[tokio::test]
+    async fn a_secondary_only_symbols_missing_hedging_row_defers_capture() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let nvda = Symbol::new("NVDA").unwrap();
+        let now = Utc::now();
+
+        // AAPL and USDC are polled at both venues; NVDA is polled at its own
+        // chain's market making alone, so its Hedging row is still absent.
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        )
+        .apply_equity_snapshot(
+            Venue::MarketMaking,
+            Chain::Ethereum,
+            [(&nvda, &FractionalShares::new(float!(4)))],
+            now,
+            None,
+            now,
+        )
+        .unwrap();
+
+        let (mut ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Ethereum,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::from([nvda]),
+                usdc_tracking_enabled: false,
+            },
+        );
+        mark_all_required_fresh(&ctx);
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let et_day = et_day(Utc::now()).to_string();
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &et_day).await,
+            0,
+            "the secondary chain's only symbol has no broker position polled yet, so the \
+             portfolio is incomplete and capture must wait"
+        );
+    }
+
     /// Onchain MarketMaking equity and BaseWalletWrapped-transit equity are
     /// WRAPPED ERC-4626 vault shares, not underlying shares. With a non-1:1
     /// ratio (1.5, simulating vault NAV accrual from dividends/splits), both
@@ -3136,7 +3489,7 @@ mod tests {
             HashSet::from([aapl()]),
             false,
             true,
-            Some(Arc::new(MockWrapper::with_ratio(ratio_1_5))),
+            base_wrapper(MockWrapper::with_ratio(ratio_1_5)),
         )
         .await;
         mark_all_required_fresh(&ctx);
@@ -3194,6 +3547,189 @@ mod tests {
         );
     }
 
+    /// Each chain's ERC-4626 vault accrues on its own, so the same symbol's
+    /// wrapped-to-underlying ratio differs per chain. A market-making row must
+    /// therefore be valued with the ratio of the chain it sits on -- borrowing
+    /// the primary's ratio misprices every secondary chain's capital.
+    #[tokio::test]
+    async fn a_wrapped_row_converts_with_its_own_chains_ratio() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(
+                aapl(),
+                FractionalShares::new(float!(10)),
+                FractionalShares::new(float!(5)),
+            )
+            .apply_equity_snapshot(
+                Venue::MarketMaking,
+                Chain::Ethereum,
+                [(&aapl(), &FractionalShares::new(float!(4)))],
+                now,
+                None,
+                now,
+            )
+            .unwrap();
+
+        let base_ratio = U256::from(1_500_000_000_000_000_000u64);
+        let ethereum_ratio = U256::from(2_000_000_000_000_000_000u64);
+        let (mut ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            false,
+            false,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::with_ratio(base_ratio)) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Ethereum,
+                    Arc::new(MockWrapper::with_ratio(ethereum_ratio)) as Arc<dyn Wrapper>,
+                ),
+            ]),
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::from([aapl()]),
+                usdc_tracking_enabled: false,
+            },
+        );
+        mark_all_required_fresh(&ctx);
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let et_day = et_day(Utc::now()).to_string();
+
+        async fn available_balance(pool: &SqlitePool, et_day: &str, location: &str) -> String {
+            sqlx::query_scalar(
+                "SELECT available_balance FROM portfolio_snapshot \
+                 WHERE et_day = ? AND asset = 'AAPL' AND location = ?",
+            )
+            .bind(et_day)
+            .bind(location)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        assert_eq!(
+            available_balance(&pool, &et_day, "market_making:base").await,
+            "15",
+            "10 wrapped shares * Base's own 1.5 ratio"
+        );
+        assert_eq!(
+            available_balance(&pool, &et_day, "market_making:ethereum").await,
+            "8",
+            "4 wrapped shares * Ethereum's own 2.0 ratio, not Base's 1.5"
+        );
+    }
+
+    /// A market-making row outlives the `(chain, symbol)` pair that created
+    /// it. Drop AAPL from Ethereum's assets table while Base still lists it,
+    /// and the durable Ethereum row must be judged by its own pair: kept
+    /// (it holds a balance), left in wrapped units, and forced unpriceable so
+    /// the day is excluded visibly. Judged by a flattened symbol set it still
+    /// looks configured, so the capture demands a live ratio for a pair that
+    /// config no longer has.
+    #[tokio::test]
+    async fn a_market_making_row_of_a_removed_pair_is_retired_not_configured() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(
+                aapl(),
+                FractionalShares::new(float!(10)),
+                FractionalShares::new(float!(5)),
+            )
+            .apply_equity_snapshot(
+                Venue::MarketMaking,
+                Chain::Ethereum,
+                [(&aapl(), &FractionalShares::new(float!(4)))],
+                now,
+                None,
+                now,
+            )
+            .unwrap();
+
+        let base_ratio = U256::from(1_500_000_000_000_000_000u64);
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            false,
+            false,
+            base_wrapper(MockWrapper::with_ratio(base_ratio)),
+        )
+        .await;
+        // `ctx.market_making` lists Base alone: Ethereum's AAPL pair is the
+        // one config dropped, while Base's keeps the symbol in play.
+        mark_all_required_fresh(&ctx);
+
+        position
+            .send(
+                &aapl(),
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: aapl(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    block_number: None,
+                    seen_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let et_day = et_day(Utc::now()).to_string();
+
+        async fn row(pool: &SqlitePool, et_day: &str, location: &str) -> (String, Option<String>) {
+            sqlx::query_as(
+                "SELECT available_balance, usd_mark FROM portfolio_snapshot \
+                 WHERE et_day = ? AND asset = 'AAPL' AND location = ?",
+            )
+            .bind(et_day)
+            .bind(location)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        assert_eq!(
+            row(&pool, &et_day, "market_making:ethereum").await,
+            ("4".to_string(), None),
+            "the retired pair's balance stays in wrapped units and unpriced, so the day is \
+             excluded rather than valued at an underlying mark"
+        );
+        assert_eq!(
+            row(&pool, &et_day, "market_making:base").await,
+            ("15".to_string(), Some("150".to_string())),
+            "the pair config still lists is converted with Base's 1.5 ratio and marked"
+        );
+    }
+
     /// Proves `perform_at` checks `freshness_gap` before it ever reads
     /// `ctx.inventory` (the fix for the restart-stale race: reading `rows`
     /// first would let a poll tick land in the gap between the read and the
@@ -3214,7 +3750,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
         // Deliberately no `mark_all_required_fresh`: freshness_gap must fail
@@ -3246,7 +3782,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -3272,7 +3808,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -3300,7 +3836,7 @@ mod tests {
             HashSet::from([aapl()]),
             false,
             true,
-            None,
+            BTreeMap::new(),
         )
         .await;
 
@@ -3439,7 +3975,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         // Deliberately no `mark_all_required_fresh`: presence passes (the
@@ -3500,7 +4036,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         // Deliberately no `mark_all_required_fresh` yet: presence passes but
@@ -3687,7 +4223,7 @@ mod tests {
             HashSet::from([aapl()]),
             true,
             false,
-            Some(Arc::new(MockWrapper::new())),
+            base_wrapper(MockWrapper::new()),
         )
         .await;
         // Deliberately no `mark_all_required_fresh`.

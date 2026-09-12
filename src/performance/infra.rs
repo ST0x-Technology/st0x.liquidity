@@ -6,7 +6,7 @@
 //! time bucket; plus poll-cycle duration/error/skipped-tick aggregates.
 //! Strictly read-only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use alloy::primitives::Address;
 use chrono::{DateTime, Duration, SubsecRound, Utc};
@@ -26,8 +26,10 @@ use crate::telemetry::{Monitor, PollOutcome, sqlite_timestamp};
 /// Load the monitors' ingestion-health telemetry for `range`: one block-lag
 /// series per watched chain (primary first), each scoped to that chain and
 /// its orderbook so a database reused across configs, or two chains sharing
-/// an orderbook address, never mix lag series. Poll health stays scoped to
-/// the primary chain's orderbook.
+/// an orderbook address, never mix lag series. Poll health covers every
+/// watched chain's orderbook: each runs its own fill watcher, so a report
+/// scoped to the primary would read as healthy through a secondary's
+/// outage.
 ///
 /// The current block lag reflects the latest sample regardless of the
 /// range: it answers "how far behind is detection right now", while the
@@ -41,7 +43,7 @@ pub(crate) async fn load_monitor_telemetry(
     for trading_chain in chains.watched() {
         block_lag.push(chain_block_lag(pool, range, trading_chain).await?);
     }
-    let poll_summary = poll_health(pool, range, chains.primary().orderbook).await?;
+    let poll_summary = poll_health(pool, range, chains).await?;
 
     Ok(MonitorTelemetry {
         block_lag,
@@ -152,14 +154,43 @@ async fn block_lag_buckets(
 async fn poll_health(
     pool: &SqlitePool,
     range: &ReportRange,
-    orderbook: Address,
+    chains: &ChainRegistry,
 ) -> Result<PollHealth, PerformanceError> {
-    // Aggregate cycles, errors, and skipped_ticks in SQL to avoid
-    // materializing potentially large row sets into the heap. The error count
-    // uses the canonical PollOutcome discriminator so writer and reader cannot
-    // drift. Duration percentiles still require the individual values, so only
-    // that column is fetched as a separate query.
-    let aggregate: AggregateRow = sqlx::query_as(
+    // Deduplicated because deterministic deployments put the same orderbook
+    // address on several chains, and its samples must be counted once.
+    let orderbooks: BTreeSet<Address> = chains.watched().map(|watched| watched.orderbook).collect();
+
+    let mut cycles = 0_i64;
+    let mut errors = 0_i64;
+    let mut skipped_ticks = 0_i64;
+    let mut durations = Vec::new();
+
+    for orderbook in orderbooks {
+        let aggregate = orderbook_poll_aggregate(pool, range, orderbook).await?;
+        cycles += aggregate.cycles;
+        errors += aggregate.errors.unwrap_or(0);
+        skipped_ticks += aggregate.skipped_ticks_sum.unwrap_or(0);
+        durations.extend(orderbook_poll_durations(pool, range, orderbook).await?);
+    }
+
+    Ok(PollHealth {
+        cycles: count(cycles),
+        errors: count(errors),
+        skipped_ticks: count(skipped_ticks),
+        duration: latency_stats(&mut durations),
+    })
+}
+
+/// One orderbook's cycle, error and skipped-tick counts. Aggregated in SQL to
+/// avoid materializing potentially large row sets into the heap. The error
+/// count uses the canonical [`PollOutcome`] discriminator so writer and reader
+/// cannot drift.
+async fn orderbook_poll_aggregate(
+    pool: &SqlitePool,
+    range: &ReportRange,
+    orderbook: Address,
+) -> Result<AggregateRow, PerformanceError> {
+    Ok(sqlx::query_as(
         "SELECT COUNT(*) AS cycles, \
                 SUM(CASE WHEN outcome = $5 THEN 1 ELSE 0 END) AS errors, \
                 SUM(skipped_ticks) AS skipped_ticks_sum \
@@ -172,9 +203,17 @@ async fn poll_health(
     .bind(orderbook.to_string())
     .bind(PollOutcome::Error.as_str())
     .fetch_one(pool)
-    .await?;
+    .await?)
+}
 
-    let mut durations: Vec<i64> = sqlx::query_scalar(
+/// One orderbook's individual cycle durations: percentiles need the raw
+/// values, so this column alone comes back row by row.
+async fn orderbook_poll_durations(
+    pool: &SqlitePool,
+    range: &ReportRange,
+    orderbook: Address,
+) -> Result<Vec<i64>, PerformanceError> {
+    Ok(sqlx::query_scalar(
         "SELECT duration_ms FROM poll_cycle_samples \
          WHERE sampled_at BETWEEN $1 AND $2 AND monitor = $3 AND orderbook = $4",
     )
@@ -183,14 +222,7 @@ async fn poll_health(
     .bind(Monitor::OrderFill.as_str())
     .bind(orderbook.to_string())
     .fetch_all(pool)
-    .await?;
-
-    Ok(PollHealth {
-        cycles: count(aggregate.cycles),
-        errors: count(aggregate.errors.unwrap_or(0)),
-        skipped_ticks: count(aggregate.skipped_ticks_sum.unwrap_or(0)),
-        duration: latency_stats(&mut durations),
-    })
+    .await?)
 }
 
 /// SQL-aggregated counts for one poll-health query. `cycles` is never null
@@ -663,6 +695,103 @@ mod tests {
         let duration = telemetry.poll.duration.unwrap();
         assert_eq!(duration.sample_count, 2);
         assert_eq!(duration.max_ms, 300);
+    }
+
+    /// A secondary chain runs its own fill watcher against its own
+    /// orderbook, so its poll cycles belong in the report's poll health --
+    /// keyed to the primary alone, an outage there would read as healthy.
+    #[tokio::test]
+    async fn poll_health_aggregates_every_watched_chain() {
+        let ethereum_orderbook = address!("0x3333333333333333333333333333333333333333");
+        let pool = setup_test_db().await;
+        let mut chains = base_only();
+        chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ethereum_orderbook)
+                .call(),
+        );
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            ORDERBOOK,
+            timestamp(10),
+            StdDuration::from_millis(100),
+            0,
+            Ok::<(), &Infallible>(()),
+        )
+        .await
+        .unwrap();
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            ethereum_orderbook,
+            timestamp(20),
+            StdDuration::from_millis(400),
+            3,
+            Err(&"secondary rpc unreachable"),
+        )
+        .await
+        .unwrap();
+
+        let telemetry = load_monitor_telemetry(&pool, &range(), &chains)
+            .await
+            .unwrap();
+
+        assert_eq!(telemetry.poll.cycles, 2);
+        assert_eq!(telemetry.poll.errors, 1);
+        assert_eq!(telemetry.poll.skipped_ticks, 3);
+        assert_eq!(telemetry.poll.duration.unwrap().max_ms, 400);
+    }
+
+    /// Deterministic deployments put the Raindex orderbook at the same address
+    /// on several chains, and poll samples are keyed by orderbook alone. Poll
+    /// health must therefore count each cycle once however many watched chains
+    /// name that address -- iterating chains instead of distinct orderbooks
+    /// would double every figure in the report.
+    #[tokio::test]
+    async fn poll_health_counts_a_shared_orderbooks_cycles_once() {
+        let pool = setup_test_db().await;
+        let mut chains = base_only();
+        chains.insert_secondary(
+            TradingChain::test()
+                .chain(Chain::Ethereum)
+                .orderbook(ORDERBOOK)
+                .call(),
+        );
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            ORDERBOOK,
+            timestamp(10),
+            StdDuration::from_millis(100),
+            0,
+            Ok::<(), &Infallible>(()),
+        )
+        .await
+        .unwrap();
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            ORDERBOOK,
+            timestamp(20),
+            StdDuration::from_millis(400),
+            3,
+            Err(&"rpc unreachable"),
+        )
+        .await
+        .unwrap();
+
+        let telemetry = load_monitor_telemetry(&pool, &range(), &chains)
+            .await
+            .unwrap();
+
+        assert_eq!(telemetry.poll.cycles, 2);
+        assert_eq!(telemetry.poll.errors, 1);
+        assert_eq!(telemetry.poll.skipped_ticks, 3);
+        let duration = telemetry.poll.duration.unwrap();
+        assert_eq!(duration.sample_count, 2);
+        assert_eq!(duration.max_ms, 400);
     }
 
     async fn insert_call(

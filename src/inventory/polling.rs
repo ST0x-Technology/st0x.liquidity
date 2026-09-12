@@ -267,35 +267,185 @@ struct CashDivergenceEscalation {
     consecutive_polls: u32,
 }
 
+/// One watched chain's vault-reading leg: its own Raindex service, its own
+/// chain-qualified vault registry, and the warning state scoped to the vaults
+/// it reads. The poller holds one per watched chain, so a chain's balances are
+/// pinned to a block of its own and stamped with its own chain.
+pub(crate) struct ChainVaultPolling<Rpc>
+where
+    Rpc: Evm,
+{
+    /// Chain the vault reads run on: stamps every onchain snapshot command so
+    /// balances land in that chain's slot.
+    pub(crate) chain: Chain,
+    pub(crate) raindex_service: Arc<RaindexService<Rpc>>,
+    /// This chain's orderbook, the vault registry key. Distinct from
+    /// `InventorySnapshotId::orderbook`, which keys the one snapshot aggregate
+    /// on the primary chain's orderbook whatever chain a reading came from.
+    pub(crate) orderbook: Address,
+    /// On-chain owner of the Raindex vaults (`vaultBalance2` owner key and vault
+    /// registry key). Distinct from `snapshot_id.owner` (the signing wallet used
+    /// for the snapshot aggregate key and tokenization-request ownership): after
+    /// the shared-inventory migration the vaults are owned by the inventory
+    /// contract, not the bot EOA. Sourced from this chain's `vault_owner`.
+    pub(crate) vault_owner: Address,
+    configured_equity_vaults: Option<BTreeMap<Address, BTreeSet<B256>>>,
+    configured_usdc_vaults: Option<BTreeSet<B256>>,
+    /// Warned-about retired vaults, per chain: the same vault id on two chains
+    /// is two vaults, and one chain's warning must not silence the other's.
+    retired_equity_vault_warnings: Mutex<HashSet<(Address, B256)>>,
+    retired_usdc_vault_warnings: Mutex<HashSet<B256>>,
+}
+
+impl<Rpc> ChainVaultPolling<Rpc>
+where
+    Rpc: Evm,
+{
+    pub(crate) fn new(
+        chain: Chain,
+        raindex_service: Arc<RaindexService<Rpc>>,
+        orderbook: Address,
+        vault_owner: Address,
+    ) -> Self {
+        Self {
+            chain,
+            raindex_service,
+            orderbook,
+            vault_owner,
+            configured_equity_vaults: None,
+            configured_usdc_vaults: None,
+            retired_equity_vault_warnings: Mutex::new(HashSet::new()),
+            retired_usdc_vault_warnings: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub(crate) fn with_configured_vaults(
+        mut self,
+        configured_equity_vaults: BTreeMap<Address, BTreeSet<B256>>,
+        configured_usdc_vaults: Option<BTreeSet<B256>>,
+    ) -> Self {
+        self.configured_equity_vaults = Some(configured_equity_vaults);
+        self.configured_usdc_vaults = configured_usdc_vaults;
+        self
+    }
+
+    /// The registry aggregate holding this chain's discovered and seeded
+    /// vaults. Chain-qualified: the same (orderbook, owner) pair is real on
+    /// several chains, so the chain is what keeps two registries apart.
+    fn vault_registry_id(&self) -> VaultRegistryId {
+        VaultRegistryId {
+            chain: self.chain,
+            orderbook: self.orderbook,
+            owner: self.vault_owner,
+        }
+    }
+
+    fn warn_if_retired_equity_vault_has_balance(
+        &self,
+        symbol: &Symbol,
+        token: Address,
+        vault_id: B256,
+        balance: FractionalShares,
+    ) -> Result<(), FloatError> {
+        let Some(configured_equity_vaults) = &self.configured_equity_vaults else {
+            return Ok(());
+        };
+
+        if configured_equity_vaults
+            .get(&token)
+            .is_some_and(|configured_vaults| configured_vaults.contains(&vault_id))
+            || balance.is_zero()?
+        {
+            return Ok(());
+        }
+
+        if self
+            .lock_retired_equity_vault_warnings()
+            .insert((token, vault_id))
+        {
+            warn!(
+                target: "inventory",
+                chain = %self.chain,
+                %symbol,
+                %token,
+                %vault_id,
+                ?balance,
+                "Registered equity vault has a positive balance but is no longer configured"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn lock_retired_equity_vault_warnings(&self) -> MutexGuard<'_, HashSet<(Address, B256)>> {
+        self.retired_equity_vault_warnings
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    target: "inventory",
+                    "Retired equity vault warning tracker was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            })
+    }
+
+    fn warn_if_retired_usdc_vault_has_balance(
+        &self,
+        vault_id: B256,
+        balance: Usdc,
+    ) -> Result<(), FloatError> {
+        let Some(configured_usdc_vaults) = &self.configured_usdc_vaults else {
+            return Ok(());
+        };
+
+        if configured_usdc_vaults.contains(&vault_id) || balance.is_zero()? {
+            return Ok(());
+        }
+
+        if self.lock_retired_usdc_vault_warnings().insert(vault_id) {
+            warn!(
+                target: "inventory",
+                chain = %self.chain,
+                %vault_id,
+                ?balance,
+                "Registered USDC vault has a positive balance but is no longer configured"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn lock_retired_usdc_vault_warnings(&self) -> MutexGuard<'_, HashSet<B256>> {
+        self.retired_usdc_vault_warnings
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    target: "inventory",
+                    "Retired USDC vault warning tracker was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            })
+    }
+}
+
 /// Service that polls actual inventory from onchain vaults and offchain brokers.
 pub(crate) struct InventoryPollingService<Rpc, Exe>
 where
     Rpc: Evm,
 {
-    raindex_service: Arc<RaindexService<Rpc>>,
+    /// One entry per watched chain. Each is polled on its own pinned block, so
+    /// a chain's equity and USDC readings describe one consistent chain state.
+    vault_polling: Vec<ChainVaultPolling<Rpc>>,
     executor: Exe,
     vault_registry: Arc<Store<VaultRegistry>>,
-    /// Chain the vault reads run on: stamps every onchain snapshot command so
-    /// balances land in that chain's slot.
-    trading_chain: Chain,
     snapshot_id: InventorySnapshotId,
-    /// On-chain owner of the Raindex vaults (`vaultBalance2` owner key and vault
-    /// registry key). Distinct from `snapshot_id.owner` (the signing wallet used
-    /// for the snapshot aggregate key and tokenization-request ownership): after
-    /// the shared-inventory migration the vaults are owned by the inventory
-    /// contract, not the bot EOA. Sourced from `Ctx::vault_owner`.
-    vault_owner: Address,
     snapshot: Arc<Store<InventorySnapshot>>,
     wallet_polling: Option<WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     pending_request_ownership: Option<Arc<dyn PendingRequestOwnership>>,
     external_pending_warnings: Mutex<HashSet<TokenizationRequestId>>,
     unconfigured_symbol_warnings: Mutex<HashSet<Symbol>>,
-    retired_equity_vault_warnings: Mutex<HashSet<(Address, B256)>>,
-    retired_usdc_vault_warnings: Mutex<HashSet<B256>>,
     configured_equity_symbols: Option<HashSet<Symbol>>,
-    configured_equity_vaults: Option<BTreeMap<Address, BTreeSet<B256>>>,
-    configured_usdc_vaults: Option<BTreeSet<B256>>,
     reserved_cash: Usd,
     /// Divergence detection wiring; `None` in tests that do not exercise
     /// divergence recovery. Production always wires it in the conductor
@@ -327,35 +477,27 @@ where
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         poll_freshness: PollFreshness,
-        raindex_service: Arc<RaindexService<Rpc>>,
+        vault_polling: Vec<ChainVaultPolling<Rpc>>,
         executor: Exe,
         vault_registry: Arc<Store<VaultRegistry>>,
-        trading_chain: Chain,
         snapshot_id: InventorySnapshotId,
-        vault_owner: Address,
         snapshot: Arc<Store<InventorySnapshot>>,
         wallet_polling: Option<WalletPollingCtx>,
         tokenizer: Option<Arc<dyn Tokenizer>>,
         reserved_cash: Usd,
     ) -> Self {
         Self {
-            raindex_service,
+            vault_polling,
             executor,
-            trading_chain,
             vault_registry,
             snapshot_id,
-            vault_owner,
             snapshot,
             wallet_polling,
             tokenizer,
             pending_request_ownership: None,
             external_pending_warnings: Mutex::new(HashSet::new()),
             unconfigured_symbol_warnings: Mutex::new(HashSet::new()),
-            retired_equity_vault_warnings: Mutex::new(HashSet::new()),
-            retired_usdc_vault_warnings: Mutex::new(HashSet::new()),
             configured_equity_symbols: None,
-            configured_equity_vaults: None,
-            configured_usdc_vaults: None,
             reserved_cash,
             divergence_recovery: None,
             hedge_order_gate_reconciliation: None,
@@ -370,16 +512,6 @@ where
         configured_equity_symbols: HashSet<Symbol>,
     ) -> Self {
         self.configured_equity_symbols = Some(configured_equity_symbols);
-        self
-    }
-
-    pub(crate) fn with_configured_vaults(
-        mut self,
-        configured_equity_vaults: BTreeMap<Address, BTreeSet<B256>>,
-        configured_usdc_vaults: Option<BTreeSet<B256>>,
-    ) -> Self {
-        self.configured_equity_vaults = Some(configured_equity_vaults);
-        self.configured_usdc_vaults = configured_usdc_vaults;
         self
     }
 
@@ -450,56 +582,100 @@ where
         Ok(())
     }
 
+    /// Polls every watched chain's vaults. A chain that fails is logged with
+    /// its chain and the remaining chains still poll, so one chain's RPC
+    /// outage cannot leave the others' inventory unrefreshed; the first
+    /// failure is returned so the caller still sees the tick was incomplete.
     async fn poll_onchain(
         &self,
         snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
-        let vault_registry = self.load_vault_registry().await?;
+        let mut first_error = None;
+
+        for vault_polling in &self.vault_polling {
+            if let Err(error) = self.poll_chain_vaults(snapshot_id, vault_polling).await {
+                warn!(
+                    target: "inventory",
+                    chain = %vault_polling.chain,
+                    ?error,
+                    "Vault polling failed on watched chain"
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn poll_chain_vaults(
+        &self,
+        snapshot_id: &InventorySnapshotId,
+        vault_polling: &ChainVaultPolling<Rpc>,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let vault_registry = self.load_vault_registry(vault_polling).await?;
 
         let Some(registry) = vault_registry else {
-            debug!(target: "inventory", "Vault registry not initialized, skipping onchain polling");
+            debug!(
+                target: "inventory",
+                chain = %vault_polling.chain,
+                "Vault registry not initialized, skipping onchain polling"
+            );
             return Ok(());
         };
 
-        // One pinned block for the whole onchain cycle: every vaultBalance2
-        // read below observes this exact chain state, and the snapshot
-        // events record it so the view's block watermarks can absorb fill
-        // deltas the balances already contain. Capture the wall-clock stamp
-        // before selecting that block because block selection defines the
-        // snapshot's external as-of point.
+        // One pinned block per chain: every vaultBalance2 read below observes
+        // this exact chain state, and the snapshot events record it so the
+        // view's block watermarks can absorb fill deltas the balances already
+        // contain. Capture the wall-clock stamp before selecting that block
+        // because block selection defines the snapshot's external as-of point.
         let (fetched_at, block_number) =
-            timestamp_before(self.raindex_service.latest_block_number()).await;
+            timestamp_before(vault_polling.raindex_service.latest_block_number()).await;
         let block_number = block_number?;
 
-        self.poll_onchain_equity(snapshot_id, &registry, block_number, fetched_at)
-            .await?;
-        self.poll_onchain_usdc(snapshot_id, &registry, block_number, fetched_at)
-            .await?;
+        self.poll_onchain_equity(
+            snapshot_id,
+            vault_polling,
+            &registry,
+            block_number,
+            fetched_at,
+        )
+        .await?;
+        self.poll_onchain_usdc(
+            snapshot_id,
+            vault_polling,
+            &registry,
+            block_number,
+            fetched_at,
+        )
+        .await?;
 
         Ok(())
     }
 
     async fn load_vault_registry(
         &self,
+        vault_polling: &ChainVaultPolling<Rpc>,
     ) -> Result<Option<VaultRegistry>, InventoryPollingError<Exe::Error>> {
-        let vault_registry_id = VaultRegistryId {
-            chain: self.trading_chain,
-            orderbook: self.snapshot_id.orderbook,
-            owner: self.vault_owner,
-        };
-
-        Ok(self.vault_registry.load(&vault_registry_id).await?)
+        Ok(self
+            .vault_registry
+            .load(&vault_polling.vault_registry_id())
+            .await?)
     }
 
     async fn poll_onchain_equity(
         &self,
         snapshot_id: &InventorySnapshotId,
+        vault_polling: &ChainVaultPolling<Rpc>,
         registry: &VaultRegistry,
         block_number: u64,
         fetched_at: DateTime<Utc>,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.equity_vaults.is_empty() {
-            debug!(target: "inventory", "No equity vaults discovered, skipping onchain equity polling");
+            debug!(
+                target: "inventory",
+                chain = %vault_polling.chain,
+                "No equity vaults discovered, skipping onchain equity polling"
+            );
             return Ok(());
         }
 
@@ -517,9 +693,10 @@ where
             })
             .map(|(token, symbol, vaults_for_token)| async move {
                 let vault_futures = vaults_for_token.values().map(|vault| {
-                    self.raindex_service
+                    vault_polling
+                        .raindex_service
                         .get_equity_balance::<OpenChainErrorRegistry>(
-                            self.vault_owner,
+                            vault_polling.vault_owner,
                             vault.token,
                             RaindexVaultId(vault.vault_id),
                             block_number,
@@ -529,7 +706,7 @@ where
                 let vault_balances = try_join_all(vault_futures).await?;
 
                 for (vault, balance) in vaults_for_token.values().zip(vault_balances.iter()) {
-                    self.warn_if_retired_equity_vault_has_balance(
+                    vault_polling.warn_if_retired_equity_vault_has_balance(
                         &symbol,
                         token,
                         vault.vault_id,
@@ -567,7 +744,7 @@ where
             .send(
                 snapshot_id,
                 InventorySnapshotCommand::OnchainEquity {
-                    chain: self.trading_chain,
+                    chain: vault_polling.chain,
                     balances,
                     fetched_at,
                     block_number: Some(block_number),
@@ -579,7 +756,7 @@ where
         // propagates via `?` above) never leaves this slot falsely fresh.
         for symbol in symbols {
             self.poll_freshness.observe(
-                PortfolioLocation::MarketMaking(self.trading_chain),
+                PortfolioLocation::MarketMaking(vault_polling.chain),
                 PortfolioAsset::Equity(symbol),
             );
         }
@@ -590,19 +767,26 @@ where
     async fn poll_onchain_usdc(
         &self,
         snapshot_id: &InventorySnapshotId,
+        vault_polling: &ChainVaultPolling<Rpc>,
         registry: &VaultRegistry,
         block_number: u64,
         fetched_at: DateTime<Utc>,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.usdc_vaults.is_empty() {
-            debug!(target: "inventory", "No USDC vaults discovered, skipping onchain cash polling");
+            debug!(
+                target: "inventory",
+                chain = %vault_polling.chain,
+                "No USDC vaults discovered, skipping onchain cash polling"
+            );
             return Ok(());
         }
 
         let balance_futures = registry.usdc_vaults.values().map(|vault| {
-            self.raindex_service
+            vault_polling
+                .raindex_service
                 .get_usdc_balance::<OpenChainErrorRegistry>(
-                    self.vault_owner,
+                    vault_polling.vault_owner,
+                    vault_polling.chain.usdc(),
                     RaindexVaultId(vault.vault_id),
                     block_number,
                 )
@@ -611,7 +795,7 @@ where
         let vault_balances = try_join_all(balance_futures).await?;
 
         for (vault, balance) in registry.usdc_vaults.values().zip(vault_balances.iter()) {
-            self.warn_if_retired_usdc_vault_has_balance(vault.vault_id, *balance)?;
+            vault_polling.warn_if_retired_usdc_vault_has_balance(vault.vault_id, *balance)?;
         }
 
         let usdc_balance = vault_balances[1..]
@@ -623,7 +807,7 @@ where
             .send(
                 snapshot_id,
                 InventorySnapshotCommand::OnchainUsdc {
-                    chain: self.trading_chain,
+                    chain: vault_polling.chain,
                     usdc_balance,
                     fetched_at,
                     block_number: Some(block_number),
@@ -634,7 +818,7 @@ where
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
         self.poll_freshness.observe(
-            PortfolioLocation::MarketMaking(self.trading_chain),
+            PortfolioLocation::MarketMaking(vault_polling.chain),
             PortfolioAsset::Usdc,
         );
 
@@ -1524,91 +1708,6 @@ where
             })
     }
 
-    fn warn_if_retired_equity_vault_has_balance(
-        &self,
-        symbol: &Symbol,
-        token: Address,
-        vault_id: B256,
-        balance: FractionalShares,
-    ) -> Result<(), FloatError> {
-        let Some(configured_equity_vaults) = &self.configured_equity_vaults else {
-            return Ok(());
-        };
-
-        if configured_equity_vaults
-            .get(&token)
-            .is_some_and(|configured_vaults| configured_vaults.contains(&vault_id))
-            || balance.is_zero()?
-        {
-            return Ok(());
-        }
-
-        if self
-            .lock_retired_equity_vault_warnings()
-            .insert((token, vault_id))
-        {
-            warn!(
-                target: "inventory",
-                %symbol,
-                %token,
-                %vault_id,
-                ?balance,
-                "Registered equity vault has a positive balance but is no longer configured"
-            );
-        }
-
-        Ok(())
-    }
-
-    fn lock_retired_equity_vault_warnings(&self) -> MutexGuard<'_, HashSet<(Address, B256)>> {
-        self.retired_equity_vault_warnings
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!(
-                    target: "inventory",
-                    "Retired equity vault warning tracker was poisoned; recovering state"
-                );
-                poisoned.into_inner()
-            })
-    }
-
-    fn warn_if_retired_usdc_vault_has_balance(
-        &self,
-        vault_id: B256,
-        balance: Usdc,
-    ) -> Result<(), FloatError> {
-        let Some(configured_usdc_vaults) = &self.configured_usdc_vaults else {
-            return Ok(());
-        };
-
-        if configured_usdc_vaults.contains(&vault_id) || balance.is_zero()? {
-            return Ok(());
-        }
-
-        if self.lock_retired_usdc_vault_warnings().insert(vault_id) {
-            warn!(
-                target: "inventory",
-                %vault_id,
-                ?balance,
-                "Registered USDC vault has a positive balance but is no longer configured"
-            );
-        }
-
-        Ok(())
-    }
-
-    fn lock_retired_usdc_vault_warnings(&self) -> MutexGuard<'_, HashSet<B256>> {
-        self.retired_usdc_vault_warnings
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!(
-                    target: "inventory",
-                    "Retired USDC vault warning tracker was poisoned; recovering state"
-                );
-                poisoned.into_inner()
-            })
-    }
-
     fn aggregate_pending_requests(
         requests: impl Iterator<Item = st0x_tokenization::TokenizationRequest>,
     ) -> Result<PendingRequests, FloatError> {
@@ -1863,11 +1962,14 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use alloy::providers::{Provider, ProviderBuilder, RootProvider};
     use alloy::rpc::client::RpcClient;
-    use alloy::rpc::types::TransactionReceipt;
-    use alloy::sol_types::SolValue;
+    use alloy::rpc::json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
+    use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+    use alloy::sol_types::{SolCall, SolValue};
+    use alloy::transports::{TransportError, TransportFut};
     use async_trait::async_trait;
     use chrono::Utc;
     use httpmock::prelude::*;
+    use serde_json::value::RawValue;
     use sqlx::{Row, SqlitePool};
     use st0x_config::ExecutionThreshold;
     use st0x_dto::Statement;
@@ -1883,13 +1985,16 @@ mod tests {
     use st0x_tokenization::issuer_request_id;
     use std::convert::Infallible;
     use std::num::NonZeroU32;
+    use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::sync::{Barrier, Notify, broadcast};
     use tokio::time::timeout;
+    use tower::Service;
     use uuid::Uuid;
 
     use super::*;
     use crate::alerts::CapturingNotifier;
+    use crate::bindings::IRaindexV6;
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::inventory::projection::InventoryProjection;
     use crate::inventory::snapshot::InventorySnapshotEvent;
@@ -2175,15 +2280,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2236,15 +2344,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2304,15 +2415,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2365,15 +2479,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2420,15 +2537,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2483,15 +2603,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2544,15 +2667,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2604,15 +2730,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2645,15 +2774,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2712,15 +2844,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2762,15 +2897,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2814,15 +2952,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2918,15 +3059,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -2975,15 +3119,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3034,15 +3181,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3101,15 +3251,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                vault_owner,
+            )],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: snapshot_owner,
             },
-            vault_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3159,12 +3312,15 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Ethereum,
+                raindex_service,
+                orderbook,
+                owner,
+            )],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Ethereum,
             InventorySnapshotId { orderbook, owner },
-            owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3182,6 +3338,323 @@ mod tests {
             has_onchain_equity,
             "OnchainEquity must be emitted, proving the registry was looked up \
              under the configured chain rather than Base",
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_onchain_stamps_each_chain_entry_with_its_own_block_and_chain() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let symbol = test_symbol("AAPL");
+        let ethereum_orderbook = address!("0x3333333333333333333333333333333333333333");
+
+        for (chain, chain_orderbook) in [
+            (Chain::Base, orderbook),
+            (Chain::Ethereum, ethereum_orderbook),
+        ] {
+            discover_equity_vault(
+                &pool,
+                chain,
+                chain_orderbook,
+                order_owner,
+                TEST_TOKEN,
+                TEST_VAULT_ID,
+                symbol.clone(),
+            )
+            .await;
+        }
+
+        let base_asserter = Asserter::new();
+        base_asserter.push_success(&serde_json::Value::from(100u64));
+        base_asserter.push_success(&vault_balance_hex(float!(7)));
+        let ethereum_asserter = Asserter::new();
+        ethereum_asserter.push_success(&serde_json::Value::from(205u64));
+        ethereum_asserter.push_success(&vault_balance_hex(float!(11)));
+
+        let poll_freshness = PollFreshness::new();
+        let service = InventoryPollingService::new(
+            poll_freshness.clone(),
+            vec![
+                ChainVaultPolling::new(
+                    Chain::Base,
+                    create_test_raindex_service(
+                        ProviderBuilder::new().connect_mocked_client(base_asserter),
+                    ),
+                    orderbook,
+                    order_owner,
+                ),
+                ChainVaultPolling::new(
+                    Chain::Ethereum,
+                    create_test_raindex_service(
+                        ProviderBuilder::new().connect_mocked_client(ethereum_asserter),
+                    ),
+                    ethereum_orderbook,
+                    order_owner,
+                ),
+            ],
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        service.poll_onchain(&snapshot_id).await.unwrap();
+
+        let readings: Vec<_> = load_snapshot_events(&pool, orderbook, order_owner)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                InventorySnapshotEvent::OnchainEquity {
+                    chain,
+                    balances,
+                    block_number,
+                    ..
+                } => Some((chain, block_number, balances.get(&symbol).copied())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            readings,
+            vec![
+                (Chain::Base, Some(100), Some(test_shares(7))),
+                (Chain::Ethereum, Some(205), Some(test_shares(11))),
+            ],
+            "each chain entry must emit its own balance pinned to its own block"
+        );
+        for chain in [Chain::Base, Chain::Ethereum] {
+            assert!(
+                observed(
+                    &poll_freshness,
+                    PortfolioLocation::MarketMaking(chain),
+                    &PortfolioAsset::Equity(symbol.clone())
+                ),
+                "{chain} must be stamped fresh by its own vault poll"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_chain_does_not_stop_the_later_chains_vault_poll() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let symbol = test_symbol("AAPL");
+        let ethereum_orderbook = address!("0x3333333333333333333333333333333333333333");
+
+        for (chain, chain_orderbook) in [
+            (Chain::Base, orderbook),
+            (Chain::Ethereum, ethereum_orderbook),
+        ] {
+            discover_equity_vault(
+                &pool,
+                chain,
+                chain_orderbook,
+                order_owner,
+                TEST_TOKEN,
+                TEST_VAULT_ID,
+                symbol.clone(),
+            )
+            .await;
+        }
+
+        let base_asserter = Asserter::new();
+        base_asserter.push_failure_msg("Base RPC failure");
+        let ethereum_asserter = Asserter::new();
+        ethereum_asserter.push_success(&serde_json::Value::from(205u64));
+        ethereum_asserter.push_success(&vault_balance_hex(float!(11)));
+
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            vec![
+                ChainVaultPolling::new(
+                    Chain::Base,
+                    create_test_raindex_service(
+                        ProviderBuilder::new().connect_mocked_client(base_asserter),
+                    ),
+                    orderbook,
+                    order_owner,
+                ),
+                ChainVaultPolling::new(
+                    Chain::Ethereum,
+                    create_test_raindex_service(
+                        ProviderBuilder::new().connect_mocked_client(ethereum_asserter),
+                    ),
+                    ethereum_orderbook,
+                    order_owner,
+                ),
+            ],
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        let error = service.poll_onchain(&snapshot_id).await.unwrap_err();
+        assert!(
+            matches!(error, InventoryPollingError::Raindex(_)),
+            "the failing chain's error must reach the caller, got {error:?}"
+        );
+
+        let chains: Vec<_> = load_snapshot_events(&pool, orderbook, order_owner)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                InventorySnapshotEvent::OnchainEquity { chain, .. } => Some(chain),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            chains,
+            vec![Chain::Ethereum],
+            "a chain that failed must not stop the remaining chains from polling"
+        );
+    }
+
+    /// Serves one chain's vault poll from a fixed block, recording the token
+    /// key of every `vaultBalance2` read so a test can assert which token
+    /// each chain was queried with.
+    #[derive(Clone)]
+    struct VaultBalanceTokenRecorder {
+        block_number: u64,
+        tokens: Arc<Mutex<Vec<Address>>>,
+    }
+
+    impl Service<RequestPacket> for VaultBalanceTokenRecorder {
+        type Response = ResponsePacket;
+        type Error = TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), TransportError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: RequestPacket) -> Self::Future {
+            let RequestPacket::Single(request) = request else {
+                panic!("VaultBalanceTokenRecorder serves single requests only");
+            };
+
+            let payload = match request.method() {
+                "eth_blockNumber" => serde_json::to_string(&self.block_number).unwrap(),
+                "eth_call" => {
+                    let params: Vec<serde_json::Value> =
+                        serde_json::from_str(request.params().unwrap().get()).unwrap();
+                    let transaction: TransactionRequest =
+                        serde_json::from_value(params[0].clone()).unwrap();
+                    let calldata = transaction.input.input().unwrap();
+                    let vault_balance =
+                        IRaindexV6::vaultBalance2Call::abi_decode(calldata).unwrap();
+                    self.tokens.lock().unwrap().push(vault_balance.token);
+                    serde_json::to_string(ZERO_FLOAT_HEX).unwrap()
+                }
+                method => panic!("VaultBalanceTokenRecorder got an unexpected method {method}"),
+            };
+
+            let response = Response {
+                id: request.id().clone(),
+                payload: ResponsePayload::Success(RawValue::from_string(payload).unwrap()),
+            };
+
+            Box::pin(async move { Ok(ResponsePacket::Single(response)) })
+        }
+    }
+
+    fn recording_raindex_service(
+        block_number: u64,
+        tokens: &Arc<Mutex<Vec<Address>>>,
+    ) -> Arc<RaindexService<ReadOnlyEvm<impl Provider + Clone + 'static>>> {
+        let recorder = VaultBalanceTokenRecorder {
+            block_number,
+            tokens: Arc::clone(tokens),
+        };
+        create_test_raindex_service(
+            ProviderBuilder::new().connect_client(RpcClient::new(recorder, true)),
+        )
+    }
+
+    /// A secondary chain's USDC vault is keyed by that chain's own USDC
+    /// contract. Reading it under Base's address queries a token the vault
+    /// never held, and that answer is a valid zero which the poll would
+    /// persist and stamp fresh.
+    #[tokio::test]
+    async fn each_chains_usdc_vault_is_read_with_that_chains_own_usdc() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let ethereum_orderbook = address!("0x3333333333333333333333333333333333333333");
+
+        for (chain, chain_orderbook) in [
+            (Chain::Base, orderbook),
+            (Chain::Ethereum, ethereum_orderbook),
+        ] {
+            discover_usdc_vault(&pool, chain, chain_orderbook, order_owner, TEST_VAULT_ID).await;
+        }
+
+        let base_tokens = Arc::new(Mutex::new(Vec::new()));
+        let ethereum_tokens = Arc::new(Mutex::new(Vec::new()));
+
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            vec![
+                ChainVaultPolling::new(
+                    Chain::Base,
+                    recording_raindex_service(100, &base_tokens),
+                    orderbook,
+                    order_owner,
+                ),
+                ChainVaultPolling::new(
+                    Chain::Ethereum,
+                    recording_raindex_service(205, &ethereum_tokens),
+                    ethereum_orderbook,
+                    order_owner,
+                ),
+            ],
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        service.poll_onchain(&snapshot_id).await.unwrap();
+
+        assert_eq!(
+            *base_tokens.lock().unwrap(),
+            vec![Chain::Base.usdc()],
+            "the Base vault must be read under Base's canonical USDC"
+        );
+        assert_eq!(
+            *ethereum_tokens.lock().unwrap(),
+            vec![Chain::Ethereum.usdc()],
+            "the Ethereum vault must be read under Ethereum's canonical USDC"
         );
     }
 
@@ -3227,15 +3700,18 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            create_test_raindex_service(provider),
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                create_test_raindex_service(provider),
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3297,15 +3773,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3341,15 +3820,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3408,23 +3890,23 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![
+                ChainVaultPolling::new(Chain::Base, raindex_service, orderbook, order_owner)
+                    .with_configured_vaults(
+                        configured_equity_vaults(TEST_TOKEN, [configured_vault_id]),
+                        None,
+                    ),
+            ],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
             Usd::ZERO,
-        )
-        .with_configured_vaults(
-            configured_equity_vaults(TEST_TOKEN, [configured_vault_id]),
-            None,
         );
 
         let snapshot_id = InventorySnapshotId {
@@ -3470,21 +3952,24 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![
+                ChainVaultPolling::new(Chain::Base, raindex_service, orderbook, order_owner)
+                    .with_configured_vaults(
+                        BTreeMap::new(),
+                        Some(BTreeSet::from([configured_vault_id])),
+                    ),
+            ],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
             Usd::ZERO,
-        )
-        .with_configured_vaults(BTreeMap::new(), Some(BTreeSet::from([configured_vault_id])));
+        );
 
         let snapshot_id = InventorySnapshotId {
             orderbook,
@@ -3521,15 +4006,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3574,12 +4062,15 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                snapshot_id.owner,
+            )],
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             snapshot_id.clone(),
-            snapshot_id.owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3620,12 +4111,15 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                snapshot_id.owner,
+            )],
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             snapshot_id.clone(),
-            snapshot_id.owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3666,15 +4160,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -3730,15 +4227,18 @@ mod tests {
         let poll_freshness = PollFreshness::new();
         let service = InventoryPollingService::new(
             poll_freshness.clone(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -3819,15 +4319,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
@@ -3870,15 +4373,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -3916,15 +4422,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -3960,15 +4469,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -4008,15 +4520,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
@@ -4050,15 +4565,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -4098,15 +4616,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new().with_inventory(inventory),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
@@ -4157,15 +4678,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -4213,15 +4737,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -4271,15 +4798,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -4326,15 +4856,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -4383,15 +4916,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -4458,15 +4994,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -4511,15 +5050,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -4569,15 +5111,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -4627,15 +5172,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -4677,15 +5225,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -4809,15 +5360,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -4864,15 +5418,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -4912,15 +5469,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -4954,15 +5514,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -5016,15 +5579,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -5085,15 +5651,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -5160,15 +5729,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -5227,15 +5799,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             Some(tokenizer),
@@ -5351,15 +5926,18 @@ mod tests {
 
         InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             snapshot,
             None,
             None,
@@ -5511,12 +6089,15 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new().with_inventory(zero_broker_inventory()),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             snapshot_id.clone(),
-            order_owner,
             Arc::clone(&snapshot),
             None,
             None,
@@ -5598,12 +6179,15 @@ mod tests {
         let notifier = Arc::new(CapturingNotifier::default());
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new().with_inventory(zero_broker_inventory()),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             snapshot_id.clone(),
-            order_owner,
             snapshot,
             None,
             None,
@@ -5698,12 +6282,15 @@ mod tests {
             .unwrap();
         let service = InventoryPollingService::new(
             PollFreshness::new(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new().with_inventory(zero_broker_inventory()),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             snapshot_id.clone(),
-            order_owner,
             snapshot_store,
             None,
             None,
@@ -7175,15 +7762,18 @@ mod tests {
         let poll_freshness = PollFreshness::new();
         let service = InventoryPollingService::new(
             poll_freshness.clone(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -7261,15 +7851,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             poll_freshness.clone(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -7310,15 +7903,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             poll_freshness.clone(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,
@@ -7376,15 +7972,18 @@ mod tests {
         let poll_freshness = PollFreshness::new();
         let service = InventoryPollingService::new(
             poll_freshness.clone(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -7431,15 +8030,18 @@ mod tests {
 
         let service = InventoryPollingService::new(
             poll_freshness.clone(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 base: base_wallet,
@@ -7520,15 +8122,18 @@ mod tests {
         let poll_freshness = PollFreshness::new();
         let service = InventoryPollingService::new(
             poll_freshness.clone(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             executor,
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             None,
             None,
@@ -7592,15 +8197,18 @@ mod tests {
         let poll_freshness = PollFreshness::new();
         let service = InventoryPollingService::new(
             poll_freshness.clone(),
-            raindex_service,
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
             MockExecutor::new(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Chain::Base,
             InventorySnapshotId {
                 orderbook,
                 owner: order_owner,
             },
-            order_owner,
             Arc::new(test_store(pool.clone(), ())),
             Some(WalletPollingCtx {
                 ethereum: ethereum_wallet,

@@ -54,8 +54,8 @@ pub(crate) use read::{
     EtDayRange, ReadError, capital_summary, evaluate_portfolio_days, load_portfolio_day_rows,
 };
 pub(crate) use write::{
-    CAPTURE_BUFFER, PortfolioSnapshotCtx, PortfolioSnapshotJob, PortfolioSnapshotJobQueue,
-    bootstrap_portfolio_snapshot,
+    CAPTURE_BUFFER, MarketMakingSlots, PortfolioSnapshotCtx, PortfolioSnapshotJob,
+    PortfolioSnapshotJobQueue, bootstrap_portfolio_snapshot,
 };
 // Only consumed by api.rs's `#[cfg(test)]` DST-boundary /pnl test, which
 // derives the same day a real capture would rather than assuming it;
