@@ -254,6 +254,55 @@ Raindex becomes the inventory, so `vault_owner` must be flipped to the
 `inventory` address in the same change that switches `inventory_mode` to
 `"managed"` and grants the bot `OPERATOR_ROLE`.
 
+##### Public Incident Messaging
+
+Operators explicitly select the Turnkey EOA that sends each public incident
+message. In inventory mode, the selected EOA represents an affected managed
+inventory and the utility proves that it administers and operates that
+inventory. A separate explicit test-wallet mode permits a selected Turnkey EOA
+to send without representing the inventory, so the complete signing and
+broadcast path can be exercised with a throwaway wallet; that wallet must differ
+from the configured inventory wallet. The approval manifest records no
+represented inventory in test-wallet mode. A message is strict UTF-8 encoded as
+the calldata of a zero-value Base transaction to an operator-selected address.
+It must be non-empty and at most 4,096 UTF-8 bytes (`MAX_MESSAGE_BYTES`). A
+reply is a new zero-value transaction to the selected sending EOA with new UTF-8
+calldata. Inbox scans explicitly select that reply-recipient EOA.
+Utility-prepared outbound transactions use EIP-1559 envelopes with empty access
+lists and independently selected nonce, gas, and fee fields; inbox
+classification does not require those envelope fields. An EOA recipient can send
+that reply directly. A contract recipient cannot originate a transaction, so its
+controller must reply from an EOA; the inbox marks that address untrusted unless
+it is the configured counterparty. The zero-value message call can execute a
+recipient contract's fallback, mutate its state, or revert. Contract recipients
+therefore require an explicit command-line opt-in after the operator reviews
+their execution behavior. The inventory contract itself does not sign messages.
+Before signing, the utility binds the selected EOA, its inventory or test-wallet
+mode, the exact transaction, and the estimated maximum Base fee to a short-lived
+operator approval, then verifies the Turnkey-signed envelope before broadcast.
+Before it asks Base to broadcast, it durably records the locally derived
+transaction hash and broadcast intent. A retry resumes confirmation of that hash
+without another broadcast. An indeterminate submission or confirmation requires
+manual inspection before the operator prepares another manifest. Transient
+disagreement between load-balanced RPC backends about the confirmed transaction
+inclusion is retried before reporting failure. The fee estimate includes L2
+execution, L1 data, and Base operator fees. The utility re-estimates the total
+before signing and refuses an estimate above the approved cap; Base does not
+expose a transaction-level cap for fee changes after signing. Turnkey requests
+authenticate with an explicitly identified local Turnkey API user and verify
+that the credential belongs to the operator-approved user. The utility verifies
+that a completed signing activity records approvals from at least two distinct
+Turnkey users before it broadcasts. It persists the pending activity and can
+resume that exact activity after approval even when the manifest has since
+expired; expiry still prevents any new submission. It writes intent state before
+submission and exclusively locks that state across processes until the accepted
+activity ID is durable. If Turnkey may have accepted a request but returns no
+activity ID, the utility preserves that intent, fails closed, and requires
+manual inspection before any retry. Inbox discovery reads confirmed Base
+transactions with bounded concurrent block reads, processes them in block order,
+and preserves untrusted senders as visibly untrusted records. Turnkey policy
+changes and private chat services are outside this messaging protocol.
+
 #### Dividend Freeze
 
 A dividend (or other corporate action) bumps a tokenized equity's wrapper NAV.

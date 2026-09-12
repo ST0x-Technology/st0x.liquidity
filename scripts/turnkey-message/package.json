@@ -1,0 +1,25 @@
+{
+  "name": "@st0x/turnkey-message",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/cli.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "@turnkey/api-key-stamper": "0.6.14",
+    "@turnkey/http": "^6.4.0",
+    "proper-lockfile": "4.1.2",
+    "smol-toml": "^1.8.0",
+    "viem": "^2.56.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.22",
+    "@types/proper-lockfile": "4.1.4",
+    "prettier": "^3.7.4",
+    "typescript": "^5.9.3"
+  }
+}
