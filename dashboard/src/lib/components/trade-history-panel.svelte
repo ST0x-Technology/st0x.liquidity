@@ -102,6 +102,13 @@
   const venueLabel = (venue: TradingVenue): string => venueLabels[venue]
   const venueColor = (venue: TradingVenue): string => venueColors[venue]
 
+  // Regular is the unremarkable default, so only the special sessions
+  // get a marker next to the venue. Legacy rows carry no session.
+  const sessionMarker = (trade: { marketSession?: string | null }): string | null => {
+    const session = trade.marketSession
+    return session && session !== 'Regular' ? session : null
+  }
+
   const venueOptions = TRADING_VENUES.map((venue) => ({ value: venue, label: venueLabel(venue) }))
   const symbolOptions = $derived(allSymbols.current.map((sym) => ({ value: sym, label: sym })))
 
@@ -589,7 +596,9 @@
               </Table.Cell>
               <Table.Cell class="font-mono text-xs font-medium">{trade.symbol}</Table.Cell>
               <Table.Cell class="text-right text-xs font-medium {venueColor(trade.venue)}"
-                >{venueLabel(trade.venue)}</Table.Cell
+                >{venueLabel(trade.venue)}{#if sessionMarker(trade)}
+                  <span class="text-muted-foreground">· {sessionMarker(trade)}</span
+                  >{/if}</Table.Cell
               >
               <Table.Cell class="text-right text-xs font-medium {directionColor(trade.direction)}">
                 {trade.direction}
@@ -649,6 +658,9 @@
           >
         </HoverTooltip>
         <span class="text-xs font-normal {venueColor(trade.venue)}">{venueLabel(trade.venue)}</span>
+        {#if sessionMarker(trade)}
+          <span class="text-xs font-normal text-muted-foreground">· {sessionMarker(trade)}</span>
+        {/if}
       </div>
       <button
         class="text-lg leading-none text-muted-foreground hover:text-foreground"
