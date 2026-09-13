@@ -447,6 +447,15 @@ impl EquityPriceMonitor {
                     },
                 });
             }
+            // Subscriptions are symbol-level on the wire, so a symbol listed
+            // on more than one chain yields a frame per chain. Another
+            // chain's frame is not a bad Base quote, it is simply not for
+            // this dashboard: skip it and leave the Base price standing.
+            // Marking the symbol unavailable here would wipe a good Base
+            // price on every foreign-chain tick.
+            Err(InvalidPrice::Chain) => {
+                debug!(target: "dashboard", symbol = %expected.symbol, chain_id = frame.chain_id, "Ignoring pricing quote for another chain");
+            }
             Err(error) => {
                 warn!(target: "dashboard", symbol = %expected.symbol, %error, "Rejecting pricing quote");
                 self.set_unavailable(&expected.symbol).await;
@@ -878,6 +887,54 @@ mod tests {
         };
         assert_eq!(price_usd.format().unwrap(), "101");
         assert_eq!(expires_at, original_expiry);
+    }
+
+    #[tokio::test]
+    async fn another_chains_frame_leaves_the_base_price_standing() {
+        // Subscriptions are symbol-level, so a symbol published on Base and
+        // on Robinhood Chain yields one frame per chain. The 4663 frame is
+        // not for this dashboard: it must be skipped, not treated as a bad
+        // Base quote that wipes the Base price on every tick.
+        let assets = assets();
+        let store = EquityPriceStore::new(&assets);
+        let (sender, _) = broadcast::channel(4);
+        let monitor = EquityPriceMonitor::new(
+            PricingCtx::new(
+                Url::parse("ws://127.0.0.1:1").unwrap(),
+                "pricing-oracle-test-key".to_string(),
+            )
+            .unwrap(),
+            &assets,
+            store.clone(),
+            sender,
+        );
+        let now = Utc::now();
+
+        monitor
+            .apply_frame(frame(float!(100), float!(0.01), now))
+            .await;
+        assert!(matches!(
+            store.snapshot(now).await[0].status,
+            EquityPriceStatus::Available { .. }
+        ));
+
+        let mut robinhood = frame(float!(99), float!(0.0101), now);
+        robinhood.chain_id = 4_663;
+        monitor.apply_frame(robinhood).await;
+        let EquityPriceStatus::Available { price_usd, .. } = store.snapshot(now).await[0].status
+        else {
+            panic!("a Robinhood Chain frame must not make the Base price unavailable")
+        };
+        assert_eq!(price_usd.format().unwrap(), "100");
+
+        // Every other rejection still marks the symbol unavailable.
+        let mut bebop = frame(float!(100), float!(0.01), now);
+        bebop.venue = Venue::Bebop;
+        monitor.apply_frame(bebop).await;
+        assert!(matches!(
+            store.snapshot(now).await[0].status,
+            EquityPriceStatus::Unavailable
+        ));
     }
 
     #[tokio::test]
