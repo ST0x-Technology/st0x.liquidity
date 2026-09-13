@@ -87,6 +87,7 @@ fn hedging_with_reserve(
                         symbol.clone(),
                         EquityHedgePolicy {
                             extended_hours_counter_trading: OperationMode::Disabled,
+                            overnight_counter_trading: OperationMode::Disabled,
                         },
                     )
                 })

@@ -264,6 +264,7 @@ retired_symbols = []
 
 [assets.equities.RKLB]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.RKLB]
 trading = "disabled"
@@ -276,6 +277,7 @@ tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
 
 [assets.equities.SGOV]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.SGOV]
 trading = "enabled"
@@ -287,6 +289,7 @@ tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 
 [assets.equities.SPYM]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.SPYM]
 trading = "enabled"
@@ -298,6 +301,7 @@ tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
 
 [assets.equities.TSLA]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.TSLA]
 trading = "enabled"
@@ -309,6 +313,7 @@ tokenized_equity_derivative = "0x219a8d384a10bf19b9f24cb5cc53f79dd0e5a03d"
 
 [assets.equities.AMZN]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.AMZN]
 trading = "enabled"
@@ -320,6 +325,7 @@ tokenized_equity_derivative = "0x997bae3ec193a249596d3708c3fab7c501bb8a53"
 
 [assets.equities.NVDA]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.NVDA]
 trading = "enabled"
@@ -331,6 +337,7 @@ tokenized_equity_derivative = "0xfb5b41acdba20a3230f84be995173cfb98b8d6e7"
 
 [assets.equities.MSTR]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.MSTR]
 trading = "enabled"
@@ -342,6 +349,7 @@ tokenized_equity_derivative = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2"
 
 [assets.equities.QSEP]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.QSEP]
 trading = "disabled"
@@ -353,6 +361,7 @@ tokenized_equity_derivative = "0x849e389982209f901b7b9ffca57ae4c9eeb11c0d"
 
 [assets.equities.IAU]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.IAU]
 trading = "enabled"
@@ -364,6 +373,7 @@ tokenized_equity_derivative = "0x1e46d7efef64a833afb1cd49299a7ad5b439f4d8"
 
 [assets.equities.COIN]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.COIN]
 trading = "enabled"
@@ -375,6 +385,7 @@ tokenized_equity_derivative = "0x5cda0e1ca4ce2af96315f7f8963c85399c172204"
 
 [assets.equities.SIVR]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.SIVR]
 trading = "enabled"
@@ -386,6 +397,7 @@ tokenized_equity_derivative = "0xeb7f3e4093c9d68253b6104fbbff561f3ec0442f"
 
 [assets.equities.CRCL]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.CRCL]
 trading = "enabled"
@@ -397,6 +409,7 @@ tokenized_equity_derivative = "0x8afba81dec38de0a18e2df5e1967a7493651eebf"
 
 [assets.equities.PPLT]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.PPLT]
 trading = "enabled"
@@ -408,6 +421,7 @@ tokenized_equity_derivative = "0x82f5baee1076334357a34a19e04f7c282d51ce47"
 
 [assets.equities.BMNR]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.BMNR]
 trading = "enabled"
@@ -419,6 +433,7 @@ tokenized_equity_derivative = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
 
 [assets.equities.QQQM]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.QQQM]
 trading = "enabled"
@@ -430,6 +445,7 @@ tokenized_equity_derivative = "0x823FF7Bbde2869aAe73A6CD53e7f614442836757"
 
 [assets.equities.VWO]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.VWO]
 trading = "enabled"
@@ -441,6 +457,7 @@ tokenized_equity_derivative = "0x23ec6886b49D7ab123E9ee8e474D2fa7AB6Cbc2d"
 
 [assets.equities.ARKK]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.ARKK]
 trading = "enabled"
@@ -452,6 +469,7 @@ tokenized_equity_derivative = "0x9FfF48B4535AF3765Ac9E1b164720EDc01DF8EE7"
 
 [assets.equities.SPCX]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.SPCX]
 trading = "enabled"
@@ -463,6 +481,7 @@ tokenized_equity_derivative = "0x19F89aaEf8a93f38A974beca9776f09aB844887F"
 
 [assets.equities.CEG]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.CEG]
 trading = "enabled"
@@ -474,6 +493,7 @@ tokenized_equity_derivative = "0x3aF952888Cd89DAD3e8AF67cf4b7E740B36829C3"
 
 [assets.equities.DRAM]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.DRAM]
 trading = "enabled"
@@ -485,6 +505,7 @@ tokenized_equity_derivative = "0x1A91Df4a970EBaB1bB4AF32Eb6d10509028eE4b8"
 
 [assets.equities.TSM]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.TSM]
 trading = "enabled"
@@ -496,6 +517,7 @@ tokenized_equity_derivative = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"
 
 [assets.equities.ASML]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.ASML]
 trading = "enabled"
@@ -507,6 +529,7 @@ tokenized_equity_derivative = "0x8200c6d9AB9E02A25D7F2099244C476d99a085ef"
 
 [assets.equities.SKHY]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.SKHY]
 trading = "enabled"
@@ -518,6 +541,7 @@ tokenized_equity_derivative = "0xFcD17aC4c4BF6a72c93018096F3fC09e66573Ff9"
 
 [assets.equities.MU]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.MU]
 trading = "enabled"
@@ -529,6 +553,7 @@ tokenized_equity_derivative = "0x89EcfE9E0728D6b3c5eb0EE7236f8C6F806C7B56"
 
 [assets.equities.AMD]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.AMD]
 trading = "enabled"
@@ -540,6 +565,7 @@ tokenized_equity_derivative = "0x648042Acd8638E12fEfd51C2b25A9f993f21a612"
 
 [assets.equities.AVGO]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.AVGO]
 trading = "enabled"
@@ -551,6 +577,7 @@ tokenized_equity_derivative = "0x70A182f481AEF05836666B6CfDbe84dCBCE8AC19"
 
 [assets.equities.AMAT]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.AMAT]
 trading = "enabled"
@@ -562,6 +589,7 @@ tokenized_equity_derivative = "0x522DC65c89C9Af4f410BAe01bbf53aF75854a9f9"
 
 [assets.equities.LRCX]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.LRCX]
 trading = "enabled"
@@ -573,6 +601,7 @@ tokenized_equity_derivative = "0x328B9aFFa511fE26673edBb4fEa37eDaF908A3bc"
 
 [assets.equities.TTWO]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.TTWO]
 trading = "enabled"
@@ -584,6 +613,7 @@ tokenized_equity_derivative = "0x045Fb493D970f94a54FeaF931033622fC82192e6"
 
 [assets.equities.GOOGL]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.GOOGL]
 trading = "enabled"
@@ -595,6 +625,7 @@ tokenized_equity_derivative = "0x6a2357Df4975C667B171bE53dA6FFe6deBf7030c"
 
 [assets.equities.INTC]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.INTC]
 trading = "enabled"
@@ -606,6 +637,7 @@ tokenized_equity_derivative = "0xf567652fC2d7Db8D5469fD06AEbe8C9c4372d722"
 
 [assets.equities.AAPL]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.AAPL]
 trading = "enabled"
@@ -617,6 +649,7 @@ tokenized_equity_derivative = "0x1020EC8Aa3f709a1f3D8705cdBa89b950451bd88"
 
 [assets.equities.MSFT]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.MSFT]
 trading = "enabled"
@@ -628,6 +661,7 @@ tokenized_equity_derivative = "0x515A3Ac2a6aB590bDFa970caFFFd7fAdC680886E"
 
 [assets.equities.LLY]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.LLY]
 trading = "enabled"
@@ -639,6 +673,7 @@ tokenized_equity_derivative = "0x892CcF5E75f4a7Ee6402971a1587F65BEE4d52bd"
 
 [assets.equities.PTY]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.PTY]
 trading = "enabled"
@@ -650,6 +685,7 @@ tokenized_equity_derivative = "0xb6D779A79E7493ed821a65D52bA419F0F6D5dD0a"
 
 [assets.equities.HOOD]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.HOOD]
 trading = "enabled"
@@ -661,6 +697,7 @@ tokenized_equity_derivative = "0xd50f561322fe3235DBc9Ec8b3aB7693383d8A425"
 
 [assets.equities.ORCL]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.ORCL]
 trading = "enabled"
@@ -672,6 +709,7 @@ tokenized_equity_derivative = "0xCB9571aB96aA47374eF30D8E9ACCC1cD51064726"
 
 [assets.equities.SMCI]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.SMCI]
 trading = "enabled"
@@ -683,6 +721,7 @@ tokenized_equity_derivative = "0xA759FAbbD866e6DB8bF76613C35825dC2e380bf0"
 
 [assets.equities.BABA]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.BABA]
 trading = "enabled"
@@ -694,6 +733,7 @@ tokenized_equity_derivative = "0x7e5cc7eAe0455A07Ab4abf354E0f5657BA2888BD"
 
 [assets.equities.TQQQ]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.TQQQ]
 trading = "enabled"
@@ -705,6 +745,7 @@ tokenized_equity_derivative = "0x295e9eCAb319006900a53b3f8D6Fcb0C131F4ada"
 
 [assets.equities.FTF]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.FTF]
 trading = "enabled"
@@ -716,6 +757,7 @@ tokenized_equity_derivative = "0x9bDe199Ac6E7E050334306D9267c93e3D6d38333"
 
 [assets.equities.CBRS]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.CBRS]
 trading = "enabled"
@@ -727,6 +769,7 @@ tokenized_equity_derivative = "0xB457cfBF31995d3aAAa704dA9999cC0b011820ca"
 
 [assets.equities.MCD]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.MCD]
 trading = "enabled"
@@ -738,6 +781,7 @@ tokenized_equity_derivative = "0x7ecAE30Ed8ee4F72653ada7b0941bDE7a0a8eE8d"
 
 [assets.equities.NKE]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.NKE]
 trading = "enabled"
@@ -749,6 +793,7 @@ tokenized_equity_derivative = "0x0883f32d23Ed5535057a4B5E3eB1970FE08606AF"
 
 [assets.equities.GRND]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.GRND]
 trading = "enabled"
@@ -760,6 +805,7 @@ tokenized_equity_derivative = "0x1197E6FA778c4D13E47875bD1761c68C22c928e0"
 
 [assets.equities.DNUT]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.DNUT]
 trading = "enabled"
@@ -771,6 +817,7 @@ tokenized_equity_derivative = "0x1db49Ff8BEe88ec73F82F395B0BEAd372BdcAdb7"
 
 [assets.equities.FGI]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.FGI]
 trading = "enabled"
@@ -782,6 +829,7 @@ tokenized_equity_derivative = "0x6aed8b1aCfb04F4e0e6db580F12fF41438a394e5"
 
 [assets.equities.PLBY]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.PLBY]
 trading = "enabled"
@@ -793,6 +841,7 @@ tokenized_equity_derivative = "0x35fDe767dBFAa610D12cf99914bCd6CFEda73B7B"
 
 [assets.equities.TR]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.TR]
 trading = "enabled"
@@ -804,6 +853,7 @@ tokenized_equity_derivative = "0x433fd2Fc0964B07E9820e4cd01774eDE59D1F002"
 
 [assets.equities.WEN]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.WEN]
 trading = "enabled"

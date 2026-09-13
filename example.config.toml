@@ -78,6 +78,12 @@ retired_symbols = []
 
 [assets.equities.EXAMPLE]
 extended_hours_counter_trading = "disabled"
+# When enabled, counter-trades for this asset may be placed during the
+# overnight session (20:00-04:00 ET) as limit orders priced from the
+# indicative overnight feed. Independent of extended_hours_counter_trading:
+# overnight has a separate broker entitlement, feed, and risk profile.
+# Requires the [broker] overnight knobs once any asset enables it.
+overnight_counter_trading = "disabled"
 
 
 [chains.base]

@@ -273,6 +273,7 @@ mod tests {
                     symbol.clone(),
                     EquityHedgePolicy {
                         extended_hours_counter_trading,
+                        overnight_counter_trading: OperationMode::Disabled,
                     },
                 )]),
             },
