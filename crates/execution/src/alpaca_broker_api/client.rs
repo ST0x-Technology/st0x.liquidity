@@ -84,6 +84,12 @@ impl AlpacaBrokerApiClient {
         !matches!(self.mode, AlpacaBrokerApiMode::Production)
     }
 
+    /// The clock session classification runs on (ADR 0021): the real clock
+    /// everywhere except `MockAt` mode, whose offset shifts it.
+    pub(super) fn session_clock_now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.mode.session_clock_now()
+    }
+
     /// A Market Data API GET for `path` (e.g. `/v2/stocks/AAPL/trades/latest`)
     /// with the right credentials attached (APCA header pair for Basic,
     /// bearer token for keyless).
