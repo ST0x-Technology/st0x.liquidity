@@ -847,6 +847,7 @@ mod tests {
             placed_at: now,
             market_session: MarketSession::Regular,
             close_flatten: false,
+            reference_price: None,
         };
         assert!(contains_source(
             &references_for(&open_order),
