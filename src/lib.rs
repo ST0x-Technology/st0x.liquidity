@@ -235,12 +235,42 @@ pub async fn run_bot_session_with_injector(
     .await
 }
 
+/// One startup line per hedged equity with its effective
+/// counter-trading modes, so the enabled session surface is readable
+/// from the log without opening the config file. Sorted by symbol for
+/// stable output. Trading is effective when any watched chain lists
+/// the symbol with trading enabled.
+fn log_effective_asset_modes(ctx: &Ctx) {
+    let mut equities: Vec<_> = ctx.assets.equities.symbols.iter().collect();
+    equities.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (symbol, policy) in equities {
+        let trading = if ctx
+            .chains
+            .watched()
+            .any(|chain| chain.assets.is_trading_enabled(symbol))
+        {
+            st0x_config::OperationMode::Enabled
+        } else {
+            st0x_config::OperationMode::Disabled
+        };
+        info!(
+            target: "startup",
+            %symbol,
+            trading = ?trading,
+            extended_hours = ?policy.extended_hours_counter_trading,
+            overnight = ?policy.overnight_counter_trading,
+            "Configured equity counter-trading modes"
+        );
+    }
+}
+
 async fn run_bot_session_inner(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
     startup_notifier: Arc<dyn startup::StartupNotifier>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
+    log_effective_asset_modes(&ctx);
     let pool = ctx.get_sqlite_pool().await?;
     let apalis_pool = conductor::connect_apalis_pool(&ctx.database_url).await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
@@ -805,11 +835,16 @@ async fn run_conductor_session(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{Address, address};
+    use std::collections::HashMap;
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use st0x_config::create_test_ctx_with_order_owner;
+    use st0x_config::{
+        ChainAssets, ChainEquities, ChainEquityAsset, EquityHedgePolicy, HedgedEquities,
+        HedgingAssets, OperationMode, create_test_ctx_with_order_owner,
+    };
+    use st0x_execution::Symbol;
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
 
     use super::*;
@@ -1363,5 +1398,56 @@ mod tests {
             message.contains("Bot task panicked"),
             "expected panic to be reported, got: {message}"
         );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn startup_logs_each_equity_mode_line() {
+        // The issue requires the effective per-asset modes to be visible
+        // in startup logs, so an operator can read the enabled session
+        // surface without opening the config file.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        ctx.chains.primary_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                operational_limit: None,
+                symbols: HashMap::from([(
+                    symbol.clone(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_ids: Vec::new(),
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                )]),
+            },
+            cash: None,
+        };
+        ctx.assets = HedgingAssets {
+            equities: HedgedEquities {
+                retired_symbols: Vec::new(),
+                symbols: HashMap::from([(
+                    symbol,
+                    EquityHedgePolicy {
+                        extended_hours_counter_trading: OperationMode::Disabled,
+                        overnight_counter_trading: OperationMode::Enabled,
+                    },
+                )]),
+            },
+            cash: None,
+        };
+
+        log_effective_asset_modes(&ctx);
+
+        assert!(logs_contain("Configured equity counter-trading modes"));
+        assert!(logs_contain("AAPL"));
+        assert!(logs_contain("trading=Enabled"));
+        assert!(logs_contain("extended_hours=Disabled"));
+        assert!(logs_contain("overnight=Enabled"));
     }
 }
