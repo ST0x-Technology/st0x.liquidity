@@ -2389,6 +2389,7 @@ mod tests {
                     kind: CounterTradeOrderKind::ExtendedHoursLimit {
                         limit_price,
                         close_flatten,
+                        reference_price: None,
                     },
                     placed_at,
                 },
@@ -2434,6 +2435,7 @@ mod tests {
                     kind: CounterTradeOrderKind::OvernightLimit {
                         limit_price,
                         snapshot: eligible_overnight_snapshot(),
+                        reference_price: None,
                     },
                     placed_at,
                 },
@@ -4031,6 +4033,7 @@ mod tests {
             submitted_at: placed_at,
             market_session: MarketSession::Extended,
             close_flatten: false,
+            reference_price: None,
         };
 
         assert!(!live_extended_hours_order_is_stale(
@@ -6179,6 +6182,7 @@ mod tests {
                     kind: CounterTradeOrderKind::ExtendedHoursLimit {
                         limit_price,
                         close_flatten: false,
+                        reference_price: None,
                     },
                 },
             )
