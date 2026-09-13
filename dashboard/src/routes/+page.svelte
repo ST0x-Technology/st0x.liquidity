@@ -6,6 +6,8 @@
   import InventoryPanel from '$lib/components/inventory-panel.svelte'
   import TradeHistoryPanel from '$lib/components/trade-history-panel.svelte'
   import TransferPanel from '$lib/components/transfer-panel.svelte'
+  import PendingOrders from '$lib/components/pending-orders.svelte'
+  import OvernightStatus from '$lib/components/overnight-status.svelte'
   import LogPanel from '$lib/components/log-panel.svelte'
   import OrdersPanel from '$lib/components/orders-panel.svelte'
   import PerformancePanel from '$lib/components/performance-panel.svelte'
@@ -210,9 +212,13 @@
     <main class="hidden min-h-0 flex-1 grid-cols-[11fr_9fr] gap-4 overflow-hidden p-4 md:grid">
       <InventoryPanel />
 
-      <div class="grid min-h-0 grid-rows-2 gap-4">
+      <div class="grid min-h-0 grid-rows-[5fr_4fr_3fr] gap-4">
         <TradeHistoryPanel />
         <TransferPanel />
+        <div class="grid min-h-0 grid-cols-2 gap-4">
+          <PendingOrders />
+          <OvernightStatus />
+        </div>
       </div>
     </main>
   {:else if activeTab.current === 'orders'}

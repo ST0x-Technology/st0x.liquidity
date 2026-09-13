@@ -10,6 +10,8 @@
   import type { TradingVenue } from '$lib/api/TradingVenue'
   import TradeOutcomeView from '$lib/components/trade-outcome.svelte'
   import MultiSelect from '$lib/components/multi-select.svelte'
+  import SessionFilterChips from '$lib/components/session-filter-chips.svelte'
+  import { matchesSessionFilter, type SessionFilter } from '$lib/session-filter'
   import { reactive } from '$lib/frp.svelte'
   import {
     getApiBaseUrl,
@@ -55,6 +57,10 @@
   const hasMore = reactive(false)
   const selectedVenues = reactive<Set<TradingVenue>>(new Set(TRADING_VENUES))
   const selectedSymbols = reactive<Set<string>>(new Set())
+  // Client-side: narrows the loaded rows rather than re-querying (the
+  // backend has no session parameter). Legacy sessionless rows only show
+  // under "All" -- see $lib/session-filter.
+  const selectedSession = reactive<SessionFilter>('all')
   const allSymbols = reactive<string[]>([])
   const since = reactive('')
   const until = reactive('')
@@ -111,6 +117,12 @@
 
   const venueOptions = TRADING_VENUES.map((venue) => ({ value: venue, label: venueLabel(venue) }))
   const symbolOptions = $derived(allSymbols.current.map((sym) => ({ value: sym, label: sym })))
+
+  const visibleEntries = $derived(
+    entries.current.filter((trade) =>
+      matchesSessionFilter(trade.marketSession, selectedSession.current)
+    )
+  )
 
   const buildParams = (
     limit = PAGE_SIZE,
@@ -488,7 +500,8 @@
           {loading.current ? 'Loading...' : 'Refresh'}
         </button>
         <span class="text-sm font-normal text-muted-foreground">
-          {entries.current.length} of {total.current}
+          {#if selectedSession.current !== 'all'}{visibleEntries.length} shown ·
+          {/if}{entries.current.length} of {total.current}
         </span>
       </div>
     </Card.Title>
@@ -509,6 +522,13 @@
           onchange={handleSymbolChange}
         />
       {/if}
+
+      <SessionFilterChips
+        selected={selectedSession.current}
+        onchange={(filter: SessionFilter) => {
+          selectedSession.update(() => filter)
+        }}
+      />
 
       <div class="flex items-center gap-1">
         {#each TIME_PRESETS as preset (preset.label)}
@@ -555,6 +575,10 @@
 
     {#if entries.current.length === 0 && !loading.current && error.current === null}
       <div class="flex h-full items-center justify-center text-muted-foreground">No trades yet</div>
+    {:else if visibleEntries.length === 0 && entries.current.length > 0}
+      <div class="flex h-full items-center justify-center text-muted-foreground">
+        No {selectedSession.current} trades among the loaded rows
+      </div>
     {:else if entries.current.length > 0}
       <Table.Root>
         <Table.Header>
@@ -569,7 +593,7 @@
           </Table.Row>
         </Table.Header>
         <Table.Body>
-          {#each entries.current as trade, idx (trade.id)}
+          {#each visibleEntries as trade, idx (trade.id)}
             <Table.Row class={idx % 2 === 0 ? 'bg-muted/40' : ''}>
               <Table.Cell class="w-8 px-1">
                 <button
