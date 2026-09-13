@@ -28,7 +28,11 @@ use st0x_config::{BrokerCtx, ChainEquities, ChainEquityAsset, OperationMode};
 #[cfg(any(test, feature = "test-support"))]
 use st0x_event_sorcery::{DomainEvent, EventSourced};
 use st0x_evm::Chain;
+#[cfg(test)]
+use st0x_execution::alpaca_broker_api::AssetStatus;
 use st0x_execution::{AlpacaBrokerApiMode, Direction, FractionalShares, Positive, Symbol};
+#[cfg(test)]
+use st0x_execution::{AssetDetails, EligibilitySnapshot};
 
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
 use crate::onchain::OnchainTrade;
@@ -47,6 +51,24 @@ const MAX_CONCURRENT_TEST_ANVILS: usize = 4;
 /// same value under a "matches such-and-such module" comment that nothing
 /// enforces.
 pub const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// A freshly-synced, fully-eligible overnight snapshot: every attribute the
+/// eligibility validator checks is in its permissive state, so tests exercise
+/// the machinery around eligibility rather than the gate itself.
+#[cfg(test)]
+pub(crate) fn eligible_overnight_snapshot() -> EligibilitySnapshot {
+    EligibilitySnapshot {
+        synced_at: Utc::now(),
+        details: AssetDetails {
+            status: AssetStatus::Active,
+            tradable: true,
+            fractionable: Some(true),
+            fractional_eh_enabled: Some(true),
+            overnight_tradable: Some(true),
+            overnight_halted: Some(false),
+        },
+    }
+}
 
 #[cfg(test)]
 static ANVIL_PERMITS: LazyLock<(Mutex<usize>, Condvar)> =
