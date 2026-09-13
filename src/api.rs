@@ -7125,7 +7125,7 @@ mod tests {
                 executor_order_id: ExecutorOrderId::new("seed-accept"),
                 placed_shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
                 submitted_at: chrono::Utc::now(),
-                market_session: st0x_execution::MarketSession::Regular,
+                is_extended_hours: false,
                 limit_price: None,
             },
             crate::offchain::order::noop_order_placer(),
