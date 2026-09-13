@@ -103,6 +103,13 @@ mod tests {
         type OrderId = String;
         type Ctx = NotifyingExecutorCtx;
 
+        async fn fetch_latest_overnight_quote(
+            &self,
+            _symbol: &st0x_execution::Symbol,
+        ) -> Result<st0x_execution::IndicativeQuote, Self::Error> {
+            unimplemented!("not exercised by the maintenance tests")
+        }
+
         async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
             unreachable!("test executor is constructed directly")
         }
@@ -229,6 +236,13 @@ mod tests {
         type Error = AlpacaBrokerApiError;
         type OrderId = String;
         type Ctx = NotifyingAlpacaExecutorCtx;
+
+        async fn fetch_latest_overnight_quote(
+            &self,
+            _symbol: &st0x_execution::Symbol,
+        ) -> Result<st0x_execution::IndicativeQuote, Self::Error> {
+            unimplemented!("not exercised by the maintenance tests")
+        }
 
         async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
             unreachable!("test executor is constructed directly")

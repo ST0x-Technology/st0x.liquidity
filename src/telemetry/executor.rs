@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use st0x_execution::{
-    CancellationOutcome, CounterTradePreflight, Executor, InventoryResult, LatestQuote, LimitOrder,
-    MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement, OrderState, Positive,
-    SupportedExecutor, Symbol, Usd,
+    CancellationOutcome, CounterTradePreflight, Executor, IndicativeQuote, InventoryResult,
+    LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement,
+    OrderState, Positive, SupportedExecutor, Symbol, Usd,
 };
 
 use super::{Dependency, DependencyCallSample, TelemetrySender, scrub_secrets};
@@ -197,6 +197,16 @@ impl<Inner: Executor + Clone> Executor for InstrumentedExecutor<Inner> {
         let started = Instant::now();
         let result = self.inner.fetch_latest_quote(symbol).await;
         self.record("fetch_latest_quote", started, &result);
+        result
+    }
+
+    async fn fetch_latest_overnight_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<IndicativeQuote, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.fetch_latest_overnight_quote(symbol).await;
+        self.record("fetch_latest_overnight_quote", started, &result);
         result
     }
 

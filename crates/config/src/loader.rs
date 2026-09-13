@@ -470,6 +470,10 @@ struct BrokerConfig {
     extended_hours_reprice_timeout_secs: Option<u64>,
     close_flatten_reprice_timeout_secs: Option<u64>,
     extended_hours_close_flatten_window_secs: Option<u64>,
+    /// Maximum age (seconds) of an indicative overnight quote the pricing
+    /// path may price from. Optional until an asset opts into overnight
+    /// counter-trading; that per-asset flag brings the requiredness gate.
+    overnight_max_quote_age_secs: Option<u64>,
     travel_rule: Option<TravelRuleConfig>,
     close_flatten_cross_max_bps: Option<u16>,
 }
@@ -533,6 +537,14 @@ impl TravelRuleConfig {
 }
 
 impl BrokerConfig {
+    /// The overnight quote max age, rejecting an explicit zero (which
+    /// would classify every quote as stale). `None` when unconfigured.
+    fn overnight_max_quote_age(&self) -> Result<Option<NonZeroU64>, CtxError> {
+        self.overnight_max_quote_age_secs
+            .map(|secs| NonZeroU64::new(secs).ok_or(CtxError::OvernightMaxQuoteAgeZero))
+            .transpose()
+    }
+
     fn counter_trade_slippage_bps(&self) -> Result<u16, CtxError> {
         let configured = self
             .counter_trade_slippage_bps
@@ -738,6 +750,10 @@ pub struct Ctx {
     /// is valid only for DryRun with no extended-hours-enabled assets; loaded
     /// Alpaca and extended-hours-enabled DryRun contexts always contain `Some`.
     pub extended_hours_reprice_timeout_secs: Option<NonZeroU64>,
+    /// Maximum age (seconds) of an indicative overnight quote the pricing
+    /// path may price from. `None` until configured; becomes required once
+    /// any asset opts into overnight counter-trading.
+    pub overnight_max_quote_age_secs: Option<NonZeroU64>,
     /// Maximum age (seconds) for a close-flatten limit hedge before it is
     /// cancelled and repriced further along the widening cross ramp.
     pub close_flatten_reprice_timeout_secs: u64,
@@ -1287,6 +1303,10 @@ impl std::fmt::Debug for Ctx {
                 &self.extended_hours_reprice_timeout_secs,
             )
             .field(
+                "overnight_max_quote_age_secs",
+                &self.overnight_max_quote_age_secs,
+            )
+            .field(
                 "close_flatten_reprice_timeout_secs",
                 &self.close_flatten_reprice_timeout_secs,
             )
@@ -1422,6 +1442,7 @@ struct ValidatedParts {
     inventory_divergence_threshold: NonZeroU32,
     hedge_order_gate_reconciliation_timeout_secs: NonZeroU64,
     extended_hours_reprice_timeout_secs: Option<NonZeroU64>,
+    overnight_max_quote_age_secs: Option<NonZeroU64>,
     close_flatten_reprice_timeout_secs: u64,
     extended_hours_close_flatten_window_secs: u64,
     close_flatten_cross_max_bps: u16,
@@ -1863,6 +1884,13 @@ fn parse_and_validate(
         return Err(CtxError::MissingTravelRule);
     }
 
+    let overnight_max_quote_age_secs = config
+        .broker
+        .as_ref()
+        .map(BrokerConfig::overnight_max_quote_age)
+        .transpose()?
+        .flatten();
+
     Ok(ValidatedParts {
         database_url: config.database_url,
         log_level: config.log_level,
@@ -1880,6 +1908,7 @@ fn parse_and_validate(
         hedge_order_gate_reconciliation_timeout_secs: config
             .hedge_order_gate_reconciliation_timeout_secs,
         extended_hours_reprice_timeout_secs,
+        overnight_max_quote_age_secs,
         close_flatten_reprice_timeout_secs,
         extended_hours_close_flatten_window_secs,
         close_flatten_cross_max_bps,
@@ -2048,6 +2077,7 @@ impl Ctx {
             hedge_order_gate_reconciliation_timeout_secs: parts
                 .hedge_order_gate_reconciliation_timeout_secs,
             extended_hours_reprice_timeout_secs: parts.extended_hours_reprice_timeout_secs,
+            overnight_max_quote_age_secs: parts.overnight_max_quote_age_secs,
             close_flatten_reprice_timeout_secs: parts.close_flatten_reprice_timeout_secs,
             extended_hours_close_flatten_window_secs: parts
                 .extended_hours_close_flatten_window_secs,
@@ -2384,6 +2414,7 @@ impl Ctx {
             inventory_divergence_threshold,
             hedge_order_gate_reconciliation_timeout_secs,
             extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
+            overnight_max_quote_age_secs: None,
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
@@ -2555,6 +2586,11 @@ pub enum CtxError {
     )]
     ExtendedHoursRepriceTimeoutOutOfRange { configured: u64, max: u64 },
     #[error(
+        "[broker] overnight_max_quote_age_secs must be nonzero: zero would classify \
+         every overnight quote as stale"
+    )]
+    OvernightMaxQuoteAgeZero,
+    #[error(
         "[broker] close_flatten_reprice_timeout_secs is required when using \
          Alpaca Broker API"
     )]
@@ -2706,6 +2742,7 @@ impl CtxError {
                 "close flatten cross max bps out of range"
             }
             Self::MissingExtendedHoursRepriceTimeout => "missing extended hours reprice timeout",
+            Self::OvernightMaxQuoteAgeZero => "overnight max quote age must be nonzero",
             Self::ExtendedHoursRepriceTimeoutOutOfRange { .. } => {
                 "extended hours reprice timeout out of range"
             }
@@ -2922,6 +2959,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         inventory_divergence_threshold: NonZeroU32::MIN,
         hedge_order_gate_reconciliation_timeout_secs: NonZeroU64::MIN,
         extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
+        overnight_max_quote_age_secs: None,
         close_flatten_reprice_timeout_secs: 60,
         extended_hours_close_flatten_window_secs: 900,
         close_flatten_cross_max_bps: 400,
@@ -4241,6 +4279,63 @@ mod tests {
         assert!(
             message.contains("per-asset") && message.contains("issuance freeze"),
             "the error must name the supported pause controls, got: {message}"
+        );
+    }
+
+    /// `alpaca_config_toml` with an `overnight_max_quote_age_secs` line
+    /// injected into `[broker]`. Body duplication follows the
+    /// `alerts_config_toml` precedent for varying one section per test.
+    fn overnight_quote_age_config_toml(quote_age_line: &str) -> NamedTempFile {
+        // The minimal config already carries a [broker] block; inject the
+        // quote-age line into it rather than appending a duplicate table.
+        toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "counter_trade_slippage_bps = 100",
+                &format!("counter_trade_slippage_bps = 100\n            {quote_age_line}"),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn overnight_max_quote_age_reaches_the_ctx() {
+        let config = overnight_quote_age_config_toml("overnight_max_quote_age_secs = 45");
+        let secrets = alpaca_secrets_toml();
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.overnight_max_quote_age_secs, NonZeroU64::new(45));
+    }
+
+    #[tokio::test]
+    async fn omitted_overnight_max_quote_age_parses_to_none() {
+        // Optional until an asset opts into overnight counter-trading;
+        // the requiredness gate arrives with that per-asset flag.
+        let config = overnight_quote_age_config_toml("");
+        let secrets = alpaca_secrets_toml();
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.overnight_max_quote_age_secs, None);
+    }
+
+    #[tokio::test]
+    async fn zero_overnight_max_quote_age_fails_validation() {
+        // Zero would classify every quote as stale; an explicit zero is
+        // a configuration mistake, never a valid operational value.
+        let config = overnight_quote_age_config_toml("overnight_max_quote_age_secs = 0");
+        let secrets = alpaca_secrets_toml();
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::OvernightMaxQuoteAgeZero),
+            "expected OvernightMaxQuoteAgeZero, got {error:?}"
         );
     }
 
@@ -6988,6 +7083,7 @@ mod tests {
             extended_hours_reprice_timeout_secs: Some(u64::MAX),
             close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(300),
+            overnight_max_quote_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7018,6 +7114,7 @@ mod tests {
             extended_hours_reprice_timeout_secs: Some(0),
             close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(300),
+            overnight_max_quote_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7045,6 +7142,7 @@ mod tests {
             extended_hours_reprice_timeout_secs: Some(MAX_EXTENDED_HOURS_REPRICE_TIMEOUT_SECS),
             close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(300),
+            overnight_max_quote_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7067,6 +7165,7 @@ mod tests {
             extended_hours_reprice_timeout_secs: Some(300),
             close_flatten_reprice_timeout_secs: None,
             extended_hours_close_flatten_window_secs: Some(300),
+            overnight_max_quote_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7097,6 +7196,7 @@ mod tests {
             extended_hours_reprice_timeout_secs: Some(300),
             close_flatten_reprice_timeout_secs: Some(60),
             extended_hours_close_flatten_window_secs: Some(u64::MAX),
+            overnight_max_quote_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -7131,6 +7231,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: Some(
                 MAX_EXTENDED_HOURS_CLOSE_FLATTEN_WINDOW_SECS,
             ),
+            overnight_max_quote_age_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
         };
@@ -9186,6 +9287,7 @@ mod tests {
             kms_key_version: None,
             counter_trade_slippage_bps: Some(100),
             extended_hours_reprice_timeout_secs: None,
+            overnight_max_quote_age_secs: None,
             close_flatten_reprice_timeout_secs: None,
             extended_hours_close_flatten_window_secs: None,
             travel_rule: None,
