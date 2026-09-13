@@ -82,6 +82,13 @@ required_confirmations = 12
 lifecycle = "observe-only"
 required_confirmations = 1
 
+# Robinhood Chain, same shape as HyperEVM.
+[chains.robinhood]
+# A signer exists and nothing moves yet. Raising this to "active" fails
+# startup: no CCTP domain and no gas-valuation feed are wired.
+lifecycle = "observe-only"
+required_confirmations = 1
+
 [wallet]
 kind = "turnkey"
 address = "0x975789F46b5De4624d6a4c3B3679901edF1a5bdA"
