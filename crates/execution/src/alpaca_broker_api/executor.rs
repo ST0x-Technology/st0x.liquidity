@@ -645,7 +645,7 @@ impl AlpacaBrokerApi {
     /// unconditionally and replaces the cached entry, so the scheduled
     /// eligibility sync freshens the same cache placement-side
     /// validation reads instead of serving a pre-window TTL hit.
-    pub(super) async fn refresh_asset_details(
+    pub async fn refresh_asset_details(
         &self,
         symbol: &Symbol,
     ) -> Result<AssetDetails, AlpacaBrokerApiError> {
