@@ -52,8 +52,13 @@ pub async fn check_execution_readiness<E: Executor>(
         return Ok(None);
     };
 
-    let Some(market_session) =
-        check_market_session(executor, symbol, hedging.is_extended_hours_enabled(symbol)).await?
+    let Some(market_session) = check_market_session(
+        executor,
+        symbol,
+        hedging.is_extended_hours_enabled(symbol),
+        hedging.is_overnight_enabled(symbol),
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -78,12 +83,14 @@ fn check_asset_enabled(asset_enabled: bool, symbol: &Symbol) -> bool {
     asset_enabled
 }
 
-/// Returns `Some(session)` when execution is allowed (regular hours, or
-/// extended hours when enabled), or `None` when the position should wait.
+/// Returns `Some(session)` when execution is allowed (regular hours, or an
+/// extended/overnight session the symbol has opted into), or `None` when the
+/// position should wait.
 async fn check_market_session<E: Executor>(
     executor: &E,
     symbol: &Symbol,
     extended_hours_enabled: bool,
+    overnight_enabled: bool,
 ) -> Result<Option<MarketSession>, OnChainError> {
     let session = executor
         .market_session()
@@ -98,15 +105,18 @@ async fn check_market_session<E: Executor>(
             Ok(Some(session))
         }
 
-        // Overnight defers unconditionally until automated overnight
-        // counter-trading ships; the per-asset overnight opt-in will gate
-        // readiness here the same way `extended_hours_enabled` does.
+        MarketSession::Overnight if overnight_enabled => {
+            debug!(target: "hedge", %symbol, "Overnight session, will use overnight limit order");
+            Ok(Some(session))
+        }
+
         MarketSession::Extended | MarketSession::Overnight | MarketSession::Closed => {
             debug!(
                 target: "hedge",
                 %symbol,
                 ?session,
                 extended_hours_enabled,
+                overnight_enabled,
                 "Market not available for trading, deferring execution"
             );
             Ok(None)
@@ -141,12 +151,14 @@ pub(crate) async fn check_all_positions<E: Executor>(
         if let Some((direction, shares)) =
             position.is_ready_for_execution(assets.operational_limit(symbol))?
         {
-            // Extended-hours is hardcoded false here: this helper only backs
-            // the test-only check_and_execute_accumulated_positions path in
-            // conductor.rs. The production CheckPositions sweep goes through
+            // Extended-hours and overnight are hardcoded false here: this
+            // helper only backs the test-only
+            // check_and_execute_accumulated_positions path in conductor.rs.
+            // The production CheckPositions sweep goes through
             // check_execution_readiness (src/position_check.rs) with the
-            // per-asset extended_hours_counter_trading config.
-            let Some(market_session) = check_market_session(executor, symbol, false).await? else {
+            // per-asset extended_hours/overnight counter-trading config.
+            let Some(market_session) = check_market_session(executor, symbol, false, false).await?
+            else {
                 continue;
             };
 
@@ -274,6 +286,28 @@ mod tests {
                     EquityHedgePolicy {
                         extended_hours_counter_trading,
                         overnight_counter_trading: OperationMode::Disabled,
+                    },
+                )]),
+            },
+            cash: None,
+        }
+    }
+
+    fn hedged_with_overnight(symbol: &Symbol, enabled: bool) -> HedgingAssets {
+        let overnight_counter_trading = if enabled {
+            OperationMode::Enabled
+        } else {
+            OperationMode::Disabled
+        };
+
+        HedgingAssets {
+            equities: HedgedEquities {
+                retired_symbols: Vec::new(),
+                symbols: HashMap::from([(
+                    symbol.clone(),
+                    EquityHedgePolicy {
+                        extended_hours_counter_trading: OperationMode::Disabled,
+                        overnight_counter_trading,
                     },
                 )]),
             },
@@ -459,7 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_execution_readiness_returns_none_in_overnight_session() {
+    async fn check_execution_readiness_returns_none_in_overnight_session_when_symbol_disabled() {
         let pool = setup_test_db().await;
         let (store, query) = create_test_position_infra(&pool).await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -481,9 +515,8 @@ mod tests {
             SupportedExecutor::DryRun,
             &listed(&symbol),
             // Extended hours genuinely enabled for the symbol, so this pins
-            // the UNCONDITIONAL overnight deferral: a future
-            // `Overnight if overnight_enabled` readiness guard must not
-            // inherit the extended-hours flag.
+            // that the overnight readiness guard reads the OVERNIGHT opt-in
+            // and never inherits the extended-hours flag.
             &hedged_with_extended_hours(&symbol, true),
             true,
         )
@@ -492,8 +525,77 @@ mod tests {
 
         assert!(
             result.is_none(),
-            "Overnight must defer until automated overnight counter-trading ships, \
+            "Overnight must defer for a symbol without the overnight opt-in, \
              even with the position above threshold and extended hours enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_execution_readiness_returns_overnight_session_when_symbol_enabled() {
+        let pool = setup_test_db().await;
+        let (store, query) = create_test_position_infra(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        initialize_position_with_fill(
+            &store,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let executor = MockExecutor::new().with_market_session(MarketSession::Overnight);
+
+        let params = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &listed(&symbol),
+            // Extended hours deliberately disabled: the overnight guard must
+            // stand on the overnight opt-in alone.
+            &hedged_with_overnight(&symbol, true),
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("overnight-enabled symbol should be ready during the Overnight session");
+
+        assert_eq!(params.symbol, symbol);
+        assert_eq!(params.market_session, MarketSession::Overnight);
+    }
+
+    #[tokio::test]
+    async fn check_execution_readiness_returns_none_in_extended_session_with_only_overnight() {
+        let pool = setup_test_db().await;
+        let (store, query) = create_test_position_infra(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        initialize_position_with_fill(
+            &store,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let executor = MockExecutor::new().with_market_session(MarketSession::Extended);
+
+        let result = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &listed(&symbol),
+            &hedged_with_overnight(&symbol, true),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "The overnight opt-in must not leak into the Extended session gate"
         );
     }
 
