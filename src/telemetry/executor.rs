@@ -220,6 +220,18 @@ impl<Inner: Executor + Clone> Executor for InstrumentedExecutor<Inner> {
         result
     }
 
+    async fn place_overnight_order(
+        &self,
+        order: LimitOrder,
+        snapshot: Option<&st0x_execution::EligibilitySnapshot>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.place_overnight_order(order, snapshot, now).await;
+        self.record("place_overnight_order", started, &result);
+        result
+    }
+
     async fn cancel_order(
         &self,
         order_id: &Self::OrderId,
