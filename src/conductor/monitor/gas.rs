@@ -119,14 +119,20 @@ pub(crate) struct GasMonitor {
 }
 
 impl GasMonitor {
+    /// The native gas token symbol for this monitor's chain, used in logs and
+    /// the low-balance alert message.
+    fn native_token(&self) -> &'static str {
+        match self.chain {
+            Chain::Base | Chain::Ethereum | Chain::Robinhood => "ETH",
+            Chain::HyperEvm => "HYPE",
+        }
+    }
+
     /// Evaluates one poll: reads the balance, advances the dedup state, and
     /// fires logs/notifications for the resulting outcome. Returns the next
     /// state. A read failure is logged and leaves the state unchanged.
     async fn poll_once(&self, state: AlertState, now: Instant) -> AlertState {
-        let native_token = match self.chain {
-            Chain::Base | Chain::Ethereum | Chain::Robinhood => "ETH",
-            Chain::HyperEvm => "HYPE",
-        };
+        let native_token = self.native_token();
 
         let balance = match self.balance_reader.native_balance(self.wallet).await {
             Ok(balance) => balance,
@@ -159,10 +165,7 @@ impl GasMonitor {
     /// Emits the log line and notification appropriate for `outcome`. Quiet
     /// outcomes (`StillHealthy`, `StillLowSuppressed`) produce no output.
     async fn act_on_outcome(&self, outcome: PollOutcome, balance: U256) {
-        let native_token = match self.chain {
-            Chain::Base | Chain::Ethereum | Chain::Robinhood => "ETH",
-            Chain::HyperEvm => "HYPE",
-        };
+        let native_token = self.native_token();
 
         match outcome {
             PollOutcome::StillHealthy | PollOutcome::StillLowSuppressed => {}
@@ -224,10 +227,7 @@ impl GasMonitor {
 
 impl SupervisedTask for GasMonitor {
     async fn run(&mut self) -> TaskResult {
-        let native_token = match self.chain {
-            Chain::Base | Chain::Ethereum | Chain::Robinhood => "ETH",
-            Chain::HyperEvm => "HYPE",
-        };
+        let native_token = self.native_token();
 
         info!(
             target: "gas",
