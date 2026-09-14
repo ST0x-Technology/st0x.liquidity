@@ -253,16 +253,18 @@ operational_limit = 50000
 # - vault_ids: Raindex vault ID(s) - single string or array of strings.
 #   (alias: vault_id for backward compat. Required when rebalancing is enabled.)
 
-# Schema-at-HEAD note (2026-09-07): `retired_symbols` is REQUIRED by the
-# config schema on master but unknown to v1.10.0, the build production
-# runs. This file therefore parses at HEAD (loader tests, config-drift)
-# but is refused by the release-time validator until a build that knows
-# the field is tagged: the first liquidity production release after the
-# hand-over must be a version tag, not a config-only release, and
-# config-check stays red on this file until that tag exists. Empty on
-# purpose: QSEP is still CONFIGURED below (as production runs it), and the
-# schema refuses a symbol that is both configured and retired; retire it
-# by deleting its tables and listing it here in one change.
+# Schema-at-HEAD note (2026-09-07, updated 2026-09-14): this file tracks
+# the schema on master, and the parser in every released binary is
+# strict, so a config-only release is valid ONLY when the deployed image
+# knows every field in this file. Check the newest schema-at-HEAD field
+# before assuming it does: `retired_symbols` needs >= v1.11.0, and
+# `settlement_retry_deadline_secs` (#1272) is in NO tag through v1.12.0,
+# so as of 2026-09-14 deploying this file requires a fresh version tag
+# rolled image + config together (see the 2026-09-04 crash-loop note at
+# [rebalancing]). `retired_symbols` is empty on purpose: QSEP is still
+# CONFIGURED below (as production runs it), and the schema refuses a
+# symbol that is both configured and retired; retire it by deleting its
+# tables and listing it here in one change.
 [assets.equities]
 retired_symbols = []
 
