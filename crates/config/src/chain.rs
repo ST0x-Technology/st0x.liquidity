@@ -534,6 +534,14 @@ pub enum ChainRegistryError {
     #[error("{chain} is supported only as a hedged secondary, not as the primary chain")]
     UnsupportedPrimaryChain { chain: Chain },
     #[error(
+        "[chains.{chain}] is the primary chain but has lifecycle = \"{lifecycle}\"; \
+         the primary must be active because its rebalancing services are always constructed"
+    )]
+    PrimaryChainMustBeActive {
+        chain: Chain,
+        lifecycle: ChainLifecycle,
+    },
+    #[error(
         "[chains.{chain}] is configured but the secrets file has no [chains.{chain}] \
          entry supplying its rpc_url"
     )]
@@ -626,6 +634,13 @@ fn enabled_chains(
     if primary_chain == Chain::HyperEvm {
         return Err(ChainRegistryError::UnsupportedPrimaryChain {
             chain: primary_chain,
+        });
+    }
+
+    if chain_config.lifecycle != ChainLifecycle::Active {
+        return Err(ChainRegistryError::PrimaryChainMustBeActive {
+            chain: primary_chain,
+            lifecycle: chain_config.lifecycle,
         });
     }
 
@@ -1440,6 +1455,25 @@ mod tests {
             ),
             "got: {error}"
         );
+    }
+
+    #[test]
+    fn registry_rejects_a_non_active_primary_chain() {
+        for lifecycle in [ChainLifecycle::ObserveOnly, ChainLifecycle::Prefunded] {
+            let mut config = chain_config(Some(trading_config_toml()));
+            config.lifecycle = lifecycle;
+            let configs = BTreeMap::from([(Chain::Base, config)]);
+
+            let error = ChainRegistry::new(&configs, secrets_for(&[Chain::Base])).unwrap_err();
+
+            assert!(matches!(
+                error,
+                ChainRegistryError::PrimaryChainMustBeActive {
+                    chain: Chain::Base,
+                    lifecycle: actual_lifecycle,
+                } if actual_lifecycle == lifecycle
+            ));
+        }
     }
 
     #[test]
