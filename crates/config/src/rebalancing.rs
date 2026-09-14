@@ -102,6 +102,7 @@ pub struct RebalancingConfig {
     /// withdrawal that never settles (deep reorg, wrong tx hash from Alpaca,
     /// funds that never arrive) cannot keep the single-rebalance guard
     /// latched forever with no operator signal.
+    #[serde(default = "default_settlement_retry_deadline_secs")]
     pub settlement_retry_deadline_secs: u64,
     /// Maximum number of burn-revert redrive attempts for a single Base->Alpaca
     /// USDC transfer job before the circuit-breaker opens and the operator is
@@ -140,6 +141,10 @@ pub struct RebalancingConfig {
 
 fn default_inventory_staleness_bound_secs() -> u64 {
     300
+}
+
+fn default_settlement_retry_deadline_secs() -> u64 {
+    24 * 60 * 60
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -620,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_settlement_retry_deadline_secs_fails() {
+    fn deserialize_missing_settlement_retry_deadline_secs_defaults() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
@@ -638,11 +643,8 @@ mod tests {
             deviation = "0.3"
         "#;
 
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("settlement_retry_deadline_secs"),
-            "Expected missing settlement_retry_deadline_secs error, got: {error}"
-        );
+        let config = toml::from_str::<RebalancingConfig>(toml_str).unwrap();
+        assert_eq!(config.settlement_retry_deadline_secs, 86_400);
     }
 
     #[test]

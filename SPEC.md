@@ -4063,23 +4063,24 @@ Alpaca to Base:
    - **Settlement retry deadline:** the retryable settlement wait
      (under-confirmed tx, or zero wallet balance after a confirmed withdrawal)
      is bounded. The deadline is `confirmed_at` (the durable
-     `WithdrawalComplete` timestamp) plus the required
-     `[rebalancing] settlement_retry_deadline_secs` config value. The bound also
-     covers persistent settlement-check RPC failures (for example a malformed tx
-     hash from Alpaca), not only clean not-settled answers. At or after the
-     deadline, the redrive emits `FailBridging` instead of re-enqueueing, and
-     the worker pages the operator with `SettlementRetryDeadlineElapsed`. The
-     aggregate becomes a pre-burn `BridgingFailed` that KEEPS the
-     single-rebalance guard held: the withdrawn funds are off Alpaca and may
-     still land on-chain late, so a fresh transfer must not start and
-     mis-attribute them. The operator verifies where the funds sit (Alpaca
-     balance vs the market-maker wallet) and settles them with
-     `transfer reconcile --kind usdc`, which releases the guard. An AlpacaToBase
-     `BridgingFailed` is reconcile-eligible even without burn evidence:
-     `FailBridging` is only reachable after the withdrawal completed, so the
-     funds are provably off Alpaca. Without this deadline, a withdrawal that
-     never settles on-chain redrives every 30 seconds forever, with the guard
-     latched and no operator signal.
+     `WithdrawalComplete` timestamp) plus the
+     `[rebalancing] settlement_retry_deadline_secs` config value. The value
+     defaults to 24 hours when absent so binaries remain compatible with configs
+     from before this setting existed. The bound also covers persistent
+     settlement-check RPC failures (for example a malformed tx hash from
+     Alpaca), not only clean not-settled answers. At or after the deadline, the
+     redrive emits `FailBridging` instead of re-enqueueing, and the worker pages
+     the operator with `SettlementRetryDeadlineElapsed`. The aggregate becomes a
+     pre-burn `BridgingFailed` that KEEPS the single-rebalance guard held: the
+     withdrawn funds are off Alpaca and may still land on-chain late, so a fresh
+     transfer must not start and mis-attribute them. The operator verifies where
+     the funds sit (Alpaca balance vs the market-maker wallet) and settles them
+     with `transfer reconcile --kind usdc`, which releases the guard. An
+     AlpacaToBase `BridgingFailed` is reconcile-eligible even without burn
+     evidence: `FailBridging` is only reachable after the withdrawal completed,
+     so the funds are provably off Alpaca. Without this deadline, a withdrawal
+     that never settles on-chain redrives every 30 seconds forever, with the
+     guard latched and no operator signal.
    - **Balance read:** after confirmation, read the market-maker Ethereum wallet
      USDC balance. Three cases:
      - **balance == 0**: delayed redrive (withdrawal not yet reflected;
