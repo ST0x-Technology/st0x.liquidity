@@ -2626,6 +2626,21 @@ async fn process_transaction(
         )
     })?;
 
+    // process-tx places a live broker hedge, so require FULL startup readiness,
+    // not just the published handle: the handle is set when the conductor's own
+    // setup completes, but the supervised monitors that reconcile the placed
+    // order (e.g. the poll-status monitor) acknowledge the startup barrier only
+    // afterwards. `health.is_ready()` gates on that barrier, so an operator
+    // cannot trigger a placement into a half-started pipeline.
+    if !state.health.is_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "process-tx is unavailable until startup completes".to_owned(),
+            }),
+        ));
+    }
+
     let handle = state.process_tx.get().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7350,13 +7365,13 @@ mod tests {
         );
     }
 
-    /// Recovery must remain unavailable until the conductor publishes its handle.
+    /// A live-hedge placement must wait for full startup readiness, not just the
+    /// published handle: `health.is_ready()` gates the whole supervised pipeline.
     #[tokio::test]
-    async fn process_transaction_reports_unavailable_before_startup() {
+    async fn process_transaction_reports_unavailable_until_health_ready() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
-        // A valid hash clears the parse guard and reaches the process_tx cell,
-        // which empty_app_state leaves unset, so the handler must report 503
-        // before it ever builds an RPC provider.
+        // A valid hash clears the parse guard and reaches the health gate, which
+        // empty_app_state leaves un-ready.
         let tx_hash = TxHash::repeat_byte(0x11).to_string();
 
         let (status, Json(body)) = process_transaction(State(state), Path(tx_hash))
@@ -7365,7 +7380,28 @@ mod tests {
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            body.error.contains("process-tx is unavailable"),
+            body.error.contains("until startup completes"),
+            "got: {}",
+            body.error
+        );
+    }
+
+    /// Once healthy, the handle must still be published before process-tx runs;
+    /// `empty_app_state` leaves the cell unset, so the handler reports 503 at the
+    /// handle gate before it ever builds an RPC provider.
+    #[tokio::test]
+    async fn process_transaction_reports_unavailable_before_the_handle_is_published() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+        let tx_hash = TxHash::repeat_byte(0x11).to_string();
+
+        let (status, Json(body)) = process_transaction(State(state), Path(tx_hash))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.error.contains("until the conductor finishes startup"),
             "got: {}",
             body.error
         );
