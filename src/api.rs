@@ -2179,8 +2179,14 @@ fn ops_command_error<Entity: EventSourced>(
 /// Reconciles a USDC rebalance stranded in a post-burn terminal failure to the
 /// clearing `Reconciled` terminal, releasing the in-progress guard. The residue
 /// was handled out-of-band, so this only loads the aggregate and sends the
-/// command; no broker, bridge, or provider is touched. Safe against the live
-/// bot: a post-burn terminal failure has no active job driving the aggregate.
+/// command; no broker, bridge, or provider is touched. A post-burn terminal
+/// failure has no active job driving the aggregate, so it is safe against the
+/// live bot.
+///
+/// Sends through the conductor-built wired store (from [`RecoveryHandle`]), so
+/// the `OperatorReconciled` event reaches the live reactor, which clears the
+/// in-memory guard and zeroes the source-venue inflight. Returns 503 until the
+/// conductor publishes the handle.
 ///
 /// Mirrors `stox transfer reconcile --kind usdc`; the precondition matches the
 /// aggregate command's accepted set so the operator gets a clear `400` before
@@ -2193,12 +2199,31 @@ async fn reconcile_usdc_transfer(
     let id = parse_usdc_rebalance_id(&id)?;
     let reason = ReconcileReason::from(request.reason);
 
-    let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
-        .build(())
-        .await
-        .map_err(ops_store_error)?;
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
 
-    let Some(rebalance) = store.load(&id).await.map_err(ops_store_error)? else {
+    reconcile_stuck_usdc_transfer(&handle.usdc_store, &id, reason).await
+}
+
+/// The store-level half of [`reconcile_usdc_transfer`]: gates on
+/// [`UsdcRebalance::is_reconcilable_failure`] and sends `ReconcileStuckRebalance`.
+///
+/// `store` is the conductor-built wired store, so the `OperatorReconciled` event
+/// reaches the live reactor and reconciles the in-memory guard and inventory. A
+/// standalone store would persist the event but leave the running bot guarded
+/// until the next sweep or restart.
+async fn reconcile_stuck_usdc_transfer(
+    store: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    reason: ReconcileReason,
+) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(rebalance) = store.load(id).await.map_err(ops_store_error)? else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -2223,10 +2248,7 @@ async fn reconcile_usdc_transfer(
     }
 
     store
-        .send(
-            &id,
-            UsdcRebalanceCommand::ReconcileStuckRebalance { reason },
-        )
+        .send(id, UsdcRebalanceCommand::ReconcileStuckRebalance { reason })
         .await
         .map_err(ops_command_error)?;
 
@@ -7017,17 +7039,15 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_usdc_transfer_reconciles_a_post_burn_failure() {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
+        let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
-        seed_usdc_bridging_failed(&state.pool, &id).await;
+        seed_usdc_bridging_failed(&pool, &id).await;
+        let store = standalone_usdc_store(&pool).await;
 
-        let resp = reconcile_usdc_transfer(
-            State(state.clone()),
-            Path(id.to_string()),
-            Json(ReconcileUsdcRequest {
-                reason: ReconcileReasonWire::FundsMovedManually,
-            }),
+        let resp = reconcile_stuck_usdc_transfer(
+            &store,
+            &id,
+            ReconcileReason::from(ReconcileReasonWire::FundsMovedManually),
         )
         .await;
 
@@ -7040,7 +7060,7 @@ mod tests {
         );
         assert!(
             matches!(
-                load_usdc_rebalance(&state.pool, &id).await,
+                load_usdc_rebalance(&pool, &id).await,
                 UsdcRebalance::Reconciled { .. }
             ),
             "the rebalance must land in the Reconciled terminal",
@@ -7049,21 +7069,18 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_usdc_transfer_rejects_a_pre_burn_in_flight_state() {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
+        let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
-        seed_usdc_bridging_submitting(&state.pool, &id, false).await;
+        seed_usdc_bridging_submitting(&pool, &id, false).await;
+        let store = standalone_usdc_store(&pool).await;
 
-        let resp = reconcile_usdc_transfer(
-            State(state.clone()),
-            Path(id.to_string()),
-            Json(ReconcileUsdcRequest {
-                reason: ReconcileReasonWire::FundsMovedManually,
-            }),
+        let Err((status, _)) = reconcile_stuck_usdc_transfer(
+            &store,
+            &id,
+            ReconcileReason::from(ReconcileReasonWire::FundsMovedManually),
         )
-        .await;
-
-        let Err((status, _)) = resp else {
+        .await
+        else {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -7071,23 +7088,50 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_usdc_transfer_404_for_unseeded_id() {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
+        let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let store = standalone_usdc_store(&pool).await;
 
-        let resp = reconcile_usdc_transfer(
-            State(state.clone()),
-            Path(id.to_string()),
-            Json(ReconcileUsdcRequest {
-                reason: ReconcileReasonWire::FundsMovedManually,
-            }),
+        let Err((status, _)) = reconcile_stuck_usdc_transfer(
+            &store,
+            &id,
+            ReconcileReason::from(ReconcileReasonWire::FundsMovedManually),
         )
-        .await;
-
-        let Err((status, _)) = resp else {
+        .await
+        else {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// In-process proof that reconciling through the conductor-built wired store
+    /// reaches the live reactor: a latched running bot must have its in-memory
+    /// guard cleared by an `OperatorReconciled`, not left stale until a sweep or
+    /// restart. A standalone store would land `Reconciled` durably while leaving
+    /// the flag set.
+    #[tokio::test]
+    async fn reconcile_reactor_clears_the_live_guard() {
+        use std::sync::atomic::Ordering;
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_failed(&pool, &id).await;
+        service.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        let _ = reconcile_stuck_usdc_transfer(
+            &store,
+            &id,
+            ReconcileReason::from(ReconcileReasonWire::FundsMovedManually),
+        )
+        .await
+        .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "the reactor must clear the live guard on reconcile, not just the durable state",
+        );
     }
 
     #[tokio::test]
