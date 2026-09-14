@@ -151,6 +151,7 @@ use crate::trading::onchain::skipped_fill::{
 };
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
 use crate::unwrapped_equity_recovery::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
+use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
@@ -989,6 +990,7 @@ fn publish_recovery_handle(
     rebalancing_service: Arc<RebalancingService>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
     usdc_driver_pause: Arc<UsdcDriverPause>,
+    usdc_store: Arc<Store<UsdcRebalance>>,
 ) {
     let _ = recovery_cell.set(crate::api::RecoveryHandle {
         transfer,
@@ -997,6 +999,7 @@ fn publish_recovery_handle(
         rebalancing_service,
         usdc_recheck,
         usdc_driver_pause,
+        usdc_store,
     });
 }
 
@@ -1149,6 +1152,7 @@ impl Conductor {
             recovery_transfer,
             usdc_recheck,
             usdc_driver_pause,
+            usdc_store: recovery_usdc_store,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store,
@@ -1365,6 +1369,7 @@ impl Conductor {
             recovery_service,
             usdc_recheck,
             usdc_driver_pause,
+            recovery_usdc_store,
         );
 
         publish_process_tx_handle(
@@ -1946,7 +1951,11 @@ struct RebalancingInfrastructure {
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
     /// Operator pause control for the USDC driver, published on the recovery
     /// handle so a write route can quiesce the workers before it mutates.
-    usdc_driver_pause: Arc<UsdcDriverPause>,
+    pub(crate) usdc_driver_pause: Arc<UsdcDriverPause>,
+    /// The conductor-built wired `UsdcRebalance` store, published on the
+    /// recovery handle so `fail-usdc-transfer` sends `FailBridging` through the
+    /// live reactor rather than a standalone store.
+    usdc_store: Arc<Store<UsdcRebalance>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -1992,6 +2001,7 @@ struct PositionAndRebalancing {
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
     usdc_driver_pause: Arc<UsdcDriverPause>,
+    usdc_store: Arc<Store<UsdcRebalance>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -2205,6 +2215,7 @@ impl PositionAndRebalancing {
             recovery_transfer: infra.recovery_transfer,
             usdc_recheck: infra.usdc_recheck,
             usdc_driver_pause: infra.usdc_driver_pause,
+            usdc_store: infra.usdc_store,
             wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store: infra.unwrapped_equity_recovery_store,
             mint_store: infra.mint_store,
@@ -3554,6 +3565,10 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
 
+        // Cloned before `built.usdc` is consumed below: the transfer handles
+        // take one handle and the recovery handle needs another for the
+        // `fail-usdc-transfer` route.
+        let recovery_usdc_store = built.usdc.clone();
         let usdc_handles = services.into_usdc_transfer_handles(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
@@ -3616,6 +3631,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             recovery_transfer,
             usdc_recheck: usdc_handles.recheck_deposit,
             usdc_driver_pause,
+            usdc_store: recovery_usdc_store,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store: built.mint,
@@ -18822,7 +18838,7 @@ mod tests {
             Arc::new(MockWrapper::new()),
         );
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let redemption_store = Arc::new(test_store(pool, services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), services.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             services,
             mint_store.clone(),
@@ -18841,6 +18857,7 @@ mod tests {
             rebalancing_service.clone(),
             usdc_recheck,
             Arc::new(crate::rebalancing::usdc::usdc_driver_pause().0),
+            Arc::new(test_store::<UsdcRebalance>(pool, ())),
         );
 
         let handle = recovery_cell
