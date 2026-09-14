@@ -1795,8 +1795,11 @@ mod tests {
     #[test]
     fn vault_polling_entries_refuse_a_hedged_chain_without_a_provider() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains
-            .insert_secondary(st0x_config::HedgedChain::test().chain(Chain::Ethereum).call());
+        ctx.chains.insert_secondary(
+            st0x_config::HedgedChain::test()
+                .chain(Chain::Ethereum)
+                .call(),
+        );
 
         // `let-else` rather than `unwrap_err`: the success type holds a
         // provider and is not `Debug`.
