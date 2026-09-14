@@ -2818,6 +2818,8 @@ pub mod process_tx {
                 error: "previous placement failed".to_string(),
                 placed_at: block_timestamp,
                 failed_at: block_timestamp,
+                market_session: st0x_execution::MarketSession::Regular,
+                close_flatten: false,
             };
 
             let disposition = reconcile_offchain_order_state(
@@ -2898,6 +2900,8 @@ pub mod process_tx {
                 error: "previous placement failed".to_string(),
                 placed_at: block_timestamp,
                 failed_at: block_timestamp,
+                market_session: st0x_execution::MarketSession::Regular,
+                close_flatten: false,
             };
 
             let disposition = reconcile_offchain_order_state(
@@ -3262,8 +3266,11 @@ pub mod process_tx {
                     direction: Direction::Sell,
                     executor: SupportedExecutor::DryRun,
                     placed_at: block_timestamp,
+                    client_order_id: None,
+                    limit_price: None,
                     market_session: st0x_execution::MarketSession::Regular,
                     close_flatten: false,
+                    buying_power_reservation: None,
                 };
 
                 let error = reconcile_offchain_order_state(
