@@ -29,7 +29,7 @@ use st0x_dto::{
     TradingVenue,
 };
 use st0x_event_sorcery::{
-    AggregateError, EventSourced, SendError, StoreBuilder, load_entity, send_command,
+    AggregateError, EventSourced, SendError, Store, StoreBuilder, load_entity, send_command,
 };
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
@@ -78,7 +78,8 @@ use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
 };
 use crate::usdc_rebalance::{
-    RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
+    PreBurnFailEligibility, RebalanceDirection, ReconcileReason, UsdcRebalance,
+    UsdcRebalanceCommand, UsdcRebalanceId,
 };
 
 /// Comma-separated filter for transfer kinds in query parameters.
@@ -1321,6 +1322,12 @@ pub(crate) struct RecoveryHandle {
     /// read then mutate a USDC rebalance, or spend the rebalancing wallet,
     /// quiesces the workers through it first and resumes them on every exit.
     pub(crate) usdc_driver_pause: Arc<UsdcDriverPause>,
+    /// The conductor-built wired `UsdcRebalance` store. `fail-usdc-transfer`
+    /// sends `FailBridging` through it so the event reaches the live
+    /// rebalancing reactor, which reconciles the in-memory guard and inventory
+    /// to the durable outcome. A standalone store would bypass the reactor and
+    /// leave the running bot latched with `guardHeld: false` reported.
+    pub(crate) usdc_store: Arc<Store<UsdcRebalance>>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
@@ -2160,8 +2167,14 @@ fn ops_command_error<Entity: EventSourced>(
 /// Reconciles a USDC rebalance stranded in a post-burn terminal failure to the
 /// clearing `Reconciled` terminal, releasing the in-progress guard. The residue
 /// was handled out-of-band, so this only loads the aggregate and sends the
-/// command; no broker, bridge, or provider is touched. Safe against the live
-/// bot: a post-burn terminal failure has no active job driving the aggregate.
+/// command; no broker, bridge, or provider is touched. A post-burn terminal
+/// failure has no active job driving the aggregate, so it is safe against the
+/// live bot.
+///
+/// Sends through the conductor-built wired store (from [`RecoveryHandle`]), so
+/// the `OperatorReconciled` event reaches the live reactor, which clears the
+/// in-memory guard and zeroes the source-venue inflight. Returns 503 until the
+/// conductor publishes the handle.
 ///
 /// Mirrors `stox transfer reconcile --kind usdc`; the precondition matches the
 /// aggregate command's accepted set so the operator gets a clear `400` before
@@ -2174,12 +2187,31 @@ async fn reconcile_usdc_transfer(
     let id = parse_usdc_rebalance_id(&id)?;
     let reason = ReconcileReason::from(request.reason);
 
-    let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
-        .build(())
-        .await
-        .map_err(ops_store_error)?;
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
 
-    let Some(rebalance) = store.load(&id).await.map_err(ops_store_error)? else {
+    reconcile_stuck_usdc_transfer(&handle.usdc_store, &id, reason).await
+}
+
+/// The store-level half of [`reconcile_usdc_transfer`]: gates on
+/// [`UsdcRebalance::is_reconcilable_failure`] and sends `ReconcileStuckRebalance`.
+///
+/// `store` is the conductor-built wired store, so the `OperatorReconciled` event
+/// reaches the live reactor and reconciles the in-memory guard and inventory. A
+/// standalone store would persist the event but leave the running bot guarded
+/// until the next sweep or restart.
+async fn reconcile_stuck_usdc_transfer(
+    store: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    reason: ReconcileReason,
+) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(rebalance) = store.load(id).await.map_err(ops_store_error)? else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -2204,10 +2236,7 @@ async fn reconcile_usdc_transfer(
     }
 
     store
-        .send(
-            &id,
-            UsdcRebalanceCommand::ReconcileStuckRebalance { reason },
-        )
+        .send(id, UsdcRebalanceCommand::ReconcileStuckRebalance { reason })
         .await
         .map_err(ops_command_error)?;
 
@@ -2298,6 +2327,160 @@ async fn clear_pending_usdc_burn(
         transfer_id: id.to_string(),
         outcome: "pending_burn_cleared",
     }))
+}
+
+/// Wire contract for the fail-usdc-transfer route.
+#[derive(Deserialize)]
+struct FailUsdcTransferRequest {
+    /// Free-text operator audit reason (required; persisted on the event).
+    reason: String,
+}
+
+/// Result of failing a pre-burn USDC rebalance.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FailUsdcTransferResponse {
+    transfer_id: String,
+    outcome: &'static str,
+    /// Whether the rebalancing guard is still held after the failure. False
+    /// for BaseToAlpaca (no funds left the source venue; the guard clears on
+    /// the next stuck-operation sweep past the transfer timeout or on
+    /// restart). True for AlpacaToBase: the withdrawal already moved the funds
+    /// off Alpaca, so the guard stays held until `reconcile-usdc` settles
+    /// them.
+    guard_held: bool,
+}
+
+/// Drives a pre-burn USDC rebalance stranded at `WithdrawalComplete` or
+/// `BridgingSubmitting` (no recorded burn) to the pre-burn `BridgingFailed`
+/// terminal. Refuses every post-burn state: the aggregate's `FailBridging`
+/// accepts post-burn `Bridging` / `Attested` and would emit a guard-holding
+/// failure, so [`UsdcRebalance::pre_burn_fail_eligibility`] is the
+/// authoritative gate, shared with `stox fail-usdc-transfer`.
+///
+/// Runs in the bot process under the resume lock and with the USDC driver
+/// quiesced, which closes the race the CLI documents ("stop the bot before
+/// running this"): a worker cannot advance the transfer from
+/// `BridgingSubmitting` to `Bridging` between the preflight and the send, and
+/// a concurrent resume cannot adopt a burn under it.
+async fn fail_usdc_transfer(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<FailUsdcTransferRequest>,
+) -> Result<Json<FailUsdcTransferResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let id = parse_usdc_rebalance_id(&id)?;
+
+    let reason = request.reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "reason is required".to_string(),
+            }),
+        ));
+    }
+
+    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A resume or recheck operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause).await?;
+
+    let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
+    Ok(Json(response))
+}
+
+/// The store-level half of [`fail_usdc_transfer`]: gates on
+/// [`UsdcRebalance::pre_burn_fail_eligibility`], sends `FailBridging`, and
+/// reports the direction-dependent guard outcome from the durable state. The
+/// caller holds the resume lock and the driver pause, so nothing can record a
+/// burn between the preflight and the send.
+///
+/// `store` is the conductor-built wired store (from [`RecoveryHandle`]), so the
+/// `FailBridging` event reaches the live rebalancing reactor and reconciles the
+/// in-memory guard and inventory. A standalone store would emit the same event
+/// but bypass the reactor, leaving the running bot latched while the response
+/// reports `guardHeld: false`.
+async fn fail_pre_burn_usdc_transfer(
+    store: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    reason: String,
+) -> Result<FailUsdcTransferResponse, (StatusCode, Json<ErrorResponse>)> {
+    let Some(rebalance) = store.load(id).await.map_err(ops_store_error)? else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("No USDC transfer found for id {id}"),
+            }),
+        ));
+    };
+
+    let refusal = match rebalance.pre_burn_fail_eligibility() {
+        PreBurnFailEligibility::Eligible => None,
+        PreBurnFailEligibility::PostBurn => Some(format!(
+            "Transfer {id} is in {}, a post-burn state: a CCTP burn may already have \
+             been broadcast. Use resume-usdc to adopt or await a recorded burn, \
+             clear-pending-burn if the recorded burn was dropped and verified absent \
+             on-chain, or reconcile-usdc for a confirmed post-burn failure.",
+            rebalance.state_name()
+        )),
+        PreBurnFailEligibility::AlreadyFailedPreBurn if rebalance.holds_rebalance_guard() => {
+            Some(format!(
+                "Transfer {id} is already in pre-burn BridgingFailed, but the rebalancing \
+                 guard is still held because the withdrawn funds left Alpaca; settle them \
+                 with reconcile-usdc to release the guard."
+            ))
+        }
+        PreBurnFailEligibility::AlreadyFailedPreBurn => Some(format!(
+            "Transfer {id} is already in pre-burn BridgingFailed; the rebalancing guard \
+             is already in its cleared state and will not re-arm on restart."
+        )),
+        PreBurnFailEligibility::NotAtBridgeBoundary => Some(format!(
+            "fail-usdc-transfer is only valid from WithdrawalComplete or BridgingSubmitting \
+             with no recorded burn; transfer {id} is in {}.",
+            rebalance.state_name()
+        )),
+    };
+    if let Some(error) = refusal {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error })));
+    }
+
+    store
+        .send(
+            id,
+            UsdcRebalanceCommand::FailBridging {
+                reason: reason.clone(),
+            },
+        )
+        .await
+        .map_err(ops_command_error)?;
+
+    let guard_held = store
+        .load(id)
+        .await
+        .map_err(ops_store_error)?
+        .is_some_and(|failed| failed.holds_rebalance_guard());
+
+    info!(%id, %reason, guard_held, "Pre-burn USDC transfer failed via API");
+    Ok(FailUsdcTransferResponse {
+        transfer_id: id.to_string(),
+        outcome: "failed_pre_burn",
+        guard_held,
+    })
 }
 
 /// Wire contract for the equity reconcile route (mint or redemption).
@@ -2902,6 +3085,10 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             post(clear_pending_usdc_burn),
         )
         .route(
+            "/liquidity-write/transfers/usdc/{id}/fail",
+            post(fail_usdc_transfer),
+        )
+        .route(
             "/liquidity-write/transfers/{kind}/{id}/reconcile",
             post(reconcile_equity_transfer),
         )
@@ -3015,6 +3202,7 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use alloy::primitives::{Address, TxHash};
     use axum::body::{Body, to_bytes};
@@ -3068,7 +3256,7 @@ mod tests {
     use crate::rebalancing::equity::ChainServicesMissing;
     use crate::rebalancing::usdc::{UsdcTransferError, usdc_driver_pause};
     use crate::tokenized_equity_mint::TokenizedEquityMint;
-    use crate::usdc_rebalance::{RebalanceDirection, TransferRef};
+    use crate::usdc_rebalance::{ConversionAmounts, RebalanceDirection, TransferRef};
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
         let (sender, _) = broadcast::channel(16);
@@ -6020,6 +6208,7 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/usdc/x/clear-pending-burn",
             ),
+            ("POST", "/liquidity-write/transfers/usdc/x/fail"),
             ("POST", "/liquidity-write/transfers/equity_mint/x/reconcile"),
             (
                 "POST",
@@ -6069,6 +6258,7 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/usdc/x/clear-pending-burn",
             ),
+            ("POST", "/liquidity-write/transfers/usdc/x/fail"),
             ("POST", "/liquidity-write/transfers/equity_mint/x/reconcile"),
             (
                 "POST",
@@ -6523,6 +6713,82 @@ mod tests {
         store.load(id).await.unwrap().expect("aggregate must exist")
     }
 
+    /// A standalone `UsdcRebalance` store for the durable-outcome tests, which
+    /// assert the eligibility gate, the response, and the persisted terminal
+    /// state -- none of which need the live reactor. The reactor-wired path is
+    /// covered in-process by the trigger module's guard-reconciliation tests.
+    async fn standalone_usdc_store(pool: &SqlitePool) -> Arc<Store<UsdcRebalance>> {
+        StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// Seeds an AlpacaToBase `UsdcRebalance` into `WithdrawalComplete`: the
+    /// pre-withdrawal conversion, then the Alpaca withdrawal confirmed. Funds
+    /// are off Alpaca but no burn intent has been recorded.
+    async fn seed_usdc_alpaca_to_base_withdrawal_complete(pool: &SqlitePool, id: &UsdcRebalanceId) {
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let amount = Usdc::new(float!(500));
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    order_id: st0x_execution::ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmConversion {
+                    conversion: ConversionAmounts::new(amount, amount),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    from_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    withdrawal: TransferRef::AlpacaId(st0x_execution::AlpacaTransferId::from(
+                        uuid::Uuid::new_v4(),
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: Some(TxHash::repeat_byte(0x55)),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     /// Seeds a `TokenizedEquityMint` into the terminal `Failed` state via
     /// `RequestMint` then `FailAcceptance`.
     async fn seed_mint_failed(pool: &SqlitePool, id: &IssuerRequestId) {
@@ -6631,17 +6897,15 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_usdc_transfer_reconciles_a_post_burn_failure() {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
+        let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
-        seed_usdc_bridging_failed(&state.pool, &id).await;
+        seed_usdc_bridging_failed(&pool, &id).await;
+        let store = standalone_usdc_store(&pool).await;
 
-        let resp = reconcile_usdc_transfer(
-            State(state.clone()),
-            Path(id.to_string()),
-            Json(ReconcileUsdcRequest {
-                reason: ReconcileReasonWire::FundsMovedManually,
-            }),
+        let resp = reconcile_stuck_usdc_transfer(
+            &store,
+            &id,
+            ReconcileReason::from(ReconcileReasonWire::FundsMovedManually),
         )
         .await;
 
@@ -6654,7 +6918,7 @@ mod tests {
         );
         assert!(
             matches!(
-                load_usdc_rebalance(&state.pool, &id).await,
+                load_usdc_rebalance(&pool, &id).await,
                 UsdcRebalance::Reconciled { .. }
             ),
             "the rebalance must land in the Reconciled terminal",
@@ -6663,21 +6927,18 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_usdc_transfer_rejects_a_pre_burn_in_flight_state() {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
+        let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
-        seed_usdc_bridging_submitting(&state.pool, &id, false).await;
+        seed_usdc_bridging_submitting(&pool, &id, false).await;
+        let store = standalone_usdc_store(&pool).await;
 
-        let resp = reconcile_usdc_transfer(
-            State(state.clone()),
-            Path(id.to_string()),
-            Json(ReconcileUsdcRequest {
-                reason: ReconcileReasonWire::FundsMovedManually,
-            }),
+        let Err((status, _)) = reconcile_stuck_usdc_transfer(
+            &store,
+            &id,
+            ReconcileReason::from(ReconcileReasonWire::FundsMovedManually),
         )
-        .await;
-
-        let Err((status, _)) = resp else {
+        .await
+        else {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -6685,23 +6946,48 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_usdc_transfer_404_for_unseeded_id() {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
+        let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let store = standalone_usdc_store(&pool).await;
 
-        let resp = reconcile_usdc_transfer(
-            State(state.clone()),
-            Path(id.to_string()),
-            Json(ReconcileUsdcRequest {
-                reason: ReconcileReasonWire::FundsMovedManually,
-            }),
+        let Err((status, _)) = reconcile_stuck_usdc_transfer(
+            &store,
+            &id,
+            ReconcileReason::from(ReconcileReasonWire::FundsMovedManually),
         )
-        .await;
-
-        let Err((status, _)) = resp else {
+        .await
+        else {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// In-process proof that reconciling through the conductor-built wired store
+    /// reaches the live reactor: a latched running bot must have its in-memory
+    /// guard cleared by an `OperatorReconciled`, not left stale until a sweep or
+    /// restart. A standalone store would land `Reconciled` durably while leaving
+    /// the flag set.
+    #[tokio::test]
+    async fn reconcile_reactor_clears_the_live_guard() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_failed(&pool, &id).await;
+        service.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        let _ = reconcile_stuck_usdc_transfer(
+            &store,
+            &id,
+            ReconcileReason::from(ReconcileReasonWire::FundsMovedManually),
+        )
+        .await
+        .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "the reactor must clear the live guard on reconcile, not just the durable state",
+        );
     }
 
     #[tokio::test]
@@ -6783,6 +7069,254 @@ mod tests {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_returns_503_before_conductor_ready() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        // Eligible, so a 503 proves the readiness gate fires before any write.
+        seed_usdc_bridging_submitting(&state.pool, &id, false).await;
+
+        let resp = fail_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(FailUsdcTransferRequest {
+                reason: "audit: pre-burn crash".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            matches!(
+                load_usdc_rebalance(&state.pool, &id).await,
+                UsdcRebalance::BridgingSubmitting { .. }
+            ),
+            "a refused request must not touch the aggregate",
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_rejects_a_blank_reason_before_the_readiness_gate() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+
+        let resp = fail_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(FailUsdcTransferRequest {
+                reason: "   ".to_string(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fail_pre_burn_usdc_transfer_clears_the_guard_for_base_to_alpaca() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&pool, &id, false).await;
+        let store = standalone_usdc_store(&pool).await;
+
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "burn never attempted".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "transferId": id.to_string(),
+                "outcome": "failed_pre_burn",
+                "guardHeld": false,
+            }),
+        );
+        assert!(
+            matches!(
+                load_usdc_rebalance(&pool, &id).await,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: None,
+                    cctp_nonce: None,
+                    ..
+                }
+            ),
+            "failing must land the pre-burn BridgingFailed terminal",
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_pre_burn_usdc_transfer_keeps_the_guard_for_alpaca_to_base() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_alpaca_to_base_withdrawal_complete(&pool, &id).await;
+        let store = standalone_usdc_store(&pool).await;
+
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "bridge never started".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        // The withdrawal already moved the funds off Alpaca, so the failure
+        // holds the guard until reconcile-usdc settles them.
+        assert!(body.guard_held);
+        assert!(matches!(
+            load_usdc_rebalance(&pool, &id).await,
+            UsdcRebalance::BridgingFailed {
+                direction: RebalanceDirection::AlpacaToBase,
+                burn_tx_hash: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_pre_burn_usdc_transfer_refuses_a_recorded_pending_burn() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&pool, &id, true).await;
+        let store = standalone_usdc_store(&pool).await;
+
+        let Err((status, Json(error))) =
+            fail_pre_burn_usdc_transfer(&store, &id, "audit".to_string()).await
+        else {
+            panic!("a recorded pending burn is post-burn and must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("post-burn"), "{}", error.error);
+        assert!(matches!(
+            load_usdc_rebalance(&pool, &id).await,
+            UsdcRebalance::BridgingSubmitting {
+                pending_burn_tx: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_pre_burn_usdc_transfer_refuses_a_post_burn_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_failed(&pool, &id).await;
+        let store = standalone_usdc_store(&pool).await;
+
+        let Err((status, _)) = fail_pre_burn_usdc_transfer(&store, &id, "audit".to_string()).await
+        else {
+            panic!("a post-burn BridgingFailed must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fail_pre_burn_usdc_transfer_is_not_repeatable() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = standalone_usdc_store(&pool).await;
+
+        // BaseToAlpaca: the guard is already cleared, nothing left to do.
+        let cleared = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&pool, &cleared, false).await;
+        fail_pre_burn_usdc_transfer(&store, &cleared, "first".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+        let Err((status, Json(error))) =
+            fail_pre_burn_usdc_transfer(&store, &cleared, "second".to_string()).await
+        else {
+            panic!("an already-failed pre-burn transfer must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("cleared state"), "{}", error.error);
+
+        // AlpacaToBase: the failure still holds the guard, so the refusal must
+        // send the operator to reconcile rather than claim nothing is needed.
+        let held = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_alpaca_to_base_withdrawal_complete(&pool, &held).await;
+        fail_pre_burn_usdc_transfer(&store, &held, "first".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+        let Err((status, Json(error))) =
+            fail_pre_burn_usdc_transfer(&store, &held, "second".to_string()).await
+        else {
+            panic!("an already-failed pre-burn transfer must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("reconcile-usdc"), "{}", error.error);
+        assert!(!error.error.contains("cleared state"), "{}", error.error);
+    }
+
+    #[tokio::test]
+    async fn fail_pre_burn_usdc_transfer_404_for_unseeded_id() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let store = standalone_usdc_store(&pool).await;
+
+        let Err((status, _)) = fail_pre_burn_usdc_transfer(&store, &id, "audit".to_string()).await
+        else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// In-process proof that routing `FailBridging` through the conductor-built
+    /// wired store reaches the live reactor: a latched running bot
+    /// (`usdc_in_progress = true`) must be cleared by a BaseToAlpaca pre-burn
+    /// failure, matching the `guardHeld: false` the route reports. A standalone
+    /// store would report `guardHeld: false` while leaving the flag set.
+    #[tokio::test]
+    async fn fail_pre_burn_reactor_clears_the_live_guard_for_base_to_alpaca() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&pool, &id, false).await;
+        // Simulate the running bot latched on this in-flight transfer.
+        service.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "burn never attempted".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert!(
+            !body.guard_held,
+            "BaseToAlpaca pre-burn failure clears the guard"
+        );
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "the reactor must clear the live in-memory guard, not just the durable state",
+        );
+    }
+
+    /// The AlpacaToBase counterpart: the withdrawal already moved funds off
+    /// Alpaca, so the reactor must KEEP the live guard latched (matching
+    /// `guardHeld: true`) until the operator reconciles.
+    #[tokio::test]
+    async fn fail_pre_burn_reactor_keeps_the_live_guard_for_alpaca_to_base() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_alpaca_to_base_withdrawal_complete(&pool, &id).await;
+        service.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "bridge never started".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert!(
+            body.guard_held,
+            "AlpacaToBase pre-burn failure holds the guard"
+        );
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "the reactor must keep the live guard latched until reconcile-usdc",
+        );
     }
 
     #[tokio::test]
