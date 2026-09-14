@@ -20,8 +20,8 @@ use st0x_evm::Chain;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS;
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth, HedgeFloor,
-    SupportedExecutor, Symbol, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth, FractionalShares,
+    HedgeFloor, SupportedExecutor, Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
@@ -816,6 +816,13 @@ impl BrokerCtx {
     pub fn counter_trade_slippage_bps(&self) -> u16 {
         let Self::AlpacaBrokerApi(ctx) = self;
         ctx.counter_trade_slippage_bps
+    }
+
+    /// Shares every outflow leaves in the broker account, per symbol.
+    #[must_use]
+    pub fn hedge_floor(&self) -> &HedgeFloor {
+        let Self::AlpacaBrokerApi(ctx) = self;
+        &ctx.hedge_floor
     }
 
     fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
@@ -2530,6 +2537,18 @@ pub enum CtxError {
         reason: &'static str,
     },
     #[error(
+        "hedge_floor_shares must not be negative: {} is {configured}",
+        symbol.as_ref().map_or_else(
+            || "[broker]".to_owned(),
+            |symbol| format!("[assets.equities.{symbol}]")
+        )
+    )]
+    NegativeHedgeFloor {
+        /// `None` for the `[broker]` default, the symbol for an override.
+        symbol: Option<Symbol>,
+        configured: FractionalShares,
+    },
+    #[error(
         "[broker] counter_trade_slippage_bps is required when using Alpaca \
          Trading API or Alpaca Broker API"
     )]
@@ -2694,6 +2713,7 @@ impl CtxError {
             Self::SecretsToml { .. } => "failed to parse secrets",
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::MissingCounterTradeSlippageBps => "missing counter trade slippage bps",
+            Self::NegativeHedgeFloor { .. } => "negative hedge floor",
             Self::KmsBrokerRequiresProductionMode => "kms broker auth requires production mode",
             Self::MissingBrokerType => "missing broker type",
             Self::BrokerIdentityConflict { .. } => "broker identity conflict",
@@ -7576,6 +7596,83 @@ mod tests {
 
         assert_eq!(parts.broker.counter_trade_slippage_bps(), 100);
         assert_eq!(parts.close_flatten_cross_max_bps, 100);
+    }
+
+    #[test]
+    fn hedge_floor_defaults_to_zero_when_absent() {
+        let config = minimal_config_toml();
+        let secrets = alpaca_secrets_toml();
+
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
+
+        assert_eq!(
+            parts
+                .broker
+                .hedge_floor()
+                .for_symbol(&Symbol::new("AAPL").unwrap()),
+            FractionalShares::ZERO
+        );
+    }
+
+    fn hedge_floor_config_toml(broker_floor: &str, aapl_floor: &str) -> NamedTempFile {
+        let base = String::from_utf8(minimal_config_toml_bytes().to_vec()).unwrap();
+        let config = base
+            .replace(
+                "[broker]\n            counter_trade_slippage_bps = 100",
+                &format!(
+                    "[broker]\n            hedge_floor_shares = {broker_floor}\n            \
+                     counter_trade_slippage_bps = 100"
+                ),
+            )
+            .replace(
+                "[chains.base.trading.assets.equities]\n",
+                &format!(
+                    "[assets.equities.AAPL]\n            \
+                     extended_hours_counter_trading = \"disabled\"\n            \
+                     hedge_floor_shares = {aapl_floor}\n\n            \
+                     [chains.base.trading.assets.equities.AAPL]\n            \
+                     tokenized_equity = \"0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b\"\n            \
+                     tokenized_equity_derivative = \
+                     \"0xf4f8c66085910d583c01f3b4e44bf731d4e2c565\"\n            \
+                     trading = \"enabled\"\n            \
+                     rebalancing = \"disabled\"\n            \
+                     wrapped_equity_recovery = \"disabled\"\n"
+                ),
+            );
+        assert_ne!(config, base, "fixture substitutions must apply");
+        toml_file(&config)
+    }
+
+    #[test]
+    fn hedge_floor_per_symbol_override_wins_over_the_broker_default() {
+        let config = hedge_floor_config_toml("1", "3");
+        let secrets = alpaca_secrets_toml();
+
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
+        let floor = parts.broker.hedge_floor();
+
+        assert_eq!(
+            floor.for_symbol(&Symbol::new("AAPL").unwrap()),
+            FractionalShares::new(float!(3))
+        );
+        assert_eq!(
+            floor.for_symbol(&Symbol::new("MSFT").unwrap()),
+            FractionalShares::new(float!(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_files_refuses_a_negative_hedge_floor() {
+        let config = hedge_floor_config_toml("1", "-1");
+        let secrets = alpaca_secrets_toml();
+
+        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+
+        let CtxError::NegativeHedgeFloor { symbol, configured } = err else {
+            panic!("expected NegativeHedgeFloor, got: {err:?}");
+        };
+        assert_eq!(symbol, Some(Symbol::new("AAPL").unwrap()));
+        assert_eq!(configured, FractionalShares::new(float!(-1)));
     }
 
     /// The ramp runs from `counter_trade_slippage_bps` up to this ceiling, so a
