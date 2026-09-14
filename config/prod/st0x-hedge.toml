@@ -344,7 +344,7 @@ extended_hours_counter_trading = "disabled"
 
 [chains.base.trading.assets.equities.QSEP]
 trading = "disabled"
-rebalancing = "enabled"
+rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0x4a9a9fc94a507559481270d0bff3315ab92fcefa"
