@@ -1365,6 +1365,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use crate::alerts::CapturingNotifier;
+    use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::inventory::view::{InFlightCashLocation, InFlightEquityLocation};
     use crate::inventory::{Inventory, InventoryView, Operator, Venue};
     use crate::portfolio_snapshot::read::{DayCapital, DayExclusionReason};
@@ -3633,6 +3634,90 @@ mod tests {
         );
     }
 
+    /// Cash sits in a vault on every chain the bot makes markets on, and each
+    /// chain's own market-making row is where the day's capture must find it:
+    /// a secondary chain's USDC folded into the primary's row, or dropped,
+    /// misstates where the capital actually is.
+    #[tokio::test]
+    async fn a_secondary_chains_usdc_is_captured_at_its_own_market_making_row() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let now = Utc::now();
+
+        // `with_usdc` seeds the trading chain's slot alone, so Ethereum's cash
+        // arrives the way the poller delivers it: that chain's own snapshot
+        // event.
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        )
+        .apply_snapshot_event(
+            &InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Ethereum,
+                usdc_balance: Usdc::new(float!(250)),
+                fetched_at: now,
+                block_number: None,
+            },
+            now,
+        )
+        .unwrap();
+
+        let (mut ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool,
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            base_wrapper(MockWrapper::new()),
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::new(),
+                usdc_tracking_enabled: true,
+            },
+        );
+        mark_all_required_fresh(&ctx);
+
+        job_for_today()
+            .perform_at(&ctx, safe_capture_now())
+            .await
+            .unwrap();
+
+        let et_day = et_day(Utc::now()).to_string();
+
+        async fn usdc_row(
+            pool: &SqlitePool,
+            et_day: &str,
+            location: &str,
+        ) -> (String, Option<String>) {
+            sqlx::query_as(
+                "SELECT available_balance, usd_mark FROM portfolio_snapshot \
+                 WHERE et_day = ? AND asset = 'USDC' AND location = ?",
+            )
+            .bind(et_day)
+            .bind(location)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        assert_eq!(
+            usdc_row(&pool, &et_day, "market_making:ethereum").await,
+            ("250".to_string(), Some("1".to_string())),
+            "Ethereum's cash is captured at Ethereum's own row, marked at par"
+        );
+        assert_eq!(
+            usdc_row(&pool, &et_day, "market_making:base").await,
+            ("1000".to_string(), Some("1".to_string())),
+            "the primary chain's row keeps its own balance, unsummed"
+        );
+    }
+
     /// A market-making row outlives the `(chain, symbol)` pair that created
     /// it. Drop AAPL from Ethereum's assets table while Base still lists it,
     /// and the durable Ethereum row must be judged by its own pair: kept
@@ -3794,6 +3879,82 @@ mod tests {
             Some(format!(
                 "AAPL not observed by a poll on/after {target_et_day} at market_making:base"
             ))
+        );
+    }
+
+    /// A secondary chain's market-making slot gates the capture exactly as
+    /// the primary's does. The chain whose poll never landed is precisely the
+    /// one whose balances the day would otherwise be captured without, and
+    /// once captured a day can never be amended.
+    #[tokio::test]
+    async fn freshness_gap_blocks_when_only_a_secondary_chains_required_slot_is_unobserved() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let nvda = Symbol::new("NVDA").unwrap();
+        let view = freshly_polled_view(
+            aapl(),
+            FractionalShares::new(float!(10)),
+            FractionalShares::new(float!(5)),
+            Usdc::new(float!(1000)),
+            Usdc::new(float!(500)),
+        );
+        let (mut ctx, _position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            view,
+            HashSet::from([aapl()]),
+            true,
+            false,
+            base_wrapper(MockWrapper::new()),
+        )
+        .await;
+        ctx.market_making.insert(
+            Chain::Ethereum,
+            MarketMakingSlots {
+                equity_symbols: HashSet::from([nvda.clone()]),
+                usdc_tracking_enabled: false,
+            },
+        );
+
+        // Every slot but Ethereum's market-making one observed: the primary
+        // chain polled normally, and the broker book backing both chains did
+        // too, so the secondary chain's own read is the only thing missing.
+        for (location, asset) in required_slots(&ctx) {
+            if location == PortfolioLocation::MarketMaking(Chain::Ethereum) {
+                continue;
+            }
+            ctx.poll_freshness.observe(location, asset);
+        }
+
+        let target_et_day = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        assert_eq!(
+            freshness_gap(&ctx, target_et_day),
+            Some(format!(
+                "{nvda} not observed by a poll on/after {target_et_day} at market_making:ethereum"
+            )),
+            "the unobserved secondary slot must be the gap the gate reports"
+        );
+
+        let boundary = et_midnight(target_et_day).unwrap() + CAPTURE_BUFFER;
+        PortfolioSnapshotJob::capture(target_et_day)
+            .perform_at(&ctx, boundary + chrono::Duration::minutes(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            portfolio_snapshot_row_count(&pool, &target_et_day.to_string()).await,
+            0,
+            "a secondary chain's unobserved slot must block the capture"
+        );
+        let rescheduled_job: Vec<u8> =
+            sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(std::any::type_name::<PortfolioSnapshotJob>())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        let rescheduled: PortfolioSnapshotJob = serde_json::from_slice(&rescheduled_job).unwrap();
+        assert_eq!(
+            rescheduled.target_et_day, target_et_day,
+            "the blocked day must be deferred, not abandoned"
         );
     }
 
