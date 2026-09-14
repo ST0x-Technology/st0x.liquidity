@@ -50,7 +50,7 @@ use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
-    MarketOrder, MarketSession, Positive, Symbol, TryIntoExecutor, Usd,
+    HedgeFloor, MarketOrder, MarketSession, Positive, Symbol, TryIntoExecutor, Usd,
 };
 use st0x_issuance_client::IssuanceClient;
 use st0x_issuance_dto::VaultModeTag;
@@ -2849,6 +2849,7 @@ fn build_rebalancing_service(
             transfer_timeout: rebalancing_ctx.transfer_timeout,
             assets: deps.ctx.chains.primary().assets.clone(),
             cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
+            hedge_floor: HedgeFloor::default(),
         },
         deps.vault_registry.clone(),
         registry_ids,
@@ -6222,6 +6223,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -7060,6 +7062,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
                     deviation: st0x_float_macro::float!(0.2),
@@ -8143,6 +8146,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
                     deviation: st0x_float_macro::float!(0.2),
@@ -8237,6 +8241,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
                     deviation: st0x_float_macro::float!(0.2),
@@ -12105,6 +12110,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -12234,6 +12240,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: threshold,
                 usdc: Some(threshold),
                 transfer_timeout: Duration::from_secs(30 * 60),
@@ -12361,6 +12368,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -12513,6 +12521,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),

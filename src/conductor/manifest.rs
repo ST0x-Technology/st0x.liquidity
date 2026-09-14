@@ -210,6 +210,7 @@ mod tests {
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.2),

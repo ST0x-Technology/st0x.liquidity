@@ -428,6 +428,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     unwrapped_token: Address,
     vault_ratio: &UnderlyingPerWrapped,
     shares_limit: Option<Positive<FractionalShares>>,
+    hedge_floor: FractionalShares,
 ) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
     let imbalance = {
         let inventory = inventory.read().await;
@@ -440,7 +441,12 @@ pub(super) async fn check_imbalance_and_build_operation(
     };
 
     let Some(imbalance) = imbalance else {
-        trace!(target: "rebalance", %symbol, "No equity imbalance detected (balanced, partial data, or inflight)");
+        trace!(
+            target: "rebalance",
+            %symbol,
+            %hedge_floor,
+            "No equity imbalance detected (balanced, partial data, or inflight)"
+        );
         return Ok(None);
     };
 
@@ -1082,6 +1088,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1106,10 +1113,94 @@ mod tests {
             Address::ZERO,
             &ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await;
 
         assert!(matches!(result, Ok(Some(TriggeredOperation::Mint { .. }))));
+    }
+
+    fn fractional_view(
+        symbol: &Symbol,
+        onchain: &str,
+        offchain: &str,
+    ) -> Arc<BroadcastingInventory> {
+        let parse = |value: &str| FractionalShares::new(Float::parse(value.to_string()).unwrap());
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, parse(onchain)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, parse(offchain)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        Arc::new(BroadcastingInventory::new(view, event_sender))
+    }
+
+    /// Everything offchain and a target of 95% onchain asks to mint 9.975 of
+    /// 10.5 shares; a one-share floor caps the mint at 9.5.
+    #[tokio::test]
+    async fn mint_stops_at_the_hedge_floor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = fractional_view(&symbol, "0", "10.5");
+        let threshold = ImbalanceThreshold {
+            target: float!(0.95),
+            deviation: float!(0.01),
+        };
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            None,
+            FractionalShares::new(float!(1)),
+        )
+        .await
+        .unwrap();
+
+        let Some(TriggeredOperation::Mint { quantity, .. }) = result else {
+            panic!("expected a floored mint, got {result:?}");
+        };
+        assert_eq!(quantity, FractionalShares::new(float!(9.5)));
+    }
+
+    /// A book that is nothing but the floor has nothing to mint.
+    #[tokio::test]
+    async fn mint_is_skipped_when_the_book_is_only_the_floor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = fractional_view(&symbol, "0", "1");
+        let threshold = ImbalanceThreshold {
+            target: float!(0.95),
+            deviation: float!(0.01),
+        };
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            None,
+            FractionalShares::new(float!(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
@@ -1132,6 +1223,7 @@ mod tests {
             unwrapped_addr,
             &ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1172,6 +1264,7 @@ mod tests {
             Address::ZERO,
             &ratio_1_to_1,
             None,
+            FractionalShares::ZERO,
         )
         .await;
         assert_eq!(result_1_to_1.unwrap(), None);
@@ -1187,6 +1280,7 @@ mod tests {
             Address::ZERO,
             &ratio_1_5,
             None,
+            FractionalShares::ZERO,
         )
         .await;
         assert!(
@@ -1259,6 +1353,7 @@ mod tests {
             Address::ZERO,
             &vault_ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await
         .unwrap()
@@ -1361,6 +1456,7 @@ mod tests {
             Address::ZERO,
             &vault_ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await
         .unwrap()
@@ -1434,6 +1530,7 @@ mod tests {
             Address::ZERO,
             &vault_ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1588,6 +1685,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             shares_limit,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1622,6 +1720,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             shares_limit,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1645,6 +1744,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             shares_limit,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1663,6 +1763,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             shares_limit,
+            FractionalShares::ZERO,
         )
         .await;
 
