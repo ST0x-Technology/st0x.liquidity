@@ -11,18 +11,19 @@
 //!
 //! This module grants a single `U256::MAX` allowance per `(token, spender)`
 //! pair at startup, to the trusted spenders only: our own ERC-4626 wrapper
-//! vaults and the Raindex orderbook. The grant is idempotent -- an allowance
-//! already at or near max is left untouched -- so restarts do not re-submit
-//! redundant approves. The per-operation approvals remain in place as a
-//! defensive fallback; once the startup grant lands they short-circuit to a
-//! no-op because the allowance already exceeds any operation amount.
+//! vaults, and the Raindex orderbook where deposits still settle against it.
+//! The grant is idempotent -- an allowance already at or near max is left
+//! untouched -- so restarts do not re-submit redundant approves. The
+//! per-operation approvals remain in place as a defensive fallback; once the
+//! startup grant lands they short-circuit to a no-op because the allowance
+//! already exceeds any operation amount.
 
 use std::future::Future;
 
 use alloy::primitives::{Address, TxHash, U256};
 use futures_util::{StreamExt, TryStreamExt, stream};
 
-use st0x_config::{ChainAssets, ChainRole};
+use st0x_config::{ChainAssets, ChainRole, InventoryMode};
 use st0x_evm::{IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 
@@ -129,18 +130,28 @@ pub(crate) enum StartupApprovalError {
     },
 }
 
-/// Builds the deterministic list of startup approval targets: the two
-/// wrap/deposit grants of every equity the chain wraps in its role (the same
-/// selection the tokenization preflight attests, so no grant targets a vault
-/// the preflight never checked), then the single USDC grant on every chain. A
-/// hedge-only secondary has no wrapper to approve, so it gets the USDC grant
-/// alone.
+/// Builds the deterministic list of startup approval targets: the wrap grant
+/// of every equity the chain wraps in its role (the same selection the
+/// tokenization preflight attests, so no grant targets a vault the preflight
+/// never checked), plus the deposit grants that chain's inventory mode makes
+/// the orderbook the spender of.
+///
+/// The orderbook is the deposit spender in [`InventoryMode::Legacy`] only. A
+/// managed chain deposits through its `RaindexInventory`, approved lazily on
+/// the deposit path, so an orderbook allowance there is never spent -- and the
+/// startup revoke of stale pre-migration allowances would clear it again on
+/// the next boot.
 pub(crate) fn build_approval_targets(
     role: ChainRole,
+    inventory: InventoryMode,
     assets: &ChainAssets,
     orderbook: Address,
     usdc: Address,
 ) -> Vec<ApprovalTarget> {
+    let deposits_through_orderbook = match inventory {
+        InventoryMode::Legacy => true,
+        InventoryMode::Managed { .. } => false,
+    };
     let mut targets = Vec::new();
 
     for (symbol, config) in role.rebalanced_equities(assets) {
@@ -154,20 +165,24 @@ pub(crate) fn build_approval_targets(
             purpose: ApprovalPurpose::WrapUnderlying,
         });
 
-        targets.push(ApprovalTarget {
-            token: derivative,
-            spender: orderbook,
-            symbol: Some(symbol.clone()),
-            purpose: ApprovalPurpose::DepositWrappedEquity,
-        });
+        if deposits_through_orderbook {
+            targets.push(ApprovalTarget {
+                token: derivative,
+                spender: orderbook,
+                symbol: Some(symbol.clone()),
+                purpose: ApprovalPurpose::DepositWrappedEquity,
+            });
+        }
     }
 
-    targets.push(ApprovalTarget {
-        token: usdc,
-        spender: orderbook,
-        symbol: None,
-        purpose: ApprovalPurpose::DepositUsdc,
-    });
+    if deposits_through_orderbook {
+        targets.push(ApprovalTarget {
+            token: usdc,
+            spender: orderbook,
+            symbol: None,
+            purpose: ApprovalPurpose::DepositUsdc,
+        });
+    }
 
     targets
 }
@@ -529,7 +544,13 @@ mod tests {
             ),
         )]);
 
-        let targets = build_approval_targets(ChainRole::Primary, &assets, orderbook, usdc);
+        let targets = build_approval_targets(
+            ChainRole::Primary,
+            InventoryMode::Legacy,
+            &assets,
+            orderbook,
+            usdc,
+        );
 
         assert_eq!(
             targets,
@@ -556,6 +577,45 @@ mod tests {
         );
     }
 
+    /// Under managed inventory the orderbook is no longer a deposit spender:
+    /// the same table keeps the wrap grant and drops both orderbook grants.
+    #[test]
+    fn build_targets_drop_the_orderbook_grants_under_managed_inventory() {
+        let underlying = Address::random();
+        let derivative = Address::random();
+        let orderbook = Address::random();
+        let usdc = Address::random();
+        let assets = assets_with([(
+            "AAPL",
+            equity_asset(
+                underlying,
+                derivative,
+                OperationMode::Enabled,
+                OperationMode::Disabled,
+            ),
+        )]);
+
+        let targets = build_approval_targets(
+            ChainRole::Primary,
+            InventoryMode::Managed {
+                inventory: Address::random(),
+            },
+            &assets,
+            orderbook,
+            usdc,
+        );
+
+        assert_eq!(
+            targets,
+            vec![ApprovalTarget {
+                token: underlying,
+                spender: derivative,
+                symbol: Some("AAPL".parse().unwrap()),
+                purpose: ApprovalPurpose::WrapUnderlying,
+            }]
+        );
+    }
+
     /// A secondary that rebalances no equity has no wrapper to approve: its
     /// trading-enabled equity gets no wrap or deposit grant and only the USDC
     /// grant remains, where the same table on the primary keeps all three.
@@ -573,7 +633,13 @@ mod tests {
             ),
         )]);
 
-        let targets = build_approval_targets(ChainRole::Secondary, &assets, orderbook, usdc);
+        let targets = build_approval_targets(
+            ChainRole::Secondary,
+            InventoryMode::Legacy,
+            &assets,
+            orderbook,
+            usdc,
+        );
 
         assert_eq!(
             targets,
@@ -604,7 +670,13 @@ mod tests {
             ),
         )]);
 
-        let targets = build_approval_targets(ChainRole::Secondary, &assets, orderbook, usdc);
+        let targets = build_approval_targets(
+            ChainRole::Secondary,
+            InventoryMode::Legacy,
+            &assets,
+            orderbook,
+            usdc,
+        );
 
         assert_eq!(
             targets
@@ -653,7 +725,13 @@ mod tests {
             ),
         ]);
 
-        let secondary = build_approval_targets(ChainRole::Secondary, &assets, orderbook, usdc);
+        let secondary = build_approval_targets(
+            ChainRole::Secondary,
+            InventoryMode::Legacy,
+            &assets,
+            orderbook,
+            usdc,
+        );
 
         assert_eq!(
             secondary
@@ -675,7 +753,13 @@ mod tests {
             ]
         );
 
-        let primary = build_approval_targets(ChainRole::Primary, &assets, orderbook, usdc);
+        let primary = build_approval_targets(
+            ChainRole::Primary,
+            InventoryMode::Legacy,
+            &assets,
+            orderbook,
+            usdc,
+        );
 
         assert_eq!(
             primary
@@ -746,7 +830,13 @@ mod tests {
             ),
         ]);
 
-        let targets = build_approval_targets(ChainRole::Primary, &assets, orderbook, usdc);
+        let targets = build_approval_targets(
+            ChainRole::Primary,
+            InventoryMode::Legacy,
+            &assets,
+            orderbook,
+            usdc,
+        );
 
         assert_eq!(targets.len(), 5);
         assert_eq!(targets[0].symbol.as_ref().unwrap().as_str(), "AAPL");

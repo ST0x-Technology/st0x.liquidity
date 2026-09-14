@@ -123,6 +123,7 @@ fn verify_hedged_chains(
         let chain = chain_inputs.chain;
         let targets = build_approval_targets(
             chain_inputs.role,
+            chain_inputs.inventory,
             &chain_inputs.assets,
             chain_inputs.orderbook,
             chain.usdc(),
@@ -485,7 +486,9 @@ mod tests {
     use alloy::primitives::address;
     use std::collections::HashMap;
 
-    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, ChainRole, OperationMode};
+    use st0x_config::{
+        ChainAssets, ChainEquities, ChainEquityAsset, ChainRole, InventoryMode, OperationMode,
+    };
     use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect, TurnkeyPolicySnapshot};
     use st0x_evm::{USDC_ETHEREUM, USDC_HYPEREVM};
 
@@ -892,11 +895,13 @@ mod tests {
 
     /// One hedged chain listing a trading-only AAPL: underlying 0x11..
     /// wraps into vault 0x22.., which deposits into orderbook 0x33.. -- the
-    /// same addresses the policy fixtures above name.
+    /// same addresses the policy fixtures above name. Legacy inventory, so
+    /// the orderbook deposit grants are in the target set to be covered.
     fn chain_inputs(chain: Chain, role: ChainRole) -> ChainApprovalInputs {
         ChainApprovalInputs {
             chain,
             role,
+            inventory: InventoryMode::Legacy,
             orderbook: address!("0x3333333333333333333333333333333333333333"),
             assets: ChainAssets {
                 equities: ChainEquities {

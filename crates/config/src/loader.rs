@@ -184,14 +184,18 @@ pub fn load_deployment_symbol_policy(
     )
 }
 
-/// One hedged chain's approval surface: the orderbook and asset table its
-/// startup MAX approvals target, and the role that decides whether its
-/// equities' wrap and deposit grants are targeted at all.
+/// One hedged chain's approval surface.
+///
+/// The orderbook and asset table its startup MAX approvals target, the role
+/// that decides whether its equities' wrap and deposit grants are targeted at
+/// all, and the inventory mode that decides whether the orderbook is still a
+/// deposit spender there.
 #[cfg(feature = "wallet-turnkey")]
 #[derive(Clone, Debug)]
 pub struct ChainApprovalInputs {
     pub chain: Chain,
     pub role: crate::ChainRole,
+    pub inventory: crate::InventoryMode,
     pub orderbook: Address,
     pub assets: crate::ChainAssets,
 }
@@ -2194,6 +2198,7 @@ impl Ctx {
                 .map(|(role, hedged)| ChainApprovalInputs {
                     chain: hedged.chain,
                     role,
+                    inventory: hedged.inventory,
                     orderbook: hedged.orderbook,
                     assets: hedged.assets.clone(),
                 })
