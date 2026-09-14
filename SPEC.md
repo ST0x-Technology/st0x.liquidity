@@ -5063,13 +5063,17 @@ guard. The live route reports this split in its `guardHeld` response field. The
 command is valid ONLY from `BridgingSubmitting` or `WithdrawalComplete` -- it is
 refused for all post-burn states (`Bridging`, `AwaitingAttestation`, `Attested`,
 `Bridged`, `DepositInitiated`, `DepositConfirmed`, `DepositFailed`,
-`Reconciled`, or any `BridgingFailed` with a recorded `burn_tx_hash`). Neither
-path drives the event through the live reactor (both use a store the reactor
-does not observe), so the live in-memory guard is NOT cleared by the failure
-itself: for a non-guard-holding outcome it clears on the next stuck-operation
-sweep past the transfer timeout, or on restart (`recover_usdc_guard` skips
-non-guard-holding aggregates), at which point automatic USDC rebalancing
-resumes.
+`Reconciled`, or any `BridgingFailed` with a recorded `burn_tx_hash`). The two
+surfaces differ in how the in-memory guard is reconciled. The live route sends
+`FailBridging` through the conductor-built wired store, so the rebalancing
+reactor runs in-process and reconciles the in-memory guard and inventory
+immediately: it clears the guard for a non-guard-holding (BaseToAlpaca) outcome
+and keeps it latched for an AlpacaToBase one, matching the reported `guardHeld`.
+The offline CLI writes through a standalone store the (stopped) bot's reactor
+never observes, so its outcome is reconciled on the next startup:
+`recover_usdc_guard` clears a non-guard-holding aggregate and re-latches an
+AlpacaToBase one until the operator reconciles. Either way, once the guard is
+released automatic USDC rebalancing resumes.
 
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further
