@@ -36,11 +36,11 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c  # v35
         with:
           # Same pin as ci.yaml: 2.24-2.28 cannot resolve rainix's foundry
           # input.
@@ -52,14 +52,14 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866  # v17
         continue-on-error: true
         with:
           name: rainlanguage
           skipPush: true
           useDaemon: false
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           prefix-key: rust-${{ github.workflow }}
 
