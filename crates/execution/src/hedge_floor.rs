@@ -9,6 +9,9 @@
 
 use std::collections::HashMap;
 
+use rain_math_float::FloatError;
+use st0x_float_macro::float;
+
 use crate::{FractionalShares, Symbol};
 
 /// The configured floor: one global default plus per-symbol overrides.
@@ -44,6 +47,26 @@ impl HedgeFloor {
     }
 }
 
+/// Rounds a floor up to whole shares for an asset the broker only trades in
+/// whole units, so a fractional floor still keeps at least one share. Zero
+/// stays zero: a disabled floor never grows into one.
+pub(crate) fn whole_share_floor(floor: FractionalShares) -> Result<FractionalShares, FloatError> {
+    let value = floor.inner();
+
+    if value.is_zero()? {
+        return Ok(FractionalShares::ZERO);
+    }
+
+    let floored = value.floor()?;
+    let ceiled = if value.frac()?.is_zero()? {
+        floored
+    } else {
+        (floored + float!(1))?
+    };
+
+    Ok(FractionalShares::new(ceiled.max(float!(1))?))
+}
+
 #[cfg(test)]
 mod tests {
     use rain_math_float::Float;
@@ -61,6 +84,15 @@ mod tests {
 
         assert_eq!(floor.for_symbol(&aapl), shares("3"));
         assert_eq!(floor.for_symbol(&Symbol::new("MSFT").unwrap()), shares("1"));
+    }
+
+    #[test]
+    fn whole_share_floor_rounds_up_and_keeps_zero_disabled() {
+        assert_eq!(whole_share_floor(shares("0.5")).unwrap(), shares("1"));
+        assert_eq!(whole_share_floor(shares("1")).unwrap(), shares("1"));
+        assert_eq!(whole_share_floor(shares("1.2")).unwrap(), shares("2"));
+        assert_eq!(whole_share_floor(shares("3")).unwrap(), shares("3"));
+        assert_eq!(whole_share_floor(shares("0")).unwrap(), shares("0"));
     }
 
     #[test]

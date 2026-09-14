@@ -362,8 +362,10 @@ impl Executor for AlpacaBrokerApi {
                     .find(|position| position.symbol == order.symbol)
                     .map_or(FractionalShares::ZERO, |position| position.quantity);
 
-                let tradable_available = if prepared.fractional_orders_supported {
-                    available
+                let floor = self.hedge_floor.for_symbol(&order.symbol);
+
+                let (tradable_available, floor) = if prepared.fractional_orders_supported {
+                    (available, floor)
                 } else {
                     let Some(truncated) = crate::truncate_to_decimal_places(available.inner(), 0)?
                     else {
@@ -374,10 +376,11 @@ impl Executor for AlpacaBrokerApi {
                             },
                         ));
                     };
-                    FractionalShares::new(truncated)
+                    (
+                        FractionalShares::new(truncated),
+                        crate::hedge_floor::whole_share_floor(floor)?,
+                    )
                 };
-
-                let floor = self.hedge_floor.for_symbol(&order.symbol);
 
                 Ok(crate::resolve_sell_preflight(
                     order,
