@@ -577,14 +577,16 @@ mod tests {
         );
     }
 
-    /// Under managed inventory the orderbook is no longer a deposit spender:
-    /// the same table keeps the wrap grant and drops both orderbook grants.
+    /// Under managed inventory the same table keeps all three grants, with
+    /// the inventory as the deposit spender in place of the orderbook: the
+    /// two deposit token identities stay in the set the deploy gate proves.
     #[test]
-    fn build_targets_drop_the_orderbook_grants_under_managed_inventory() {
+    fn build_targets_name_the_inventory_as_the_deposit_spender_under_managed() {
         let underlying = Address::random();
         let derivative = Address::random();
         let orderbook = Address::random();
         let usdc = Address::random();
+        let inventory = Address::random();
         let assets = assets_with([(
             "AAPL",
             equity_asset(
@@ -597,9 +599,7 @@ mod tests {
 
         let targets = build_approval_targets(
             ChainRole::Primary,
-            InventoryMode::Managed {
-                inventory: Address::random(),
-            },
+            InventoryMode::Managed { inventory },
             &assets,
             orderbook,
             usdc,
@@ -607,12 +607,26 @@ mod tests {
 
         assert_eq!(
             targets,
-            vec![ApprovalTarget {
-                token: underlying,
-                spender: derivative,
-                symbol: Some("AAPL".parse().unwrap()),
-                purpose: ApprovalPurpose::WrapUnderlying,
-            }]
+            vec![
+                ApprovalTarget {
+                    token: underlying,
+                    spender: derivative,
+                    symbol: Some("AAPL".parse().unwrap()),
+                    purpose: ApprovalPurpose::WrapUnderlying,
+                },
+                ApprovalTarget {
+                    token: derivative,
+                    spender: inventory,
+                    symbol: Some("AAPL".parse().unwrap()),
+                    purpose: ApprovalPurpose::DepositWrappedEquity,
+                },
+                ApprovalTarget {
+                    token: usdc,
+                    spender: inventory,
+                    symbol: None,
+                    purpose: ApprovalPurpose::DepositUsdc,
+                },
+            ]
         );
     }
 

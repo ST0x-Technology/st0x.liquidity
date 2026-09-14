@@ -9637,7 +9637,7 @@ mod tests {
 
     /// The deploy gate proves coverage for every chain startup grants
     /// approvals on, so the inputs list each hedged chain with its own
-    /// orderbook and asset table -- not only the primary's.
+    /// orderbook, inventory mode and asset table -- not only the primary's.
     #[cfg(feature = "wallet-turnkey")]
     #[test]
     fn load_turnkey_approval_policy_inputs_list_every_hedged_chain() {
@@ -9788,17 +9788,23 @@ mod tests {
             inputs
                 .hedged
                 .iter()
-                .map(|chain| (chain.chain, chain.role, chain.orderbook))
+                .map(|chain| (chain.chain, chain.role, chain.inventory, chain.orderbook))
                 .collect::<Vec<_>>(),
             vec![
                 (
                     Chain::Base,
                     crate::ChainRole::Primary,
+                    InventoryMode::Managed {
+                        inventory: address!("0x2222222222222222222222222222222222222222")
+                    },
                     address!("0x1111111111111111111111111111111111111111")
                 ),
                 (
                     Chain::Ethereum,
                     crate::ChainRole::Secondary,
+                    InventoryMode::Managed {
+                        inventory: address!("0x2222222222222222222222222222222222222222")
+                    },
                     address!("0x9999999999999999999999999999999999999999")
                 ),
             ]

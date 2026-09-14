@@ -490,7 +490,7 @@ mod tests {
         ChainAssets, ChainEquities, ChainEquityAsset, ChainRole, InventoryMode, OperationMode,
     };
     use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect, TurnkeyPolicySnapshot};
-    use st0x_evm::{USDC_ETHEREUM, USDC_HYPEREVM};
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
 
     use super::*;
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
@@ -895,13 +895,17 @@ mod tests {
 
     /// One hedged chain listing a trading-only AAPL: underlying 0x11..
     /// wraps into vault 0x22.., which deposits into orderbook 0x33.. -- the
-    /// same addresses the policy fixtures above name. Legacy inventory, so
-    /// the orderbook deposit grants are in the target set to be covered.
-    fn chain_inputs(chain: Chain, role: ChainRole) -> ChainApprovalInputs {
+    /// same addresses the policy fixtures above name. The inventory mode
+    /// decides which spender the two deposit grants must be covered for.
+    fn chain_inputs(
+        chain: Chain,
+        role: ChainRole,
+        inventory: InventoryMode,
+    ) -> ChainApprovalInputs {
         ChainApprovalInputs {
             chain,
             role,
-            inventory: InventoryMode::Legacy,
+            inventory,
             orderbook: address!("0x3333333333333333333333333333333333333333"),
             assets: ChainAssets {
                 equities: ChainEquities {
@@ -943,7 +947,11 @@ mod tests {
         let wallet_address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
 
         let covered = verify_hedged_chains(
-            &[chain_inputs(Chain::Base, ChainRole::Primary)],
+            &[chain_inputs(
+                Chain::Base,
+                ChainRole::Primary,
+                InventoryMode::Legacy,
+            )],
             &policies,
             wallet_address,
         )
@@ -952,8 +960,8 @@ mod tests {
 
         let error = verify_hedged_chains(
             &[
-                chain_inputs(Chain::Base, ChainRole::Primary),
-                chain_inputs(Chain::Ethereum, ChainRole::Secondary),
+                chain_inputs(Chain::Base, ChainRole::Primary, InventoryMode::Legacy),
+                chain_inputs(Chain::Ethereum, ChainRole::Secondary, InventoryMode::Legacy),
             ],
             &policies,
             wallet_address,
@@ -975,7 +983,11 @@ mod tests {
 
     #[test]
     fn hedged_hyperevm_requires_policy_for_its_canonical_usdc() {
-        let hedged = [chain_inputs(Chain::HyperEvm, ChainRole::Secondary)];
+        let hedged = [chain_inputs(
+            Chain::HyperEvm,
+            ChainRole::Secondary,
+            InventoryMode::Legacy,
+        )];
         let wallet_address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
         let condition = format!(
             "eth.tx.chain_id == 999 && eth.tx.to == '{USDC_HYPEREVM:#x}' && \
@@ -1014,6 +1026,68 @@ mod tests {
             )
             .unwrap(),
             1
+        );
+    }
+
+    /// The gate proves the spender startup actually approves, so a managed
+    /// chain's two deposit grants must be covered for its inventory: a policy
+    /// that only authorizes the orderbook as spender leaves both uncovered,
+    /// and the inventory-spender policy covers all three targets.
+    #[test]
+    fn managed_chain_coverage_follows_the_inventory_spender() {
+        let inventory = address!("0x4444444444444444444444444444444444444444");
+        let hedged = [chain_inputs(
+            Chain::Base,
+            ChainRole::Primary,
+            InventoryMode::Managed { inventory },
+        )];
+        let wallet_address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
+        let spender_allow = |spender: &str| {
+            tag_allow(&format!(
+                "activity.type == 'ACTIVITY_TYPE_SIGN_TRANSACTION_V2' && \
+                 eth.tx.chain_id == 8453 && \
+                 eth.tx.data[2..10] == '095ea7b3' && \
+                 eth.tx.data[34..74] in \
+                 ['2222222222222222222222222222222222222222', '{spender}']"
+            ))
+        };
+
+        let error = verify_hedged_chains(
+            &hedged,
+            &snapshot(vec![spender_allow(
+                "3333333333333333333333333333333333333333",
+            )]),
+            wallet_address,
+        )
+        .unwrap_err();
+        let ChainCoverageError::MissingCoverage(missing) = error;
+
+        assert_eq!(
+            missing
+                .missing
+                .iter()
+                .map(|target| (target.token, target.spender, target.purpose))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    address!("0x2222222222222222222222222222222222222222"),
+                    inventory,
+                    ApprovalPurpose::DepositWrappedEquity
+                ),
+                (USDC_BASE, inventory, ApprovalPurpose::DepositUsdc),
+            ],
+            "the orderbook-spender policy must not cover the inventory grants"
+        );
+        assert_eq!(
+            verify_hedged_chains(
+                &hedged,
+                &snapshot(vec![spender_allow(
+                    "4444444444444444444444444444444444444444",
+                )]),
+                wallet_address,
+            )
+            .unwrap(),
+            3
         );
     }
 }
