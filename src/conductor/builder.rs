@@ -1722,9 +1722,12 @@ mod tests {
 
     /// Vault polling is what seeds a chain's inventory slots, so every
     /// watched chain needs an entry of its own -- keyed on that chain's
-    /// orderbook and vault owner, not the primary's.
-    #[test]
-    fn vault_polling_entries_cover_every_watched_chain() {
+    /// orderbook and vault owner, not the primary's, and reading through that
+    /// chain's own provider. An entry holding another chain's provider reads
+    /// balances that chain never held into this chain's slot, so the read each
+    /// entry performs is pinned too, not just its addresses.
+    #[tokio::test]
+    async fn vault_polling_entries_cover_every_watched_chain() {
         let ethereum_orderbook = Address::repeat_byte(0xe0);
         let ethereum_vault_owner = Address::repeat_byte(0xe1);
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
@@ -1736,30 +1739,92 @@ mod tests {
                 .call(),
         );
 
+        // Each chain's transport serves a block height only that chain
+        // reports, so the height an entry reads names the provider it holds.
+        // The primary's height is queued twice so an entry wrongly built on
+        // the primary's provider reads a mismatched height rather than
+        // draining an exhausted queue.
+        let base_block = 100u64;
+        let ethereum_block = 205u64;
+        let base_asserter = Asserter::new();
+        base_asserter.push_success(&serde_json::Value::from(base_block));
+        base_asserter.push_success(&serde_json::Value::from(base_block));
+        let ethereum_asserter = Asserter::new();
+        ethereum_asserter.push_success(&serde_json::Value::from(ethereum_block));
+
         let entries = vault_polling_entries(
             &ctx,
-            &ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            &ProviderBuilder::new().connect_mocked_client(base_asserter),
             &BTreeMap::from([(
                 Chain::Ethereum,
-                ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+                ProviderBuilder::new().connect_mocked_client(ethereum_asserter),
             )]),
         )
         .unwrap();
 
+        let mut wiring = Vec::new();
+        for entry in &entries {
+            wiring.push((
+                entry.chain,
+                entry.orderbook,
+                entry.vault_owner,
+                entry.raindex_service.latest_block_number().await.unwrap(),
+            ));
+        }
+
         assert_eq!(
-            entries
-                .iter()
-                .map(|entry| (entry.chain, entry.orderbook, entry.vault_owner))
-                .collect::<Vec<_>>(),
+            wiring,
             vec![
                 (
                     Chain::Base,
                     ctx.chains.primary().orderbook,
-                    ctx.chains.primary().vault_owner
+                    ctx.chains.primary().vault_owner,
+                    base_block
                 ),
-                (Chain::Ethereum, ethereum_orderbook, ethereum_vault_owner),
+                (
+                    Chain::Ethereum,
+                    ethereum_orderbook,
+                    ethereum_vault_owner,
+                    ethereum_block
+                ),
             ],
-            "each watched chain must get its own vault-polling entry"
+            "each watched chain must get its own vault-polling entry, reading through its own \
+             provider"
+        );
+    }
+
+    /// A watched chain with no provider wired must refuse the spawn. Skipping
+    /// it silently leaves that chain's inventory slots empty for the process
+    /// lifetime: nothing corrects drift there and no fill-absorption
+    /// watermark ever advances.
+    #[test]
+    fn vault_polling_entries_refuse_a_watched_chain_without_a_provider() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.insert_secondary(
+            st0x_config::TradingChain::test()
+                .chain(Chain::Ethereum)
+                .call(),
+        );
+
+        // `let-else` rather than `unwrap_err`: the success type holds a
+        // provider and is not `Debug`.
+        let Err(error) = vault_polling_entries(
+            &ctx,
+            &ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            &BTreeMap::new(),
+        ) else {
+            panic!("a watched chain with no vault-polling provider must refuse the spawn");
+        };
+
+        assert!(
+            matches!(
+                error,
+                ConductorSpawnError::MissingWatchWiring {
+                    chain: Chain::Ethereum,
+                    what: "vault polling provider"
+                }
+            ),
+            "a watched chain with no vault-polling provider must refuse the spawn, got {error:?}"
         );
     }
 
