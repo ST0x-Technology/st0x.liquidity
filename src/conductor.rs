@@ -1402,10 +1402,10 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .collect()
 }
 
-/// The startup approval targets of every hedged chain, keyed by chain: where
-/// the chain rebalances equity, each enabled equity's wrap grant, plus the
-/// deposit grants against its own orderbook that its inventory mode still
-/// settles through.
+/// The startup approval targets of every hedged chain, keyed by chain: its
+/// canonical USDC and, where the chain rebalances equity, each enabled
+/// equity's wrap and deposit grants -- the deposit grants against the spender
+/// its inventory mode settles through, its own orderbook or its inventory.
 fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
     ctx.chains
         .hedged_with_roles()
@@ -1427,11 +1427,12 @@ fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
 }
 
 /// Grants one-time idempotent MAX ERC20 approvals to the trusted spenders at
-/// startup, on every hedged chain: on the primary and every secondary that
-/// rebalances equity each enabled equity's underlying -> wrapper vault, and on
-/// a legacy-inventory chain that chain's USDC -> orderbook and wrapped -> that
-/// chain's orderbook. Submitted through that chain's wallet so confirmations
-/// and nonce handling match every other on-chain write there.
+/// startup, on every hedged chain: that chain's USDC -> its deposit spender,
+/// and on the primary and every secondary that rebalances equity each enabled
+/// equity's underlying -> wrapper vault and wrapped -> that same deposit
+/// spender (the chain's orderbook in legacy inventory mode, its inventory in
+/// managed mode), submitted through that chain's wallet so confirmations and
+/// nonce handling match every other on-chain write there.
 ///
 /// Skips entirely when no wallet is configured -- without one the bot never
 /// wraps or deposits, so it has no allowances to grant.

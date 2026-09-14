@@ -1,22 +1,25 @@
 //! One-time idempotent MAX ERC20 approvals granted on startup.
 //!
 //! The market maker repeatedly wraps tokenized equity into its ERC-4626 vault
-//! and deposits both wrapped equity and USDC into the Raindex orderbook. The
-//! per-operation approve transactions that previously preceded each of those
-//! actions were gas-coupled and race-prone: an approve that could not land on
-//! low gas, or a stale allowance read served by a lagging load-balanced RPC
-//! node, left the subsequent `transferFrom` to revert with
-//! `ERC20InsufficientAllowance` -- which in turn wedged unwrapped-equity
-//! recovery.
+//! and deposits both wrapped equity and USDC into its Raindex vaults: against
+//! the orderbook in legacy inventory mode, against the shared
+//! `RaindexInventory` in managed mode. The per-operation approve transactions
+//! that previously preceded each of those actions were gas-coupled and
+//! race-prone: an approve that could not land on low gas, or a stale allowance
+//! read served by a lagging load-balanced RPC node, left the subsequent
+//! `transferFrom` to revert with `ERC20InsufficientAllowance` -- which in turn
+//! wedged unwrapped-equity recovery.
 //!
 //! This module grants a single `U256::MAX` allowance per `(token, spender)`
 //! pair at startup, to the trusted spenders only: our own ERC-4626 wrapper
-//! vaults, and the Raindex orderbook where deposits still settle against it.
-//! The grant is idempotent -- an allowance already at or near max is left
-//! untouched -- so restarts do not re-submit redundant approves. The
-//! per-operation approvals remain in place as a defensive fallback; once the
-//! startup grant lands they short-circuit to a no-op because the allowance
-//! already exceeds any operation amount.
+//! vaults and the chain's deposit spender. The grant is idempotent -- an
+//! allowance already at or near max is left untouched -- so restarts do not
+//! re-submit redundant approves. The per-operation approvals remain in place
+//! as a defensive fallback; once the startup grant lands they short-circuit to
+//! a no-op while the allowance still covers the operation amount. USDC
+//! (FiatToken v2.2) decrements even a MAX allowance on each `transferFrom`, so
+//! its grant drains: a later startup re-grants it once it falls below
+//! [`MAX_APPROVAL_WATERMARK`].
 
 use std::future::Future;
 
@@ -84,9 +87,10 @@ pub(crate) struct ApprovalTarget {
 pub(crate) enum ApprovalPurpose {
     /// `approve(underlying tToken -> wtToken vault)` -- enables wrapping.
     WrapUnderlying,
-    /// `approve(wtToken -> orderbook)` -- enables depositing wrapped equity.
+    /// `approve(wtToken -> deposit spender)` -- enables depositing wrapped
+    /// equity into the chain's Raindex vaults.
     DepositWrappedEquity,
-    /// `approve(USDC -> orderbook)` -- enables USDC vault deposits.
+    /// `approve(USDC -> deposit spender)` -- enables USDC vault deposits.
     DepositUsdc,
 }
 
@@ -95,8 +99,8 @@ impl ApprovalPurpose {
     const fn note(self) -> &'static str {
         match self {
             Self::WrapUnderlying => "startup MAX approve: underlying -> wrapper vault",
-            Self::DepositWrappedEquity => "startup MAX approve: wrapped equity -> orderbook",
-            Self::DepositUsdc => "startup MAX approve: USDC -> orderbook",
+            Self::DepositWrappedEquity => "startup MAX approve: wrapped equity -> deposit spender",
+            Self::DepositUsdc => "startup MAX approve: USDC -> deposit spender",
         }
     }
 }
@@ -130,17 +134,18 @@ pub(crate) enum StartupApprovalError {
     },
 }
 
-/// Builds the deterministic list of startup approval targets: the wrap grant
-/// of every equity the chain wraps in its role (the same selection the
-/// tokenization preflight attests, so no grant targets a vault the preflight
-/// never checked), plus the deposit grants that chain's inventory mode makes
-/// the orderbook the spender of.
+/// Builds the deterministic list of startup approval targets: the two
+/// wrap/deposit grants of every equity the chain wraps in its role (the same
+/// selection the tokenization preflight attests, so no grant targets a vault
+/// the preflight never checked), then the single USDC grant on every chain. A
+/// hedge-only secondary has no wrapper to approve, so it gets the USDC grant
+/// alone.
 ///
-/// The orderbook is the deposit spender in [`InventoryMode::Legacy`] only. A
-/// managed chain deposits through its `RaindexInventory`, approved lazily on
-/// the deposit path, so an orderbook allowance there is never spent -- and the
-/// startup revoke of stale pre-migration allowances would clear it again on
-/// the next boot.
+/// Both deposit grants name the spender that chain settles deposits through:
+/// its orderbook in [`InventoryMode::Legacy`], its shared `RaindexInventory`
+/// in [`InventoryMode::Managed`]. Under managed inventory that keeps them
+/// clear of the startup revoke, which clears orderbook allowances only, while
+/// the deploy gate still proves a policy for both deposit tokens.
 pub(crate) fn build_approval_targets(
     role: ChainRole,
     inventory: InventoryMode,
@@ -148,9 +153,9 @@ pub(crate) fn build_approval_targets(
     orderbook: Address,
     usdc: Address,
 ) -> Vec<ApprovalTarget> {
-    let deposits_through_orderbook = match inventory {
-        InventoryMode::Legacy => true,
-        InventoryMode::Managed { .. } => false,
+    let deposit_spender = match inventory {
+        InventoryMode::Legacy => orderbook,
+        InventoryMode::Managed { inventory } => inventory,
     };
     let mut targets = Vec::new();
 
@@ -165,24 +170,20 @@ pub(crate) fn build_approval_targets(
             purpose: ApprovalPurpose::WrapUnderlying,
         });
 
-        if deposits_through_orderbook {
-            targets.push(ApprovalTarget {
-                token: derivative,
-                spender: orderbook,
-                symbol: Some(symbol.clone()),
-                purpose: ApprovalPurpose::DepositWrappedEquity,
-            });
-        }
-    }
-
-    if deposits_through_orderbook {
         targets.push(ApprovalTarget {
-            token: usdc,
-            spender: orderbook,
-            symbol: None,
-            purpose: ApprovalPurpose::DepositUsdc,
+            token: derivative,
+            spender: deposit_spender,
+            symbol: Some(symbol.clone()),
+            purpose: ApprovalPurpose::DepositWrappedEquity,
         });
     }
+
+    targets.push(ApprovalTarget {
+        token: usdc,
+        spender: deposit_spender,
+        symbol: None,
+        purpose: ApprovalPurpose::DepositUsdc,
+    });
 
     targets
 }
