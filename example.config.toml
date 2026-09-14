@@ -83,12 +83,14 @@ extended_hours_counter_trading = "disabled"
 #
 #   disabled     -- not constructed at all: no RPC, no watcher, no signer.
 #   observe-only -- the bot reads this chain; it places no orders and moves no
-#                   funds. Refused on a chain whose assets have
-#                   trading = "enabled", since those fills would be recorded
-#                   and never hedged.
+#                   funds. Refused on a chain whose assets enable trading or
+#                   rebalancing.
 #   prefunded    -- the bot holds and moves funds here, but tops them up by
-#                   hand; no rebalancing.
+#                   hand. Trading may be enabled; rebalancing may not.
 #   active       -- rebalancing runs too, subject to the per-asset flags.
+#
+# The hedged chain whose trading table sets primary = true must be active;
+# observe-only and prefunded are valid for secondary hedged or transport chains.
 #
 # Startup refuses a state this build cannot serve, naming what is missing:
 # a chain with no fill watcher cannot trade, and one whose gas token is not
@@ -154,8 +156,9 @@ ingestion_cutoff = "safe"
 # Seconds between fill-watch poll cycles on this chain (required; was the
 # global order_fill_poll_interval with a hidden default of 5).
 order_fill_poll_interval_secs = 5
-# Exactly one hedged chain is the primary: the one whose inventory the bot
-# polls and rebalances automatically. Fills are hedged on every hedged chain.
+# Exactly one hedged chain is the active primary: the one whose inventory the
+# bot rebalances automatically. Fills and vault balances are polled on every
+# hedged chain.
 primary = true
 # Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption go
 # here. Per chain: a redemption delivers tokens that exist on one chain, so
