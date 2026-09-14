@@ -89,8 +89,9 @@ pub(crate) enum Debug {
     Resume,
     /// Re-check a stuck transfer by kind and aggregate id.
     Recheck {
-        /// Transfer kind path segment (for example mint or redemption).
-        kind: String,
+        /// Transfer kind to recheck.
+        #[arg(value_enum)]
+        kind: RecheckTransferType,
         /// Aggregate id path segment.
         id: String,
     },
@@ -165,6 +166,16 @@ pub(crate) enum UsdcDirection {
 pub(crate) enum EquityTransferKind {
     Mint,
     Redemption,
+}
+
+/// Recheck transfer kind. A superset of `EquityTransferKind`: a failed USDC
+/// deposit leg is recheckable too. Each variant maps to the bot's recheck path
+/// segment in `main.rs`.
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum RecheckTransferType {
+    Mint,
+    Redemption,
+    Usdc,
 }
 
 #[derive(Subcommand)]

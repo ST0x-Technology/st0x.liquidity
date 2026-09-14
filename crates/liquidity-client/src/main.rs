@@ -13,7 +13,8 @@ use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
 use crate::cli::{
-    Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read, UsdcDirection,
+    Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read,
+    RecheckTransferType, UsdcDirection,
 };
 use crate::output::OutputError;
 use crate::target::Auth;
@@ -164,7 +165,11 @@ async fn dispatch<A: TokenSource + Sync>(
         }
         Command::Debug(Debug::Resume) => client.post("/transfers/resume").await?,
         Command::Debug(Debug::Recheck { kind, id }) => {
-            let kind = encode_segment(&kind);
+            let kind = match kind {
+                RecheckTransferType::Mint => "equity_mint",
+                RecheckTransferType::Redemption => "equity_redemption",
+                RecheckTransferType::Usdc => "usdc_bridge",
+            };
             let id = encode_segment(&id);
             client
                 .post(&format!("/transfers/recheck/{kind}/{id}"))
@@ -282,8 +287,8 @@ mod tests {
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
         Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read, ReadResource,
-        ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs, TradeEventsArgs,
-        TransferEventsArgs, UsdcDirection,
+        RecheckTransferType, ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs,
+        TradeEventsArgs, TransferEventsArgs, UsdcDirection,
     };
     use crate::output::OutputError;
     use crate::transport::{Client, TransportError};
@@ -428,16 +433,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recheck_posts_the_write_path() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::Recheck {
-            kind: "mint".to_owned(),
-            id: "abc".to_owned(),
-        }))
-        .await?;
-        assert_eq!(
-            request_line(&request),
-            "POST /liquidity-write/transfers/recheck/mint/abc HTTP/1.1"
-        );
+    async fn recheck_maps_each_kind_to_its_write_path() -> Result<(), Box<dyn std::error::Error>> {
+        for (kind, segment) in [
+            (RecheckTransferType::Mint, "equity_mint"),
+            (RecheckTransferType::Redemption, "equity_redemption"),
+            (RecheckTransferType::Usdc, "usdc_bridge"),
+        ] {
+            let request = request_for(Command::Debug(Debug::Recheck {
+                kind,
+                id: "abc".to_owned(),
+            }))
+            .await?;
+            assert_eq!(
+                request_line(&request),
+                format!("POST /liquidity-write/transfers/recheck/{segment}/abc HTTP/1.1")
+            );
+        }
         Ok(())
     }
 
