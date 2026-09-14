@@ -17,7 +17,7 @@ use st0x_wrapper::{UnderlyingPerWrapped, WrapperError};
 use super::{RebalancingService, TokenAddressError, TriggeredOperation};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
-    BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold,
+    BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold, Venue,
 };
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
@@ -441,18 +441,23 @@ pub(super) async fn check_imbalance_and_build_operation(
     };
 
     let Some(imbalance) = imbalance else {
-        trace!(
-            target: "rebalance",
-            %symbol,
-            %hedge_floor,
-            "No equity imbalance detected (balanced, partial data, or inflight)"
-        );
+        trace!(target: "rebalance", %symbol, "No equity imbalance detected (balanced, partial data, or inflight)");
         return Ok(None);
     };
 
     Ok(Some(match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let quantity = truncate_for_alpaca(symbol, cap_shares(symbol, excess, shares_limit))?;
+            let offchain_available = inventory
+                .read()
+                .await
+                .equity_available(symbol, Venue::Hedging)
+                .unwrap_or(FractionalShares::ZERO);
+            let Some(mintable) =
+                mintable_above_floor(symbol, excess, offchain_available, hedge_floor)?
+            else {
+                return Ok(None);
+            };
+            let quantity = truncate_for_alpaca(symbol, cap_shares(symbol, mintable, shares_limit))?;
             TriggeredOperation::Mint {
                 symbol: symbol.clone(),
                 quantity,
@@ -468,6 +473,44 @@ pub(super) async fn check_imbalance_and_build_operation(
             }
         }
     }))
+}
+
+/// Caps a mint so the broker keeps `hedge_floor` shares of the symbol, the
+/// same residual a sell hedge leaves. `None` when the book is the floor or
+/// less: balanced enough, decided here rather than inside the imbalance
+/// ratio so a floor-only book never reads as an imbalance.
+fn mintable_above_floor(
+    symbol: &Symbol,
+    excess: FractionalShares,
+    offchain_available: FractionalShares,
+    hedge_floor: FractionalShares,
+) -> Result<Option<FractionalShares>, FloatError> {
+    let above_floor = (offchain_available - hedge_floor)?;
+
+    if !above_floor.inner().gt(FractionalShares::ZERO.inner())? {
+        trace!(
+            target: "rebalance",
+            %symbol,
+            offchain = %offchain_available,
+            floor = %hedge_floor,
+            "Skipping mint: broker book is at or below the hedge floor"
+        );
+        return Ok(None);
+    }
+
+    if excess > above_floor {
+        debug!(
+            target: "rebalance",
+            %symbol,
+            computed = %excess,
+            floor = %hedge_floor,
+            capped = %above_floor,
+            "Equity mint capped to keep the hedge floor"
+        );
+        return Ok(Some(above_floor));
+    }
+
+    Ok(Some(excess))
 }
 
 fn cap_shares(
@@ -661,7 +704,7 @@ mod tests {
 
     use super::*;
     use crate::inventory::view::Operator;
-    use crate::inventory::{Inventory, InventoryView, TransferOp, Venue};
+    use crate::inventory::{Inventory, InventoryView, TransferOp};
 
     fn make_in_progress() -> Arc<std::sync::RwLock<HashMap<Symbol, GuardState>>> {
         Arc::new(std::sync::RwLock::new(HashMap::new()))
