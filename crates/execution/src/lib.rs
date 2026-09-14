@@ -761,17 +761,24 @@ pub(crate) fn buying_power_counter_trade_preflight(
 static MINIMUM_PARTIAL_HEDGE_SHARES: LazyLock<Float> = LazyLock::new(|| float!(0.01));
 
 /// Resolves whether a sell counter-trade should proceed given the available
-/// broker inventory. Returns:
-/// - `Allowed` with full shares when inventory covers the request
-/// - `Allowed` with capped shares when inventory is partial but above the
-///   minimum threshold
-/// - `Skipped` when inventory is zero or below the minimum threshold
+/// broker inventory and the shares the hedge floor keeps in the account.
+/// Only `available - floor` is ever offered to the order; the reservation
+/// carries that same figure so a batch of hedges cannot sum past the floor.
+/// Returns:
+/// - `Allowed` with full shares when the sellable book covers the request
+/// - `Allowed` with capped shares when the sellable book is partial but
+///   above the minimum threshold
+/// - `Skipped` with `HeldAtFloor` when inventory exists but the floor keeps
+///   all of it, and `InsufficientEquity` when there is no inventory to speak
+///   of
 pub(crate) fn resolve_sell_preflight(
     order: MarketOrder,
     available: FractionalShares,
     floor: FractionalShares,
 ) -> Result<CounterTradePreflight, FloatError> {
-    let sufficient = available.inner().gte(order.shares.inner().inner())?;
+    let sellable = sellable_above_floor(available, floor)?;
+    let requested = order.shares.inner().inner();
+    let sufficient = sellable.inner().gte(requested)?;
 
     if sufficient {
         debug!(
@@ -787,37 +794,75 @@ pub(crate) fn resolve_sell_preflight(
             reservation: Some(CounterTradeReservation::Equity {
                 symbol: order.symbol,
                 required: order.shares,
-                available,
+                available: sellable,
             }),
         });
     }
 
-    let above_minimum = available.inner().gte(*MINIMUM_PARTIAL_HEDGE_SHARES)?;
+    let above_minimum = sellable.inner().gte(*MINIMUM_PARTIAL_HEDGE_SHARES)?;
 
-    if above_minimum && let Ok(capped) = Positive::new(available) {
-        info!(
-            target: "broker",
-            symbol = %order.symbol,
-            available = %available,
-            requested = %order.shares,
-            "Partial hedge: capping sell to available inventory"
-        );
+    if above_minimum && let Ok(capped) = Positive::new(sellable) {
+        if available.inner().gte(requested)? {
+            info!(
+                target: "broker",
+                symbol = %order.symbol,
+                available = %available,
+                floor = %floor,
+                requested = %order.shares,
+                "Partial hedge: holding shares at the hedge floor"
+            );
+        } else {
+            info!(
+                target: "broker",
+                symbol = %order.symbol,
+                available = %available,
+                floor = %floor,
+                requested = %order.shares,
+                "Partial hedge: capping sell to available inventory"
+            );
+        }
 
-        Ok(CounterTradePreflight::Allowed {
+        return Ok(CounterTradePreflight::Allowed {
             reservation: Some(CounterTradeReservation::Equity {
                 symbol: order.symbol,
                 required: capped,
-                available,
+                available: sellable,
             }),
-        })
-    } else {
-        Ok(CounterTradePreflight::Skipped(
-            CounterTradeSkipReason::InsufficientEquity {
-                required: order.shares,
+        });
+    }
+
+    // Inventory the broker would have sold sits under the floor: expected,
+    // and a different runbook from an empty account.
+    if available.inner().gte(*MINIMUM_PARTIAL_HEDGE_SHARES)? {
+        return Ok(CounterTradePreflight::Skipped(
+            CounterTradeSkipReason::HeldAtFloor {
+                symbol: order.symbol,
+                floor,
                 available,
             },
-        ))
+        ));
     }
+
+    Ok(CounterTradePreflight::Skipped(
+        CounterTradeSkipReason::InsufficientEquity {
+            required: order.shares,
+            available,
+        },
+    ))
+}
+
+/// `available - floor`, clamped at zero.
+fn sellable_above_floor(
+    available: FractionalShares,
+    floor: FractionalShares,
+) -> Result<FractionalShares, FloatError> {
+    let sellable = (available - floor)?;
+
+    if sellable.inner().lt(FractionalShares::ZERO.inner())? {
+        return Ok(FractionalShares::ZERO);
+    }
+
+    Ok(sellable)
 }
 
 /// Trait for converting executor contexts into their corresponding executor implementations
