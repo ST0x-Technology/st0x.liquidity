@@ -1326,8 +1326,9 @@ mod tests {
     use st0x_evm::Chain;
     use st0x_execution::{
         AlpacaBrokerApiError, AlpacaMarketDataError, CancellationOutcome, ClientOrderId, Direction,
-        ExecutorOrderId, FractionalShares, Inventory, LimitOrder, MockExecutor, MockExecutorCtx,
-        OrderState, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
+        EquityPosition, ExecutorOrderId, FractionalShares, HedgeFloor, Inventory, LimitOrder,
+        MockExecutor, MockExecutorCtx, OrderState, Positive, SupportedExecutor, Symbol,
+        TryIntoExecutor,
     };
     use st0x_finance::Usd;
     use st0x_float_macro::float;
@@ -2758,6 +2759,65 @@ mod tests {
         assert!(rendered.contains("close_flatten_blocked_total{"));
         assert!(rendered.contains("reason=\"insufficient_equity\""));
         assert!(rendered.contains("symbol=\"AAPL\""));
+    }
+
+    /// Close-flatten sells run the same scan-time preflight as every sell,
+    /// so the floor holds there with no special handling: a book of exactly
+    /// the floor leaves nothing to flatten with, and the block is labelled
+    /// as the floor, not as an empty account.
+    #[tokio::test]
+    async fn close_flatten_sell_is_held_at_the_hedge_floor() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
+            .with_inventory(Inventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(1)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 100_000,
+                cash_buying_power_cents: Some(100_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            })
+            .with_hedge_floor(HedgeFloor::new(
+                FractionalShares::new(float!(1)),
+                std::collections::HashMap::new(),
+            ));
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("close_flatten_blocked_total{")
+                && rendered.contains("reason=\"held_at_floor\"")
+                && rendered.contains("symbol=\"AAPL\""),
+            "expected a held_at_floor close-flatten block, got:\n{rendered}"
+        );
     }
 
     #[tokio::test]
