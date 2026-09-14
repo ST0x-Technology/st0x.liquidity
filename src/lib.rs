@@ -246,7 +246,7 @@ async fn run_bot_session_inner(
     let metrics_handle = metrics::setup().context("failed to install Prometheus recorder")?;
 
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
-        inventory::InventoryView::for_trading_chain(ctx.chains.primary().chain),
+        inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain),
         event_sender.clone(),
     ));
     let equity_prices =
@@ -319,8 +319,8 @@ async fn run_bot_session_inner(
     });
     let order_fill_monitor_tokens: std::collections::BTreeMap<_, _> = ctx
         .chains
-        .watched()
-        .map(|watched| (watched.chain, startup_barrier.token()))
+        .hedged()
+        .map(|hedged| (hedged.chain, startup_barrier.token()))
         .collect();
     let mut bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,

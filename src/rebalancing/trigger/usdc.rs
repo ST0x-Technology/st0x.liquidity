@@ -355,7 +355,7 @@ pub(super) async fn check_imbalance_and_build_operation(
         let inventory = inventory.read().await;
         let imbalance = inventory
             .check_usdc_imbalance_with_gross_offchain(
-                inventory.trading_chain(),
+                inventory.primary_chain(),
                 threshold,
                 reserved,
             )
@@ -1577,13 +1577,13 @@ mod tests {
         );
     }
 
-    /// The imbalance check must read the configured trading chain's USDC
+    /// The imbalance check must read the configured primary chain's USDC
     /// slot, not `Chain::Base`: with the balance stored under Ethereum, a
     /// Base-hardcoded read would see no onchain venue and skip with
     /// `NoImbalance` instead of computing the excess.
     #[tokio::test]
-    async fn imbalance_check_reads_the_configured_trading_chain_slot() {
-        let inventory = InventoryView::for_trading_chain(Chain::Ethereum)
+    async fn imbalance_check_reads_the_configured_primary_chain_slot() {
+        let inventory = InventoryView::for_primary_chain(Chain::Ethereum)
             .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
             .with_withdrawable_cash_cents(50_000);
 
@@ -1601,7 +1601,7 @@ mod tests {
             Ok(UsdcRebalanceOperation::AlpacaToBase {
                 amount: Usdc::new(float!(200))
             }),
-            "the Ethereum trading chain's slot must drive the imbalance, got {result:?}"
+            "the Ethereum primary chain's slot must drive the imbalance, got {result:?}"
         );
     }
 

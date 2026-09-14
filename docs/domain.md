@@ -89,13 +89,27 @@ and confusing.
 
 ## Domain Glossary
 
+### Chain Roles
+
+- **Hedged chain**: a chain whose config carries a `[chains.<name>.trading]`
+  table. The bot runs a fill watcher there, accounts the fills and hedges them
+  with offsetting broker orders. The Rust type is `HedgedChain`; the registry
+  hands them out through `ChainRegistry::hedged`. The TOML key stays `trading`.
+- **Transport chain**: a chain with no trading table -- RPC and confirmations
+  only, used as a cash corridor endpoint.
+- **Primary chain**: THE hedged chain that sets `primary = true`. It is the
+  chain the bot rebalances automatically and the endpoint of the cash corridor.
+  Its vault inventory is polled like every hedged chain's.
+- **Secondary chain**: any other hedged chain. Prefunded: its fills are hedged
+  and its vault inventory is polled, but it is not rebalanced.
+
 ### Trading Venue
 
 A location where trades are executed. The system operates across two types of
 venue:
 
 - **Onchain venue**: A protocol or liquidity source that executes
-  tokenized-equity trades on a watched chain. Raindex is the onchain orderbook
+  tokenized-equity trades on a hedged chain. Raindex is the onchain orderbook
   that holds the bot's tokenized-equity orders and their backing vaults; direct
   fills execute there. A shared-inventory adapter may execute the trade on
   another venue, such as Bebop or Uniswap v4, before settling it through the
