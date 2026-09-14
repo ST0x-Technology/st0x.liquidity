@@ -441,6 +441,66 @@ pub struct TradeProcessingCqrs {
     /// still-open order) is skipped instead of forking a new
     /// self-perpetuating chain.
     pub poll_interval: Duration,
+    /// Test-only coordination hook: pauses the first placement between its
+    /// Position claim and the `OffchainOrder` creation, and signals when a
+    /// racer's reconciliation observes the pending pointer. Lets a test pin the
+    /// exact double-hedge window deterministically instead of relying on
+    /// scheduler timing. `None` in production and in tests that do not use it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub placement_barrier: Option<Arc<PlacementBarrier>>,
+}
+
+/// Deterministic race harness for the placement path (see the
+/// `placement_barrier` field). The first placement to claim the Position parks
+/// at [`Self::on_first_claim`] until [`Self::release`] is signalled, holding
+/// the window open so a concurrent reconciliation is guaranteed to observe the
+/// orphan pointer it would otherwise only see under an unlucky schedule.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+pub struct PlacementBarrier {
+    claim_fired: std::sync::atomic::AtomicBool,
+    claimed: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    saw_pending: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PlacementBarrier {
+    /// Called between the Position claim and the `OffchainOrder` creation. Only
+    /// the first claimer parks (a second claimer in the same test would be the
+    /// buggy double-placement and must not deadlock); it announces `claimed`
+    /// and waits for `release`.
+    async fn on_first_claim(&self) {
+        if self
+            .claim_fired
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.claimed.notify_one();
+        self.release.notified().await;
+    }
+
+    /// Called when a reconciliation finds a pending pointer -- the orphan-misread
+    /// window a concurrent placement opens.
+    fn on_saw_pending(&self) {
+        self.saw_pending.notify_one();
+    }
+
+    /// Awaits the first claimer parking.
+    pub async fn wait_claimed(&self) {
+        self.claimed.notified().await;
+    }
+
+    /// Awaits a racer observing the pending pointer.
+    pub async fn wait_saw_pending(&self) {
+        self.saw_pending.notified().await;
+    }
+
+    /// Releases the parked claimer.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 /// Orchestrates the bot's runtime by composing long-running supervised tasks
@@ -4815,6 +4875,14 @@ async fn place_offchain_order(
         return recover_claimed_offchain_order(execution, cqrs).await;
     }
 
+    // Test hook: hold the window between the Position claim above and the
+    // `OffchainOrder` creation below, so a concurrent reconciliation reliably
+    // observes the orphan pointer. No-op unless a test installs the barrier.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(barrier) = &cqrs.placement_barrier {
+        barrier.on_first_claim().await;
+    }
+
     execute_create_offchain_order(execution, cqrs, offchain_order_id).await?;
 
     let loaded = cqrs
@@ -4855,6 +4923,13 @@ async fn reconcile_existing_pending_order(
     let Some(offchain_order_id) = position.pending_offchain_order_id else {
         return Ok(ExistingPendingOrderOutcome::NoPending);
     };
+
+    // Test hook: announce that this reconciliation observed a pending pointer
+    // (the orphan-misread window). No-op unless a test installs the barrier.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(barrier) = &cqrs.placement_barrier {
+        barrier.on_saw_pending();
+    }
 
     let loaded = cqrs
         .offchain_order
@@ -8970,6 +9045,8 @@ mod tests {
             poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            #[cfg(any(test, feature = "test-support"))]
+            placement_barrier: None,
         };
 
         (cqrs, assets)
@@ -9194,24 +9271,72 @@ mod tests {
         );
     }
 
-    /// Two live ticks racing to hedge the same symbol must place exactly one
-    /// broker order. Both drive the shared `TradeProcessingCqrs` (one
-    /// `counter_trade_submission_lock`), so the reconcile -> claim -> placement
-    /// sequence serializes: the loser cannot observe the winner's Position
-    /// claim before the winner's `OffchainOrder` aggregate exists and clear it
-    /// as an orphan. Regression for the pre-fix window where `process_queued_trade`
-    /// reconciled before taking the lock (mirrors the process-tx path's
-    /// `concurrent_process_tx_and_tick_place_one_hedge`).
+    /// An `OrderPlacer` that counts broker `place_market_order` calls and
+    /// otherwise succeeds, so a test can assert exactly one broker submission.
+    fn counting_order_placer() -> (Arc<dyn OrderPlacer>, Arc<AtomicUsize>) {
+        struct Counting(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl OrderPlacer for Counting {
+            async fn place_market_order(
+                &self,
+                order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                    placed_shares: order.shares,
+                    is_extended_hours: false,
+                    limit_price: None,
+                })
+            }
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                unimplemented!("counting placer: limit orders not used")
+            }
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                unimplemented!("counting placer: cancellation not used")
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        (Arc::new(Counting(count.clone())), count)
+    }
+
+    /// Two live ticks race to hedge the same symbol. The `placement_barrier`
+    /// pins the first claimer in the exact window between its `Position` claim
+    /// and its `OffchainOrder` creation, holding it open until the test
+    /// releases it -- so the race no longer depends on scheduler timing. With
+    /// the fix, the second tick blocks on `counter_trade_submission_lock` the
+    /// claimer holds and cannot reconcile within that window, so it never sees
+    /// the claim as an orphan; the barrier's `saw_pending` signal therefore
+    /// stays silent (the bounded wait elapses) and the second tick only runs
+    /// after the first fully placed, observing the order as in-flight. Exactly
+    /// one broker call and one persisted order. Reverting the lock hoist makes
+    /// the second tick reconcile inside the pinned window, clear the claim as
+    /// an orphan, and place a second order -- which this test then catches.
     #[tokio::test]
     async fn concurrent_live_ticks_place_one_hedge() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
-        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
+        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
             &frameworks,
             &pool,
             ExecutionThreshold::whole_share(),
             &apalis_pool,
         );
+        let barrier = Arc::new(PlacementBarrier::default());
+        let (placer, broker_calls) = counting_order_placer();
+        cqrs.order_placer = placer;
+        cqrs.placement_barrier = Some(barrier.clone());
+        let cqrs = Arc::new(cqrs);
+        let assets = Arc::new(assets);
 
         // Two distinct fills for the same symbol: distinct log_index (and so
         // tx_hash and trade_id) so both are accounted and both reach placement.
@@ -9220,19 +9345,44 @@ mod tests {
         let fill_a = test_trade_with_amount(float!(1.5), 10);
         let fill_b = test_trade_with_amount(float!(1.5), 20);
 
-        let executor = MockExecutor::new();
-        let (result_a, result_b) = tokio::join!(
-            process_queued_trade(&executor, &event_a, fill_a, &cqrs, &assets, true),
-            process_queued_trade(&executor, &event_b, fill_b, &cqrs, &assets, true),
+        let tick = |event: EmittedOnChain<RaindexTradeEvent>, fill: OnchainTrade| {
+            let cqrs = cqrs.clone();
+            let assets = assets.clone();
+            tokio::spawn(async move {
+                let executor = MockExecutor::new();
+                process_queued_trade(&executor, &event, fill, &cqrs, &assets, true).await
+            })
+        };
+
+        let a = tick(event_a, fill_a);
+        // The first claimer has claimed the Position and parked before creating
+        // its OffchainOrder, holding the submission lock.
+        barrier.wait_claimed().await;
+
+        let b = tick(event_b, fill_b);
+        // Give the second tick a bounded chance to reconcile inside the pinned
+        // window. Under the fix it is blocked on the lock and this elapses;
+        // without the fix it reconciles and signals immediately.
+        let saw_pending =
+            tokio::time::timeout(Duration::from_millis(500), barrier.wait_saw_pending())
+                .await
+                .is_ok();
+        assert!(
+            !saw_pending,
+            "the second tick must not reconcile while the first holds the claim window under the lock"
         );
 
-        let placed_count =
-            usize::from(result_a.unwrap().is_some()) + usize::from(result_b.unwrap().is_some());
+        barrier.release();
+        let (result_a, result_b) = tokio::join!(a, b);
+        let placed_count = usize::from(result_a.unwrap().unwrap().is_some())
+            + usize::from(result_b.unwrap().unwrap().is_some());
+        assert_eq!(placed_count, 1, "exactly one tick may place a hedge");
+
         assert_eq!(
-            placed_count, 1,
-            "exactly one concurrent tick may place a hedge"
+            broker_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one broker order must be placed"
         );
-
         let (order_count,): (i64,) = sqlx::query_as(
             "SELECT COUNT(DISTINCT aggregate_id) FROM events \
              WHERE event_type LIKE 'OffchainOrderEvent%'",
@@ -9242,7 +9392,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             order_count, 1,
-            "concurrent live ticks must place exactly one hedge order, got {order_count}"
+            "concurrent live ticks must persist exactly one hedge order, got {order_count}"
         );
     }
 
@@ -10730,6 +10880,8 @@ mod tests {
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            #[cfg(any(test, feature = "test-support"))]
+            placement_barrier: None,
         };
 
         let trade_event = make_trade_event(77);

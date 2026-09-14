@@ -977,6 +977,8 @@ async fn create_test_cqrs(
         order_placer,
         hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
         poll_interval: TEST_POLL_INTERVAL,
+        #[cfg(any(test, feature = "test-support"))]
+        placement_barrier: None,
     };
 
     (

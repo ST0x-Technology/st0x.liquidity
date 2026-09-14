@@ -499,6 +499,8 @@ where
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
         poll_interval,
+        #[cfg(any(test, feature = "test-support"))]
+        placement_barrier: None,
     };
 
     let maintenance_interval = context.executor.maintenance_interval();

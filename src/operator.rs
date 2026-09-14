@@ -2556,6 +2556,8 @@ pub mod process_tx {
                 poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
                 hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
                 poll_interval: TEST_POLL_INTERVAL,
+                #[cfg(any(test, feature = "test-support"))]
+                placement_barrier: None,
             };
 
             // The trade_event payload is never accessed because process_queued_trade
