@@ -2,21 +2,20 @@
 //!
 //! Surfaces the order-fill monitors' block-lag and poll-cycle samples
 //! (recorded by `crate::telemetry`) as the dashboard's ingestion-health
-//! report: per hedged chain, the current block lag and the worst lag per
-//! time bucket; plus poll-cycle duration/error/skipped-tick aggregates.
-//! Strictly read-only.
+//! report: per hedged chain, the current block lag, the worst lag per time
+//! bucket, and that chain's poll-cycle duration/error/skipped-tick
+//! aggregates. Strictly read-only.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use alloy::primitives::Address;
 use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sqlx::SqlitePool;
 use tracing::warn;
 
 use st0x_config::{ChainRegistry, HedgedChain};
 use st0x_dto::{
-    BlockLagPoint, ChainBlockLag, ChainName, DependencyBucket, DependencyName, DependencyStats,
-    MonitorTelemetry, PollHealth,
+    BlockLagPoint, ChainBlockLag, ChainName, ChainPollHealth, DependencyBucket, DependencyName,
+    DependencyStats, MonitorTelemetry,
 };
 use st0x_evm::Chain;
 
@@ -26,10 +25,10 @@ use crate::telemetry::{Monitor, PollOutcome, sqlite_timestamp};
 /// Load the monitors' ingestion-health telemetry for `range`: one block-lag
 /// series per hedged chain (primary first), each scoped to that chain and
 /// its orderbook so a database reused across configs, or two chains sharing
-/// an orderbook address, never mix lag series. Poll health covers every
-/// hedged chain's orderbook: each runs its own fill watcher, so a report
-/// scoped to the primary would read as healthy through a secondary's
-/// outage.
+/// an orderbook address, never mix lag series. Poll health is scoped and
+/// ordered the same way, one report per hedged chain: each runs its own fill
+/// watcher, so a report scoped to the primary would read as healthy through a
+/// secondary's outage.
 ///
 /// The current block lag reflects the latest sample regardless of the
 /// range: it answers "how far behind is detection right now", while the
@@ -151,76 +150,77 @@ async fn block_lag_buckets(
         .collect())
 }
 
+/// One poll report per hedged chain, primary first: each chain runs its own
+/// fill watcher on its own cadence, and a chain with no samples in range
+/// still gets a zeroed report so a silent watcher is visible rather than
+/// absent.
 async fn poll_health(
     pool: &SqlitePool,
     range: &ReportRange,
     chains: &ChainRegistry,
-) -> Result<PollHealth, PerformanceError> {
-    // Deduplicated because deterministic deployments put the same orderbook
-    // address on several chains, and its samples must be counted once.
-    let orderbooks: BTreeSet<Address> = chains.hedged().map(|hedged| hedged.orderbook).collect();
+) -> Result<Vec<ChainPollHealth>, PerformanceError> {
+    let mut reports = Vec::new();
+    for hedged_chain in chains.hedged() {
+        let aggregate = chain_poll_aggregate(pool, range, hedged_chain).await?;
+        let mut durations = chain_poll_durations(pool, range, hedged_chain).await?;
 
-    let mut cycles = 0_i64;
-    let mut errors = 0_i64;
-    let mut skipped_ticks = 0_i64;
-    let mut durations = Vec::new();
-
-    for orderbook in orderbooks {
-        let aggregate = orderbook_poll_aggregate(pool, range, orderbook).await?;
-        cycles += aggregate.cycles;
-        errors += aggregate.errors.unwrap_or(0);
-        skipped_ticks += aggregate.skipped_ticks_sum.unwrap_or(0);
-        durations.extend(orderbook_poll_durations(pool, range, orderbook).await?);
+        reports.push(ChainPollHealth {
+            chain: chain_name(hedged_chain.chain),
+            cycles: count(aggregate.cycles),
+            errors: count(aggregate.errors.unwrap_or(0)),
+            skipped_ticks: count(aggregate.skipped_ticks_sum.unwrap_or(0)),
+            duration: latency_stats(&mut durations),
+        });
     }
 
-    Ok(PollHealth {
-        cycles: count(cycles),
-        errors: count(errors),
-        skipped_ticks: count(skipped_ticks),
-        duration: latency_stats(&mut durations),
-    })
+    Ok(reports)
 }
 
-/// One orderbook's cycle, error and skipped-tick counts. Aggregated in SQL to
-/// avoid materializing potentially large row sets into the heap. The error
-/// count uses the canonical [`PollOutcome`] discriminator so writer and reader
-/// cannot drift.
-async fn orderbook_poll_aggregate(
+/// One hedged chain's cycle, error and skipped-tick counts. Aggregated in SQL
+/// to avoid materializing potentially large row sets into the heap. Scoped to
+/// the chain as well as its orderbook, so two chains sharing a deterministic
+/// orderbook address keep their own counts. The error count uses the canonical
+/// [`PollOutcome`] discriminator so writer and reader cannot drift.
+async fn chain_poll_aggregate(
     pool: &SqlitePool,
     range: &ReportRange,
-    orderbook: Address,
+    hedged_chain: &HedgedChain,
 ) -> Result<AggregateRow, PerformanceError> {
     Ok(sqlx::query_as(
         "SELECT COUNT(*) AS cycles, \
-                SUM(CASE WHEN outcome = $5 THEN 1 ELSE 0 END) AS errors, \
+                SUM(CASE WHEN outcome = $6 THEN 1 ELSE 0 END) AS errors, \
                 SUM(skipped_ticks) AS skipped_ticks_sum \
          FROM poll_cycle_samples \
-         WHERE sampled_at BETWEEN $1 AND $2 AND monitor = $3 AND orderbook = $4",
+         WHERE sampled_at BETWEEN $1 AND $2 AND monitor = $3 AND chain = $4 \
+           AND orderbook = $5",
     )
     .bind(sqlite_timestamp(range.from))
     .bind(sqlite_timestamp(range.to))
     .bind(Monitor::OrderFill.as_str())
-    .bind(orderbook.to_string())
+    .bind(hedged_chain.chain.as_str())
+    .bind(hedged_chain.orderbook.to_string())
     .bind(PollOutcome::Error.as_str())
     .fetch_one(pool)
     .await?)
 }
 
-/// One orderbook's individual cycle durations: percentiles need the raw
+/// One hedged chain's individual cycle durations: percentiles need the raw
 /// values, so this column alone comes back row by row.
-async fn orderbook_poll_durations(
+async fn chain_poll_durations(
     pool: &SqlitePool,
     range: &ReportRange,
-    orderbook: Address,
+    hedged_chain: &HedgedChain,
 ) -> Result<Vec<i64>, PerformanceError> {
     Ok(sqlx::query_scalar(
         "SELECT duration_ms FROM poll_cycle_samples \
-         WHERE sampled_at BETWEEN $1 AND $2 AND monitor = $3 AND orderbook = $4",
+         WHERE sampled_at BETWEEN $1 AND $2 AND monitor = $3 AND chain = $4 \
+           AND orderbook = $5",
     )
     .bind(sqlite_timestamp(range.from))
     .bind(sqlite_timestamp(range.to))
     .bind(Monitor::OrderFill.as_str())
-    .bind(orderbook.to_string())
+    .bind(hedged_chain.chain.as_str())
+    .bind(hedged_chain.orderbook.to_string())
     .fetch_all(pool)
     .await?)
 }
@@ -368,11 +368,11 @@ mod tests {
     use std::convert::Infallible;
     use std::time::Duration as StdDuration;
 
-    use alloy::primitives::address;
+    use alloy::primitives::{Address, address};
     use chrono::TimeZone;
 
     use st0x_config::{ChainRegistry, HedgedChain};
-    use st0x_dto::{ChainBlockLag, ChainName};
+    use st0x_dto::{ChainBlockLag, ChainName, ChainPollHealth};
     use st0x_evm::Chain;
 
     use crate::telemetry::{BlockLagSample, record_block_lag, record_poll_cycle};
@@ -448,6 +448,15 @@ mod tests {
         };
         assert_eq!(series.chain, ChainName::Base);
         series
+    }
+
+    /// The one poll report a Base-only report carries.
+    fn base_poll(telemetry: &MonitorTelemetry) -> &ChainPollHealth {
+        let [poll] = telemetry.poll.as_slice() else {
+            panic!("expected exactly one poll report, got {:?}", telemetry.poll);
+        };
+        assert_eq!(poll.chain, ChainName::Base);
+        poll
     }
 
     /// Two hedged chains keep separate lag series even when the Raindex
@@ -629,6 +638,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(10),
             StdDuration::from_millis(100),
@@ -640,6 +650,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(20),
             StdDuration::from_millis(300),
@@ -652,6 +663,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(-100),
             StdDuration::from_millis(900),
@@ -663,10 +675,11 @@ mod tests {
         // A different monitor's samples must not pollute the aggregates.
         sqlx::query(
             "INSERT INTO poll_cycle_samples \
-             (sampled_at, monitor, orderbook, duration_ms, skipped_ticks, outcome, error) \
-             VALUES ($1, 'other_monitor', $2, 9000, 9, 'ok', NULL)",
+             (sampled_at, monitor, chain, orderbook, duration_ms, skipped_ticks, outcome, error) \
+             VALUES ($1, 'other_monitor', $2, $3, 9000, 9, 'ok', NULL)",
         )
         .bind(sqlite_timestamp(timestamp(30)))
+        .bind(Chain::Base.as_str())
         .bind(ORDERBOOK.to_string())
         .execute(&pool)
         .await
@@ -676,6 +689,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             address!("0x2222222222222222222222222222222222222222"),
             timestamp(40),
             StdDuration::from_millis(7_000),
@@ -689,19 +703,48 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(telemetry.poll.cycles, 2);
-        assert_eq!(telemetry.poll.errors, 1);
-        assert_eq!(telemetry.poll.skipped_ticks, 2);
-        let duration = telemetry.poll.duration.unwrap();
+        assert_eq!(base_poll(&telemetry).cycles, 2);
+        assert_eq!(base_poll(&telemetry).errors, 1);
+        assert_eq!(base_poll(&telemetry).skipped_ticks, 2);
+        let duration = base_poll(&telemetry).duration.as_ref().unwrap();
         assert_eq!(duration.sample_count, 2);
         assert_eq!(duration.max_ms, 300);
     }
 
-    /// A secondary chain runs its own fill watcher against its own
-    /// orderbook, so its poll cycles belong in the report's poll health --
-    /// keyed to the primary alone, an outage there would read as healthy.
+    /// Poll cycles belong to the chain whose watcher ran them: a sample from
+    /// a chain that is not hedged must not be counted for one that is, even
+    /// when both name the same deterministic orderbook address.
     #[tokio::test]
-    async fn poll_health_aggregates_every_hedged_chain() {
+    async fn a_chains_poll_cycles_are_not_counted_for_another_chain() {
+        let pool = setup_test_db().await;
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            Chain::Ethereum,
+            ORDERBOOK,
+            timestamp(10),
+            StdDuration::from_millis(100),
+            4,
+            Err(&"ethereum rpc unreachable"),
+        )
+        .await
+        .unwrap();
+
+        let telemetry = load_monitor_telemetry(&pool, &range(), &base_only())
+            .await
+            .unwrap();
+
+        assert_eq!(base_poll(&telemetry).cycles, 0);
+        assert_eq!(base_poll(&telemetry).errors, 0);
+        assert_eq!(base_poll(&telemetry).skipped_ticks, 0);
+        assert_eq!(base_poll(&telemetry).duration, None);
+    }
+
+    /// A secondary chain runs its own fill watcher against its own
+    /// orderbook, so it gets its own poll report -- folded into the
+    /// primary's, an outage there would read as healthy.
+    #[tokio::test]
+    async fn poll_health_reports_every_hedged_chain() {
         let ethereum_orderbook = address!("0x3333333333333333333333333333333333333333");
         let pool = setup_test_db().await;
         let mut chains = base_only();
@@ -714,6 +757,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(10),
             StdDuration::from_millis(100),
@@ -725,6 +769,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Ethereum,
             ethereum_orderbook,
             timestamp(20),
             StdDuration::from_millis(400),
@@ -738,19 +783,31 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(telemetry.poll.cycles, 2);
-        assert_eq!(telemetry.poll.errors, 1);
-        assert_eq!(telemetry.poll.skipped_ticks, 3);
-        assert_eq!(telemetry.poll.duration.unwrap().max_ms, 400);
+        let [base, ethereum] = telemetry.poll.as_slice() else {
+            panic!(
+                "expected one poll report per hedged chain, got {:?}",
+                telemetry.poll
+            );
+        };
+        assert_eq!(base.chain, ChainName::Base);
+        assert_eq!(base.cycles, 1);
+        assert_eq!(base.errors, 0);
+        assert_eq!(base.skipped_ticks, 0);
+        assert_eq!(base.duration.as_ref().unwrap().max_ms, 100);
+        assert_eq!(ethereum.chain, ChainName::Ethereum);
+        assert_eq!(ethereum.cycles, 1);
+        assert_eq!(ethereum.errors, 1);
+        assert_eq!(ethereum.skipped_ticks, 3);
+        assert_eq!(ethereum.duration.as_ref().unwrap().max_ms, 400);
     }
 
     /// Deterministic deployments put the Raindex orderbook at the same address
-    /// on several chains, and poll samples are keyed by orderbook alone. Poll
-    /// health must therefore count each cycle once however many hedged chains
-    /// name that address -- iterating chains instead of distinct orderbooks
-    /// would double every figure in the report.
+    /// on several chains. Each chain's watcher still polls on its own, so its
+    /// cycles are reported under its own chain and counted once: scoped to the
+    /// orderbook alone, both chains would read every cycle taken at that
+    /// address.
     #[tokio::test]
-    async fn poll_health_counts_a_shared_orderbooks_cycles_once() {
+    async fn a_shared_orderbooks_cycles_are_reported_per_chain() {
         let pool = setup_test_db().await;
         let mut chains = base_only();
         chains.insert_secondary(
@@ -762,6 +819,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(10),
             StdDuration::from_millis(100),
@@ -773,6 +831,7 @@ mod tests {
         record_poll_cycle(
             &pool,
             Monitor::OrderFill,
+            Chain::Base,
             ORDERBOOK,
             timestamp(20),
             StdDuration::from_millis(400),
@@ -781,17 +840,43 @@ mod tests {
         )
         .await
         .unwrap();
+        record_poll_cycle(
+            &pool,
+            Monitor::OrderFill,
+            Chain::Ethereum,
+            ORDERBOOK,
+            timestamp(30),
+            StdDuration::from_millis(900),
+            1,
+            Ok::<(), &Infallible>(()),
+        )
+        .await
+        .unwrap();
 
         let telemetry = load_monitor_telemetry(&pool, &range(), &chains)
             .await
             .unwrap();
 
-        assert_eq!(telemetry.poll.cycles, 2);
-        assert_eq!(telemetry.poll.errors, 1);
-        assert_eq!(telemetry.poll.skipped_ticks, 3);
-        let duration = telemetry.poll.duration.unwrap();
-        assert_eq!(duration.sample_count, 2);
-        assert_eq!(duration.max_ms, 400);
+        let [base, ethereum] = telemetry.poll.as_slice() else {
+            panic!(
+                "expected one poll report per hedged chain, got {:?}",
+                telemetry.poll
+            );
+        };
+        assert_eq!(base.chain, ChainName::Base);
+        assert_eq!(base.cycles, 2);
+        assert_eq!(base.errors, 1);
+        assert_eq!(base.skipped_ticks, 3);
+        let base_duration = base.duration.as_ref().unwrap();
+        assert_eq!(base_duration.sample_count, 2);
+        assert_eq!(base_duration.max_ms, 400);
+        assert_eq!(ethereum.chain, ChainName::Ethereum);
+        assert_eq!(ethereum.cycles, 1);
+        assert_eq!(ethereum.errors, 0);
+        assert_eq!(ethereum.skipped_ticks, 1);
+        let ethereum_duration = ethereum.duration.as_ref().unwrap();
+        assert_eq!(ethereum_duration.sample_count, 1);
+        assert_eq!(ethereum_duration.max_ms, 900);
     }
 
     async fn insert_call(
@@ -879,12 +964,13 @@ mod tests {
         assert_eq!(base_series(&telemetry).points, vec![]);
         assert_eq!(
             telemetry.poll,
-            PollHealth {
+            vec![ChainPollHealth {
+                chain: ChainName::Base,
                 cycles: 0,
                 errors: 0,
                 skipped_ticks: 0,
                 duration: None,
-            }
+            }]
         );
     }
 }
