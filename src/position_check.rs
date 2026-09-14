@@ -12,7 +12,7 @@ use std::time::Duration;
 use apalis::prelude::Status;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
-use metrics::counter;
+use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
@@ -21,8 +21,8 @@ use tracing::{debug, error, warn};
 use st0x_config::{ChainAssets, ChainRegistry, Ctx};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Projection, Store};
 use st0x_execution::{
-    ClientOrderId, CounterTradePreflight, Direction, Executor, MarketOrder, MarketSession,
-    Permanence, SupportedExecutor, Symbol,
+    ClientOrderId, CounterTradePreflight, Direction, Executor, FractionalShares, MarketOrder,
+    MarketSession, Permanence, SupportedExecutor, Symbol,
 };
 
 use crate::alerts::Notifier;
@@ -179,6 +179,39 @@ pub(crate) fn record_scan_skip(
             "reason" => reason
         )
         .increment(1);
+    }
+}
+
+/// Exports the floor a symbol keeps and the shares this scan wanted to hedge
+/// but could not place, so the residual the floor leaves unhedged is
+/// graphable. Both are gauges refreshed every scan; an unparseable value
+/// logs and leaves that gauge untouched rather than writing a wrong one.
+/// f64 export is lossy by nature and fine for monitoring, as with
+/// `position_shares`.
+fn record_hedge_floor_gauges(
+    symbol: &Symbol,
+    floor: FractionalShares,
+    requested: FractionalShares,
+    allowed: FractionalShares,
+) {
+    let deficit = match requested - allowed {
+        Ok(deficit) => deficit,
+        Err(error) => {
+            warn!(%symbol, %error, "hedge_deficit_shares gauge skipped: subtraction failed");
+            return;
+        }
+    };
+
+    for (name, value) in [
+        ("hedge_floor_shares", floor),
+        ("hedge_deficit_shares", deficit),
+    ] {
+        match value.to_string().parse::<f64>() {
+            Ok(value) => gauge!(name, "symbol" => symbol.to_string()).set(value),
+            Err(error) => {
+                warn!(%symbol, %error, "{name} gauge skipped: could not parse shares as f64");
+            }
+        }
     }
 }
 
@@ -477,6 +510,29 @@ where
     /// if the order should proceed (possibly with reduced shares), `false` if
     /// it should be skipped entirely.
     async fn preflight_and_clamp_shares(
+        &self,
+        ready: &mut ExecutionCtx,
+        close_flatten_window_cache: &mut CloseFlattenWindowCache,
+    ) -> bool {
+        let requested = ready.shares.inner();
+        let enqueue = self
+            .preflight_and_clamp(ready, close_flatten_window_cache)
+            .await;
+        let allowed = if enqueue {
+            ready.shares.inner()
+        } else {
+            FractionalShares::ZERO
+        };
+        record_hedge_floor_gauges(
+            &ready.symbol,
+            self.ctx.broker.hedge_floor().for_symbol(&ready.symbol),
+            requested,
+            allowed,
+        );
+        enqueue
+    }
+
+    async fn preflight_and_clamp(
         &self,
         ready: &mut ExecutionCtx,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
