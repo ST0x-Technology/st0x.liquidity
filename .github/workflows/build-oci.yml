@@ -20,13 +20,20 @@ name: build-oci
 # app-deploy PAM grant in t0-liquidity (since 2026-09-07, t0.devops#465).
 #
 # Auth: GitHub OIDC → the t0-artifacts WIF provider, bound to
-# liquidity-deployer (master only — the WIF binding lives in t0.devops
+# liquidity-deployer (master, plus the release branches listed in t0.devops
 # terraform/production-artifacts/liquidity.tf). PRs get nothing.
+#
+# RELEASE BRANCHES BUILD BUT DO NOT ROLL STAGING. A hotfix is cut on top of
+# a shipped tag (release/vX.Y.Z; first done for v1.12.1 in #1498), and
+# release-tag can only label images CI has built and attested for the
+# tagged commit. So a push to release/** runs build-push alone; the
+# roll-staging job below is gated to master.
 
 on:
   push:
     branches:
       - master
+      - "release/**"
   workflow_dispatch: {}
 
 concurrency:
@@ -179,6 +186,7 @@ jobs:
   # and SECRETS_VERSION included, is preserved byte for byte.
   roll-staging:
     needs: build-push
+    if: github.ref == 'refs/heads/master'
     permissions:
       id-token: write
       contents: read

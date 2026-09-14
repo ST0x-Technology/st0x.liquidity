@@ -1,8 +1,9 @@
 name: release-tag
 
 # Promote-on-tag, the org-standard release flow (settled in
-# st0x.liquidity#1289): pushing git tag vX.Y.Z labels the images master
-# CI already built and attested for that commit, then cuts the GitHub
+# st0x.liquidity#1289): pushing git tag vX.Y.Z labels the images CI
+# (master or a release branch) already built and attested for that
+# commit, then cuts the GitHub
 # release. It does not build and it does not deploy: production is rolled
 # by ONE manual action, Actions -> production-release -> Run workflow with
 # this version, followed by the app-deploy PAM approval (agreed with Juan
