@@ -61,6 +61,7 @@ use st0x_tokenization::Tokenizer;
 use st0x_wrapper::{Wrapper, WrapperError, WrapperService};
 
 use crate::alerts::{LogNotifier, Notifier};
+use crate::bindings::IERC4626;
 use crate::bot_gas::{
     BotGasCostLedger, BotGasReceiptCost, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostCtx,
     RecordBotGasReceiptCostJobQueue,
@@ -129,7 +130,9 @@ use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::telemetry::executor::InstrumentedExecutor;
 use crate::telemetry::rpc::RpcTelemetryLayer;
 use crate::telemetry::{TelemetrySender, spawn_dependency_call_writer};
-use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
+use crate::tokenized_equity_mint::{
+    TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, interrupted_mint_ids,
+};
 use crate::trading::offchain::close_flatten::{CloseFlattenCrossRamp, CloseFlattenPolicy};
 use crate::trading::offchain::hedge::{apply_slippage, resolve_extended_hours_reference_price};
 use crate::trading::onchain::inclusion::EmittedOnChain;
@@ -2167,7 +2170,7 @@ where
     // fail-loud beats a green /health hiding a dead chain; degraded start
     // arrives with chain-disable). The primary uses the main provider;
     // secondaries their own.
-    for hedged in ctx.chains.hedged() {
+    for (role, hedged) in ctx.chains.hedged_with_roles() {
         let chain_provider = if hedged.chain == ctx.chains.primary().chain {
             provider
         } else {
@@ -2199,7 +2202,7 @@ where
             CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
         }
 
-        confirm_configured_asset_responds(chain_provider, hedged).await?;
+        confirm_configured_assets_respond(chain_provider, role, hedged).await?;
     }
 
     confirm_transport_chain_ids(ctx).await?;
@@ -2214,59 +2217,186 @@ where
     Ok(())
 }
 
-/// Startup read-path canary: one configured equity's token contract must
-/// answer a `decimals()` view call on the chain it is configured for.
+/// Startup read-path canary: every configured token address must answer a
+/// `decimals()` view call on the chain it is configured for, and must report
+/// [`TOKENIZED_EQUITY_DECIMALS`]. A wrapped share must additionally report the
+/// equity's configured unwrapped token as its ERC-4626 `asset()`.
 ///
-/// Proves the configured address is a live contract on the endpoint the
+/// Proves the configured addresses are live contracts on the endpoint the
 /// registry entry names -- config, RPC transport, and ABI decoding exercised
-/// in one read, before any funds-adjacent work starts. Runs per hedged
-/// chain: a secondary's addresses are as mistypeable as the primary's, and
-/// its fills need the token as much. Read-only and cold-start-safe: a chain
-/// with no configured equities is the normal bring-up state and skips with a
-/// log instead of failing.
-async fn confirm_configured_asset_responds<P: Provider + Clone + 'static>(
+/// in one read each, before any funds-adjacent work starts. Which addresses
+/// are read follows the roles they play: see [`asset_read_probes`].
+/// Read-only and cold-start-safe: a chain with no configured equities is the
+/// normal bring-up state and skips with a log instead of failing.
+///
+/// Only equity tokens are read here, so the 18-decimal demand never reaches
+/// the cash side: USDC is 6 decimals and is not probed.
+async fn confirm_configured_assets_respond<P: Provider + Clone + 'static>(
     provider: &P,
+    role: ChainRole,
     hedged: &HedgedChain,
 ) -> anyhow::Result<()> {
-    let Some((symbol, asset)) = hedged
-        .assets
-        .equities
-        .symbols
-        .iter()
-        .min_by(|(first, _), (second, _)| first.cmp(second))
-    else {
+    let probes = asset_read_probes(role, &hedged.assets);
+
+    if probes.is_empty() {
         info!(
             target: "startup",
             chain = %hedged.chain,
             "No equities configured on this chain; skipping the asset read canary"
         );
         return Ok(());
-    };
+    }
 
     let evm = ReadOnlyEvm::new(provider.clone());
-    let decimals = evm
-        .call::<OpenChainErrorRegistry, _>(asset.tokenized_equity, IERC20::decimalsCall {})
-        .await
-        .with_context(|| {
-            format!(
-                "startup read canary failed: [chains.{chain}] equity {symbol} at \
-                 {token} did not answer decimals() -- wrong address, wrong chain, \
-                 or a broken endpoint",
-                chain = hedged.chain,
-                token = asset.tokenized_equity,
-            )
-        })?;
 
-    info!(
-        target: "startup",
-        chain = %hedged.chain,
-        %symbol,
-        token = %asset.tokenized_equity,
-        decimals,
-        "Confirmed a configured asset responds on its chain"
-    );
+    for (symbol, probed, token) in probes {
+        let decimals = evm
+            .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
+            .await
+            .with_context(|| {
+                format!(
+                    "startup read canary failed: [chains.{chain}] equity {symbol}'s \
+                     {field} at {token} did not answer decimals() -- wrong address, \
+                     wrong chain, or a broken endpoint",
+                    chain = hedged.chain,
+                    field = probed.field(),
+                )
+            })?;
+
+        // Every equity quantity the bot scales is 18-decimal share-wei: the
+        // mint authorization signs `amount` at 18, a redemption decodes the
+        // unwrapped amount at 18, and a share deposit reaches the vault at 18.
+        // A token at another precision answers this read and then mis-scales
+        // all of them, so a wrong precision is a config error, not a variant
+        // to honour.
+        anyhow::ensure!(
+            decimals == TOKENIZED_EQUITY_DECIMALS,
+            "startup read canary failed: [chains.{chain}] equity {symbol}'s {field} at \
+             {token} reports {decimals} decimals, but every equity amount the bot \
+             scales is {TOKENIZED_EQUITY_DECIMALS}-decimal share-wei; this address is \
+             not the configured equity's token",
+            chain = hedged.chain,
+            field = probed.field(),
+        );
+
+        // A live 18-decimal contract is still any contract: a typo landing on
+        // another token answers both reads above and only surfaces when the
+        // first fill cannot resolve its symbol. The vault's `asset()` is what
+        // ties it to this equity, so demand it here -- the same comparison
+        // `Wrapper::attest_underlying` makes, pulled forward to the chains
+        // that never reach it (a hedge-only chain builds no wrapper, and a
+        // rebalancing secondary attests only the equities that opt in).
+        match probed {
+            ProbedToken::WrappedShare { underlying } => {
+                let attested: Address = evm
+                    .call::<OpenChainErrorRegistry, _>(token, IERC4626::assetCall {})
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "startup read canary failed: [chains.{chain}] equity {symbol}'s \
+                             tokenized_equity_derivative at {token} did not answer asset() \
+                             -- wrong address, wrong chain, or a broken endpoint",
+                            chain = hedged.chain,
+                        )
+                    })?;
+
+                anyhow::ensure!(
+                    attested == underlying,
+                    "startup read canary failed: [chains.{chain}] equity {symbol}'s \
+                     tokenized_equity_derivative at {token} wraps {attested}, but its \
+                     tokenized_equity is {underlying}; this vault belongs to a different \
+                     equity",
+                    chain = hedged.chain,
+                );
+            }
+            ProbedToken::UnwrappedEquity => {}
+        }
+
+        info!(
+            target: "startup",
+            chain = %hedged.chain,
+            %symbol,
+            field = probed.field(),
+            %token,
+            decimals,
+            "Confirmed a configured asset responds on its chain"
+        );
+    }
 
     Ok(())
+}
+
+/// Which configured address a canary read covers, so a refusal names the
+/// config field to correct and not just an address.
+#[derive(Debug, Clone, Copy)]
+enum ProbedToken {
+    /// The wrapped share a fill resolves its symbol through: the vault
+    /// registry and the symbol cache both key on it. Carries the equity's
+    /// configured unwrapped token, which the vault's `asset()` must report.
+    WrappedShare { underlying: Address },
+    /// The unwrapped token that mint, redeem, wrap, unwrap and wrapped-equity
+    /// recovery move.
+    UnwrappedEquity,
+}
+
+impl ProbedToken {
+    /// The config field holding the address, so a refusal points at the line
+    /// to fix.
+    const fn field(self) -> &'static str {
+        match self {
+            Self::WrappedShare { .. } => "tokenized_equity_derivative",
+            Self::UnwrappedEquity => "tokenized_equity",
+        }
+    }
+}
+
+/// The token reads one chain owes at startup, matching the roles each address
+/// plays there: every equity's wrapped share, because every fill on any hedged
+/// chain resolves through it, then the unwrapped token of each equity the
+/// chain's role rebalances or that opts into wrapped-equity recovery, because
+/// those are the equities whose unwrapped token is minted, redeemed, wrapped,
+/// unwrapped or polled. Recovery is independent of rebalancing, so a
+/// recovery-only equity owes the unwrapped read that its role alone would not
+/// ask for. Both halves run in symbol order, so which read fails first is
+/// deterministic.
+fn asset_read_probes(
+    role: ChainRole,
+    assets: &ChainAssets,
+) -> Vec<(&Symbol, ProbedToken, Address)> {
+    let mut wrapped = assets
+        .equities
+        .symbols
+        .iter()
+        .map(|(symbol, equity)| {
+            (
+                symbol,
+                ProbedToken::WrappedShare {
+                    underlying: equity.tokenized_equity,
+                },
+                equity.tokenized_equity_derivative,
+            )
+        })
+        .collect::<Vec<_>>();
+    wrapped.sort_by_key(|(symbol, _, _)| *symbol);
+
+    // Collected through a map so an equity that both rebalances and opts into
+    // recovery is read once, in symbol order.
+    let unwrapped = role
+        .rebalanced_equities(assets)
+        .into_iter()
+        .chain(
+            assets
+                .equities
+                .symbols
+                .iter()
+                .filter(|(symbol, _)| assets.is_wrapped_equity_recovery_enabled(symbol)),
+        )
+        .map(|(symbol, equity)| (symbol, equity.tokenized_equity))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .map(|(symbol, token)| (symbol, ProbedToken::UnwrappedEquity, token));
+
+    wrapped.into_iter().chain(unwrapped).collect()
 }
 
 async fn confirm_chain_id<P: Provider>(provider: &P, chain: Chain) -> anyhow::Result<()> {
@@ -5446,47 +5576,76 @@ mod tests {
         );
     }
 
-    fn hedged_chain_with_equity(symbol: &str, token: Address) -> HedgedChain {
-        let mut trading = create_test_ctx_with_order_owner(Address::ZERO)
+    /// A hedged chain carrying the given equities, each named by its symbol,
+    /// its unwrapped token and its wrapped share. Rebalancing stays off, so a
+    /// chain's role alone decides whether its unwrapped tokens are used.
+    fn hedged_chain_with_equities<'symbols>(
+        equities: impl IntoIterator<Item = (&'symbols str, Address, Address)>,
+    ) -> HedgedChain {
+        let mut hedged = create_test_ctx_with_order_owner(Address::ZERO)
             .chains
             .primary()
             .clone();
-        trading.assets = ChainAssets {
+        hedged.assets = ChainAssets {
             equities: ChainEquities {
                 operational_limit: None,
-                symbols: HashMap::from([(
-                    Symbol::new(symbol).unwrap(),
-                    ChainEquityAsset {
-                        tokenized_equity: token,
-                        tokenized_equity_derivative: Address::ZERO,
-                        vault_ids: vec![],
-                        trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
-                        wrapped_equity_recovery: OperationMode::Disabled,
-                        operational_limit: None,
-                    },
-                )]),
+                symbols: equities
+                    .into_iter()
+                    .map(|(symbol, unwrapped, wrapped)| {
+                        (
+                            Symbol::new(symbol).unwrap(),
+                            ChainEquityAsset {
+                                tokenized_equity: unwrapped,
+                                tokenized_equity_derivative: wrapped,
+                                vault_ids: vec![],
+                                trading: OperationMode::Enabled,
+                                rebalancing: OperationMode::Disabled,
+                                wrapped_equity_recovery: OperationMode::Disabled,
+                                operational_limit: None,
+                            },
+                        )
+                    })
+                    .collect(),
             },
             cash: None,
         };
-        trading
+        hedged
+    }
+
+    /// Queues the reads one wrapped-share probe makes, in order: its
+    /// `decimals()`, then the `asset()` it must report as the equity's
+    /// configured unwrapped token.
+    fn push_wrapped_share_reads(asserter: &Asserter, underlying: Address) {
+        asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &TOKENIZED_EQUITY_DECIMALS,
+            ),
+        );
+        asserter.push_success(
+            &<IERC4626::assetCall as alloy::sol_types::SolCall>::abi_encode_returns(&underlying),
+        );
     }
 
     #[tokio::test]
-    async fn asset_canary_accepts_a_token_that_answers_decimals() {
+    async fn asset_canary_accepts_tokens_that_answer_decimals() {
+        // A rebalancing role reads both of the equity's tokens: the wrapped
+        // share's decimals and asset(), then the unwrapped token's decimals.
+        let unwrapped = address!("0x1111111111111111111111111111111111111111");
         let asserter = Asserter::new();
+        push_wrapped_share_reads(&asserter, unwrapped);
         asserter.push_success(
             &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
-                &18u8,
+                &TOKENIZED_EQUITY_DECIMALS,
             ),
         );
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-        let trading = hedged_chain_with_equity(
+        let trading = hedged_chain_with_equities([(
             "AAPL",
-            address!("0x1111111111111111111111111111111111111111"),
-        );
+            unwrapped,
+            address!("0x2222222222222222222222222222222222222222"),
+        )]);
 
-        confirm_configured_asset_responds(&provider, &trading)
+        confirm_configured_assets_respond(&provider, ChainRole::Primary, &trading)
             .await
             .unwrap();
     }
@@ -5499,12 +5658,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("connection reset by peer");
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
-        let trading = hedged_chain_with_equity(
+        let trading = hedged_chain_with_equities([(
             "AAPL",
             address!("0x1111111111111111111111111111111111111111"),
-        );
+            address!("0x2222222222222222222222222222222222222222"),
+        )]);
 
-        let error = confirm_configured_asset_responds(&provider, &trading)
+        let error = confirm_configured_assets_respond(&provider, ChainRole::Primary, &trading)
             .await
             .unwrap_err();
 
@@ -5515,6 +5675,79 @@ mod tests {
         assert!(
             error.to_string().contains("AAPL"),
             "the error must name the symbol: {error}"
+        );
+    }
+
+    /// Every equity amount the bot scales is 18-decimal share-wei: the mint
+    /// authorization signs at 18, a redemption decodes the unwrapped amount at
+    /// 18, and a share deposit reaches the vault at 18. A token at another
+    /// precision answers `decimals()` happily and then mis-scales all of them,
+    /// so the canary must refuse it instead of only proving it answers.
+    #[tokio::test]
+    async fn asset_canary_refuses_an_equity_token_that_is_not_18_decimals() {
+        let asserter = Asserter::new();
+        asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &6u8,
+            ),
+        );
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let wrapped = address!("0x2222222222222222222222222222222222222222");
+        let hedge_only = hedged_chain_with_equities([(
+            "AAPL",
+            address!("0x1111111111111111111111111111111111111111"),
+            wrapped,
+        )]);
+
+        let error = confirm_configured_assets_respond(&provider, ChainRole::Secondary, &hedge_only)
+            .await
+            .expect_err("a 6-decimal equity token must refuse startup");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("reports 6 decimals"),
+            "the refusal must name the precision the token reported: {message}"
+        );
+        assert!(
+            message.contains("AAPL") && message.contains(&wrapped.to_string()),
+            "the refusal must name the symbol and the token: {message}"
+        );
+    }
+
+    /// `decimals()` proves a contract answers, not that it is the configured
+    /// symbol's wrapper: a typo landing on another 18-decimal token passes
+    /// every read above and is only found when the first fill on the chain
+    /// cannot resolve its symbol. The ERC-4626 `asset()` is what ties a vault
+    /// to its equity, and a hedge-only chain has no other attestation.
+    #[tokio::test]
+    async fn asset_canary_refuses_a_wrapped_share_that_wraps_another_token() {
+        let unwrapped = address!("0x1111111111111111111111111111111111111111");
+        let wrapped = address!("0x2222222222222222222222222222222222222222");
+        let stranger = address!("0x3333333333333333333333333333333333333333");
+        let asserter = Asserter::new();
+        asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &TOKENIZED_EQUITY_DECIMALS,
+            ),
+        );
+        asserter.push_success(
+            &<IERC4626::assetCall as alloy::sol_types::SolCall>::abi_encode_returns(&stranger),
+        );
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let hedge_only = hedged_chain_with_equities([("AAPL", unwrapped, wrapped)]);
+
+        let error = confirm_configured_assets_respond(&provider, ChainRole::Secondary, &hedge_only)
+            .await
+            .expect_err("a wrapped share reporting another asset() must refuse startup");
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&stranger.to_string()) && message.contains(&unwrapped.to_string()),
+            "the refusal must name both the attested and the configured token: {message}"
+        );
+        assert!(
+            message.contains("AAPL") && message.contains(&wrapped.to_string()),
+            "the refusal must name the symbol and the vault: {message}"
         );
     }
 
@@ -5530,7 +5763,7 @@ mod tests {
             .primary()
             .clone();
 
-        confirm_configured_asset_responds(&provider, &trading)
+        confirm_configured_assets_respond(&provider, ChainRole::Primary, &trading)
             .await
             .unwrap();
 
@@ -5558,21 +5791,27 @@ mod tests {
     #[tokio::test]
     async fn asset_canary_runs_on_every_hedged_chain() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        *ctx.chains.primary_mut() = hedged_chain_with_equity(
+        *ctx.chains.primary_mut() = hedged_chain_with_equities([(
             "AAPL",
             address!("0x1111111111111111111111111111111111111111"),
-        );
-        let mut secondary = hedged_chain_with_equity(
+            address!("0x3333333333333333333333333333333333333333"),
+        )]);
+        let mut secondary = hedged_chain_with_equities([(
             "MSFT",
             address!("0x2222222222222222222222222222222222222222"),
-        );
+            address!("0x4444444444444444444444444444444444444444"),
+        )]);
         secondary.chain = Chain::Ethereum;
         ctx.chains.insert_secondary(secondary);
 
         let primary_asserter = hedged_chain_asserter(Chain::Base);
+        push_wrapped_share_reads(
+            &primary_asserter,
+            address!("0x1111111111111111111111111111111111111111"),
+        );
         primary_asserter.push_success(
             &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
-                &18u8,
+                &TOKENIZED_EQUITY_DECIMALS,
             ),
         );
         let provider = ProviderBuilder::new().connect_mocked_client(primary_asserter);
@@ -5600,6 +5839,211 @@ mod tests {
             "the error must name the secondary chain and its symbol: {message}"
         );
     }
+
+    /// A hedge-only chain touches the wrapped share and nothing else: the
+    /// vault registry and the symbol cache key on it, so a fill there cannot
+    /// be recognised when that address is wrong. The canary must read it.
+    #[tokio::test]
+    async fn asset_canary_probes_the_wrapped_share_on_a_hedge_only_chain() {
+        let unwrapped = Address::repeat_byte(0x11);
+        let wrapped = Address::repeat_byte(0x22);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary = hedged_chain_with_equities([("MSFT", unwrapped, wrapped)]);
+        secondary.chain = Chain::Ethereum;
+        ctx.chains.insert_secondary(secondary);
+
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Base));
+        let secondary_asserter = hedged_chain_asserter(Chain::Ethereum);
+        secondary_asserter.push_failure_msg("connection reset by peer");
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(secondary_asserter),
+        )]);
+
+        let error = startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&wrapped.to_string()),
+            "the refusal must name the wrapped share that did not answer: {message}"
+        );
+        assert!(
+            message.contains("MSFT") && message.contains("ethereum"),
+            "the refusal must name the chain and the symbol: {message}"
+        );
+        assert!(
+            message.contains("wrong address, wrong chain, or a broken endpoint"),
+            "the refusal must keep naming the three ways this goes wrong: {message}"
+        );
+    }
+
+    /// A chain that rebalances equity mints, redeems, wraps and unwraps the
+    /// unwrapped token, so a wrapped share that answers is not enough there.
+    #[tokio::test]
+    async fn asset_canary_probes_the_unwrapped_token_where_equity_rebalances() {
+        let unwrapped = Address::repeat_byte(0x11);
+        let wrapped = Address::repeat_byte(0x22);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        *ctx.chains.primary_mut() = hedged_chain_with_equities([("AAPL", unwrapped, wrapped)]);
+
+        let asserter = hedged_chain_asserter(Chain::Base);
+        push_wrapped_share_reads(&asserter, unwrapped);
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = startup_smoke_checks(&MockExecutor::new(), &provider, &BTreeMap::new(), &ctx)
+            .await
+            .expect_err("a rebalancing chain whose unwrapped token is dead must refuse startup");
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&unwrapped.to_string()),
+            "the refusal must name the unwrapped token that did not answer: {message}"
+        );
+        assert!(
+            message.contains("AAPL") && message.contains("base"),
+            "the refusal must name the chain and the symbol: {message}"
+        );
+    }
+
+    /// A secondary rebalances only the equities that opt in, and an opted-in
+    /// equity there mints, redeems, wraps and unwraps just as on the primary,
+    /// so its unwrapped token owes the same read. Only a run through
+    /// `startup_smoke_checks` proves the secondary is probed under its own
+    /// role and against its own endpoint.
+    #[tokio::test]
+    async fn asset_canary_probes_the_unwrapped_token_on_a_rebalancing_secondary() {
+        let unwrapped = Address::repeat_byte(0x55);
+        let wrapped = Address::repeat_byte(0x66);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary = hedged_chain_with_equities([("MSFT", unwrapped, wrapped)]);
+        secondary.chain = Chain::Ethereum;
+        for equity in secondary.assets.equities.symbols.values_mut() {
+            equity.rebalancing = OperationMode::Enabled;
+        }
+        ctx.chains.insert_secondary(secondary);
+
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Base));
+        // The wrapped share answers first, so the refusal can only come from
+        // the unwrapped read the rebalancing role adds.
+        let secondary_asserter = hedged_chain_asserter(Chain::Ethereum);
+        push_wrapped_share_reads(&secondary_asserter, unwrapped);
+        secondary_asserter.push_failure_msg("connection reset by peer");
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(secondary_asserter),
+        )]);
+
+        let error = startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .expect_err("a rebalancing secondary with a dead unwrapped token must refuse startup");
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&unwrapped.to_string()),
+            "the refusal must name the unwrapped token that did not answer: {message}"
+        );
+        assert!(
+            message.contains("MSFT") && message.contains("ethereum"),
+            "the refusal must name the chain and the symbol: {message}"
+        );
+    }
+
+    /// Wrapped-equity recovery moves the unwrapped token whatever the role
+    /// says: its wallet balance is polled and scaled as 18-decimal share-wei,
+    /// and the recovery job wraps it. A recovery-only equity -- recovery
+    /// enabled while trading and rebalancing both stay off -- is outside the
+    /// role's rebalanced set, so selecting by role alone leaves that address
+    /// unread until the first poll reaches it.
+    #[tokio::test]
+    async fn asset_canary_probes_the_unwrapped_token_of_a_recovery_only_equity() {
+        let unwrapped = Address::repeat_byte(0x11);
+        let wrapped = Address::repeat_byte(0x22);
+        let mut recovery_only = hedged_chain_with_equities([("AAPL", unwrapped, wrapped)]);
+        for equity in recovery_only.assets.equities.symbols.values_mut() {
+            equity.trading = OperationMode::Disabled;
+            equity.rebalancing = OperationMode::Disabled;
+            equity.wrapped_equity_recovery = OperationMode::Enabled;
+        }
+
+        // The wrapped share answers first, so the refusal can only come from
+        // the unwrapped read recovery owes.
+        let asserter = Asserter::new();
+        push_wrapped_share_reads(&asserter, unwrapped);
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error =
+            confirm_configured_assets_respond(&provider, ChainRole::Primary, &recovery_only)
+                .await
+                .expect_err(
+                    "a recovery-only equity with a dead unwrapped token must refuse startup",
+                );
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&format!("AAPL's tokenized_equity at {unwrapped}")),
+            "the refusal must name the symbol, the config field and the token: {message}"
+        );
+        assert!(
+            message.contains("did not answer decimals()"),
+            "the refusal must name the canary read: {message}"
+        );
+    }
+
+    /// Every equity on the chain is probed, not just the first by symbol, and
+    /// a hedge-only chain reads no unwrapped token at all: nothing there mints,
+    /// redeems, wraps or unwraps, so that address plays no part.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn asset_canary_reads_every_wrapped_share_and_no_unwrapped_token_when_hedge_only() {
+        let apple_unwrapped = Address::repeat_byte(0x11);
+        let apple_wrapped = Address::repeat_byte(0x22);
+        let microsoft_unwrapped = Address::repeat_byte(0x33);
+        let microsoft_wrapped = Address::repeat_byte(0x44);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary = hedged_chain_with_equities([
+            ("AAPL", apple_unwrapped, apple_wrapped),
+            ("MSFT", microsoft_unwrapped, microsoft_wrapped),
+        ]);
+        secondary.chain = Chain::Ethereum;
+        ctx.chains.insert_secondary(secondary);
+
+        let provider =
+            ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Base));
+        // Two wrapped shares and nothing else: a further read would find the
+        // queue empty and fail startup, which is the assertion that no
+        // unwrapped token is read here.
+        let secondary_asserter = hedged_chain_asserter(Chain::Ethereum);
+        push_wrapped_share_reads(&secondary_asserter, apple_unwrapped);
+        push_wrapped_share_reads(&secondary_asserter, microsoft_unwrapped);
+        let watch_providers = BTreeMap::from([(
+            Chain::Ethereum,
+            ProviderBuilder::new().connect_mocked_client(secondary_asserter),
+        )]);
+
+        startup_smoke_checks(&MockExecutor::new(), &provider, &watch_providers, &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            logs_contain(&apple_wrapped.to_string()),
+            "the first equity's wrapped share must be read and logged"
+        );
+        assert!(
+            logs_contain(&microsoft_wrapped.to_string()),
+            "the second equity's wrapped share must be read and logged"
+        );
+        assert!(
+            !logs_contain(&apple_unwrapped.to_string()),
+            "a hedge-only chain must not read an unwrapped token"
+        );
+    }
+
     /// The durable double-hedge guard keys on the full chain-qualified fill
     /// identity: the same (tx_hash, log_index) on another chain is a distinct
     /// fill, never a duplicate (SPEC multi-chain invariant 3), while the same
