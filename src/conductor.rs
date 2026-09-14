@@ -15816,6 +15816,8 @@ mod tests {
         ));
         let rebalancing_service = freeze_guard_test_service().await;
         let usdc_recheck: Arc<dyn RecheckUsdcDeposit> = Arc::new(NeverCalledUsdcRecheck);
+        let usdc_driver_pause = Arc::new(usdc_driver_pause().0);
+        let usdc_store = Arc::new(test_store::<UsdcRebalance>(pool, ()));
 
         let recovery_cell = tokio::sync::OnceCell::new();
 
@@ -15826,8 +15828,8 @@ mod tests {
             redemption_store.clone(),
             rebalancing_service.clone(),
             usdc_recheck,
-            Arc::new(usdc_driver_pause().0),
-            Arc::new(test_store::<UsdcRebalance>(pool, ())),
+            usdc_driver_pause.clone(),
+            usdc_store.clone(),
         );
 
         let handle = recovery_cell
@@ -15839,6 +15841,14 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&handle.mint_store, &mint_store));
         assert!(Arc::ptr_eq(&handle.redemption_store, &redemption_store));
+        assert!(
+            Arc::ptr_eq(&handle.usdc_driver_pause, &usdc_driver_pause),
+            "the cell must hold the published USDC driver pause"
+        );
+        assert!(
+            Arc::ptr_eq(&handle.usdc_store, &usdc_store),
+            "the cell must hold the published wired USDC store"
+        );
         assert!(
             Arc::ptr_eq(&handle.rebalancing_service, &rebalancing_service),
             "the cell must hold the published rebalancing service"
