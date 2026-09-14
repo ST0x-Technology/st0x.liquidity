@@ -4517,6 +4517,16 @@ where
 
     let base_symbol = trade.symbol.base();
 
+    // Serialize the whole reconcile -> claim -> placement sequence against the
+    // in-bot process-tx path (ADR 0014). Both sides hold this lock across
+    // `Position::PlaceOffChainOrder` (the claim) and `OffchainOrder::Place`
+    // (the aggregate), so a pending pointer observed here under the lock is a
+    // genuine orphan -- never a claim whose aggregate is about to exist.
+    // Acquired once and held to the end of the function (through both the
+    // extended-hours enqueue and the inline placement), so the mutex is taken
+    // exactly once per trade.
+    let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+
     match reconcile_existing_pending_order(base_symbol, cqrs).await? {
         ExistingPendingOrderOutcome::NoPending | ExistingPendingOrderOutcome::Cleared => {}
         ExistingPendingOrderOutcome::InFlight => return Ok(None),
@@ -4547,7 +4557,6 @@ where
         let Some(preflight) = resolve_extended_hours_preflight(&execution, cqrs).await else {
             return Ok(None);
         };
-        let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
         match preflight_extended_hours_trade_submission(executor, &execution, preflight).await? {
             CounterTradeSubmissionCheck::Skipped => return Ok(None),
@@ -4592,8 +4601,6 @@ where
         // nothing about, so signal "no inline placement" with None.
         return Ok(None);
     }
-
-    let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
     let counter_trade_submission =
         match preflight_counter_trade_submission(executor, &execution, None).await {
@@ -9610,6 +9617,58 @@ mod tests {
         assert!(
             matches!(offchain_order, OffchainOrder::Submitted { .. }),
             "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
+        );
+    }
+
+    /// Two live ticks racing to hedge the same symbol must place exactly one
+    /// broker order. Both drive the shared `TradeProcessingCqrs` (one
+    /// `counter_trade_submission_lock`), so the reconcile -> claim -> placement
+    /// sequence serializes: the loser cannot observe the winner's Position
+    /// claim before the winner's `OffchainOrder` aggregate exists and clear it
+    /// as an orphan. Regression for the pre-fix window where `process_queued_trade`
+    /// reconciled before taking the lock (mirrors the process-tx path's
+    /// `concurrent_process_tx_and_tick_place_one_hedge`).
+    #[tokio::test]
+    async fn concurrent_live_ticks_place_one_hedge() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        // Two distinct fills for the same symbol: distinct log_index (and so
+        // tx_hash and trade_id) so both are accounted and both reach placement.
+        let event_a = make_trade_event(10);
+        let event_b = make_trade_event(20);
+        let fill_a = test_trade_with_amount(float!(1.5), 10);
+        let fill_b = test_trade_with_amount(float!(1.5), 20);
+
+        let executor = MockExecutor::new();
+        let (result_a, result_b) = tokio::join!(
+            process_queued_trade(&executor, &event_a, fill_a, &cqrs, &assets, true),
+            process_queued_trade(&executor, &event_b, fill_b, &cqrs, &assets, true),
+        );
+
+        let placed_count =
+            usize::from(result_a.unwrap().is_some()) + usize::from(result_b.unwrap().is_some());
+        assert_eq!(
+            placed_count, 1,
+            "exactly one concurrent tick may place a hedge"
+        );
+
+        let (order_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT aggregate_id) FROM events \
+             WHERE event_type LIKE 'OffchainOrderEvent%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            order_count, 1,
+            "concurrent live ticks must place exactly one hedge order, got {order_count}"
         );
     }
 
