@@ -4831,6 +4831,23 @@ fn log_counter_trade_skip(
                 "Skipping counter trade before broker submission: insufficient offchain equity"
             );
         }
+        // Expected once the book is down to the floor; the runbook for
+        // `InsufficientEquity` (fund the account) does not apply.
+        CounterTradeSkipReason::HeldAtFloor {
+            symbol,
+            floor,
+            available,
+        } => {
+            info!(
+                %symbol,
+                shares = %execution.shares,
+                direction = ?execution.direction,
+                source,
+                floor_shares = %floor,
+                available_shares = %available,
+                "Skipping counter trade before broker submission: sell held at the hedge floor"
+            );
+        }
         CounterTradeSkipReason::InsufficientBuyingPower {
             estimated_cost_cents,
             available_buying_power_cents,
@@ -16043,6 +16060,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: 50,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
         })
     }
 

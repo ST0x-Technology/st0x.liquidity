@@ -4009,6 +4009,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
         });
         let app = build_app(empty_app_state(ctx).await);
 

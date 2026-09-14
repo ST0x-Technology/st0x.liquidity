@@ -14,9 +14,9 @@ use super::order::{AlpacaLimitOrder, ConversionOrder, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, CounterTradeSkipReason, Direction,
-    Executor, ExecutorOrderId, FractionalShares, IndicativeQuote, InventoryResult, LatestQuote,
-    LimitOrder, MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement, OrderState,
-    OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
+    Executor, ExecutorOrderId, FractionalShares, HedgeFloor, IndicativeQuote, InventoryResult,
+    LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement,
+    OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
     buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
 
@@ -126,6 +126,7 @@ pub struct AlpacaBrokerApi {
     asset_cache_ttl: Duration,
     time_in_force: TimeInForce,
     counter_trade_slippage_bps: u16,
+    hedge_floor: HedgeFloor,
 }
 
 impl Clone for AlpacaBrokerApi {
@@ -136,6 +137,7 @@ impl Clone for AlpacaBrokerApi {
             asset_cache_ttl: self.asset_cache_ttl,
             time_in_force: self.time_in_force,
             counter_trade_slippage_bps: self.counter_trade_slippage_bps,
+            hedge_floor: self.hedge_floor.clone(),
         }
     }
 }
@@ -150,6 +152,7 @@ impl std::fmt::Debug for AlpacaBrokerApi {
                 "counter_trade_slippage_bps",
                 &self.counter_trade_slippage_bps,
             )
+            .field("hedge_floor", &self.hedge_floor)
             .finish_non_exhaustive()
     }
 }
@@ -185,6 +188,7 @@ impl Executor for AlpacaBrokerApi {
             asset_cache_ttl: ctx.asset_cache_ttl,
             time_in_force: ctx.time_in_force,
             counter_trade_slippage_bps: ctx.counter_trade_slippage_bps,
+            hedge_floor: ctx.hedge_floor,
         })
     }
 
@@ -373,7 +377,13 @@ impl Executor for AlpacaBrokerApi {
                     FractionalShares::new(truncated)
                 };
 
-                Ok(crate::resolve_sell_preflight(order, tradable_available)?)
+                let floor = self.hedge_floor.for_symbol(&order.symbol);
+
+                Ok(crate::resolve_sell_preflight(
+                    order,
+                    tradable_available,
+                    floor,
+                )?)
             }
             Direction::Buy => {
                 let latest_trade_price = crate::alpaca_market_data::fetch_latest_trade_price(
@@ -1041,6 +1051,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: HedgeFloor::default(),
         }
     }
 
@@ -2167,6 +2178,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::ZERO,
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: HedgeFloor::default(),
         };
 
         let account_mock = create_account_mock(&server);

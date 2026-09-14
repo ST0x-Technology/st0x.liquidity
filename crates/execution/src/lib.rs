@@ -22,6 +22,7 @@ pub mod alpaca_broker_api;
 mod alpaca_market_data;
 mod alpaca_wallet;
 pub mod error;
+mod hedge_floor;
 pub mod mock;
 pub mod order;
 mod rate_limit;
@@ -42,6 +43,7 @@ pub use alpaca_broker_api::{
 #[cfg(any(test, feature = "test-support"))]
 pub use alpaca_market_data::AlpacaMarketDataError;
 pub use error::PersistenceError;
+pub use hedge_floor::HedgeFloor;
 pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{
     CancellationOutcome, ClientOrderId, ClientOrderIdError, LimitOrder, MarketOrder,
@@ -614,6 +616,15 @@ pub enum CounterTradeSkipReason {
         available: FractionalShares,
     },
     #[error(
+        "sell held at the hedge floor for {symbol}: {available} shares available, \
+         floor keeps {floor}"
+    )]
+    HeldAtFloor {
+        symbol: Symbol,
+        floor: FractionalShares,
+        available: FractionalShares,
+    },
+    #[error(
         "insufficient cash buying power: estimated cost {estimated_cost_cents} cents \
          exceeds available {available_buying_power_cents} cents"
     )]
@@ -758,6 +769,7 @@ static MINIMUM_PARTIAL_HEDGE_SHARES: LazyLock<Float> = LazyLock::new(|| float!(0
 pub(crate) fn resolve_sell_preflight(
     order: MarketOrder,
     available: FractionalShares,
+    floor: FractionalShares,
 ) -> Result<CounterTradePreflight, FloatError> {
     let sufficient = available.inner().gte(order.shares.inner().inner())?;
 
@@ -766,6 +778,7 @@ pub(crate) fn resolve_sell_preflight(
             target: "broker",
             symbol = %order.symbol,
             available = %available,
+            floor = %floor,
             required = %order.shares,
             "Preflight passed: sufficient equity for sell"
         );
@@ -1192,7 +1205,7 @@ mod tests {
         let order = sell_order("AAPL", "10");
         let available = frac_shares("15");
 
-        let result = resolve_sell_preflight(order, available).unwrap();
+        let result = resolve_sell_preflight(order, available, FractionalShares::ZERO).unwrap();
 
         match result {
             CounterTradePreflight::Allowed {
@@ -1212,7 +1225,7 @@ mod tests {
         let order = sell_order("AAPL", "20");
         let available = frac_shares("10");
 
-        let result = resolve_sell_preflight(order, available).unwrap();
+        let result = resolve_sell_preflight(order, available, FractionalShares::ZERO).unwrap();
 
         match result {
             CounterTradePreflight::Allowed {
@@ -1232,7 +1245,7 @@ mod tests {
         let order = sell_order("AAPL", "5");
         let available = FractionalShares::ZERO;
 
-        let result = resolve_sell_preflight(order, available).unwrap();
+        let result = resolve_sell_preflight(order, available, FractionalShares::ZERO).unwrap();
 
         assert!(
             matches!(
@@ -1248,7 +1261,7 @@ mod tests {
         let order = sell_order("AAPL", "5");
         let available = frac_shares("0.001");
 
-        let result = resolve_sell_preflight(order, available).unwrap();
+        let result = resolve_sell_preflight(order, available, FractionalShares::ZERO).unwrap();
 
         assert!(
             matches!(
@@ -1264,7 +1277,7 @@ mod tests {
         let order = sell_order("AAPL", "5");
         let available = frac_shares("0.01");
 
-        let result = resolve_sell_preflight(order, available).unwrap();
+        let result = resolve_sell_preflight(order, available, FractionalShares::ZERO).unwrap();
 
         match result {
             CounterTradePreflight::Allowed {
@@ -1277,5 +1290,69 @@ mod tests {
             }
             other => panic!("Expected Allowed at minimum threshold, got {other:?}"),
         }
+    }
+
+    /// The 2026-09-14 COIN drain: 5.27 available against a 21.48 request
+    /// sold every share and left pricing with no position to mark from.
+    #[test]
+    fn resolve_sell_preflight_keeps_the_floor_out_of_a_partial_hedge() {
+        let order = sell_order("COIN", "21.48");
+
+        let result = resolve_sell_preflight(order, frac_shares("5.27"), frac_shares("1")).unwrap();
+
+        let CounterTradePreflight::Allowed {
+            reservation:
+                Some(CounterTradeReservation::Equity {
+                    required,
+                    available,
+                    ..
+                }),
+        } = result
+        else {
+            panic!("Expected Allowed with a floored cap, got {result:?}");
+        };
+        assert_eq!(required.inner(), frac_shares("4.27"));
+        assert_eq!(available, frac_shares("4.27"));
+    }
+
+    #[test]
+    fn resolve_sell_preflight_holds_at_floor_instead_of_reporting_no_inventory() {
+        let order = sell_order("COIN", "5");
+
+        let result = resolve_sell_preflight(order, frac_shares("0.8"), frac_shares("1")).unwrap();
+
+        let CounterTradePreflight::Skipped(CounterTradeSkipReason::HeldAtFloor {
+            symbol,
+            floor,
+            available,
+        }) = result
+        else {
+            panic!("Expected HeldAtFloor, got {result:?}");
+        };
+        assert_eq!(symbol, Symbol::new("COIN").unwrap());
+        assert_eq!(floor, frac_shares("1"));
+        assert_eq!(available, frac_shares("0.8"));
+    }
+
+    #[test]
+    fn resolve_sell_preflight_with_zero_floor_still_sells_the_whole_book() {
+        let order = sell_order("COIN", "21.48");
+
+        let result =
+            resolve_sell_preflight(order, frac_shares("5.27"), FractionalShares::ZERO).unwrap();
+
+        let CounterTradePreflight::Allowed {
+            reservation:
+                Some(CounterTradeReservation::Equity {
+                    required,
+                    available,
+                    ..
+                }),
+        } = result
+        else {
+            panic!("Expected Allowed capped to the book, got {result:?}");
+        };
+        assert_eq!(required.inner(), frac_shares("5.27"));
+        assert_eq!(available, frac_shares("5.27"));
     }
 }

@@ -589,6 +589,7 @@ enum CloseFlattenBlockReason {
     QuoteFetchFailed,
     NonFractionableQuantityBelowOne,
     InsufficientEquity,
+    HeldAtFloor,
     InsufficientBuyingPower,
 }
 
@@ -600,6 +601,7 @@ impl CloseFlattenBlockReason {
             Self::QuoteFetchFailed => "quote_fetch_failed",
             Self::NonFractionableQuantityBelowOne => "non_fractionable_quantity_below_one",
             Self::InsufficientEquity => "insufficient_equity",
+            Self::HeldAtFloor => "held_at_floor",
             Self::InsufficientBuyingPower => "insufficient_buying_power",
         }
     }
@@ -622,6 +624,7 @@ impl From<&CounterTradeSkipReason> for CloseFlattenBlockReason {
                 Self::NonFractionableQuantityBelowOne
             }
             CounterTradeSkipReason::InsufficientEquity { .. } => Self::InsufficientEquity,
+            CounterTradeSkipReason::HeldAtFloor { .. } => Self::HeldAtFloor,
             CounterTradeSkipReason::InsufficientBuyingPower { .. } => Self::InsufficientBuyingPower,
         }
     }

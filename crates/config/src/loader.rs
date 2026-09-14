@@ -20,8 +20,8 @@ use st0x_evm::Chain;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS;
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth, SupportedExecutor,
-    Symbol, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth, HedgeFloor,
+    SupportedExecutor, Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
@@ -844,6 +844,7 @@ impl BrokerCtx {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: broker_config.counter_trade_slippage_bps()?,
+            hedge_floor: HedgeFloor::default(),
         }))
     }
 }
@@ -2891,6 +2892,7 @@ pub fn test_alpaca_broker_ctx() -> BrokerCtx {
         asset_cache_ttl: std::time::Duration::from_secs(3600),
         time_in_force: TimeInForce::default(),
         counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        hedge_floor: HedgeFloor::default(),
     })
 }
 

@@ -99,6 +99,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        hedge_floor: st0x_execution::HedgeFloor::default(),
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 
