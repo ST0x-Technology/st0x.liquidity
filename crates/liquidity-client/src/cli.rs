@@ -6,6 +6,17 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::target::Env;
 use crate::wire::ReconcileUsdcReason;
 
+/// Rejects an empty or whitespace-only audit `--reason` at parse time, before
+/// the value can reach auth or the network. The server rejects blank reasons
+/// too, so this only moves the rejection earlier, into a clear clap error.
+fn nonblank_reason(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("must not be blank".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "st0x-liquidity-client",
@@ -108,7 +119,7 @@ pub(crate) enum Debug {
         /// Aggregate id.
         id: String,
         /// Free text audit reason, persisted on the event.
-        #[arg(long)]
+        #[arg(long, value_parser = nonblank_reason)]
         reason: String,
     },
     /// Clear a dropped CCTP burn hash from a USDC rebalance so the guard can
@@ -117,7 +128,7 @@ pub(crate) enum Debug {
         /// USDC rebalance id.
         id: String,
         /// Audit reason, logged with the action.
-        #[arg(long)]
+        #[arg(long, value_parser = nonblank_reason)]
         reason: String,
     },
     /// Mark a pre-burn USDC rebalance failed so the guard can be released.
@@ -126,7 +137,7 @@ pub(crate) enum Debug {
         /// USDC rebalance id.
         id: String,
         /// Free text audit reason, persisted on the event.
-        #[arg(long)]
+        #[arg(long, value_parser = nonblank_reason)]
         reason: String,
     },
     /// Recover stuck position state.
@@ -176,7 +187,7 @@ pub(crate) struct SetPositionArgs {
     #[arg(long)]
     pub(crate) price_usdc: Option<String>,
     /// Free text audit reason, persisted on the event.
-    #[arg(long)]
+    #[arg(long, value_parser = nonblank_reason)]
     pub(crate) reason: String,
 }
 
@@ -188,7 +199,7 @@ pub(crate) struct ReleaseHedgeArgs {
     #[arg(long)]
     pub(crate) order_id: String,
     /// Free text audit reason, persisted on the event.
-    #[arg(long)]
+    #[arg(long, value_parser = nonblank_reason)]
     pub(crate) reason: String,
 }
 
@@ -216,7 +227,7 @@ pub(crate) struct SetMarkArgs {
     #[arg(long)]
     pub(crate) source: String,
     /// Free text audit reason, persisted on the event.
-    #[arg(long)]
+    #[arg(long, value_parser = nonblank_reason)]
     pub(crate) reason: String,
 }
 
@@ -332,6 +343,59 @@ mod tests {
             Command::Debug(debug) => debug,
             Command::Read(_) => panic!("expected a debug command"),
         })
+    }
+
+    /// Every free-text `--reason` shares the nonblank parser, so an empty or
+    /// whitespace-only value is refused by clap before auth or the network,
+    /// rather than round-tripping to the server's blank check.
+    #[test]
+    fn blank_reasons_are_rejected_at_parse_time() {
+        let blanks = ["", "   ", "\t", "\n"];
+        let verbs: &[&[&str]] = &[
+            &["reconcile-equity", "mint", "abc", "--reason"],
+            &["clear-pending-burn", "abc", "--reason"],
+            &["fail-usdc-transfer", "abc", "--reason"],
+            &["position", "set", "AAPL", "--target-net", "1", "--reason"],
+            &[
+                "position",
+                "release-hedge",
+                "AAPL",
+                "--order-id",
+                "ord-1",
+                "--reason",
+            ],
+            &[
+                "portfolio-snapshot",
+                "set-mark",
+                "--day",
+                "2026-09-01",
+                "--symbol",
+                "AAPL",
+                "--usd-mark",
+                "1",
+                "--observed-at",
+                "2026-09-01T20:00:00Z",
+                "--source",
+                "nasdaq",
+                "--reason",
+            ],
+        ];
+        for verb in verbs {
+            for blank in blanks {
+                let argv: Vec<&str> = verb.iter().copied().chain([blank]).collect();
+                let Err(error) = debug(&argv) else {
+                    panic!("{argv:?} must be rejected");
+                };
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{argv:?}"
+                );
+            }
+            // A non-blank reason with the same shape parses.
+            let argv: Vec<&str> = verb.iter().copied().chain(["real reason"]).collect();
+            assert!(debug(&argv).is_ok(), "{argv:?} must parse");
+        }
     }
 
     /// The verbs whose only inputs are positionals and a `--reason`: the
