@@ -1651,6 +1651,7 @@ pub mod process_tx {
         }
     }
 
+    /// Accounts a decoded fill, reconciles any pending hedge, and places a new hedge when needed.
     async fn process_found_trade(
         onchain_trade: OnchainTrade,
         ctx: &Ctx,
@@ -1858,6 +1859,7 @@ pub mod process_tx {
         })
     }
 
+    /// Completes fill accounting after the recovery path has resolved its hedge decision.
     async fn mark_and_settle_fill(
         onchain_trade_store: &Store<OnChainTrade>,
         position_store: &Store<Position>,
@@ -1954,6 +1956,7 @@ pub mod process_tx {
         PostPlacement,
     }
 
+    /// Classifies a persisted hedge and updates its position claim when reconciliation permits.
     async fn reconcile_offchain_order_state(
         loaded_order: Option<OffchainOrder>,
         position_store: &Store<Position>,
@@ -2028,6 +2031,7 @@ pub mod process_tx {
         }
     }
 
+    /// Finalizes a position from a terminal hedge while refusing unpriced retained fills.
     async fn reconcile_terminal_offchain_order(
         order: &OffchainOrder,
         position_store: &Store<Position>,
@@ -2122,20 +2126,24 @@ pub mod process_tx {
             reconcile_post_place_state,
         };
 
+        /// Parses a positive share quantity for process-tx fixtures.
         fn positive_shares(value: &str) -> Positive<FractionalShares> {
             try_positive_shares(value).expect("test shares must be valid and positive")
         }
 
+        /// Creates a migrated database for an isolated process-tx test.
         async fn setup_test_db() -> sqlx::SqlitePool {
             try_setup_test_db()
                 .await
                 .expect("test database setup must succeed")
         }
 
+        /// Returns the valid baseline onchain trade fixture used throughout this module.
         fn onchain_trade_builder() -> OnchainTradeBuilder {
             OnchainTradeBuilder::try_new().expect("default onchain trade fixture must be valid")
         }
 
+        /// Builds the minimal application context required by process-tx tests.
         fn create_base_test_ctx() -> Ctx {
             st0x_config::create_test_ctx_with_order_owner(Address::ZERO)
         }

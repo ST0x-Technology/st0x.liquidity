@@ -7258,6 +7258,7 @@ mod tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
+    /// Every domain outcome must retain its meaning across the API boundary.
     #[test]
     fn process_tx_response_serializes_each_mapped_outcome() {
         let mut cases: Vec<(ProcessTxOutcome, serde_json::Value)> = vec![
@@ -7331,6 +7332,7 @@ mod tests {
         }
     }
 
+    /// Invalid transaction hashes must be rejected before any recovery work starts.
     #[tokio::test]
     async fn process_transaction_rejects_an_invalid_tx_hash() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
@@ -7348,6 +7350,7 @@ mod tests {
         );
     }
 
+    /// Recovery must remain unavailable until the conductor publishes its handle.
     #[tokio::test]
     async fn process_transaction_reports_unavailable_before_startup() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;

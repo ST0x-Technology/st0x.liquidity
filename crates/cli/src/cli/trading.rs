@@ -650,6 +650,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     render_process_tx_outcome(tx_hash, &outcome, stdout)
 }
 
+/// Renders a process-tx outcome as operator-facing CLI guidance.
 fn render_process_tx_outcome<W: Write>(
     tx_hash: TxHash,
     outcome: &ProcessTxOutcome,
@@ -1228,6 +1229,7 @@ mod tests {
     }
 
     impl SequencedStatusExecutor {
+        /// Builds an executor that returns the supplied states in order.
         fn new(statuses: Vec<OrderState>) -> Self {
             Self {
                 statuses: Arc::new(statuses),
@@ -1236,11 +1238,13 @@ mod tests {
             }
         }
 
+        /// Records the quantity expected by the placement assertion.
         fn with_placed_shares(mut self, placed_shares: Positive<FractionalShares>) -> Self {
             self.placed_shares = Some(placed_shares);
             self
         }
 
+        /// Returns how many status polls the command issued.
         fn status_calls(&self) -> usize {
             self.status_calls.load(Ordering::SeqCst)
         }
@@ -2542,6 +2546,7 @@ mod tests {
         );
     }
 
+    /// A broker cancellation must fail a market buy instead of reporting a fill.
     #[tokio::test]
     async fn market_buy_fails_when_the_broker_cancels_the_order() {
         let broker = MockExecutor::new().with_order_status(OrderState::Cancelled {
@@ -2568,6 +2573,7 @@ mod tests {
         );
     }
 
+    /// A cancelled partial fill must preserve its executed quantity in the error.
     #[tokio::test]
     async fn market_buy_cancelled_after_partial_fill_reports_details() {
         let broker = MockExecutor::new().with_order_status(OrderState::Cancelled {
@@ -2601,6 +2607,7 @@ mod tests {
         );
     }
 
+    /// Filled-order output must report the executed quantity.
     #[test]
     fn write_order_status_displays_filled_quantity() {
         let mut stdout = Vec::new();
@@ -2623,6 +2630,7 @@ mod tests {
         );
     }
 
+    /// Partially-filled output must identify the state, quantity, and broker order.
     #[test]
     fn write_order_status_displays_partially_filled_state() {
         let mut stdout = Vec::new();
@@ -2651,6 +2659,7 @@ mod tests {
         );
     }
 
+    /// Cancelled-order output must identify the state, quantity, and broker order.
     #[test]
     fn write_order_status_displays_cancelled_state() {
         let mut stdout = Vec::new();
@@ -2677,6 +2686,7 @@ mod tests {
         );
     }
 
+    /// Terminal failure output must tell the operator to place a fresh order.
     #[test]
     fn write_order_status_displays_terminal_failure() {
         let mut stdout = Vec::new();
@@ -2708,6 +2718,7 @@ mod tests {
         );
     }
 
+    /// Non-terminal failure output must tell the operator the order will resume.
     #[test]
     fn write_order_status_displays_not_terminal_failure() {
         let mut stdout = Vec::new();
@@ -2736,6 +2747,7 @@ mod tests {
         );
     }
 
+    /// Every process-tx outcome must render actionable operator guidance.
     #[test]
     fn render_process_tx_outcome_covers_every_arm() {
         let tx_hash = TxHash::repeat_byte(0x11);
