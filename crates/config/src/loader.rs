@@ -9,7 +9,7 @@ use clap::Parser;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -472,6 +472,10 @@ struct BrokerConfig {
     extended_hours_close_flatten_window_secs: Option<u64>,
     travel_rule: Option<TravelRuleConfig>,
     close_flatten_cross_max_bps: Option<u16>,
+    /// Shares every outflow leaves in the broker account per symbol, so
+    /// pricing (which marks from `/positions`) never loses the mark. Absent
+    /// means zero, today's behaviour; `[assets.equities.SYM]` overrides it.
+    hedge_floor_shares: Option<FractionalShares>,
 }
 
 /// The broker identity tag: which executor backs hedging, minus its
@@ -837,6 +841,7 @@ impl BrokerCtx {
         account_id: AlpacaAccountId,
         mode: Option<AlpacaBrokerApiMode>,
         broker_config: Option<&BrokerConfig>,
+        hedge_floor: HedgeFloor,
     ) -> Result<Self, CtxError> {
         // Unwrap the section once: a per-field `ok_or` would make the
         // error reported for a wholly missing `[broker]` depend on
@@ -851,7 +856,7 @@ impl BrokerCtx {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: broker_config.counter_trade_slippage_bps()?,
-            hedge_floor: HedgeFloor::default(),
+            hedge_floor,
         }))
     }
 }
@@ -1034,12 +1039,58 @@ struct ResolvedIdentity {
     private_key_pem_path: Option<PathBuf>,
 }
 
+/// The floor every broker outflow keeps: `[broker] hedge_floor_shares` as
+/// the default, overridden per symbol under `[assets.equities.SYM]`. Absent
+/// means zero. A negative value is refused rather than clamped.
+fn assemble_hedge_floor(
+    broker_config: Option<&BrokerConfig>,
+    hedging: &HedgingAssets,
+) -> Result<HedgeFloor, CtxError> {
+    let default_shares = broker_config
+        .and_then(|config| config.hedge_floor_shares)
+        .unwrap_or(FractionalShares::ZERO);
+    refuse_negative_hedge_floor(None, default_shares)?;
+
+    let per_symbol = hedging
+        .equities
+        .symbols
+        .iter()
+        .filter_map(|(symbol, policy)| {
+            policy
+                .hedge_floor_shares
+                .map(|floor| (symbol.clone(), floor))
+        })
+        .map(|(symbol, floor)| {
+            refuse_negative_hedge_floor(Some(&symbol), floor)?;
+            Ok((symbol, floor))
+        })
+        .collect::<Result<HashMap<_, _>, CtxError>>()?;
+
+    Ok(HedgeFloor::new(default_shares, per_symbol))
+}
+
+fn refuse_negative_hedge_floor(
+    symbol: Option<&Symbol>,
+    configured: FractionalShares,
+) -> Result<(), CtxError> {
+    if configured.inner().lt(FractionalShares::ZERO.inner())? {
+        return Err(CtxError::NegativeHedgeFloor {
+            symbol: symbol.cloned(),
+            configured,
+        });
+    }
+
+    Ok(())
+}
+
 fn resolve_broker(
     broker_config: Option<&BrokerConfig>,
     secrets: Option<BrokerSecrets>,
+    hedging: &HedgingAssets,
     startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<BrokerCtx, CtxError> {
     let secrets_parts = secrets.map(SecretsBrokerParts::from);
+    let hedge_floor = assemble_hedge_floor(broker_config, hedging)?;
 
     // Migration shim, removed next release: see `BrokerSecrets`.
     if let Some(notice) = secrets_parts
@@ -1143,6 +1194,7 @@ fn resolve_broker(
                 account_id,
                 mode,
                 broker_config,
+                hedge_floor,
             )
         }
         BrokerKind::AlpacaBrokerApiKms => {
@@ -1191,6 +1243,7 @@ fn resolve_broker(
                 account_id,
                 mode,
                 broker_config,
+                hedge_floor,
             )
         }
         BrokerKind::AlpacaBrokerApiJwt => {
@@ -1241,6 +1294,7 @@ fn resolve_broker(
                 account_id,
                 Some(mode),
                 broker_config,
+                hedge_floor,
             )
         }
     }
@@ -1818,7 +1872,12 @@ fn parse_and_validate(
         travel_rule,
     } = validate_config(&config, config_path, &mut startup_notices)?;
 
-    let broker = resolve_broker(config.broker.as_ref(), secrets.broker, &mut startup_notices)?;
+    let broker = resolve_broker(
+        config.broker.as_ref(),
+        secrets.broker,
+        &config.assets,
+        &mut startup_notices,
+    )?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
 
     // Migration shim, removed next release: see the `Secrets::alerts` field.
@@ -2356,6 +2415,7 @@ impl Ctx {
                             symbol.clone(),
                             crate::EquityHedgePolicy {
                                 extended_hours_counter_trading: OperationMode::Disabled,
+                                hedge_floor_shares: None,
                             },
                         )
                     })
@@ -7012,6 +7072,8 @@ mod tests {
             extended_hours_close_flatten_window_secs: Some(300),
             travel_rule: None,
             close_flatten_cross_max_bps: None,
+
+            hedge_floor_shares: None,
         };
 
         let error = broker.extended_hours_reprice_timeout_secs().unwrap_err();
@@ -7042,6 +7104,8 @@ mod tests {
             extended_hours_close_flatten_window_secs: Some(300),
             travel_rule: None,
             close_flatten_cross_max_bps: None,
+
+            hedge_floor_shares: None,
         };
 
         let error = broker.extended_hours_reprice_timeout_secs().unwrap_err();
@@ -7069,6 +7133,8 @@ mod tests {
             extended_hours_close_flatten_window_secs: Some(300),
             travel_rule: None,
             close_flatten_cross_max_bps: None,
+
+            hedge_floor_shares: None,
         };
 
         assert_eq!(
@@ -7091,6 +7157,8 @@ mod tests {
             extended_hours_close_flatten_window_secs: Some(300),
             travel_rule: None,
             close_flatten_cross_max_bps: None,
+
+            hedge_floor_shares: None,
         };
         assert!(matches!(
             missing.close_flatten_reprice_timeout_secs(),
@@ -7121,6 +7189,8 @@ mod tests {
             extended_hours_close_flatten_window_secs: Some(u64::MAX),
             travel_rule: None,
             close_flatten_cross_max_bps: None,
+
+            hedge_floor_shares: None,
         };
 
         let error = broker
@@ -7155,6 +7225,8 @@ mod tests {
             ),
             travel_rule: None,
             close_flatten_cross_max_bps: None,
+
+            hedge_floor_shares: None,
         };
 
         assert_eq!(
@@ -7636,7 +7708,9 @@ mod tests {
                      \"0xf4f8c66085910d583c01f3b4e44bf731d4e2c565\"\n            \
                      trading = \"enabled\"\n            \
                      rebalancing = \"disabled\"\n            \
-                     wrapped_equity_recovery = \"disabled\"\n"
+                     wrapped_equity_recovery = \"disabled\"\n\n            \
+                     [pricing]\n            \
+                     ws_url = \"wss://pricing.test/ws\"\n"
                 ),
             );
         assert_ne!(config, base, "fixture substitutions must apply");
@@ -7646,7 +7720,7 @@ mod tests {
     #[test]
     fn hedge_floor_per_symbol_override_wins_over_the_broker_default() {
         let config = hedge_floor_config_toml("1", "3");
-        let secrets = alpaca_secrets_toml();
+        let secrets = alpaca_pricing_secrets_toml();
 
         let parts = parse_and_validate_files(&config, &secrets).unwrap();
         let floor = parts.broker.hedge_floor();
@@ -7664,7 +7738,7 @@ mod tests {
     #[tokio::test]
     async fn validate_files_refuses_a_negative_hedge_floor() {
         let config = hedge_floor_config_toml("1", "-1");
-        let secrets = alpaca_secrets_toml();
+        let secrets = alpaca_pricing_secrets_toml();
 
         let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
 
@@ -9289,6 +9363,7 @@ mod tests {
             extended_hours_close_flatten_window_secs: None,
             travel_rule: None,
             close_flatten_cross_max_bps: None,
+            hedge_floor_shares: None,
         }
     }
 
@@ -9312,6 +9387,7 @@ mod tests {
                 account_id: "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef".parse().unwrap(),
                 mode: AlpacaBrokerApiMode::Sandbox,
             }),
+            &HedgingAssets::default(),
             &mut Vec::new(),
         )
         .unwrap();
@@ -9343,6 +9419,7 @@ mod tests {
                 account_id: "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef".parse().unwrap(),
                 mode: AlpacaBrokerApiMode::Sandbox,
             }),
+            &HedgingAssets::default(),
             &mut Vec::new(),
         )
         .unwrap_err();

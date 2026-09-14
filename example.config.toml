@@ -63,6 +63,15 @@ extended_hours_close_flatten_window_secs = 900
 # Placement prices off the broker's position mark, so this bounds how far it
 # will chase a fill before a weekend or holiday (ADR 0019).
 close_flatten_cross_max_bps = 400
+# Shares every sell hedge and every equity mint leaves in the account, per
+# symbol. Pricing marks each symbol from this account's positions, so a symbol
+# whose position hits zero has no price anywhere; the floor keeps one. The
+# residual is a deliberate unhedged exposure of about floor x price per symbol
+# (hedge_deficit_shares{symbol} reports it). Whole-share assets round it up to
+# a full share. 0 disables. Fund at least the floor when onboarding a symbol,
+# or it holds nothing on day one. Override per symbol under
+# [assets.equities.SYM].
+hedge_floor_shares = 1
 
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"
@@ -74,6 +83,8 @@ retired_symbols = []
 
 [assets.equities.EXAMPLE]
 extended_hours_counter_trading = "disabled"
+# Per-symbol override of [broker] hedge_floor_shares.
+hedge_floor_shares = 1
 
 
 [chains.base]

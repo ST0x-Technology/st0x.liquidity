@@ -1624,6 +1624,7 @@ mod tests {
                     Symbol::new(symbol).unwrap(),
                     EquityHedgePolicy {
                         extended_hours_counter_trading,
+                        hedge_floor_shares: None,
                     },
                 ))
                 .collect(),

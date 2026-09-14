@@ -179,6 +179,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
                             Symbol::new(symbol).unwrap(),
                             EquityHedgePolicy {
                                 extended_hours_counter_trading: OperationMode::Disabled,
+                                hedge_floor_shares: None,
                             },
                         )
                     })

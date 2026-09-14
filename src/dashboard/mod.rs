@@ -673,6 +673,7 @@ mod tests {
             symbol.clone(),
             st0x_config::EquityHedgePolicy {
                 extended_hours_counter_trading: OperationMode::Enabled,
+                hedge_floor_shares: None,
             },
         );
 

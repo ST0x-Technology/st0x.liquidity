@@ -50,7 +50,7 @@ use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
     CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
-    HedgeFloor, MarketOrder, MarketSession, Positive, Symbol, TryIntoExecutor, Usd,
+    MarketOrder, MarketSession, Positive, Symbol, TryIntoExecutor, Usd,
 };
 use st0x_issuance_client::IssuanceClient;
 use st0x_issuance_dto::VaultModeTag;
@@ -2849,7 +2849,7 @@ fn build_rebalancing_service(
             transfer_timeout: rebalancing_ctx.transfer_timeout,
             assets: deps.ctx.chains.primary().assets.clone(),
             cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
-            hedge_floor: HedgeFloor::default(),
+            hedge_floor: deps.ctx.broker.hedge_floor().clone(),
         },
         deps.vault_registry.clone(),
         registry_ids,
@@ -9347,6 +9347,7 @@ mod tests {
                             symbol.clone(),
                             st0x_config::EquityHedgePolicy {
                                 extended_hours_counter_trading: extended_hours,
+                                hedge_floor_shares: None,
                             },
                         )
                     })
@@ -11017,6 +11018,7 @@ mod tests {
                         Symbol::new("AAPL").unwrap(),
                         st0x_config::EquityHedgePolicy {
                             extended_hours_counter_trading: OperationMode::Enabled,
+                            hedge_floor_shares: None,
                         },
                     )]),
                 },

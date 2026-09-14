@@ -1675,6 +1675,7 @@ mod tests {
                             symbol.clone(),
                             EquityHedgePolicy {
                                 extended_hours_counter_trading: extended_hours,
+                                hedge_floor_shares: None,
                             },
                         )
                     })
