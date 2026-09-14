@@ -29,7 +29,7 @@ use st0x_dto::{
     TradingVenue,
 };
 use st0x_event_sorcery::{
-    AggregateError, EventSourced, SendError, StoreBuilder, load_entity, send_command,
+    AggregateError, EventSourced, SendError, Store, StoreBuilder, load_entity, send_command,
 };
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
@@ -1322,6 +1322,12 @@ pub(crate) struct RecoveryHandle {
     /// read then mutate a USDC rebalance, or spend the rebalancing wallet,
     /// quiesces the workers through it first and resumes them on every exit.
     pub(crate) usdc_driver_pause: Arc<UsdcDriverPause>,
+    /// The conductor-built wired `UsdcRebalance` store. `fail-usdc-transfer`
+    /// sends `FailBridging` through it so the event reaches the live
+    /// rebalancing reactor, which reconciles the in-memory guard and inventory
+    /// to the durable outcome. A standalone store would bypass the reactor and
+    /// leave the running bot latched with `guardHeld: false` reported.
+    pub(crate) usdc_store: Arc<Store<UsdcRebalance>>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
@@ -2372,7 +2378,7 @@ async fn fail_usdc_transfer(
 
     let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause).await?;
 
-    let response = fail_pre_burn_usdc_transfer(&state.pool, &id, reason).await?;
+    let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
     Ok(Json(response))
 }
 
@@ -2381,16 +2387,17 @@ async fn fail_usdc_transfer(
 /// reports the direction-dependent guard outcome from the durable state. The
 /// caller holds the resume lock and the driver pause, so nothing can record a
 /// burn between the preflight and the send.
+///
+/// `store` is the conductor-built wired store (from [`RecoveryHandle`]), so the
+/// `FailBridging` event reaches the live rebalancing reactor and reconciles the
+/// in-memory guard and inventory. A standalone store would emit the same event
+/// but bypass the reactor, leaving the running bot latched while the response
+/// reports `guardHeld: false`.
 async fn fail_pre_burn_usdc_transfer(
-    pool: &sqlx::SqlitePool,
+    store: &Store<UsdcRebalance>,
     id: &UsdcRebalanceId,
     reason: String,
 ) -> Result<FailUsdcTransferResponse, (StatusCode, Json<ErrorResponse>)> {
-    let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-        .build(())
-        .await
-        .map_err(ops_store_error)?;
-
     let Some(rebalance) = store.load(id).await.map_err(ops_store_error)? else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -6683,6 +6690,18 @@ mod tests {
         store.load(id).await.unwrap().expect("aggregate must exist")
     }
 
+    /// A standalone `UsdcRebalance` store for the durable-outcome tests, which
+    /// assert the eligibility gate, the response, and the persisted terminal
+    /// state -- none of which need the live reactor. The reactor-wired path is
+    /// covered in-process by the trigger module's guard-reconciliation tests.
+    async fn standalone_usdc_store(pool: &SqlitePool) -> Arc<Store<UsdcRebalance>> {
+        StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap()
+            .0
+    }
+
     /// Seeds an AlpacaToBase `UsdcRebalance` into `WithdrawalComplete`: the
     /// pre-withdrawal conversion, then the Alpaca withdrawal confirmed. Funds
     /// are off Alpaca but no burn intent has been recorded.
@@ -7065,8 +7084,9 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_submitting(&pool, &id, false).await;
+        let store = standalone_usdc_store(&pool).await;
 
-        let body = fail_pre_burn_usdc_transfer(&pool, &id, "burn never attempted".to_string())
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "burn never attempted".to_string())
             .await
             .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
 
@@ -7096,8 +7116,9 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_alpaca_to_base_withdrawal_complete(&pool, &id).await;
+        let store = standalone_usdc_store(&pool).await;
 
-        let body = fail_pre_burn_usdc_transfer(&pool, &id, "bridge never started".to_string())
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "bridge never started".to_string())
             .await
             .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
 
@@ -7119,9 +7140,10 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_submitting(&pool, &id, true).await;
+        let store = standalone_usdc_store(&pool).await;
 
         let Err((status, Json(error))) =
-            fail_pre_burn_usdc_transfer(&pool, &id, "audit".to_string()).await
+            fail_pre_burn_usdc_transfer(&store, &id, "audit".to_string()).await
         else {
             panic!("a recorded pending burn is post-burn and must be refused");
         };
@@ -7141,8 +7163,9 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_failed(&pool, &id).await;
+        let store = standalone_usdc_store(&pool).await;
 
-        let Err((status, _)) = fail_pre_burn_usdc_transfer(&pool, &id, "audit".to_string()).await
+        let Err((status, _)) = fail_pre_burn_usdc_transfer(&store, &id, "audit".to_string()).await
         else {
             panic!("a post-burn BridgingFailed must be refused");
         };
@@ -7152,15 +7175,16 @@ mod tests {
     #[tokio::test]
     async fn fail_pre_burn_usdc_transfer_is_not_repeatable() {
         let pool = crate::test_utils::setup_test_db().await;
+        let store = standalone_usdc_store(&pool).await;
 
         // BaseToAlpaca: the guard is already cleared, nothing left to do.
         let cleared = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_submitting(&pool, &cleared, false).await;
-        fail_pre_burn_usdc_transfer(&pool, &cleared, "first".to_string())
+        fail_pre_burn_usdc_transfer(&store, &cleared, "first".to_string())
             .await
             .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
         let Err((status, Json(error))) =
-            fail_pre_burn_usdc_transfer(&pool, &cleared, "second".to_string()).await
+            fail_pre_burn_usdc_transfer(&store, &cleared, "second".to_string()).await
         else {
             panic!("an already-failed pre-burn transfer must be refused");
         };
@@ -7171,11 +7195,11 @@ mod tests {
         // send the operator to reconcile rather than claim nothing is needed.
         let held = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_alpaca_to_base_withdrawal_complete(&pool, &held).await;
-        fail_pre_burn_usdc_transfer(&pool, &held, "first".to_string())
+        fail_pre_burn_usdc_transfer(&store, &held, "first".to_string())
             .await
             .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
         let Err((status, Json(error))) =
-            fail_pre_burn_usdc_transfer(&pool, &held, "second".to_string()).await
+            fail_pre_burn_usdc_transfer(&store, &held, "second".to_string()).await
         else {
             panic!("an already-failed pre-burn transfer must be refused");
         };
@@ -7188,12 +7212,72 @@ mod tests {
     async fn fail_pre_burn_usdc_transfer_404_for_unseeded_id() {
         let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let store = standalone_usdc_store(&pool).await;
 
-        let Err((status, _)) = fail_pre_burn_usdc_transfer(&pool, &id, "audit".to_string()).await
+        let Err((status, _)) = fail_pre_burn_usdc_transfer(&store, &id, "audit".to_string()).await
         else {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// In-process proof that routing `FailBridging` through the conductor-built
+    /// wired store reaches the live reactor: a latched running bot
+    /// (`usdc_in_progress = true`) must be cleared by a BaseToAlpaca pre-burn
+    /// failure, matching the `guardHeld: false` the route reports. A standalone
+    /// store would report `guardHeld: false` while leaving the flag set.
+    #[tokio::test]
+    async fn fail_pre_burn_reactor_clears_the_live_guard_for_base_to_alpaca() {
+        use std::sync::atomic::Ordering;
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&pool, &id, false).await;
+        // Simulate the running bot latched on this in-flight transfer.
+        service.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "burn never attempted".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert!(
+            !body.guard_held,
+            "BaseToAlpaca pre-burn failure clears the guard"
+        );
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "the reactor must clear the live in-memory guard, not just the durable state",
+        );
+    }
+
+    /// The AlpacaToBase counterpart: the withdrawal already moved funds off
+    /// Alpaca, so the reactor must KEEP the live guard latched (matching
+    /// `guardHeld: true`) until the operator reconciles.
+    #[tokio::test]
+    async fn fail_pre_burn_reactor_keeps_the_live_guard_for_alpaca_to_base() {
+        use std::sync::atomic::Ordering;
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_alpaca_to_base_withdrawal_complete(&pool, &id).await;
+        service.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "bridge never started".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert!(
+            body.guard_held,
+            "AlpacaToBase pre-burn failure holds the guard"
+        );
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "the reactor must keep the live guard latched until reconcile-usdc",
+        );
     }
 
     #[tokio::test]
