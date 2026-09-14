@@ -2094,6 +2094,91 @@ mod tests {
         ));
     }
 
+    async fn floored_non_fractionable_sell_preflight(floor: &str) -> CounterTradePreflight {
+        let server = MockServer::start();
+        let mut ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        ctx.hedge_floor = HedgeFloor::new(
+            FractionalShares::new(Float::parse(floor.to_string()).unwrap()),
+            HashMap::new(),
+        );
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "100.00"
+                }));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "symbol": "FGI",
+                    "asset_class": "us_equity",
+                    "qty_available": "1.9"
+                }]));
+        });
+        create_asset_fractionability_mock(&server, "FGI", false);
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+
+        executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("FGI").unwrap(),
+                shares: positive_shares("2.75"),
+                direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap()
+    }
+
+    /// 1.9 shares of a whole-share asset is one sellable share; a floor of
+    /// one keeps it.
+    #[tokio::test]
+    async fn non_fractionable_sell_preflight_holds_the_last_whole_share_at_floor() {
+        let preflight = floored_non_fractionable_sell_preflight("1").await;
+
+        assert!(
+            matches!(
+                preflight,
+                CounterTradePreflight::Skipped(CounterTradeSkipReason::HeldAtFloor {
+                    ref symbol,
+                    floor,
+                    available,
+                }) if symbol == &Symbol::new("FGI").unwrap()
+                    && floor == FractionalShares::new(float!(1))
+                    && available == FractionalShares::new(float!(1))
+            ),
+            "expected HeldAtFloor, got {preflight:?}"
+        );
+    }
+
+    /// A fractional floor on a whole-share asset rounds up to one share:
+    /// otherwise the preflight would offer 0.5 of a share the broker cannot
+    /// sell.
+    #[tokio::test]
+    async fn non_fractionable_sell_preflight_rounds_a_fractional_floor_up_to_a_whole_share() {
+        let preflight = floored_non_fractionable_sell_preflight("0.5").await;
+
+        assert!(
+            matches!(
+                preflight,
+                CounterTradePreflight::Skipped(CounterTradeSkipReason::HeldAtFloor {
+                    floor,
+                    available,
+                    ..
+                }) if floor == FractionalShares::new(float!(1))
+                    && available == FractionalShares::new(float!(1))
+            ),
+            "expected HeldAtFloor with a whole-share floor, got {preflight:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_asset_validation_uses_cache() {
         let server = MockServer::start();
