@@ -94,7 +94,7 @@ impl fmt::Display for ChainCapability {
 ///   an ETH/USD Pyth feed read at a Base block.
 /// - Ethereum signs, holds USDC (CCTP domain 0), pays gas in ETH, and has a
 ///   fill watcher whose fills are accounted and hedged against its own asset
-///   table (the position check backstop sweeps every watched chain's table),
+///   table (the position check backstop sweeps every hedged chain's table),
 ///   but no wrapper.
 /// - HyperEVM signs, watches fills and hedges prefunded inventory. It has no
 ///   CCTP domain or wrapper, and the ETH/USD feed cannot value its HYPE gas.

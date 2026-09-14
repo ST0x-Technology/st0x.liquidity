@@ -79,7 +79,7 @@ use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
-use st0x_config::{IngestionCutoff, TradingChain};
+use st0x_config::{HedgedChain, IngestionCutoff};
 
 use crate::conductor::job::QueuePushError;
 use crate::onchain::OnChainError;
@@ -100,7 +100,7 @@ use crate::telemetry::{
 /// checkpoint -- so a hiccup never halts ingestion.
 #[derive(Clone)]
 pub(crate) struct OrderFillMonitor<P> {
-    evm_ctx: TradingChain,
+    evm_ctx: HedgedChain,
     backfill_queue: BackfillJobQueue,
     pool: SqlitePool,
     provider: P,
@@ -109,7 +109,7 @@ pub(crate) struct OrderFillMonitor<P> {
 
 impl<P> OrderFillMonitor<P> {
     pub(crate) fn new(
-        evm_ctx: TradingChain,
+        evm_ctx: HedgedChain,
         backfill_queue: BackfillJobQueue,
         pool: SqlitePool,
         provider: P,
@@ -684,7 +684,7 @@ mod tests {
         OrderFillMonitor<P>,
         SqlitePool,
         apalis_sqlite::SqlitePool,
-        TradingChain,
+        HedgedChain,
     ) {
         setup_with_deployment_block(provider, 1).await
     }
@@ -696,7 +696,7 @@ mod tests {
         OrderFillMonitor<P>,
         SqlitePool,
         apalis_sqlite::SqlitePool,
-        TradingChain,
+        HedgedChain,
     ) {
         setup_with_deployment_block_and_cutoff(provider, deployment_block, IngestionCutoff::Safe)
             .await
@@ -710,24 +710,24 @@ mod tests {
         OrderFillMonitor<P>,
         SqlitePool,
         apalis_sqlite::SqlitePool,
-        TradingChain,
+        HedgedChain,
     ) {
-        let evm_ctx = TradingChain::test()
+        let evm_ctx = HedgedChain::test()
             .deployment_block(deployment_block)
             .ingestion_cutoff(ingestion_cutoff)
             .call();
 
-        setup_with_trading_chain(provider, evm_ctx).await
+        setup_with_hedged_chain(provider, evm_ctx).await
     }
 
-    async fn setup_with_trading_chain<P>(
+    async fn setup_with_hedged_chain<P>(
         provider: P,
-        evm_ctx: TradingChain,
+        evm_ctx: HedgedChain,
     ) -> (
         OrderFillMonitor<P>,
         SqlitePool,
         apalis_sqlite::SqlitePool,
-        TradingChain,
+        HedgedChain,
     ) {
         let (pool, apalis_pool) = setup_test_pools().await;
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
@@ -1299,7 +1299,7 @@ mod tests {
         let (pool, apalis_pool, db_path, _dir) =
             crate::test_utils::setup_file_backed_test_db(Duration::from_millis(250)).await;
         let backfill_queue = BackfillJobQueue::new(&apalis_pool);
-        let evm_ctx = TradingChain::test().deployment_block(1).call();
+        let evm_ctx = HedgedChain::test().deployment_block(1).call();
 
         // One chain-tip + cutoff-block response pair per poll_once call.
         let asserter = Asserter::new();
@@ -1505,16 +1505,16 @@ mod tests {
         assert_eq!(lag_blocks, Some(3));
     }
 
-    /// One watcher runs per watched chain: a secondary chain's sample is
+    /// One watcher runs per hedged chain: a secondary chain's sample is
     /// filed under that chain, never under the primary's.
     #[tokio::test]
     async fn poll_once_files_the_lag_sample_under_the_watchers_chain() {
-        let ethereum = TradingChain::test()
+        let ethereum = HedgedChain::test()
             .chain(Chain::Ethereum)
             .deployment_block(1)
             .call();
         let (mut monitor, pool, _apalis_pool, evm_ctx) =
-            setup_with_trading_chain(provider_at(105, 102), ethereum).await;
+            setup_with_hedged_chain(provider_at(105, 102), ethereum).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
             .await
             .unwrap();

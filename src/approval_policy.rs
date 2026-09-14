@@ -26,7 +26,7 @@ pub enum ApprovalPolicyVerification {
     },
 }
 
-/// Every startup approval target on one watched chain for which no provably
+/// Every startup approval target on one hedged chain for which no provably
 /// matching allow policy was returned by Turnkey.
 #[derive(Debug)]
 pub struct MissingPolicyCoverage {
@@ -78,7 +78,7 @@ pub enum ApprovalPolicyVerificationError {
     Coverage(#[from] ChainCoverageError),
 }
 
-/// Why one watched chain's startup approvals are not provably covered.
+/// Why one hedged chain's startup approvals are not provably covered.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainCoverageError {
     #[error(transparent)]
@@ -101,7 +101,7 @@ pub async fn verify_turnkey_approval_policies(
     )
     .await?;
     let snapshot = client.list_policies().await?;
-    let target_count = verify_watched_chains(&inputs.watched, &snapshot, inputs.wallet_address)?;
+    let target_count = verify_hedged_chains(&inputs.hedged, &snapshot, inputs.wallet_address)?;
 
     Ok(ApprovalPolicyVerification::Verified {
         target_count,
@@ -109,17 +109,17 @@ pub async fn verify_turnkey_approval_policies(
     })
 }
 
-/// Every watched chain's startup targets, each checked against the policies
+/// Every hedged chain's startup targets, each checked against the policies
 /// on that chain's own id; the covered target count on success. The first
 /// chain with an uncovered target fails the gate naming that chain.
-fn verify_watched_chains(
-    watched: &[ChainApprovalInputs],
+fn verify_hedged_chains(
+    hedged: &[ChainApprovalInputs],
     snapshot: &TurnkeyPolicySnapshot,
     wallet_address: Address,
 ) -> Result<usize, ChainCoverageError> {
     let mut target_count = 0;
 
-    for chain_inputs in watched {
+    for chain_inputs in hedged {
         let chain = chain_inputs.chain;
         let targets = build_approval_targets(
             chain_inputs.role,
@@ -890,7 +890,7 @@ mod tests {
         }
     }
 
-    /// One watched chain listing a trading-only AAPL: underlying 0x11..
+    /// One hedged chain listing a trading-only AAPL: underlying 0x11..
     /// wraps into vault 0x22.., which deposits into orderbook 0x33.. -- the
     /// same addresses the policy fixtures above name.
     fn chain_inputs(chain: Chain, role: ChainRole) -> ChainApprovalInputs {
@@ -923,13 +923,13 @@ mod tests {
         }
     }
 
-    /// Each watched chain's targets are checked on that chain's own id: a
+    /// Each hedged chain's targets are checked on that chain's own id: a
     /// policy pinned to Base's chain id covers Base's three targets and
     /// refuses an Ethereum trading table outright, naming the chain. The
     /// hedge-only secondary's one uncovered target is Ethereum's own USDC:
     /// its trading-only AAPL has no wrapper there to approve.
     #[test]
-    fn watched_chain_targets_are_checked_on_their_own_chain_id() {
+    fn hedged_chain_targets_are_checked_on_their_own_chain_id() {
         let policies = snapshot(vec![tag_allow(
             "activity.type == 'ACTIVITY_TYPE_SIGN_TRANSACTION_V2' && \
              eth.tx.chain_id == 8453 && \
@@ -937,7 +937,7 @@ mod tests {
         )]);
         let wallet_address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
 
-        let covered = verify_watched_chains(
+        let covered = verify_hedged_chains(
             &[chain_inputs(Chain::Base, ChainRole::Primary)],
             &policies,
             wallet_address,
@@ -945,7 +945,7 @@ mod tests {
         .unwrap();
         assert_eq!(covered, 3);
 
-        let error = verify_watched_chains(
+        let error = verify_hedged_chains(
             &[
                 chain_inputs(Chain::Base, ChainRole::Primary),
                 chain_inputs(Chain::Ethereum, ChainRole::Secondary),
@@ -969,8 +969,8 @@ mod tests {
     }
 
     #[test]
-    fn watched_hyperevm_requires_policy_for_its_canonical_usdc() {
-        let watched = [chain_inputs(Chain::HyperEvm, ChainRole::Secondary)];
+    fn hedged_hyperevm_requires_policy_for_its_canonical_usdc() {
+        let hedged = [chain_inputs(Chain::HyperEvm, ChainRole::Secondary)];
         let wallet_address = address!("0x52908400098527886E0F7030069857D2E4169EE7");
         let condition = format!(
             "eth.tx.chain_id == 999 && eth.tx.to == '{USDC_HYPEREVM:#x}' && \
@@ -986,7 +986,7 @@ mod tests {
             )))],
         ] {
             let error =
-                verify_watched_chains(&watched, &snapshot(policies), wallet_address).unwrap_err();
+                verify_hedged_chains(&hedged, &snapshot(policies), wallet_address).unwrap_err();
             let ChainCoverageError::MissingCoverage(missing) = error;
 
             assert_eq!(missing.chain, Chain::HyperEvm);
@@ -994,7 +994,7 @@ mod tests {
                 missing.missing,
                 vec![ApprovalTarget {
                     token: USDC_HYPEREVM,
-                    spender: watched[0].orderbook,
+                    spender: hedged[0].orderbook,
                     symbol: None,
                     purpose: ApprovalPurpose::DepositUsdc,
                 }]
@@ -1002,8 +1002,8 @@ mod tests {
         }
 
         assert_eq!(
-            verify_watched_chains(
-                &watched,
+            verify_hedged_chains(
+                &hedged,
                 &snapshot(vec![allow(Some(&condition))]),
                 wallet_address,
             )

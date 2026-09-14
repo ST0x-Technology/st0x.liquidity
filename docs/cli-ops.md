@@ -300,7 +300,7 @@ is listed on before the cutover:
       bot's config and deploy issuance.
 - [ ] Add the same address under `[orchestrator.addresses].<chain>` in this
       bot's config (`validate-config` rejects an unknown chain key or a zero
-      address) and deploy; the startup log must not warn about a watched chain
+      address) and deploy; the startup log must not warn about a hedged chain
       without an entry.
 - [ ] Extend the Turnkey signing policy to `MintAuth` typed data with that
       chain's id and orchestrator as the verifying contract (SPEC, "Mint
