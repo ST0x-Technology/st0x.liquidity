@@ -16584,6 +16584,41 @@ mod tests {
         );
     }
 
+    /// A managed-inventory chain deposits through its inventory contract, so
+    /// startup grants it no orderbook allowance at all: its rebalanced equity
+    /// keeps the wrapper grant alone and the USDC grant is gone. The
+    /// legacy-mode primary still settles against the orderbook, so both of
+    /// its orderbook grants stay.
+    #[test]
+    fn startup_approval_targets_skip_the_orderbook_spender_on_a_managed_chain() {
+        let mut ctx = ctx_with_base_and_ethereum_trading();
+        ctx.chains
+            .insert_secondary(ethereum_trading_chain(None, OperationMode::Enabled));
+        let base_orderbook = ctx.chains.primary().orderbook;
+
+        let targets = startup_approval_targets(&ctx);
+
+        assert_eq!(
+            targets[&Chain::Ethereum],
+            vec![ApprovalTarget {
+                token: Address::repeat_byte(0xe5),
+                spender: Address::repeat_byte(0xe6),
+                symbol: Some(Symbol::new("TSLA").unwrap()),
+                purpose: ApprovalPurpose::WrapUnderlying,
+            }]
+        );
+        assert_eq!(
+            targets[&Chain::Base]
+                .iter()
+                .map(|target| (target.spender, target.purpose))
+                .collect::<Vec<_>>(),
+            vec![
+                (Address::repeat_byte(0xa6), ApprovalPurpose::WrapUnderlying),
+                (base_orderbook, ApprovalPurpose::DepositWrappedEquity),
+                (base_orderbook, ApprovalPurpose::DepositUsdc),
+            ]
+        );
+    }
     /// The stale-allowance revoke walks each managed-inventory chain's own
     /// wrapped tokens and canonical USDC; a legacy-mode chain has no
     /// distinct inventory and is left out.
@@ -16611,6 +16646,43 @@ mod tests {
             revocations[&Chain::Ethereum],
             vec![USDC_ETHEREUM, Address::repeat_byte(0xe6)]
         );
+    }
+
+    /// Startup must never grant an allowance that the same startup then
+    /// revokes as stale. On every configured chain the `(token, spender)`
+    /// pairs the approval targets grant and the `(token, orderbook)` pairs the
+    /// revoke plan clears stay disjoint, whatever spenders either side grows.
+    #[test]
+    fn startup_grants_and_stale_revocations_never_share_a_token_and_spender() {
+        let mut ctx = ctx_with_base_and_ethereum_trading();
+        ctx.chains
+            .insert_secondary(ethereum_trading_chain(None, OperationMode::Enabled));
+        ctx.chains
+            .insert_secondary(TradingChain::test().chain(Chain::HyperEvm).call());
+
+        let targets = startup_approval_targets(&ctx);
+        let revocations = stale_allowance_revocations(&ctx);
+
+        assert_eq!(
+            revocations.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Ethereum, Chain::HyperEvm],
+            "both managed chains must plan revokes, or the invariant holds vacuously"
+        );
+
+        for (chain, granted) in &targets {
+            let orderbook = ctx.chains.watch(*chain).unwrap().orderbook;
+            let revoked = revocations.get(chain).cloned().unwrap_or_default();
+            let granted_then_revoked = granted
+                .iter()
+                .filter(|target| target.spender == orderbook && revoked.contains(&target.token))
+                .collect::<Vec<_>>();
+
+            assert!(
+                granted_then_revoked.is_empty(),
+                "{chain} grants allowances that startup revokes as stale: \
+                 {granted_then_revoked:?}"
+            );
+        }
     }
 
     fn assets_with_equity(symbol: &str, asset: ChainEquityAsset) -> ChainAssets {
