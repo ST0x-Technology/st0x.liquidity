@@ -735,6 +735,23 @@ The bot supports multiple brokers through a unified trait interface:
 - Position querying for inventory management
 - Account balance monitoring for available capital
 
+##### Hedge Floor
+
+Pricing derives every symbol's mark from this account's positions, so a symbol
+whose position reaches zero has no price anywhere. The bot therefore never takes
+a symbol's broker position to zero: a configured per-symbol floor
+(`[broker] hedge_floor_shares` as the default,
+`[assets.equities.SYM] hedge_floor_shares` as an override, absent meaning zero)
+is subtracted from the available position before any sell hedge is sized, and an
+equity rebalance mint is capped at the same figure. For assets the broker trades
+only in whole shares the floor rounds up to a whole share. The residual is a
+deliberate, bounded unhedged exposure of roughly floor times price per symbol;
+`hedge_floor_shares{symbol}` and `hedge_deficit_shares{symbol}` report the floor
+and the shares the last scan could not hedge. A sell blocked by the floor is
+reported as held at the floor, distinct from an empty account, because the two
+call for different operator action. Onboarding a symbol must fund the account
+with at least the floor; the bot does not seed positions.
+
 #### Extended-Hours Counter-Trading
 
 By default, automated counter-trades execute as market orders during regular
