@@ -3202,6 +3202,7 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use alloy::primitives::{Address, TxHash};
     use axum::body::{Body, to_bytes};
@@ -6968,8 +6969,6 @@ mod tests {
     /// the flag set.
     #[tokio::test]
     async fn reconcile_reactor_clears_the_live_guard() {
-        use std::sync::atomic::Ordering;
-
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (service, store) =
             crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
@@ -7272,8 +7271,6 @@ mod tests {
     /// store would report `guardHeld: false` while leaving the flag set.
     #[tokio::test]
     async fn fail_pre_burn_reactor_clears_the_live_guard_for_base_to_alpaca() {
-        use std::sync::atomic::Ordering;
-
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (service, store) =
             crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
@@ -7301,8 +7298,6 @@ mod tests {
     /// `guardHeld: true`) until the operator reconciles.
     #[tokio::test]
     async fn fail_pre_burn_reactor_keeps_the_live_guard_for_alpaca_to_base() {
-        use std::sync::atomic::Ordering;
-
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (service, store) =
             crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
