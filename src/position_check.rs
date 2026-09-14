@@ -2821,6 +2821,67 @@ mod tests {
         );
     }
 
+    /// The residual the floor leaves unhedged must be graphable: every scan
+    /// exports the configured floor and the shares it wanted to sell but
+    /// could not, per symbol.
+    #[tokio::test]
+    async fn scan_exports_the_hedge_floor_and_the_deficit_it_leaves() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let mut cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let floor = HedgeFloor::new(
+            FractionalShares::new(float!(1)),
+            std::collections::HashMap::new(),
+        );
+        let st0x_config::BrokerCtx::AlpacaBrokerApi(broker) = &mut cfg.broker;
+        broker.hedge_floor = floor.clone();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_inventory(Inventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(3)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 100_000,
+                cash_buying_power_cents: Some(100_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            })
+            .with_hedge_floor(floor);
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(5)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let rendered = metrics_handle.render();
+        let sample = |name: &str| {
+            rendered
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{symbol=\"AAPL\"}}")))
+                .and_then(|line| line.rsplit_once(' '))
+                .map_or_else(
+                    || panic!("no {name} series for AAPL in:\n{rendered}"),
+                    |(_, value)| value.to_owned(),
+                )
+        };
+        assert_eq!(sample("hedge_floor_shares"), "1");
+        assert_eq!(sample("hedge_deficit_shares"), "3");
+    }
+
     #[tokio::test]
     async fn close_flatten_buying_power_block_is_signalled_without_enqueueing() {
         let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
