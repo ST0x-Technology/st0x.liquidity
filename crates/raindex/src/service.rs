@@ -351,15 +351,20 @@ impl<E: Evm> RaindexService<E> {
         Ok(FractionalShares::new(exact))
     }
 
-    /// Gets the USDC balance of a vault on Base, pinned to `block_number`.
+    /// Gets the USDC balance of a vault, pinned to `block_number`.
+    ///
+    /// The caller supplies its chain's canonical USDC (`Chain::usdc`): the
+    /// token is half the vault's storage key, so reading a vault under
+    /// another chain's USDC returns a valid zero rather than an error.
     pub async fn get_usdc_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
+        usdc: Address,
         vault_id: RaindexVaultId,
         block_number: u64,
     ) -> Result<Usdc, RaindexError> {
         let exact = self
-            .get_vault_balance::<Registry>(owner, USDC_BASE, vault_id, block_number)
+            .get_vault_balance::<Registry>(owner, usdc, vault_id, block_number)
             .await?;
         Ok(Usdc::new(exact))
     }
