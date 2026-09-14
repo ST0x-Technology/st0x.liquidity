@@ -3594,6 +3594,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_usdc_transfer_directs_alpaca_to_base_to_reconcile_when_already_failed() {
+        // An AlpacaToBase transfer failed pre-burn from WithdrawalComplete lands
+        // in BridgingFailed { burn_tx_hash: None } but STILL holds the guard: the
+        // withdrawal moved the funds off Alpaca. Re-running the command must send
+        // the operator to `transfer reconcile`, not claim no action is needed.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0009);
+
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        // Seed the AlpacaToBase history through WithdrawalComplete: the
+        // conversion leg runs first, then the withdrawal.
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
+        for command in [
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xB0B9)),
+            },
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: ConversionAmounts::new(amount, amount),
+            },
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::OnchainTx(b256!(
+                    "0x00000000000000000000000000000000000000000000000000000000000000b9"
+                )),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        ] {
+            store.send(&UsdcRebalanceId(id), command).await.unwrap();
+        }
+
+        // First run fails the pre-burn transfer.
+        let mut stdout = Vec::new();
+        fail_usdc_transfer_command(&mut stdout, id, &"manual fail".parse().unwrap(), &pool)
+            .await
+            .unwrap();
+
+        // Second run: already BridgingFailed, but AlpacaToBase still holds the
+        // guard, so the operator must be directed to reconcile.
+        let mut stdout = Vec::new();
+        let err_msg =
+            fail_usdc_transfer_command(&mut stdout, id, &"re-fail".parse().unwrap(), &pool)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err_msg.contains("already in pre-burn BridgingFailed"),
+            "got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("transfer reconcile --kind usdc"),
+            "AlpacaToBase re-fail must direct the operator to reconcile; got: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("No action needed"),
+            "the guard is still held, so it must not say no action is needed; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn fail_usdc_transfer_succeeds_on_bridging_submitting() {
         let pool = setup_test_db().await;
         let id = Uuid::from_u128(0xBEEF_0005);
