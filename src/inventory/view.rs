@@ -998,7 +998,8 @@ impl InventoryView {
         alpaca_to_base_usdc_capacity(self.withdrawable_cash_cents, reserved)
     }
 
-    /// Converts the in-memory inventory view to a DTO for dashboard serialization.
+    /// Converts the in-memory inventory view to a DTO for dashboard
+    /// serialization.
     pub(crate) fn to_dto(&self) -> st0x_dto::Inventory {
         let per_symbol = self
             .equities
@@ -1008,6 +1009,11 @@ impl InventoryView {
             .sorted()
             .map(|symbol| {
                 let inventory = self.equities.get(symbol);
+                // The trading chain's slot alone, never a cross-chain total:
+                // a wrapped share is worth its own chain's underlying, so the
+                // chains cannot be added. Surfacing the other chains needs a
+                // chain-qualified field the dashboard can render per chain,
+                // not a wider sum here.
                 let (onchain_available, onchain_inflight) = inventory
                     .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
                         venue_balances(item.onchain.get(&self.trading_chain).copied())
@@ -1040,6 +1046,11 @@ impl InventoryView {
             })
             .collect();
 
+        // The trading chain's slot alone: the dashboard measures this against
+        // the rebalancing target, which governs that chain's vault. Cash
+        // prefunded elsewhere is beyond the rebalancer's reach, so totalling it
+        // in reads as a healthy allocation while the chain that rebalances is
+        // underfunded.
         let (usdc_onchain_available, usdc_onchain_inflight) =
             venue_balances(self.usdc.onchain.get(&self.trading_chain).copied());
 
@@ -5817,6 +5828,52 @@ mod tests {
             Some(shares(15)),
             "New redemption inflight must be preserved when previous \
              poll marker was cleared by VaultWithdrawPending"
+        );
+    }
+
+    /// Neither cash nor equity is totalled across chains. Equity cannot be:
+    /// a market-making slot holds wrapped ERC-4626 vault shares, and each
+    /// chain's vault has its own underlying-per-wrapped ratio, so adding two
+    /// chains' share counts yields a number that is no longer a share count.
+    /// Cash must not be: the dashboard measures the onchain figure against the
+    /// rebalancing target, which the rebalancer applies to the trading chain's
+    /// slot alone, so cash prefunded on another chain would read as a healthy
+    /// allocation the rebalancer cannot reach.
+    #[test]
+    fn to_dto_keeps_usdc_and_equity_chain_qualified() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let equity_on = |chain: Chain, amount: i64| InventorySnapshotEvent::OnchainEquity {
+            chain,
+            balances: BTreeMap::from([(aapl.clone(), shares(amount))]),
+            fetched_at: now,
+            block_number: None,
+        };
+        let usdc_on = |chain: Chain, amount: i64| InventorySnapshotEvent::OnchainUsdc {
+            chain,
+            usdc_balance: Usdc::from_cents(amount).unwrap(),
+            fetched_at: now,
+            block_number: None,
+        };
+
+        let view = InventoryView::for_trading_chain(Chain::Base)
+            .apply_snapshot_event(&equity_on(Chain::Base, 50), now)
+            .unwrap()
+            .apply_snapshot_event(&equity_on(Chain::Ethereum, 7), now)
+            .unwrap()
+            .apply_snapshot_event(&usdc_on(Chain::Base, 200_000), now)
+            .unwrap()
+            .apply_snapshot_event(&usdc_on(Chain::Ethereum, 50_000), now)
+            .unwrap();
+
+        let dto = view.to_dto();
+
+        assert_eq!(dto.per_symbol.len(), 1);
+        assert_eq!(dto.per_symbol[0].onchain_available, shares(50));
+        assert_eq!(
+            dto.usdc.onchain_available,
+            Usdc::from_cents(200_000).unwrap(),
+            "the dashboard cash figure names the trading chain"
         );
     }
 
