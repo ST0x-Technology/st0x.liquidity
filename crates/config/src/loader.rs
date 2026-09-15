@@ -7676,8 +7676,11 @@ mod tests {
         assert_eq!(parts.close_flatten_cross_max_bps, 100);
     }
 
+    /// The smallest position the bot treats as real is also the smallest
+    /// that keeps a mark alive, so it is the floor when nothing is
+    /// configured. Zero is an explicit opt-out, not the default.
     #[test]
-    fn hedge_floor_defaults_to_zero_when_absent() {
+    fn hedge_floor_defaults_to_the_minimum_partial_hedge_when_absent() {
         let config = minimal_config_toml();
         let secrets = alpaca_secrets_toml();
 
@@ -7688,7 +7691,7 @@ mod tests {
                 .broker
                 .hedge_floor()
                 .for_symbol(&Symbol::new("AAPL").unwrap()),
-            FractionalShares::ZERO
+            FractionalShares::new(float!(0.01))
         );
     }
 
