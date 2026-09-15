@@ -12,6 +12,7 @@ use std::str::FromStr;
 
 use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
+use st0x_evm::SettlementStable;
 use st0x_execution::{Direction, FractionalShares, Symbol};
 
 use super::OnChainError;
@@ -35,6 +36,10 @@ macro_rules! symbol {
         st0x_execution::Symbol::new($symbol).unwrap()
     };
 }
+
+/// The decimals the internal cash amount holds: what every `Usdc` value is
+/// scaled to once it leaves the chain's own token grid.
+const USDC_DECIMALS: u8 = 6;
 
 /// Represents a validated USDC amount (non-negative)
 #[derive(Clone, Copy)]
@@ -79,6 +84,29 @@ impl Usdc {
 
     pub(crate) fn value(self) -> Float {
         self.0
+    }
+
+    /// The cash leg of a fill as the chain moved it. Rain's orderbook emits
+    /// Float amounts finer than the token's grid and the ERC-20 transfer
+    /// truncates to the token's decimals, so the amount is truncated the same
+    /// way. The internal amount holds six decimals, so a stable with more
+    /// decimals whose moved amount does not fit is refused, never rounded.
+    pub(crate) fn from_token_amount(
+        value: Float,
+        decimals: u8,
+    ) -> Result<Self, TradeValidationError> {
+        Self::new(value)?;
+        let moved = truncate_to_dp(value, decimals)?;
+
+        moved.to_fixed_decimal(USDC_DECIMALS).map_err(|source| {
+            TradeValidationError::CashPrecisionLoss {
+                amount: moved,
+                decimals,
+                source,
+            }
+        })?;
+
+        Ok(Self(moved))
     }
 }
 
@@ -216,9 +244,11 @@ impl TradeDetails {
         self.direction
     }
     /// Extracts trade details from input/output symbol and amount pairs.
-    /// Both symbols must be either USDC or a wrapped tokenized equity
-    /// (wtTICKER), since Raindex orders always involve wrapped tokens.
+    /// One symbol must be the chain's settlement stable and the other a
+    /// wrapped tokenized equity (wtTICKER), since Raindex orders always
+    /// involve wrapped tokens.
     pub(crate) fn try_from_io(
+        settlement_stable: SettlementStable,
         input_symbol: &str,
         input_token: InputToken,
         input_amount: Float,
@@ -229,17 +259,18 @@ impl TradeDetails {
         let InputToken(input_token) = input_token;
         let OutputToken(output_token) = output_token;
 
-        let (equity_symbol, direction) = determine_trade_details(input_symbol, output_symbol)?;
+        let (equity_symbol, direction) =
+            determine_trade_details(settlement_stable.symbol, input_symbol, output_symbol)?;
 
         let is_wrapped_equity =
             |symbol: &str| TokenizedSymbol::<WrappedTokenizedShares>::parse(symbol).is_ok();
 
-        // Extract the equity/USDC amounts and the equity/USDC token addresses
+        // Extract the equity/cash amounts and the equity/cash token addresses
         // based on which side is the tokenized equity.
         let (equity_amount_raw, usdc_amount_raw, equity_token, usdc_token) =
-            if input_symbol == "USDC" && is_wrapped_equity(output_symbol) {
+            if input_symbol == settlement_stable.symbol && is_wrapped_equity(output_symbol) {
                 (output_amount, input_amount, output_token, input_token)
-            } else if output_symbol == "USDC" && is_wrapped_equity(input_symbol) {
+            } else if output_symbol == settlement_stable.symbol && is_wrapped_equity(input_symbol) {
                 (input_amount, output_amount, input_token, output_token)
             } else {
                 return Err(TradeValidationError::InvalidSymbolConfiguration(
@@ -267,12 +298,12 @@ impl TradeDetails {
         // Rain's orderbook emits raw Float values in events, which can
         // carry more precision than the token's fixed-point representation.
         // The actual ERC-20 transfer truncates to the token's decimals
-        // (6 for USDC, 18 for ERC-20 shares), so we align with that.
+        // (18 for ERC-20 shares, the stable's own for cash), so we align
+        // with that.
         let equity_amount = FractionalShares::new(
             truncate_to_dp(equity_amount_raw, 18).map_err(TradeValidationError::Float)?,
         );
-        let usdc_amount =
-            Usdc::new(truncate_to_dp(usdc_amount_raw, 6).map_err(TradeValidationError::Float)?)?;
+        let usdc_amount = Usdc::from_token_amount(usdc_amount_raw, settlement_stable.decimals)?;
 
         Ok(Self {
             equity_symbol,
@@ -297,20 +328,22 @@ fn truncate_to_dp(value: Float, decimal_places: u8) -> Result<Float, FloatError>
 /// Determines onchain trade direction and the parsed tokenized-equity ticker
 /// based on onchain symbol configuration.
 ///
-/// If the on-chain order has USDC as input and a wrapped tokenized
-/// equity (wt prefix) as output, the order sold tokenized equity
-/// onchain. Raindex orders always involve wrapped tokens (wtTICKER).
+/// If the on-chain order has the settlement stable (`cash_symbol`) as input
+/// and a wrapped tokenized equity (wt prefix) as output, the order sold
+/// tokenized equity onchain. Raindex orders always involve wrapped tokens
+/// (wtTICKER).
 fn determine_trade_details(
+    cash_symbol: &str,
     onchain_input_symbol: &str,
     onchain_output_symbol: &str,
 ) -> Result<(TokenizedSymbol<WrappedTokenizedShares>, Direction), OnChainError> {
-    if onchain_input_symbol == "USDC"
+    if onchain_input_symbol == cash_symbol
         && let Ok(equity) = TokenizedSymbol::<WrappedTokenizedShares>::parse(onchain_output_symbol)
     {
         return Ok((equity, Direction::Sell));
     }
 
-    if onchain_output_symbol == "USDC"
+    if onchain_output_symbol == cash_symbol
         && let Ok(equity) = TokenizedSymbol::<WrappedTokenizedShares>::parse(onchain_input_symbol)
     {
         return Ok((equity, Direction::Buy));
@@ -326,8 +359,9 @@ fn determine_trade_details(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-
     use st0x_float_macro::float;
+
+    use st0x_evm::Chain;
 
     use super::*;
 
@@ -479,43 +513,43 @@ mod tests {
 
     #[test]
     fn test_determine_trade_details_usdc_to_wrapped() {
-        let result = determine_trade_details("USDC", "wtAAPL").unwrap();
+        let result = determine_trade_details("USDC", "USDC", "wtAAPL").unwrap();
         assert_eq!(result.0.base(), &symbol!("AAPL"));
         assert_eq!(result.1, Direction::Sell);
 
-        let result = determine_trade_details("USDC", "wtTSLA").unwrap();
+        let result = determine_trade_details("USDC", "USDC", "wtTSLA").unwrap();
         assert_eq!(result.0.base(), &symbol!("TSLA"));
         assert_eq!(result.1, Direction::Sell);
 
-        let result = determine_trade_details("USDC", "wtGME").unwrap();
+        let result = determine_trade_details("USDC", "USDC", "wtGME").unwrap();
         assert_eq!(result.0.base(), &symbol!("GME"));
         assert_eq!(result.1, Direction::Sell);
     }
 
     #[test]
     fn test_determine_trade_details_wrapped_to_usdc() {
-        let result = determine_trade_details("wtAAPL", "USDC").unwrap();
+        let result = determine_trade_details("USDC", "wtAAPL", "USDC").unwrap();
         assert_eq!(result.0.base(), &symbol!("AAPL"));
         assert_eq!(result.1, Direction::Buy);
 
-        let result = determine_trade_details("wtTSLA", "USDC").unwrap();
+        let result = determine_trade_details("USDC", "wtTSLA", "USDC").unwrap();
         assert_eq!(result.0.base(), &symbol!("TSLA"));
         assert_eq!(result.1, Direction::Buy);
 
-        let result = determine_trade_details("wtGME", "USDC").unwrap();
+        let result = determine_trade_details("USDC", "wtGME", "USDC").unwrap();
         assert_eq!(result.0.base(), &symbol!("GME"));
         assert_eq!(result.1, Direction::Buy);
     }
 
     #[test]
     fn test_determine_trade_details_rejects_unwrapped_prefix() {
-        let result = determine_trade_details("USDC", "tAAPL");
+        let result = determine_trade_details("USDC", "USDC", "tAAPL");
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
-        let result = determine_trade_details("tAAPL", "USDC");
+        let result = determine_trade_details("USDC", "tAAPL", "USDC");
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
@@ -524,25 +558,25 @@ mod tests {
 
     #[test]
     fn test_determine_trade_details_invalid_configurations() {
-        let result = determine_trade_details("BTC", "ETH");
+        let result = determine_trade_details("USDC", "BTC", "ETH");
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
-        let result = determine_trade_details("USDC", "USDC");
+        let result = determine_trade_details("USDC", "USDC", "USDC");
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
-        let result = determine_trade_details("wtAAPL", "wtTSLA");
+        let result = determine_trade_details("USDC", "wtAAPL", "wtTSLA");
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
-        let result = determine_trade_details("", "");
+        let result = determine_trade_details("USDC", "", "");
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
@@ -552,6 +586,7 @@ mod tests {
     #[test]
     fn test_trade_details_try_from_io_usdc_to_wrapped() {
         let details = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(100),
@@ -573,6 +608,7 @@ mod tests {
     #[test]
     fn test_trade_details_try_from_io_wrapped_to_usdc() {
         let details = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "wtAAPL",
             InputToken(EQUITY_TOKEN),
             float!(0.5),
@@ -594,6 +630,7 @@ mod tests {
     #[test]
     fn test_trade_details_try_from_io_nvda() {
         let details = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(64.17),
@@ -609,6 +646,7 @@ mod tests {
         assert_eq!(details.direction(), Direction::Sell);
 
         let details = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "wtNVDA",
             InputToken(EQUITY_TOKEN),
             float!(0.374),
@@ -627,6 +665,7 @@ mod tests {
     #[test]
     fn test_trade_details_try_from_io_invalid_configurations() {
         let result = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(100),
@@ -640,6 +679,7 @@ mod tests {
         ));
 
         let result = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "BTC",
             InputToken(Address::ZERO),
             float!(1),
@@ -656,6 +696,7 @@ mod tests {
     #[test]
     fn test_trade_details_negative_amount_validation() {
         let result = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(100),
@@ -669,6 +710,7 @@ mod tests {
         ));
 
         let result = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(-100),
@@ -715,6 +757,7 @@ mod tests {
         // Real transaction: 0.374 wtNVDA sold for 64.169234 USDC
         // Verifies equity vs USDC amounts are not swapped
         let details = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(64.169234),
@@ -740,6 +783,7 @@ mod tests {
         let shares_with_dust = float!(&"0.374000000000000000001".to_string());
 
         let details = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             usdc_with_dust,
@@ -765,6 +809,7 @@ mod tests {
         );
 
         let details = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(&"34.645024000001".to_string()),
@@ -781,6 +826,7 @@ mod tests {
     #[test]
     fn test_edge_case_validation_very_small_amounts() {
         let details = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(0.01),
@@ -797,6 +843,7 @@ mod tests {
     #[test]
     fn test_edge_case_validation_very_large_amounts() {
         let details = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(1000000),
@@ -838,6 +885,7 @@ mod tests {
     #[test]
     fn test_trade_details_rejects_unwrapped_prefix() {
         let result = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "USDC",
             InputToken(USDC_TOKEN),
             float!(100),
@@ -851,6 +899,7 @@ mod tests {
         ));
 
         let result = TradeDetails::try_from_io(
+            Chain::Base.settlement_stable(),
             "tAAPL",
             InputToken(EQUITY_TOKEN),
             float!(0.5),
@@ -862,5 +911,102 @@ mod tests {
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
+    }
+
+    /// A stable with fewer decimals than the internal amount converts on its
+    /// own grid: the digits beyond it never moved on chain.
+    #[test]
+    fn from_token_amount_truncates_to_the_stables_decimals() {
+        let amount = Usdc::from_token_amount(float!(100.129), 2).unwrap();
+
+        assert_eq!(amount, Usdc::new(float!(100.12)).unwrap());
+    }
+
+    /// An 18-decimal stable converts exactly while the moved amount fits the
+    /// six-decimal internal amount.
+    #[test]
+    fn from_token_amount_converts_an_eighteen_decimal_stable_that_fits() {
+        let amount = Usdc::from_token_amount(float!(100.123456), 18).unwrap();
+
+        assert_eq!(amount, Usdc::new(float!(100.123456)).unwrap());
+    }
+
+    /// An 18-decimal stable whose moved amount carries digits beyond six
+    /// decimals is refused, never rounded into the internal amount.
+    #[test]
+    fn from_token_amount_refuses_an_eighteen_decimal_amount_beyond_six_decimals() {
+        let error = Usdc::from_token_amount(float!(100.0000001), 18).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TradeValidationError::CashPrecisionLoss { decimals: 18, .. }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Today's six-decimal stables keep their behaviour: dust beyond six
+    /// decimals never moved on chain, so it is truncated rather than refused.
+    #[test]
+    fn from_token_amount_truncates_six_decimal_dust() {
+        let amount = Usdc::from_token_amount(float!(100.0000001), 6).unwrap();
+
+        assert_eq!(amount, Usdc::new(float!(100)).unwrap());
+    }
+
+    #[test]
+    fn from_token_amount_rejects_negative_amounts() {
+        let error = Usdc::from_token_amount(float!(-1), 6).unwrap_err();
+
+        assert!(
+            matches!(error, TradeValidationError::NegativeUsdc(_)),
+            "{error:?}"
+        );
+    }
+
+    /// The cash leg is classified by the chain's pinned stable symbol, so a
+    /// fill quoted in USDC on a chain that settles in another stable is not
+    /// a trade this bot recognises.
+    #[test]
+    fn try_from_io_classifies_the_cash_leg_by_the_stables_symbol() {
+        let usdg = SettlementStable {
+            address: USDC_TOKEN,
+            symbol: "USDG",
+            decimals: 6,
+        };
+
+        let details = TradeDetails::try_from_io(
+            usdg,
+            "USDG",
+            InputToken(USDC_TOKEN),
+            float!(100),
+            "wtAAPL",
+            OutputToken(EQUITY_TOKEN),
+            float!(0.5),
+        )
+        .unwrap();
+
+        assert_eq!(details.direction(), Direction::Sell);
+        assert_eq!(details.usdc_token(), USDC_TOKEN);
+
+        let error = TradeDetails::try_from_io(
+            usdg,
+            "USDC",
+            InputToken(USDC_TOKEN),
+            float!(100),
+            "wtAAPL",
+            OutputToken(EQUITY_TOKEN),
+            float!(0.5),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
+            ),
+            "{error:?}"
+        );
     }
 }
