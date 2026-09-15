@@ -89,12 +89,14 @@ pub(crate) struct EquityPriceStore {
 }
 
 impl EquityPriceStore {
-    pub(crate) fn new(assets: &ChainAssets) -> Self {
-        let prices = assets
-            .equities
-            .symbols
-            .keys()
-            .cloned()
+    /// Seeds one `None` entry per symbol the bot trades on any chain, so the
+    /// snapshot reports every tradable symbol as unavailable until a price
+    /// arrives. Spans the same chains as [`EquityPriceMonitor::new`] so a
+    /// symbol the monitor accepts is never dropped by the store.
+    pub(crate) fn new<'a>(traded_chains: impl IntoIterator<Item = &'a ChainAssets>) -> Self {
+        let prices = traded_chains
+            .into_iter()
+            .flat_map(|assets| assets.equities.symbols.keys().cloned())
             .map(|symbol| (symbol, None))
             .collect();
 
@@ -852,7 +854,7 @@ mod tests {
     #[tokio::test]
     async fn untraded_chain_quote_does_not_clobber_a_held_traded_price() {
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         // A live price on a chain we trade (Base).
@@ -892,6 +894,25 @@ mod tests {
             store.snapshot(Utc::now()).await[0].status,
             EquityPriceStatus::Available { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn store_seeds_symbols_from_every_traded_chain() {
+        let base = assets();
+        let mut other = assets();
+        let asset = other.equities.symbols.values().next().unwrap().clone();
+        other.equities.symbols = HashMap::from([(Symbol::new("TSLA").unwrap(), asset)]);
+
+        let store = EquityPriceStore::new([&base, &other]);
+
+        let symbols: Vec<Symbol> = store
+            .snapshot(Utc::now())
+            .await
+            .into_iter()
+            .map(|price| price.symbol)
+            .collect();
+        assert!(symbols.contains(&Symbol::new("AAPL").unwrap()));
+        assert!(symbols.contains(&Symbol::new("TSLA").unwrap()));
     }
 
     #[tokio::test]
@@ -1003,7 +1024,7 @@ mod tests {
             ciborium::from_reader::<ClientFrame, _>(frame.as_ref()).unwrap()
         });
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let (sender, _) = broadcast::channel(4);
         let monitor = EquityPriceMonitor::new(
             PricingCtx::new(
@@ -1042,7 +1063,7 @@ mod tests {
             socket.close(None).await.unwrap();
         });
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         assert!(
@@ -1105,7 +1126,7 @@ mod tests {
             let _ = socket.next().await;
         });
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         assert!(
@@ -1179,7 +1200,7 @@ mod tests {
             ciborium::from_reader::<ClientFrame, _>(response.as_ref()).unwrap()
         });
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let (sender, _) = broadcast::channel(4);
         let monitor = EquityPriceMonitor::new(
             PricingCtx::new(
@@ -1209,7 +1230,7 @@ mod tests {
     #[tokio::test]
     async fn service_errors_only_invalidate_requested_assets() {
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         assert!(

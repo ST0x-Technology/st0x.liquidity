@@ -2894,7 +2894,7 @@ mod tests {
                 sender,
             )),
             equity_prices: crate::dashboard::equity_price::EquityPriceStore::new(
-                &ctx.chains.primary().assets,
+                ctx.chains.hedged().map(|hedged| &hedged.assets),
             ),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
