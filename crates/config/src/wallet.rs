@@ -1,6 +1,6 @@
 //! Top-level wallet infrastructure, independent of rebalancing.
 //!
-//! Provides signing wallets for Base and Ethereum chains. Used by CLI
+//! Provides one signing wallet per chain. Used by CLI
 //! commands that need to sign on-chain transactions (vault ops, CCTP
 //! bridging, token wrapping, Alpaca deposits/withdrawals) regardless
 //! of whether the system is in Standalone or Rebalancing trading mode.
@@ -81,7 +81,7 @@ pub(crate) fn require_secure_wallet_rpc_url(url: &Url, chain: Chain) -> Result<(
     }
 }
 
-/// Pre-built signing wallets for Base and Ethereum chains.
+/// Pre-built signing wallets, one per chain.
 ///
 /// Independent of rebalancing — any trading mode can optionally
 /// configure a wallet for manual CLI operations.

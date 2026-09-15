@@ -129,8 +129,8 @@ pub(crate) enum ConductorSpawnError {
          runs on it"
     )]
     MissingGasThreshold { chain: Chain },
-    #[error("HyperEVM gas monitor selection and wallet availability disagree")]
-    HyperEvmGasWalletMismatch,
+    #[error("{chain} gas monitor selection and wallet availability disagree")]
+    GasWalletMismatch { chain: Chain },
     #[error("[alerts] requires a configured [wallet] section")]
     AlertsRequireWallet,
 }
@@ -444,6 +444,13 @@ where
                     let wallet = wallet_ctx.hyperevm_wallet();
                     (wallet.provider().clone(), wallet.address())
                 }),
+            alerts
+                .low_balance_threshold_wei(Chain::Robinhood)
+                .is_some()
+                .then(|| {
+                    let wallet = wallet_ctx.robinhood_wallet();
+                    (wallet.provider().clone(), wallet.address())
+                }),
             &notifier,
         )?)
     } else {
@@ -621,6 +628,7 @@ where
         base_gas_monitor: base_gas_monitor_startup,
         ethereum_gas_monitor: ethereum_gas_monitor_startup,
         hyperevm_gas_monitor: hyperevm_gas_monitor_startup,
+        robinhood_gas_monitor: robinhood_gas_monitor_startup,
     } = context.supervisor_startup;
 
     // Fail-fast: exit if any supervised task dies, relying on systemd restart for recovery.
@@ -719,6 +727,7 @@ where
             base_gas_monitor_startup,
             ethereum_gas_monitor_startup,
             hyperevm_gas_monitor_startup,
+            robinhood_gas_monitor_startup,
         ],
     ) {
         supervisor_builder = supervisor_builder.with_task(name, task);
@@ -1268,24 +1277,27 @@ struct GasMonitors {
     base: GasMonitor,
     ethereum: GasMonitor,
     hyperevm: Option<GasMonitor>,
+    robinhood: Option<GasMonitor>,
 }
 
 fn gas_monitor_tasks(
     monitors: Option<GasMonitors>,
-    tokens: [StartupToken; 3],
+    tokens: [StartupToken; 4],
 ) -> impl Iterator<Item = (&'static str, StartupTask<GasMonitor>)> {
     let monitors = match monitors {
         Some(GasMonitors {
             base,
             ethereum,
             hyperevm,
-        }) => [Some(base), Some(ethereum), hyperevm],
-        None => [None, None, None],
+            robinhood,
+        }) => [Some(base), Some(ethereum), hyperevm, robinhood],
+        None => [None, None, None, None],
     };
     [
         "gas-monitor-base",
         "gas-monitor-ethereum",
         "gas-monitor-hyperevm",
+        "gas-monitor-robinhood",
     ]
     .into_iter()
     .zip(monitors)
@@ -1300,21 +1312,30 @@ fn gas_monitor_tasks(
     })
 }
 
-/// Builds monitors with each chain's own provider, wallet and validated threshold.
-fn build_gas_monitors<BaseProv, EthereumProv, HyperProv>(
+/// Builds monitors with each chain's own provider, wallet and validated
+/// threshold. The hedged secondaries are optional: each is monitored exactly
+/// when the alerts config selected it, and the wallet handed in must agree.
+fn build_gas_monitors<BaseProv, EthereumProv, HyperProv, RobinhoodProv>(
     alerts: &AlertsCtx,
     base: (BaseProv, Address),
     ethereum: (EthereumProv, Address),
     hyperevm: Option<(HyperProv, Address)>,
+    robinhood: Option<(RobinhoodProv, Address)>,
     notifier: &Arc<dyn Notifier>,
 ) -> Result<GasMonitors, ConductorSpawnError>
 where
     BaseProv: Provider + Send + Sync + 'static,
     EthereumProv: Provider + Send + Sync + 'static,
     HyperProv: Provider + Send + Sync + 'static,
+    RobinhoodProv: Provider + Send + Sync + 'static,
 {
-    if alerts.low_balance_threshold_wei(Chain::HyperEvm).is_some() != hyperevm.is_some() {
-        return Err(ConductorSpawnError::HyperEvmGasWalletMismatch);
+    for (chain, wallet_present) in [
+        (Chain::HyperEvm, hyperevm.is_some()),
+        (Chain::Robinhood, robinhood.is_some()),
+    ] {
+        if alerts.low_balance_threshold_wei(chain).is_some() != wallet_present {
+            return Err(ConductorSpawnError::GasWalletMismatch { chain });
+        }
     }
 
     let monitor = |chain, balance_reader, wallet| -> Result<GasMonitor, ConductorSpawnError> {
@@ -1347,6 +1368,15 @@ where
             .map(|(provider, wallet)| {
                 monitor(
                     Chain::HyperEvm,
+                    Arc::new(ProviderBalanceReader::new(provider)),
+                    wallet,
+                )
+            })
+            .transpose()?,
+        robinhood: robinhood
+            .map(|(provider, wallet)| {
+                monitor(
+                    Chain::Robinhood,
                     Arc::new(ProviderBalanceReader::new(provider)),
                     wallet,
                 )
@@ -1925,6 +1955,7 @@ mod tests {
                 address!("0x0000000000000000000000000000000000000e78"),
             ),
             None::<(RootProvider, Address)>,
+            None::<(RootProvider, Address)>,
             &(Arc::new(crate::alerts::LogNotifier) as Arc<dyn Notifier>),
         );
 
@@ -1946,10 +1977,17 @@ mod tests {
     #[tokio::test]
     async fn absent_alerts_acknowledge_all_gas_startup_slots_without_tasks() {
         let barrier = StartupBarrier::new();
-        let names: Vec<_> =
-            gas_monitor_tasks(None, [barrier.token(), barrier.token(), barrier.token()])
-                .map(|(name, _)| name)
-                .collect();
+        let names: Vec<_> = gas_monitor_tasks(
+            None,
+            [
+                barrier.token(),
+                barrier.token(),
+                barrier.token(),
+                barrier.token(),
+            ],
+        )
+        .map(|(name, _)| name)
+        .collect();
         assert_eq!(names, Vec::<&str>::new());
         tokio::time::timeout(Duration::from_secs(1), barrier.wait())
             .await
@@ -1957,7 +1995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unselected_hyperevm_acknowledges_its_slot_without_a_task() {
+    async fn unselected_secondaries_acknowledge_their_slots_without_a_task() {
         let alerts = AlertsCtx::for_test(
             BTreeMap::from([
                 (Chain::Base, U256::from(100_u64)),
@@ -1977,6 +2015,7 @@ mod tests {
                 Address::random(),
             ),
             None::<(RootProvider, Address)>,
+            None::<(RootProvider, Address)>,
             &(Arc::new(crate::alerts::LogNotifier) as Arc<dyn Notifier>),
         )
         .unwrap();
@@ -1985,7 +2024,12 @@ mod tests {
         let ethereum = barrier.token();
         let tasks: Vec<_> = gas_monitor_tasks(
             Some(monitors),
-            [base.clone(), ethereum.clone(), barrier.token()],
+            [
+                base.clone(),
+                ethereum.clone(),
+                barrier.token(),
+                barrier.token(),
+            ],
         )
         .collect();
         assert_eq!(
@@ -2003,17 +2047,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_hyperevm_task_acknowledges_only_its_own_startup_slot_when_polled() {
+    async fn selected_secondary_tasks_acknowledge_only_their_own_startup_slot_when_polled() {
         let alerts = AlertsCtx::for_test(
             BTreeMap::from([
                 (Chain::Base, U256::from(100_u64)),
                 (Chain::Ethereum, U256::from(200_u64)),
                 (Chain::HyperEvm, U256::from(300_u64)),
+                (Chain::Robinhood, U256::from(400_u64)),
             ]),
             Duration::from_secs(300),
             Duration::from_secs(3600),
         );
-        let wallets = [Chain::Base, Chain::Ethereum, Chain::HyperEvm].map(|_| {
+        let wallets = Chain::ALL.map(|_| {
             let asserter = Asserter::new();
             asserter.push_success(&U256::from(1000_u64));
             (
@@ -2021,16 +2066,23 @@ mod tests {
                 Address::random(),
             )
         });
-        let [base_wallet, ethereum_wallet, hyperevm_wallet] = wallets;
+        let [
+            base_wallet,
+            ethereum_wallet,
+            hyperevm_wallet,
+            robinhood_wallet,
+        ] = wallets;
         let monitors = build_gas_monitors(
             &alerts,
             base_wallet,
             ethereum_wallet,
             Some(hyperevm_wallet),
+            Some(robinhood_wallet),
             &(Arc::new(crate::alerts::LogNotifier) as Arc<dyn Notifier>),
         )
         .unwrap();
         let barriers = [
+            StartupBarrier::new(),
             StartupBarrier::new(),
             StartupBarrier::new(),
             StartupBarrier::new(),
@@ -2049,6 +2101,7 @@ mod tests {
                 ("gas-monitor-base", Chain::Base),
                 ("gas-monitor-ethereum", Chain::Ethereum),
                 ("gas-monitor-hyperevm", Chain::HyperEvm),
+                ("gas-monitor-robinhood", Chain::Robinhood),
             ]
         );
         for (index, (_, task)) in tasks.iter_mut().enumerate() {
@@ -2067,49 +2120,59 @@ mod tests {
     }
 
     #[test]
-    fn hyperevm_monitor_requires_matching_wallet_selection() {
-        for selected in [false, true] {
-            for wallet_present in [false, true] {
-                let mut thresholds = BTreeMap::from([
-                    (Chain::Base, U256::from(100_u64)),
-                    (Chain::Ethereum, U256::from(200_u64)),
-                ]);
-                if selected {
-                    thresholds.insert(Chain::HyperEvm, U256::from(300_u64));
-                }
-                let alerts = AlertsCtx::for_test(
-                    thresholds,
-                    Duration::from_secs(300),
-                    Duration::from_secs(3600),
-                );
-                let result = build_gas_monitors(
-                    &alerts,
-                    (
-                        ProviderBuilder::new().connect_mocked_client(Asserter::new()),
-                        Address::random(),
-                    ),
-                    (
-                        ProviderBuilder::new().connect_mocked_client(Asserter::new()),
-                        Address::random(),
-                    ),
-                    wallet_present.then(|| {
+    fn secondary_monitor_requires_matching_wallet_selection() {
+        for chain in [Chain::HyperEvm, Chain::Robinhood] {
+            for selected in [false, true] {
+                for wallet_present in [false, true] {
+                    let mut thresholds = BTreeMap::from([
+                        (Chain::Base, U256::from(100_u64)),
+                        (Chain::Ethereum, U256::from(200_u64)),
+                    ]);
+                    if selected {
+                        thresholds.insert(chain, U256::from(300_u64));
+                    }
+                    let alerts = AlertsCtx::for_test(
+                        thresholds,
+                        Duration::from_secs(300),
+                        Duration::from_secs(3600),
+                    );
+                    let mocked = || {
                         (
                             ProviderBuilder::new().connect_mocked_client(Asserter::new()),
                             Address::random(),
                         )
-                    }),
-                    &(Arc::new(crate::alerts::LogNotifier) as Arc<dyn Notifier>),
-                );
-                if selected == wallet_present {
-                    assert_eq!(
-                        result.unwrap().hyperevm.map(|monitor| monitor.chain),
-                        selected.then_some(Chain::HyperEvm)
+                    };
+                    let (hyperevm, robinhood) = match chain {
+                        Chain::HyperEvm => (wallet_present.then(mocked), None),
+                        Chain::Robinhood => (None, wallet_present.then(mocked)),
+                        Chain::Base | Chain::Ethereum => unreachable!("always monitored"),
+                    };
+                    let result = build_gas_monitors(
+                        &alerts,
+                        mocked(),
+                        mocked(),
+                        hyperevm,
+                        robinhood,
+                        &(Arc::new(crate::alerts::LogNotifier) as Arc<dyn Notifier>),
                     );
-                } else {
-                    assert!(matches!(
-                        result,
-                        Err(ConductorSpawnError::HyperEvmGasWalletMismatch)
-                    ));
+                    if selected == wallet_present {
+                        let monitors = result.unwrap();
+                        let selected_monitor = match chain {
+                            Chain::HyperEvm => monitors.hyperevm,
+                            Chain::Robinhood => monitors.robinhood,
+                            Chain::Base | Chain::Ethereum => unreachable!("always monitored"),
+                        };
+                        assert_eq!(
+                            selected_monitor.map(|monitor| monitor.chain),
+                            selected.then_some(chain)
+                        );
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(ConductorSpawnError::GasWalletMismatch { chain: mismatched })
+                                if mismatched == chain
+                        ));
+                    }
                 }
             }
         }
@@ -2140,6 +2203,7 @@ mod tests {
             base,
             ethereum,
             hyperevm,
+            robinhood,
         } = build_gas_monitors(
             &alerts,
             (
@@ -2154,9 +2218,14 @@ mod tests {
                 ProviderBuilder::new().connect_mocked_client(hyperevm_asserter),
                 hyperevm_wallet,
             )),
+            None::<(RootProvider, Address)>,
             &(Arc::new(crate::alerts::LogNotifier) as Arc<dyn Notifier>),
         )
         .unwrap();
+        assert!(
+            robinhood.is_none(),
+            "no Robinhood threshold selects no monitor"
+        );
 
         let hyperevm = hyperevm.unwrap();
         assert_eq!(hyperevm.wallet, hyperevm_wallet);

@@ -10,7 +10,9 @@ use std::str::FromStr;
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
-use crate::tokens::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM, USDC_ROBINHOOD};
+use crate::tokens::{
+    USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM, USDC_ROBINHOOD, USDG_ROBINHOOD,
+};
 
 /// An EVM chain the bot acts on.
 ///
@@ -84,8 +86,8 @@ impl Chain {
                 decimals: 6,
             },
             Self::Robinhood => SettlementStable {
-                address: USDC_ROBINHOOD,
-                symbol: "USDC",
+                address: USDG_ROBINHOOD,
+                symbol: "USDG",
                 decimals: 6,
             },
         }
@@ -100,7 +102,7 @@ impl Chain {
             Self::Base => Some(USDC_BASE),
             Self::Ethereum => Some(USDC_ETHEREUM),
             Self::HyperEvm => Some(USDC_HYPEREVM),
-            Self::Robinhood => Some(USDC_ROBINHOOD),
+            Self::Robinhood => None,
         }
     }
 
@@ -238,8 +240,8 @@ mod tests {
         assert_eq!(
             Chain::Robinhood.settlement_stable(),
             SettlementStable {
-                address: address!("0x80e0e24718dbFcad49ECAA6F1e6C89A190586cA8"),
-                symbol: "USDC",
+                address: address!("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"),
+                symbol: "USDG",
                 decimals: 6,
             }
         );
@@ -263,7 +265,7 @@ mod tests {
                 Some(address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")),
                 Some(address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")),
                 Some(address!("0xb88339CB7199b77E23DB6E890353E22632Ba630f")),
-                Some(address!("0x80e0e24718dbFcad49ECAA6F1e6C89A190586cA8")),
+                None,
             ]
         );
     }

@@ -3285,18 +3285,14 @@ mod tests {
     /// chain is enabled with a signer and nothing else.
     #[test]
     fn observe_only_robinhood_table_loads() {
-        let config: Config = toml::from_str(
-            &String::from_utf8_lossy(minimal_config_toml_bytes())
-                .replace("[chains.hyperevm]", "[chains.robinhood]"),
-        )
-        .unwrap();
+        let config: Config =
+            toml::from_str(&String::from_utf8_lossy(minimal_config_toml_bytes())).unwrap();
 
         validate_config(&config, Path::new("config.toml"), &mut Vec::new()).unwrap();
 
-        let (_, robinhood) = config
+        let robinhood = config
             .chains
-            .iter()
-            .find(|(chain, _)| chain.as_str() == "robinhood")
+            .get(&Chain::Robinhood)
             .expect("the robinhood table must load under its wire name");
         assert_eq!(robinhood.lifecycle, ChainLifecycle::ObserveOnly);
         assert!(robinhood.trading.is_none());
@@ -9073,7 +9069,9 @@ mod tests {
         assert!(matches!(
             validate_config(&config, Path::new("example.config.toml"), &mut Vec::new()),
             Err(CtxError::Alerts(
-                crate::AlertsAssemblyError::HyperEvmRequiresAlerts
+                crate::AlertsAssemblyError::HedgedChainRequiresAlerts {
+                    chain: Chain::HyperEvm
+                }
             ))
         ));
     }

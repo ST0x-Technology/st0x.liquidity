@@ -875,6 +875,9 @@ fn generate_batch_ranges(
     start_block: u64,
     end_block: u64,
 ) -> impl Iterator<Item = (u64, u64)> {
+    // Robinhood's 1000 is an assumption to verify against the serving RPC:
+    // neither the public endpoint nor Alchemy's robinhood-mainnet documents a
+    // getLogs range cap, so it inherits Base's request size.
     let batch_size = match chain {
         Chain::Base | Chain::Ethereum | Chain::Robinhood => 1_000,
         Chain::HyperEvm => 50,
@@ -1126,6 +1129,7 @@ mod tests {
             (Chain::HyperEvm, vec![(100, 149), (150, 150)]),
             (Chain::Base, vec![(100, 150)]),
             (Chain::Ethereum, vec![(100, 150)]),
+            (Chain::Robinhood, vec![(100, 150)]),
         ] {
             let (pool, apalis_pool) = setup_test_pools().await;
             let trading = HedgedChain::test().chain(chain).call();
@@ -1428,6 +1432,7 @@ mod tests {
             (Chain::Base, 1000),
             (Chain::Ethereum, 1000),
             (Chain::HyperEvm, 50),
+            (Chain::Robinhood, 1000),
         ] {
             for start in [0, 100, u64::MAX - 3 * cap] {
                 assert_eq!(
@@ -1471,7 +1476,7 @@ mod tests {
             start in any::<u64>(),
             length in 0_u64..5000,
             policy in prop::sample::select(vec![(Chain::Base, 1000_u64),
-                (Chain::Ethereum, 1000), (Chain::HyperEvm, 50)]),
+                (Chain::Ethereum, 1000), (Chain::HyperEvm, 50), (Chain::Robinhood, 1000)]),
         ) {
             let (chain, cap) = policy;
             let end = start + length.min(u64::MAX - start);

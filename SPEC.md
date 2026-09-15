@@ -189,6 +189,16 @@ provide gas valuation or automated rebalancing capabilities; `active` remains
 unavailable. Its vault balances are polled like any hedged chain's; automated
 rebalancing remains on Base.
 
+Robinhood Chain (chain id 4663, an Arbitrum Orbit L2) is declared the same way
+and today runs observe-only: a signer exists, nothing is ingested and nothing is
+signed. Its settlement stable is USDG at
+`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 decimals), so it is the first
+chain whose stable CCTP cannot carry. It pays gas in ETH, so the Base Chainlink
+ETH/USD read values its gas and `active` is reachable without rebalancing
+assets; no wrapper or CCTP domain is wired, so it cannot be the primary chain.
+Base's `safe` cutoff is OP-Stack-only: a Robinhood trading table must use the
+`confirmations` cutoff with a depth covering parent-chain finality.
+
 The tokenization services are built per hedged chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
 one rebalancing-enabled equity (the same per-asset flags that make the chain
@@ -501,8 +511,9 @@ excellent async ecosystem for handling concurrent trading flows.
   address and advances the checkpoint only on success. `required_confirmations`
   governs transaction-submission paths only and does not affect fill ingestion.
   Every backfill path, including durable retries, uses the hedged chain's
-  explicit policy: HyperEVM 50 blocks, Base and Ethereum 1000 blocks per
-  request, counted inclusively. Adding a chain requires an explicit policy
+  explicit policy: HyperEVM 50 blocks, Base, Ethereum and Robinhood 1000 blocks
+  per request, counted inclusively (Robinhood's inherits Base's until the
+  serving RPC's cap is measured). Adding a chain requires an explicit policy
   before the code compiles. Poll intervals remain required deployment
   configuration; block limits are constants and need no new configuration field.
   The cutoff tag is configured via `ingestion_cutoff` (required field):
@@ -679,20 +690,20 @@ checkpoint is updated only after the full backfill range succeeds, so a partial
 failure cannot skip unprocessed history.
 
 Every supported chain pins its settlement stable in code -- address, symbol and
-decimals, next to its chain id; USDC on every chain today -- so adding a chain
-requires pinning its stable before the code compiles. It is the cash leg
-everywhere: vault polling reads that token's vault, the fill parse scales the
-cash amount by its decimals (a fill whose moved amount the six-decimal internal
-amount cannot hold is skipped and recorded, never rounded), and the inventory
-view names it in the `symbol` field the dashboard labels the cash row with. Fill
-validation matches it two ways: an `InventoryTrade` fill must quote in the
-stable's address, while a `ClearV3`/`TakeOrderV3` fill is classified by the
-stable's symbol and its address is gated only by vault discovery, which skips a
-cash vault whose token is not the pinned address. The portfolio snapshot still
-persists its cash asset as the literal `USDC`; labelling it per chain changes
-persisted rows and is its own follow-up. Circle's USDC is exposed separately,
-`Some` only on chains whose stable is that USDC, and read by the CCTP bridge
-alone.
+decimals, next to its chain id; USDC on Base, Ethereum and HyperEVM, USDG on
+Robinhood -- so adding a chain requires pinning its stable before the code
+compiles. It is the cash leg everywhere: vault polling reads that token's vault,
+the fill parse scales the cash amount by its decimals (a fill whose moved amount
+the six-decimal internal amount cannot hold is skipped and recorded, never
+rounded), and the inventory view names it in the `symbol` field the dashboard
+labels the cash row with. Fill validation matches it two ways: an
+`InventoryTrade` fill must quote in the stable's address, while a
+`ClearV3`/`TakeOrderV3` fill is classified by the stable's symbol and its
+address is gated only by vault discovery, which skips a cash vault whose token
+is not the pinned address. The portfolio snapshot still persists its cash asset
+as the literal `USDC`; labelling it per chain changes persisted rows and is its
+own follow-up. Circle's USDC is exposed separately, `Some` only on chains whose
+stable is that USDC, and read by the CCTP bridge alone.
 
 Completed apalis jobs are operational queue records, not audit history. The
 runtime periodically deletes terminal job rows and vacuums SQLite at the

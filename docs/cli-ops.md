@@ -12,11 +12,11 @@ Use `stox --help` to list all commands and `stox <command> --help` for details
 on any specific command.
 
 Every command that itself submits an onchain operation takes `--network`
-(`base`, `ethereum`, `hyperevm`; default `base`) and runs on that chain's
-signing wallet. The `transfer` recovery verbs (`recheck`, `resume`, `reconcile`,
-`fail`) take no `--network`: they act on the bot's local records or hand the
-work to the running bot, whose recovery runs on the primary chain's services.
-Two contracts apply to the network-aware commands:
+(`base`, `ethereum`, `hyperevm`, `robinhood`; default `base`) and runs on that
+chain's signing wallet. The `transfer` recovery verbs (`recheck`, `resume`,
+`reconcile`, `fail`) take no `--network`: they act on the bot's local records or
+hand the work to the running bot, whose recovery runs on the primary chain's
+services. Two contracts apply to the network-aware commands:
 
 - Orderbook-backed commands (`vault-deposit`, `vault-withdraw`,
   `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`, `donate-equity`,
@@ -30,8 +30,11 @@ Two contracts apply to the network-aware commands:
   `--registry` (the st0x.registry token list), and `alpaca-tokenize` accepts the
   tStock address directly with `--token`.
 
-Where a command needs USDC it uses the selected chain's canonical contract.
-HyperEVM uses `USDC_HYPEREVM` (`0xb88339CB7199b77E23DB6E890353E22632Ba630f`).
+Where a command needs cash it uses the selected chain's pinned settlement
+stable. HyperEVM uses `USDC_HYPEREVM`
+(`0xb88339CB7199b77E23DB6E890353E22632Ba630f`); Robinhood settles in
+`USDG_ROBINHOOD` (`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`), which CCTP
+cannot bridge.
 
 ## Running the CLI on GCP
 

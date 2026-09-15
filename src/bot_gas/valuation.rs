@@ -94,6 +94,7 @@ where
 {
     let (block_number, block_id) = match chain {
         Chain::Base => (receipt_block_number, BlockId::hash(receipt_block_hash)),
+        // Both pay gas in ETH but have no block on Base to pin the read to.
         Chain::Ethereum | Chain::Robinhood => {
             let latest = base_provider.get_block_number().await?;
             (latest, BlockId::number(latest))
@@ -359,28 +360,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ethereum_receipt_uses_latest_base_block() {
-        let asserter = Asserter::new();
-        asserter.push_success(&999u64);
-        asserter.push_success(&encode_decimals(8));
-        asserter.push_success(&encode_round(
-            I256::try_from(200_000_000_000_i64).unwrap(),
-            occurred_at(),
-        ));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+    async fn eth_gas_receipts_off_base_use_latest_base_block() {
+        for chain in [Chain::Ethereum, Chain::Robinhood] {
+            let asserter = Asserter::new();
+            asserter.push_success(&999u64);
+            asserter.push_success(&encode_decimals(8));
+            asserter.push_success(&encode_round(
+                I256::try_from(200_000_000_000_i64).unwrap(),
+                occurred_at(),
+            ));
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let result = read_eth_usd_price(
-            &provider,
-            CHAINLINK_FEED,
-            Chain::Ethereum,
-            111,
-            RECEIPT_BLOCK_HASH,
-            occurred_at(),
-        )
-        .await
-        .unwrap();
+            let result = read_eth_usd_price(
+                &provider,
+                CHAINLINK_FEED,
+                chain,
+                111,
+                RECEIPT_BLOCK_HASH,
+                occurred_at(),
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(result.block_number, Some(999));
+            assert_eq!(result.block_number, Some(999), "{chain}");
+        }
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! Canonical USDC token contract addresses across supported chains.
+//! Settlement-stable token contract addresses across supported chains.
 
 use alloy::primitives::{Address, address};
 
@@ -18,3 +18,6 @@ pub const USDC_HYPEREVM: Address = address!("0xb88339CB7199b77E23DB6E890353E2263
 /// (`L2GatewayRouter.calculateL2TokenAddress` of L1 USDC). Verified on-chain
 /// to answer `symbol() == "USDC"` with 6 decimals.
 pub const USDC_ROBINHOOD: Address = address!("0x80e0e24718dbFcad49ECAA6F1e6C89A190586cA8");
+
+/// USDG on Robinhood Chain mainnet.
+pub const USDG_ROBINHOOD: Address = address!("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168");

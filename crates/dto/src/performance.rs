@@ -1004,5 +1004,9 @@ mod tests {
             serde_json::to_value(ChainName::HyperEvm).unwrap(),
             json!("hyperevm")
         );
+        assert_eq!(
+            serde_json::to_value(ChainName::Robinhood).unwrap(),
+            json!("robinhood")
+        );
     }
 }

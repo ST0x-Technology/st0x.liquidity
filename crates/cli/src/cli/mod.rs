@@ -2465,6 +2465,29 @@ mod tests {
     }
 
     #[test]
+    fn alpaca_tokenize_parses_robinhood_network() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "alpaca-tokenize",
+            "-s",
+            "RKLB",
+            "-q",
+            "1",
+            "--network",
+            "robinhood",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::AlpacaTokenize { network, .. } => {
+                assert_eq!(network, TokenizationNetwork::Robinhood);
+                assert_eq!(Chain::from(network), Chain::Robinhood);
+            }
+            other => panic!("expected alpaca-tokenize command, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn transfer_equity_parses_network() {
         let cli = Cli::try_parse_from([
             "st0x-cli",

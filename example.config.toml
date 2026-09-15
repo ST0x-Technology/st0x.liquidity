@@ -201,10 +201,15 @@ required_confirmations = 12
 lifecycle = "observe-only"
 required_confirmations = 1
 
-# Robinhood Chain, same shape as HyperEVM.
+# Robinhood Chain (an Arbitrum Orbit L2, chain id 4663), same shape as
+# HyperEVM. Its settlement stable is USDG, pinned in code.
 [chains.robinhood]
-# A signer exists and nothing moves yet. Raising this to "active" fails
-# startup: no CCTP domain and no gas-valuation feed are wired.
+# A signer exists and nothing moves yet: no orderbook is watched and nothing
+# is signed. Gas is ETH, so "active" is reachable once a trading table lands.
+# When it does, Base's "safe" cutoff is OP-Stack-only: use
+# ingestion_cutoff = "confirmations" with ingestion_cutoff_confirmations
+# covering parent-chain finality (~13 min) at Robinhood's ~100 ms block
+# cadence.
 lifecycle = "observe-only"
 required_confirmations = 1
 
@@ -234,7 +239,7 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 # orchestrator-mode is owned by the issuance bot (the vault_mode field on its
 # per-asset status endpoint); this section only supplies contract addresses,
 # one per chain (each chain carries its own deployment; the keys are chain
-# names: base, ethereum, hyperevm). Every hedged chain gets a mint authorizer
+# names: base, ethereum, hyperevm, robinhood). Every hedged chain gets a mint authorizer
 # built from its own entry; a mint signs against the entry of the chain it
 # lands on (the primary chain today) and fails loudly without it, and a
 # hedged chain with no entry is warned about at startup.
@@ -330,8 +335,9 @@ rebalancing = "enabled"
 [issuance]
 base_url = "https://issuance.internal:8000"
 
-# Required in rebalancing mode and for a hedged HyperEVM chain (a trading
-# table with lifecycle other than disabled). Optional only when neither applies.
+# Required in rebalancing mode and for a hedged HyperEVM or Robinhood chain (a
+# trading table with lifecycle other than disabled). Optional only when neither
+# applies.
 # Provides low-gas alerts and thresholds that refuse fresh transfers before
 # funds move. Every field is required (no silent defaults).
 # Alerts are structured ERROR logs (target "operational_alert"); delivery to
@@ -344,10 +350,11 @@ poll_interval = 300
 # (twice daily) keeps a persistent low balance from being noisy.
 realert_interval = 43200
 # Native-gas balance below which alerts fire, as decimal strings in the chain's
-# native token (ETH for Base/Ethereum, HYPE for HyperEVM). Base and Ethereum
-# thresholds are required whenever [alerts] is present. A positive hyperevm
-# threshold is also required for a hedged HyperEVM chain. Disabled, absent,
-# and transport-only HyperEVM configurations reject an unused threshold.
+# native token (ETH for Base/Ethereum/Robinhood, HYPE for HyperEVM). Base and
+# Ethereum thresholds are required whenever [alerts] is present. A positive
+# hyperevm or robinhood threshold is also required once that chain is hedged.
+# Disabled, absent, and transport-only configurations of those two chains
+# reject an unused threshold.
 [alerts.low_balance_thresholds]
 base = "0.05"
 ethereum = "0.05"

@@ -631,10 +631,15 @@ fn enabled_chains(
         }
     };
 
-    if primary_chain == Chain::HyperEvm {
-        return Err(ChainRegistryError::UnsupportedPrimaryChain {
-            chain: primary_chain,
-        });
+    // The primary's rebalancing services are always constructed, and only
+    // Base and Ethereum have the wrapper or CCTP wiring they need.
+    match primary_chain {
+        Chain::Base | Chain::Ethereum => {}
+        Chain::HyperEvm | Chain::Robinhood => {
+            return Err(ChainRegistryError::UnsupportedPrimaryChain {
+                chain: primary_chain,
+            });
+        }
     }
 
     if chain_config.lifecycle != ChainLifecycle::Active {

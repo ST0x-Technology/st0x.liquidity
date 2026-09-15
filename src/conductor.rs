@@ -173,6 +173,7 @@ pub(crate) struct SupervisorStartupTokens {
     pub(crate) base_gas_monitor: StartupToken,
     pub(crate) ethereum_gas_monitor: StartupToken,
     pub(crate) hyperevm_gas_monitor: StartupToken,
+    pub(crate) robinhood_gas_monitor: StartupToken,
 }
 
 /// Opens an apalis-side pool (sqlx 0.8) against the same database as the
@@ -1362,6 +1363,7 @@ fn build_record_bot_gas_receipt_cost_ctx(
     Ok(Arc::new(RecordBotGasReceiptCostCtx {
         base_wallet: wallet_ctx.base_wallet().clone(),
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
+        robinhood_wallet: wallet_ctx.robinhood_wallet().clone(),
         chainlink_feed: bot_gas_valuation.chainlink_feed,
         ledger: BotGasCostLedger::new(bot_gas_receipt_cost_store),
         job_queue,

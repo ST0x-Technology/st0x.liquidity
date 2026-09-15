@@ -3011,7 +3011,7 @@ mod tests {
     /// One match yields both the wallet and the wire value, so the pairing is
     /// pinned here for every network: ethereum selects the ethereum wallet and
     /// the "ethereum" wire value, base the base pair, hyperevm the hyperevm
-    /// pair, and robinhood the robinhood pair.
+    /// pair, robinhood the robinhood pair.
     #[cfg(feature = "test-support")]
     #[test]
     fn tokenization_network_context_pairs_wallet_and_wire() {
