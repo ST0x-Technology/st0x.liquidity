@@ -194,23 +194,21 @@ fn record_hedge_floor_gauges(
     requested: FractionalShares,
     allowed: FractionalShares,
 ) {
-    let deficit = match requested - allowed {
-        Ok(deficit) => deficit,
+    set_shares_gauge("hedge_floor_shares", symbol, floor);
+
+    match requested - allowed {
+        Ok(deficit) => set_shares_gauge("hedge_deficit_shares", symbol, deficit),
         Err(error) => {
             warn!(%symbol, %error, "hedge_deficit_shares gauge skipped: subtraction failed");
-            return;
         }
-    };
+    }
+}
 
-    for (name, value) in [
-        ("hedge_floor_shares", floor),
-        ("hedge_deficit_shares", deficit),
-    ] {
-        match value.to_string().parse::<f64>() {
-            Ok(value) => gauge!(name, "symbol" => symbol.to_string()).set(value),
-            Err(error) => {
-                warn!(%symbol, %error, "{name} gauge skipped: could not parse shares as f64");
-            }
+fn set_shares_gauge(name: &'static str, symbol: &Symbol, value: FractionalShares) {
+    match value.to_string().parse::<f64>() {
+        Ok(value) => gauge!(name, "symbol" => symbol.to_string()).set(value),
+        Err(error) => {
+            warn!(%symbol, %error, "{name} gauge skipped: could not parse shares as f64");
         }
     }
 }

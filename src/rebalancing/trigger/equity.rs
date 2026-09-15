@@ -473,6 +473,15 @@ pub(super) async fn check_imbalance_and_build_operation(
                 return Ok(None);
             };
             let quantity = truncate_for_alpaca(symbol, cap_shares(symbol, mintable, shares_limit))?;
+            if quantity.inner().lt(MINIMUM_MINT_SHARES.inner())? {
+                trace!(
+                    target: "rebalance",
+                    %symbol,
+                    %quantity,
+                    "Skipping mint: capped quantity is below the minimum mint size"
+                );
+                return Ok(None);
+            }
             TriggeredOperation::Mint {
                 symbol: symbol.clone(),
                 quantity,
@@ -1255,6 +1264,35 @@ mod tests {
             Address::ZERO,
             &ratio,
             None,
+            FractionalShares::new(float!(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    /// An operational limit below the minimum mint size must not turn a
+    /// legitimate excess into a dust mint either.
+    #[tokio::test]
+    async fn mint_is_skipped_when_the_operational_limit_leaves_only_dust() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = fractional_view(&symbol, "0", "10.5");
+        let threshold = ImbalanceThreshold {
+            target: float!(0.95),
+            deviation: float!(0.01),
+        };
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+        let limit = Positive::new(FractionalShares::new(float!(0.001))).unwrap();
+
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            Some(limit),
             FractionalShares::new(float!(1)),
         )
         .await

@@ -2479,6 +2479,10 @@ mod tests {
             "insufficient_equity"
         );
         assert_eq!(
+            CloseFlattenBlockReason::HeldAtFloor.metric_label(),
+            "held_at_floor"
+        );
+        assert_eq!(
             CloseFlattenBlockReason::InsufficientBuyingPower.metric_label(),
             "insufficient_buying_power"
         );
