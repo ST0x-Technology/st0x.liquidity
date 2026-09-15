@@ -845,8 +845,11 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::AlpacaBrokerApi,
             placed_at: now,
+            client_order_id: None,
+            limit_price: None,
             market_session: MarketSession::Regular,
             close_flatten: false,
+            buying_power_reservation: None,
         };
         assert!(contains_source(
             &references_for(&open_order),
@@ -866,6 +869,8 @@ mod tests {
                 error: "rejected".to_string(),
                 placed_at: now,
                 failed_at: now,
+                market_session: MarketSession::Regular,
+                close_flatten: false,
             })
             .is_empty()
         );

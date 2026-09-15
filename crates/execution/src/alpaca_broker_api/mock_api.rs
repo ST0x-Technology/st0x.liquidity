@@ -1646,6 +1646,7 @@ fn register_order_by_client_order_id_endpoint(server: &MockServer, state: &Arc<M
                             .as_ref()
                             .map(format_float_with_fallback),
                         "client_order_id": client_order_id,
+                        "created_at": "2025-01-06T12:00:00Z",
                     })
                 })
             });
@@ -2382,7 +2383,44 @@ mod tests {
     use crate::alpaca_broker_api::{
         AccountActivitiesQuery, AlpacaBrokerApi, AlpacaBrokerApiError, TimeInForce, market_hours,
     };
-    use crate::{Executor, MarketSession, Symbol, Usd, Usdc};
+    use crate::{
+        ClientOrderId, Direction, Executor, FractionalShares, MarketOrder, MarketSession, Positive,
+        Symbol, Usd, Usdc,
+    };
+
+    #[tokio::test]
+    async fn recorded_failed_placement_is_found_by_client_order_id() {
+        let mock = AlpacaBrokerMock::start()
+            .symbol_fill_prices(vec![(Symbol::new("AAPL").unwrap(), float!(100))])
+            .symbol_positions(vec![])
+            .call()
+            .await;
+        mock.set_transient_placement_failures(1);
+        let executor = AlpacaBrokerApi::try_from_ctx(mock_broker_ctx(&mock))
+            .await
+            .unwrap();
+        let client_order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+        let expected_shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: expected_shares,
+            direction: Direction::Buy,
+            client_order_id: client_order_id.clone(),
+        };
+
+        executor.place_market_order(order).await.unwrap_err();
+        let recovered = executor
+            .get_order_by_client_order_id(&client_order_id)
+            .await
+            .unwrap()
+            .expect("recorded order must be recoverable");
+
+        assert_eq!(recovered.symbol, Symbol::new("AAPL").unwrap());
+        assert_eq!(recovered.shares, expected_shares);
+        assert_eq!(recovered.direction, Direction::Buy);
+        assert_eq!(recovered.extended_hours, None);
+        assert_eq!(recovered.limit_price, None);
+    }
 
     /// Contract test between the mock's overnight-quote and asset knobs and
     /// the real client parsers: the knobs must produce payload shapes the

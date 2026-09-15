@@ -108,6 +108,22 @@ pub struct OrderPlacement<OrderId> {
     pub limit_price: Option<Positive<Usd>>,
 }
 
+/// A broker order recovered by its client-supplied idempotency key.
+///
+/// Unlike a fresh placement response, a lookup can omit optional echoed order
+/// terms. Callers must then recover those terms from the durable local intent
+/// rather than fabricate regular-session values.
+#[derive(Debug)]
+pub struct RecoveredOrderPlacement<OrderId> {
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub shares: Positive<FractionalShares>,
+    pub direction: Direction,
+    pub placed_at: DateTime<Utc>,
+    pub extended_hours: Option<bool>,
+    pub limit_price: Option<Positive<Usd>>,
+}
+
 pub struct OrderUpdate<OrderId> {
     pub order_id: OrderId,
     pub symbol: Symbol,

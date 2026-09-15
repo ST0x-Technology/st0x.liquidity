@@ -157,6 +157,8 @@ pub(crate) fn preflight_skip_reason_label(reason: &CounterTradeSkipReason) -> &'
         CounterTradeSkipReason::InsufficientEquity { .. } => "insufficient_equity",
         CounterTradeSkipReason::HeldAtFloor { .. } => "held_at_floor",
         CounterTradeSkipReason::InsufficientBuyingPower { .. } => "insufficient_buying_power",
+        CounterTradeSkipReason::BelowBrokerPrecision { .. } => "below_broker_precision",
+        CounterTradeSkipReason::BelowMinimumNotional => "below_minimum_notional",
     }
 }
 

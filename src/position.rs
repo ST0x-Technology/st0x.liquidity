@@ -193,6 +193,82 @@ pub(crate) async fn hydrate_position_gauges(
     Ok(())
 }
 
+fn evolve_offchain_order_failure(
+    entity: &Position,
+    offchain_order_id: OffchainOrderId,
+    failed_at: DateTime<Utc>,
+    anchor: AnchorDisposition,
+) -> Option<Position> {
+    if entity.pending_offchain_order_id != Some(offchain_order_id) {
+        return None;
+    }
+
+    let last_failed_offchain_order_id = match anchor {
+        // Preserve the first key the broker may have observed across a chain
+        // of locally failed retries.
+        AnchorDisposition::Preserve => entity
+            .last_failed_offchain_order_id
+            .or(Some(offchain_order_id)),
+        AnchorDisposition::Release => None,
+    };
+    Some(Position {
+        pending_offchain_order_id: None,
+        last_failed_offchain_order_id,
+        last_updated: Some(failed_at),
+        ..entity.clone()
+    })
+}
+
+fn evolve_failed_order_anchor_release(
+    entity: &Position,
+    expected_offchain_order_id: OffchainOrderId,
+    released_at: DateTime<Utc>,
+) -> Option<Position> {
+    (entity.last_failed_offchain_order_id == Some(expected_offchain_order_id)).then(|| Position {
+        last_failed_offchain_order_id: None,
+        last_updated: Some(released_at),
+        ..entity.clone()
+    })
+}
+
+fn evolve_onchain_order_fill(
+    entity: &Position,
+    trade_id: &TradeId,
+    amount: FractionalShares,
+    direction: Direction,
+    price_usdc: Float,
+    block_timestamp: DateTime<Utc>,
+    seen_at: DateTime<Utc>,
+) -> Result<Option<Position>, PositionError> {
+    let (net, accumulated_long, accumulated_short) = match direction {
+        Direction::Buy => (
+            (entity.net + amount)?,
+            (entity.accumulated_long + amount)?,
+            entity.accumulated_short,
+        ),
+        Direction::Sell => (
+            (entity.net - amount)?,
+            entity.accumulated_long,
+            (entity.accumulated_short + amount)?,
+        ),
+    };
+    record_position_gauge(&entity.symbol, &net);
+    Ok(Some(Position {
+        net,
+        accumulated_long,
+        accumulated_short,
+        last_acknowledged_trade_id: Some(trade_id.clone()),
+        last_updated: Some(seen_at),
+        // Use economic block time, not ingestion time, so a delayed backfill
+        // cannot make an old price look fresh.
+        last_price: Some(PriceObservation {
+            price: price_usdc,
+            observed_at: block_timestamp,
+        }),
+        ..entity.clone()
+    }))
+}
+
 #[async_trait]
 impl EventSourced for Position {
     type Id = Symbol;
@@ -239,56 +315,20 @@ impl EventSourced for Position {
             OnChainOrderFilled {
                 trade_id,
                 amount,
-                direction: Buy,
+                direction,
                 price_usdc,
                 block_timestamp,
                 seen_at,
                 ..
-            } => {
-                let new_net = (entity.net + *amount)?;
-                let new_accumulated_long = (entity.accumulated_long + *amount)?;
-                record_position_gauge(&entity.symbol, &new_net);
-                Ok(Some(Self {
-                    net: new_net,
-                    accumulated_long: new_accumulated_long,
-                    last_acknowledged_trade_id: Some(trade_id.clone()),
-                    last_updated: Some(*seen_at),
-                    // block_timestamp, NOT seen_at: the economic time the price
-                    // was valid on-chain. seen_at can go fresh on a delayed
-                    // catch-up backfill, which would make an old price look
-                    // fresh and defeat the staleness gate this field exists for.
-                    last_price: Some(PriceObservation {
-                        price: *price_usdc,
-                        observed_at: *block_timestamp,
-                    }),
-                    ..entity.clone()
-                }))
-            }
-
-            OnChainOrderFilled {
+            } => evolve_onchain_order_fill(
+                entity,
                 trade_id,
-                direction: Sell,
-                amount,
-                price_usdc,
-                block_timestamp,
-                seen_at,
-                ..
-            } => {
-                let new_net = (entity.net - *amount)?;
-                let new_accumulated_short = (entity.accumulated_short + *amount)?;
-                record_position_gauge(&entity.symbol, &new_net);
-                Ok(Some(Self {
-                    net: new_net,
-                    accumulated_short: new_accumulated_short,
-                    last_acknowledged_trade_id: Some(trade_id.clone()),
-                    last_updated: Some(*seen_at),
-                    last_price: Some(PriceObservation {
-                        price: *price_usdc,
-                        observed_at: *block_timestamp,
-                    }),
-                    ..entity.clone()
-                }))
-            }
+                *amount,
+                *direction,
+                *price_usdc,
+                *block_timestamp,
+                *seen_at,
+            ),
 
             // Bookkeeping only (ADR 0010): track the applied fill in the
             // pending-acknowledgement set without touching net or
@@ -365,39 +405,25 @@ impl EventSourced for Position {
             }
 
             OffChainOrderFailed {
-                offchain_order_id, ..
-            } if entity.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
-
-            OffChainOrderFailed {
                 offchain_order_id,
                 failed_at,
                 anchor,
                 ..
-            } => {
-                let last_failed_offchain_order_id = match anchor {
-                    // Stash the failed OID so the next placement attempt can
-                    // reuse it as `client_order_id` and let the broker
-                    // dedupe.
-                    //
-                    // Preserve the *first* failed anchor across a chain of
-                    // failures: the broker recorded the original attempt
-                    // under that key, so a later attempt whose own response
-                    // was also lost must keep deduping against the original
-                    // key. Overwriting with each new OID would point the
-                    // next retry at a key the broker never saw,
-                    // double-submitting the order.
-                    AnchorDisposition::Preserve => entity
-                        .last_failed_offchain_order_id
-                        .or(Some(*offchain_order_id)),
-                    AnchorDisposition::Release => None,
-                };
-                Ok(Some(Self {
-                    pending_offchain_order_id: None,
-                    last_failed_offchain_order_id,
-                    last_updated: Some(*failed_at),
-                    ..entity.clone()
-                }))
-            }
+            } => Ok(evolve_offchain_order_failure(
+                entity,
+                *offchain_order_id,
+                *failed_at,
+                *anchor,
+            )),
+
+            FailedOrderAnchorReleased {
+                expected_offchain_order_id,
+                released_at,
+            } => Ok(evolve_failed_order_anchor_release(
+                entity,
+                *expected_offchain_order_id,
+                *released_at,
+            )),
 
             OffChainOrderCancelled {
                 offchain_order_id, ..
@@ -636,6 +662,20 @@ impl EventSourced for Position {
                 Utc::now(),
             ),
 
+            RecoverFailedOffChainOrder {
+                expected_failed_offchain_order_id,
+                offchain_order_id,
+                shares,
+                direction,
+                executor,
+            } => self.recover_failed_offchain_order_events(
+                expected_failed_offchain_order_id,
+                offchain_order_id,
+                shares,
+                direction,
+                executor,
+            ),
+
             #[cfg(any(test, feature = "test-support"))]
             PlaceOffChainOrderAt {
                 offchain_order_id,
@@ -692,6 +732,10 @@ impl EventSourced for Position {
                     anchor,
                 }])
             }
+
+            ReleaseFailedOrderAnchor {
+                expected_offchain_order_id,
+            } => self.release_failed_order_anchor_events(expected_offchain_order_id),
 
             CancelOffChainOrder {
                 offchain_order_id,
@@ -776,6 +820,74 @@ struct OnChainFillFacts {
 }
 
 impl Position {
+    fn recover_failed_offchain_order_events(
+        &self,
+        expected_failed_offchain_order_id: OffchainOrderId,
+        offchain_order_id: OffchainOrderId,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        executor: SupportedExecutor,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        if self.last_failed_offchain_order_id != Some(expected_failed_offchain_order_id) {
+            return Err(PositionError::FailedOrderAnchorMismatch {
+                expected: expected_failed_offchain_order_id,
+                actual: self.last_failed_offchain_order_id,
+            });
+        }
+        if let Some(pending) = self.pending_offchain_order_id {
+            return Err(PositionError::PendingExecution {
+                offchain_order_id: pending,
+            });
+        }
+
+        info!(
+            target: "hedge",
+            symbol = %self.symbol,
+            anchor = %expected_failed_offchain_order_id,
+            recovered_shares = %shares,
+            %offchain_order_id,
+            "Claiming position for broker order recovered from failed idempotency anchor"
+        );
+
+        Ok(vec![PositionEvent::OffChainOrderPlaced {
+            offchain_order_id,
+            shares,
+            direction,
+            executor,
+            trigger_reason: TriggerReason::FailedOrderRecovery {
+                failed_offchain_order_id: expected_failed_offchain_order_id,
+            },
+            placed_at: Utc::now(),
+        }])
+    }
+
+    fn release_failed_order_anchor_events(
+        &self,
+        expected_offchain_order_id: OffchainOrderId,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        if self.last_failed_offchain_order_id != Some(expected_offchain_order_id) {
+            return Err(PositionError::FailedOrderAnchorMismatch {
+                expected: expected_offchain_order_id,
+                actual: self.last_failed_offchain_order_id,
+            });
+        }
+        if let Some(pending) = self.pending_offchain_order_id {
+            return Err(PositionError::PendingExecution {
+                offchain_order_id: pending,
+            });
+        }
+        info!(
+            target: "hedge",
+            symbol = %self.symbol,
+            %expected_offchain_order_id,
+            "Broker has no order for failed idempotency anchor; releasing it"
+        );
+        Ok(vec![PositionEvent::FailedOrderAnchorReleased {
+            expected_offchain_order_id,
+            released_at: Utc::now(),
+        }])
+    }
+
     fn acknowledge_on_chain_fill_init_events(
         symbol: Symbol,
         threshold: ExecutionThreshold,
@@ -1058,8 +1170,12 @@ impl Position {
 
                 Ok(Some((direction, capped_shares)))
             }
-            None => Ok(None),
+            Some(TriggerReason::FailedOrderRecovery { .. }) | None => Ok(None),
         }
+    }
+
+    pub(crate) fn absolute_net_shares(&self) -> Result<FractionalShares, PositionError> {
+        Ok(self.net.abs()?)
     }
 }
 
@@ -1121,6 +1237,11 @@ pub enum PositionError {
     OffchainOrderIdMismatch {
         expected: OffchainOrderId,
         actual: OffchainOrderId,
+    },
+    #[error("Failed-order anchor mismatch: expected {expected:?}, got {actual:?}")]
+    FailedOrderAnchorMismatch {
+        expected: OffchainOrderId,
+        actual: Option<OffchainOrderId>,
     },
     // Stores the error as String rather than the typed FloatError because
     // PositionError must implement Serialize/Deserialize (it's a CQRS error
@@ -1184,6 +1305,17 @@ pub enum PositionCommand {
         executor: SupportedExecutor,
         threshold: ExecutionThreshold,
     },
+    /// Claims the position for a broker order found under a preserved failed
+    /// idempotency anchor. This deliberately bypasses the current hedge
+    /// threshold: the broker side effect may already exist and must be polled
+    /// and accounted even if later onchain fills changed the net exposure.
+    RecoverFailedOffChainOrder {
+        expected_failed_offchain_order_id: OffchainOrderId,
+        offchain_order_id: OffchainOrderId,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        executor: SupportedExecutor,
+    },
     /// Test/fixture-only: identical to `PlaceOffChainOrder` but takes
     /// `placed_at` explicitly instead of stamping `Utc::now()`, so fixture
     /// seeding can backdate synthetic history.
@@ -1213,6 +1345,9 @@ pub enum PositionCommand {
         /// the failed placement's key reached a terminal state; see
         /// `AnchorDisposition`.
         anchor: AnchorDisposition,
+    },
+    ReleaseFailedOrderAnchor {
+        expected_offchain_order_id: OffchainOrderId,
     },
     /// Clear a pending offchain order that was intentionally cancelled (e.g.
     /// the extended-hours -> regular cancel-and-replace), distinct from a broker
@@ -1307,6 +1442,10 @@ pub enum PositionEvent {
         #[serde(default)]
         anchor: AnchorDisposition,
     },
+    FailedOrderAnchorReleased {
+        expected_offchain_order_id: OffchainOrderId,
+        released_at: DateTime<Utc>,
+    },
     /// A pending offchain order was intentionally cancelled (not a failure), so
     /// failure-rate analytics can tell the two apart. Clears the pending
     /// reference without setting the failure/idempotency anchor.
@@ -1347,6 +1486,7 @@ impl PositionEvent {
                 broker_timestamp, ..
             } => *broker_timestamp,
             OffChainOrderFailed { failed_at, .. } => *failed_at,
+            FailedOrderAnchorReleased { released_at, .. } => *released_at,
             OffChainOrderCancelled { cancelled_at, .. } => *cancelled_at,
             ThresholdUpdated { updated_at, .. } => *updated_at,
             ManualPositionAdjusted { adjusted_at, .. } => *adjusted_at,
@@ -1365,6 +1505,9 @@ impl DomainEvent for PositionEvent {
             OffChainOrderPlaced { .. } => "PositionEvent::OffChainOrderPlaced".to_string(),
             OffChainOrderFilled { .. } => "PositionEvent::OffChainOrderFilled".to_string(),
             OffChainOrderFailed { .. } => "PositionEvent::OffChainOrderFailed".to_string(),
+            FailedOrderAnchorReleased { .. } => {
+                "PositionEvent::FailedOrderAnchorReleased".to_string()
+            }
             OffChainOrderCancelled { .. } => "PositionEvent::OffChainOrderCancelled".to_string(),
             ThresholdUpdated { .. } => "PositionEvent::ThresholdUpdated".to_string(),
             ManualPositionAdjusted { .. } => "PositionEvent::ManualPositionAdjusted".to_string(),
@@ -1507,6 +1650,16 @@ impl PartialEq for PositionEvent {
                 },
             ) => o1 == o2 && e1 == e2 && f1 == f2 && a1 == a2,
             (
+                Self::FailedOrderAnchorReleased {
+                    expected_offchain_order_id: e1,
+                    released_at: r1,
+                },
+                Self::FailedOrderAnchorReleased {
+                    expected_offchain_order_id: e2,
+                    released_at: r2,
+                },
+            ) => e1 == e2 && r1 == r2,
+            (
                 Self::OffChainOrderCancelled {
                     offchain_order_id: o1,
                     reason: r1,
@@ -1605,6 +1758,9 @@ pub enum TriggerReason {
         )]
         threshold_dollars: Float,
     },
+    FailedOrderRecovery {
+        failed_offchain_order_id: OffchainOrderId,
+    },
 }
 
 /// Required by `cqrs_es::DomainEvent` (via `PositionEvent`).
@@ -1640,6 +1796,14 @@ impl PartialEq for TriggerReason {
                     && p1.eq(*p2).unwrap_or(false)
                     && t1.eq(*t2).unwrap_or(false)
             }
+            (
+                Self::FailedOrderRecovery {
+                    failed_offchain_order_id: o1,
+                },
+                Self::FailedOrderRecovery {
+                    failed_offchain_order_id: o2,
+                },
+            ) => o1 == o2,
             _ => false,
         }
     }
@@ -1711,6 +1875,23 @@ impl std::fmt::Debug for PositionCommand {
                 .field("executor", executor)
                 .field("threshold", threshold)
                 .finish(),
+            Self::RecoverFailedOffChainOrder {
+                expected_failed_offchain_order_id,
+                offchain_order_id,
+                shares,
+                direction,
+                executor,
+            } => f
+                .debug_struct("RecoverFailedOffChainOrder")
+                .field(
+                    "expected_failed_offchain_order_id",
+                    expected_failed_offchain_order_id,
+                )
+                .field("offchain_order_id", offchain_order_id)
+                .field("shares", shares)
+                .field("direction", direction)
+                .field("executor", executor)
+                .finish(),
             #[cfg(any(test, feature = "test-support"))]
             Self::PlaceOffChainOrderAt {
                 offchain_order_id,
@@ -1753,6 +1934,12 @@ impl std::fmt::Debug for PositionCommand {
                 .field("offchain_order_id", offchain_order_id)
                 .field("error", error)
                 .field("anchor", anchor)
+                .finish(),
+            Self::ReleaseFailedOrderAnchor {
+                expected_offchain_order_id,
+            } => f
+                .debug_struct("ReleaseFailedOrderAnchor")
+                .field("expected_offchain_order_id", expected_offchain_order_id)
                 .finish(),
             Self::CancelOffChainOrder {
                 offchain_order_id,
@@ -1881,6 +2068,14 @@ impl std::fmt::Debug for PositionEvent {
                 .field("failed_at", failed_at)
                 .field("anchor", anchor)
                 .finish(),
+            Self::FailedOrderAnchorReleased {
+                expected_offchain_order_id,
+                released_at,
+            } => f
+                .debug_struct("FailedOrderAnchorReleased")
+                .field("expected_offchain_order_id", expected_offchain_order_id)
+                .field("released_at", released_at)
+                .finish(),
             Self::OffChainOrderCancelled {
                 offchain_order_id,
                 reason,
@@ -1944,6 +2139,12 @@ impl std::fmt::Debug for TriggerReason {
                 .field("price_usdc", &DebugFloat(price_usdc))
                 .field("threshold_dollars", &DebugFloat(threshold_dollars))
                 .finish(),
+            Self::FailedOrderRecovery {
+                failed_offchain_order_id,
+            } => f
+                .debug_struct("FailedOrderRecovery")
+                .field("failed_offchain_order_id", failed_offchain_order_id)
+                .finish(),
         }
     }
 }
@@ -1962,6 +2163,104 @@ mod tests {
 
     fn one_share_threshold() -> ExecutionThreshold {
         ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(1))).unwrap())
+    }
+
+    fn failed_anchor_history(anchor: OffchainOrderId) -> Vec<PositionEvent> {
+        vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    chain: Chain::Base,
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(100),
+                block_timestamp: Utc::now(),
+                block_number: None,
+                seen_at: Utc::now(),
+            },
+            PositionEvent::OffChainOrderPlaced {
+                offchain_order_id: anchor,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            PositionEvent::OffChainOrderFailed {
+                offchain_order_id: anchor,
+                error: "placement response lost".to_string(),
+                failed_at: Utc::now(),
+                anchor: AnchorDisposition::Preserve,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn release_failed_order_anchor_requires_and_clears_the_expected_anchor() {
+        let anchor = OffchainOrderId::new();
+        let events = TestHarness::<Position>::with(())
+            .given(failed_anchor_history(anchor))
+            .when(PositionCommand::ReleaseFailedOrderAnchor {
+                expected_offchain_order_id: anchor,
+            })
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [PositionEvent::FailedOrderAnchorReleased {
+                expected_offchain_order_id,
+                ..
+            }] if *expected_offchain_order_id == anchor
+        ));
+    }
+
+    #[tokio::test]
+    async fn release_failed_order_anchor_rejects_a_stale_expected_anchor() {
+        let anchor = OffchainOrderId::new();
+        let stale = OffchainOrderId::new();
+        TestHarness::<Position>::with(())
+            .given(failed_anchor_history(anchor))
+            .when(PositionCommand::ReleaseFailedOrderAnchor {
+                expected_offchain_order_id: stale,
+            })
+            .await
+            .then_expect_error();
+    }
+
+    #[tokio::test]
+    async fn release_failed_order_anchor_rejects_a_pending_recovery_order() {
+        let anchor = OffchainOrderId::new();
+        let recovery = OffchainOrderId::new();
+        let mut history = failed_anchor_history(anchor);
+        history.push(PositionEvent::OffChainOrderPlaced {
+            offchain_order_id: recovery,
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::AlpacaBrokerApi,
+            trigger_reason: TriggerReason::FailedOrderRecovery {
+                failed_offchain_order_id: anchor,
+            },
+            placed_at: Utc::now(),
+        });
+
+        TestHarness::<Position>::with(())
+            .given(history)
+            .when(PositionCommand::ReleaseFailedOrderAnchor {
+                expected_offchain_order_id: anchor,
+            })
+            .await
+            .then_expect_error();
     }
 
     #[test]

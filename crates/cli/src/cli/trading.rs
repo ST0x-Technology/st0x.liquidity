@@ -15,10 +15,11 @@ use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
-    ALPACA_MAX_DECIMAL_PLACES, AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, Direction,
+    ALPACA_MAX_DECIMAL_PLACES, AlpacaBrokerApiError, BuyingPowerReservationCents,
+    CancellationOutcome, ClientOrderId, CounterTradePreflight, CounterTradeReservation, Direction,
     Executor, ExecutorOrderId, FractionalShares, MarketOrder, MarketSession, MockExecutor,
-    OrderFailureTerminality, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
-    TryIntoExecutor,
+    OrderFailureTerminality, OrderPlacement, OrderState, Positive, SupportedExecutor, Symbol,
+    TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
 use st0x_hedge::operator::conductor::{
@@ -26,9 +27,13 @@ use st0x_hedge::operator::conductor::{
     execute_settle_fill, is_expected_place_offchain_order_rejection,
 };
 use st0x_hedge::operator::offchain::order::{
-    OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacementResult, OrderPlacer,
-    TerminalPositionFinalization, client_order_id_for_placement, place_offchain_order_at_broker,
-    position_command_for_finalization, terminal_position_finalization,
+    BrokerOrderPlacement, OffchainOrder, OffchainOrderId, OffchainOrderPlacement,
+    OrderPlacementResult, OrderPlacer, TerminalPositionFinalization, client_order_id_for_placement,
+    place_offchain_order_at_broker, position_command_for_finalization,
+    terminal_position_finalization,
+};
+use st0x_hedge::operator::offchain::{
+    acquire_counter_trade_submission_file_lock, live_buying_power_reservations,
 };
 use st0x_hedge::operator::onchain::accumulator::check_execution_readiness;
 use st0x_hedge::operator::onchain::trade::{BotOperator, RecoveryActors};
@@ -88,6 +93,38 @@ impl OrderPlacer for CliOrderPlacer {
         _executor_order_id: &ExecutorOrderId,
     ) -> Result<OrderState, Box<dyn std::error::Error + Send + Sync>> {
         Err("CLI does not support reading order status via OrderPlacer".into())
+    }
+
+    async fn get_order_by_client_order_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>> {
+        let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &self.ctx.broker;
+        let broker = alpaca_auth.clone().try_into_executor().await?;
+        Ok(broker
+            .get_order_by_client_order_id(client_order_id)
+            .await?
+            .map(|placement| BrokerOrderPlacement {
+                executor_order_id: ExecutorOrderId::new(&placement.order_id),
+                symbol: placement.symbol,
+                shares: placement.shares,
+                direction: placement.direction,
+                placed_at: placement.placed_at,
+                is_extended_hours: placement.extended_hours,
+                limit_price: placement.limit_price,
+            }))
+    }
+
+    async fn preflight_counter_trade_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &self.ctx.broker;
+        let broker = alpaca_auth.clone().try_into_executor().await?;
+        Ok(broker
+            .preflight_counter_trade_with_reserved_buying_power(order, reserved)
+            .await?)
     }
 }
 
@@ -875,17 +912,13 @@ pub(super) async fn process_found_trade<W: Write>(
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     display_trade_details(&onchain_trade, stdout)?;
-
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
-
     let trade_id = OnChainTradeId::new(
         onchain_trade.chain,
         onchain_trade.tx_hash,
         onchain_trade.log_index,
     );
 
-    // Build stores. CLI path: per-invocation instances are fine (single-instance
-    // rule applies to the server path only; see AGENTS.md).
     let (onchain_trade_store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
         .build(())
         .await?;
@@ -900,7 +933,7 @@ pub(super) async fn process_found_trade<W: Write>(
         anyhow::bail!("Fill {trade_id}: missing block_number, cannot witness fill");
     };
 
-    let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
+    let FillAccountingOutcome::Accounted { .. } = account_for_onchain_fill(
         pool,
         &onchain_trade_store,
         &position_store,
@@ -931,16 +964,27 @@ pub(super) async fn process_found_trade<W: Write>(
     {
         CliPendingReconciliation::NoPending | CliPendingReconciliation::Cleared => {}
         CliPendingReconciliation::InFlight => {
-            mark_and_settle_fill(
-                &onchain_trade_store,
-                &position_store,
-                &trade_id,
-                &onchain_trade,
-            )
-            .await?;
+            settle_fill(&onchain_trade_store, &position_store, &onchain_trade).await?;
             return Ok(());
         }
     }
+
+    let offchain_order_id = OffchainOrderId::new();
+    let anchor = match reconcile_cli_failed_anchor(
+        &position_store,
+        order_placer.as_ref(),
+        base_symbol,
+        offchain_order_id,
+        executor_type,
+    )
+    .await
+    {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            settle_fill(&onchain_trade_store, &position_store, &onchain_trade).await?;
+            return Err(error);
+        }
+    };
 
     let trading_enabled = ctx.chains.primary().assets.is_trading_enabled(base_symbol);
 
@@ -949,13 +993,7 @@ pub(super) async fn process_found_trade<W: Write>(
             stdout,
             "Trading disabled by configuration for {base_symbol}"
         )?;
-        mark_and_settle_fill(
-            &onchain_trade_store,
-            &position_store,
-            &trade_id,
-            &onchain_trade,
-        )
-        .await?;
+        settle_fill(&onchain_trade_store, &position_store, &onchain_trade).await?;
         return Ok(());
     }
 
@@ -979,43 +1017,41 @@ pub(super) async fn process_found_trade<W: Write>(
             stdout,
             "   (Waiting to accumulate enough shares for a whole share execution)"
         )?;
-        mark_and_settle_fill(
-            &onchain_trade_store,
-            &position_store,
-            &trade_id,
-            &onchain_trade,
-        )
-        .await?;
+        settle_fill(&onchain_trade_store, &position_store, &onchain_trade).await?;
         return Ok(());
     };
 
-    let offchain_order_id = OffchainOrderId::new();
+    let _counter_trade_submission_guard = acquire_counter_trade_submission_file_lock(pool).await?;
+    let (hedge_shares, buying_power_reservation) = if params.direction == Direction::Buy {
+        let Some(preflight) = preflight_cli_buy(
+            pool,
+            order_placer.as_ref(),
+            &params.symbol,
+            params.shares,
+            client_order_id_for_placement(offchain_order_id, anchor),
+            stdout,
+        )
+        .await?
+        else {
+            settle_fill(&onchain_trade_store, &position_store, &onchain_trade).await?;
+            return Ok(());
+        };
+        preflight
+    } else {
+        (params.shares, None)
+    };
 
     writeln!(
         stdout,
         "Trade triggered execution for {executor_type:?} (ID: {offchain_order_id})"
     )?;
 
-    let anchor = position_store
-        .load(&params.symbol)
-        .await
-        .inspect_err(|error| {
-            error!(
-                %offchain_order_id,
-                symbol = %params.symbol,
-                %error,
-                "Failed to load position for the idempotency anchor; refusing \
-                 placement until it can be read"
-            );
-        })?
-        .and_then(|position| position.last_failed_offchain_order_id);
-
     match position_store
         .send(
             &params.symbol,
             PositionCommand::PlaceOffChainOrder {
                 offchain_order_id,
-                shares: params.shares,
+                shares: hedge_shares,
                 direction: params.direction,
                 executor: params.executor,
                 threshold: ctx.execution_threshold,
@@ -1030,13 +1066,7 @@ pub(super) async fn process_found_trade<W: Write>(
                 symbol = %params.symbol,
                 "Position::PlaceOffChainOrder rejected by domain state: {error}"
             );
-            mark_and_settle_fill(
-                &onchain_trade_store,
-                &position_store,
-                &trade_id,
-                &onchain_trade,
-            )
-            .await?;
+            settle_fill(&onchain_trade_store, &position_store, &onchain_trade).await?;
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -1050,11 +1080,12 @@ pub(super) async fn process_found_trade<W: Write>(
         &offchain_order_id,
         OffchainOrderPlacement::market(
             params.symbol.clone(),
-            params.shares,
+            hedge_shares,
             params.direction,
             params.executor,
             client_order_id,
-        ),
+        )
+        .with_buying_power_reservation(buying_power_reservation),
     )
     .await?;
 
@@ -1067,23 +1098,122 @@ pub(super) async fn process_found_trade<W: Write>(
     )
     .await?;
 
-    mark_and_settle_fill(
-        &onchain_trade_store,
-        &position_store,
-        &trade_id,
-        &onchain_trade,
-    )
-    .await?;
+    settle_fill(&onchain_trade_store, &position_store, &onchain_trade).await?;
     Ok(())
 }
 
-async fn mark_and_settle_fill(
+async fn preflight_cli_buy<W: Write>(
+    pool: &SqlitePool,
+    order_placer: &dyn OrderPlacer,
+    symbol: &Symbol,
+    shares: Positive<FractionalShares>,
+    client_order_id: ClientOrderId,
+    stdout: &mut W,
+) -> anyhow::Result<
+    Option<(
+        Positive<FractionalShares>,
+        Option<BuyingPowerReservationCents>,
+    )>,
+> {
+    let reserved = live_buying_power_reservations(pool).await?;
+    let preflight = order_placer
+        .preflight_counter_trade_with_reserved_buying_power(
+            MarketOrder {
+                symbol: symbol.clone(),
+                shares,
+                direction: Direction::Buy,
+                client_order_id,
+            },
+            reserved,
+        )
+        .await
+        .map_err(anyhow::Error::from_boxed)?;
+    match preflight {
+        CounterTradePreflight::Skipped(reason) => {
+            writeln!(
+                stdout,
+                "Trade accumulated but buy preflight deferred the hedge: {reason}"
+            )?;
+            Ok(None)
+        }
+        CounterTradePreflight::Allowed {
+            reservation:
+                Some(CounterTradeReservation::BuyingPower {
+                    required,
+                    estimated_cost_cents,
+                    ..
+                }),
+        } => Ok(Some((
+            required,
+            Some(BuyingPowerReservationCents::new(estimated_cost_cents)?),
+        ))),
+        CounterTradePreflight::Allowed { .. } => {
+            anyhow::bail!("Alpaca buy preflight returned no buying-power reservation")
+        }
+    }
+}
+
+async fn reconcile_cli_failed_anchor(
+    position_store: &Store<Position>,
+    order_placer: &dyn OrderPlacer,
+    symbol: &Symbol,
+    offchain_order_id: OffchainOrderId,
+    executor: SupportedExecutor,
+) -> anyhow::Result<Option<OffchainOrderId>> {
+    let anchor = position_store
+        .load(symbol)
+        .await
+        .inspect_err(|error| {
+            error!(
+                %offchain_order_id,
+                %symbol,
+                %error,
+                "Failed to load position for the idempotency anchor; refusing \
+                 placement until it can be read"
+            );
+        })?
+        .and_then(|position| position.last_failed_offchain_order_id);
+    if executor != SupportedExecutor::AlpacaBrokerApi {
+        return Ok(anchor);
+    }
+    let Some(anchor) = anchor else {
+        return Ok(None);
+    };
+
+    let client_order_id = client_order_id_for_placement(offchain_order_id, Some(anchor));
+    if let Some(broker_order) = order_placer
+        .get_order_by_client_order_id(&client_order_id)
+        .await
+        .map_err(anyhow::Error::from_boxed)?
+    {
+        anyhow::bail!(
+            "broker order {} already exists for failed anchor {anchor}; let the liquidity \
+             service reconcile it before processing this fill",
+            broker_order.executor_order_id
+        )
+    }
+    position_store
+        .send(
+            symbol,
+            PositionCommand::ReleaseFailedOrderAnchor {
+                expected_offchain_order_id: anchor,
+            },
+        )
+        .await?;
+    Ok(None)
+}
+
+async fn settle_fill(
     onchain_trade_store: &Store<OnChainTrade>,
     position_store: &Store<Position>,
-    trade_id: &OnChainTradeId,
     onchain_trade: &OnchainTrade,
 ) -> anyhow::Result<()> {
-    execute_mark_acknowledged(onchain_trade_store, trade_id).await?;
+    let trade_id = OnChainTradeId::new(
+        onchain_trade.chain,
+        onchain_trade.tx_hash,
+        onchain_trade.log_index,
+    );
+    execute_mark_acknowledged(onchain_trade_store, &trade_id).await?;
     execute_settle_fill(position_store, onchain_trade).await?;
 
     Ok(())
@@ -1373,6 +1503,7 @@ mod tests {
     use st0x_hedge::operator::onchain_trade::{
         InventoryVenue, OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand, OnChainTradeSource,
     };
+    use st0x_hedge::operator::position::TradeId;
     use st0x_hedge::operator::test_utils::{
         OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, mock_alpaca_broker_ctx,
         try_positive_shares, try_setup_test_db, try_setup_test_pools,
@@ -1697,6 +1828,14 @@ mod tests {
         ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
             Err("broker rejected the cancellation".into())
         }
+
+        async fn preflight_counter_trade_with_reserved_buying_power(
+            &self,
+            order: MarketOrder,
+            _reserved: BuyingPowerReservationCents,
+        ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(test_buy_preflight(order))
+        }
     }
 
     /// `OrderPlacer` that always returns a successful placement, used to drive
@@ -1735,6 +1874,218 @@ mod tests {
         ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
             Err("unexpected cancellation from CLI test order placer".into())
         }
+
+        async fn preflight_counter_trade_with_reserved_buying_power(
+            &self,
+            order: MarketOrder,
+            _reserved: BuyingPowerReservationCents,
+        ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(test_buy_preflight(order))
+        }
+    }
+
+    fn test_buy_preflight(_order: MarketOrder) -> CounterTradePreflight {
+        CounterTradePreflight::Allowed {
+            reservation: Some(CounterTradeReservation::BuyingPower {
+                required: positive_shares("0.5"),
+                estimated_cost_cents: 5_000,
+                available_buying_power_cents: 100_000,
+            }),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum AnchorLookupResult {
+        Found,
+        Missing,
+        Error,
+    }
+
+    struct AnchorLookupOrderPlacer(AnchorLookupResult);
+
+    #[async_trait]
+    impl OrderPlacer for AnchorLookupOrderPlacer {
+        async fn place_market_order(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("anchor reconciliation test must not place")
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("anchor reconciliation test must not place")
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("anchor reconciliation test must not cancel")
+        }
+
+        async fn get_order_by_client_order_id(
+            &self,
+            _client_order_id: &ClientOrderId,
+        ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            match self.0 {
+                AnchorLookupResult::Found => Ok(Some(BrokerOrderPlacement {
+                    executor_order_id: ExecutorOrderId::new("existing-anchor-order"),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: positive_shares("1"),
+                    direction: Direction::Sell,
+                    placed_at: Utc::now(),
+                    is_extended_hours: Some(false),
+                    limit_price: None,
+                })),
+                AnchorLookupResult::Missing => Ok(None),
+                AnchorLookupResult::Error => {
+                    Err(std::io::Error::other("anchor lookup unavailable").into())
+                }
+            }
+        }
+    }
+
+    async fn seeded_cli_failed_anchor(
+        pool: &SqlitePool,
+    ) -> (Arc<Store<Position>>, Symbol, OffchainOrderId) {
+        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trade = onchain_trade_builder().build();
+        execute_acknowledge_fill(
+            &position_store,
+            &trade,
+            ExecutionThreshold::whole_share(),
+            trade.block_timestamp.unwrap(),
+        )
+        .await
+        .unwrap();
+        let anchor = OffchainOrderId::new();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: anchor,
+                    shares: positive_shares("1"),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: anchor,
+                    error: "lost placement response".to_string(),
+                    anchor: AnchorDisposition::Preserve,
+                },
+            )
+            .await
+            .unwrap();
+        (position_store, symbol, anchor)
+    }
+
+    #[tokio::test]
+    async fn cli_anchor_reconciliation_releases_only_when_broker_confirms_absence() {
+        for outcome in [
+            AnchorLookupResult::Found,
+            AnchorLookupResult::Missing,
+            AnchorLookupResult::Error,
+        ] {
+            let pool = setup_test_db().await;
+            let (position_store, symbol, anchor) = seeded_cli_failed_anchor(&pool).await;
+            let result = reconcile_cli_failed_anchor(
+                &position_store,
+                &AnchorLookupOrderPlacer(outcome),
+                &symbol,
+                OffchainOrderId::new(),
+                SupportedExecutor::AlpacaBrokerApi,
+            )
+            .await;
+            let position = position_store.load(&symbol).await.unwrap().unwrap();
+
+            match outcome {
+                AnchorLookupResult::Missing => {
+                    assert_eq!(result.unwrap(), None);
+                    assert_eq!(position.last_failed_offchain_order_id, None);
+                }
+                AnchorLookupResult::Found | AnchorLookupResult::Error => {
+                    assert!(result.is_err());
+                    assert_eq!(position.last_failed_offchain_order_id, Some(anchor));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn process_tx_settles_the_fill_before_reporting_an_existing_anchor_order() {
+        let pool = setup_test_db().await;
+        let (_position_store, _symbol, _anchor) = seeded_cli_failed_anchor(&pool).await;
+        let ctx = create_base_test_ctx();
+        let onchain_trade = onchain_trade_builder()
+            .with_log_index(2)
+            .with_block_number(42)
+            .build();
+        let trade_id = OnChainTradeId::new(
+            onchain_trade.chain,
+            onchain_trade.tx_hash,
+            onchain_trade.log_index,
+        );
+        let position_trade_id = TradeId {
+            chain: onchain_trade.chain,
+            tx_hash: onchain_trade.tx_hash,
+            log_index: onchain_trade.log_index,
+        };
+
+        let error = process_found_trade(
+            onchain_trade,
+            &ctx,
+            &pool,
+            &mut std::io::sink(),
+            Arc::new(AnchorLookupOrderPlacer(AnchorLookupResult::Found)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already exists for failed anchor")
+        );
+        let (onchain_trade_store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        assert!(
+            onchain_trade_store
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_acknowledged(),
+            "the durable onchain marker must be acknowledged before the anchor error returns"
+        );
+        let (position_store, _) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let position = position_store
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !position
+                .pending_acknowledged_trade_ids
+                .contains(&position_trade_id),
+            "the accounted fill must be settled before the reconciliation error propagates"
+        );
     }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -3623,6 +3974,8 @@ mod tests {
             filled_shares: None,
             executor_order_id: None,
             error: "previous placement failed".to_string(),
+            market_session: MarketSession::Regular,
+            close_flatten: false,
             placed_at: block_timestamp,
             failed_at: block_timestamp,
         };
@@ -3712,6 +4065,8 @@ mod tests {
             filled_shares: None,
             executor_order_id: Some(ExecutorOrderId::new("already-poll-failed")),
             error: "previous placement failed".to_string(),
+            market_session: MarketSession::Regular,
+            close_flatten: false,
             placed_at: block_timestamp,
             failed_at: block_timestamp,
         };
@@ -4472,8 +4827,11 @@ mod tests {
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
 
-        // 1 share buy -> net +1 -> is_ready_for_execution returns (Sell, 1).
-        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+        // 1 share sell -> net -1 -> buy preflight clamps the hedge to 0.5.
+        let onchain_trade = onchain_trade_builder()
+            .with_direction(Direction::Sell)
+            .with_block_number(42)
+            .build();
 
         let mut stdout = Vec::new();
         process_found_trade(onchain_trade, &ctx, &pool, &mut stdout, order_placer)
@@ -4512,9 +4870,27 @@ mod tests {
             .await
             .unwrap()
             .expect("pending_offchain_order_id must refer to a persisted offchain order");
-        assert!(
-            matches!(offchain_order, OffchainOrder::Submitted { .. }),
-            "pending_offchain_order_id must point to the submitted broker order, got: {offchain_order:?}"
+        assert!(matches!(
+            offchain_order,
+            OffchainOrder::Submitted {
+                shares,
+                direction: Direction::Buy,
+                ..
+            } if shares == positive_shares("0.5")
+        ));
+
+        let placement_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? AND sequence = 1",
+        )
+        .bind(pending_order_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&placement_payload).unwrap()["Placed"]["buying_power_reservation"],
+            serde_json::json!(5_000),
+            "the CLI must durably reserve cash for its clamped partial buy"
         );
 
         let (offchain_event_count,): (i64,) = sqlx::query_as(
