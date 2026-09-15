@@ -73,7 +73,7 @@ use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperat
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_evm::{Chain, EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
-use st0x_finance::{FractionalShares, Id};
+use st0x_finance::FractionalShares;
 use st0x_tokenization::TokenizationRequestId;
 use st0x_tokenization::Tokenizer;
 use st0x_wrapper::{UnwrappedToken, WrapperError};
@@ -1240,7 +1240,7 @@ impl EquityRedemption {
                 pending_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Withdrawing,
@@ -1254,7 +1254,7 @@ impl EquityRedemption {
                 submitted_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Withdrawing,
@@ -1268,7 +1268,7 @@ impl EquityRedemption {
                 withdrawn_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Withdrawing,
@@ -1288,7 +1288,7 @@ impl EquityRedemption {
                 withdrawn_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Unwrapping,
@@ -1310,7 +1310,7 @@ impl EquityRedemption {
                 unwrapped_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Unwrapping,
@@ -1324,7 +1324,7 @@ impl EquityRedemption {
                 sent_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Sending,
@@ -1339,7 +1339,7 @@ impl EquityRedemption {
                 detected_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::PendingConfirmation,
@@ -1354,7 +1354,7 @@ impl EquityRedemption {
                 completed_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Completed {
@@ -1371,7 +1371,7 @@ impl EquityRedemption {
                 failed_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Failed {
@@ -1390,7 +1390,7 @@ impl EquityRedemption {
                 reconciled_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.to_string()),
+                id: crate::transfer_id(id.0),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Reconciled {
@@ -5602,7 +5602,7 @@ mod tests {
                 withdrawn.to_dto(&id)
             );
         };
-        assert_eq!(op.id, Id::new(id.to_string()));
+        assert_eq!(op.id, crate::transfer_id(id.0));
         assert_eq!(op.symbol, symbol);
         assert_eq!(op.quantity, FractionalShares::new(float!(50.25)));
         assert!(

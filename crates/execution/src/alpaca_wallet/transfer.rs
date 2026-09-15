@@ -320,17 +320,17 @@ pub(super) async fn find_transfer_by_tx_hash(
 mod tests {
     use alloy::primitives::{address, fixed_bytes};
     use httpmock::prelude::*;
+    use rain_math_float::Float;
     use serde_json::json;
     use std::str::FromStr;
     use uuid::uuid;
 
-    use crate::AlpacaAccountId;
-    use rain_math_float::Float;
+    use st0x_finance::NotPositive;
+    use st0x_float_macro::float;
 
     use super::*;
-
+    use crate::AlpacaAccountId;
     use crate::alpaca_broker_api::AlpacaBrokerAuth;
-    use st0x_float_macro::float;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -470,13 +470,21 @@ mod tests {
     fn test_initiate_withdrawal_zero_amount() {
         let zero = Float::zero().unwrap();
         let error = Positive::new(Usdc::new(zero)).unwrap_err();
-        assert_eq!(error.value, Usdc::new(Float::zero().unwrap()));
+        assert!(matches!(
+            error,
+            NotPositive::Constraint { value }
+                if value == Usdc::new(Float::zero().unwrap())
+        ));
     }
 
     #[test]
     fn test_initiate_withdrawal_negative_amount() {
         let error = Positive::new(Usdc::new(float!(-100))).unwrap_err();
-        assert_eq!(error.value, Usdc::new(float!(-100)));
+        assert!(matches!(
+            error,
+            NotPositive::Constraint { value }
+                if value == Usdc::new(float!(-100))
+        ));
     }
 
     #[tokio::test]
