@@ -21,8 +21,8 @@ use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::portfolio_snapshot::PortfolioSnapshotProjection;
 use crate::position::Position;
-use crate::vault_registry::{VaultRegistry, VaultRegistryId};
-use st0x_execution::Symbol;
+use crate::vault_registry::{ParseVaultRegistryIdError, VaultRegistry, VaultRegistryId};
+use st0x_execution::{EmptySymbolError, Symbol};
 
 /// A view or read model an operator may rebuild. Kebab-cased for both the
 /// CLI value and the wire (`position`, `offchain-order`, ...).
@@ -109,11 +109,23 @@ pub enum ViewRebuildError {
     /// the whole model.
     #[error("{view} rebuild replays the whole read model and cannot rebuild a single id")]
     WholeModelOnly { view: RebuildableView },
-    #[error("invalid {view} id {id:?}: {message}")]
-    InvalidId {
-        view: RebuildableView,
+    #[error("invalid position id {id:?}: {source}")]
+    InvalidPositionId {
         id: String,
-        message: String,
+        #[source]
+        source: EmptySymbolError,
+    },
+    #[error("invalid offchain-order id {id:?}: {source}")]
+    InvalidOffchainOrderId {
+        id: String,
+        #[source]
+        source: uuid::Error,
+    },
+    #[error("invalid vault-registry id {id:?}: {source}")]
+    InvalidVaultRegistryId {
+        id: String,
+        #[source]
+        source: ParseVaultRegistryIdError,
     },
     #[error(transparent)]
     Position(ProjectionError<Position>),
@@ -135,7 +147,13 @@ impl ViewRebuildError {
     /// Whether the failure is the caller's (bad scope or id) rather than the
     /// store's.
     pub const fn is_caller_error(&self) -> bool {
-        matches!(self, Self::WholeModelOnly { .. } | Self::InvalidId { .. })
+        matches!(
+            self,
+            Self::WholeModelOnly { .. }
+                | Self::InvalidPositionId { .. }
+                | Self::InvalidOffchainOrderId { .. }
+                | Self::InvalidVaultRegistryId { .. }
+        )
     }
 }
 
@@ -146,17 +164,14 @@ pub async fn rebuild_view(
     view: RebuildableView,
     scope: RebuildScope,
 ) -> Result<ViewRebuilt, ViewRebuildError> {
-    let invalid_id = |id: &str, message: String| ViewRebuildError::InvalidId {
-        view,
-        id: id.to_owned(),
-        message,
-    };
-
     let replayed = match (view, &scope) {
         (RebuildableView::Position, RebuildScope::Id(id)) => {
-            let symbol: Symbol = id
-                .parse()
-                .map_err(|error| invalid_id(id, format!("{error}")))?;
+            let symbol: Symbol =
+                id.parse()
+                    .map_err(|source| ViewRebuildError::InvalidPositionId {
+                        id: id.to_owned(),
+                        source,
+                    })?;
             Projection::<Position>::sqlite(pool.clone())
                 .rebuild(&symbol)
                 .await
@@ -171,9 +186,12 @@ pub async fn rebuild_view(
             None
         }
         (RebuildableView::OffchainOrder, RebuildScope::Id(id)) => {
-            let order_id: OffchainOrderId = id
-                .parse()
-                .map_err(|error| invalid_id(id, format!("{error}")))?;
+            let order_id: OffchainOrderId =
+                id.parse()
+                    .map_err(|source| ViewRebuildError::InvalidOffchainOrderId {
+                        id: id.to_owned(),
+                        source,
+                    })?;
             Projection::<OffchainOrder>::sqlite(pool.clone())
                 .rebuild(&order_id)
                 .await
@@ -188,9 +206,12 @@ pub async fn rebuild_view(
             None
         }
         (RebuildableView::VaultRegistry, RebuildScope::Id(id)) => {
-            let registry_id: VaultRegistryId = id
-                .parse()
-                .map_err(|error| invalid_id(id, format!("{error}")))?;
+            let registry_id: VaultRegistryId =
+                id.parse()
+                    .map_err(|source| ViewRebuildError::InvalidVaultRegistryId {
+                        id: id.to_owned(),
+                        source,
+                    })?;
             Projection::<VaultRegistry>::sqlite(pool.clone())
                 .rebuild(&registry_id)
                 .await
@@ -280,10 +301,15 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(error, ViewRebuildError::InvalidId { .. }),
+            matches!(error, ViewRebuildError::InvalidVaultRegistryId { .. }),
             "{error}"
         );
         assert!(error.is_caller_error());
+        // The typed source chain is preserved, not flattened into a string.
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the parse error must remain the source",
+        );
     }
 
     #[tokio::test]
