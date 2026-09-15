@@ -607,7 +607,7 @@ describe('createWebSocket', () => {
         'initial snapshot',
         {
           type: 'current_state',
-          data: { trades: [makeTrade({ shares: '0' })] }
+          data: makeCurrentState({ trades: [makeTrade({ shares: '0' })] })
         }
       ],
       [

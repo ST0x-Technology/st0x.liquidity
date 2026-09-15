@@ -43,9 +43,9 @@
   type GlossaryEntry = { name: string; def: string }
 
   const cashEntries: GlossaryEntry[] = [
-    { name: 'Asset', def: 'Always "Cash" for the USDC row.' },
-    { name: 'Raindex', def: 'USDC available in the Raindex vaults to settle takers.' },
-    { name: 'Inflight', def: 'USDC the bot has already committed to transfers or settlements between venues. Included in Total, but not in Ratio.' },
+    { name: 'Asset', def: 'The settlement stable the cash row counts, named by the backend for the chain it settles on.' },
+    { name: 'Raindex', def: 'Settlement stable available in the Raindex vaults to settle takers.' },
+    { name: 'Inflight', def: 'Settlement stable the bot has already committed to transfers or settlements between venues. Included in Total, but not in Ratio.' },
     { name: 'Alpaca Total', def: 'Alpaca USD cash used for inventory math: gross broker cash when available, otherwise available cash. This is USD cash at Alpaca, not wallet-observed USDC.' },
     { name: 'Total', def: 'Raindex + Inflight + Alpaca Total. Wallet-observed Eth/Base balances are excluded.' },
     { name: 'Ratio', def: 'Venue split for cash allocation: Raindex / (Raindex + Alpaca Total). Inflight and wallet-observed balances are excluded from the ratio.' },

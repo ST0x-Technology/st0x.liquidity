@@ -183,6 +183,7 @@
   )
 
   type CashCells = {
+    symbol: string
     alpacaUsd: Formatted
     alpacaUsdc: Formatted | null
     counterTradeUsd: Formatted
@@ -202,6 +203,7 @@
     const amounts = cashInventoryAmounts(usdc, settings?.cashReserved ?? null)
 
     return {
+      symbol: usdc.symbol,
       alpacaUsd: fmt(amounts.alpacaUsd),
       alpacaUsdc: amounts.alpacaUsdc === null ? null : fmt(amounts.alpacaUsdc),
       counterTradeUsd: fmt(amounts.counterTradeUsd),
@@ -376,13 +378,13 @@
           <Table.Head
             class={cashCoreHeadClass}
             rowspan={2}
-            title="USDC available in Raindex vaults to settle takers."
+            title="{cashCells.symbol} available in Raindex vaults to settle takers."
             >Raindex</Table.Head
           >
           <Table.Head
             class={cashCoreHeadClass}
             rowspan={2}
-            title="USDC the books track as in motion between venues (CCTP transfers, pending settlements). Part of imbalance math."
+            title="{cashCells.symbol} the books track as in motion between venues (CCTP transfers, pending settlements). Part of imbalance math."
             >Inflight</Table.Head
           >
           <Table.Head
@@ -450,7 +452,7 @@
 
       <Table.Body>
         <Table.Row>
-          <Table.Cell class="font-mono font-medium">Cash</Table.Cell>
+          <Table.Cell class="font-mono font-medium">{cashCells.symbol}</Table.Cell>
 
           <Table.Cell class="text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue
