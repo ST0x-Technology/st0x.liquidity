@@ -1219,6 +1219,35 @@ mod tests {
         assert_eq!(quantity, FractionalShares::new(float!(9.5)));
     }
 
+    /// A floored sell leaves the book at exactly the floor, and broker
+    /// positions carry nine-decimal residue, so `floor + dust` is the steady
+    /// state. That must not become a dust mint every cycle.
+    #[tokio::test]
+    async fn mint_is_skipped_when_only_dust_sits_above_the_floor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = fractional_view(&symbol, "0", "1.000000001");
+        let threshold = ImbalanceThreshold {
+            target: float!(0.95),
+            deviation: float!(0.01),
+        };
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            None,
+            FractionalShares::new(float!(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
     /// A book that is nothing but the floor has nothing to mint.
     #[tokio::test]
     async fn mint_is_skipped_when_the_book_is_only_the_floor() {
