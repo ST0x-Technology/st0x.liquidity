@@ -46,13 +46,38 @@ impl Chain {
         }
     }
 
-    /// The canonical USDC contract on this chain. USDC differs per chain, so a
-    /// new variant cannot compile until its own contract is pinned here.
-    pub const fn usdc(self) -> Address {
+    /// The stablecoin this chain's cash leg settles in. Pinned in code, not
+    /// config: a config-supplied value would let a typo point fill validation
+    /// at the wrong token. A new variant cannot compile until its stable is
+    /// pinned here.
+    pub const fn settlement_stable(self) -> SettlementStable {
         match self {
-            Self::Base => USDC_BASE,
-            Self::Ethereum => USDC_ETHEREUM,
-            Self::HyperEvm => USDC_HYPEREVM,
+            Self::Base => SettlementStable {
+                address: USDC_BASE,
+                symbol: "USDC",
+                decimals: 6,
+            },
+            Self::Ethereum => SettlementStable {
+                address: USDC_ETHEREUM,
+                symbol: "USDC",
+                decimals: 6,
+            },
+            Self::HyperEvm => SettlementStable {
+                address: USDC_HYPEREVM,
+                symbol: "USDC",
+                decimals: 6,
+            },
+        }
+    }
+
+    /// Circle's USDC on this chain, the only token CCTP burns and mints:
+    /// `Some` exactly where the settlement stable is that USDC, so the bridge
+    /// is never handed a stable it cannot carry.
+    pub const fn cctp_usdc(self) -> Option<Address> {
+        match self {
+            Self::Base => Some(USDC_BASE),
+            Self::Ethereum => Some(USDC_ETHEREUM),
+            Self::HyperEvm => Some(USDC_HYPEREVM),
         }
     }
 
@@ -65,6 +90,18 @@ impl Chain {
             Self::HyperEvm => "hyperevm",
         }
     }
+}
+
+/// The token a chain's cash leg settles in: the quote token fill validation
+/// accepts, the token the cash vault holds, and the label the inventory
+/// surfaces show for that balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlementStable {
+    pub address: Address,
+    /// The ticker the token reports on chain and the dashboard displays.
+    pub symbol: &'static str,
+    /// The ERC-20 decimals: the grid an on-chain transfer truncates to.
+    pub decimals: u8,
 }
 
 impl fmt::Display for Chain {
@@ -90,6 +127,8 @@ impl FromStr for Chain {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
+
     use super::*;
 
     /// The three encoders of a chain name -- serde, `Display` and `FromStr` --
@@ -139,11 +178,56 @@ mod tests {
         );
     }
 
+    /// The settlement stable is what fill validation, vault polling and the
+    /// inventory surfaces read, so each chain's is asserted as literals
+    /// rather than re-derived from the constants the accessor reads.
     #[test]
-    fn hyperevm_usdc_is_the_canonical_contract() {
+    fn settlement_stables_are_pinned_literals() {
         assert_eq!(
-            Chain::HyperEvm.usdc(),
-            alloy::primitives::address!("0xb88339CB7199b77E23DB6E890353E22632Ba630f")
+            Chain::Base.settlement_stable(),
+            SettlementStable {
+                address: address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+                symbol: "USDC",
+                decimals: 6,
+            }
+        );
+        assert_eq!(
+            Chain::Ethereum.settlement_stable(),
+            SettlementStable {
+                address: address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+                symbol: "USDC",
+                decimals: 6,
+            }
+        );
+        assert_eq!(
+            Chain::HyperEvm.settlement_stable(),
+            SettlementStable {
+                address: address!("0xb88339CB7199b77E23DB6E890353E22632Ba630f"),
+                symbol: "USDC",
+                decimals: 6,
+            }
+        );
+    }
+
+    /// CCTP carries Circle's USDC alone, so the bridge accessor is `Some`
+    /// exactly on the chains whose settlement stable is that USDC, and it
+    /// names the same contract.
+    #[test]
+    fn cctp_usdc_is_some_exactly_where_the_stable_is_circles_usdc() {
+        for chain in Chain::ALL {
+            let stable = chain.settlement_stable();
+            let expected = (stable.symbol == "USDC").then_some(stable.address);
+
+            assert_eq!(chain.cctp_usdc(), expected, "cctp_usdc for {chain:?}");
+        }
+
+        assert_eq!(
+            Chain::ALL.map(Chain::cctp_usdc),
+            [
+                Some(address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")),
+                Some(address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")),
+                Some(address!("0xb88339CB7199b77E23DB6E890353E22632Ba630f")),
+            ]
         );
     }
 

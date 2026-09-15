@@ -43,6 +43,9 @@ pub struct InFlightEquity {
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct UsdcInventory {
+    /// The settlement stable the onchain balances are held in, as the
+    /// dashboard labels the cash row.
+    pub symbol: String,
     #[ts(type = "string")]
     pub onchain_available: Usdc,
     #[ts(type = "string")]
@@ -102,11 +105,13 @@ pub struct Inventory {
 }
 
 impl Inventory {
+    /// No balances at all, labelled with `symbol` as the settlement stable.
     #[must_use]
-    pub fn empty() -> Self {
+    pub fn empty(symbol: &str) -> Self {
         Self {
             per_symbol: Vec::new(),
             usdc: UsdcInventory {
+                symbol: symbol.to_string(),
                 onchain_available: Usdc::ZERO,
                 onchain_inflight: Usdc::ZERO,
                 offchain_available: Usdc::ZERO,
@@ -150,6 +155,7 @@ mod tests {
                 },
             }],
             usdc: UsdcInventory {
+                symbol: "USDC".to_string(),
                 onchain_available: Usdc::new(float!(10000)),
                 onchain_inflight: Usdc::ZERO,
                 offchain_available: Usdc::new(float!(5000)),
@@ -185,5 +191,26 @@ mod tests {
         assert_eq!(usdc["alpacaUsdc"], json!("125"));
         assert_eq!(usdc["inflightCash"]["ethereumWallet"], json!("250"));
         assert_eq!(usdc["inflightCash"]["baseWallet"], json!("0"));
+    }
+
+    /// The dashboard labels the cash row from the payload, so the payload
+    /// must name the stable it counts instead of leaving USDC implied.
+    #[test]
+    fn usdc_inventory_serializes_the_settlement_stable_symbol() {
+        let inventory = UsdcInventory {
+            symbol: "USDC".to_string(),
+            onchain_available: Usdc::new(float!(10000)),
+            onchain_inflight: Usdc::ZERO,
+            offchain_available: Usdc::new(float!(5000)),
+            offchain_inflight: Usdc::ZERO,
+            offchain_gross: None,
+            withdrawable_cash: None,
+            alpaca_usdc: None,
+            inflight_cash: InFlightCash::empty(),
+        };
+
+        let json = serde_json::to_value(&inventory).unwrap();
+
+        assert_eq!(json["symbol"], json!("USDC"));
     }
 }
