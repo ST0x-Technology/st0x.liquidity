@@ -4905,6 +4905,22 @@ impl CctpMintRecoveryError {
                 if !matches!(source, CctpError::MalformedAttestation { .. })
         )
     }
+
+    /// Whether the mint's outcome is unknown: the `receiveMessage` submission
+    /// errored and the recovery probe could neither confirm the mint landed nor
+    /// prove the nonce unconsumed, so the destination mint may already exist
+    /// (see [`CctpError::MintRecoveryInconclusive`]). The operator should verify
+    /// on-chain; re-running is safe because a consumed CCTP nonce cannot be
+    /// minted twice.
+    pub(crate) fn is_mint_inconclusive(&self) -> bool {
+        matches!(
+            self,
+            Self::Mint {
+                source: CctpError::MintRecoveryInconclusive { .. },
+                ..
+            }
+        )
+    }
 }
 
 /// Two-phase entry point for the operator `cctp complete-mint` recovery of a

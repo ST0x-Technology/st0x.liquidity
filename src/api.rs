@@ -2731,14 +2731,25 @@ async fn complete_cctp_mint_recovery(
     }))
 }
 
-/// Maps a [`CctpMintRecoveryError`]. A retryable failure (Circle has not
-/// attested the burn yet, or a transient transport hiccup) is an upstream
-/// condition the operator retries later, so 502 with the typed message. A hard
-/// failure (a complete but malformed attestation, a failed mint, an amount
-/// decode, or a gas-ledger enqueue) is a 500 whose detail is logged at the call
-/// site rather than returned.
+/// Maps a [`CctpMintRecoveryError`]. An inconclusive mint (the destination mint
+/// may already have landed but could not be confirmed) is an explicit retryable
+/// 502 that tells the operator to verify on-chain and that re-running is safe. A
+/// retryable attestation failure (Circle has not attested yet, or a transient
+/// transport hiccup) is a 502 with the typed message. A hard failure (a complete
+/// but malformed attestation, a deterministic mint failure, an amount decode, or
+/// a gas-ledger enqueue) is a 500 whose detail is logged at the call site rather
+/// than returned.
 fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCode, String) {
-    if error.is_retryable() {
+    if error.is_mint_inconclusive() {
+        (
+            StatusCode::BAD_GATEWAY,
+            "CCTP mint recovery is inconclusive: the destination mint may already \
+             have landed but its outcome could not be confirmed. Verify on-chain \
+             whether the mint exists; re-running complete-mint is safe, since a \
+             consumed CCTP nonce cannot be minted twice."
+                .to_string(),
+        )
+    } else if error.is_retryable() {
         (StatusCode::BAD_GATEWAY, error.to_string())
     } else {
         (
@@ -3579,7 +3590,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use alloy::primitives::{Address, TxHash};
+    use alloy::primitives::{Address, Bytes, TxHash};
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
@@ -8018,6 +8029,71 @@ mod tests {
         let (status, message) = cctp_mint_recovery_error_response(&mint);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "CCTP mint recovery failed");
+    }
+
+    /// A `RecoverCctpMint` whose burn attests, but whose mint submission comes
+    /// back inconclusive: the destination mint may already exist.
+    struct InconclusiveMint;
+
+    #[async_trait::async_trait]
+    impl RecoverCctpMint for InconclusiveMint {
+        async fn poll_recovery_attestation(
+            &self,
+            _direction: BridgeDirection,
+            _burn_tx: TxHash,
+        ) -> Result<st0x_bridge::cctp::AttestationResponse, CctpMintRecoveryError> {
+            // A full CCTP envelope with a non-placeholder nonce (byte 43 = 1).
+            let mut message = vec![0u8; 200];
+            message[43] = 1;
+            Ok(st0x_bridge::cctp::AttestationResponse::for_test(
+                Bytes::from(message),
+                Bytes::from(vec![0u8; 65]),
+            )
+            .unwrap())
+        }
+
+        async fn submit_recovered_cctp_mint(
+            &self,
+            _direction: BridgeDirection,
+            burn_tx: TxHash,
+            _attestation: st0x_bridge::cctp::AttestationResponse,
+        ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
+            Err(CctpMintRecoveryError::Mint {
+                burn_tx,
+                source: st0x_bridge::cctp::CctpError::MintRecoveryInconclusive {
+                    recovery_error: Box::new(st0x_bridge::cctp::CctpError::PlaceholderNonce),
+                },
+            })
+        }
+    }
+
+    /// Route test: an inconclusive mint (the destination mint may already exist)
+    /// must be reported as an explicit retryable 502 that tells the operator to
+    /// verify on-chain, not collapsed into the generic 500 of a deterministic
+    /// mint failure.
+    #[tokio::test]
+    async fn complete_cctp_mint_reports_an_inconclusive_mint_as_retryable() {
+        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let (pause, _gate) = usdc_driver_pause();
+
+        let resp = complete_cctp_mint_recovery(
+            &InconclusiveMint,
+            &resume_lock,
+            &pause,
+            BridgeDirection::BaseToEthereum,
+            TxHash::repeat_byte(0x11),
+        )
+        .await;
+
+        let Err((status, Json(body))) = resp else {
+            panic!("an inconclusive mint must be reported as an error");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            body.error.contains("inconclusive") && body.error.contains("Verify on-chain"),
+            "{}",
+            body.error,
+        );
     }
 
     #[tokio::test]
