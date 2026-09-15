@@ -353,9 +353,10 @@ impl<E: Evm> RaindexService<E> {
 
     /// Gets the USDC balance of a vault, pinned to `block_number`.
     ///
-    /// The caller supplies its chain's canonical USDC (`Chain::usdc`): the
-    /// token is half the vault's storage key, so reading a vault under
-    /// another chain's USDC returns a valid zero rather than an error.
+    /// The caller supplies its chain's settlement stable
+    /// (`Chain::settlement_stable`): the token is half the vault's storage
+    /// key, so reading a vault under another chain's stable returns a valid
+    /// zero rather than an error.
     pub async fn get_usdc_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,

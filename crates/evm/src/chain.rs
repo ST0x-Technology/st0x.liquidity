@@ -83,6 +83,11 @@ impl Chain {
                 symbol: "USDC",
                 decimals: 6,
             },
+            Self::Robinhood => SettlementStable {
+                address: USDC_ROBINHOOD,
+                symbol: "USDC",
+                decimals: 6,
+            },
         }
     }
 
@@ -94,6 +99,7 @@ impl Chain {
             Self::Base => Some(USDC_BASE),
             Self::Ethereum => Some(USDC_ETHEREUM),
             Self::HyperEvm => Some(USDC_HYPEREVM),
+            Self::Robinhood => Some(USDC_ROBINHOOD),
         }
     }
 
@@ -228,6 +234,14 @@ mod tests {
                 decimals: 6,
             }
         );
+        assert_eq!(
+            Chain::Robinhood.settlement_stable(),
+            SettlementStable {
+                address: address!("0x80e0e24718dbFcad49ECAA6F1e6C89A190586cA8"),
+                symbol: "USDC",
+                decimals: 6,
+            }
+        );
     }
 
     /// CCTP carries Circle's USDC alone, so the bridge accessor is `Some`
@@ -248,6 +262,7 @@ mod tests {
                 Some(address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")),
                 Some(address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")),
                 Some(address!("0xb88339CB7199b77E23DB6E890353E22632Ba630f")),
+                Some(address!("0x80e0e24718dbFcad49ECAA6F1e6C89A190586cA8")),
             ]
         );
     }

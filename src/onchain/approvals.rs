@@ -137,9 +137,9 @@ pub(crate) enum StartupApprovalError {
 /// Builds the deterministic list of startup approval targets: the two
 /// wrap/deposit grants of every equity the chain wraps in its role (the same
 /// selection the tokenization preflight attests, so no grant targets a vault
-/// the preflight never checked), then the single USDC grant on every chain. A
-/// hedge-only secondary has no wrapper to approve, so it gets the USDC grant
-/// alone.
+/// the preflight never checked), then the single settlement-stable grant on
+/// every chain. A hedge-only secondary has no wrapper to approve, so it gets
+/// that grant alone.
 ///
 /// Both deposit grants name the spender that chain settles deposits through:
 /// its orderbook in [`InventoryMode::Legacy`], its shared `RaindexInventory`
@@ -151,7 +151,7 @@ pub(crate) fn build_approval_targets(
     inventory: InventoryMode,
     assets: &ChainAssets,
     orderbook: Address,
-    usdc: Address,
+    settlement_stable: Address,
 ) -> Vec<ApprovalTarget> {
     let deposit_spender = match inventory {
         InventoryMode::Legacy => orderbook,
@@ -179,7 +179,7 @@ pub(crate) fn build_approval_targets(
     }
 
     targets.push(ApprovalTarget {
-        token: usdc,
+        token: settlement_stable,
         spender: deposit_spender,
         symbol: None,
         purpose: ApprovalPurpose::DepositUsdc,
