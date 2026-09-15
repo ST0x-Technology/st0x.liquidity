@@ -1086,11 +1086,10 @@ fn refuse_negative_hedge_floor(
 fn resolve_broker(
     broker_config: Option<&BrokerConfig>,
     secrets: Option<BrokerSecrets>,
-    hedging: &HedgingAssets,
+    hedge_floor: HedgeFloor,
     startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<BrokerCtx, CtxError> {
     let secrets_parts = secrets.map(SecretsBrokerParts::from);
-    let hedge_floor = assemble_hedge_floor(broker_config, hedging)?;
 
     // Migration shim, removed next release: see `BrokerSecrets`.
     if let Some(notice) = secrets_parts
@@ -1708,6 +1707,9 @@ struct ValidatedConfigParts {
     file_logging: Option<crate::FileLogging>,
     log_query_url_template: Option<LogQueryUrlTemplate>,
     travel_rule: Option<TravelRuleConfig>,
+    /// Assembled here so the config-only validator refuses a negative floor
+    /// exactly as boot does.
+    hedge_floor: HedgeFloor,
 }
 
 /// Every business rule the plaintext config can be judged against on its own,
@@ -1832,12 +1834,15 @@ fn validate_config(
         .map(TravelRuleConfig::validated)
         .transpose()?;
 
+    let hedge_floor = assemble_hedge_floor(config.broker.as_ref(), &config.assets)?;
+
     Ok(ValidatedConfigParts {
         polling_intervals,
         alerts,
         file_logging,
         log_query_url_template,
         travel_rule,
+        hedge_floor,
     })
 }
 
@@ -1870,12 +1875,13 @@ fn parse_and_validate(
         file_logging,
         log_query_url_template,
         travel_rule,
+        hedge_floor,
     } = validate_config(&config, config_path, &mut startup_notices)?;
 
     let broker = resolve_broker(
         config.broker.as_ref(),
         secrets.broker,
-        &config.assets,
+        hedge_floor,
         &mut startup_notices,
     )?;
     let telemetry = config.telemetry.map(TelemetryCtx::from);
@@ -9403,7 +9409,7 @@ mod tests {
                 account_id: "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef".parse().unwrap(),
                 mode: AlpacaBrokerApiMode::Sandbox,
             }),
-            &HedgingAssets::default(),
+            HedgeFloor::default(),
             &mut Vec::new(),
         )
         .unwrap();
@@ -9435,7 +9441,7 @@ mod tests {
                 account_id: "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef".parse().unwrap(),
                 mode: AlpacaBrokerApiMode::Sandbox,
             }),
-            &HedgingAssets::default(),
+            HedgeFloor::default(),
             &mut Vec::new(),
         )
         .unwrap_err();
