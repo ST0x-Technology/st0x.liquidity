@@ -589,6 +589,7 @@ enum CloseFlattenBlockReason {
     QuoteFetchFailed,
     NonFractionableQuantityBelowOne,
     InsufficientEquity,
+    HeldAtFloor,
     InsufficientBuyingPower,
 }
 
@@ -600,6 +601,7 @@ impl CloseFlattenBlockReason {
             Self::QuoteFetchFailed => "quote_fetch_failed",
             Self::NonFractionableQuantityBelowOne => "non_fractionable_quantity_below_one",
             Self::InsufficientEquity => "insufficient_equity",
+            Self::HeldAtFloor => "held_at_floor",
             Self::InsufficientBuyingPower => "insufficient_buying_power",
         }
     }
@@ -622,6 +624,7 @@ impl From<&CounterTradeSkipReason> for CloseFlattenBlockReason {
                 Self::NonFractionableQuantityBelowOne
             }
             CounterTradeSkipReason::InsufficientEquity { .. } => Self::InsufficientEquity,
+            CounterTradeSkipReason::HeldAtFloor { .. } => Self::HeldAtFloor,
             CounterTradeSkipReason::InsufficientBuyingPower { .. } => Self::InsufficientBuyingPower,
         }
     }
@@ -1621,6 +1624,7 @@ mod tests {
                     Symbol::new(symbol).unwrap(),
                     EquityHedgePolicy {
                         extended_hours_counter_trading,
+                        hedge_floor_shares: None,
                     },
                 ))
                 .collect(),
@@ -2473,6 +2477,10 @@ mod tests {
         assert_eq!(
             CloseFlattenBlockReason::InsufficientEquity.metric_label(),
             "insufficient_equity"
+        );
+        assert_eq!(
+            CloseFlattenBlockReason::HeldAtFloor.metric_label(),
+            "held_at_floor"
         );
         assert_eq!(
             CloseFlattenBlockReason::InsufficientBuyingPower.metric_label(),

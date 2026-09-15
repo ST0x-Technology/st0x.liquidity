@@ -155,6 +155,7 @@ pub(crate) fn preflight_skip_reason_label(reason: &CounterTradeSkipReason) -> &'
             "non_fractionable_quantity_below_one"
         }
         CounterTradeSkipReason::InsufficientEquity { .. } => "insufficient_equity",
+        CounterTradeSkipReason::HeldAtFloor { .. } => "held_at_floor",
         CounterTradeSkipReason::InsufficientBuyingPower { .. } => "insufficient_buying_power",
     }
 }

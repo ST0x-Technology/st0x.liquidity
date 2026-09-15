@@ -29,7 +29,7 @@ use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
 };
 use st0x_evm::Chain;
-use st0x_execution::{FractionalShares, Positive, SharesConversionError, Symbol};
+use st0x_execution::{FractionalShares, HedgeFloor, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId};
 use st0x_wrapper::{Wrapper, WrapperError};
@@ -240,6 +240,8 @@ pub(crate) struct RebalancingServiceConfig {
     /// The broker-side cash reserve, which sits at the broker rather than on
     /// any chain, so it does not travel with the chain's cash vaults.
     pub(crate) cash_reserved: Option<Positive<Usd>>,
+    /// Shares a mint may never take out of the broker account, per symbol.
+    pub(crate) hedge_floor: HedgeFloor,
 }
 
 impl RebalancingServiceConfig {
@@ -2914,6 +2916,7 @@ impl RebalancingService {
             unwrapped_token,
             &vault_ratio,
             shares_limit,
+            self.config.hedge_floor.for_symbol(symbol),
         )
         .await
     }
@@ -6394,6 +6397,7 @@ mod tests {
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
+            hedge_floor: HedgeFloor::default(),
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.2),
@@ -9439,6 +9443,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: test_config().equity,
                 usdc: None,
                 transfer_timeout: test_config().transfer_timeout,
@@ -23082,6 +23087,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),

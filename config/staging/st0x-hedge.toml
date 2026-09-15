@@ -55,6 +55,15 @@ extended_hours_reprice_timeout_secs = 300
 close_flatten_reprice_timeout_secs = 60
 extended_hours_close_flatten_window_secs = 900
 close_flatten_cross_max_bps = 400
+# hedge_floor_shares: shares every sell hedge and equity mint leaves in the
+# account per symbol, so pricing (which marks from this account's positions)
+# never loses a symbol's price; ST0-58. An absent value selects the default
+# of 0.01; the floor is enabled by the first build that knows the field. On
+# whole-share assets a positive fractional floor rounds up to the next whole
+# share. Overridable under
+# [assets.equities.SYM]; 0 disables the floor, here for every symbol and
+# there for that symbol only. Not written here: the running image refuses
+# fields it does not know.
 
 # Travel Rule beneficiary identity for Alpaca whitelist creation.
 [broker.travel_rule]

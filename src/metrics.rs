@@ -32,6 +32,16 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "position_shares",
         "Net open position in fractional shares, by symbol"
     );
+    metrics::describe_gauge!(
+        "hedge_floor_shares",
+        "Shares every sell hedge and equity mint leaves in the broker account, by symbol; \
+         refreshed by every position scan"
+    );
+    metrics::describe_gauge!(
+        "hedge_deficit_shares",
+        "Shares the last position scan wanted to hedge but could not place, by symbol; the \
+         floor's residual plus any other preflight shortfall"
+    );
     metrics::describe_counter!(
         "onchain_events_total",
         "ClearV3, TakeOrderV3 and InventoryTrade events received from Raindex, by event_type"

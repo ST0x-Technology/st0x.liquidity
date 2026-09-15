@@ -14,7 +14,7 @@ static MOCK_FILL_PRICE: LazyLock<Float> = LazyLock::new(|| float!(100));
 use crate::{
     CancellationOutcome, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, Executor,
-    ExecutorOrderId, Inventory, InventoryResult, LatestQuote, LimitOrder, MarketOrder,
+    ExecutorOrderId, HedgeFloor, Inventory, InventoryResult, LatestQuote, LimitOrder, MarketOrder,
     MarketSession, MarketSessionStatus, OrderPlacement, OrderState, Positive, PostCloseGap,
     SupportedExecutor, Symbol, TryIntoExecutor, Usd, estimate_buffered_cost_cents,
 };
@@ -65,6 +65,7 @@ pub struct MockExecutor {
     latest_quote_override: Option<LatestQuote>,
     position_mark_override: Option<Positive<Usd>>,
     preflight_price: Float,
+    hedge_floor: HedgeFloor,
 }
 
 impl MockExecutor {
@@ -82,6 +83,7 @@ impl MockExecutor {
             latest_quote_override: None,
             position_mark_override: None,
             preflight_price: *MOCK_FILL_PRICE,
+            hedge_floor: HedgeFloor::default(),
         }
     }
 
@@ -98,6 +100,13 @@ impl MockExecutor {
     #[must_use]
     pub fn with_inventory(mut self, inventory: Inventory) -> Self {
         self.inventory_result = InventoryResult::Fetched(inventory);
+        self
+    }
+
+    /// Configures the per-symbol shares a sell preflight keeps in the account.
+    #[must_use]
+    pub fn with_hedge_floor(mut self, hedge_floor: HedgeFloor) -> Self {
+        self.hedge_floor = hedge_floor;
         self
     }
 
@@ -227,7 +236,9 @@ impl MockExecutor {
             .find(|position| position.symbol == order.symbol)
             .map_or(crate::FractionalShares::ZERO, |position| position.quantity);
 
-        Ok(crate::resolve_sell_preflight(order, available)?)
+        let floor = self.hedge_floor.for_symbol(&order.symbol);
+
+        Ok(crate::resolve_sell_preflight(order, available, floor)?)
     }
 
     /// Shared cash check for counter-trade buy branches.

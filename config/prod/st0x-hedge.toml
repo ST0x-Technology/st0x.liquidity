@@ -62,6 +62,17 @@ extended_hours_reprice_timeout_secs = 300
 close_flatten_reprice_timeout_secs = 60
 extended_hours_close_flatten_window_secs = 900
 close_flatten_cross_max_bps = 400
+# hedge_floor_shares: shares every sell hedge and equity mint leaves in the
+# account per symbol, so pricing (which marks from this account's positions)
+# never loses a symbol's price; ST0-58. Absent means the default, 0.01, which
+# rounds up to one whole share on whole-share assets; the floor is therefore
+# on from the first build that knows it, with no config change. Overridable
+# under [assets.equities.SYM]; 0 disables the floor, here for every symbol
+# and there for that symbol only. Not written here on purpose: the
+# release-time validator runs inside the running image, which refuses fields
+# it does not know (see the schema-at-HEAD note above [assets.equities]). The
+# floor holds a position, it never creates one: a symbol at zero stays dark
+# until a redemption or a manual buy funds it.
 
 # Travel Rule beneficiary identity for Alpaca whitelist creation.
 
@@ -236,7 +247,8 @@ rebalancing = "enabled"
 operational_limit = 25000
 
 # Per-equity config, grouped by symbol. Two tables are required:
-# [assets.equities.SYM] is the broker hedge policy (extended hours).
+# [assets.equities.SYM] is the broker hedge policy (extended hours, and an
+# optional hedge_floor_shares override of the [broker] default).
 # [chains.base.trading.assets.equities.SYM] is the Base listing
 # (trading, rebalancing, recovery, addresses, vault).
 # - trading: whether the bot hedges fills for this asset.

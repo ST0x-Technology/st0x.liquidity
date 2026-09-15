@@ -14,9 +14,9 @@ use super::order::{AlpacaLimitOrder, ConversionOrder, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
     CancellationOutcome, ClientOrderId, CounterTradePreflight, CounterTradeSkipReason, Direction,
-    Executor, ExecutorOrderId, FractionalShares, IndicativeQuote, InventoryResult, LatestQuote,
-    LimitOrder, MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement, OrderState,
-    OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
+    Executor, ExecutorOrderId, FractionalShares, HedgeFloor, IndicativeQuote, InventoryResult,
+    LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement,
+    OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
     buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
 
@@ -101,7 +101,15 @@ fn truncate_non_fractionable_shares(
 #[derive(Debug, Clone, Copy)]
 struct PreparedCounterTradeShares {
     shares: Option<Positive<FractionalShares>>,
-    fractional_orders_supported: bool,
+    sizing: OrderSizing,
+}
+
+/// The unit the broker trades an asset in, from its `fractionable` flag.
+/// Missing metadata is treated as whole-share-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderSizing {
+    Fractional,
+    WholeShares,
 }
 
 /// A symbol's full Alpaca asset attribute set, for inspection consumers such
@@ -126,6 +134,7 @@ pub struct AlpacaBrokerApi {
     asset_cache_ttl: Duration,
     time_in_force: TimeInForce,
     counter_trade_slippage_bps: u16,
+    hedge_floor: HedgeFloor,
 }
 
 impl Clone for AlpacaBrokerApi {
@@ -136,6 +145,7 @@ impl Clone for AlpacaBrokerApi {
             asset_cache_ttl: self.asset_cache_ttl,
             time_in_force: self.time_in_force,
             counter_trade_slippage_bps: self.counter_trade_slippage_bps,
+            hedge_floor: self.hedge_floor.clone(),
         }
     }
 }
@@ -150,6 +160,7 @@ impl std::fmt::Debug for AlpacaBrokerApi {
                 "counter_trade_slippage_bps",
                 &self.counter_trade_slippage_bps,
             )
+            .field("hedge_floor", &self.hedge_floor)
             .finish_non_exhaustive()
     }
 }
@@ -185,6 +196,7 @@ impl Executor for AlpacaBrokerApi {
             asset_cache_ttl: ctx.asset_cache_ttl,
             time_in_force: ctx.time_in_force,
             counter_trade_slippage_bps: ctx.counter_trade_slippage_bps,
+            hedge_floor: ctx.hedge_floor,
         })
     }
 
@@ -358,22 +370,35 @@ impl Executor for AlpacaBrokerApi {
                     .find(|position| position.symbol == order.symbol)
                     .map_or(FractionalShares::ZERO, |position| position.quantity);
 
-                let tradable_available = if prepared.fractional_orders_supported {
-                    available
-                } else {
-                    let Some(truncated) = crate::truncate_to_decimal_places(available.inner(), 0)?
-                    else {
-                        return Ok(CounterTradePreflight::Skipped(
-                            CounterTradeSkipReason::InsufficientEquity {
-                                required: order.shares,
-                                available,
-                            },
-                        ));
-                    };
-                    FractionalShares::new(truncated)
+                let floor = self.hedge_floor.for_symbol(&order.symbol);
+
+                // The book and the floor must be in the unit the broker sells
+                // in. A fractional asset uses both as they are. A whole-share
+                // asset has its book truncated down, since the broker cannot
+                // sell the remainder, and its floor rounded up, since the
+                // broker cannot keep a fraction either: the default 0.01
+                // becomes one share there.
+                let (sellable_book, floor) = match prepared.sizing {
+                    OrderSizing::Fractional => (available, floor),
+                    OrderSizing::WholeShares => {
+                        let Some(whole_shares) =
+                            crate::truncate_to_decimal_places(available.inner(), 0)?
+                        else {
+                            return Ok(CounterTradePreflight::Skipped(
+                                CounterTradeSkipReason::InsufficientEquity {
+                                    required: order.shares,
+                                    available,
+                                },
+                            ));
+                        };
+                        (
+                            FractionalShares::new(whole_shares),
+                            crate::hedge_floor::whole_share_floor(floor)?,
+                        )
+                    }
                 };
 
-                Ok(crate::resolve_sell_preflight(order, tradable_available)?)
+                Ok(crate::resolve_sell_preflight(order, sellable_book, floor)?)
             }
             Direction::Buy => {
                 let latest_trade_price = crate::alpaca_market_data::fetch_latest_trade_price(
@@ -682,7 +707,11 @@ impl AlpacaBrokerApi {
         let asset = self.get_asset_cached(symbol).await?;
         Self::validate_asset(symbol, &asset)?;
 
-        let fractional_orders_supported = asset.fractionable == Some(true);
+        let sizing = if asset.fractionable == Some(true) {
+            OrderSizing::Fractional
+        } else {
+            OrderSizing::WholeShares
+        };
 
         if asset.fractionable.is_none() {
             warn!(
@@ -700,7 +729,7 @@ impl AlpacaBrokerApi {
             );
             return Ok(PreparedCounterTradeShares {
                 shares: None,
-                fractional_orders_supported,
+                sizing,
             });
         };
 
@@ -715,7 +744,7 @@ impl AlpacaBrokerApi {
 
         Ok(PreparedCounterTradeShares {
             shares: Some(truncated),
-            fractional_orders_supported,
+            sizing,
         })
     }
 
@@ -1041,6 +1070,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: HedgeFloor::default(),
         }
     }
 
@@ -2083,6 +2113,91 @@ mod tests {
         ));
     }
 
+    async fn floored_non_fractionable_sell_preflight(floor: &str) -> CounterTradePreflight {
+        let server = MockServer::start();
+        let mut ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        ctx.hedge_floor = HedgeFloor::new(
+            FractionalShares::new(Float::parse(floor.to_string()).unwrap()),
+            HashMap::new(),
+        );
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "100.00"
+                }));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "symbol": "FGI",
+                    "asset_class": "us_equity",
+                    "qty_available": "1.9"
+                }]));
+        });
+        create_asset_fractionability_mock(&server, "FGI", false);
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+
+        executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("FGI").unwrap(),
+                shares: positive_shares("2.75"),
+                direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap()
+    }
+
+    /// 1.9 shares of a whole-share asset is one sellable share; a floor of
+    /// one keeps it.
+    #[tokio::test]
+    async fn non_fractionable_sell_preflight_holds_the_last_whole_share_at_floor() {
+        let preflight = floored_non_fractionable_sell_preflight("1").await;
+
+        assert!(
+            matches!(
+                preflight,
+                CounterTradePreflight::Skipped(CounterTradeSkipReason::HeldAtFloor {
+                    ref symbol,
+                    floor,
+                    available,
+                }) if symbol == &Symbol::new("FGI").unwrap()
+                    && floor == FractionalShares::new(float!(1))
+                    && available == FractionalShares::new(float!(1))
+            ),
+            "expected HeldAtFloor, got {preflight:?}"
+        );
+    }
+
+    /// A fractional floor on a whole-share asset rounds up to one share:
+    /// otherwise the preflight would offer 0.5 of a share the broker cannot
+    /// sell.
+    #[tokio::test]
+    async fn non_fractionable_sell_preflight_rounds_a_fractional_floor_up_to_a_whole_share() {
+        let preflight = floored_non_fractionable_sell_preflight("0.5").await;
+
+        assert!(
+            matches!(
+                preflight,
+                CounterTradePreflight::Skipped(CounterTradeSkipReason::HeldAtFloor {
+                    floor,
+                    available,
+                    ..
+                }) if floor == FractionalShares::new(float!(1))
+                    && available == FractionalShares::new(float!(1))
+            ),
+            "expected HeldAtFloor with a whole-share floor, got {preflight:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_asset_validation_uses_cache() {
         let server = MockServer::start();
@@ -2167,6 +2282,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::ZERO,
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: HedgeFloor::default(),
         };
 
         let account_mock = create_account_mock(&server);

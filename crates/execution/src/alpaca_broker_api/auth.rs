@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::TimeInForce;
+use crate::HedgeFloor;
 
 /// Strongly typed Alpaca account identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +232,10 @@ pub struct AlpacaBrokerApiCtx {
     #[serde(default)]
     pub time_in_force: TimeInForce,
     pub counter_trade_slippage_bps: u16,
+    /// Assembled by the config loader from `[broker]` and per-symbol
+    /// overrides, never read from the broker table itself.
+    #[serde(skip)]
+    pub hedge_floor: HedgeFloor,
 }
 
 fn default_asset_cache_ttl_secs() -> std::time::Duration {
@@ -276,6 +281,7 @@ impl std::fmt::Debug for AlpacaBrokerApiCtx {
                 "counter_trade_slippage_bps",
                 &self.counter_trade_slippage_bps,
             )
+            .field("hedge_floor", &self.hedge_floor)
             .finish()
     }
 }
@@ -323,6 +329,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: HedgeFloor::default(),
         }
     }
 
@@ -532,6 +539,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: HedgeFloor::default(),
         };
 
         let debug_output = format!("{ctx:?}");

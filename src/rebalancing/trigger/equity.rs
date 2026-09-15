@@ -12,16 +12,23 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
 use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_float_macro::float;
 use st0x_wrapper::{UnderlyingPerWrapped, WrapperError};
 
 use super::{RebalancingService, TokenAddressError, TriggeredOperation};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
-    BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold,
+    BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold, Venue,
 };
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
 const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
+
+/// Smallest mint worth dispatching. A floored sell leaves the broker book at
+/// exactly the floor and positions carry nine-decimal residue, so anything
+/// smaller than this above the floor is dust, not an imbalance.
+static MINIMUM_MINT_SHARES: LazyLock<FractionalShares> =
+    LazyLock::new(|| FractionalShares::new(float!(0.01)));
 
 /// Why an equity trigger failed.
 #[derive(Debug, thiserror::Error)]
@@ -428,15 +435,21 @@ pub(super) async fn check_imbalance_and_build_operation(
     unwrapped_token: Address,
     vault_ratio: &UnderlyingPerWrapped,
     shares_limit: Option<Positive<FractionalShares>>,
+    hedge_floor: FractionalShares,
 ) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
-    let imbalance = {
+    // One read for both figures, so the floor is applied to the same
+    // snapshot the imbalance was computed from.
+    let (imbalance, offchain_available) = {
         let inventory = inventory.read().await;
-        inventory.check_equity_imbalance(
-            symbol,
-            inventory.primary_chain(),
-            threshold,
-            vault_ratio,
-        )?
+        (
+            inventory.check_equity_imbalance(
+                symbol,
+                inventory.primary_chain(),
+                threshold,
+                vault_ratio,
+            )?,
+            inventory.equity_available(symbol, Venue::Hedging),
+        )
     };
 
     let Some(imbalance) = imbalance else {
@@ -446,7 +459,29 @@ pub(super) async fn check_imbalance_and_build_operation(
 
     Ok(Some(match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let quantity = truncate_for_alpaca(symbol, cap_shares(symbol, excess, shares_limit))?;
+            let Some(offchain_available) = offchain_available else {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    "Skipping mint: imbalance detected but the broker venue is missing from the view"
+                );
+                return Ok(None);
+            };
+            let Some(mintable) =
+                mintable_above_floor(symbol, excess, offchain_available, hedge_floor)?
+            else {
+                return Ok(None);
+            };
+            let quantity = truncate_for_alpaca(symbol, cap_shares(symbol, mintable, shares_limit))?;
+            if quantity.inner().lt(MINIMUM_MINT_SHARES.inner())? {
+                trace!(
+                    target: "rebalance",
+                    %symbol,
+                    %quantity,
+                    "Skipping mint: capped quantity is below the minimum mint size"
+                );
+                return Ok(None);
+            }
             TriggeredOperation::Mint {
                 symbol: symbol.clone(),
                 quantity,
@@ -462,6 +497,44 @@ pub(super) async fn check_imbalance_and_build_operation(
             }
         }
     }))
+}
+
+/// Caps a mint so the broker keeps `hedge_floor` shares of the symbol, the
+/// same residual a sell hedge leaves. `None` when the book is the floor or
+/// less: balanced enough, decided here rather than inside the imbalance
+/// ratio so a floor-only book never reads as an imbalance.
+fn mintable_above_floor(
+    symbol: &Symbol,
+    excess: FractionalShares,
+    offchain_available: FractionalShares,
+    hedge_floor: FractionalShares,
+) -> Result<Option<FractionalShares>, FloatError> {
+    let above_floor = (offchain_available - hedge_floor)?;
+
+    if above_floor.inner().lt(MINIMUM_MINT_SHARES.inner())? {
+        trace!(
+            target: "rebalance",
+            %symbol,
+            offchain = %offchain_available,
+            floor = %hedge_floor,
+            "Skipping mint: broker book is at the hedge floor"
+        );
+        return Ok(None);
+    }
+
+    if excess.inner().gt(above_floor.inner())? {
+        debug!(
+            target: "rebalance",
+            %symbol,
+            computed = %excess,
+            floor = %hedge_floor,
+            capped = %above_floor,
+            "Equity mint capped to keep the hedge floor"
+        );
+        return Ok(Some(above_floor));
+    }
+
+    Ok(Some(excess))
 }
 
 fn cap_shares(
@@ -655,7 +728,7 @@ mod tests {
 
     use super::*;
     use crate::inventory::view::Operator;
-    use crate::inventory::{Inventory, InventoryView, TransferOp, Venue};
+    use crate::inventory::{Inventory, InventoryView, TransferOp};
 
     fn make_in_progress() -> Arc<std::sync::RwLock<HashMap<Symbol, GuardState>>> {
         Arc::new(std::sync::RwLock::new(HashMap::new()))
@@ -1082,6 +1155,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1106,10 +1180,152 @@ mod tests {
             Address::ZERO,
             &ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await;
 
         assert!(matches!(result, Ok(Some(TriggeredOperation::Mint { .. }))));
+    }
+
+    fn fractional_view(
+        symbol: &Symbol,
+        onchain: &str,
+        offchain: &str,
+    ) -> Arc<BroadcastingInventory> {
+        let parse = |value: &str| FractionalShares::new(Float::parse(value.to_string()).unwrap());
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, parse(onchain)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, parse(offchain)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        Arc::new(BroadcastingInventory::new(view, event_sender))
+    }
+
+    /// Everything offchain and a target of 95% onchain asks to mint 9.975 of
+    /// 10.5 shares; a one-share floor caps the mint at 9.5.
+    #[tokio::test]
+    async fn mint_stops_at_the_hedge_floor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = fractional_view(&symbol, "0", "10.5");
+        let threshold = ImbalanceThreshold {
+            target: float!(0.95),
+            deviation: float!(0.01),
+        };
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            None,
+            FractionalShares::new(float!(1)),
+        )
+        .await
+        .unwrap();
+
+        let Some(TriggeredOperation::Mint { quantity, .. }) = result else {
+            panic!("expected a floored mint, got {result:?}");
+        };
+        assert_eq!(quantity, FractionalShares::new(float!(9.5)));
+    }
+
+    /// A floored sell leaves the book at exactly the floor, and broker
+    /// positions carry nine-decimal residue, so `floor + dust` is the steady
+    /// state. That must not become a dust mint every cycle.
+    #[tokio::test]
+    async fn mint_is_skipped_when_only_dust_sits_above_the_floor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = fractional_view(&symbol, "0", "1.000000001");
+        let threshold = ImbalanceThreshold {
+            target: float!(0.95),
+            deviation: float!(0.01),
+        };
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            None,
+            FractionalShares::new(float!(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    /// An operational limit below the minimum mint size must not turn a
+    /// legitimate excess into a dust mint either.
+    #[tokio::test]
+    async fn mint_is_skipped_when_the_operational_limit_leaves_only_dust() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = fractional_view(&symbol, "0", "10.5");
+        let threshold = ImbalanceThreshold {
+            target: float!(0.95),
+            deviation: float!(0.01),
+        };
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+        let limit = Positive::new(FractionalShares::new(float!(0.001))).unwrap();
+
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            Some(limit),
+            FractionalShares::new(float!(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    /// A book that is nothing but the floor has nothing to mint.
+    #[tokio::test]
+    async fn mint_is_skipped_when_the_book_is_only_the_floor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = fractional_view(&symbol, "0", "1");
+        let threshold = ImbalanceThreshold {
+            target: float!(0.95),
+            deviation: float!(0.01),
+        };
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio,
+            None,
+            FractionalShares::new(float!(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
@@ -1132,6 +1348,7 @@ mod tests {
             unwrapped_addr,
             &ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1172,6 +1389,7 @@ mod tests {
             Address::ZERO,
             &ratio_1_to_1,
             None,
+            FractionalShares::ZERO,
         )
         .await;
         assert_eq!(result_1_to_1.unwrap(), None);
@@ -1187,6 +1405,7 @@ mod tests {
             Address::ZERO,
             &ratio_1_5,
             None,
+            FractionalShares::ZERO,
         )
         .await;
         assert!(
@@ -1259,6 +1478,7 @@ mod tests {
             Address::ZERO,
             &vault_ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await
         .unwrap()
@@ -1361,6 +1581,7 @@ mod tests {
             Address::ZERO,
             &vault_ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await
         .unwrap()
@@ -1434,6 +1655,7 @@ mod tests {
             Address::ZERO,
             &vault_ratio,
             None,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1588,6 +1810,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             shares_limit,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1622,6 +1845,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             shares_limit,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1645,6 +1869,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             shares_limit,
+            FractionalShares::ZERO,
         )
         .await;
 
@@ -1663,6 +1888,7 @@ mod tests {
             Address::ZERO,
             &ratio,
             shares_limit,
+            FractionalShares::ZERO,
         )
         .await;
 

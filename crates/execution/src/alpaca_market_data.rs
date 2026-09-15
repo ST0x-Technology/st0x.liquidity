@@ -396,6 +396,7 @@ mod tests {
             asset_cache_ttl: Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: crate::HedgeFloor::default(),
         })
         .unwrap()
     }
