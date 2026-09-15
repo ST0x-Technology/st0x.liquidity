@@ -8,18 +8,21 @@
 //! Shares are tokenized to, and donated from, the configured `[wallet]`, so the
 //! issuer config funds and signs the whole bump.
 
-use std::io::Write;
-
 use async_trait::async_trait;
+use std::io::Write;
+use std::sync::Arc;
 
 use st0x_config::Ctx;
 use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_hedge::alerts::{LogNotifier, Notifier};
 
 use super::{TokenizationNetwork, rebalancing, trading, wrapper};
 
 #[async_trait]
 trait DividendBumpOperations: Sync {
+    fn prepare_notifier(&self, ctx: &Ctx) -> anyhow::Result<Arc<dyn Notifier>>;
+
     async fn buy<Writer: Write + Send>(
         &self,
         stdout: &mut Writer,
@@ -43,6 +46,7 @@ trait DividendBumpOperations: Sync {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         network: TokenizationNetwork,
+        notifier: &dyn Notifier,
         ctx: &Ctx,
     ) -> anyhow::Result<()>;
 }
@@ -51,6 +55,10 @@ struct LiveDividendBumpOperations;
 
 #[async_trait]
 impl DividendBumpOperations for LiveDividendBumpOperations {
+    fn prepare_notifier(&self, _ctx: &Ctx) -> anyhow::Result<Arc<dyn Notifier>> {
+        Ok(Arc::new(LogNotifier))
+    }
+
     async fn buy<Writer: Write + Send>(
         &self,
         stdout: &mut Writer,
@@ -87,9 +95,13 @@ impl DividendBumpOperations for LiveDividendBumpOperations {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         network: TokenizationNetwork,
+        notifier: &dyn Notifier,
         ctx: &Ctx,
     ) -> anyhow::Result<()> {
-        wrapper::donate_equity_command(stdout, symbol, quantity, network, ctx).await
+        wrapper::donate_equity_command_with_notifier(
+            stdout, symbol, quantity, network, notifier, ctx,
+        )
+        .await
     }
 }
 
@@ -119,6 +131,7 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
     ctx: &Ctx,
     operations: &Operations,
 ) -> anyhow::Result<()> {
+    let notifier = operations.prepare_notifier(ctx)?;
     let chain = Chain::from(network);
     writeln!(stdout, "Dividend NAV bump: {quantity} {symbol} on {chain}")?;
 
@@ -143,7 +156,14 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
         "Step 3/3: donating {filled_quantity} {symbol} into the wrapper"
     )?;
     operations
-        .donate(stdout, symbol, filled_quantity, network, ctx)
+        .donate(
+            stdout,
+            symbol,
+            filled_quantity,
+            network,
+            notifier.as_ref(),
+            ctx,
+        )
         .await?;
 
     writeln!(stdout, "✅ Dividend NAV bump completed")?;
@@ -153,6 +173,7 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use alloy::primitives::{Address, address};
     use rain_math_float::Float;
@@ -174,12 +195,22 @@ mod tests {
 
     struct RecordingDividendBumpOperations {
         filled_quantity: Positive<FractionalShares>,
+        notifier_setup_fails: bool,
+        buy_calls: AtomicUsize,
         tokenized: Mutex<Vec<(Positive<FractionalShares>, TokenizationNetwork)>>,
         donated: Mutex<Vec<(Positive<FractionalShares>, TokenizationNetwork)>>,
     }
 
     #[async_trait]
     impl DividendBumpOperations for RecordingDividendBumpOperations {
+        fn prepare_notifier(&self, _ctx: &Ctx) -> anyhow::Result<Arc<dyn Notifier>> {
+            if self.notifier_setup_fails {
+                anyhow::bail!("notifier setup failed");
+            }
+
+            Ok(Arc::new(LogNotifier))
+        }
+
         async fn buy<Writer: Write + Send>(
             &self,
             _stdout: &mut Writer,
@@ -187,6 +218,7 @@ mod tests {
             _quantity: Positive<FractionalShares>,
             _ctx: &Ctx,
         ) -> anyhow::Result<Positive<FractionalShares>> {
+            self.buy_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.filled_quantity)
         }
 
@@ -208,6 +240,7 @@ mod tests {
             _symbol: Symbol,
             quantity: Positive<FractionalShares>,
             network: TokenizationNetwork,
+            _notifier: &dyn Notifier,
             _ctx: &Ctx,
         ) -> anyhow::Result<()> {
             self.donated.lock().unwrap().push((quantity, network));
@@ -315,12 +348,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dividend_bump_refuses_to_buy_when_notifier_setup_fails() {
+        let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
+        let operations = RecordingDividendBumpOperations {
+            filled_quantity: positive_shares("1"),
+            notifier_setup_fails: true,
+            buy_calls: AtomicUsize::new(0),
+            tokenized: Mutex::new(Vec::new()),
+            donated: Mutex::new(Vec::new()),
+        };
+        let mut stdout = Vec::new();
+
+        let error = dividend_bump_with_operations(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Base,
+            &ctx,
+            &operations,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "notifier setup failed");
+        assert_eq!(operations.buy_calls.load(Ordering::SeqCst), 0);
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
     async fn dividend_bump_tokenizes_and_donates_the_broker_filled_quantity() {
         // The recording operations never touch the broker, so the plain
         // mode-less Alpaca fixture suffices (no mock server needed).
         let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
         let operations = RecordingDividendBumpOperations {
             filled_quantity: positive_shares("0.0041"),
+            notifier_setup_fails: false,
+            buy_calls: AtomicUsize::new(0),
             tokenized: Mutex::new(Vec::new()),
             donated: Mutex::new(Vec::new()),
         };
@@ -357,6 +420,8 @@ mod tests {
         let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
         let operations = RecordingDividendBumpOperations {
             filled_quantity: positive_shares("2"),
+            notifier_setup_fails: false,
+            buy_calls: AtomicUsize::new(0),
             tokenized: Mutex::new(Vec::new()),
             donated: Mutex::new(Vec::new()),
         };
