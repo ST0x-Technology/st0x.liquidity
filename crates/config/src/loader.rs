@@ -3281,6 +3281,27 @@ mod tests {
         "#
     }
 
+    /// A `[chains.robinhood]` table at observe-only loads and validates: the
+    /// chain is enabled with a signer and nothing else.
+    #[test]
+    fn observe_only_robinhood_table_loads() {
+        let config: Config = toml::from_str(
+            &String::from_utf8_lossy(minimal_config_toml_bytes())
+                .replace("[chains.hyperevm]", "[chains.robinhood]"),
+        )
+        .unwrap();
+
+        validate_config(&config, Path::new("config.toml"), &mut Vec::new()).unwrap();
+
+        let (_, robinhood) = config
+            .chains
+            .iter()
+            .find(|(chain, _)| chain.as_str() == "robinhood")
+            .expect("the robinhood table must load under its wire name");
+        assert_eq!(robinhood.lifecycle, ChainLifecycle::ObserveOnly);
+        assert!(robinhood.trading.is_none());
+    }
+
     /// The enablement predicate has to run on the real load path, not just as
     /// a unit. HyperEVM supports prefunded trading and Robinhood signs only;
     /// neither wires a gas-valuation source, so raising either from

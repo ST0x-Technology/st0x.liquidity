@@ -268,6 +268,28 @@ mod tests {
         );
     }
 
+    /// Robinhood Chain (an Arbitrum Orbit L2) settles in USDG rather than
+    /// Circle's USDC, so it is the first chain whose bridge accessor is
+    /// `None` while its settlement stable is pinned like every other.
+    #[test]
+    fn robinhood_is_pinned_by_wire_name() {
+        let robinhood: Chain = "robinhood".parse().unwrap();
+
+        assert_eq!(Chain::ALL.len(), 4);
+        assert!(Chain::ALL.contains(&robinhood));
+        assert_eq!(robinhood.chain_id(), 4663);
+        assert_eq!(serde_json::to_string(&robinhood).unwrap(), "\"robinhood\"");
+        assert_eq!(
+            robinhood.settlement_stable(),
+            SettlementStable {
+                address: address!("0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"),
+                symbol: "USDG",
+                decimals: 6,
+            }
+        );
+        assert_eq!(robinhood.cctp_usdc(), None);
+    }
+
     #[test]
     fn robinhood_usdc_is_the_canonical_contract() {
         assert_eq!(

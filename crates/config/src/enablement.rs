@@ -410,6 +410,71 @@ mod tests {
         );
     }
 
+    /// Robinhood pays gas in ETH, so the Base ETH/USD read values it and the
+    /// chain can reach `active`, unlike HyperEVM. It still has no wrapper and
+    /// no CCTP domain, so rebalancing assets are refused by capability.
+    #[test]
+    fn robinhood_can_be_active_but_cannot_rebalance() {
+        let robinhood: Chain = "robinhood".parse().unwrap();
+
+        for lifecycle in [
+            ChainLifecycle::ObserveOnly,
+            ChainLifecycle::Prefunded,
+            ChainLifecycle::Active,
+        ] {
+            check_enablement(robinhood, lifecycle, true, None).unwrap();
+        }
+        assert_eq!(
+            provided_capabilities(robinhood),
+            BTreeSet::from([
+                ChainCapability::FillIngestion,
+                ChainCapability::Hedging,
+                ChainCapability::WalletSigning,
+                ChainCapability::GasValuation,
+            ])
+        );
+
+        let mut assets = ChainAssets::default();
+        assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: alloy::primitives::Address::repeat_byte(0x11),
+                tokenized_equity_derivative: alloy::primitives::Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        assets.cash = Some(crate::ChainCashAsset {
+            vault_ids: Vec::new(),
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        });
+        let error =
+            check_enablement(robinhood, ChainLifecycle::Active, true, Some(&assets)).unwrap_err();
+
+        let ChainEnablementError::MissingCapabilities {
+            chain,
+            lifecycle,
+            missing,
+        } = error
+        else {
+            panic!("expected MissingCapabilities, got: {error:?}")
+        };
+        assert_eq!(chain, robinhood);
+        assert_eq!(lifecycle, ChainLifecycle::Active);
+        assert_eq!(
+            missing.into_inner(),
+            vec![
+                ChainCapability::EquityRebalancing,
+                ChainCapability::CashRebalancing
+            ],
+            "no wrapper and no CCTP domain are wired for Robinhood"
+        );
+    }
+
     #[test]
     fn ethereum_may_hold_funds_and_watch_fills_but_not_rebalance_equity() {
         check_enablement(Chain::Ethereum, ChainLifecycle::Active, false, None).unwrap();
