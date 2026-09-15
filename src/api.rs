@@ -2606,9 +2606,13 @@ impl CctpSourceChain {
 #[serde(rename_all = "camelCase")]
 struct CompleteCctpMintResponse {
     mint_tx: String,
-    /// USDC minted to the recipient, net of the fee.
-    amount_received: String,
-    fee_collected: String,
+    /// USDC minted to the recipient, net of the fee. `null` if the on-chain
+    /// amounts could not be decoded; the mint is still final.
+    amount_received: Option<String>,
+    fee_collected: Option<String>,
+    /// Whether the bot-gas cost was recorded. `false` means the mint landed but
+    /// the gas enqueue failed and must be re-recorded out of band.
+    gas_recorded: bool,
 }
 
 /// Completes the destination mint of a CCTP burn whose mint never landed
@@ -2703,11 +2707,24 @@ async fn complete_cctp_mint_recovery(
         .await
         .map_err(|error| cctp_recovery_failure(&error, burn_tx, direction))?;
 
-    info!(%burn_tx, ?direction, mint_tx = %recovered.mint_tx, "CCTP mint recovered via API");
+    info!(
+        %burn_tx,
+        ?direction,
+        mint_tx = %recovered.mint_tx,
+        gas_recorded = recovered.gas_recorded,
+        "CCTP mint recovered via API"
+    );
     Ok(Json(CompleteCctpMintResponse {
         mint_tx: recovered.mint_tx.to_string(),
-        amount_received: recovered.amount_received.to_string(),
-        fee_collected: recovered.fee_collected.to_string(),
+        amount_received: recovered
+            .amounts
+            .as_ref()
+            .map(|amounts| amounts.amount_received.to_string()),
+        fee_collected: recovered
+            .amounts
+            .as_ref()
+            .map(|amounts| amounts.fee_collected.to_string()),
+        gas_recorded: recovered.gas_recorded,
     }))
 }
 

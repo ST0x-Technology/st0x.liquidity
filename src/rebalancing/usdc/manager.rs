@@ -4857,10 +4857,27 @@ where
     }
 }
 
-/// A recovered CCTP mint: the destination-chain `receiveMessage` landed.
+/// A recovered CCTP mint. The destination-chain `receiveMessage` is final once
+/// this exists, so `mint_tx` is always present; the post-mint bookkeeping is
+/// best effort and degrades into the remaining fields rather than discarding the
+/// hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveredCctpMint {
     pub(crate) mint_tx: TxHash,
+    /// Minted amount and fee, `None` only if the on-chain `U256` values could
+    /// not be decoded. The mint is final regardless; `mint_tx` is authoritative.
+    pub(crate) amounts: Option<RecoveredMintAmounts>,
+    /// Whether the bot-gas cost was enqueued for ADR 0017 accounting. `false`
+    /// means the mint landed but the enqueue failed; the failure is logged with
+    /// the mint tx and chain so it can be re-recorded out of band. A
+    /// re-`complete-mint` is unnecessary and unsafe for this: the nonce is
+    /// already consumed.
+    pub(crate) gas_recorded: bool,
+}
+
+/// The decoded amounts of a recovered mint, present together or not at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredMintAmounts {
     /// USDC minted to the recipient, net of the fee.
     pub(crate) amount_received: Usdc,
     pub(crate) fee_collected: Usdc,
@@ -4883,22 +4900,19 @@ pub(crate) enum CctpMintRecoveryError {
         #[source]
         source: CctpError,
     },
-    /// An amount decode or a bot-gas-cost enqueue failed.
-    #[error(transparent)]
-    Transfer(#[from] Box<UsdcTransferError>),
 }
 
 impl CctpMintRecoveryError {
     /// Whether the operator should retry. Circle not having attested the burn
     /// yet, or a transient transport hiccup, is retryable. A complete but
     /// malformed attestation is a definitively hard failure (see
-    /// [`CctpError::MalformedAttestation`]) that retrying cannot fix, as is any
-    /// mint submission or bookkeeping failure.
+    /// [`CctpError::MalformedAttestation`]) that retrying cannot fix, as is a
+    /// deterministic mint submission failure.
     pub(crate) fn is_retryable(&self) -> bool {
         // Retryable only for an attestation that is not definitively malformed:
         // Circle has not attested yet, or a transient transport hiccup. A
-        // malformed complete attestation, a failed mint, and a bookkeeping error
-        // are hard failures retrying cannot fix.
+        // malformed complete attestation and a failed mint are hard failures
+        // retrying cannot fix.
         matches!(
             self,
             Self::Attestation { source, .. }
@@ -4978,20 +4992,55 @@ where
             .await
             .map_err(|source| CctpMintRecoveryError::Mint { burn_tx, source })?;
 
-        // Record the mint's gas for ADR 0017 accounting, as every other CCTP
-        // mint site does; the mint lands on the chain opposite the burn.
+        // The mint is now FINAL on-chain. Nothing below may discard `receipt.tx`:
+        // the post-mint bookkeeping degrades into the outcome instead of erroring.
         let mint_chain = match direction {
             BridgeDirection::EthereumToBase => Chain::Base,
             BridgeDirection::BaseToEthereum => Chain::Ethereum,
         };
-        self.enqueue_bot_gas_cost(mint_chain, receipt.tx, BotGasOperationCategory::CctpMint)
+
+        // Record the mint's gas for ADR 0017 accounting, as every other CCTP
+        // mint site does. A failed enqueue does not undo the mint, so log it with
+        // the tx and chain for out-of-band re-recording and report it as not
+        // recorded rather than failing the whole recovery.
+        let gas_recorded = match self
+            .enqueue_bot_gas_cost(mint_chain, receipt.tx, BotGasOperationCategory::CctpMint)
             .await
-            .map_err(Box::new)?;
+        {
+            Ok(()) => true,
+            Err(error) => {
+                error!(
+                    target: "rebalance",
+                    ?error,
+                    mint_tx = %receipt.tx,
+                    chain = %mint_chain,
+                    "CCTP mint landed but the bot-gas enqueue failed; the mint is final -- re-record the gas cost out of band"
+                );
+                false
+            }
+        };
+
+        let amounts = match (u256_to_usdc(receipt.amount), u256_to_usdc(receipt.fee)) {
+            (Ok(amount_received), Ok(fee_collected)) => Some(RecoveredMintAmounts {
+                amount_received,
+                fee_collected,
+            }),
+            (amount, fee) => {
+                error!(
+                    target: "rebalance",
+                    mint_tx = %receipt.tx,
+                    ?amount,
+                    ?fee,
+                    "CCTP mint landed but its amounts could not be decoded; the mint is final"
+                );
+                None
+            }
+        };
 
         Ok(RecoveredCctpMint {
             mint_tx: receipt.tx,
-            amount_received: u256_to_usdc(receipt.amount).map_err(Box::new)?,
-            fee_collected: u256_to_usdc(receipt.fee).map_err(Box::new)?,
+            amounts,
+            gas_recorded,
         })
     }
 }
@@ -17310,6 +17359,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovered.mint_tx, mint_tx);
+        assert!(recovered.gas_recorded, "the enqueue succeeded");
+        let amounts = recovered.amounts.expect("amounts decode from the receipt");
+        assert_eq!(amounts.amount_received, usdc("100"));
+        assert_eq!(amounts.fee_collected, usdc("1"));
 
         let jobs = pending_bot_gas_jobs(&apalis_pool).await;
         assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
@@ -17318,6 +17371,64 @@ mod tests {
         assert_eq!(jobs[0].chain, Chain::Ethereum);
         assert_eq!(jobs[0].tx_hash, mint_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// The destination mint is final before the bot-gas enqueue runs. If the
+    /// enqueue fails, the recovery must still return the mint hash and amounts
+    /// (flagged as gas not recorded) rather than losing the final mint in a
+    /// generic failure.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn recover_cctp_mint_preserves_the_hash_when_the_gas_enqueue_fails() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let mint_tx =
+            fixed_bytes!("0xeeee000000000000000000000000000000000000000000000000000000000002");
+        let (manager, apalis_pool, _server) = manager_with_bot_gas_queue(
+            cqrs,
+            wallet,
+            MockBridge::new().with_recover_mint(
+                valid_cctp_message(),
+                st0x_bridge::MintReceipt {
+                    tx: mint_tx,
+                    amount: usdc_to_u256(usdc("100")).unwrap(),
+                    fee: usdc_to_u256(usdc("1")).unwrap(),
+                },
+            ),
+        )
+        .await;
+
+        // Close the queue's pool so the post-mint bot-gas enqueue fails.
+        apalis_pool.close().await;
+
+        let attestation = manager
+            .poll_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
+            .await
+            .unwrap();
+        let recovered = manager
+            .submit_recovered_cctp_mint(
+                BridgeDirection::BaseToEthereum,
+                TxHash::repeat_byte(0x11),
+                attestation,
+            )
+            .await
+            .expect("a final mint must not be lost when the gas enqueue fails");
+
+        assert_eq!(
+            recovered.mint_tx, mint_tx,
+            "the final mint hash must be preserved"
+        );
+        assert!(
+            !recovered.gas_recorded,
+            "the enqueue failed, so gas is reported as not recorded"
+        );
+        let amounts = recovered
+            .amounts
+            .expect("amounts still decode from the receipt");
+        assert_eq!(amounts.amount_received, usdc("100"));
     }
 
     /// Acceptance criterion: resuming an Alpaca->Base transfer stalled at
