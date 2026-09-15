@@ -2711,17 +2711,20 @@ async fn complete_cctp_mint_recovery(
     }))
 }
 
-/// Maps a [`CctpMintRecoveryError`]: an unavailable attestation is an
-/// upstream (Circle) condition the operator retries later, so 502 with the
-/// typed message; a mint failure, amount decode, or gas-ledger enqueue is an
-/// internal failure whose detail is logged at the call site.
+/// Maps a [`CctpMintRecoveryError`]. A retryable failure (Circle has not
+/// attested the burn yet, or a transient transport hiccup) is an upstream
+/// condition the operator retries later, so 502 with the typed message. A hard
+/// failure (a complete but malformed attestation, a failed mint, an amount
+/// decode, or a gas-ledger enqueue) is a 500 whose detail is logged at the call
+/// site rather than returned.
 fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCode, String) {
-    match error {
-        CctpMintRecoveryError::Attestation { .. } => (StatusCode::BAD_GATEWAY, error.to_string()),
-        CctpMintRecoveryError::Mint { .. } | CctpMintRecoveryError::Transfer(_) => (
+    if error.is_retryable() {
+        (StatusCode::BAD_GATEWAY, error.to_string())
+    } else {
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
             "CCTP mint recovery failed".to_string(),
-        ),
+        )
     }
 }
 
@@ -7842,6 +7845,20 @@ mod tests {
         let (status, message) = cctp_mint_recovery_error_response(&attestation);
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(message.contains(&burn_tx.to_string()), "{message}");
+
+        // A complete but malformed attestation is a hard failure: retrying
+        // cannot fix it, so it is a 500 with the detail withheld, not a 502.
+        let malformed = CctpMintRecoveryError::Attestation {
+            burn_tx,
+            source: st0x_bridge::cctp::CctpError::MalformedAttestation {
+                source: st0x_bridge::cctp::AttestationError::MissingField {
+                    field: "attestation",
+                },
+            },
+        };
+        let (status, message) = cctp_mint_recovery_error_response(&malformed);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "CCTP mint recovery failed");
 
         let mint = CctpMintRecoveryError::Mint {
             burn_tx,

@@ -4888,6 +4888,25 @@ pub(crate) enum CctpMintRecoveryError {
     Transfer(#[from] Box<UsdcTransferError>),
 }
 
+impl CctpMintRecoveryError {
+    /// Whether the operator should retry. Circle not having attested the burn
+    /// yet, or a transient transport hiccup, is retryable. A complete but
+    /// malformed attestation is a definitively hard failure (see
+    /// [`CctpError::MalformedAttestation`]) that retrying cannot fix, as is any
+    /// mint submission or bookkeeping failure.
+    pub(crate) fn is_retryable(&self) -> bool {
+        // Retryable only for an attestation that is not definitively malformed:
+        // Circle has not attested yet, or a transient transport hiccup. A
+        // malformed complete attestation, a failed mint, and a bookkeeping error
+        // are hard failures retrying cannot fix.
+        matches!(
+            self,
+            Self::Attestation { source, .. }
+                if !matches!(source, CctpError::MalformedAttestation { .. })
+        )
+    }
+}
+
 /// Two-phase entry point for the operator `cctp complete-mint` recovery of a
 /// burn whose destination mint never completed.
 ///
