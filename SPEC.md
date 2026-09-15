@@ -171,6 +171,16 @@ rebalancing secondary makes only for the equities that opt in — so a typo
 landing on another live token refuses startup instead of surfacing as the first
 unresolvable fill.
 
+The lifecycle is a strict ceiling over the chain's asset settings. The hedged
+chain with `primary = true` must be `active`; startup rejects an observe-only or
+prefunded primary with `PrimaryChainMustBeActive` because the primary's
+rebalancing services are always constructed. An `observe-only` chain may read
+chain state but must not enable asset trading or rebalancing. A `prefunded`
+chain may enable trading and hedge fills against manually funded inventory, but
+must not enable automatic equity or cash rebalancing. An `active` chain may
+enable both, subject to its asset flags. Startup rejects a subordinate setting
+that exceeds this ceiling.
+
 HyperEVM supports prefunded fill ingestion and hedging as a hedged secondary
 with manually funded equity, USDC and native HYPE gas. Configuring HyperEVM as
 the primary chain fails validation. Its canonical USDC is
