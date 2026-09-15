@@ -8619,6 +8619,22 @@ mod tests {
         );
     }
 
+    /// The CI config gates run without secrets, so the floor's sign rule has
+    /// to be a config-only rule or a bad value merges and only fails at the
+    /// release gate.
+    #[test]
+    fn validate_config_file_refuses_a_negative_hedge_floor() {
+        let config = hedge_floor_config_toml("-1", "3");
+
+        let error = Ctx::validate_config_file(config.path()).unwrap_err();
+
+        let CtxError::NegativeHedgeFloor { symbol, configured } = error else {
+            panic!("expected NegativeHedgeFloor, got: {error:?}");
+        };
+        assert_eq!(symbol, None);
+        assert_eq!(configured, FractionalShares::new(float!(-1)));
+    }
+
     /// The secrets half stays the deploy gate's job: without `--secrets` the
     /// validator must not invent a verdict about credentials it never read.
     #[test]
