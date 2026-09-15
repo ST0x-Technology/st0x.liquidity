@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use st0x_execution::{
-    CancellationOutcome, CounterTradePreflight, Executor, InventoryResult, LatestQuote, LimitOrder,
-    MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement, OrderState, Positive,
-    SupportedExecutor, Symbol, Usd,
+    BuyingPowerReservationCents, CancellationOutcome, ClientOrderId, CounterTradePreflight,
+    Executor, InventoryResult, LatestQuote, LimitOrder, MarketOrder, MarketSession,
+    MarketSessionStatus, OrderPlacement, OrderState, Positive, SupportedExecutor, Symbol, Usd,
 };
 
 use super::{Dependency, DependencyCallSample, TelemetrySender, scrub_secrets};
@@ -101,6 +101,19 @@ impl<Inner: Executor + Clone> Executor for InstrumentedExecutor<Inner> {
         result
     }
 
+    async fn get_order_by_client_order_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<OrderPlacement<Self::OrderId>>, Self::Error> {
+        let started = Instant::now();
+        let result = self
+            .inner
+            .get_order_by_client_order_id(client_order_id)
+            .await;
+        self.record("get_order_by_client_order_id", started, &result);
+        result
+    }
+
     fn to_supported_executor(&self) -> SupportedExecutor {
         self.inner.to_supported_executor()
     }
@@ -148,6 +161,47 @@ impl<Inner: Executor + Clone> Executor for InstrumentedExecutor<Inner> {
             .preflight_counter_trade_at_price(order, reference_price)
             .await;
         self.record("preflight_counter_trade_at_price", started, &result);
+        result
+    }
+
+    async fn preflight_counter_trade_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        let started = Instant::now();
+        let result = self
+            .inner
+            .preflight_counter_trade_with_reserved_buying_power(order, reserved)
+            .await;
+        self.record(
+            "preflight_counter_trade_with_reserved_buying_power",
+            started,
+            &result,
+        );
+        result
+    }
+
+    async fn preflight_counter_trade_at_price_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reference_price: Positive<Usd>,
+        reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        let started = Instant::now();
+        let result = self
+            .inner
+            .preflight_counter_trade_at_price_with_reserved_buying_power(
+                order,
+                reference_price,
+                reserved,
+            )
+            .await;
+        self.record(
+            "preflight_counter_trade_at_price_with_reserved_buying_power",
+            started,
+            &result,
+        );
         result
     }
 
@@ -226,7 +280,7 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
 
     use st0x_execution::{
-        ClientOrderId, CounterTradeSkipReason, Direction, FractionalShares, Inventory,
+        ClientOrderId, CounterTradeReservation, Direction, FractionalShares, Inventory,
         MockExecutor, Positive, Symbol,
     };
     use st0x_float_macro::float;
@@ -410,9 +464,9 @@ mod tests {
     /// reference, so a widening extended-hours spread could pass this check
     /// while the order actually submitted needs materially more buying power
     /// than was checked. Funds the mock so the ordinary (mock-default
-    /// $100/share) preflight passes, then asserts the same order rejects
-    /// once priced against a materially higher supplied reference price --
-    /// proving the wrapper does not discard `reference_price`.
+    /// $100/share) preflight passes in full, then asserts the same order is
+    /// reduced once priced against a materially higher supplied reference
+    /// price -- proving the wrapper does not discard `reference_price`.
     #[tokio::test]
     async fn preflight_counter_trade_at_price_forwards_reference_price() {
         let pool = setup_test_db().await;
@@ -450,20 +504,53 @@ mod tests {
             .preflight_counter_trade_at_price(order, reference_price)
             .await
             .unwrap();
-        assert!(
-            matches!(
-                at_price,
-                CounterTradePreflight::Skipped(
-                    CounterTradeSkipReason::InsufficientBuyingPower { .. }
-                )
-            ),
-            "at-price preflight must reject using the supplied $200 reference price instead \
-             of falling back to the $100 ordinary reference, got {at_price:?}"
-        );
+        let CounterTradePreflight::Allowed {
+            reservation:
+                Some(CounterTradeReservation::BuyingPower {
+                    required,
+                    estimated_cost_cents,
+                    ..
+                }),
+        } = at_price
+        else {
+            panic!("at-price preflight must return a partial reservation");
+        };
+        assert!(required.inner().inner().eq(float!(0.505)).unwrap());
+        assert_eq!(estimated_cost_cents, 10_100);
 
         drop(executor);
         drop(sender);
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_buying_power_is_forwarded_to_the_inner_executor() {
+        let (sender, _receiver) = TelemetrySender::channel();
+        let inventory = Inventory {
+            positions: vec![],
+            alpaca_usdc: None,
+            usd_balance_cents: 10_100,
+            cash_buying_power_cents: Some(10_100),
+            cash_withdrawable_cents: None,
+        };
+        let executor =
+            InstrumentedExecutor::new(MockExecutor::new().with_inventory(inventory), sender);
+
+        let preflight = executor
+            .preflight_counter_trade_with_reserved_buying_power(
+                market_order(),
+                BuyingPowerReservationCents::new(5_050).unwrap(),
+            )
+            .await
+            .unwrap();
+        let CounterTradePreflight::Allowed {
+            reservation: Some(CounterTradeReservation::BuyingPower { required, .. }),
+        } = preflight
+        else {
+            panic!("reserved buying power must produce a partial reservation");
+        };
+
+        assert!(required.inner().inner().eq(float!(0.5)).unwrap());
     }
 
     #[tokio::test]

@@ -663,6 +663,12 @@ pub enum TradeAccountingError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    #[error("Failed to run definitive placement preflight for {symbol}")]
+    PlacementPreflight {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// Wraps a pricing failure raised on the recovery path, where a claim is
     /// already outstanding. Distinct from the unwrapped pricing variants so
     /// the hedge worker can preserve the claim while applying the source's
@@ -679,6 +685,33 @@ pub enum TradeAccountingError {
     },
     #[error("PollOrderStatus live-job guard failed: {0}")]
     PollJobGuard(#[from] crate::offchain::order::JobError),
+    #[error("Failed-anchor hedge live-job guard failed: {0}")]
+    HedgeJobGuard(crate::offchain::order::JobError),
+    #[error("Buying-power reservation lookup failed: {0}")]
+    BuyingPowerReservation(#[from] crate::trading::offchain::hedge::BuyingPowerReservationError),
+    #[error("Failed to reconcile broker idempotency anchor for {symbol}")]
+    BrokerAnchorLookup {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("Local offchain order {anchor} for broker idempotency anchor {symbol} is missing")]
+    BrokerAnchorOrderMissing {
+        symbol: st0x_execution::Symbol,
+        anchor: crate::offchain::order::OffchainOrderId,
+    },
+    #[error(
+        "Broker idempotency anchor for {expected_symbol} {expected_direction:?} has mismatched \
+         order terms: symbol {actual_symbol}, direction {actual_direction:?}"
+    )]
+    BrokerAnchorMismatch {
+        expected_symbol: st0x_execution::Symbol,
+        expected_direction: st0x_dto::Direction,
+        actual_symbol: st0x_execution::Symbol,
+        actual_direction: st0x_dto::Direction,
+    },
+    #[error("Broker idempotency anchor for {symbol} is extended-hours but has no limit price")]
+    BrokerAnchorMissingLimitPrice { symbol: st0x_execution::Symbol },
 }
 
 /// A failure re-deriving an order kind after the position is already claimed.
@@ -728,6 +761,8 @@ pub enum SymbolScopedReason {
     LimitQuoteUnavailable,
     SlippageCalculation,
     CloseFlattenPreflightAtPrice,
+    PlacementPreflight,
+    BrokerAnchorLookup,
 }
 
 impl SymbolScopedReason {
@@ -738,6 +773,8 @@ impl SymbolScopedReason {
             Self::LimitQuoteUnavailable => "limit_quote_unavailable",
             Self::SlippageCalculation => "slippage_calculation",
             Self::CloseFlattenPreflightAtPrice => "close_flatten_preflight_at_price",
+            Self::PlacementPreflight => "placement_preflight",
+            Self::BrokerAnchorLookup => "broker_anchor_lookup",
         }
     }
 }
@@ -787,7 +824,7 @@ pub(crate) enum ErrorScope {
 impl TradeAccountingError {
     /// Classifies this error against the position claim.
     ///
-    /// Every symbol-scoped variant is raised inside
+    /// Pricing-related symbol-scoped variants are raised inside
     /// `select_order_kind_for_current_session` (or, for
     /// `CloseFlattenPreflightAtPrice`, inside
     /// `close_flatten_preflight_at_submitted_price`, which it calls). That
@@ -798,7 +835,10 @@ impl TradeAccountingError {
     /// `ClaimedHedgeOrderKind`, which remains process-scoped at this generic
     /// boundary. The hedge worker recognizes that wrapper before ordinary
     /// scope routing and applies the boxed source's symbol-scoped retry policy
-    /// without releasing the claim.
+    /// without releasing the claim. `BrokerAnchorLookup` is also
+    /// symbol-scoped because failed-anchor reconciliation runs before this
+    /// attempt creates a new position claim; its persisted failed anchor is
+    /// left for the periodic recovery sweep when the bounded retry exhausts.
     ///
     /// That does NOT make the position unclaimed at dead-letter time: apalis
     /// re-runs `perform_body` from the top, so this attempt's pre-claim
@@ -830,6 +870,17 @@ impl TradeAccountingError {
             Self::CloseFlattenPreflightAtPrice { .. } => SymbolScoped {
                 reason: SymbolScopedReason::CloseFlattenPreflightAtPrice,
             },
+            Self::PlacementPreflight { source, .. }
+                if find_permanence(source.as_ref()) == Some(Permanence::Permanent) =>
+            {
+                ProcessScoped
+            }
+            Self::PlacementPreflight { .. } => SymbolScoped {
+                reason: SymbolScopedReason::PlacementPreflight,
+            },
+            Self::BrokerAnchorLookup { .. } => SymbolScoped {
+                reason: SymbolScopedReason::BrokerAnchorLookup,
+            },
 
             Self::ClaimedHedgeOrderKind { .. }
             | Self::OnChain(_)
@@ -847,7 +898,12 @@ impl TradeAccountingError {
             | Self::InconsistentOnChainTradeState { .. }
             // A broker-clock failure is account-wide, not per-symbol.
             | Self::MarketSessionCheck { .. }
-            | Self::PollJobGuard(_) => ProcessScoped,
+            | Self::PollJobGuard(_)
+            | Self::HedgeJobGuard(_)
+            | Self::BuyingPowerReservation(_)
+            | Self::BrokerAnchorOrderMissing { .. }
+            | Self::BrokerAnchorMismatch { .. }
+            | Self::BrokerAnchorMissingLimitPrice { .. } => ProcessScoped,
         }
     }
 }
@@ -2875,10 +2931,24 @@ mod tests {
             ),
             (
                 TradeAccountingError::CloseFlattenPreflightAtPrice {
-                    symbol,
+                    symbol: symbol.clone(),
                     source: boxed(),
                 },
                 SymbolScopedReason::CloseFlattenPreflightAtPrice,
+            ),
+            (
+                TradeAccountingError::PlacementPreflight {
+                    symbol: symbol.clone(),
+                    source: boxed(),
+                },
+                SymbolScopedReason::PlacementPreflight,
+            ),
+            (
+                TradeAccountingError::BrokerAnchorLookup {
+                    symbol,
+                    source: boxed(),
+                },
+                SymbolScopedReason::BrokerAnchorLookup,
             ),
         ];
 
@@ -2927,6 +2997,14 @@ mod tests {
         assert_eq!(
             SymbolScopedReason::CloseFlattenPreflightAtPrice.metric_label(),
             "close_flatten_preflight_at_price"
+        );
+        assert_eq!(
+            SymbolScopedReason::PlacementPreflight.metric_label(),
+            "placement_preflight"
+        );
+        assert_eq!(
+            SymbolScopedReason::BrokerAnchorLookup.metric_label(),
+            "broker_anchor_lookup"
         );
         assert_eq!(
             DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteFetch).metric_label(),

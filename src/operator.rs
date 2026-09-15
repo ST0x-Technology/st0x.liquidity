@@ -578,8 +578,8 @@ pub mod native_gas {
 pub mod offchain {
     pub mod order {
         pub use crate::offchain::order::{
-            OffchainOrder, OffchainOrderCommand, OffchainOrderError, OffchainOrderId,
-            OffchainOrderPlacement, OrderPlacementResult, OrderPlacer,
+            BrokerOrderPlacement, OffchainOrder, OffchainOrderCommand, OffchainOrderError,
+            OffchainOrderId, OffchainOrderPlacement, OrderPlacementResult, OrderPlacer,
             TerminalPositionFinalization, client_order_id_for_placement,
             place_offchain_order_at_broker, position_command_for_finalization,
             terminal_position_finalization,
@@ -591,6 +591,8 @@ pub mod offchain {
             noop_order_placer,
         };
     }
+
+    pub use crate::trading::offchain::hedge::live_buying_power_reservations;
 }
 
 pub mod onchain {

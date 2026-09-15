@@ -569,6 +569,12 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
+    pub fn with_direction(mut self, direction: Direction) -> Self {
+        self.trade.direction = direction;
+        self
+    }
+
+    #[must_use]
     pub fn with_log_index(mut self, index: u64) -> Self {
         self.trade.log_index = index;
         self

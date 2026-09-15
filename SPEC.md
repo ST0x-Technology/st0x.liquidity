@@ -81,6 +81,14 @@ and the system proves market fit.
   whole-share-only. Fractionable assets retain Alpaca's nine-decimal quantity
   bound. Production can use dollar-value execution thresholds to reduce unhedged
   exposure while still respecting buying-power constraints.
+- **Buy-side cash limits**: A buy counter-trade never relies on margin. When the
+  full requested quantity exceeds available Alpaca cash, the bot submits the
+  largest broker-valid partial quantity whose slippage-buffered cost fits the
+  cash budget. The unhedged remainder stays in the position for a later retry.
+  Cash already reserved by live bot buy orders, including reservations restored
+  after restart, is subtracted before sizing so concurrent hedges cannot reuse
+  the shared balance. Fractional quantities below Alpaca's $1 notional minimum
+  are deferred without a broker call.
 
 #### Rebalancing Process
 
@@ -1196,7 +1204,16 @@ confirms.
   an order that can still fill. A placement failure with unknown broker state
   also keeps the anchor, since that is the window a lost response can still
   land. Intentional cancellation and manual adjustment already release the
-  anchor.
+  anchor. Preserved Alpaca anchors are reconciled independently of fresh hedge
+  readiness: the periodic position sweep must recover and poll an existing
+  broker order even if later fills moved the position below threshold or the
+  asset was disabled. That guarded recovery uses the anchored order's original
+  terms. Periodic and inline discovery must share a live-job guard so only one
+  recovery chain per symbol can exist at a time, while terminal attempts do not
+  prevent a later retry. Broker-confirmed absence releases the anchor without
+  placing a fresh order; a missing local placement intent also releases it
+  because the broker call cannot precede that durable intent. Normal readiness
+  decides any subsequent hedge.
 - Broker `PartiallyFilled` status is preserved through the executor boundary
   (cumulative fills are not collapsed into `Submitted`), and broker-confirmed
   `Cancelled` is represented distinctly from `Failed`.

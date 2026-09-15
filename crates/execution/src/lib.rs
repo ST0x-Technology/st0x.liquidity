@@ -305,6 +305,13 @@ pub trait Executor: Send + Sync + 'static {
     /// Used to check if pending orders have been filled or failed
     async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error>;
 
+    async fn get_order_by_client_order_id(
+        &self,
+        _client_order_id: &ClientOrderId,
+    ) -> Result<Option<OrderPlacement<Self::OrderId>>, Self::Error> {
+        Ok(None)
+    }
+
     /// Return the enum variant representing this executor type
     /// Used for database storage and conditional logic
     fn to_supported_executor(&self) -> SupportedExecutor;
@@ -357,6 +364,20 @@ pub trait Executor: Send + Sync + 'static {
         Ok(CounterTradePreflight::Allowed { reservation: None })
     }
 
+    /// Re-checks a counter-trade while accounting for durable buying-power
+    /// reservations.
+    ///
+    /// The default ignores `reserved` and delegates to
+    /// [`preflight_counter_trade`](Self::preflight_counter_trade). Executors
+    /// that model cash must override this method to account for reservations.
+    async fn preflight_counter_trade_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        _reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        self.preflight_counter_trade(order).await
+    }
+
     /// Checks whether a counter-trade can be submitted at an exact limit price
     /// without relying on margin or short inventory.
     ///
@@ -371,6 +392,19 @@ pub trait Executor: Send + Sync + 'static {
         order: MarketOrder,
         limit_price: Positive<Usd>,
     ) -> Result<CounterTradePreflight, Self::Error>;
+
+    /// Exact-price counterpart to the reservation-aware market preflight.
+    ///
+    /// The default likewise ignores `reserved`.
+    async fn preflight_counter_trade_at_price_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        limit_price: Positive<Usd>,
+        _reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        self.preflight_counter_trade_at_price(order, limit_price)
+            .await
+    }
 
     /// Returns the current market session (regular, extended, or closed).
     ///
@@ -621,6 +655,8 @@ pub enum CounterTradeSkipReason {
         estimated_cost_cents: i64,
         available_buying_power_cents: i64,
     },
+    #[error("fractional order notional is below the $1 minimum")]
+    BelowMinimumNotional,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,6 +671,28 @@ pub enum CounterTradeReservation {
         estimated_cost_cents: i64,
         available_buying_power_cents: i64,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BuyingPowerReservationCents(u64);
+
+impl BuyingPowerReservationCents {
+    pub const ZERO: Self = Self(0);
+
+    pub fn new(cents: i64) -> Result<Self, std::num::TryFromIntError> {
+        cents.try_into().map(Self)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,6 +755,8 @@ pub enum CounterTradeCostError {
     Float(#[from] FloatError),
     #[error("estimated cost in cents does not fit in i64: {formatted_cents}")]
     EstimatedCostOverflow { formatted_cents: String },
+    #[error(transparent)]
+    NonPositiveCandidate(#[from] NotPositive<FractionalShares>),
 }
 
 pub(crate) fn estimate_buffered_cost_cents(
@@ -723,24 +783,102 @@ pub(crate) fn estimate_buffered_cost_cents(
         .map_err(|_| CounterTradeCostError::EstimatedCostOverflow { formatted_cents })
 }
 
-pub(crate) fn buying_power_counter_trade_preflight(
-    required: Positive<FractionalShares>,
-    estimated_cost_cents: i64,
+pub(crate) fn resolve_buy_preflight(
+    order: &MarketOrder,
+    reference_price: Float,
+    slippage_bps: u16,
     available_buying_power_cents: i64,
-) -> CounterTradePreflight {
-    if available_buying_power_cents >= estimated_cost_cents {
-        CounterTradePreflight::Allowed {
+    quantity_decimals: u8,
+    fractional_order: bool,
+) -> Result<CounterTradePreflight, CounterTradeCostError> {
+    let requested = order.shares;
+    let Some(quantized) = truncate_to_decimal_places(requested.inner().inner(), quantity_decimals)?
+    else {
+        return Ok(CounterTradePreflight::Skipped(
+            CounterTradeSkipReason::InsufficientBuyingPower {
+                estimated_cost_cents: estimate_buffered_cost_cents(
+                    requested,
+                    reference_price,
+                    slippage_bps,
+                )?,
+                available_buying_power_cents,
+            },
+        ));
+    };
+    let quantized = Positive::new(FractionalShares::new(quantized))?;
+    let requested_cost = estimate_buffered_cost_cents(quantized, reference_price, slippage_bps)?;
+    let requested_notional = (quantized.inner().inner() * reference_price)?;
+    let requested_meets_minimum = !fractional_order || requested_notional.gte(float!(1))?;
+
+    if !requested_meets_minimum {
+        return Ok(CounterTradePreflight::Skipped(
+            CounterTradeSkipReason::BelowMinimumNotional,
+        ));
+    }
+
+    let allowed = if available_buying_power_cents >= requested_cost {
+        Some((quantized, requested_cost))
+    } else if available_buying_power_cents <= 0 {
+        None
+    } else {
+        let (maximum_units, _) = quantized
+            .inner()
+            .inner()
+            .to_fixed_decimal_lossy(quantity_decimals)?;
+        let mut low = U256::ZERO;
+        let mut high = maximum_units;
+
+        while low < high {
+            let distance = high - low;
+            let midpoint = low + distance / U256::from(2) + distance % U256::from(2);
+            let shares = Positive::new(FractionalShares::new(Float::from_fixed_decimal(
+                midpoint,
+                quantity_decimals,
+            )?))?;
+            let cost = estimate_buffered_cost_cents(shares, reference_price, slippage_bps)?;
+
+            if cost <= available_buying_power_cents {
+                low = midpoint;
+            } else {
+                high = midpoint - U256::from(1);
+            }
+        }
+
+        if low == U256::ZERO {
+            None
+        } else {
+            let shares = Positive::new(FractionalShares::new(Float::from_fixed_decimal(
+                low,
+                quantity_decimals,
+            )?))?;
+            let cost = estimate_buffered_cost_cents(shares, reference_price, slippage_bps)?;
+            let notional = (shares.inner().inner() * reference_price)?;
+            let meets_fractional_minimum = !fractional_order || notional.gte(float!(1))?;
+
+            if !meets_fractional_minimum {
+                return Ok(CounterTradePreflight::Skipped(
+                    CounterTradeSkipReason::BelowMinimumNotional,
+                ));
+            }
+
+            Some((shares, cost))
+        }
+    };
+
+    match allowed {
+        Some((required, estimated_cost_cents)) => Ok(CounterTradePreflight::Allowed {
             reservation: Some(CounterTradeReservation::BuyingPower {
                 required,
                 estimated_cost_cents,
                 available_buying_power_cents,
             }),
-        }
-    } else {
-        CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
-            estimated_cost_cents,
-            available_buying_power_cents,
-        })
+        }),
+        None => Ok(CounterTradePreflight::Skipped(
+            CounterTradeSkipReason::InsufficientBuyingPower {
+                estimated_cost_cents: requested_cost,
+                available_buying_power_cents,
+            },
+        )),
     }
 }
 
@@ -918,6 +1056,75 @@ mod tests {
         .unwrap();
 
         assert_eq!(rounded_up_cost_cents, 10_101);
+    }
+
+    fn buy_order(shares: &str) -> MarketOrder {
+        MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(
+                Float::parse(shares.to_string()).unwrap(),
+            ))
+            .unwrap(),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+        }
+    }
+
+    #[test]
+    fn resolve_buy_preflight_caps_to_cash_at_broker_precision() {
+        let result =
+            resolve_buy_preflight(&buy_order("2"), float!(100), 100, 10_100, 9, true).unwrap();
+
+        let CounterTradePreflight::Allowed {
+            reservation:
+                Some(CounterTradeReservation::BuyingPower {
+                    required,
+                    estimated_cost_cents,
+                    ..
+                }),
+        } = result
+        else {
+            panic!("expected a partial buying-power reservation");
+        };
+
+        assert!(required.inner().inner().eq(float!(1)).unwrap());
+        assert_eq!(estimated_cost_cents, 10_100);
+    }
+
+    #[test]
+    fn resolve_buy_preflight_skips_zero_cash_and_fractional_dust() {
+        let zero = resolve_buy_preflight(&buy_order("2"), float!(100), 100, 0, 9, true).unwrap();
+        assert!(matches!(
+            zero,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower { .. })
+        ));
+
+        let dust = resolve_buy_preflight(&buy_order("1"), float!(0.5), 0, 25, 9, true).unwrap();
+        assert!(matches!(
+            dust,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::BelowMinimumNotional)
+        ));
+
+        let fully_funded_dust =
+            resolve_buy_preflight(&buy_order("1"), float!(0.5), 0, 100, 9, true).unwrap();
+        assert!(matches!(
+            fully_funded_dust,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::BelowMinimumNotional)
+        ));
+    }
+
+    #[test]
+    fn resolve_buy_preflight_floors_whole_share_orders() {
+        let result =
+            resolve_buy_preflight(&buy_order("3.75"), float!(100), 0, 25_000, 0, false).unwrap();
+
+        let CounterTradePreflight::Allowed {
+            reservation: Some(CounterTradeReservation::BuyingPower { required, .. }),
+        } = result
+        else {
+            panic!("expected a whole-share partial reservation");
+        };
+        assert!(required.inner().inner().eq(float!(2)).unwrap());
     }
 
     #[test]

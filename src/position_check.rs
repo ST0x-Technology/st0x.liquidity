@@ -43,7 +43,7 @@ use crate::trading::offchain::close_flatten::{
 };
 use crate::trading::offchain::hedge::{
     HedgeJobQueue, PlaceHedge, ReferencePriceError, TransientFailureStreak, alert_dead_letter,
-    apply_slippage, resolve_extended_hours_reference_price,
+    apply_slippage, push_anchor_recovery_job_if_absent, resolve_extended_hours_reference_price,
 };
 use crate::trading::onchain::trade_accountant::{DeadLetterReason, SymbolScopedReason};
 
@@ -123,6 +123,27 @@ pub(crate) enum HedgeScanSkipReason {
     MarkFetchFailed,
     QuoteFetchFailed,
     SlippageCalculation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedAnchorRecoveryAction {
+    Preserve,
+    Release,
+    Enqueue,
+}
+
+fn failed_anchor_recovery_action(
+    configured: SupportedExecutor,
+    anchored: SupportedExecutor,
+) -> FailedAnchorRecoveryAction {
+    if configured == anchored {
+        match anchored {
+            SupportedExecutor::AlpacaBrokerApi => FailedAnchorRecoveryAction::Enqueue,
+            SupportedExecutor::DryRun => FailedAnchorRecoveryAction::Release,
+        }
+    } else {
+        FailedAnchorRecoveryAction::Preserve
+    }
 }
 
 impl HedgeScanSkipReason {
@@ -391,6 +412,7 @@ where
         }
 
         let all_positions = self.position_projection.load_all().await?;
+        self.enqueue_failed_anchor_recoveries(&all_positions).await;
         let active_transfers = symbols_with_active_transfers(&self.pool).await?;
 
         // Each symbol is paired with the asset table that sizes its hedge:
@@ -398,6 +420,7 @@ where
         // several do. A symbol no hedged chain enables is not swept.
         let eligible: Vec<(Symbol, &ChainAssets)> = all_positions
             .iter()
+            .filter(|(_, position)| position.last_failed_offchain_order_id.is_none())
             .filter_map(|(symbol, _)| {
                 backstop_sizing_assets(&self.ctx.chains, symbol)
                     .map(|assets| (symbol.clone(), assets))
@@ -418,6 +441,85 @@ where
         }
 
         Ok(())
+    }
+
+    async fn enqueue_failed_anchor_recoveries(&self, positions: &[(Symbol, Position)]) {
+        for (symbol, position) in positions {
+            let Some(anchor) = position.last_failed_offchain_order_id else {
+                continue;
+            };
+            let anchored_order = match self.offchain_order_projection.load(&anchor).await {
+                Ok(Some(order)) => order,
+                Ok(None) => {
+                    if let Err(error) = self
+                        .position
+                        .send(
+                            symbol,
+                            crate::position::PositionCommand::ReleaseFailedOrderAnchor {
+                                expected_offchain_order_id: anchor,
+                            },
+                        )
+                        .await
+                    {
+                        error!(%symbol, %anchor, %error, "Failed to release anchor with no local offchain order");
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    error!(%symbol, %anchor, %error, "Failed to load broker anchor for recovery");
+                    continue;
+                }
+            };
+            match failed_anchor_recovery_action(
+                self.executor.to_supported_executor(),
+                anchored_order.executor(),
+            ) {
+                FailedAnchorRecoveryAction::Preserve => {
+                    debug!(
+                        %symbol,
+                        %anchor,
+                        configured_executor = %self.executor.to_supported_executor(),
+                        anchored_executor = %anchored_order.executor(),
+                        "Leaving broker anchor unchanged because its executor is not configured"
+                    );
+                    continue;
+                }
+                FailedAnchorRecoveryAction::Release => {
+                    if let Err(error) = self
+                        .position
+                        .send(
+                            symbol,
+                            crate::position::PositionCommand::ReleaseFailedOrderAnchor {
+                                expected_offchain_order_id: anchor,
+                            },
+                        )
+                        .await
+                    {
+                        error!(
+                            %symbol,
+                            %anchor,
+                            %error,
+                            "Failed to release broker anchor for an executor without recovery support"
+                        );
+                    }
+                    continue;
+                }
+                FailedAnchorRecoveryAction::Enqueue => {}
+            }
+
+            let job = PlaceHedge::anchor_recovery(
+                symbol.clone(),
+                anchored_order.shares(),
+                anchored_order.direction(),
+                anchored_order.executor(),
+                self.ctx.execution_threshold,
+            );
+            if let Err(error) =
+                push_anchor_recovery_job_if_absent(self.hedge_queue.clone(), job).await
+            {
+                error!(%symbol, %anchor, %error, "Failed to enqueue broker-anchor recovery");
+            }
+        }
     }
 
     async fn check_and_enqueue_symbol(
@@ -465,6 +567,7 @@ where
             market_session: ready.market_session,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         let mut queue = self.hedge_queue.clone();
@@ -1339,7 +1442,7 @@ mod tests {
         CounterTradeOrderKind, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
         OrderPlacementResult, PollOrderStatus, ReconcileOrderFillJobQueue,
     };
-    use crate::position::{PositionCommand, TradeId};
+    use crate::position::{AnchorDisposition, PositionCommand, TradeId};
     use crate::test_utils::{TEST_POLL_INTERVAL, setup_test_pools};
 
     async fn build_ctx(
@@ -1960,6 +2063,95 @@ mod tests {
         CheckPositions::default().perform(&ctx).await.unwrap();
 
         assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_alpaca_anchor_is_preserved_when_dry_run_is_configured() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&[], OperationMode::Disabled);
+        let (ctx, position) =
+            build_ctx(pool, apalis_pool.clone(), cfg, Duration::from_secs(60)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(1)),
+            Direction::Buy,
+        )
+        .await;
+        let anchor = OffchainOrderId::new();
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        ctx.offchain_order
+            .send(
+                &anchor,
+                OffchainOrderCommand::PlaceReserved {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(anchor.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                    buying_power_reservation: None,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &anchor,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "lost placement response".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: anchor,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: anchor,
+                    error: "lost placement response".to_string(),
+                    anchor: crate::position::AnchorDisposition::Preserve,
+                },
+            )
+            .await
+            .unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(1)),
+            Direction::Sell,
+        )
+        .await;
+
+        ctx.scan_and_enqueue(&mut CloseFlattenWindowCache::default())
+            .await
+            .unwrap();
+        ctx.scan_and_enqueue(&mut CloseFlattenWindowCache::default())
+            .await
+            .unwrap();
+
+        assert!(load_hedge_jobs(&apalis_pool).await.is_empty());
+        let recovered = ctx
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.last_failed_offchain_order_id, Some(anchor));
     }
 
     #[tokio::test]
@@ -2821,7 +3013,7 @@ mod tests {
     /// would pass easily; the ask ($1,000, `with_latest_quote`) must be what
     /// actually gets checked and rejected.
     #[tokio::test]
-    async fn close_flatten_buy_preflight_uses_ask_not_stale_trade_price() {
+    async fn close_flatten_buy_preflight_partially_hedges_at_the_ask() {
         let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let (pool, apalis_pool) = setup_test_pools().await;
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
@@ -2869,13 +3061,14 @@ mod tests {
 
         assert_eq!(
             count_jobs(&apalis_pool, &hedge_job_type()).await,
-            0,
-            "the ask-priced preflight must block a buy the stale trade-price preflight would have allowed"
+            1,
+            "the ask-priced preflight must enqueue the affordable partial buy"
         );
         let rendered = metrics_handle.render();
-        assert!(rendered.contains("close_flatten_blocked_total{"));
-        assert!(rendered.contains("reason=\"insufficient_buying_power\""));
-        assert!(rendered.contains("symbol=\"AAPL\""));
+        assert!(
+            !rendered.contains("close_flatten_blocked_total{"),
+            "an affordable partial close-flatten buy is not blocked, in:\n{rendered}"
+        );
     }
 
     /// Companion to the block test above: when cash covers the ask-priced
@@ -2982,7 +3175,7 @@ mod tests {
     /// ($202.00), so this fails if the resolver skips the mark for the delayed
     /// quote or trade price, and equally if the cross is dropped.
     #[tokio::test]
-    async fn ordinary_extended_hours_buy_preflights_the_crossed_mark() {
+    async fn ordinary_extended_hours_buy_partially_hedges_at_the_crossed_mark() {
         let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
         let (pool, apalis_pool) = setup_test_pools().await;
         let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
@@ -3029,8 +3222,8 @@ mod tests {
 
         assert_eq!(
             count_jobs(&apalis_pool, &hedge_job_type()).await,
-            0,
-            "cash covering only the un-crossed mark must block the buy"
+            1,
+            "cash covering only part of the crossed mark must enqueue a partial buy"
         );
         let rendered = metrics_handle.render();
         assert!(
@@ -3148,6 +3341,117 @@ mod tests {
         assert!(
             notifier.messages().is_empty(),
             "DryRun intentionally has no live reference-price provider, so absence is not an incident"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_recovery_releases_a_failed_anchor_without_broker_lookup_support() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            MockExecutor::new(),
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2)),
+            Direction::Buy,
+        )
+        .await;
+        let anchor = OffchainOrderId::new();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: anchor,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &anchor,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(anchor.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &anchor,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "dry-run placement failed".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: anchor,
+                    error: "dry-run placement failed".to_string(),
+                    anchor: AnchorDisposition::Preserve,
+                },
+            )
+            .await
+            .unwrap();
+
+        let positions = ctx.position_projection.load_all().await.unwrap();
+        ctx.enqueue_failed_anchor_recoveries(&positions).await;
+
+        let recovered = ctx
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.last_failed_offchain_order_id, None);
+    }
+
+    #[test]
+    fn failed_anchor_recovery_actions_match_executor_ownership() {
+        assert_eq!(
+            failed_anchor_recovery_action(
+                SupportedExecutor::AlpacaBrokerApi,
+                SupportedExecutor::AlpacaBrokerApi,
+            ),
+            FailedAnchorRecoveryAction::Enqueue
+        );
+        assert_eq!(
+            failed_anchor_recovery_action(SupportedExecutor::DryRun, SupportedExecutor::DryRun,),
+            FailedAnchorRecoveryAction::Release
+        );
+        assert_eq!(
+            failed_anchor_recovery_action(
+                SupportedExecutor::DryRun,
+                SupportedExecutor::AlpacaBrokerApi,
+            ),
+            FailedAnchorRecoveryAction::Preserve
+        );
+        assert_eq!(
+            failed_anchor_recovery_action(
+                SupportedExecutor::AlpacaBrokerApi,
+                SupportedExecutor::DryRun,
+            ),
+            FailedAnchorRecoveryAction::Preserve
         );
     }
 
@@ -3786,9 +4090,8 @@ mod tests {
             "missing offchain-order aggregate must clear the pending claim"
         );
         assert_eq!(
-            aapl_position.last_failed_offchain_order_id,
-            Some(aapl_order_id),
-            "missing offchain-order aggregate must leave a failure anchor for retry"
+            aapl_position.last_failed_offchain_order_id, None,
+            "a missing pre-intent order cannot exist at the broker and must not leave an anchor"
         );
     }
 

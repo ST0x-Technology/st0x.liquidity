@@ -2638,7 +2638,8 @@ impl Reactor for RebalancingService {
                     | ThresholdUpdated { .. }
                     // Dedup bookkeeping only (ADR 0010): no inventory effect.
                     | OnChainFillApplied { .. }
-                    | OnChainFillSettled { .. } => {
+                    | OnChainFillSettled { .. }
+                    | FailedOrderAnchorReleased { .. } => {
                         return Ok(());
                     }
                     ManualPositionAdjusted { .. } => {

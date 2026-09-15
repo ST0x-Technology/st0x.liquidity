@@ -502,6 +502,7 @@ where
     let alerted_dead_letters = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
 
     let hedge_ctx = Arc::new(HedgeCtx {
+        pool: context.pool.clone(),
         position: context.frameworks.position.clone(),
         offchain_order: context.frameworks.offchain_order.clone(),
         order_placer: order_placer.clone(),

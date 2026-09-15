@@ -738,11 +738,11 @@ async fn run_usdc_transfer<Writer: Write>(
         usdc_base: USDC_BASE,
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
         base_wallet: wallet_ctx.base_wallet().clone(),
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
     })?);
 
@@ -772,11 +772,11 @@ async fn run_usdc_transfer<Writer: Write>(
                 .as_ref()
                 .map(|cash| cash.reserved)
                 .map(Positive::inner),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             circle_api_base: rebalancing_ctx.circle_api_base.clone(),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             token_messenger: rebalancing_ctx.token_messenger,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             message_transmitter: rebalancing_ctx.message_transmitter,
         },
         BotGasReceiptCostEnqueuer::Disabled,
