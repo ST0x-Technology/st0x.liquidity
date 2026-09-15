@@ -49,11 +49,13 @@ impl Display for MissingPolicyCoverage {
             self.chain,
         )?;
 
+        let stable = self.chain.settlement_stable().symbol;
+
         for target in &self.missing {
-            let symbol = target.symbol.as_ref().map_or(
-                self.chain.settlement_stable().symbol,
-                st0x_execution::Symbol::as_str,
-            );
+            let symbol = target
+                .symbol
+                .as_ref()
+                .map_or(stable, st0x_execution::Symbol::as_str);
             writeln!(
                 formatter,
                 "- {symbol}: token {}, spender {}, purpose {:?}",
