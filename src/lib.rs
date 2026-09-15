@@ -254,7 +254,9 @@ async fn run_bot_session_inner(
     let equity_price_monitor = ctx.pricing.clone().map(|pricing| {
         dashboard::equity_price::EquityPriceMonitor::new(
             pricing,
-            &ctx.chains.primary().assets,
+            ctx.chains
+                .hedged()
+                .map(|hedged| (hedged.chain.chain_id(), &hedged.assets)),
             equity_prices.clone(),
             event_sender.clone(),
         )
