@@ -22,11 +22,10 @@ use tracing::{debug, info, warn};
 
 use st0x_config::{ChainAssets, PricingAuth, PricingCtx};
 use st0x_dto::{EquityPrice, EquityPriceStatus, Statement};
-use st0x_evm::USDC_BASE;
+use st0x_evm::Chain;
 use st0x_finance::Symbol;
 use st0x_float_macro::float;
 
-const BASE_CHAIN_ID: u64 = 8_453;
 // The pricing service's existing `oracle` identity is scoped to Raindex quotes.
 const CONSUMER: &str = "oracle";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -69,7 +68,11 @@ fn reconnect_jitter() -> Duration {
 #[derive(Clone, Debug)]
 struct ExpectedPrice {
     symbol: Symbol,
-    base: Address,
+    /// Chains this bot trades this symbol on, each mapped to that chain's
+    /// tokenized-equity-derivative address (the `base` token a valid quote
+    /// must name). A frame whose `chain_id` is absent here is for a venue we
+    /// price but do not trade -- discarded, never applied to the read model.
+    traded: HashMap<u64, Address>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,12 +89,14 @@ pub(crate) struct EquityPriceStore {
 }
 
 impl EquityPriceStore {
-    pub(crate) fn new(assets: &ChainAssets) -> Self {
-        let prices = assets
-            .equities
-            .symbols
-            .keys()
-            .cloned()
+    /// Seeds one `None` entry per symbol the bot trades on any chain, so the
+    /// snapshot reports every tradable symbol as unavailable until a price
+    /// arrives. Spans the same chains as [`EquityPriceMonitor::new`] so a
+    /// symbol the monitor accepts is never dropped by the store.
+    pub(crate) fn new<'a>(traded_chains: impl IntoIterator<Item = &'a ChainAssets>) -> Self {
+        let prices = traded_chains
+            .into_iter()
+            .flat_map(|assets| assets.equities.symbols.keys().cloned())
             .map(|symbol| (symbol, None))
             .collect();
 
@@ -194,26 +199,31 @@ pub(crate) struct EquityPriceMonitor {
 }
 
 impl EquityPriceMonitor {
-    pub(crate) fn new(
+    /// `traded_chains` yields, for every chain this bot trades on, that
+    /// chain's id and equity assets. A symbol's price is only accepted on a
+    /// chain it appears under here: the pricing service publishes the same
+    /// symbol on chains we merely price but never trade (e.g. Robinhood), and
+    /// those frames must be discarded rather than clobber the tradable
+    /// chain's price.
+    pub(crate) fn new<'a>(
         ctx: PricingCtx,
-        assets: &ChainAssets,
+        traded_chains: impl IntoIterator<Item = (u64, &'a ChainAssets)>,
         store: EquityPriceStore,
         sender: broadcast::Sender<Statement>,
     ) -> Self {
-        let expected = assets
-            .equities
-            .symbols
-            .iter()
-            .map(|(symbol, asset)| {
-                (
-                    format!("wt{symbol}"),
-                    ExpectedPrice {
+        let mut expected: HashMap<String, ExpectedPrice> = HashMap::new();
+        for (chain_id, assets) in traded_chains {
+            for (symbol, asset) in &assets.equities.symbols {
+                expected
+                    .entry(format!("wt{symbol}"))
+                    .or_insert_with(|| ExpectedPrice {
                         symbol: symbol.clone(),
-                        base: asset.tokenized_equity_derivative,
-                    },
-                )
-            })
-            .collect();
+                        traded: HashMap::new(),
+                    })
+                    .traded
+                    .insert(chain_id, asset.tokenized_equity_derivative);
+            }
+        }
 
         Self {
             ctx,
@@ -447,6 +457,19 @@ impl EquityPriceMonitor {
                     },
                 });
             }
+            Err(InvalidPrice::UntradedChain) => {
+                // A quote for a chain we don't trade this symbol on. The
+                // pricing service publishes the same symbol on chains we only
+                // price and never trade (e.g. Robinhood); those frames are not
+                // ours. Ignore -- never let one clobber the price we hold for a
+                // chain we do trade.
+                debug!(
+                    target: "dashboard",
+                    symbol = %expected.symbol,
+                    chain_id = frame.chain_id,
+                    "Discarding quote for a chain we don't trade this symbol on"
+                );
+            }
             Err(error) => {
                 warn!(target: "dashboard", symbol = %expected.symbol, %error, "Rejecting pricing quote");
                 self.set_unavailable(&expected.symbol).await;
@@ -518,13 +541,22 @@ fn validated_price(
     expected: &ExpectedPrice,
     now: DateTime<Utc>,
 ) -> Result<AvailablePrice, InvalidPrice> {
+    // Chain membership is checked first: a frame for a chain we don't trade
+    // this symbol on is not ours and must never fall through to another error
+    // that would blank the price we hold for a chain we do trade.
+    let Some(&base) = expected.traded.get(&frame.chain_id) else {
+        return Err(InvalidPrice::UntradedChain);
+    };
     if frame.venue != Venue::Raindex {
         return Err(InvalidPrice::Venue);
     }
-    if frame.chain_id != BASE_CHAIN_ID {
-        return Err(InvalidPrice::Chain);
-    }
-    if Address::from(frame.base.0) != expected.base || Address::from(frame.quote.0) != USDC_BASE {
+    // The quote token must be the canonical USDC on the frame's chain, which
+    // differs per chain.
+    let quote = Chain::ALL
+        .into_iter()
+        .find(|chain| chain.chain_id() == frame.chain_id)
+        .map(Chain::usdc);
+    if Address::from(frame.base.0) != base || quote != Some(Address::from(frame.quote.0)) {
         return Err(InvalidPrice::Pair);
     }
 
@@ -641,8 +673,8 @@ async fn fetch_gcp_identity_token_from(
 enum InvalidPrice {
     #[error("venue is not raindex")]
     Venue,
-    #[error("chain is not Base")]
-    Chain,
+    #[error("symbol is not traded on this chain")]
+    UntradedChain,
     #[error("token pair does not match configured wrapped equity and Base USDC")]
     Pair,
     #[error("source or expiry timestamp is invalid")]
@@ -663,6 +695,7 @@ enum InvalidPrice {
 mod tests {
     use alloy::primitives::address;
     use chrono::TimeDelta;
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
     use st0x_pricing_types::{ErrorCode, PingFrame, WireAddress, WireFloat};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
@@ -692,10 +725,13 @@ mod tests {
         }
     }
 
+    const TEST_CHAIN_ID: u64 = 8_453;
+    const TEST_DERIVATIVE: Address = address!("0x1111111111111111111111111111111111111111");
+
     fn expected() -> ExpectedPrice {
         ExpectedPrice {
             symbol: Symbol::new("AAPL").unwrap(),
-            base: address!("0x1111111111111111111111111111111111111111"),
+            traded: HashMap::from([(TEST_CHAIN_ID, TEST_DERIVATIVE)]),
         }
     }
 
@@ -707,8 +743,8 @@ mod tests {
         PriceFrame {
             asset: "wtAAPL".to_string(),
             venue: Venue::Raindex,
-            chain_id: BASE_CHAIN_ID,
-            base: WireAddress::from_bytes(expected().base.into_array()),
+            chain_id: TEST_CHAIN_ID,
+            base: WireAddress::from_bytes(TEST_DERIVATIVE.into_array()),
             quote: WireAddress::from_bytes(USDC_BASE.into_array()),
             rate_base_to_quote: wire_float(bid),
             rate_quote_to_base: wire_float(quote_to_base),
@@ -726,7 +762,7 @@ mod tests {
                     Symbol::new("AAPL").unwrap(),
                     ChainEquityAsset {
                         tokenized_equity: address!("0x2222222222222222222222222222222222222222"),
-                        tokenized_equity_derivative: expected().base,
+                        tokenized_equity_derivative: TEST_DERIVATIVE,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,
@@ -785,6 +821,106 @@ mod tests {
             validated_price(&future, &expected(), now),
             Err(InvalidPrice::FutureTimestamp)
         ));
+    }
+
+    #[test]
+    fn untraded_chain_quote_is_rejected_as_untraded() {
+        let now = Utc::now();
+        let mut untraded = frame(float!(99), float!(0.01), now);
+        // Robinhood (4663): the pricing service publishes this symbol here,
+        // but the bot does not trade it on this chain.
+        untraded.chain_id = 4_663;
+
+        assert!(matches!(
+            validated_price(&untraded, &expected(), now),
+            Err(InvalidPrice::UntradedChain)
+        ));
+    }
+
+    #[test]
+    fn quote_is_accepted_on_any_chain_the_symbol_is_traded_on() {
+        let now = Utc::now();
+        let other_chain = Chain::Ethereum.chain_id();
+        let other_derivative = address!("0x3333333333333333333333333333333333333333");
+        let expected = ExpectedPrice {
+            symbol: Symbol::new("AAPL").unwrap(),
+            traded: HashMap::from([
+                (TEST_CHAIN_ID, TEST_DERIVATIVE),
+                (other_chain, other_derivative),
+            ]),
+        };
+
+        assert!(validated_price(&frame(float!(99), float!(0.01), now), &expected, now).is_ok());
+
+        let mut second = frame(float!(99), float!(0.01), now);
+        second.chain_id = other_chain;
+        second.base = WireAddress::from_bytes(other_derivative.into_array());
+        second.quote = WireAddress::from_bytes(USDC_ETHEREUM.into_array());
+        assert!(validated_price(&second, &expected, now).is_ok());
+    }
+
+    #[tokio::test]
+    async fn untraded_chain_quote_does_not_clobber_a_held_traded_price() {
+        let assets = assets();
+        let store = EquityPriceStore::new([&assets]);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        // A live price on a chain we trade (Base).
+        assert!(
+            store
+                .update(
+                    &symbol,
+                    AvailablePrice {
+                        price_usd: float!(100),
+                        observed_at: now,
+                        expires_at: now + TimeDelta::seconds(30),
+                    },
+                )
+                .await
+        );
+
+        let (sender, _receiver) = broadcast::channel(4);
+        let monitor = EquityPriceMonitor::new(
+            PricingCtx::new(
+                Url::parse("ws://127.0.0.1:1").unwrap(),
+                "pricing-oracle-test-key".to_string(),
+            )
+            .unwrap(),
+            [(TEST_CHAIN_ID, &assets)],
+            store.clone(),
+            sender,
+        );
+
+        // A quote arrives for a chain we do NOT trade this symbol on.
+        let mut untraded = frame(float!(99), float!(0.01), now);
+        untraded.chain_id = 4_663;
+        monitor.apply_frame(untraded).await;
+
+        // The held Base price must survive -- never blanked by an untraded
+        // chain's frame (the FGI-on-Robinhood regression).
+        assert!(matches!(
+            store.snapshot(Utc::now()).await[0].status,
+            EquityPriceStatus::Available { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn store_seeds_symbols_from_every_traded_chain() {
+        let base = assets();
+        let mut other = assets();
+        let asset = other.equities.symbols.values().next().unwrap().clone();
+        other.equities.symbols = HashMap::from([(Symbol::new("TSLA").unwrap(), asset)]);
+
+        let store = EquityPriceStore::new([&base, &other]);
+
+        let symbols: Vec<Symbol> = store
+            .snapshot(Utc::now())
+            .await
+            .into_iter()
+            .map(|price| price.symbol)
+            .collect();
+        assert!(symbols.contains(&Symbol::new("AAPL").unwrap()));
+        assert!(symbols.contains(&Symbol::new("TSLA").unwrap()));
     }
 
     #[tokio::test]
@@ -896,7 +1032,7 @@ mod tests {
             ciborium::from_reader::<ClientFrame, _>(frame.as_ref()).unwrap()
         });
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let (sender, _) = broadcast::channel(4);
         let monitor = EquityPriceMonitor::new(
             PricingCtx::new(
@@ -904,7 +1040,7 @@ mod tests {
                 "pricing-oracle-test-key".to_string(),
             )
             .unwrap(),
-            &assets,
+            [(TEST_CHAIN_ID, &assets)],
             store,
             sender,
         );
@@ -935,7 +1071,7 @@ mod tests {
             socket.close(None).await.unwrap();
         });
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         assert!(
@@ -957,7 +1093,7 @@ mod tests {
                 "pricing-oracle-test-key".to_string(),
             )
             .unwrap(),
-            &assets,
+            [(TEST_CHAIN_ID, &assets)],
             store.clone(),
             sender,
         );
@@ -998,7 +1134,7 @@ mod tests {
             let _ = socket.next().await;
         });
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         assert!(
@@ -1020,7 +1156,7 @@ mod tests {
                 "pricing-oracle-test-key".to_string(),
             )
             .unwrap(),
-            &assets,
+            [(TEST_CHAIN_ID, &assets)],
             store.clone(),
             sender,
         );
@@ -1072,7 +1208,7 @@ mod tests {
             ciborium::from_reader::<ClientFrame, _>(response.as_ref()).unwrap()
         });
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let (sender, _) = broadcast::channel(4);
         let monitor = EquityPriceMonitor::new(
             PricingCtx::new(
@@ -1080,7 +1216,7 @@ mod tests {
                 "pricing-oracle-test-key".to_string(),
             )
             .unwrap(),
-            &assets,
+            [(TEST_CHAIN_ID, &assets)],
             store,
             sender,
         );
@@ -1102,7 +1238,7 @@ mod tests {
     #[tokio::test]
     async fn service_errors_only_invalidate_requested_assets() {
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         assert!(
@@ -1124,7 +1260,7 @@ mod tests {
                 "pricing-oracle-test-key".to_string(),
             )
             .unwrap(),
-            &assets,
+            [(TEST_CHAIN_ID, &assets)],
             store.clone(),
             sender,
         );

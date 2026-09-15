@@ -742,7 +742,7 @@ mod tests {
                 inventory::InventoryView::default(),
                 sender,
             )),
-            equity_prices: equity_price::EquityPriceStore::new(&ChainAssets::default()),
+            equity_prices: equity_price::EquityPriceStore::new([&ChainAssets::default()]),
             settings: empty_settings(),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),

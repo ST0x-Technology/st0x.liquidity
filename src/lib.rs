@@ -249,12 +249,15 @@ async fn run_bot_session_inner(
         inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain),
         event_sender.clone(),
     ));
-    let equity_prices =
-        dashboard::equity_price::EquityPriceStore::new(&ctx.chains.primary().assets);
+    let equity_prices = dashboard::equity_price::EquityPriceStore::new(
+        ctx.chains.hedged().map(|hedged| &hedged.assets),
+    );
     let equity_price_monitor = ctx.pricing.clone().map(|pricing| {
         dashboard::equity_price::EquityPriceMonitor::new(
             pricing,
-            &ctx.chains.primary().assets,
+            ctx.chains
+                .hedged()
+                .map(|hedged| (hedged.chain.chain_id(), &hedged.assets)),
             equity_prices.clone(),
             event_sender.clone(),
         )
