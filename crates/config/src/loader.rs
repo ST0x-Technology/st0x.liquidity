@@ -474,7 +474,8 @@ struct BrokerConfig {
     close_flatten_cross_max_bps: Option<u16>,
     /// Shares every outflow leaves in the broker account per symbol, so
     /// pricing (which marks from `/positions`) never loses the mark. Absent
-    /// means zero, today's behaviour; `[assets.equities.SYM]` overrides it.
+    /// means the minimum partial hedge (0.01); `[assets.equities.SYM]`
+    /// overrides it, and an override of zero opts that symbol out.
     hedge_floor_shares: Option<FractionalShares>,
 }
 
@@ -1041,14 +1042,16 @@ struct ResolvedIdentity {
 
 /// The floor every broker outflow keeps: `[broker] hedge_floor_shares` as
 /// the default, overridden per symbol under `[assets.equities.SYM]`. Absent
-/// means zero. A negative value is refused rather than clamped.
+/// means the minimum partial hedge, the smallest position that still keeps
+/// a mark; zero is an explicit opt-out. A negative value is refused rather
+/// than clamped.
 fn assemble_hedge_floor(
     broker_config: Option<&BrokerConfig>,
     hedging: &HedgingAssets,
 ) -> Result<HedgeFloor, CtxError> {
     let default_shares = broker_config
         .and_then(|config| config.hedge_floor_shares)
-        .unwrap_or(FractionalShares::ZERO);
+        .unwrap_or_else(HedgeFloor::minimum_shares);
     refuse_negative_hedge_floor(None, default_shares)?;
 
     let per_symbol = hedging
@@ -7724,6 +7727,27 @@ mod tests {
             );
         assert_ne!(config, base, "fixture substitutions must apply");
         toml_file(&config)
+    }
+
+    /// A whole-share asset priced in the hundreds may not be worth a share of
+    /// exposure; zero per asset disables the floor there and accepts the
+    /// pricing gap for that symbol only.
+    #[test]
+    fn hedge_floor_zero_override_opts_a_symbol_out() {
+        let config = hedge_floor_config_toml("1", "0");
+        let secrets = alpaca_pricing_secrets_toml();
+
+        let parts = parse_and_validate_files(&config, &secrets).unwrap();
+        let floor = parts.broker.hedge_floor();
+
+        assert_eq!(
+            floor.for_symbol(&Symbol::new("AAPL").unwrap()),
+            FractionalShares::ZERO
+        );
+        assert_eq!(
+            floor.for_symbol(&Symbol::new("MSFT").unwrap()),
+            FractionalShares::new(float!(1))
+        );
     }
 
     #[test]

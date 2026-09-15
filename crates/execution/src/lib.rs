@@ -758,7 +758,7 @@ pub(crate) fn buying_power_counter_trade_preflight(
 /// Minimum shares threshold for partial hedges. Below this amount, the order
 /// is too small for most brokers to accept and would produce repeated
 /// rejected-order attempts.
-static MINIMUM_PARTIAL_HEDGE_SHARES: LazyLock<Float> = LazyLock::new(|| float!(0.01));
+pub(crate) static MINIMUM_PARTIAL_HEDGE_SHARES: LazyLock<Float> = LazyLock::new(|| float!(0.01));
 
 /// Resolves whether a sell counter-trade should proceed given the available
 /// broker inventory and the shares the hedge floor keeps in the account.

@@ -739,18 +739,23 @@ The bot supports multiple brokers through a unified trait interface:
 
 Pricing derives every symbol's mark from this account's positions, so a symbol
 whose position reaches zero has no price anywhere. The bot therefore never takes
-a symbol's broker position to zero: a configured per-symbol floor
-(`[broker] hedge_floor_shares` as the default,
-`[assets.equities.SYM] hedge_floor_shares` as an override, absent meaning zero)
-is subtracted from the available position before any sell hedge is sized, and an
-equity rebalance mint is capped at the same figure. For assets the broker trades
-only in whole shares the floor rounds up to a whole share. The residual is a
-deliberate, bounded unhedged exposure of roughly floor times price per symbol;
-`hedge_floor_shares{symbol}` and `hedge_deficit_shares{symbol}` report the floor
-and the shares the last scan could not hedge. A sell blocked by the floor is
-reported as held at the floor, distinct from an empty account, because the two
-call for different operator action. Onboarding a symbol must fund the account
-with at least the floor; the bot does not seed positions.
+a symbol's broker position to zero: a per-symbol floor is subtracted from the
+available position before any sell hedge is sized, and an equity rebalance mint
+is capped at the same figure. The floor defaults to the minimum partial hedge,
+0.01 shares, the smallest position the bot treats as real and the smallest that
+keeps a mark alive. For assets the broker trades only in whole shares any
+positive floor rounds up to one whole share, which is the whole exposure that
+case costs. `[broker] hedge_floor_shares` overrides the default globally and
+`[assets.equities.SYM] hedge_floor_shares` per symbol; zero opts a symbol out
+and accepts the pricing gap for it alone, the choice for a whole-share asset not
+worth a full share of exposure. The residual is a deliberate, bounded unhedged
+exposure of roughly floor times price per symbol; `hedge_floor_shares{symbol}`
+and `hedge_deficit_shares{symbol}` report the floor and the shares the last scan
+could not hedge. A sell blocked by the floor is reported as held at the floor,
+distinct from an empty account, because the two call for different operator
+action. The floor holds a position; it never establishes one. Onboarding a
+symbol must fund the account with at least the floor, and a symbol already at
+zero stays dark until a redemption or a manual buy puts shares there.
 
 #### Extended-Hours Counter-Trading
 

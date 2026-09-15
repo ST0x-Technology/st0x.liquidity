@@ -57,10 +57,10 @@ extended_hours_close_flatten_window_secs = 900
 close_flatten_cross_max_bps = 400
 # hedge_floor_shares: shares every sell hedge and equity mint leaves in the
 # account per symbol, so pricing (which marks from this account's positions)
-# never loses a symbol's price; ST0-58. Absent means 0. Overridable under
-# [assets.equities.SYM]. Enable once the build that knows the field is
-# deployed and every configured symbol holds at least the floor.
-# hedge_floor_shares = 1
+# never loses a symbol's price; ST0-58. Absent means the default, 0.01, one
+# whole share on whole-share assets, on from the first build that knows it.
+# Overridable under [assets.equities.SYM]; 0 there opts a symbol out. Not
+# written here: the running image refuses fields it does not know.
 
 # Travel Rule beneficiary identity for Alpaca whitelist creation.
 [broker.travel_rule]

@@ -229,7 +229,8 @@ pub struct EquityHedgePolicy {
     pub extended_hours_counter_trading: OperationMode,
     /// Overrides `[broker] hedge_floor_shares` for this symbol: the shares a
     /// sell hedge or mint always leaves in the broker account. Absent means
-    /// the broker default applies.
+    /// the broker default applies; zero opts this symbol out, which is the
+    /// choice for a whole-share asset not worth a full share of exposure.
     #[serde(default)]
     pub hedge_floor_shares: Option<FractionalShares>,
 }

@@ -179,8 +179,10 @@ Direction logic: positive net position -> sell offchain; negative net position
 The shares of a symbol every outflow leaves in the broker account: a sell hedge
 is sized against `available - floor`, an equity mint against `offchain - floor`.
 Exists because pricing marks each symbol from the broker's positions, so a flat
-position means no price. Configured as `hedge_floor_shares`, globally under
-`[broker]` and per symbol under `[assets.equities.SYM]`; the type is
+position means no price. Defaults to the minimum partial hedge, 0.01 shares, and
+rounds up to one whole share for assets the broker trades only in whole units.
+Configured as `hedge_floor_shares`, globally under `[broker]` and per symbol
+under `[assets.equities.SYM]`; zero per symbol opts that symbol out. The type is
 `HedgeFloor`. A sell the floor blocks is `HeldAtFloor`, never
 `InsufficientEquity`: the first is expected, the second means the account needs
 funding. The unhedged residual it leaves is the hedge deficit, exported as

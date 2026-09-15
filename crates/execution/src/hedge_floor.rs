@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use st0x_float_macro::float;
 
-use crate::{FractionalShares, Symbol};
+use crate::{FractionalShares, MINIMUM_PARTIAL_HEDGE_SHARES, Symbol};
 
 /// The configured floor: one global default plus per-symbol overrides.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,13 @@ impl HedgeFloor {
             default_shares,
             per_symbol,
         }
+    }
+
+    /// The smallest position the bot treats as real: any nonzero position
+    /// keeps the mark alive, and below this the bot never sells anyway, so
+    /// this is the floor when nothing is configured.
+    pub fn minimum_shares() -> FractionalShares {
+        FractionalShares::new(*MINIMUM_PARTIAL_HEDGE_SHARES)
     }
 
     /// Floor for `symbol`: its override when configured, else the default.
@@ -93,6 +100,11 @@ mod tests {
         assert_eq!(whole_share_floor(shares("1.2")).unwrap(), shares("2"));
         assert_eq!(whole_share_floor(shares("3")).unwrap(), shares("3"));
         assert_eq!(whole_share_floor(shares("0")).unwrap(), shares("0"));
+    }
+
+    #[test]
+    fn minimum_floor_is_the_minimum_partial_hedge() {
+        assert_eq!(HedgeFloor::minimum_shares(), shares("0.01"));
     }
 
     #[test]
