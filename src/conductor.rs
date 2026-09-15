@@ -934,7 +934,7 @@ impl Conductor {
             portfolio_snapshot,
             wallet_polling,
             tokenizer,
-            wrapper,
+            wrappers,
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck,
@@ -1042,7 +1042,7 @@ impl Conductor {
             inventory: inventory.clone(),
             wallet_polling,
             tokenizer,
-            wrapper,
+            wrappers,
             shutdown_token: shutdown_token.clone(),
             startup_token: startup_tokens.apalis_monitor,
             supervisor_startup: startup_tokens.supervisor,
@@ -1663,7 +1663,10 @@ struct RebalancingInfrastructure {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     tokenizer: Arc<dyn Tokenizer>,
-    wrapper: Arc<dyn Wrapper>,
+    /// One ratio source per watched chain that rebalances equity, handed to
+    /// the daily portfolio capture so a wrapped balance is valued with the
+    /// ratio of the chain it sits on.
+    wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     /// Operator `transfer recheck` entry point for a failed USDC deposit,
@@ -1709,7 +1712,7 @@ struct PositionAndRebalancing {
     portfolio_snapshot: Arc<Store<PortfolioSnapshot>>,
     wallet_polling: crate::inventory::WalletPollingCtx,
     tokenizer: Arc<dyn Tokenizer>,
-    wrapper: Arc<dyn Wrapper>,
+    wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
@@ -1763,8 +1766,11 @@ struct ChainTokenization<Signer: Wallet> {
 /// What a watched chain's tokenization set can do beyond signing.
 enum EquityTokenization {
     /// The chain hedges its fills and rebalances no equity: nothing is
-    /// minted, wrapped or redeemed there, so it needs no wrapper vault,
-    /// issuer client or redemption wallet, and the preflight attests nothing.
+    /// minted, wrapped or redeemed there, so it needs no issuer client,
+    /// redemption wallet or mint authorizer, and the preflight attests
+    /// nothing. Its vaults still hold wrapped shares the daily portfolio
+    /// capture must value, so it still gets a ratio reader
+    /// ([`watched_chain_wrappers`]).
     HedgeOnly,
     /// The chain moves equity between its vaults and the broker.
     Rebalancing(EquityTokenizationServices),
@@ -1914,7 +1920,7 @@ impl PositionAndRebalancing {
             portfolio_snapshot,
             wallet_polling,
             tokenizer: infra.tokenizer,
-            wrapper: infra.wrapper,
+            wrappers: infra.wrappers,
             service: infra.service,
             recovery_transfer: infra.recovery_transfer,
             usdc_recheck: infra.usdc_recheck,
@@ -2755,11 +2761,49 @@ fn build_rebalancing_service(
 }
 
 /// Every watched chain's equity transfer services, plus the per-chain vault
-/// registry ids and wrappers the trigger reads.
+/// registry ids the trigger reads and the per-chain ratio readers
+/// [`watched_chain_wrappers`] builds. `chains` and `registry_ids` cover the
+/// chains that rebalance equity; `wrappers` covers every watched chain.
 struct WatchedEquityServices {
     chains: BTreeMap<Chain, ChainEquityServices>,
     registry_ids: BTreeMap<Chain, VaultRegistryId>,
     wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
+}
+
+/// One ERC-4626 ratio reader per watched chain, hedge-only chains included.
+///
+/// Every watched chain's market-making vaults hold that chain's
+/// `tokenized_equity_derivative` -- wrapped vault shares -- and vault polling
+/// reads them all, so the daily portfolio capture needs the ratio of the chain
+/// each balance sits on to value it in underlying units. A hedge-only chain is
+/// exempt from the ISSUING half of the equity leg (issuer client, redemption
+/// wallet, mint authorizer, wrap and deposit approvals), not from reading its
+/// own vault's ratio: that reader needs only the chain's signer and its asset
+/// table, both of which a hedge-only chain keeps.
+fn watched_chain_wrappers<Signer: Wallet + Clone + 'static>(
+    ctx: &Ctx,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+) -> anyhow::Result<BTreeMap<Chain, Arc<dyn Wrapper>>> {
+    tokenizations
+        .iter()
+        .map(|(chain, tokenization)| {
+            let wrapper: Arc<dyn Wrapper> = match &tokenization.equity {
+                EquityTokenization::Rebalancing(equity) => equity.wrapper.clone(),
+                EquityTokenization::HedgeOnly => {
+                    let watched = ctx.chains.watch(*chain).with_context(|| {
+                        format!(
+                            "{chain} has tokenization services but no \
+                             [chains.{chain}.trading] table"
+                        )
+                    })?;
+
+                    build_wrapper(tokenization.wallet.clone(), watched)
+                }
+            };
+
+            Ok((*chain, wrapper))
+        })
+        .collect()
 }
 
 /// Builds one [`ChainEquityServices`] per watched chain, so a mint or
@@ -2770,8 +2814,9 @@ struct WatchedEquityServices {
 /// here (see [`build_equity_gas_readiness`]). A hedge-only chain gets no
 /// entry at all, so a transfer naming it is refused by the lookup; the
 /// primary, which always carries the equity leg, keeps the fail-closed
-/// `Unwired` check when it rebalances nothing.
-fn build_watched_equity_services<Signer: Wallet + Clone>(
+/// `Unwired` check when it rebalances nothing. Its ratio reader is the one
+/// exception ([`watched_chain_wrappers`]).
+fn build_watched_equity_services<Signer: Wallet + Clone + 'static>(
     deps: &RebalancingDeps,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
     wallets: &ChainWallets<Signer>,
@@ -2803,9 +2848,9 @@ fn build_watched_equity_services<Signer: Wallet + Clone>(
     )?;
     drop(gas_chains);
 
+    let wrappers = watched_chain_wrappers(&deps.ctx, tokenizations)?;
     let mut chains = BTreeMap::new();
     let mut registry_ids = BTreeMap::new();
-    let mut wrappers: BTreeMap<Chain, Arc<dyn Wrapper>> = BTreeMap::new();
     for (chain, tokenization) in tokenizations {
         let equity = match &tokenization.equity {
             EquityTokenization::HedgeOnly => {
@@ -2827,7 +2872,6 @@ fn build_watched_equity_services<Signer: Wallet + Clone>(
         );
 
         registry_ids.insert(*chain, registry_id);
-        wrappers.insert(*chain, equity.wrapper.clone());
         chains.insert(
             *chain,
             ChainEquityServices {
@@ -2918,7 +2962,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         preflight_tokenization(&deps.ctx, &tokenizations, issuance_client.as_ref()).await?;
 
         let tokenizer = primary_equity.tokenizer.clone();
-        let wrapper = primary_equity.wrapper.clone();
 
         let mint_authorization =
             build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
@@ -2951,7 +2994,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let notifier = deps.notifier.clone();
 
         let rebalancing_service =
-            build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers);
+            build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
 
         wire_transfer_admission_guards(
             &rebalancing_service,
@@ -3095,7 +3138,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             position_projection: built.position_projection,
             snapshot: built.snapshot,
             tokenizer,
-            wrapper,
+            wrappers,
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck: usdc_handles.recheck_deposit,
@@ -15845,6 +15888,34 @@ mod tests {
                 },
             ),
         ])
+    }
+
+    /// Vault polling reads every watched chain's market-making vaults, and
+    /// those hold that chain's `tokenized_equity_derivative` -- wrapped vault
+    /// shares -- so the daily portfolio capture needs the ratio reader of the
+    /// chain each balance sits on. A hedge-only chain is exempt from the
+    /// issuing half of the equity leg, not from reading its own vault's
+    /// ratio, and the reader must read that chain's own asset table rather
+    /// than the primary's.
+    #[test]
+    fn watched_chain_wrappers_cover_a_hedge_only_secondary() {
+        let ctx = ctx_with_base_and_ethereum_trading();
+        let tokenizations = base_and_hedge_only_ethereum_tokenizations(MockWrapper::new());
+
+        let wrappers = watched_chain_wrappers(&ctx, &tokenizations).unwrap();
+
+        assert_eq!(
+            wrappers.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base, Chain::Ethereum],
+            "every watched chain needs a ratio reader for its market-making shares"
+        );
+        assert_eq!(
+            wrappers[&Chain::Ethereum]
+                .lookup_underlying(&Symbol::new("TSLA").unwrap())
+                .unwrap(),
+            Address::repeat_byte(0xe5),
+            "the hedge-only chain's reader must resolve its own tokenized equity"
+        );
     }
 
     /// Startup with a hedge-only Ethereum next to the Base primary: the
