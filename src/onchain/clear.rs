@@ -7,7 +7,7 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use tracing::debug;
 
-use st0x_config::TradingChain;
+use st0x_config::HedgedChain;
 use st0x_evm::Evm;
 use st0x_registry::SymbolCache;
 
@@ -20,7 +20,7 @@ impl OnchainTrade {
     /// Creates OnchainTrade directly from ClearV3 blockchain events
     #[tracing::instrument(target = "hedge", skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
     pub async fn try_from_clear_v3<E: Evm>(
-        trading_chain: &TradingChain,
+        hedged_chain: &HedgedChain,
         cache: &SymbolCache,
         evm: &E,
         event: ClearV3,
@@ -64,7 +64,7 @@ impl OnchainTrade {
             return Ok(None);
         }
 
-        let after_clear = fetch_after_clear_event(evm, trading_chain, &log).await?;
+        let after_clear = fetch_after_clear_event(evm, hedged_chain, &log).await?;
 
         let ClearStateChangeV2 {
             aliceOutput,
@@ -91,15 +91,9 @@ impl OnchainTrade {
             (bob_order, fill)
         };
 
-        let result = Self::try_from_order_and_fill_details(
-            trading_chain.chain,
-            cache,
-            evm,
-            order,
-            fill,
-            log,
-        )
-        .await;
+        let result =
+            Self::try_from_order_and_fill_details(hedged_chain.chain, cache, evm, order, fill, log)
+                .await;
 
         if let Ok(Some(ref trade)) = result {
             debug!(
@@ -131,7 +125,7 @@ impl OnchainTrade {
 /// returned 0 AfterClearV2 logs, but `get_transaction_receipt` showed both logs present.
 async fn fetch_after_clear_event(
     evm: &impl Evm,
-    trading_chain: &TradingChain,
+    hedged_chain: &HedgedChain,
     log: &Log,
 ) -> Result<AfterClearV2, OnChainError> {
     let block_number = log
@@ -142,7 +136,7 @@ async fn fetch_after_clear_event(
 
     let filter = Filter::new()
         .select(block_number)
-        .address(trading_chain.orderbook)
+        .address(hedged_chain.orderbook)
         .event_signature(AfterClearV2::SIGNATURE_HASH);
 
     let after_clear_logs = evm.provider().get_logs(&filter).await?;
@@ -194,7 +188,7 @@ async fn fetch_after_clear_event(
         .logs()
         .iter()
         .filter(|receipt_log| {
-            receipt_log.address() == trading_chain.orderbook
+            receipt_log.address() == hedged_chain.orderbook
                 && receipt_log.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
                 && receipt_log
                     .log_index
@@ -217,11 +211,11 @@ async fn fetch_after_clear_event(
 
     // Check what's actually in the receipt for error reporting
     let clear_in_receipt = tx_receipt.inner.logs().iter().any(|log| {
-        log.address() == trading_chain.orderbook
+        log.address() == hedged_chain.orderbook
             && log.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
     });
     let after_clear_in_receipt = tx_receipt.inner.logs().iter().any(|log| {
-        log.address() == trading_chain.orderbook
+        log.address() == hedged_chain.orderbook
             && log.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
     });
 
@@ -271,8 +265,8 @@ mod tests {
 
     /// A non-Base chain, so a conversion path that hard-codes `Chain::Base`
     /// fails the chain-propagation assertions below.
-    fn create_test_ctx() -> TradingChain {
-        TradingChain::test()
+    fn create_test_ctx() -> HedgedChain {
+        HedgedChain::test()
             .chain(Chain::Ethereum)
             .deployment_block(1)
             .call()

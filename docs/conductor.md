@@ -59,7 +59,7 @@ nothing enqueued). The `backfill-worker` fetches the logs and pushes an
 success. The cutoff tag is unrelated to `required_confirmations`, which governs
 only transaction-submission paths.
 
-Each watched chain has its own required `order_fill_poll_interval_secs` and
+Each hedged chain has its own required `order_fill_poll_interval_secs` and
 independent backfill queue. All fill scans, including startup catch-up and
 durable retries, split inclusive block ranges using explicit chain constants:
 Base and Ethereum use 1000 blocks per request; HyperEVM uses 50. This applies to
@@ -1132,9 +1132,9 @@ cadence is required config and must be non-zero.
 
 With `[alerts]` configured, Base and Ethereum always have separate gas monitors.
 HyperEVM gets a third monitor only when its lifecycle is not `disabled` and it
-has a trading table. This includes observe-only watched use; transport-only
+has a trading table. This includes observe-only hedged use; transport-only
 HyperEVM keeps its existing configuration without a HYPE threshold. Enabled
-watched HyperEVM requires alerts and a positive HyperEVM threshold. Unselected
+hedged HyperEVM requires alerts and a positive HyperEVM threshold. Unselected
 HyperEVM thresholds are rejected rather than silently ignored.
 
 Each monitor uses its own chain's signing wallet and RPC provider. ETH and HYPE

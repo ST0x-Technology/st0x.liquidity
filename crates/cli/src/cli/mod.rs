@@ -2190,15 +2190,10 @@ mod tests {
     use st0x_config::HedgingAssets;
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{BrokerCtx, LogFormat, LogLevel};
-    use st0x_config::{IngestionCutoff, InventoryMode, TradingChain};
+    use st0x_config::{HedgedChain, IngestionCutoff, InventoryMode};
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_float_macro::float;
-    use st0x_tokenization::IssuerRequestId;
-    use st0x_tokenization::mock::MockTokenizer;
-    use st0x_wrapper::MockWrapper;
-
-    use super::*;
     use st0x_hedge::operator::mint_authorization::ConfiguredMintAuthorizer;
     use st0x_hedge::operator::native_gas::ConfiguredGasReadiness;
     use st0x_hedge::operator::offchain::order::OffchainOrderEvent;
@@ -2209,6 +2204,11 @@ mod tests {
         TokenizedEquityMint, TokenizedEquityMintCommand,
     };
     use st0x_hedge::operator::vault_lookup::MockVaultLookup;
+    use st0x_tokenization::IssuerRequestId;
+    use st0x_tokenization::mock::MockTokenizer;
+    use st0x_wrapper::MockWrapper;
+
+    use super::*;
 
     fn positive_shares(value: &str) -> Positive<FractionalShares> {
         try_positive_shares(value).expect("test shares must be valid and positive")
@@ -2236,8 +2236,8 @@ mod tests {
             log_query_url_template: None,
             server_port: 8080,
             board_port: 8081,
-            chains: ChainRegistry::single_trading_chain(
-                TradingChain::test()
+            chains: ChainRegistry::single_hedged_chain(
+                HedgedChain::test()
                     .orderbook(address!("0x1234567890123456789012345678901234567890"))
                     .inventory(InventoryMode::Managed {
                         inventory: address!("0x1234567890123456789012345678901234567890"),

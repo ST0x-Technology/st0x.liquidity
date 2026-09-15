@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use st0x_config::{Ctx, TradingChain};
+use st0x_config::{Ctx, HedgedChain};
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Chain, ReadOnlyEvm};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
@@ -71,7 +71,7 @@ pub struct AccountForDexTrade {
 /// from another chain silently mis-processes the fill (a wrong `vault_owner`
 /// owner-filters every fill out; wrong contracts reconstruct wrong logs).
 pub(crate) struct ChainAccounting<Node> {
-    pub(crate) trading: TradingChain,
+    pub(crate) trading: HedgedChain,
     /// Orderbook and shared `RaindexInventory` addresses on this chain --
     /// the latter is the source contract for `InventoryTrade` events
     /// (`OperatorDeposit`/`OperatorWithdraw`). Used to reconstruct the
@@ -84,7 +84,7 @@ pub(crate) struct ChainAccounting<Node> {
 pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) ctx: Ctx,
     pub(crate) cache: SymbolCache,
-    /// One [`ChainAccounting`] per watched chain; jobs resolve theirs from
+    /// One [`ChainAccounting`] per hedged chain; jobs resolve theirs from
     /// the fill payload's chain.
     pub(crate) chains: std::collections::BTreeMap<Chain, ChainAccounting<Node>>,
     pub(crate) cqrs: TradeProcessingCqrs,
@@ -136,7 +136,7 @@ where
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
         let trade_event = &self.trade;
         let chain_ctx = ctx.chains.get(&trade_event.chain).ok_or_else(|| {
-            TradeAccountingError::OnChain(OnChainError::UnwatchedChain {
+            TradeAccountingError::OnChain(OnChainError::UnhedgedChain {
                 chain: trade_event.chain,
             })
         })?;
@@ -1129,7 +1129,7 @@ mod tests {
         assert!(notifier.messages()[0].contains("DISABLED"));
     }
 
-    /// The dedup key is chain and symbol: a symbol disabled on two watched
+    /// The dedup key is chain and symbol: a symbol disabled on two hedged
     /// chains pages once per chain, each message naming its own chain.
     #[tokio::test]
     async fn disabled_asset_alert_pages_per_chain() {
@@ -1168,10 +1168,10 @@ mod tests {
         assert!(messages[1].contains("chain ethereum"));
     }
 
-    /// A job stamped with a chain no watched entry covers fails loudly
+    /// A job stamped with a chain no hedged entry covers fails loudly
     /// instead of silently accounting against the wrong chain's contracts.
     #[tokio::test]
-    async fn fill_on_unwatched_chain_is_refused() {
+    async fn fill_on_unhedged_chain_is_refused() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
@@ -1192,7 +1192,7 @@ mod tests {
         let error = job.perform(&ctx).await.unwrap_err();
         assert!(matches!(
             error,
-            TradeAccountingError::OnChain(OnChainError::UnwatchedChain {
+            TradeAccountingError::OnChain(OnChainError::UnhedgedChain {
                 chain: Chain::HyperEvm
             })
         ));
@@ -1299,7 +1299,7 @@ mod tests {
             ExecutionThreshold::whole_share(),
         )
         .await;
-        let mut secondary = TradingChain::test().chain(Chain::HyperEvm).call();
+        let mut secondary = HedgedChain::test().chain(Chain::HyperEvm).call();
         secondary.vault_owner = owner;
         secondary.orderbook = Address::repeat_byte(0x96);
         secondary.assets.equities.symbols.insert(
