@@ -7,9 +7,9 @@
 //! `available - floor` instead of `available`. The residual is a deliberate,
 //! bounded unhedged exposure; a floor of zero disables it.
 
+use rain_math_float::FloatError;
 use std::collections::HashMap;
 
-use rain_math_float::FloatError;
 use st0x_float_macro::float;
 
 use crate::{FractionalShares, Symbol};

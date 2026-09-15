@@ -7741,8 +7741,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn validate_files_refuses_a_negative_hedge_floor() {
+    #[test]
+    fn validate_files_refuses_a_negative_hedge_floor() {
         let config = hedge_floor_config_toml("1", "-1");
         let secrets = alpaca_pricing_secrets_toml();
 
