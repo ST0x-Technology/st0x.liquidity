@@ -744,8 +744,9 @@ available position before any sell hedge is sized, and an equity rebalance mint
 is capped at the same figure. The floor defaults to the minimum partial hedge,
 0.01 shares, the smallest position the bot treats as real and the smallest that
 keeps a mark alive. For assets the broker trades only in whole shares any
-positive floor rounds up to one whole share, which is the whole exposure that
-case costs. `[broker] hedge_floor_shares` overrides the default globally and
+positive fractional floor rounds up to the next whole share (the default 0.01
+becomes 1, 1.2 becomes 2), the smallest exposure that case costs.
+`[broker] hedge_floor_shares` overrides the default globally and
 `[assets.equities.SYM] hedge_floor_shares` per symbol; zero opts a symbol out
 and accepts the pricing gap for it alone, the choice for a whole-share asset not
 worth a full share of exposure. The residual is a deliberate, bounded unhedged
