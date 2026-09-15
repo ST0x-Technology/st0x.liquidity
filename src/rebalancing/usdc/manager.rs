@@ -4888,17 +4888,29 @@ pub(crate) enum CctpMintRecoveryError {
     Transfer(#[from] Box<UsdcTransferError>),
 }
 
-/// Trait-erased entry point for the operator `cctp complete-mint` recovery
-/// of a burn whose destination mint never completed: polls the attestation
-/// for the burn and submits `receiveMessage` through the bot's own bridge and
-/// wallet. Live RPC only; touches no aggregate. The caller quiesces the USDC
-/// driver so a worker cannot drive the same mint concurrently.
+/// Two-phase entry point for the operator `cctp complete-mint` recovery of a
+/// burn whose destination mint never completed.
+///
+/// [`Self::poll_recovery_attestation`] polls Circle for the burn's attestation. It
+/// is read only, touches no aggregate and no wallet, and is bounded but can take
+/// minutes, so the caller runs it without the resume lock or the driver pause: a
+/// burn Circle has not attested yet must not park unrelated USDC work.
+/// [`Self::submit_recovered_cctp_mint`] submits `receiveMessage` and records the
+/// mint gas; it spends the wallet and can race the driver, so the caller holds
+/// the resume lock and quiesces the USDC driver across it only.
 #[async_trait::async_trait]
 pub(crate) trait RecoverCctpMint: Send + Sync + 'static {
-    async fn recover_cctp_mint(
+    async fn poll_recovery_attestation(
         &self,
         direction: BridgeDirection,
         burn_tx: TxHash,
+    ) -> Result<AttestationResponse, CctpMintRecoveryError>;
+
+    async fn submit_recovered_cctp_mint(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+        attestation: AttestationResponse,
     ) -> Result<RecoveredCctpMint, CctpMintRecoveryError>;
 }
 
@@ -4908,16 +4920,23 @@ where
     Signer: Wallet + Send + Sync + 'static,
     B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
 {
-    async fn recover_cctp_mint(
+    async fn poll_recovery_attestation(
         &self,
         direction: BridgeDirection,
         burn_tx: TxHash,
-    ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
-        let attestation = self
-            .cctp_bridge
+    ) -> Result<AttestationResponse, CctpMintRecoveryError> {
+        self.cctp_bridge
             .poll_attestation(direction, burn_tx)
             .await
-            .map_err(|source| CctpMintRecoveryError::Attestation { burn_tx, source })?;
+            .map_err(|source| CctpMintRecoveryError::Attestation { burn_tx, source })
+    }
+
+    async fn submit_recovered_cctp_mint(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+        attestation: AttestationResponse,
+    ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
         let receipt = self
             .cctp_bridge
             .mint(direction, &attestation)
@@ -17238,8 +17257,16 @@ mod tests {
         )
         .await;
 
+        let attestation = manager
+            .poll_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
+            .await
+            .unwrap();
         let recovered = manager
-            .recover_cctp_mint(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
+            .submit_recovered_cctp_mint(
+                BridgeDirection::BaseToEthereum,
+                TxHash::repeat_byte(0x11),
+                attestation,
+            )
             .await
             .unwrap();
         assert_eq!(recovered.mint_tx, mint_tx);

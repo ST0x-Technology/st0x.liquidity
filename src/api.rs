@@ -2638,10 +2638,12 @@ struct CompleteCctpMintResponse {
 /// lands, bring the stuck `UsdcRebalance` back in sync with `resume-usdc`
 /// (non-terminal: adopts the mint) or `reconcile-usdc` (post-burn terminal).
 ///
-/// Runs under the resume lock and with the USDC driver quiesced for its whole
-/// duration, so no worker can drive the same mint concurrently. Attestation
-/// polling is bounded (60 attempts, 5s apart); a burn Circle has not attested
-/// yet is reported as 502 and is retryable.
+/// The attestation poll (bounded to 60 attempts, 5s apart) runs before the
+/// resume lock and the driver pause are taken, since it is read only and can
+/// take minutes: a burn Circle has not attested yet must not park unrelated
+/// USDC work. The resume lock and the driver pause are held only around the
+/// mint submission, which spends the wallet and races the driver. A burn not
+/// attested yet is reported as 502 and is retryable.
 ///
 /// Mirrors `stox cctp complete-mint`.
 async fn complete_cctp_mint(
@@ -2658,15 +2660,6 @@ async fn complete_cctp_mint(
     })?;
     let direction = request.source_chain.bridge_direction();
 
-    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
-        (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: "A resume or recheck operation is already in progress".to_string(),
-            }),
-        )
-    })?;
-
     let handle = state.recovery.get().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2676,17 +2669,59 @@ async fn complete_cctp_mint(
         )
     })?;
 
-    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause).await?;
+    complete_cctp_mint_recovery(
+        handle.cctp_mint_recovery.as_ref(),
+        &state.resume_lock,
+        &handle.usdc_driver_pause,
+        direction,
+        burn_tx,
+    )
+    .await
+}
 
-    let recovered = handle
-        .cctp_mint_recovery
-        .recover_cctp_mint(direction, burn_tx)
+/// Maps a failed CCTP mint recovery to its HTTP response, logging the internal
+/// detail at the call site.
+fn cctp_recovery_failure(
+    error: &CctpMintRecoveryError,
+    burn_tx: TxHash,
+    direction: BridgeDirection,
+) -> (StatusCode, Json<ErrorResponse>) {
+    error!(?error, %burn_tx, ?direction, "CCTP mint recovery failed");
+    let (status, message) = cctp_mint_recovery_error_response(error);
+    (status, Json(ErrorResponse { error: message }))
+}
+
+/// The lock-ordered half of [`complete_cctp_mint`]. Polls Circle for the burn's
+/// attestation WITHOUT the resume lock or the driver pause, then takes both only
+/// around the mint submission and the post-mint gas handling. Keeping the poll
+/// lock free is the point: it is read only and can take minutes, so a burn that
+/// Circle has not attested yet must not park unrelated USDC work.
+async fn complete_cctp_mint_recovery(
+    recovery: &dyn RecoverCctpMint,
+    resume_lock: &ResumeLock,
+    driver_pause: &UsdcDriverPause,
+    direction: BridgeDirection,
+    burn_tx: TxHash,
+) -> Result<Json<CompleteCctpMintResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let attestation = recovery
+        .poll_recovery_attestation(direction, burn_tx)
         .await
-        .map_err(|error| {
-            error!(?error, %burn_tx, ?direction, "CCTP mint recovery failed");
-            let (status, message) = cctp_mint_recovery_error_response(&error);
-            (status, Json(ErrorResponse { error: message }))
-        })?;
+        .map_err(|error| cctp_recovery_failure(&error, burn_tx, direction))?;
+
+    let _guard = resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A resume or recheck operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+    let _driver_paused = quiesce_usdc_driver(driver_pause).await?;
+
+    let recovered = recovery
+        .submit_recovered_cctp_mint(direction, burn_tx, attestation)
+        .await
+        .map_err(|error| cctp_recovery_failure(&error, burn_tx, direction))?;
 
     info!(%burn_tx, ?direction, mint_tx = %recovered.mint_tx, "CCTP mint recovered via API");
     Ok(Json(CompleteCctpMintResponse {
@@ -3539,7 +3574,7 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use alloy::primitives::{Address, TxHash};
     use axum::body::{Body, to_bytes};
@@ -3591,7 +3626,9 @@ mod tests {
     };
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
-    use crate::rebalancing::usdc::{UsdcTransferError, usdc_driver_pause};
+    use crate::rebalancing::usdc::{
+        RecoveredCctpMint, UsdcDriverGate, UsdcTransferError, usdc_driver_pause,
+    };
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::usdc_rebalance::{ConversionAmounts, RebalanceDirection, TransferRef};
 
@@ -7854,6 +7891,82 @@ mod tests {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A `RecoverCctpMint` whose attestation poll records whether the resume
+    /// lock is free and the driver is unpaused at poll time, then reports the
+    /// burn as not yet attested. `submit` must never run for an unattested burn.
+    struct PollProbe {
+        resume_lock: Arc<ResumeLock>,
+        gate: UsdcDriverGate,
+        lock_free_at_poll: Arc<AtomicBool>,
+        driver_free_at_poll: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl RecoverCctpMint for PollProbe {
+        async fn poll_recovery_attestation(
+            &self,
+            _direction: BridgeDirection,
+            burn_tx: TxHash,
+        ) -> Result<st0x_bridge::cctp::AttestationResponse, CctpMintRecoveryError> {
+            self.lock_free_at_poll
+                .store(self.resume_lock.0.try_lock().is_ok(), Ordering::SeqCst);
+            self.driver_free_at_poll
+                .store(self.gate.try_enter().is_some(), Ordering::SeqCst);
+            Err(CctpMintRecoveryError::Attestation {
+                burn_tx,
+                source: st0x_bridge::cctp::CctpError::PlaceholderNonce,
+            })
+        }
+
+        async fn submit_recovered_cctp_mint(
+            &self,
+            _direction: BridgeDirection,
+            _burn_tx: TxHash,
+            _attestation: st0x_bridge::cctp::AttestationResponse,
+        ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
+            unreachable!("submit must not run while the burn is unattested")
+        }
+    }
+
+    /// The attestation poll must not park unrelated USDC work: while a burn is
+    /// still unattested, the resume lock stays free and the driver stays
+    /// unpaused, and only the (never reached) mint submission would take them.
+    #[tokio::test]
+    async fn complete_cctp_mint_poll_does_not_park_usdc_work_while_unattested() {
+        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let (pause, gate) = usdc_driver_pause();
+        let lock_free = Arc::new(AtomicBool::new(false));
+        let driver_free = Arc::new(AtomicBool::new(false));
+        let probe = PollProbe {
+            resume_lock: resume_lock.clone(),
+            gate: gate.clone(),
+            lock_free_at_poll: lock_free.clone(),
+            driver_free_at_poll: driver_free.clone(),
+        };
+
+        let resp = complete_cctp_mint_recovery(
+            &probe,
+            &resume_lock,
+            &pause,
+            BridgeDirection::BaseToEthereum,
+            TxHash::repeat_byte(0x11),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("an unattested burn must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            lock_free.load(Ordering::SeqCst),
+            "the resume lock must be free while the attestation is still pending",
+        );
+        assert!(
+            driver_free.load(Ordering::SeqCst),
+            "the USDC driver must not be paused while the attestation is still pending",
+        );
     }
 
     #[test]

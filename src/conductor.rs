@@ -904,28 +904,9 @@ where
 /// holds an equivalent handle.
 fn publish_recovery_handle(
     recovery_cell: &tokio::sync::OnceCell<crate::api::RecoveryHandle>,
-    transfer: Arc<CrossVenueEquityTransfer>,
-    mint_store: Arc<Store<TokenizedEquityMint>>,
-    redemption_store: Arc<Store<EquityRedemption>>,
-    rebalancing_service: Arc<RebalancingService>,
-    usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
-    cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
-    usdc_driver_pause: Arc<UsdcDriverPause>,
-    usdc_store: Arc<Store<UsdcRebalance>>,
+    handle: crate::api::RecoveryHandle,
 ) {
-    let _ = recovery_cell.set(crate::api::RecoveryHandle {
-        transfer,
-        mint_store,
-        redemption_store,
-        rebalancing_service,
-        usdc_recheck,
-        cctp_mint_recovery,
-        usdc_driver_pause,
-        usdc_store,
-        projection_maintenance: Arc::new(
-            crate::conductor::projection_pause::init_projection_maintenance(),
-        ),
-    });
+    let _ = recovery_cell.set(handle);
 }
 
 /// Publishes the process-tx handle backing the in-bot process-tx route, set
@@ -1225,14 +1206,19 @@ impl Conductor {
 
         publish_recovery_handle(
             &recovery_cell,
-            recovery_transfer,
-            recovery_mint_store,
-            recovery_redemption_store,
-            recovery_service,
-            usdc_recheck,
-            cctp_mint_recovery,
-            usdc_driver_pause,
-            recovery_usdc_store,
+            crate::api::RecoveryHandle {
+                transfer: recovery_transfer,
+                mint_store: recovery_mint_store,
+                redemption_store: recovery_redemption_store,
+                rebalancing_service: recovery_service,
+                usdc_recheck,
+                cctp_mint_recovery,
+                usdc_driver_pause,
+                usdc_store: recovery_usdc_store,
+                projection_maintenance: Arc::new(
+                    crate::conductor::projection_pause::init_projection_maintenance(),
+                ),
+            },
         );
 
         publish_process_tx_handle(
@@ -16296,10 +16282,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RecoverCctpMint for NeverCalledUsdcRecheck {
-        async fn recover_cctp_mint(
+        async fn poll_recovery_attestation(
             &self,
             _direction: st0x_bridge::BridgeDirection,
             _burn_tx: TxHash,
+        ) -> Result<st0x_bridge::cctp::AttestationResponse, CctpMintRecoveryError> {
+            panic!("cctp mint recovery must not be called in this test")
+        }
+
+        async fn submit_recovered_cctp_mint(
+            &self,
+            _direction: st0x_bridge::BridgeDirection,
+            _burn_tx: TxHash,
+            _attestation: st0x_bridge::cctp::AttestationResponse,
         ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
             panic!("cctp mint recovery must not be called in this test")
         }
@@ -16336,14 +16331,19 @@ mod tests {
 
         publish_recovery_handle(
             &recovery_cell,
-            transfer.clone(),
-            mint_store.clone(),
-            redemption_store.clone(),
-            rebalancing_service.clone(),
-            usdc_recheck,
-            cctp_mint_recovery,
-            usdc_driver_pause.clone(),
-            usdc_store.clone(),
+            crate::api::RecoveryHandle {
+                transfer: transfer.clone(),
+                mint_store: mint_store.clone(),
+                redemption_store: redemption_store.clone(),
+                rebalancing_service: rebalancing_service.clone(),
+                usdc_recheck,
+                cctp_mint_recovery,
+                usdc_driver_pause: usdc_driver_pause.clone(),
+                usdc_store: usdc_store.clone(),
+                projection_maintenance: Arc::new(
+                    crate::conductor::projection_pause::init_projection_maintenance(),
+                ),
+            },
         );
 
         let handle = recovery_cell
