@@ -43,7 +43,7 @@ mod bindings;
 pub use bindings::IERC20;
 
 mod chain;
-pub use chain::{Chain, ParseChainError};
+pub use chain::{Chain, ParseChainError, SettlementStable};
 
 mod tokens;
 pub use tokens::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, USDC_HYPEREVM};
