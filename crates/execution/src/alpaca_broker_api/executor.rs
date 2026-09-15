@@ -101,7 +101,15 @@ fn truncate_non_fractionable_shares(
 #[derive(Debug, Clone, Copy)]
 struct PreparedCounterTradeShares {
     shares: Option<Positive<FractionalShares>>,
-    fractional_orders_supported: bool,
+    sizing: OrderSizing,
+}
+
+/// The unit the broker trades an asset in, from its `fractionable` flag.
+/// Missing metadata is treated as whole-share-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderSizing {
+    Fractional,
+    WholeShares,
 }
 
 /// A symbol's full Alpaca asset attribute set, for inspection consumers such
@@ -364,29 +372,33 @@ impl Executor for AlpacaBrokerApi {
 
                 let floor = self.hedge_floor.for_symbol(&order.symbol);
 
-                let (tradable_available, floor) = if prepared.fractional_orders_supported {
-                    (available, floor)
-                } else {
-                    let Some(truncated) = crate::truncate_to_decimal_places(available.inner(), 0)?
-                    else {
-                        return Ok(CounterTradePreflight::Skipped(
-                            CounterTradeSkipReason::InsufficientEquity {
-                                required: order.shares,
-                                available,
-                            },
-                        ));
-                    };
-                    (
-                        FractionalShares::new(truncated),
-                        crate::hedge_floor::whole_share_floor(floor)?,
-                    )
+                // The book and the floor must be in the unit the broker sells
+                // in. A fractional asset uses both as they are. A whole-share
+                // asset has its book truncated down, since the broker cannot
+                // sell the remainder, and its floor rounded up, since the
+                // broker cannot keep a fraction either: the default 0.01
+                // becomes one share there.
+                let (sellable_book, floor) = match prepared.sizing {
+                    OrderSizing::Fractional => (available, floor),
+                    OrderSizing::WholeShares => {
+                        let Some(whole_shares) =
+                            crate::truncate_to_decimal_places(available.inner(), 0)?
+                        else {
+                            return Ok(CounterTradePreflight::Skipped(
+                                CounterTradeSkipReason::InsufficientEquity {
+                                    required: order.shares,
+                                    available,
+                                },
+                            ));
+                        };
+                        (
+                            FractionalShares::new(whole_shares),
+                            crate::hedge_floor::whole_share_floor(floor)?,
+                        )
+                    }
                 };
 
-                Ok(crate::resolve_sell_preflight(
-                    order,
-                    tradable_available,
-                    floor,
-                )?)
+                Ok(crate::resolve_sell_preflight(order, sellable_book, floor)?)
             }
             Direction::Buy => {
                 let latest_trade_price = crate::alpaca_market_data::fetch_latest_trade_price(
@@ -695,7 +707,11 @@ impl AlpacaBrokerApi {
         let asset = self.get_asset_cached(symbol).await?;
         Self::validate_asset(symbol, &asset)?;
 
-        let fractional_orders_supported = asset.fractionable == Some(true);
+        let sizing = if asset.fractionable == Some(true) {
+            OrderSizing::Fractional
+        } else {
+            OrderSizing::WholeShares
+        };
 
         if asset.fractionable.is_none() {
             warn!(
@@ -713,7 +729,7 @@ impl AlpacaBrokerApi {
             );
             return Ok(PreparedCounterTradeShares {
                 shares: None,
-                fractional_orders_supported,
+                sizing,
             });
         };
 
@@ -728,7 +744,7 @@ impl AlpacaBrokerApi {
 
         Ok(PreparedCounterTradeShares {
             shares: Some(truncated),
-            fractional_orders_supported,
+            sizing,
         })
     }
 
