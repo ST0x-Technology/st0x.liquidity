@@ -8,6 +8,7 @@ mod exit;
 pub(crate) mod job;
 mod manifest;
 pub(crate) mod monitor;
+pub(crate) mod projection_pause;
 mod trading_queues;
 
 use alloy::primitives::Address;
@@ -914,6 +915,9 @@ fn publish_recovery_handle(
         usdc_recheck,
         usdc_driver_pause,
         usdc_store,
+        projection_maintenance: Arc::new(
+            crate::conductor::projection_pause::init_projection_maintenance(),
+        ),
     });
 }
 

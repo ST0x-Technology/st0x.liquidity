@@ -1328,6 +1328,14 @@ pub(crate) struct RecoveryHandle {
     /// to the durable outcome. A standalone store would bypass the reactor and
     /// leave the running bot latched with `guardHeld: false` reported.
     pub(crate) usdc_store: Arc<Store<UsdcRebalance>>,
+    /// Projection-maintenance pause control (RAI-2436): a rebuild route quiesces
+    /// every projection writer through it before it deletes and replays a
+    /// materialized view. Consumed by the `rebuild_materialized_view` route in
+    /// `rai-2248-view-cctp-recovery`, restacked on top of this branch; unread
+    /// here until that route lands.
+    #[allow(dead_code)]
+    pub(crate) projection_maintenance:
+        Arc<crate::conductor::projection_pause::ProjectionMaintenance>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
