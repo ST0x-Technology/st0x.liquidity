@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
 use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_float_macro::float;
 use st0x_wrapper::{UnderlyingPerWrapped, WrapperError};
 
 use super::{RebalancingService, TokenAddressError, TriggeredOperation};
@@ -22,6 +23,12 @@ use crate::inventory::{
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
 const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
+
+/// Smallest mint worth dispatching. A floored sell leaves the broker book at
+/// exactly the floor and positions carry nine-decimal residue, so anything
+/// smaller than this above the floor is dust, not an imbalance.
+static MINIMUM_MINT_SHARES: LazyLock<FractionalShares> =
+    LazyLock::new(|| FractionalShares::new(float!(0.01)));
 
 /// Why an equity trigger failed.
 #[derive(Debug, thiserror::Error)]
@@ -430,14 +437,19 @@ pub(super) async fn check_imbalance_and_build_operation(
     shares_limit: Option<Positive<FractionalShares>>,
     hedge_floor: FractionalShares,
 ) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
-    let imbalance = {
+    // One read for both figures, so the floor is applied to the same
+    // snapshot the imbalance was computed from.
+    let (imbalance, offchain_available) = {
         let inventory = inventory.read().await;
-        inventory.check_equity_imbalance(
-            symbol,
-            inventory.primary_chain(),
-            threshold,
-            vault_ratio,
-        )?
+        (
+            inventory.check_equity_imbalance(
+                symbol,
+                inventory.primary_chain(),
+                threshold,
+                vault_ratio,
+            )?,
+            inventory.equity_available(symbol, Venue::Hedging),
+        )
     };
 
     let Some(imbalance) = imbalance else {
@@ -447,11 +459,14 @@ pub(super) async fn check_imbalance_and_build_operation(
 
     Ok(Some(match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let offchain_available = inventory
-                .read()
-                .await
-                .equity_available(symbol, Venue::Hedging)
-                .unwrap_or(FractionalShares::ZERO);
+            let Some(offchain_available) = offchain_available else {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    "Skipping mint: imbalance detected but the broker venue is missing from the view"
+                );
+                return Ok(None);
+            };
             let Some(mintable) =
                 mintable_above_floor(symbol, excess, offchain_available, hedge_floor)?
             else {
@@ -487,18 +502,18 @@ fn mintable_above_floor(
 ) -> Result<Option<FractionalShares>, FloatError> {
     let above_floor = (offchain_available - hedge_floor)?;
 
-    if !above_floor.inner().gt(FractionalShares::ZERO.inner())? {
+    if above_floor.inner().lt(MINIMUM_MINT_SHARES.inner())? {
         trace!(
             target: "rebalance",
             %symbol,
             offchain = %offchain_available,
             floor = %hedge_floor,
-            "Skipping mint: broker book is at or below the hedge floor"
+            "Skipping mint: broker book is at the hedge floor"
         );
         return Ok(None);
     }
 
-    if excess > above_floor {
+    if excess.inner().gt(above_floor.inner())? {
         debug!(
             target: "rebalance",
             %symbol,
