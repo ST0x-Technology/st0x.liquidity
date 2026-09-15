@@ -178,9 +178,12 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   trading- or rebalancing-enabled equity on the primary, the rebalancing-enabled
   ones on a secondary -- and fails naming the chain and symbol otherwise.
 - The Turnkey policies allow the startup approvals on that chain's id: the
-  approvals (underlying to vault, vault to that chain's orderbook, that chain's
-  USDC to its orderbook) are granted per hedged chain, and the deploy gate
-  checks coverage per chain.
+  approvals (underlying to vault, vault to that chain's deposit spender, that
+  chain's USDC to the same deposit spender) are granted per hedged chain, and
+  the deploy gate checks coverage per chain. The deposit spender is the chain's
+  orderbook when its `inventory_mode` is `legacy`, and its configured
+  `inventory` when it is `managed`, so a chain that has migrated needs its
+  policies on the inventory address.
 - If the asset is in orchestrator mode, `[orchestrator.addresses]` has an entry
   for that chain (keys are chain names: `base`, `ethereum`, `hyperevm`). The
   order is fixed per chain: deploy the `ST0xOrchestrator` there, add its address

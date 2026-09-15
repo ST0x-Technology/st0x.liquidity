@@ -214,11 +214,14 @@ orphan-recovery aggregates still borrow the primary's. The tokenization
 preflight (below) runs once per hedged chain with that chain's wallet, orderbook
 and canonical USDC, as does the stale-allowance revoke on each chain in managed
 inventory mode. The startup MAX approvals run on every hedged chain in either
-mode, but only the USDC-to-orderbook grant is unconditional: the equity grants
-(underlying to wrapper vault, wrapped token to orderbook) are made only on
-chains that rebalance equity, since a hedge-only secondary has no wrapper to
-approve. A hedged chain for which this build has no pinned USDC fails startup
-rather than borrowing another chain's address.
+mode, but only the USDC grant is unconditional: the equity grants (underlying to
+wrapper vault, wrapped token to the deposit spender) are made only on chains
+that rebalance equity, since a hedge-only secondary has no wrapper to approve.
+Both deposit grants name the spender that chain settles deposits through -- its
+orderbook in legacy inventory mode, its `RaindexInventory` in managed mode -- so
+the same two token identities are approved, and proved by the deploy gate, in
+either inventory mode. A hedged chain for which this build has no pinned USDC
+fails startup rather than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
@@ -632,25 +635,26 @@ persisted checkpoint and re-scans any gap.
 
 Before any worker or rebalancer runs, and in both modes whenever a signing
 wallet is configured, startup grants the one-time MAX approvals on every hedged
-chain with that chain's wallet: that chain's canonical USDC to its orderbook on
-every hedged chain, and each wrapped equity's underlying to its wrapper vault
-and wrapped to that chain's orderbook: on the primary every equity with trading
-or rebalancing enabled, on a secondary only the equities with rebalancing
-enabled, the same selection its tokenization preflight attests (a hedge-only
-secondary has no wrapper to approve, so its allowance work is the USDC grant
-alone). Only when rebalancing is configured does it also revoke any stale
-orderbook allowance, per chain in managed inventory mode, the same way, and a
-tokenization preflight then runs per hedged chain, read-only: the chain's issuer
-redemption wallet must be configured, and every preflighted equity's configured
-vault must report the configured underlying as its `asset()` (the same
-attestation a redemption's unwrap step performs). The preflighted equities are,
-on the primary, every trading- or rebalancing-enabled equity (the bot may wrap
-or redeem any of them there), and on a secondary only its rebalancing-enabled
-equities; a hedge-only secondary is skipped with a log line and has no
-redemption-wallet requirement. Each failure is fatal and names the chain and,
-where one applies, the symbol. Then, on every preflighted chain with no
-`[orchestrator.addresses]` entry, the preflight asks issuance's per-asset status
-endpoint (the freeze gate's endpoint, through the same client) for each
+chain with that chain's wallet: that chain's canonical USDC to its deposit
+spender on every hedged chain, and each wrapped equity's underlying to its
+wrapper vault and wrapped to that same deposit spender -- the chain's orderbook
+in legacy inventory mode, its `RaindexInventory` in managed mode: on the primary
+every equity with trading or rebalancing enabled, on a secondary only the
+equities with rebalancing enabled, the same selection its tokenization preflight
+attests (a hedge-only secondary has no wrapper to approve, so its allowance work
+is the USDC grant alone). Only when rebalancing is configured does it also
+revoke any stale orderbook allowance, per chain in managed inventory mode, the
+same way, and a tokenization preflight then runs per hedged chain, read-only:
+the chain's issuer redemption wallet must be configured, and every preflighted
+equity's configured vault must report the configured underlying as its `asset()`
+(the same attestation a redemption's unwrap step performs). The preflighted
+equities are, on the primary, every trading- or rebalancing-enabled equity (the
+bot may wrap or redeem any of them there), and on a secondary only its
+rebalancing-enabled equities; a hedge-only secondary is skipped with a log line
+and has no redemption-wallet requirement. Each failure is fatal and names the
+chain and, where one applies, the symbol. Then, on every preflighted chain with
+no `[orchestrator.addresses]` entry, the preflight asks issuance's per-asset
+status endpoint (the freeze gate's endpoint, through the same client) for each
 preflighted equity's `vault_mode` and refuses startup naming the chain and
 symbol when one is orchestrator-mode: its first mint would stall at the signing
 step. Chains with an entry are not queried: the entry is the only prerequisite
@@ -1816,32 +1820,34 @@ systemd unit:
   and runs `validate-config` while the old process is still running. For Turnkey
   wallets it then lists policies through Turnkey's authenticated read-only API
   and proves that every startup MAX approval target on every hedged chain (that
-  chain's canonical USDC to its orderbook, plus equity token to wrapper and
-  wrapper to that chain's orderbook for every equity the chain wraps in its
-  role: trading or rebalancing enabled on the primary, rebalancing enabled on a
-  secondary) is covered by an allow policy whose consensus the authenticated API
-  user can satisfy alone and whose target condition provably applies on that
-  chain's id. Applicable deny policies take precedence; unknown allow or deny
-  applicability, unsupported consensus, a hedged chain with no pinned USDC, and
-  missing coverage fail closed, naming the chain, symbol, token contract, and
-  spender. Only after both gates pass may activation stop the old process and
-  install the candidate files, so a policy or config failure leaves the running
-  bot untouched; a failed stop aborts before candidate files are installed. It
-  then verifies migrations, chowns data files, writes the git-rev marker,
-  touches the activation marker, and restarts the unit. The server writes its
-  PID to a systemd-managed runtime-directory file only after Conductor has
-  completed startup initialization and every essential supervised runtime task
-  has reached a pending run state. Activation waits for that PID to match the
-  unit's live main process with a bounded startup timeout. If the process exits,
-  readiness reporting fails, or the timeout expires first, activation prints the
-  unit status and recent journal, exits non-zero, and deploy-rs rolls the
-  profile back. The unit remains `Type=simple` so automatic rollback stays
-  compatible with service generations from before the readiness handshake was
-  introduced. The first rollout requires deploying the system profile before the
-  service profile; a service-only deploy verifies the installed unit exposes the
-  expected ready file before stopping the running bot and otherwise fails
-  immediately with the required rollout order. Outside systemd, the server uses
-  a no-op readiness notifier so local runs remain available.
+  chain's canonical USDC to its deposit spender -- its orderbook in legacy
+  inventory mode, its `RaindexInventory` in managed mode -- plus equity token to
+  wrapper and wrapper to that same deposit spender for every equity the chain
+  wraps in its role: trading or rebalancing enabled on the primary, rebalancing
+  enabled on a secondary) is covered by an allow policy whose consensus the
+  authenticated API user can satisfy alone and whose target condition provably
+  applies on that chain's id. Applicable deny policies take precedence; unknown
+  allow or deny applicability, unsupported consensus, a hedged chain with no
+  pinned USDC, and missing coverage fail closed, naming the chain, symbol, token
+  contract, and spender. Only after both gates pass may activation stop the old
+  process and install the candidate files, so a policy or config failure leaves
+  the running bot untouched; a failed stop aborts before candidate files are
+  installed. It then verifies migrations, chowns data files, writes the git-rev
+  marker, touches the activation marker, and restarts the unit. The server
+  writes its PID to a systemd-managed runtime-directory file only after
+  Conductor has completed startup initialization and every essential supervised
+  runtime task has reached a pending run state. Activation waits for that PID to
+  match the unit's live main process with a bounded startup timeout. If the
+  process exits, readiness reporting fails, or the timeout expires first,
+  activation prints the unit status and recent journal, exits non-zero, and
+  deploy-rs rolls the profile back. The unit remains `Type=simple` so automatic
+  rollback stays compatible with service generations from before the readiness
+  handshake was introduced. The first rollout requires deploying the system
+  profile before the service profile; a service-only deploy verifies the
+  installed unit exposes the expected ready file before stopping the running bot
+  and otherwise fails immediately with the required rollout order. Outside
+  systemd, the server uses a no-op readiness notifier so local runs remain
+  available.
 - `dashboard` (kind = `static`) - frontend assets served by nginx; the deploy
   step is `systemctl reload nginx` and there is no managed systemd unit.
 - `datasette` (kind = `plain`) - read-only SQLite explorer over the hedge DB.

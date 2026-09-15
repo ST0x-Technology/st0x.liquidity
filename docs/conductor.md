@@ -1063,8 +1063,10 @@ Before systemd stops the existing bot, deploy activation validates staged
 config/secrets and uses Turnkey's read-only policy list to verify coverage for
 the exact approval targets startup will grant. Both paths call the same
 deterministic target builder, limited to trading- or rebalancing-enabled symbols
-plus USDC. An allow policy covers a target only when the authenticated API user
-can satisfy its consensus alone and its target condition provably applies.
+plus USDC. Its deposit grants name the spender the chain settles deposits
+through: its orderbook in legacy inventory mode, its `RaindexInventory` in
+managed mode. An allow policy covers a target only when the authenticated API
+user can satisfy its consensus alone and its target condition provably applies.
 Applicable or unprovable deny policies take precedence. Missing or unrecognized
 coverage fails activation without replacing the running process or installed
 config. If stopping the validated service fails, activation also aborts before

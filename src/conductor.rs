@@ -1403,8 +1403,9 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
 }
 
 /// The startup approval targets of every hedged chain, keyed by chain: its
-/// canonical USDC against its own orderbook, plus, where the chain rebalances
-/// equity, each enabled equity's wrap and deposit grants.
+/// canonical USDC and, where the chain rebalances equity, each enabled
+/// equity's wrap and deposit grants -- the deposit grants against the spender
+/// its inventory mode settles through, its own orderbook or its inventory.
 fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
     ctx.chains
         .hedged_with_roles()
@@ -1413,18 +1414,25 @@ fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
 
             (
                 chain,
-                build_approval_targets(role, &hedged.assets, hedged.orderbook, chain.usdc()),
+                build_approval_targets(
+                    role,
+                    hedged.inventory,
+                    &hedged.assets,
+                    hedged.orderbook,
+                    chain.usdc(),
+                ),
             )
         })
         .collect()
 }
 
 /// Grants one-time idempotent MAX ERC20 approvals to the trusted spenders at
-/// startup, on every hedged chain: that chain's USDC -> orderbook, and on the
-/// primary and every secondary that rebalances equity each enabled equity's
-/// underlying -> wrapper vault and wrapped -> that chain's orderbook, submitted
-/// through that chain's wallet so confirmations and nonce handling match every
-/// other on-chain write there.
+/// startup, on every hedged chain: that chain's USDC -> its deposit spender,
+/// and on the primary and every secondary that rebalances equity each enabled
+/// equity's underlying -> wrapper vault and wrapped -> that same deposit
+/// spender (the chain's orderbook in legacy inventory mode, its inventory in
+/// managed mode), submitted through that chain's wallet so confirmations and
+/// nonce handling match every other on-chain write there.
 ///
 /// Skips entirely when no wallet is configured -- without one the bot never
 /// wraps or deposits, so it has no allowances to grant.
@@ -16058,15 +16066,23 @@ mod tests {
         }
     }
 
+    /// The distinct `RaindexInventory` the hedged Ethereum settles its
+    /// deposits through when it runs in managed inventory mode.
+    const ETHEREUM_INVENTORY: InventoryMode = InventoryMode::Managed {
+        inventory: Address::repeat_byte(0xe7),
+    };
+
     /// A hedged Ethereum listing one TSLA that trades, with the given
-    /// rebalancing flag and issuer redemption wallet.
+    /// rebalancing flag, issuer redemption wallet and inventory mode.
     fn ethereum_hedged_chain(
         redemption_wallet: Option<Address>,
         rebalancing: OperationMode,
+        inventory: InventoryMode,
     ) -> HedgedChain {
         let mut trading = HedgedChain::test()
             .chain(Chain::Ethereum)
             .orderbook(Address::repeat_byte(0xe0))
+            .inventory(inventory)
             .maybe_redemption_wallet(redemption_wallet)
             .call();
         let mut tsla = equity_asset(Address::repeat_byte(0xe5), Address::repeat_byte(0xe6));
@@ -16104,6 +16120,7 @@ mod tests {
         ctx.chains.insert_secondary(ethereum_hedged_chain(
             Some(Address::repeat_byte(0xe1)),
             OperationMode::Enabled,
+            ETHEREUM_INVENTORY,
         ));
 
         let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
@@ -16143,8 +16160,11 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.broker = alpaca_broker_ctx();
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
-        ctx.chains
-            .insert_secondary(ethereum_hedged_chain(None, OperationMode::Enabled));
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            None,
+            OperationMode::Enabled,
+            ETHEREUM_INVENTORY,
+        ));
 
         let Err(error) = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()) else {
             panic!("a hedged chain without a redemption wallet must fail startup");
@@ -16166,8 +16186,11 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.broker = alpaca_broker_ctx();
         ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
-        ctx.chains
-            .insert_secondary(ethereum_hedged_chain(None, OperationMode::Disabled));
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            None,
+            OperationMode::Disabled,
+            ETHEREUM_INVENTORY,
+        ));
 
         let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
 
@@ -16197,8 +16220,11 @@ mod tests {
             },
             cash: None,
         };
-        ctx.chains
-            .insert_secondary(ethereum_hedged_chain(None, OperationMode::Disabled));
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            None,
+            OperationMode::Disabled,
+            ETHEREUM_INVENTORY,
+        ));
         ctx
     }
 
@@ -16478,10 +16504,16 @@ mod tests {
     /// Each hedged chain's targets use its own orderbook and USDC. The
     /// primary carries its equities' wrap and deposit grants; a hedge-only
     /// secondary (Ethereum here: TSLA trades but does not rebalance) has no
-    /// wrapper to approve, so only its USDC grant remains.
+    /// wrapper to approve, so only its USDC grant remains. Both chains are
+    /// legacy-inventory, where the orderbook is the deposit spender.
     #[test]
     fn startup_approval_targets_follow_each_hedged_chain() {
-        let ctx = ctx_with_base_and_ethereum_trading();
+        let mut ctx = ctx_with_base_and_ethereum_trading();
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            None,
+            OperationMode::Disabled,
+            InventoryMode::Legacy,
+        ));
         let base_orderbook = ctx.chains.primary().orderbook;
 
         let targets = startup_approval_targets(&ctx);
@@ -16524,14 +16556,16 @@ mod tests {
         );
     }
 
-    /// A secondary that rebalances equity gets the wrap and deposit grants
-    /// against its own equity contracts and orderbook, for the equities that
-    /// opt into rebalancing there only: NVDA trades on Ethereum but is not
-    /// rebalanced, so it is hedged, never wrapped, and gets no grant.
+    /// A legacy-inventory secondary that rebalances equity gets the wrap and
+    /// deposit grants against its own equity contracts and orderbook, for the
+    /// equities that opt into rebalancing there only: NVDA trades on Ethereum
+    /// but is not rebalanced, so it is hedged, never wrapped, and gets no
+    /// grant.
     #[test]
     fn startup_approval_targets_follow_a_rebalancing_secondarys_own_contracts() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let mut ethereum = ethereum_hedged_chain(None, OperationMode::Enabled);
+        let mut ethereum =
+            ethereum_hedged_chain(None, OperationMode::Enabled, InventoryMode::Legacy);
         ethereum.assets.equities.symbols.insert(
             Symbol::new("NVDA").unwrap(),
             equity_asset(Address::repeat_byte(0xe8), Address::repeat_byte(0xe9)),
@@ -16568,7 +16602,10 @@ mod tests {
     #[test]
     fn startup_approval_targets_use_hyperevm_usdc_and_orderbook() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let mut hyperevm = HedgedChain::test().chain(Chain::HyperEvm).call();
+        let mut hyperevm = HedgedChain::test()
+            .chain(Chain::HyperEvm)
+            .inventory(InventoryMode::Legacy)
+            .call();
         hyperevm.orderbook = Address::repeat_byte(0x99);
         ctx.chains.insert_secondary(hyperevm);
 
@@ -16581,6 +16618,58 @@ mod tests {
                 symbol: None,
                 purpose: ApprovalPurpose::DepositUsdc,
             }]
+        );
+    }
+
+    /// A managed-inventory chain deposits through its inventory contract, so
+    /// both of its deposit grants name that inventory as the spender while
+    /// the legacy-mode primary keeps naming its orderbook. Neither chain
+    /// loses a deposit token from the set the deploy gate proves.
+    #[test]
+    fn startup_approval_targets_name_the_inventory_spender_on_a_managed_chain() {
+        let mut ctx = ctx_with_base_and_ethereum_trading();
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            None,
+            OperationMode::Enabled,
+            ETHEREUM_INVENTORY,
+        ));
+        let base_orderbook = ctx.chains.primary().orderbook;
+
+        let targets = startup_approval_targets(&ctx);
+
+        assert_eq!(
+            targets[&Chain::Ethereum],
+            vec![
+                ApprovalTarget {
+                    token: Address::repeat_byte(0xe5),
+                    spender: Address::repeat_byte(0xe6),
+                    symbol: Some(Symbol::new("TSLA").unwrap()),
+                    purpose: ApprovalPurpose::WrapUnderlying,
+                },
+                ApprovalTarget {
+                    token: Address::repeat_byte(0xe6),
+                    spender: Address::repeat_byte(0xe7),
+                    symbol: Some(Symbol::new("TSLA").unwrap()),
+                    purpose: ApprovalPurpose::DepositWrappedEquity,
+                },
+                ApprovalTarget {
+                    token: USDC_ETHEREUM,
+                    spender: Address::repeat_byte(0xe7),
+                    symbol: None,
+                    purpose: ApprovalPurpose::DepositUsdc,
+                },
+            ]
+        );
+        assert_eq!(
+            targets[&Chain::Base]
+                .iter()
+                .map(|target| (target.spender, target.purpose))
+                .collect::<Vec<_>>(),
+            vec![
+                (Address::repeat_byte(0xa6), ApprovalPurpose::WrapUnderlying),
+                (base_orderbook, ApprovalPurpose::DepositWrappedEquity),
+                (base_orderbook, ApprovalPurpose::DepositUsdc),
+            ]
         );
     }
 
@@ -16611,6 +16700,63 @@ mod tests {
             revocations[&Chain::Ethereum],
             vec![USDC_ETHEREUM, Address::repeat_byte(0xe6)]
         );
+    }
+
+    /// Startup must never grant an allowance that the same startup then
+    /// revokes as stale. The revoke plan clears `(token, orderbook)` pairs on
+    /// managed chains only, and those chains grant to their inventory
+    /// instead, so on every configured chain the two sets stay disjoint,
+    /// whatever spenders either side grows.
+    #[test]
+    fn startup_grants_and_stale_revocations_never_share_a_token_and_spender() {
+        let mut ctx = ctx_with_base_and_ethereum_trading();
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            None,
+            OperationMode::Enabled,
+            ETHEREUM_INVENTORY,
+        ));
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::HyperEvm)
+                .orderbook(Address::repeat_byte(0x99))
+                .inventory(InventoryMode::Managed {
+                    inventory: Address::repeat_byte(0x9a),
+                })
+                .call(),
+        );
+
+        let targets = startup_approval_targets(&ctx);
+        let revocations = stale_allowance_revocations(&ctx);
+
+        assert_eq!(
+            targets.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base, Chain::Ethereum, Chain::HyperEvm],
+            "every configured chain must plan grants, or the invariant holds vacuously"
+        );
+        assert_eq!(
+            revocations.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Ethereum, Chain::HyperEvm],
+            "both managed chains must plan revokes, or the invariant holds vacuously"
+        );
+
+        for (chain, granted) in &targets {
+            let orderbook = ctx.chains.hedged_chain(*chain).unwrap().orderbook;
+            let revoked = revocations.get(chain).cloned().unwrap_or_default();
+            let granted_then_revoked = granted
+                .iter()
+                .filter(|target| target.spender == orderbook && revoked.contains(&target.token))
+                .collect::<Vec<_>>();
+
+            assert!(
+                !granted.is_empty(),
+                "{chain} plans no grants, so the invariant holds vacuously there"
+            );
+            assert!(
+                granted_then_revoked.is_empty(),
+                "{chain} grants allowances that startup revokes as stale: \
+                 {granted_then_revoked:?}"
+            );
+        }
     }
 
     fn assets_with_equity(symbol: &str, asset: ChainEquityAsset) -> ChainAssets {
