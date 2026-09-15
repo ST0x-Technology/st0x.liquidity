@@ -182,6 +182,7 @@ mod tests {
         assert_eq!(symbol["inflightEquity"]["baseWalletWrapped"], json!("2"));
 
         let usdc = &json["usdc"];
+        assert_eq!(usdc["symbol"], json!("USDC"));
         assert_eq!(usdc["onchainAvailable"], json!("10000"));
         assert_eq!(usdc["onchainInflight"], json!("0"));
         assert_eq!(usdc["offchainAvailable"], json!("5000"));
@@ -191,26 +192,5 @@ mod tests {
         assert_eq!(usdc["alpacaUsdc"], json!("125"));
         assert_eq!(usdc["inflightCash"]["ethereumWallet"], json!("250"));
         assert_eq!(usdc["inflightCash"]["baseWallet"], json!("0"));
-    }
-
-    /// The dashboard labels the cash row from the payload, so the payload
-    /// must name the stable it counts instead of leaving USDC implied.
-    #[test]
-    fn usdc_inventory_serializes_the_settlement_stable_symbol() {
-        let inventory = UsdcInventory {
-            symbol: "USDC".to_string(),
-            onchain_available: Usdc::new(float!(10000)),
-            onchain_inflight: Usdc::ZERO,
-            offchain_available: Usdc::new(float!(5000)),
-            offchain_inflight: Usdc::ZERO,
-            offchain_gross: None,
-            withdrawable_cash: None,
-            alpaca_usdc: None,
-            inflight_cash: InFlightCash::empty(),
-        };
-
-        let json = serde_json::to_value(&inventory).unwrap();
-
-        assert_eq!(json["symbol"], json!("USDC"));
     }
 }
