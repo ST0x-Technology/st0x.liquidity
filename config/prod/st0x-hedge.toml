@@ -144,14 +144,6 @@ required_confirmations = 12
 lifecycle = "observe-only"
 required_confirmations = 1
 
-# Robinhood Chain, same shape as HyperEVM.
-
-[chains.robinhood]
-# A signer exists and nothing moves yet. Raising this to "active" fails
-# startup: no CCTP domain and no gas-valuation feed are wired.
-lifecycle = "observe-only"
-required_confirmations = 1
-
 [wallet]
 # Keyless Turnkey auth: the API key lives in Cloud KMS; the secrets file
 # carries no api_private_key. Key minted by t0.devops #270 (2026-08-14).
