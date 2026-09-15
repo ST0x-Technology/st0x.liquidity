@@ -186,4 +186,24 @@ mod tests {
         assert_eq!(usdc["inflightCash"]["ethereumWallet"], json!("250"));
         assert_eq!(usdc["inflightCash"]["baseWallet"], json!("0"));
     }
+
+    /// The dashboard labels the cash row from the payload, so the payload
+    /// must name the stable it counts instead of leaving USDC implied.
+    #[test]
+    fn usdc_inventory_serializes_the_settlement_stable_symbol() {
+        let inventory = UsdcInventory {
+            onchain_available: Usdc::new(float!(10000)),
+            onchain_inflight: Usdc::ZERO,
+            offchain_available: Usdc::new(float!(5000)),
+            offchain_inflight: Usdc::ZERO,
+            offchain_gross: None,
+            withdrawable_cash: None,
+            alpaca_usdc: None,
+            inflight_cash: InFlightCash::empty(),
+        };
+
+        let json = serde_json::to_value(&inventory).unwrap();
+
+        assert_eq!(json["symbol"], json!("USDC"));
+    }
 }
