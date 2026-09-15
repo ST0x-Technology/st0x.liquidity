@@ -12,6 +12,7 @@ use std::str::FromStr;
 
 use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
+
 use st0x_evm::SettlementStable;
 use st0x_execution::{Direction, FractionalShares, Symbol};
 
@@ -359,9 +360,9 @@ fn determine_trade_details(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
-    use st0x_float_macro::float;
 
     use st0x_evm::Chain;
+    use st0x_float_macro::float;
 
     use super::*;
 

@@ -50,10 +50,10 @@ impl Display for MissingPolicyCoverage {
         )?;
 
         for target in &self.missing {
-            let symbol = target
-                .symbol
-                .as_ref()
-                .map_or("USDC", st0x_execution::Symbol::as_str);
+            let symbol = target.symbol.as_ref().map_or(
+                self.chain.settlement_stable().symbol,
+                st0x_execution::Symbol::as_str,
+            );
             writeln!(
                 formatter,
                 "- {symbol}: token {}, spender {}, purpose {:?}",
