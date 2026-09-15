@@ -745,18 +745,19 @@ is capped at the same figure. The floor defaults to the minimum partial hedge,
 0.01 shares, the smallest position the bot treats as real and the smallest that
 keeps a mark alive. For assets the broker trades only in whole shares any
 positive fractional floor rounds up to the next whole share (the default 0.01
-becomes 1, 1.2 becomes 2), the smallest exposure that case costs.
-`[broker] hedge_floor_shares` overrides the default globally and
-`[assets.equities.SYM] hedge_floor_shares` per symbol; zero opts a symbol out
-and accepts the pricing gap for it alone, the choice for a whole-share asset not
-worth a full share of exposure. The residual is a deliberate, bounded unhedged
-exposure of roughly floor times price per symbol; `hedge_floor_shares{symbol}`
-and `hedge_deficit_shares{symbol}` report the floor and the shares the last scan
-could not hedge. A sell blocked by the floor is reported as held at the floor,
-distinct from an empty account, because the two call for different operator
-action. The floor holds a position; it never establishes one. Onboarding a
-symbol must fund the account with at least the floor, and a symbol already at
-zero stays dark until a redemption or a manual buy puts shares there.
+becomes 1, 1.2 becomes 2), so the account always retains at least that many
+whole shares of the symbol. `[broker] hedge_floor_shares` overrides the default
+globally and `[assets.equities.SYM] hedge_floor_shares` per symbol; zero opts a
+symbol out and accepts the pricing gap for it alone, the choice for a
+whole-share asset not worth a full share of exposure. The residual is a
+deliberate, bounded unhedged exposure of roughly floor times price per symbol;
+`hedge_floor_shares{symbol}` and `hedge_deficit_shares{symbol}` report the floor
+and the shares the last scan could not hedge. A sell blocked by the floor is
+reported as held at the floor, distinct from an empty account, because the two
+call for different operator action. The floor holds a position; it never
+establishes one. Onboarding a symbol must fund the account with at least the
+floor, and a symbol already at zero stays dark until a redemption or a manual
+buy puts shares there.
 
 #### Extended-Hours Counter-Trading
 

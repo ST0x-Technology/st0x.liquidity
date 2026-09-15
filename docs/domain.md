@@ -184,10 +184,10 @@ assets the broker trades only in whole units a positive fractional floor rounds
 up to the next whole share. Configured as `hedge_floor_shares`, globally under
 `[broker]` and per symbol under `[assets.equities.SYM]`; zero disables the floor
 at either scope, for every symbol under `[broker]` and for that symbol alone
-under `[assets.equities.SYM]`. The type is `HedgeFloor`. A sell the floor blocks
-is `HeldAtFloor`, never `InsufficientEquity`: the first is expected, the second
-means the account needs funding. The unhedged residual it leaves is the hedge
-deficit, exported as `hedge_deficit_shares`.
+under `[assets.equities.SYM]`. The type is `HedgeFloor`. When the floor blocks a
+sell, the skip reason is `HeldAtFloor`, never `InsufficientEquity`: the first is
+expected, the second means the account needs funding. The unhedged residual it
+leaves is the hedge deficit, exported as `hedge_deficit_shares`.
 
 ### Market Session
 
