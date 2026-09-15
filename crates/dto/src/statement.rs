@@ -147,7 +147,7 @@ mod tests {
     fn statement_current_state_serializes_with_type_tag() {
         let msg = Statement::CurrentState(Box::new(CurrentState {
             trades: Vec::new(),
-            inventory: Inventory::empty(),
+            inventory: Inventory::empty("USDC"),
             positions: Vec::new(),
             equity_prices: Vec::new(),
             settings: Settings {
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn statement_inventory_snapshot_serializes_with_type_tag() {
         let msg = Statement::InventorySnapshot(Box::new(InventorySnapshot {
-            inventory: Inventory::empty(),
+            inventory: Inventory::empty("USDC"),
             fetched_at: Utc::now(),
         }));
         let json = serde_json::to_value(&msg).expect("serialization should succeed");

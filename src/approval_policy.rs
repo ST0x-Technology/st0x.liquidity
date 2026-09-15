@@ -126,7 +126,7 @@ fn verify_hedged_chains(
             chain_inputs.inventory,
             &chain_inputs.assets,
             chain_inputs.orderbook,
-            chain.usdc(),
+            chain.settlement_stable().address,
         );
         let context = ApprovalPolicyContext {
             user_id: &snapshot.user_id,

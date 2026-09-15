@@ -550,12 +550,12 @@ fn validated_price(
     if frame.venue != Venue::Raindex {
         return Err(InvalidPrice::Venue);
     }
-    // The quote token must be the canonical USDC on the frame's chain, which
-    // differs per chain.
+    // The quote token must be the settlement stable of the frame's chain,
+    // which differs per chain.
     let quote = Chain::ALL
         .into_iter()
         .find(|chain| chain.chain_id() == frame.chain_id)
-        .map(Chain::usdc);
+        .map(|chain| chain.settlement_stable().address);
     if Address::from(frame.base.0) != base || quote != Some(Address::from(frame.quote.0)) {
         return Err(InvalidPrice::Pair);
     }

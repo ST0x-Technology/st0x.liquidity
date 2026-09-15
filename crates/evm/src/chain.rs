@@ -46,16 +46,6 @@ impl Chain {
         }
     }
 
-    /// The canonical USDC contract on this chain. USDC differs per chain, so a
-    /// new variant cannot compile until its own contract is pinned here.
-    pub const fn usdc(self) -> Address {
-        match self {
-            Self::Base => USDC_BASE,
-            Self::Ethereum => USDC_ETHEREUM,
-            Self::HyperEvm => USDC_HYPEREVM,
-        }
-    }
-
     /// The stablecoin this chain's cash leg settles in. Pinned in code, not
     /// config: a config-supplied value would let a typo point fill validation
     /// at the wrong token. A new variant cannot compile until its stable is

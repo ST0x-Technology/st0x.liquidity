@@ -2055,7 +2055,7 @@ mod tests {
             let (pool, apalis_pool) = setup_test_pools().await;
             let asserter = Asserter::new();
 
-            let usdc_token = chain.usdc();
+            let usdc_token = chain.settlement_stable().address;
             let equity_token = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
             let operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
 
