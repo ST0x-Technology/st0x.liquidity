@@ -370,6 +370,7 @@ impl OnchainTrade {
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
         let trade_details = TradeDetails::try_from_io(
+            chain.settlement_stable(),
             &onchain_input_symbol,
             InputToken(input.token),
             onchain_input_amount,
@@ -477,6 +478,7 @@ impl OnchainTrade {
         // variant; everything else (e.g. `InvalidSymbolConfiguration`) passes
         // through unchanged.
         let trade_details = TradeDetails::try_from_io(
+            chain.settlement_stable(),
             &input_symbol,
             InputToken(trade.deposit.token),
             input_amount,
@@ -689,9 +691,9 @@ fn reclassify_inventory_float_error(error: OnChainError) -> OnChainError {
     }
 }
 
-/// Validates that an `InventoryTrade`'s USDC and equity leg addresses match
-/// this bot's configured canonical addresses, not just their self-reported
-/// `symbol()`.
+/// Validates that an `InventoryTrade`'s cash and equity leg addresses match
+/// the chain's settlement stable and this bot's configured equity address,
+/// not just their self-reported `symbol()`.
 ///
 /// Unlike ClearV3/TakeOrderV3 (whose token addresses come from the bot's own
 /// trusted order config), `InventoryTrade` legs are supplied by any
@@ -708,12 +710,12 @@ fn validate_inventory_token_addresses(
     assets: &ChainAssets,
     trade_details: &TradeDetails,
 ) -> Result<(), TradeValidationError> {
-    let expected_usdc = chain.usdc();
+    let settlement_stable = chain.settlement_stable();
     let usdc_token = trade_details.usdc_token();
-    if usdc_token != expected_usdc {
+    if usdc_token != settlement_stable.address {
         return Err(TradeValidationError::UnrecognizedInventoryToken {
             token: usdc_token,
-            claimed_symbol: "USDC".to_string(),
+            claimed_symbol: settlement_stable.symbol.to_string(),
         });
     }
 
@@ -939,6 +941,20 @@ pub enum TradeValidationError {
     NegativeShares(Float),
     #[error("Negative USDC amount: {}", format_float_with_fallback(.0))]
     NegativeUsdc(Float),
+    /// The cash leg, truncated to the settlement stable's own grid, still
+    /// carries digits the six-decimal internal amount cannot hold. Only a
+    /// stable with more than six decimals can reach this; it is refused
+    /// rather than rounded so no fill is hedged against a misstated amount.
+    #[error(
+        "cash amount {} moved at {decimals} decimals does not fit six decimals: {source}",
+        format_float_with_fallback(.amount)
+    )]
+    CashPrecisionLoss {
+        amount: Float,
+        decimals: u8,
+        #[source]
+        source: FloatError,
+    },
     #[error(
         "fill has non-zero equity but a non-positive USDC/share price: {}",
         format_float_with_fallback(.0)
