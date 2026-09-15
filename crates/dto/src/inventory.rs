@@ -43,8 +43,8 @@ pub struct InFlightEquity {
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct UsdcInventory {
-    /// The settlement stable the onchain balances are held in, as the
-    /// dashboard labels the cash row.
+    /// The settlement stable the onchain balances are held in; the dashboard
+    /// labels the cash row with it.
     pub symbol: String,
     #[ts(type = "string")]
     pub onchain_available: Usdc,

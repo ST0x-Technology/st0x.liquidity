@@ -91,9 +91,10 @@ impl Chain {
         }
     }
 
-    /// Circle's USDC on this chain, the only token CCTP burns and mints:
-    /// `Some` exactly where the settlement stable is that USDC, so the bridge
-    /// is never handed a stable it cannot carry.
+    /// Circle's native USDC on this chain, the only token CCTP burns and
+    /// mints: `Some` exactly where the settlement stable is that USDC. Whether
+    /// a CCTP corridor exists for the chain is the bridge's concern; today it
+    /// has domains for Base and Ethereum only.
     pub const fn cctp_usdc(self) -> Option<Address> {
         match self {
             Self::Base => Some(USDC_BASE),

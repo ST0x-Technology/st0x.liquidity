@@ -158,11 +158,13 @@ tokenization operates on the base `Symbol` directly.
 
 The stablecoin a chain's cash leg settles in, pinned in code per `Chain` as
 address, symbol and decimals (`Chain::settlement_stable`, type
-`SettlementStable`). Fill validation accepts it as the only quote token, vault
-polling reads its vault, the fill parse scales the cash amount by its decimals,
-and the inventory surfaces label cash with its symbol. USDC on every chain
-today. Circle's USDC is exposed separately (`Chain::cctp_usdc`, `Some` only
-where the stable is that USDC) for the CCTP bridge alone.
+`SettlementStable`). Vault polling reads its vault, the fill parse scales the
+cash amount by its decimals, and the inventory view carries its symbol for the
+dashboard's cash row. An `InventoryTrade` fill must quote in its address; a
+`ClearV3`/`TakeOrderV3` fill is matched by its symbol, with the address gated by
+vault discovery. The portfolio snapshot still labels cash `USDC`. USDC on every
+chain today. Circle's USDC is exposed separately (`Chain::cctp_usdc`, `Some`
+only where the stable is that USDC) for the CCTP bridge alone.
 
 ### Retired Symbol
 

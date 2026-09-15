@@ -681,12 +681,18 @@ failure cannot skip unprocessed history.
 Every supported chain pins its settlement stable in code -- address, symbol and
 decimals, next to its chain id; USDC on every chain today -- so adding a chain
 requires pinning its stable before the code compiles. It is the cash leg
-everywhere: fill validation accepts only that token as the quote leg, vault
-polling reads that token's vault, the fill parse scales the cash amount by its
-decimals (refusing, never rounding, an amount the six-decimal internal amount
-cannot hold), and the inventory view, the portfolio snapshot and the dashboard
-label cash with its symbol. Circle's USDC is exposed separately, `Some` only on
-chains whose stable is that USDC, and read by the CCTP bridge alone.
+everywhere: vault polling reads that token's vault, the fill parse scales the
+cash amount by its decimals (a fill whose moved amount the six-decimal internal
+amount cannot hold is skipped and recorded, never rounded), and the inventory
+view names it in the `symbol` field the dashboard labels the cash row with. Fill
+validation matches it two ways: an `InventoryTrade` fill must quote in the
+stable's address, while a `ClearV3`/`TakeOrderV3` fill is classified by the
+stable's symbol and its address is gated only by vault discovery, which skips a
+cash vault whose token is not the pinned address. The portfolio snapshot still
+persists its cash asset as the literal `USDC`; labelling it per chain changes
+persisted rows and is its own follow-up. Circle's USDC is exposed separately,
+`Some` only on chains whose stable is that USDC, and read by the CCTP bridge
+alone.
 
 Completed apalis jobs are operational queue records, not audit history. The
 runtime periodically deletes terminal job rows and vacuums SQLite at the
