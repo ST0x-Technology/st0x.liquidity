@@ -1187,6 +1187,11 @@ where
 {
     let label = job.label();
     log_processing(&label, attempt.current());
+    // Gate every projection write this job commits (event-sorcery folds
+    // projections synchronously inside `Store::send`) so a materialized-view
+    // rebuild can quiesce the workers first. Held for the whole job; released on
+    // return. Ungated until a conductor calls `init_projection_maintenance`.
+    let _projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
     perform_bounded::<Ctx, J>(
         &job,
         &ctx,

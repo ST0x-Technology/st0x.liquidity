@@ -66,6 +66,7 @@ mod performance;
 mod portfolio_snapshot;
 mod position;
 mod position_check;
+mod quiesce;
 mod rebalancing;
 mod startup;
 mod telemetry;
