@@ -347,8 +347,10 @@ impl AccountForDexTrade {
 /// shared inventory, not the bot's own trusted order config, so a
 /// non-standard token, a spoofed address or a malformed amount there must not
 /// trip the conductor-wide fail-stop; an unpriceable fill is anomalous,
-/// possibly adversarial, and gets the same treatment. Everything else is a
-/// real bug or a node fault and propagates.
+/// possibly adversarial, and gets the same treatment, as does a cash leg the
+/// internal amount cannot hold, which is a legitimate on-chain transfer on a
+/// stable with more than six decimals. Everything else is a real bug or a
+/// node fault and propagates.
 fn per_fill_skip(error: &TradeValidationError) -> Option<(SkipReason, &'static str)> {
     use TradeValidationError::*;
 
@@ -369,6 +371,10 @@ fn per_fill_skip(error: &TradeValidationError) -> Option<(SkipReason, &'static s
             SkipReason::InvalidInventoryAmount,
             "Skipping InventoryTrade fill with an unconvertible amount",
         )),
+        CashPrecisionLoss { .. } => Some((
+            SkipReason::UnrepresentableCashAmount,
+            "Skipping fill whose cash leg the internal amount cannot hold",
+        )),
         NoTxHash
         | NoLogIndex
         | NoBlockNumber
@@ -382,7 +388,6 @@ fn per_fill_skip(error: &TradeValidationError) -> Option<(SkipReason, &'static s
         | AfterClearMissingFromReceipt { .. }
         | NegativeShares(_)
         | NegativeUsdc(_)
-        | CashPrecisionLoss { .. }
         | Float(_)
         | NotTokenizedEquity { .. } => None,
     }
