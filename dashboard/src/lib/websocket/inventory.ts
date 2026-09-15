@@ -19,7 +19,10 @@ type PreRolloutInventory = Omit<Inventory, 'usdc'> & {
  */
 const namedStable = (inventory: PreRolloutInventory): Inventory => ({
   ...inventory,
-  usdc: { ...inventory.usdc, symbol: inventory.usdc.symbol ?? 'USDC' }
+  usdc: {
+    ...inventory.usdc,
+    symbol: inventory.usdc.symbol ?? 'USDC'
+  }
 })
 
 export const seedInventory = (queryClient: QueryClient, state: CurrentState) => {

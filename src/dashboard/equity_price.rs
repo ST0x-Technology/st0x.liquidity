@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use st0x_config::{ChainAssets, PricingAuth, PricingCtx};
 use st0x_dto::{EquityPrice, EquityPriceStatus, Statement};
-use st0x_evm::Chain;
+use st0x_evm::{Chain, SettlementStable};
 use st0x_finance::Symbol;
 use st0x_float_macro::float;
 
@@ -552,12 +552,15 @@ fn validated_price(
     }
     // The quote token must be the settlement stable of the frame's chain,
     // which differs per chain.
-    let quote = Chain::ALL
+    let settlement_stable = Chain::ALL
         .into_iter()
         .find(|chain| chain.chain_id() == frame.chain_id)
-        .map(|chain| chain.settlement_stable().address);
-    if Address::from(frame.base.0) != base || quote != Some(Address::from(frame.quote.0)) {
-        return Err(InvalidPrice::Pair);
+        .map(Chain::settlement_stable)
+        .ok_or(InvalidPrice::UntradedChain)?;
+    if Address::from(frame.base.0) != base
+        || settlement_stable.address != Address::from(frame.quote.0)
+    {
+        return Err(InvalidPrice::Pair { settlement_stable });
     }
 
     let observed_at = Utc
@@ -675,8 +678,12 @@ enum InvalidPrice {
     Venue,
     #[error("symbol is not traded on this chain")]
     UntradedChain,
-    #[error("token pair does not match configured wrapped equity and Base USDC")]
-    Pair,
+    #[error(
+        "token pair does not match configured wrapped equity and {} ({})",
+        .settlement_stable.symbol,
+        .settlement_stable.address
+    )]
+    Pair { settlement_stable: SettlementStable },
     #[error("source or expiry timestamp is invalid")]
     Timestamp,
     #[error("source timestamp is in the future")]
@@ -857,6 +864,37 @@ mod tests {
         second.base = WireAddress::from_bytes(other_derivative.into_array());
         second.quote = WireAddress::from_bytes(USDC_ETHEREUM.into_array());
         assert!(validated_price(&second, &expected, now).is_ok());
+    }
+
+    #[test]
+    fn pair_error_names_the_frame_chains_settlement_stable() {
+        let now = Utc::now();
+        let chain = Chain::Ethereum;
+        let derivative = address!("0x3333333333333333333333333333333333333333");
+        let expected = ExpectedPrice {
+            symbol: Symbol::new("AAPL").unwrap(),
+            traded: HashMap::from([(chain.chain_id(), derivative)]),
+        };
+        let mut mismatched = frame(float!(99), float!(0.01), now);
+        mismatched.chain_id = chain.chain_id();
+        mismatched.base = WireAddress::from_bytes(derivative.into_array());
+
+        let error = validated_price(&mismatched, &expected, now).unwrap_err();
+        let settlement_stable = chain.settlement_stable();
+
+        assert!(matches!(
+            &error,
+            InvalidPrice::Pair {
+                settlement_stable: actual
+            } if *actual == settlement_stable
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "token pair does not match configured wrapped equity and {} ({})",
+                settlement_stable.symbol, settlement_stable.address
+            )
+        );
     }
 
     #[tokio::test]

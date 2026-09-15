@@ -43,32 +43,101 @@
   type GlossaryEntry = { name: string; def: string }
 
   const cashEntries: GlossaryEntry[] = [
-    { name: 'Asset', def: 'The settlement stable the cash row counts, named by the backend for the chain it settles on.' },
-    { name: 'Raindex', def: 'Settlement stable available in the Raindex vaults to settle takers.' },
-    { name: 'Inflight', def: 'Settlement stable the bot has already committed to transfers or settlements between venues. Included in Total, but not in Ratio.' },
-    { name: 'Alpaca Total', def: 'Alpaca USD cash used for inventory math: gross broker cash when available, otherwise available cash. This is USD cash at Alpaca, not wallet-observed USDC.' },
-    { name: 'Total', def: 'Raindex + Inflight + Alpaca Total. Wallet-observed Eth/Base balances are excluded.' },
-    { name: 'Ratio', def: 'Venue split for cash allocation: Raindex / (Raindex + Alpaca Total). Inflight and wallet-observed balances are excluded from the ratio.' },
-    { name: 'Alpaca / USDC', def: 'USDC token balance held in the Alpaca account. This is separate from Alpaca USD cash and does not count toward the cash reserve.' },
-    { name: 'Alpaca / Rebalanceable', def: 'Settled Alpaca cash that can leave Alpaca for USDC rebalancing after preserving the configured reserve.' },
-    { name: 'Alpaca / Counter-tradeable', def: 'Alpaca cash available for buy-side equity counter-trades. The configured reserve is not subtracted from this value.' },
-    { name: 'Eth', def: 'USDC observed in the Ethereum wallet while moving between Alpaca and CCTP. Not included in Total, Ratio, or rebalancing decisions.' },
-    { name: 'Base', def: 'USDC observed in the Base wallet while moving between CCTP and Raindex. Not included in Total, Ratio, or rebalancing decisions.' },
+    {
+      name: 'Asset',
+      def: 'The settlement stable the cash row counts, named by the backend for the chain it settles on.'
+    },
+    {
+      name: 'Raindex',
+      def: 'Settlement stable available in the Raindex vaults to settle takers.'
+    },
+    {
+      name: 'Inflight',
+      def: 'Settlement stable the bot has already committed to transfers or settlements between venues. Included in Total, but not in Ratio.'
+    },
+    {
+      name: 'Alpaca Total',
+      def: 'Alpaca USD cash used for inventory math: gross broker cash when available, otherwise available cash. This is USD cash at Alpaca, not wallet-observed USDC.'
+    },
+    {
+      name: 'Total',
+      def: 'Raindex + Inflight + Alpaca Total. Wallet-observed Eth/Base balances are excluded.'
+    },
+    {
+      name: 'Ratio',
+      def: 'Venue split for cash allocation: Raindex / (Raindex + Alpaca Total). Inflight and wallet-observed balances are excluded from the ratio.'
+    },
+    {
+      name: 'Alpaca / USDC',
+      def: 'USDC token balance held in the Alpaca account. This is separate from Alpaca USD cash and does not count toward the cash reserve.'
+    },
+    {
+      name: 'Alpaca / Rebalanceable',
+      def: 'Settled Alpaca cash that can leave Alpaca for USDC rebalancing after preserving the configured reserve.'
+    },
+    {
+      name: 'Alpaca / Counter-tradeable',
+      def: 'Alpaca cash available for buy-side equity counter-trades. The configured reserve is not subtracted from this value.'
+    },
+    {
+      name: 'Eth',
+      def: 'USDC observed in the Ethereum wallet while moving between Alpaca and CCTP. Not included in Total, Ratio, or rebalancing decisions.'
+    },
+    {
+      name: 'Base',
+      def: 'USDC observed in the Base wallet while moving between CCTP and Raindex. Not included in Total, Ratio, or rebalancing decisions.'
+    }
   ]
 
   const equityEntries: GlossaryEntry[] = [
-    { name: 'Asset', def: 'Equity symbol with the t/wt prefix stripped (e.g. AAPL for tAAPL / wtAAPL). Non-trading assets are dimmed.' },
-    { name: 'CT', def: 'Counter-trading / hedging status for this asset. Green means enabled; red means disabled; grey means not configured.' },
-    { name: 'Rebal', def: 'Automatic equity rebalancing status for this asset. Green means enabled; red means disabled; grey means not configured.' },
-    { name: 'Ext', def: 'Extended-hours counter-trading status for this asset (only active while counter-trading is enabled). Green means enabled; red means disabled; grey means not configured.' },
-    { name: 'Raindex', def: 'tSTOCK tokens available in the Raindex vault to settle takers.' },
-    { name: 'Inflight', def: 'Shares the books track as in motion between venues (pending mints, redeems, transfers). Part of imbalance math.' },
-    { name: 'Alpaca', def: 'Shares held at Alpaca (offchain available).' },
-    { name: 'Total', def: 'Raindex + Inflight + Alpaca. Excludes wallet-observed amounts (Unwrapped / Wrapped).' },
-    { name: 'Ratio', def: 'Proportion of total shares sitting on Raindex (onchain / total). Bar and percent reflect the current split; colored offset is deviation from target.' },
-    { name: 'Exposure', def: 'Net directional dollar exposure from counterparty fills (net position × live pricing-service reference price). ▲ green = long, ▼ red = short. An em dash means the live price is unavailable; known values under $0.01 render as $0.' },
-    { name: 'Unwrapped', def: 'Wallet-observed tSTOCK parked on the Base wallet between a Raindex withdrawal and an Alpaca redemption transfer (or post-mint, pre-vault deposit). Out-of-band — NOT part of imbalance math.' },
-    { name: 'Wrapped', def: 'Wallet-observed wtSTOCK vault shares on the Base wallet (post vault-withdraw, pre-unwrap). Out-of-band — NOT part of imbalance math.' },
+    {
+      name: 'Asset',
+      def: 'Equity symbol with the t/wt prefix stripped (e.g. AAPL for tAAPL / wtAAPL). Non-trading assets are dimmed.'
+    },
+    {
+      name: 'CT',
+      def: 'Counter-trading / hedging status for this asset. Green means enabled; red means disabled; grey means not configured.'
+    },
+    {
+      name: 'Rebal',
+      def: 'Automatic equity rebalancing status for this asset. Green means enabled; red means disabled; grey means not configured.'
+    },
+    {
+      name: 'Ext',
+      def: 'Extended-hours counter-trading status for this asset (only active while counter-trading is enabled). Green means enabled; red means disabled; grey means not configured.'
+    },
+    {
+      name: 'Raindex',
+      def: 'tSTOCK tokens available in the Raindex vault to settle takers.'
+    },
+    {
+      name: 'Inflight',
+      def: 'Shares the books track as in motion between venues (pending mints, redeems, transfers). Part of imbalance math.'
+    },
+    {
+      name: 'Alpaca',
+      def: 'Shares held at Alpaca (offchain available).'
+    },
+    {
+      name: 'Total',
+      def: 'Raindex + Inflight + Alpaca. Excludes wallet-observed amounts (Unwrapped / Wrapped).'
+    },
+    {
+      name: 'Ratio',
+      def: 'Proportion of total shares sitting on Raindex (onchain / total). Bar and percent reflect the current split; colored offset is deviation from target.'
+    },
+    {
+      name: 'Exposure',
+      def: 'Net directional dollar exposure from counterparty fills (net position × live pricing-service reference price). ▲ green = long, ▼ red = short. An em dash means the live price is unavailable; known values under $0.01 render as $0.'
+    },
+    {
+      name: 'Unwrapped',
+      def: 'Wallet-observed tSTOCK parked on the Base wallet between a Raindex withdrawal and an Alpaca redemption transfer (or post-mint, pre-vault deposit). Out-of-band — NOT part of imbalance math.'
+    },
+    {
+      name: 'Wrapped',
+      def: 'Wallet-observed wtSTOCK vault shares on the Base wallet (post vault-withdraw, pre-unwrap). Out-of-band — NOT part of imbalance math.'
+    }
   ]
 </script>
 

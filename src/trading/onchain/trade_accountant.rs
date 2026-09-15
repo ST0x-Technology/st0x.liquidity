@@ -337,10 +337,6 @@ impl AccountForDexTrade {
     }
 }
 
-/// Best-effort durable record of a skipped fill for manual reconciliation. A
-/// persistence failure is logged but never propagated: the whole point of the
-/// skip is to not fail the job, so a write hiccup must not resurrect the
-/// fail-stop it exists to avoid.
 /// The validation rejections the accountant skips per fill instead of
 /// propagating: the reason recorded for reconciliation and the log line's
 /// summary. `InventoryTrade` legs come from any `OPERATOR_ROLE` holder on the
@@ -393,6 +389,10 @@ fn per_fill_skip(error: &TradeValidationError) -> Option<(SkipReason, &'static s
     }
 }
 
+/// Best-effort durable record of a skipped fill for manual reconciliation. A
+/// persistence failure is logged but never propagated: the whole point of the
+/// skip is to not fail the job, so a write hiccup must not resurrect the
+/// fail-stop it exists to avoid.
 async fn persist_skipped_fill(
     pool: &SqlitePool,
     trade_event: &EmittedOnChain<RaindexTradeEvent>,

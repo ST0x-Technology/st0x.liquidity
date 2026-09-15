@@ -27,7 +27,10 @@ const preRolloutInventory = () => ({
     offchainGross: null,
     withdrawableCash: null,
     alpacaUsdc: null,
-    inflightCash: { ethereumWallet: null, baseWallet: null }
+    inflightCash: {
+      ethereumWallet: null,
+      baseWallet: null
+    }
   }
 })
 
@@ -52,7 +55,13 @@ describe('seedInventory', () => {
     const { queryClient, cache } = createQueryClient()
     const inventory = preRolloutInventory()
     const state = {
-      inventory: { ...inventory, usdc: { ...inventory.usdc, symbol: 'USDG' } },
+      inventory: {
+        ...inventory,
+        usdc: {
+          ...inventory.usdc,
+          symbol: 'USDG'
+        }
+      },
       positions: [],
       settings: {}
     } as unknown as CurrentState
