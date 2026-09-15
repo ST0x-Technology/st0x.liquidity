@@ -2,9 +2,9 @@
 
 import type { ChainBlockLag } from '$lib/api/ChainBlockLag'
 import type { ChainName } from '$lib/api/ChainName'
+import type { ChainPollHealth } from '$lib/api/ChainPollHealth'
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
 import type { InfraReport } from '$lib/api/InfraReport'
-import type { PollHealth } from '$lib/api/PollHealth'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 import {
   BLOCK_LAG_THRESHOLDS,
@@ -138,21 +138,25 @@ export const CHAIN_LABELS: Record<ChainName, string> = {
 }
 
 /**
- * One card per watched chain: each chain's fill watcher samples its own lag.
- * Skipped ticks are poll health, which the API scopes to the primary chain
- * and lists first, so only that chain's card carries them.
+ * One card per hedged chain: each chain's fill watcher samples its own lag and
+ * runs its own poll loop, so a card's skipped ticks come from that chain's own
+ * poll report.
  */
 export const blockLagCards = (report: InfraReport | null, now: Date | null): SloCard[] => {
   if (!report || !now) {
     return [loadingCard('Block lag')]
   }
 
-  return report.monitor.blockLag.map((series, index) =>
-    blockLagCard(series, index === 0 ? report.monitor.poll : null, now),
+  return report.monitor.blockLag.map((series) =>
+    blockLagCard(
+      series,
+      report.monitor.poll.find((poll) => poll.chain === series.chain) ?? null,
+      now,
+    ),
   )
 }
 
-const blockLagCard = (series: ChainBlockLag, poll: PollHealth | null, now: Date): SloCard => {
+const blockLagCard = (series: ChainBlockLag, poll: ChainPollHealth | null, now: Date): SloCard => {
   const title = `Block lag · ${CHAIN_LABELS[series.chain]}`
   const { currentLagBlocks, currentLagSampledAt } = series
 

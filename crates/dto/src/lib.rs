@@ -112,7 +112,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     ChainName::export_all_to(out_dir)?;
     ChainBlockLag::export_all_to(out_dir)?;
     BlockLagPoint::export_all_to(out_dir)?;
-    PollHealth::export_all_to(out_dir)?;
+    ChainPollHealth::export_all_to(out_dir)?;
     DependencyName::export_all_to(out_dir)?;
     DependencyStats::export_all_to(out_dir)?;
     DependencyBucket::export_all_to(out_dir)?;
