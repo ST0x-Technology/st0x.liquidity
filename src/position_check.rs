@@ -2936,6 +2936,33 @@ mod tests {
         };
         assert_eq!(sample("hedge_floor_shares"), "1");
         assert_eq!(sample("hedge_deficit_shares"), "3");
+
+        // The onchain flow reverses and nets the position out. There is
+        // nothing left to hedge, so the deficit must read zero on the next
+        // scan rather than sit at its last value until restart.
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(5)),
+            Direction::Sell,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let rendered = metrics_handle.render();
+        let sample = |name: &str| {
+            rendered
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{symbol=\"AAPL\"}}")))
+                .and_then(|line| line.rsplit_once(' '))
+                .map_or_else(
+                    || panic!("no {name} series for AAPL in:\n{rendered}"),
+                    |(_, value)| value.to_owned(),
+                )
+        };
+        assert_eq!(sample("hedge_floor_shares"), "1");
+        assert_eq!(sample("hedge_deficit_shares"), "0");
     }
 
     #[tokio::test]
