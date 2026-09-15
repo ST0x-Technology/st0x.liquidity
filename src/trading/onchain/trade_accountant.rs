@@ -849,6 +849,7 @@ mod tests {
     };
     use crate::offchain::order::{OffchainOrder, noop_order_placer};
     use crate::onchain::backfill::{BackfillRange, load_backfill_checkpoint};
+    use crate::onchain::io::Usdc;
     use crate::onchain::trade::{INVENTORY_TOKEN_DECIMALS_MAX_RETRIES, InventoryTrade};
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
@@ -1850,6 +1851,18 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].event_type, "InventoryTrade");
         assert_eq!(recorded[0].reason, "invalid_inventory_amount");
+    }
+
+    /// A cash leg the six-decimal internal amount cannot hold (an
+    /// eighteen-decimal stable moving sub-six-decimal dust) is skipped per
+    /// fill like every other validation rejection, not fail-stopped.
+    #[test]
+    fn an_unrepresentable_cash_leg_is_skipped_per_fill() {
+        let error = Usdc::from_token_amount(float!(100.0000001), 18).unwrap_err();
+
+        let (reason, _) = per_fill_skip(&error).unwrap();
+
+        assert_eq!(reason, SkipReason::UnrepresentableCashAmount);
     }
 
     /// A hedgeable `InventoryTrade` (real USDC leg + real equity leg, from
