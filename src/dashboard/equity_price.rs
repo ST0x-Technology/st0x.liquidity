@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use st0x_config::{ChainAssets, PricingAuth, PricingCtx};
 use st0x_dto::{EquityPrice, EquityPriceStatus, Statement};
-use st0x_evm::USDC_BASE;
+use st0x_evm::Chain;
 use st0x_finance::Symbol;
 use st0x_float_macro::float;
 
@@ -550,7 +550,13 @@ fn validated_price(
     if frame.venue != Venue::Raindex {
         return Err(InvalidPrice::Venue);
     }
-    if Address::from(frame.base.0) != base || Address::from(frame.quote.0) != USDC_BASE {
+    // The quote token must be the canonical USDC on the frame's chain, which
+    // differs per chain.
+    let quote = Chain::ALL
+        .into_iter()
+        .find(|chain| chain.chain_id() == frame.chain_id)
+        .map(Chain::usdc);
+    if Address::from(frame.base.0) != base || quote != Some(Address::from(frame.quote.0)) {
         return Err(InvalidPrice::Pair);
     }
 
@@ -689,6 +695,7 @@ enum InvalidPrice {
 mod tests {
     use alloy::primitives::address;
     use chrono::TimeDelta;
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
     use st0x_pricing_types::{ErrorCode, PingFrame, WireAddress, WireFloat};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
@@ -833,7 +840,7 @@ mod tests {
     #[test]
     fn quote_is_accepted_on_any_chain_the_symbol_is_traded_on() {
         let now = Utc::now();
-        let other_chain = 4_663;
+        let other_chain = Chain::Ethereum.chain_id();
         let other_derivative = address!("0x3333333333333333333333333333333333333333");
         let expected = ExpectedPrice {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -848,6 +855,7 @@ mod tests {
         let mut second = frame(float!(99), float!(0.01), now);
         second.chain_id = other_chain;
         second.base = WireAddress::from_bytes(other_derivative.into_array());
+        second.quote = WireAddress::from_bytes(USDC_ETHEREUM.into_array());
         assert!(validated_price(&second, &expected, now).is_ok());
     }
 
