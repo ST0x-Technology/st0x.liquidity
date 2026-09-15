@@ -426,6 +426,18 @@ where
         let all_positions = self.position_projection.load_all().await?;
         let active_transfers = symbols_with_active_transfers(&self.pool).await?;
 
+        // Every known symbol starts the scan at zero deficit; the preflight
+        // below overwrites the ones it tries to hedge. Otherwise a symbol that
+        // stops being hedge-ready keeps its last deficit until restart.
+        for (symbol, _) in &all_positions {
+            record_hedge_floor_gauges(
+                symbol,
+                self.ctx.broker.hedge_floor().for_symbol(symbol),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            );
+        }
+
         // Each symbol is paired with the asset table that sizes its hedge:
         // the hedged chain enabling it, or the tightest-capped one when
         // several do. A symbol no hedged chain enables is not swept.
