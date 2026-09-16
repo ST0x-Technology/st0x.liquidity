@@ -2440,6 +2440,11 @@ impl Ctx {
         #[builder(default = InventoryMode::Legacy)]
         inventory_mode: InventoryMode,
         #[builder(default = InventoryAdapters::default())] inventory_adapters: InventoryAdapters,
+        /// Overnight broker knobs, `None` by default like a config with no
+        /// overnight assets; overnight e2e scenarios set all three.
+        overnight_max_quote_age_secs: Option<NonZeroU64>,
+        overnight_slippage_bps: Option<u16>,
+        overnight_reprice_timeout_secs: Option<NonZeroU64>,
         /// What the trading chain lists.
         assets: crate::ChainAssets,
         /// How those symbols hedge. Omitted by most fixtures, which care about
@@ -2533,9 +2538,9 @@ impl Ctx {
             inventory_divergence_threshold,
             hedge_order_gate_reconciliation_timeout_secs,
             extended_hours_reprice_timeout_secs: NonZeroU64::new(300),
-            overnight_max_quote_age_secs: None,
-            overnight_slippage_bps: None,
-            overnight_reprice_timeout_secs: None,
+            overnight_max_quote_age_secs,
+            overnight_slippage_bps,
+            overnight_reprice_timeout_secs,
             close_flatten_reprice_timeout_secs: 60,
             extended_hours_close_flatten_window_secs: 900,
             close_flatten_cross_max_bps: 400,
