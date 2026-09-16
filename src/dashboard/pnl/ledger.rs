@@ -455,6 +455,7 @@ async fn ingest_position(
         | PositionEvent::OnChainFillApplied { .. }
         | PositionEvent::OnChainFillSettled { .. }
         | PositionEvent::OffChainOrderFailed { .. }
+        | PositionEvent::FailedOrderAnchorReleased { .. }
         | PositionEvent::OffChainOrderCancelled { .. } => {}
     }
 

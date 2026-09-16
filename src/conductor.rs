@@ -48,9 +48,10 @@ use st0x_event_sorcery::{
 };
 use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
-    CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
-    MarketOrder, MarketSession, Positive, Symbol, TryIntoExecutor, Usd,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, BuyingPowerReservationCents,
+    ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
+    Direction, ExecutionError, Executor, FractionalShares, MarketOrder, MarketSession, Positive,
+    SupportedExecutor, Symbol, TryIntoExecutor, Usd,
 };
 use st0x_issuance_client::IssuanceClient;
 use st0x_issuance_dto::VaultModeTag;
@@ -134,7 +135,9 @@ use crate::tokenized_equity_mint::{
     TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, interrupted_mint_ids,
 };
 use crate::trading::offchain::close_flatten::{CloseFlattenCrossRamp, CloseFlattenPolicy};
-use crate::trading::offchain::hedge::{apply_slippage, resolve_extended_hours_reference_price};
+use crate::trading::offchain::hedge::{
+    apply_slippage, push_anchor_recovery_job_if_absent, resolve_extended_hours_reference_price,
+};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
 use crate::unwrapped_equity_recovery::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
@@ -3916,7 +3919,7 @@ async fn resolve_terminal_claimed_order(
                 PositionCommand::FailOffChainOrder {
                     offchain_order_id: order_id,
                     error: "pending offchain order has no offchain order aggregate".to_string(),
-                    anchor: AnchorDisposition::Preserve,
+                    anchor: AnchorDisposition::Release,
                 },
             )
             .await?;
@@ -4468,6 +4471,10 @@ where
         ExistingPendingOrderOutcome::InFlight => return Ok(None),
     }
 
+    if enqueue_failed_anchor_recovery(base_symbol, cqrs).await? {
+        return Ok(None);
+    }
+
     let executor_type = executor.to_supported_executor();
 
     let Some(mut execution) = check_execution_readiness(
@@ -4494,8 +4501,31 @@ where
             return Ok(None);
         };
         let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+        let reserved = if execution.direction == Direction::Buy {
+            match crate::trading::offchain::hedge::live_buying_power_reservations(&cqrs.pool).await
+            {
+                Ok(reserved) => reserved,
+                Err(crate::trading::offchain::hedge::BuyingPowerReservationError::Unknown {
+                    order_id,
+                }) => {
+                    warn!(
+                        target: "hedge",
+                        symbol = %execution.symbol,
+                        %order_id,
+                        "Deferring inline extended-hours buy hedge while a live legacy buy has \
+                         unknown reserved buying power"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            BuyingPowerReservationCents::ZERO
+        };
 
-        match preflight_extended_hours_trade_submission(executor, &execution, preflight).await? {
+        match preflight_extended_hours_trade_submission(executor, &execution, preflight, reserved)
+            .await?
+        {
             CounterTradeSubmissionCheck::Skipped => return Ok(None),
             CounterTradeSubmissionCheck::Allowed { reservation } => {
                 clamp_shares_to_reservation(&mut execution, reservation.as_ref());
@@ -4521,6 +4551,7 @@ where
             market_session: execution.market_session,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: crate::trading::offchain::hedge::TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         if let Err(error) = cqrs.hedge_queue.clone().push(job).await {
@@ -4541,20 +4572,54 @@ where
 
     let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
+    if enqueue_failed_anchor_recovery(base_symbol, cqrs).await? {
+        return Ok(None);
+    }
+
+    let reserved = if execution.direction == Direction::Buy {
+        match crate::trading::offchain::hedge::live_buying_power_reservations(&cqrs.pool).await {
+            Ok(reserved) => reserved,
+            Err(crate::trading::offchain::hedge::BuyingPowerReservationError::Unknown {
+                order_id,
+            }) => {
+                warn!(
+                    target: "hedge",
+                    symbol = %execution.symbol,
+                    %order_id,
+                    "Deferring inline buy hedge while a live legacy buy has unknown reserved buying power"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        BuyingPowerReservationCents::ZERO
+    };
     let counter_trade_submission =
-        match preflight_counter_trade_submission(executor, &execution, None).await {
+        match preflight_counter_trade_submission(executor, &execution, None, reserved).await {
             Ok(check) => check,
             Err(error) => return Err(error),
         };
 
-    match counter_trade_submission {
+    let buying_power_reservation = match counter_trade_submission {
         CounterTradeSubmissionCheck::Skipped => return Ok(None),
         CounterTradeSubmissionCheck::Allowed { reservation } => {
             clamp_shares_to_reservation(&mut execution, reservation.as_ref());
+            reservation
+                .and_then(|reservation| match reservation {
+                    CounterTradeReservation::BuyingPower {
+                        estimated_cost_cents,
+                        ..
+                    } => Some(estimated_cost_cents),
+                    CounterTradeReservation::Equity { .. } => None,
+                })
+                .map(BuyingPowerReservationCents::new)
+                .transpose()
+                .map_err(ExecutionError::from)?
         }
-    }
+    };
 
-    place_offchain_order(&execution, cqrs).await
+    place_offchain_order(&execution, cqrs, buying_power_reservation).await
 }
 
 #[derive(Default)]
@@ -4756,12 +4821,13 @@ async fn preflight_extended_hours_trade_submission<E: Executor>(
     executor: &E,
     execution: &ExecutionCtx,
     preflight: ExtendedHoursPreflight,
+    reserved: BuyingPowerReservationCents,
 ) -> Result<CounterTradeSubmissionCheck, TradeAccountingError>
 where
     TradeAccountingError: From<E::Error>,
 {
     let ExtendedHoursPreflight::ExactPrice(reference_price) = preflight else {
-        return preflight_counter_trade_submission(executor, execution, None).await;
+        return preflight_counter_trade_submission(executor, execution, None, reserved).await;
     };
 
     let order = MarketOrder {
@@ -4772,7 +4838,11 @@ where
     };
 
     match executor
-        .preflight_counter_trade_at_price(order, reference_price)
+        .preflight_counter_trade_at_price_with_reserved_buying_power(
+            order,
+            reference_price,
+            reserved,
+        )
         .await?
     {
         CounterTradePreflight::Allowed { reservation } => {
@@ -4853,6 +4923,15 @@ fn log_counter_trade_skip(
                 "Skipping counter trade before broker submission: insufficient buying power"
             );
         }
+        CounterTradeSkipReason::BelowMinimumNotional => {
+            debug!(
+                symbol = %execution.symbol,
+                shares = %execution.shares,
+                direction = ?execution.direction,
+                source,
+                "Deferring counter trade until its notional reaches the fractional-order minimum"
+            );
+        }
     }
 }
 
@@ -4860,6 +4939,7 @@ async fn preflight_counter_trade_submission<E: Executor>(
     executor: &E,
     execution: &ExecutionCtx,
     batch_budget: Option<&CounterTradeBatchBudget>,
+    reserved: BuyingPowerReservationCents,
 ) -> Result<CounterTradeSubmissionCheck, TradeAccountingError>
 where
     TradeAccountingError: From<E::Error>,
@@ -4874,7 +4954,10 @@ where
         client_order_id: ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
     };
 
-    match executor.preflight_counter_trade(order).await? {
+    match executor
+        .preflight_counter_trade_with_reserved_buying_power(order, reserved)
+        .await?
+    {
         CounterTradePreflight::Allowed { reservation } => {
             if let (Some(batch_budget), Some(reservation)) = (batch_budget, reservation.as_ref())
                 && let Some(reason) = batch_budget.check_reservation(reservation)?
@@ -4895,6 +4978,7 @@ where
 async fn place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
+    buying_power_reservation: Option<BuyingPowerReservationCents>,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
     // Always mint a fresh OffchainOrderId for the new aggregate — the
     // prior aggregate may be in `Failed` state and cannot be revived. The
@@ -4912,7 +4996,8 @@ async fn place_offchain_order(
         return recover_claimed_offchain_order(execution, cqrs).await;
     }
 
-    execute_create_offchain_order(execution, cqrs, offchain_order_id).await?;
+    execute_create_offchain_order(execution, cqrs, offchain_order_id, buying_power_reservation)
+        .await?;
 
     let loaded = cqrs
         .offchain_order
@@ -4939,6 +5024,48 @@ enum ExistingPendingOrderOutcome {
     NoPending,
     InFlight,
     Cleared,
+}
+
+async fn enqueue_failed_anchor_recovery(
+    symbol: &Symbol,
+    cqrs: &TradeProcessingCqrs,
+) -> Result<bool, TradeAccountingError> {
+    let Some(anchor) = cqrs
+        .position
+        .load(symbol)
+        .await?
+        .and_then(|position| position.last_failed_offchain_order_id)
+    else {
+        return Ok(false);
+    };
+    let Some(anchored_order) = cqrs.offchain_order.load(&anchor).await? else {
+        cqrs.position
+            .send(
+                symbol,
+                PositionCommand::ReleaseFailedOrderAnchor {
+                    expected_offchain_order_id: anchor,
+                },
+            )
+            .await?;
+        return Ok(false);
+    };
+    if anchored_order.executor() != SupportedExecutor::AlpacaBrokerApi {
+        return Ok(false);
+    }
+
+    push_anchor_recovery_job_if_absent(
+        cqrs.hedge_queue.clone(),
+        crate::trading::offchain::hedge::PlaceHedge::anchor_recovery(
+            symbol.clone(),
+            anchored_order.shares(),
+            anchored_order.direction(),
+            anchored_order.executor(),
+            cqrs.execution_threshold,
+        ),
+    )
+    .await
+    .map_err(TradeAccountingError::HedgeJobGuard)?;
+    Ok(true)
 }
 
 async fn reconcile_existing_pending_order(
@@ -5244,6 +5371,7 @@ async fn execute_create_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
+    buying_power_reservation: Option<BuyingPowerReservationCents>,
 ) -> Result<(), TradeAccountingError> {
     // Derive the broker-side client_order_id from the live position aggregate
     // (read after PlaceOffChainOrder claimed it), reusing a prior failed
@@ -5286,7 +5414,8 @@ async fn execute_create_offchain_order(
             execution.direction,
             execution.executor,
             client_order_id,
-        ),
+        )
+        .with_buying_power_reservation(buying_power_reservation),
     )
     .await
     .inspect(|_| {
@@ -5353,13 +5482,17 @@ where
     let mut batch_budget = CounterTradeBatchBudget::default();
 
     for mut execution in ready_positions {
-        let reservation =
-            match preflight_counter_trade_submission(executor, &execution, Some(&batch_budget))
-                .await?
-            {
-                CounterTradeSubmissionCheck::Allowed { reservation } => reservation,
-                CounterTradeSubmissionCheck::Skipped => continue,
-            };
+        let reservation = match preflight_counter_trade_submission(
+            executor,
+            &execution,
+            Some(&batch_budget),
+            BuyingPowerReservationCents::ZERO,
+        )
+        .await?
+        {
+            CounterTradeSubmissionCheck::Allowed { reservation } => reservation,
+            CounterTradeSubmissionCheck::Skipped => continue,
+        };
 
         clamp_shares_to_reservation(&mut execution, reservation.as_ref());
 
@@ -5517,7 +5650,9 @@ mod tests {
     use crate::mint_authorization::{
         MintAuthorizationError, MockMintAuthorizer, StubVaultModeReader, VaultModeCheckError,
     };
-    use crate::offchain::order::{CancellationReason, OrderPlacementResult, RetainedFill};
+    use crate::offchain::order::{
+        CancellationReason, CounterTradeOrderKind, OrderPlacementResult, RetainedFill,
+    };
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
     use crate::onchain::mock::MockRaindex;
     use crate::onchain::trade::{InventoryTrade, OnchainTrade};
@@ -10782,11 +10917,28 @@ mod tests {
         let resolved = resolve_extended_hours_preflight(&execution, &cqrs)
             .await
             .unwrap();
-        let preflight = preflight_extended_hours_trade_submission(&executor, &execution, resolved)
-            .await
-            .unwrap();
+        let preflight = preflight_extended_hours_trade_submission(
+            &executor,
+            &execution,
+            resolved,
+            BuyingPowerReservationCents::new(10_000).unwrap(),
+        )
+        .await
+        .unwrap();
 
-        assert!(matches!(preflight, CounterTradeSubmissionCheck::Skipped));
+        let CounterTradeSubmissionCheck::Allowed {
+            reservation:
+                Some(CounterTradeReservation::BuyingPower {
+                    required,
+                    available_buying_power_cents,
+                    ..
+                }),
+        } = preflight
+        else {
+            panic!("the ramped mark must produce a partial buy reservation");
+        };
+        assert!(required.inner().inner().lt(float!(2)).unwrap());
+        assert_eq!(available_buying_power_cents, 10_500);
         assert_eq!(
             executor.market_session_status_call_count(),
             1,
@@ -10953,9 +11105,14 @@ mod tests {
         let resolved = resolve_extended_hours_preflight(&execution, &cqrs)
             .await
             .unwrap();
-        let preflight = preflight_extended_hours_trade_submission(&executor, &execution, resolved)
-            .await
-            .unwrap();
+        let preflight = preflight_extended_hours_trade_submission(
+            &executor,
+            &execution,
+            resolved,
+            BuyingPowerReservationCents::ZERO,
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             preflight,
@@ -11352,6 +11509,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_buy_defers_when_legacy_live_buy_reservation_is_unknown() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (cqrs, assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let legacy_order_id = OffchainOrderId::new();
+        cqrs.offchain_order
+            .send(
+                &legacy_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("MSFT").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(legacy_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        let trade_event = make_trade_event(24);
+        let trade = test_trade_with_amount_and_direction(float!(1.5), 24, Direction::Sell);
+        let executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![],
+                usd_balance_cents: 100_000,
+                cash_buying_power_cents: Some(100_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            })
+            .with_preflight_price(float!(100));
+
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.pending_offchain_order_id, None);
+        assert!(position.net.inner().eq(float!(-1.5)).unwrap());
+        assert_eq!(offchain_order_projection.load_all().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn multiple_trades_accumulate_then_trigger() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
@@ -11648,7 +11859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_checker_skips_counter_trade_without_buying_power() {
+    async fn periodic_checker_partially_hedges_with_limited_buying_power() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) = create_cqrs_frameworks(&pool).await;
         let (cqrs, assets) = trade_processing_cqrs_with_threshold(
@@ -11696,17 +11907,10 @@ mod tests {
             .expect("position should exist");
 
         assert!(
-            position.pending_offchain_order_id.is_none(),
-            "Skipped accumulated counter trades must not leave the position pending"
+            position.pending_offchain_order_id.is_some(),
+            "Available buying power must create a partial hedge"
         );
-        assert!(
-            offchain_order_projection
-                .load_all()
-                .await
-                .unwrap()
-                .is_empty(),
-            "Skipped accumulated counter trades must not create offchain orders"
-        );
+        assert_eq!(offchain_order_projection.load_all().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -13279,7 +13483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_orphaned_pending_clears_missing_order_aggregate() {
+    async fn recover_orphaned_pending_releases_missing_pre_intent_order_without_anchor() {
         let pool = setup_test_db().await;
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -13350,6 +13554,10 @@ mod tests {
         assert_eq!(
             pos.pending_offchain_order_id, None,
             "Recovery should clear a pending order id when the offchain order aggregate is missing"
+        );
+        assert_eq!(
+            pos.last_failed_offchain_order_id, None,
+            "a crash before placement intent cannot have reached the broker, so it must not preserve an anchor"
         );
     }
 

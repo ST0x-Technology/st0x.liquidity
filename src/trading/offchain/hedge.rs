@@ -12,6 +12,7 @@ use alloy::primitives::U256;
 use metrics::counter;
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use st0x_float_macro::float;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -19,9 +20,9 @@ use tracing::{debug, error, info, warn};
 use st0x_config::{ExecutionThreshold, HedgingAssets};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
 use st0x_execution::{
-    Backpressure, ClientOrderId, CounterTradePreflight, CounterTradeSkipReason, Direction,
-    FractionalShares, MarketOrder, MarketSession, Permanence, Positive, PostCloseGap,
-    SupportedExecutor, Symbol, Usd,
+    Backpressure, BuyingPowerReservationCents, ClientOrderId, CounterTradePreflight,
+    CounterTradeReservation, CounterTradeSkipReason, Direction, ExecutionError, FractionalShares,
+    MarketOrder, MarketSession, Permanence, Positive, PostCloseGap, SupportedExecutor, Symbol, Usd,
 };
 
 use crate::alerts::Notifier;
@@ -32,8 +33,8 @@ use crate::conductor::job::{
 #[cfg(test)]
 use crate::offchain::order::PollOrderStatus;
 use crate::offchain::order::{
-    CounterTradeOrderKind, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
-    PollOrderStatusJobQueue, client_order_id_for_placement,
+    CounterTradeOrderKind, JobError, OffchainOrder, OffchainOrderId, OffchainOrderPlacement,
+    OrderPlacer, PollOrderStatusJobQueue, client_order_id_for_placement,
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
     push_poll_job_if_absent,
 };
@@ -106,9 +107,44 @@ pub(crate) fn apply_slippage(
 
 /// Persistent job queue for hedge placement.
 pub type HedgeJobQueue = JobQueue<PlaceHedge>;
+static ANCHOR_RECOVERY_JOB_PUSH_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Enqueues one live failed-anchor recovery per symbol.
+///
+/// Both the periodic scan and inline fill processing can discover the same
+/// anchor. Their check and push are serialized so they cannot create parallel
+/// recovery chains while a broker lookup is slow or rate-limited. Terminal
+/// rows do not block a later scan from retrying an anchor that still exists.
+pub(crate) async fn push_anchor_recovery_job_if_absent(
+    mut queue: HedgeJobQueue,
+    job: PlaceHedge,
+) -> Result<bool, JobError> {
+    let _push_guard = ANCHOR_RECOVERY_JOB_PUSH_LOCK.lock().await;
+    let is_live: bool = sqlx_apalis::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM Jobs \
+         WHERE job_type = ? \
+           AND json_valid(CAST(job AS TEXT)) \
+           AND json_extract(CAST(job AS TEXT), '$.anchor_recovery_only') = 1 \
+           AND json_extract(CAST(job AS TEXT), '$.symbol') = ? \
+           AND (status IN ('Pending', 'Queued', 'Running') \
+                OR (status = 'Failed' AND attempts < max_attempts)))",
+    )
+    .bind(std::any::type_name::<PlaceHedge>())
+    .bind(job.symbol.to_string())
+    .fetch_one(queue.pool())
+    .await?;
+
+    if is_live {
+        return Ok(false);
+    }
+
+    queue.push(job).await?;
+    Ok(true)
+}
 
 /// Shared dependencies for hedge placement jobs.
 pub(crate) struct HedgeCtx {
+    pub(crate) pool: SqlitePool,
     pub(crate) position: Arc<Store<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     /// Places the broker order, lifted out of the (now pure)
@@ -165,6 +201,126 @@ pub(crate) struct HedgeCtx {
     /// again. In-process only: a restart re-pages, which is the right
     /// behaviour for a condition that survived a restart.
     pub(crate) alerted_dead_letters: Arc<Mutex<HashSet<(Symbol, DeadLetterReason)>>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BuyingPowerReservationError {
+    #[error("failed to query live buying-power reservations")]
+    Database(#[source] sqlx::Error),
+    #[error("offchain order {order_id} has malformed projected state")]
+    MalformedOrder {
+        order_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("offchain order {order_id} has a malformed placement event")]
+    MalformedPlacement {
+        order_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("live Alpaca buy {order_id} has no durable buying-power reservation")]
+    Unknown { order_id: String },
+    #[error("live buying-power reservation total overflowed")]
+    Overflow,
+}
+
+pub async fn live_buying_power_reservations(
+    pool: &SqlitePool,
+) -> Result<BuyingPowerReservationCents, BuyingPowerReservationError> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT view.view_id, view.payload, event.payload \
+         FROM offchain_order_view AS view \
+         JOIN events AS event \
+           ON event.aggregate_type = 'OffchainOrder' \
+          AND event.aggregate_id = view.view_id \
+          AND event.sequence = 1 \
+         WHERE view.status IN ('Pending', 'Submitted', 'PartiallyFilled', 'Cancelling') \
+            OR (view.status = 'Failed' AND EXISTS ( \
+                SELECT 1 FROM position_view AS position \
+                WHERE json_extract(position.payload, '$.Live.last_failed_offchain_order_id') = \
+                      view.view_id \
+                  AND json_type(position.payload, '$.Live.pending_offchain_order_id') = 'null' \
+            ))",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(BuyingPowerReservationError::Database)?;
+
+    rows.into_iter().try_fold(
+        BuyingPowerReservationCents::ZERO,
+        |total, (order_id, state_payload, event_payload)| {
+            let projected: serde_json::Value =
+                serde_json::from_str(&state_payload).map_err(|source| {
+                    BuyingPowerReservationError::MalformedOrder {
+                        order_id: order_id.clone(),
+                        source,
+                    }
+                })?;
+            let state: OffchainOrder =
+                serde_json::from_value(projected["Live"].clone()).map_err(|source| {
+                    BuyingPowerReservationError::MalformedOrder {
+                        order_id: order_id.clone(),
+                        source,
+                    }
+                })?;
+            if state.executor() != SupportedExecutor::AlpacaBrokerApi
+                || state.direction() != Direction::Buy
+            {
+                return Ok(total);
+            }
+
+            let event: crate::offchain::order::OffchainOrderEvent =
+                serde_json::from_str(&event_payload).map_err(|source| {
+                    BuyingPowerReservationError::MalformedPlacement {
+                        order_id: order_id.clone(),
+                        source,
+                    }
+                })?;
+            let crate::offchain::order::OffchainOrderEvent::Placed {
+                buying_power_reservation,
+                ..
+            } = event
+            else {
+                return Err(BuyingPowerReservationError::Unknown { order_id });
+            };
+            let reservation = buying_power_reservation
+                .ok_or(BuyingPowerReservationError::Unknown { order_id })?;
+            total
+                .checked_add(reservation)
+                .ok_or(BuyingPowerReservationError::Overflow)
+        },
+    )
+}
+
+async fn buying_power_reservation_for_order(
+    pool: &SqlitePool,
+    order_id: OffchainOrderId,
+) -> Result<Option<BuyingPowerReservationCents>, BuyingPowerReservationError> {
+    let payload: Option<String> = sqlx::query_scalar(
+        "SELECT payload FROM events \
+         WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? AND sequence = 1",
+    )
+    .bind(order_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .map_err(BuyingPowerReservationError::Database)?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let event: crate::offchain::order::OffchainOrderEvent = serde_json::from_str(&payload)
+        .map_err(|source| BuyingPowerReservationError::MalformedPlacement {
+            order_id: order_id.to_string(),
+            source,
+        })?;
+    let crate::offchain::order::OffchainOrderEvent::Placed {
+        buying_power_reservation,
+        ..
+    } = event
+    else {
+        return Ok(None);
+    };
+    Ok(buying_power_reservation)
 }
 
 /// Pages the operator once per `(symbol, reason)` for a hedge this process
@@ -255,6 +411,19 @@ pub struct PlaceHedge {
     /// still deserializes to `0` instead of crashing the poll stream's decode.
     #[serde(default)]
     pub(crate) transient_streak: TransientFailureStreak,
+    /// Reconcile only an already-preserved broker idempotency anchor. Used by
+    /// periodic recovery independently of current hedge readiness; when the
+    /// broker has no matching order, release the anchor without placing fresh.
+    #[serde(default)]
+    pub(crate) anchor_recovery_only: bool,
+}
+
+struct RecoveredAnchor {
+    order_kind: CounterTradeOrderKind,
+    shares: Positive<FractionalShares>,
+    direction: Direction,
+    buying_power_reservation: Option<BuyingPowerReservationCents>,
+    anchor: OffchainOrderId,
 }
 
 /// Durable count of consecutive symbol-scoped transient re-drives leading up to
@@ -483,12 +652,7 @@ async fn extended_hours_preflight_at_submitted_price(
         .order_placer
         .preflight_counter_trade_at_price(order, limit_price)
         .await
-        .map_err(
-            |source| TradeAccountingError::CloseFlattenPreflightAtPrice {
-                symbol: symbol.clone(),
-                source,
-            },
-        )?;
+        .map_err(|source| submitted_price_preflight_error(symbol, close_flatten_active, source))?;
 
     match preflight {
         CounterTradePreflight::Allowed { .. } => Ok(true),
@@ -503,6 +667,24 @@ async fn extended_hours_preflight_at_submitted_price(
                  passes the scan-time preflight"
             );
             Ok(false)
+        }
+    }
+}
+
+fn submitted_price_preflight_error(
+    symbol: &Symbol,
+    close_flatten_active: bool,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> TradeAccountingError {
+    if close_flatten_active {
+        TradeAccountingError::CloseFlattenPreflightAtPrice {
+            symbol: symbol.clone(),
+            source,
+        }
+    } else {
+        TradeAccountingError::PlacementPreflight {
+            symbol: symbol.clone(),
+            source,
         }
     }
 }
@@ -590,6 +772,7 @@ enum CloseFlattenBlockReason {
     NonFractionableQuantityBelowOne,
     InsufficientEquity,
     InsufficientBuyingPower,
+    BelowMinimumNotional,
 }
 
 impl CloseFlattenBlockReason {
@@ -601,6 +784,7 @@ impl CloseFlattenBlockReason {
             Self::NonFractionableQuantityBelowOne => "non_fractionable_quantity_below_one",
             Self::InsufficientEquity => "insufficient_equity",
             Self::InsufficientBuyingPower => "insufficient_buying_power",
+            Self::BelowMinimumNotional => "below_minimum_notional",
         }
     }
 }
@@ -623,6 +807,7 @@ impl From<&CounterTradeSkipReason> for CloseFlattenBlockReason {
             }
             CounterTradeSkipReason::InsufficientEquity { .. } => Self::InsufficientEquity,
             CounterTradeSkipReason::InsufficientBuyingPower { .. } => Self::InsufficientBuyingPower,
+            CounterTradeSkipReason::BelowMinimumNotional => Self::BelowMinimumNotional,
         }
     }
 }
@@ -1080,6 +1265,187 @@ impl Job<HedgeCtx> for PlaceHedge {
 }
 
 impl PlaceHedge {
+    pub(crate) fn anchor_recovery(
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        executor: SupportedExecutor,
+        threshold: ExecutionThreshold,
+    ) -> Self {
+        Self {
+            symbol,
+            direction,
+            shares,
+            executor,
+            threshold,
+            offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Regular,
+            backpressure_streak: BackpressureStreak::default(),
+            transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: true,
+        }
+    }
+
+    async fn reconcile_failed_anchor(
+        &self,
+        ctx: &HedgeCtx,
+    ) -> Result<Option<RecoveredAnchor>, TradeAccountingError> {
+        if self.executor != SupportedExecutor::AlpacaBrokerApi {
+            return Ok(None);
+        }
+        let Some(anchor) = ctx
+            .position
+            .load(&self.symbol)
+            .await?
+            .and_then(|position| position.last_failed_offchain_order_id)
+        else {
+            return Ok(None);
+        };
+        let client_order_id = ClientOrderId::from_uuid(anchor.as_uuid());
+        let Some(broker_order) = ctx
+            .order_placer
+            .get_order_by_client_order_id(&client_order_id)
+            .await
+            .map_err(|source| TradeAccountingError::BrokerAnchorLookup {
+                symbol: self.symbol.clone(),
+                source,
+            })?
+        else {
+            ctx.position
+                .send(
+                    &self.symbol,
+                    PositionCommand::ReleaseFailedOrderAnchor {
+                        expected_offchain_order_id: anchor,
+                    },
+                )
+                .await?;
+            return Ok(None);
+        };
+
+        let anchored_order = ctx.offchain_order.load(&anchor).await?.ok_or_else(|| {
+            TradeAccountingError::BrokerAnchorOrderMissing {
+                symbol: self.symbol.clone(),
+                anchor,
+            }
+        })?;
+        let expected_symbol = anchored_order.symbol();
+        let expected_direction = anchored_order.direction();
+        if broker_order.symbol != *expected_symbol || broker_order.direction != expected_direction {
+            return Err(TradeAccountingError::BrokerAnchorMismatch {
+                expected_symbol: expected_symbol.clone(),
+                expected_direction,
+                actual_symbol: broker_order.symbol,
+                actual_direction: broker_order.direction,
+            });
+        }
+        let order_kind = if broker_order.is_extended_hours {
+            CounterTradeOrderKind::ExtendedHoursLimit {
+                limit_price: broker_order.limit_price.ok_or_else(|| {
+                    TradeAccountingError::BrokerAnchorMissingLimitPrice {
+                        symbol: self.symbol.clone(),
+                    }
+                })?,
+                close_flatten: false,
+            }
+        } else {
+            CounterTradeOrderKind::Market
+        };
+
+        Ok(Some(RecoveredAnchor {
+            order_kind,
+            shares: broker_order.shares,
+            direction: broker_order.direction,
+            buying_power_reservation: buying_power_reservation_for_order(&ctx.pool, anchor).await?,
+            anchor,
+        }))
+    }
+
+    async fn preflight_fresh_placement(
+        &self,
+        ctx: &HedgeCtx,
+        order_kind: &CounterTradeOrderKind,
+    ) -> Result<
+        Option<(
+            Positive<FractionalShares>,
+            Option<BuyingPowerReservationCents>,
+        )>,
+        TradeAccountingError,
+    > {
+        let reserved = if self.direction == Direction::Buy {
+            match live_buying_power_reservations(&ctx.pool).await {
+                Ok(reserved) => reserved,
+                Err(BuyingPowerReservationError::Unknown { order_id }) => {
+                    warn!(
+                        target: "hedge",
+                        symbol = %self.symbol,
+                        %order_id,
+                        "Deferring buy hedge while a live legacy buy has unknown reserved buying power"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            BuyingPowerReservationCents::ZERO
+        };
+        let preflight_order = MarketOrder {
+            symbol: self.symbol.clone(),
+            shares: self.shares,
+            direction: self.direction,
+            client_order_id: ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+        };
+        let preflight = match order_kind {
+            CounterTradeOrderKind::Market => {
+                ctx.order_placer
+                    .preflight_counter_trade_with_reserved_buying_power(preflight_order, reserved)
+                    .await
+            }
+            CounterTradeOrderKind::ExtendedHoursLimit { limit_price, .. } => {
+                ctx.order_placer
+                    .preflight_counter_trade_at_price_with_reserved_buying_power(
+                        preflight_order,
+                        *limit_price,
+                        reserved,
+                    )
+                    .await
+            }
+        }
+        .map_err(|source| TradeAccountingError::PlacementPreflight {
+            symbol: self.symbol.clone(),
+            source,
+        })?;
+        let reservation = match preflight {
+            CounterTradePreflight::Skipped(reason) => {
+                warn!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    %reason,
+                    "Hedge blocked by definitive placement-time preflight"
+                );
+                return Ok(None);
+            }
+            CounterTradePreflight::Allowed { reservation } => reservation,
+        };
+        let shares = match reservation.as_ref() {
+            Some(
+                CounterTradeReservation::Equity { required, .. }
+                | CounterTradeReservation::BuyingPower { required, .. },
+            ) => *required,
+            None => self.shares,
+        };
+        let buying_power_reservation = match reservation {
+            Some(CounterTradeReservation::BuyingPower {
+                estimated_cost_cents,
+                ..
+            }) => Some(
+                BuyingPowerReservationCents::new(estimated_cost_cents)
+                    .map_err(ExecutionError::from)?,
+            ),
+            Some(CounterTradeReservation::Equity { .. }) | None => None,
+        };
+        Ok(Some((shares, buying_power_reservation)))
+    }
+
     async fn perform_body(&self, ctx: &HedgeCtx) -> Result<(), TradeAccountingError> {
         // Residual TOCTOU: the session read, the limit-price fetch, and the
         // broker submission are three separate awaits, so the venue clock can
@@ -1103,31 +1469,61 @@ impl PlaceHedge {
         // apalis across a 9:30 or 16:00 ET boundary: a regular job that crossed
         // the close must not blindly submit a market order into a closed or
         // extended venue using its stale serialized session.
-        let Some(order_kind) = select_order_kind_for_current_session(
-            ctx,
-            &self.symbol,
-            self.shares,
-            self.direction,
-            self.market_session,
-            SubmittedPricePreflight::Required,
-        )
-        .await?
-        else {
-            // Not a plain Ok(()): a retry whose first attempt submitted the
-            // order but lost the poll enqueue must re-enqueue it here, or
-            // the live order sits un-polled (and its fill unrecorded) until
-            // the next restart. A stale job may have a different ID from the
-            // order that actually owns the position, so recover the live claim
-            // under the same submission lock as every broker placement.
-            self.recover_actual_pending_order(ctx).await?;
-            return Ok(());
-        };
-
         // Serialize every broker placement (ADR 0014): the trade-processing path
         // holds this same lock across its placement, so the position claim and
         // broker side effect cannot interleave with a recovery re-drive or inline
         // counter-trade placement.
-        let _submission_guard = ctx.counter_trade_submission_lock.lock().await;
+        let submission_guard = ctx.counter_trade_submission_lock.lock().await;
+
+        let recovered_anchor = self.reconcile_failed_anchor(ctx).await?;
+
+        if self.anchor_recovery_only && recovered_anchor.is_none() {
+            return Ok(());
+        }
+
+        let order_kind = if let Some(recovered) = recovered_anchor.as_ref() {
+            recovered.order_kind.clone()
+        } else {
+            let Some(order_kind) = select_order_kind_for_current_session(
+                ctx,
+                &self.symbol,
+                self.shares,
+                self.direction,
+                self.market_session,
+                SubmittedPricePreflight::Required,
+            )
+            .await?
+            else {
+                // Not a plain Ok(()): a retry whose first attempt submitted the
+                // order but lost the poll enqueue must re-enqueue it here, or
+                // the live order sits un-polled (and its fill unrecorded) until
+                // the next restart. Drop the non-reentrant placement lock before
+                // entering the recovery helper, which acquires it itself.
+                drop(submission_guard);
+                self.recover_actual_pending_order(ctx).await?;
+                return Ok(());
+            };
+            order_kind
+        };
+
+        let (shares, direction, buying_power_reservation, recovered_anchor_id) =
+            if let Some(recovered) = recovered_anchor {
+                (
+                    recovered.shares,
+                    recovered.direction,
+                    recovered.buying_power_reservation,
+                    Some(recovered.anchor),
+                )
+            } else {
+                let Some((shares, reservation)) =
+                    self.preflight_fresh_placement(ctx, &order_kind).await?
+                else {
+                    drop(submission_guard);
+                    self.recover_actual_pending_order(ctx).await?;
+                    return Ok(());
+                };
+                (shares, self.direction, reservation, None)
+            };
 
         // Only specific business rejections are safe to swallow:
         // - PendingExecution: another attempt already claimed this position
@@ -1140,20 +1536,23 @@ impl PlaceHedge {
         //
         // Everything else (lifecycle bugs, aggregate conflicts, DB errors)
         // propagates so backon retries the job.
-        match ctx
-            .position
-            .send(
-                &self.symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id: self.offchain_order_id,
-                    shares: self.shares,
-                    direction: self.direction,
-                    executor: self.executor,
-                    threshold: self.threshold,
-                },
-            )
-            .await
-        {
+        let position_command = recovered_anchor_id.map_or_else(
+            || PositionCommand::PlaceOffChainOrder {
+                offchain_order_id: self.offchain_order_id,
+                shares,
+                direction,
+                executor: self.executor,
+                threshold: self.threshold,
+            },
+            |expected_failed_offchain_order_id| PositionCommand::RecoverFailedOffChainOrder {
+                expected_failed_offchain_order_id,
+                offchain_order_id: self.offchain_order_id,
+                shares,
+                direction,
+                executor: self.executor,
+            },
+        );
+        match ctx.position.send(&self.symbol, position_command).await {
             Ok(()) => {}
 
             Err(AggregateError::UserError(LifecycleError::Apply(
@@ -1207,12 +1606,13 @@ impl PlaceHedge {
             &self.offchain_order_id,
             OffchainOrderPlacement::with_kind(
                 self.symbol.clone(),
-                self.shares,
-                self.direction,
+                shares,
+                direction,
                 self.executor,
                 client_order_id,
                 order_kind,
-            ),
+            )
+            .with_buying_power_reservation(buying_power_reservation),
         )
         .await?;
 
@@ -1258,6 +1658,7 @@ impl PlaceHedge {
             market_session: self.market_session,
             backpressure_streak: next_streak,
             transient_streak: self.transient_streak,
+            anchor_recovery_only: self.anchor_recovery_only,
         })
         .await?;
 
@@ -1331,8 +1732,8 @@ impl PlaceHedge {
     ///
     /// The underlying cause then decides how quickly the symbol is given up on,
     /// which the variant alone does not say: `MarkFetch`, `LimitQuoteFetch` and
-    /// `CloseFlattenPreflightAtPrice` each box an opaque source that carries an
-    /// entitlement 403 and a TCP reset alike. A permanent cause is abandoned at
+    /// `CloseFlattenPreflightAtPrice` and `PlacementPreflight` each box an opaque
+    /// source that carries an entitlement 403 and a TCP reset alike. A permanent cause is abandoned at
     /// once, since re-asking cannot change the answer; a transient one is
     /// re-driven on this job's own bounded budget first, because abandoning it
     /// immediately would trade a one-second retry for a full `CheckPositions`
@@ -1590,8 +1991,8 @@ mod tests {
     use st0x_event_sorcery::StoreBuilder;
     use st0x_evm::Chain;
     use st0x_execution::{
-        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
-        Symbol,
+        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Inventory, MockExecutor,
+        Positive, SupportedExecutor, Symbol,
     };
     use st0x_finance::Usd;
     use st0x_float_macro::float;
@@ -1599,10 +2000,13 @@ mod tests {
     use super::*;
     use crate::conductor::job::Job;
     use crate::offchain::order::{
-        OffchainOrder, OffchainOrderCommand, OrderPlacementResult, OrderPlacer,
+        BrokerOrderPlacement, ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand,
+        OrderPlacementResult, OrderPlacer,
     };
     use crate::position::{AnchorDisposition, Position, PositionCommand, TradeId};
     use crate::test_utils::TEST_POLL_INTERVAL;
+
+    type CapturedPlacements = Arc<StdMutex<Vec<(ClientOrderId, Positive<FractionalShares>)>>>;
 
     /// Builds an [`HedgingAssets`] with a single equity whose extended-hours
     /// counter-trading flag is set as given. Used to drive the per-symbol
@@ -1851,6 +2255,7 @@ mod tests {
         let notifier = Arc::new(FlakyNotifier::default());
 
         let ctx = HedgeCtx {
+            pool,
             position: position.clone(),
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
@@ -1876,6 +2281,761 @@ mod tests {
             offchain_order_projection,
             notifier,
         }
+    }
+
+    #[tokio::test]
+    async fn live_buying_power_reservations_sum_durable_placement_intents() {
+        let TestInfra { ctx, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let order_id = OffchainOrderId::new();
+        let reservation = BuyingPowerReservationCents::new(12_345).unwrap();
+
+        place_offchain_order_at_broker(
+            &ctx.offchain_order,
+            ctx.order_placer.as_ref(),
+            &order_id,
+            OffchainOrderPlacement::market(
+                Symbol::new("AAPL").unwrap(),
+                Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                Direction::Buy,
+                SupportedExecutor::AlpacaBrokerApi,
+                ClientOrderId::from_uuid(order_id.as_uuid()),
+            )
+            .with_buying_power_reservation(Some(reservation)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            live_buying_power_reservations(&ctx.pool).await.unwrap(),
+            reservation
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_live_alpaca_buy_makes_reservation_budget_unknown() {
+        let TestInfra { ctx, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let order_id = OffchainOrderId::new();
+
+        ctx.offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            live_buying_power_reservations(&ctx.pool).await,
+            Err(BuyingPowerReservationError::Unknown { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_buy_reservation_does_not_block_a_sell_hedge() {
+        let TestInfra {
+            ctx,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let legacy_order_id = OffchainOrderId::new();
+        ctx.offchain_order
+            .send(
+                &legacy_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(legacy_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("MSFT").unwrap();
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(1)),
+            Direction::Buy,
+        )
+        .await;
+        let sell = hedge_job(&symbol, 1.0, Direction::Sell);
+
+        sell.perform_body(&ctx).await.unwrap();
+
+        assert!(matches!(
+            offchain_order_projection
+                .load(&sell.offchain_order_id)
+                .await
+                .unwrap(),
+            Some(OffchainOrder::Submitted {
+                direction: Direction::Sell,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_legacy_buy_reservation_defers_a_buy_hedge_without_failing_the_job() {
+        let TestInfra {
+            ctx,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let legacy_order_id = OffchainOrderId::new();
+        ctx.offchain_order
+            .send(
+                &legacy_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(legacy_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("MSFT").unwrap();
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(1)),
+            Direction::Sell,
+        )
+        .await;
+        let buy = hedge_job(&symbol, 1.0, Direction::Buy);
+
+        buy.perform(&ctx).await.unwrap();
+
+        assert!(
+            offchain_order_projection
+                .load(&buy.offchain_order_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown legacy reservation must defer the buy before claiming or placing"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_anchor_recovery_enqueues_create_one_live_job_per_symbol() {
+        let TestInfra { apalis_pool, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let first = PlaceHedge::anchor_recovery(
+            symbol.clone(),
+            Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            Direction::Buy,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutionThreshold::whole_share(),
+        );
+        let second = PlaceHedge::anchor_recovery(
+            symbol,
+            Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            Direction::Buy,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutionThreshold::whole_share(),
+        );
+
+        let (first_outcome, second_outcome) = tokio::join!(
+            push_anchor_recovery_job_if_absent(HedgeJobQueue::new(&apalis_pool), first),
+            push_anchor_recovery_job_if_absent(HedgeJobQueue::new(&apalis_pool), second),
+        );
+
+        assert_ne!(first_outcome.unwrap(), second_outcome.unwrap());
+        let count: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<PlaceHedge>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn placement_time_reservations_prevent_two_buys_reusing_cash() {
+        let executor = MockExecutor::new()
+            .with_inventory(Inventory {
+                positions: vec![],
+                alpaca_usdc: None,
+                usd_balance_cents: 15_000,
+                cash_buying_power_cents: Some(15_000),
+                cash_withdrawable_cents: None,
+            })
+            .with_preflight_price(float!(100));
+        let TestInfra {
+            ctx,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx(Arc::new(ExecutorOrderPlacer(executor))).await;
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+        fill_position(
+            &ctx.position,
+            &aapl,
+            FractionalShares::new(float!(1)),
+            Direction::Sell,
+        )
+        .await;
+        fill_position(
+            &ctx.position,
+            &msft,
+            FractionalShares::new(float!(1)),
+            Direction::Sell,
+        )
+        .await;
+        let mut first = hedge_job(&aapl, 1.0, Direction::Buy);
+        first.executor = SupportedExecutor::AlpacaBrokerApi;
+        let mut second = hedge_job(&msft, 1.0, Direction::Buy);
+        second.executor = SupportedExecutor::AlpacaBrokerApi;
+
+        first.perform_body(&ctx).await.unwrap();
+        second.perform_body(&ctx).await.unwrap();
+
+        let first_order = offchain_order_projection
+            .load(&first.offchain_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_order = offchain_order_projection
+            .load(&second.offchain_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            first_order,
+            OffchainOrder::Submitted { shares, .. }
+                if shares.inner().inner().eq(float!(1)).unwrap()
+        ));
+        assert!(matches!(
+            second_order,
+            OffchainOrder::Submitted { shares, .. }
+                if shares.inner().inner().eq(float!(0.485148514)).unwrap()
+        ));
+        assert_eq!(
+            live_buying_power_reservations(&ctx.pool)
+                .await
+                .unwrap()
+                .get(),
+            15_000
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_anchor_recovery_reuses_original_quantity_and_reservation() {
+        struct AnchoredPlacer {
+            anchor: OffchainOrderId,
+            captured: CapturedPlacements,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for AnchoredPlacer {
+            async fn place_market_order(
+                &self,
+                order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .push((order.client_order_id, order.shares));
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("anchored-broker-order"),
+                    placed_shares: order.shares,
+                    is_extended_hours: false,
+                    limit_price: None,
+                })
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("regular anchor must recover as a market order")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn get_order_by_client_order_id(
+                &self,
+                client_order_id: &ClientOrderId,
+            ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                assert_eq!(
+                    client_order_id,
+                    &ClientOrderId::from_uuid(self.anchor.as_uuid())
+                );
+                Ok(Some(BrokerOrderPlacement {
+                    executor_order_id: ExecutorOrderId::new("anchored-broker-order"),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                    direction: Direction::Buy,
+                    is_extended_hours: false,
+                    limit_price: None,
+                }))
+            }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                _order: st0x_execution::MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("an existing broker order must not be resized by fresh preflight")
+            }
+        }
+
+        let anchor = OffchainOrderId::new();
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let placer: Arc<dyn OrderPlacer> = Arc::new(AnchoredPlacer {
+            anchor,
+            captured: captured.clone(),
+        });
+        let TestInfra {
+            ctx,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx(placer).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let original_shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let reservation = BuyingPowerReservationCents::new(20_000).unwrap();
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(3)),
+            Direction::Sell,
+        )
+        .await;
+        ctx.offchain_order
+            .send(
+                &anchor,
+                OffchainOrderCommand::PlaceReserved {
+                    symbol: symbol.clone(),
+                    shares: original_shares,
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(anchor.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                    buying_power_reservation: Some(reservation),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &anchor,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "lost placement response".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: anchor,
+                    shares: original_shares,
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: anchor,
+                    error: "lost placement response".to_string(),
+                    anchor: AnchorDisposition::Preserve,
+                },
+            )
+            .await
+            .unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(3)),
+            Direction::Buy,
+        )
+        .await;
+
+        let retry = PlaceHedge::anchor_recovery(
+            symbol.clone(),
+            original_shares,
+            Direction::Sell,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutionThreshold::whole_share(),
+        );
+        retry.perform_body(&ctx).await.unwrap();
+
+        let retry_order = offchain_order_projection
+            .load(&retry.offchain_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            retry_order,
+            OffchainOrder::Submitted { shares, .. } if shares == original_shares
+        ));
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            &[(ClientOrderId::from_uuid(anchor.as_uuid()), original_shares)]
+        );
+        assert_eq!(
+            live_buying_power_reservations(&ctx.pool).await.unwrap(),
+            reservation
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_broker_anchor_is_released_before_fresh_partial_buy() {
+        struct MissingAnchorPlacer {
+            anchor: OffchainOrderId,
+            captured: CapturedPlacements,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for MissingAnchorPlacer {
+            async fn place_market_order(
+                &self,
+                order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .push((order.client_order_id, order.shares));
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("fresh-partial-order"),
+                    placed_shares: order.shares,
+                    is_extended_hours: false,
+                    limit_price: None,
+                })
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("regular-session test must not place a limit order")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn get_order_by_client_order_id(
+                &self,
+                client_order_id: &ClientOrderId,
+            ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                assert_eq!(
+                    client_order_id,
+                    &ClientOrderId::from_uuid(self.anchor.as_uuid())
+                );
+                Ok(None)
+            }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                _order: MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(CounterTradePreflight::Allowed {
+                    reservation: Some(CounterTradeReservation::BuyingPower {
+                        required: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                        estimated_cost_cents: 10_000,
+                        available_buying_power_cents: 10_000,
+                    }),
+                })
+            }
+        }
+
+        let anchor = OffchainOrderId::new();
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let placer: Arc<dyn OrderPlacer> = Arc::new(MissingAnchorPlacer {
+            anchor,
+            captured: captured.clone(),
+        });
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(placer).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let original_shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        preserve_failed_buy_anchor(&ctx, &symbol, anchor, original_shares).await;
+
+        let mut retry = hedge_job(&symbol, 3.0, Direction::Buy);
+        retry.executor = SupportedExecutor::AlpacaBrokerApi;
+        retry.perform_body(&ctx).await.unwrap();
+
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            &[(
+                ClientOrderId::from_uuid(retry.offchain_order_id.as_uuid()),
+                Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            )]
+        );
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(position.last_failed_offchain_order_id, None);
+        assert_eq!(
+            live_buying_power_reservations(&ctx.pool)
+                .await
+                .unwrap()
+                .get(),
+            10_000
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_anchor_lookup_error_preserves_anchor_and_defers_retry() {
+        struct FailingAnchorLookupPlacer;
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for FailingAnchorLookupPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("lookup failure must prevent placement")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("lookup failure must prevent placement")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("lookup failure must prevent cancellation")
+            }
+
+            async fn get_order_by_client_order_id(
+                &self,
+                _client_order_id: &ClientOrderId,
+            ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err(std::io::Error::other("broker lookup unavailable").into())
+            }
+        }
+
+        let anchor = OffchainOrderId::new();
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(Arc::new(FailingAnchorLookupPlacer)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        preserve_failed_buy_anchor(
+            &ctx,
+            &symbol,
+            anchor,
+            Positive::new(FractionalShares::new(float!(2))).unwrap(),
+        )
+        .await;
+
+        let mut retry = hedge_job(&symbol, 3.0, Direction::Buy);
+        retry.executor = SupportedExecutor::AlpacaBrokerApi;
+        assert!(matches!(
+            retry.perform_body(&ctx).await,
+            Err(TradeAccountingError::BrokerAnchorLookup { .. })
+        ));
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(position.last_failed_offchain_order_id, Some(anchor));
+        assert_eq!(position.pending_offchain_order_id, None);
+    }
+
+    #[tokio::test]
+    async fn broker_anchor_term_mismatch_preserves_anchor_and_defers_retry() {
+        struct MismatchedAnchorPlacer;
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for MismatchedAnchorPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("anchor mismatch must prevent placement")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("anchor mismatch must prevent placement")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("anchor mismatch must prevent cancellation")
+            }
+
+            async fn get_order_by_client_order_id(
+                &self,
+                _client_order_id: &ClientOrderId,
+            ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(Some(BrokerOrderPlacement {
+                    executor_order_id: ExecutorOrderId::new("mismatched-order"),
+                    symbol: Symbol::new("MSFT").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                    direction: Direction::Buy,
+                    is_extended_hours: false,
+                    limit_price: None,
+                }))
+            }
+        }
+
+        let anchor = OffchainOrderId::new();
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(Arc::new(MismatchedAnchorPlacer)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        preserve_failed_buy_anchor(
+            &ctx,
+            &symbol,
+            anchor,
+            Positive::new(FractionalShares::new(float!(2))).unwrap(),
+        )
+        .await;
+
+        let recovery = PlaceHedge::anchor_recovery(
+            symbol.clone(),
+            Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            Direction::Buy,
+            SupportedExecutor::AlpacaBrokerApi,
+            ExecutionThreshold::whole_share(),
+        );
+        assert!(matches!(
+            recovery.perform_body(&ctx).await,
+            Err(TradeAccountingError::BrokerAnchorMismatch { .. })
+        ));
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(position.last_failed_offchain_order_id, Some(anchor));
+        assert_eq!(position.pending_offchain_order_id, None);
+    }
+
+    async fn preserve_failed_buy_anchor(
+        ctx: &HedgeCtx,
+        symbol: &Symbol,
+        anchor: OffchainOrderId,
+        shares: Positive<FractionalShares>,
+    ) {
+        fill_position(
+            &ctx.position,
+            symbol,
+            FractionalShares::new(float!(3)),
+            Direction::Sell,
+        )
+        .await;
+        ctx.offchain_order
+            .send(
+                &anchor,
+                OffchainOrderCommand::PlaceReserved {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(anchor.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                    buying_power_reservation: Some(
+                        BuyingPowerReservationCents::new(20_000).unwrap(),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &anchor,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "lost placement response".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position
+            .send(
+                symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: anchor,
+                    shares,
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position
+            .send(
+                symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: anchor,
+                    error: "lost placement response".to_string(),
+                    anchor: AnchorDisposition::Preserve,
+                },
+            )
+            .await
+            .unwrap();
     }
 
     async fn fill_position(
@@ -1917,6 +3077,7 @@ mod tests {
             market_session: MarketSession::Regular,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         }
     }
 
@@ -2478,6 +3639,10 @@ mod tests {
             CloseFlattenBlockReason::InsufficientBuyingPower.metric_label(),
             "insufficient_buying_power"
         );
+        assert_eq!(
+            CloseFlattenBlockReason::BelowMinimumNotional.metric_label(),
+            "below_minimum_notional"
+        );
     }
 
     fn dead_letter_count(rendered: &str, symbol: &Symbol, reason: DeadLetterReason) -> u64 {
@@ -2503,13 +3668,37 @@ mod tests {
     /// because the enum carries no iteration, but [`sample_symbol_scoped_error`]
     /// matches it exhaustively, so a new variant cannot be added without the
     /// compiler pointing at this pair.
-    const EVERY_SYMBOL_SCOPED_REASON: [SymbolScopedReason; 5] = [
+    const EVERY_SYMBOL_SCOPED_REASON: [SymbolScopedReason; 7] = [
         SymbolScopedReason::MarkFetch,
         SymbolScopedReason::LimitQuoteFetch,
         SymbolScopedReason::LimitQuoteUnavailable,
         SymbolScopedReason::SlippageCalculation,
         SymbolScopedReason::CloseFlattenPreflightAtPrice,
+        SymbolScopedReason::PlacementPreflight,
+        SymbolScopedReason::BrokerAnchorLookup,
     ];
+
+    #[test]
+    fn submitted_price_preflight_error_preserves_close_flatten_classification() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        assert!(matches!(
+            submitted_price_preflight_error(
+                &symbol,
+                true,
+                std::io::Error::other("preflight unavailable").into(),
+            ),
+            TradeAccountingError::CloseFlattenPreflightAtPrice { .. }
+        ));
+        assert!(matches!(
+            submitted_price_preflight_error(
+                &symbol,
+                false,
+                std::io::Error::other("preflight unavailable").into(),
+            ),
+            TradeAccountingError::PlacementPreflight { .. }
+        ));
+    }
 
     /// Builds the error variant `scope()` classifies as `reason`, with a cause
     /// carrying no broker classification so every one of them is abandoned
@@ -2543,6 +3732,14 @@ mod tests {
                     source: "preflight endpoint unavailable".into(),
                 }
             }
+            SymbolScopedReason::PlacementPreflight => TradeAccountingError::PlacementPreflight {
+                symbol: symbol.clone(),
+                source: "placement preflight endpoint unavailable".into(),
+            },
+            SymbolScopedReason::BrokerAnchorLookup => TradeAccountingError::BrokerAnchorLookup {
+                symbol: symbol.clone(),
+                source: "broker anchor lookup unavailable".into(),
+            },
         }
     }
 
@@ -3636,6 +4833,7 @@ mod tests {
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         // Driven through the REAL `Job::perform` entry point (not
@@ -4718,16 +5916,9 @@ mod tests {
             offchain_order_projection,
             position_projection,
             ..
-        } = create_hedge_ctx_with(
-            ordinary_extended_preflight_rejecting_placer(float!(100.00)),
-            extended_hours_assets("AAPL", true),
-        )
-        .await;
+        } = create_hedge_ctx(succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let stale_job = PlaceHedge {
-            market_session: MarketSession::Extended,
-            ..hedge_job(&symbol, 2.0, Direction::Buy)
-        };
+        let stale_job = hedge_job(&symbol, 2.0, Direction::Buy);
         let claimed_order_id = OffchainOrderId::new();
 
         fill_position(
@@ -4759,10 +5950,7 @@ mod tests {
                     direction: stale_job.direction,
                     executor: stale_job.executor,
                     client_order_id: ClientOrderId::from_uuid(claimed_order_id.as_uuid()),
-                    kind: CounterTradeOrderKind::ExtendedHoursLimit {
-                        limit_price: Positive::new(Usd::new(float!(101.00))).unwrap(),
-                        close_flatten: false,
-                    },
+                    kind: CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -4774,8 +5962,8 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("preflight-skip-live-claim"),
                     placed_shares: stale_job.shares,
                     submitted_at: chrono::Utc::now(),
-                    market_session: MarketSession::Extended,
-                    limit_price: Some(Positive::new(Usd::new(float!(101.00))).unwrap()),
+                    market_session: MarketSession::Regular,
+                    limit_price: None,
                 },
             )
             .await
@@ -4833,6 +6021,7 @@ mod tests {
         let notifier = Arc::new(FlakyNotifier::default());
 
         let ctx = HedgeCtx {
+            pool,
             position: position.clone(),
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
@@ -4964,6 +6153,7 @@ mod tests {
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         job.perform(&ctx).await.unwrap();
@@ -5297,6 +6487,7 @@ mod tests {
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         job.perform(&ctx).await.unwrap();
@@ -5371,6 +6562,7 @@ mod tests {
             market_session: MarketSession::Regular,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         job.perform(&ctx)
@@ -5436,6 +6628,7 @@ mod tests {
             market_session: MarketSession::Regular,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         job.perform(&ctx)
@@ -5499,6 +6692,7 @@ mod tests {
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         job.perform(&ctx)
@@ -5697,6 +6891,7 @@ mod tests {
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         }
         .perform(&ctx)
         .await
@@ -5935,6 +7130,7 @@ mod tests {
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         }
         .perform(&ctx)
         .await
@@ -6030,6 +7226,7 @@ mod tests {
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         let result = job.perform(&ctx).await;
@@ -6183,6 +7380,7 @@ mod tests {
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         job.perform(&ctx)
@@ -6231,6 +7429,7 @@ mod tests {
             market_session: MarketSession::Extended,
             backpressure_streak: BackpressureStreak::default(),
             transient_streak: TransientFailureStreak::default(),
+            anchor_recovery_only: false,
         };
 
         job.perform(&ctx).await.unwrap();
@@ -6345,6 +7544,7 @@ mod tests {
         let notifier = Arc::new(FlakyNotifier::default());
 
         let ctx = HedgeCtx {
+            pool,
             position: position.clone(),
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),

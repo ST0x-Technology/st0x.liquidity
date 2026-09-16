@@ -45,10 +45,10 @@ use uuid::Uuid;
 use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
 use st0x_execution::{
-    AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, CounterTradePreflight,
-    ExecutionError, Executor, ExecutorOrderId, FractionalShares, LatestQuote, LimitOrder,
-    MarketOrder, MarketSession, MarketSessionStatus, OrderFailureTerminality, OrderState,
-    PersistenceError, Positive, SupportedExecutor, Symbol,
+    AlpacaBrokerApiError, BuyingPowerReservationCents, CancellationOutcome, ClientOrderId,
+    CounterTradePreflight, ExecutionError, Executor, ExecutorOrderId, FractionalShares,
+    LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus,
+    OrderFailureTerminality, OrderState, PersistenceError, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::{NonNegative, NotNonNegative, Usd};
 
@@ -117,6 +117,7 @@ pub struct OffchainOrderPlacement {
     executor: SupportedExecutor,
     client_order_id: ClientOrderId,
     kind: CounterTradeOrderKind,
+    buying_power_reservation: Option<BuyingPowerReservationCents>,
 }
 
 impl OffchainOrderPlacement {
@@ -152,7 +153,17 @@ impl OffchainOrderPlacement {
             executor,
             client_order_id,
             kind,
+            buying_power_reservation: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_buying_power_reservation(
+        mut self,
+        reservation: Option<BuyingPowerReservationCents>,
+    ) -> Self {
+        self.buying_power_reservation = reservation;
+        self
     }
 }
 
@@ -200,18 +211,20 @@ pub async fn place_offchain_order_at_broker(
         executor,
         client_order_id,
         kind,
+        buying_power_reservation,
     } = placement;
 
     store
         .send(
             offchain_order_id,
-            OffchainOrderCommand::Place {
+            OffchainOrderCommand::PlaceReserved {
                 symbol: symbol.clone(),
                 shares,
                 direction,
                 executor,
                 client_order_id: client_order_id.clone(),
                 kind: kind.clone(),
+                buying_power_reservation,
             },
         )
         .await?;
@@ -404,6 +417,7 @@ fn placed_event(
     executor: SupportedExecutor,
     client_order_id: &ClientOrderId,
     kind: &CounterTradeOrderKind,
+    buying_power_reservation: Option<BuyingPowerReservationCents>,
     placed_at: DateTime<Utc>,
 ) -> OffchainOrderEvent {
     let requested_market_session = kind.market_session();
@@ -425,6 +439,7 @@ fn placed_event(
         limit_price,
         client_order_id: Some(client_order_id.clone()),
         close_flatten,
+        buying_power_reservation,
     }
 }
 
@@ -600,6 +615,7 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             limit_price: _,
             client_order_id: _,
             close_flatten,
+            buying_power_reservation: _,
         } => Some(OffchainOrder::Pending {
             symbol: symbol.clone(),
             shares: *shares,
@@ -883,6 +899,26 @@ impl EventSourced for OffchainOrder {
                 executor,
                 &client_order_id,
                 &kind,
+                None,
+                Utc::now(),
+            )]),
+
+            PlaceReserved {
+                symbol,
+                shares,
+                direction,
+                executor,
+                client_order_id,
+                kind,
+                buying_power_reservation,
+            } => Ok(vec![placed_event(
+                symbol,
+                shares,
+                direction,
+                executor,
+                &client_order_id,
+                &kind,
+                buying_power_reservation,
                 Utc::now(),
             )]),
 
@@ -902,6 +938,7 @@ impl EventSourced for OffchainOrder {
                 executor,
                 &client_order_id,
                 &kind,
+                None,
                 placed_at,
             )]),
 
@@ -929,6 +966,16 @@ impl EventSourced for OffchainOrder {
                 shares: _,
                 client_order_id: _,
                 kind: _,
+            } => validate_place_replay(self, &symbol, direction, executor),
+
+            OffchainOrderCommand::PlaceReserved {
+                symbol,
+                direction,
+                executor,
+                shares: _,
+                client_order_id: _,
+                kind: _,
+                buying_power_reservation: _,
             } => validate_place_replay(self, &symbol, direction, executor),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -2586,6 +2633,16 @@ pub struct OrderPlacementResult {
     pub limit_price: Option<Positive<Usd>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BrokerOrderPlacement {
+    pub executor_order_id: ExecutorOrderId,
+    pub symbol: Symbol,
+    pub shares: Positive<FractionalShares>,
+    pub direction: Direction,
+    pub is_extended_hours: bool,
+    pub limit_price: Option<Positive<Usd>>,
+}
+
 /// Type-erased order placement capability.
 ///
 /// Used by the durable placement path
@@ -2615,6 +2672,21 @@ pub trait OrderPlacer: Send + Sync {
         &self,
         executor_order_id: &ExecutorOrderId,
     ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn get_order_by_client_order_id(
+        &self,
+        _client_order_id: &ClientOrderId,
+    ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_order_by_client_order_id not implemented for this OrderPlacer".into())
+    }
+
+    async fn preflight_counter_trade_with_reserved_buying_power(
+        &self,
+        _order: MarketOrder,
+        _reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(CounterTradePreflight::Allowed { reservation: None })
+    }
 
     /// Fetches an optional current bid/ask quote suitable as the primary
     /// extended-hours limit-order reference. The default preserves today's
@@ -2662,6 +2734,16 @@ pub trait OrderPlacer: Send + Sync {
         _reference_price: Positive<Usd>,
     ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
         Ok(CounterTradePreflight::Allowed { reservation: None })
+    }
+
+    async fn preflight_counter_trade_at_price_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reference_price: Positive<Usd>,
+        _reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        self.preflight_counter_trade_at_price(order, reference_price)
+            .await
     }
 
     /// Returns the current market session. Used by hedge jobs to re-check
@@ -2745,6 +2827,35 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         Ok(self.0.cancel_order(&order_id).await?)
     }
 
+    async fn get_order_by_client_order_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .0
+            .get_order_by_client_order_id(client_order_id)
+            .await?
+            .map(|placement| BrokerOrderPlacement {
+                executor_order_id: ExecutorOrderId::new(&placement.order_id),
+                symbol: placement.symbol,
+                shares: placement.shares,
+                direction: placement.direction,
+                is_extended_hours: placement.extended_hours,
+                limit_price: placement.limit_price,
+            }))
+    }
+
+    async fn preflight_counter_trade_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .0
+            .preflight_counter_trade_with_reserved_buying_power(order, reserved)
+            .await?)
+    }
+
     async fn fetch_position_mark(
         &self,
         symbol: &Symbol,
@@ -2775,6 +2886,22 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         Ok(self
             .0
             .preflight_counter_trade_at_price(order, reference_price)
+            .await?)
+    }
+
+    async fn preflight_counter_trade_at_price_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reference_price: Positive<Usd>,
+        reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .0
+            .preflight_counter_trade_at_price_with_reserved_buying_power(
+                order,
+                reference_price,
+                reserved,
+            )
             .await?)
     }
 
@@ -2903,6 +3030,15 @@ pub enum OffchainOrderCommand {
         client_order_id: ClientOrderId,
         kind: CounterTradeOrderKind,
     },
+    PlaceReserved {
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        executor: SupportedExecutor,
+        client_order_id: ClientOrderId,
+        kind: CounterTradeOrderKind,
+        buying_power_reservation: Option<BuyingPowerReservationCents>,
+    },
     /// Test/fixture-only: identical to `Place` but takes `placed_at`
     /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
     /// backdate synthetic history.
@@ -3019,6 +3155,8 @@ pub enum OffchainOrderEvent {
         /// to the flatten window. `false` for events predating this field.
         #[serde(default)]
         close_flatten: bool,
+        #[serde(default)]
+        buying_power_reservation: Option<BuyingPowerReservationCents>,
     },
     /// Legacy broker-acceptance event. Predates the durable-job extraction,
     /// where `Place` did the broker call inline and emitted this alongside
@@ -3519,6 +3657,7 @@ mod tests {
             limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
             client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
             close_flatten: true,
+            buying_power_reservation: None,
         };
 
         // The submitted terms are recorded on the event for audit.
@@ -6346,6 +6485,7 @@ mod tests {
             limit_price: None,
             client_order_id: None,
             close_flatten: false,
+            buying_power_reservation: None,
         };
 
         // Strip the post-upgrade keys to reconstruct the exact payload shape
@@ -6437,6 +6577,7 @@ mod tests {
                 limit_price: None,
                 client_order_id: None,
                 close_flatten: false,
+                buying_power_reservation: None,
             },
             OffchainOrderEvent::Submitted {
                 executor_order_id: ExecutorOrderId::new("broker-cancelled"),

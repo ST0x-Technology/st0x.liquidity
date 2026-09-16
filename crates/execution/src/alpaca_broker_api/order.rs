@@ -560,7 +560,7 @@ pub(super) async fn place_market_order(
 
 /// Converts the broker-reported limit price into the domain type, failing
 /// fast on a non-positive value rather than silently dropping it.
-fn parse_limit_price(
+pub(super) fn parse_limit_price(
     limit_price: Option<Float>,
 ) -> Result<Option<Positive<Usd>>, AlpacaBrokerApiError> {
     limit_price
@@ -615,6 +615,8 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         | BelowPrecision { .. }
         | UsdcBelowPrecision { .. }
         | UsdcPrecisionExceeded { .. }
+        | BuyingPowerReservationOutOfRange { .. }
+        | BuyingPowerReservationOverflow { .. }
         | NotPositive(_)
         | NotPositiveLimitPrice(_)
         | FloatConversion(_)
