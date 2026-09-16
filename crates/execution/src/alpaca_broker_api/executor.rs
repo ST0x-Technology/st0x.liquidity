@@ -115,7 +115,7 @@ struct PreparedCounterTradeShares {
 ///
 /// An `Option` field is `None` when the broker's asset payload omitted it;
 /// eligibility decisions treat that as ineligible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AssetDetails {
     pub status: AssetStatus,
     pub tradable: bool,
@@ -1844,6 +1844,7 @@ mod tests {
 
     fn eligible_overnight_snapshot() -> EligibilitySnapshot {
         EligibilitySnapshot {
+            symbol: Symbol::new("RKLB").unwrap(),
             synced_at: Utc.with_ymd_and_hms(2026, 8, 28, 23, 55, 0).unwrap(),
             details: AssetDetails {
                 status: AssetStatus::Active,

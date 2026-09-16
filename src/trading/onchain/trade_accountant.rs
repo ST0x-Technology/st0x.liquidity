@@ -663,6 +663,12 @@ pub enum TradeAccountingError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    #[error("Failed to re-preflight overnight buy against its submitted limit price for {symbol}")]
+    OvernightPreflightAtPrice {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// Wraps a pricing failure raised on the recovery path, where a claim is
     /// already outstanding. Distinct from the unwrapped pricing variants so
     /// the hedge worker can preserve the claim while applying the source's
@@ -728,6 +734,7 @@ pub enum SymbolScopedReason {
     LimitQuoteUnavailable,
     SlippageCalculation,
     CloseFlattenPreflightAtPrice,
+    OvernightPreflightAtPrice,
 }
 
 impl SymbolScopedReason {
@@ -738,6 +745,7 @@ impl SymbolScopedReason {
             Self::LimitQuoteUnavailable => "limit_quote_unavailable",
             Self::SlippageCalculation => "slippage_calculation",
             Self::CloseFlattenPreflightAtPrice => "close_flatten_preflight_at_price",
+            Self::OvernightPreflightAtPrice => "overnight_preflight_at_price",
         }
     }
 }
@@ -829,6 +837,14 @@ impl TradeAccountingError {
             }
             Self::CloseFlattenPreflightAtPrice { .. } => SymbolScoped {
                 reason: SymbolScopedReason::CloseFlattenPreflightAtPrice,
+            },
+            Self::OvernightPreflightAtPrice { source, .. }
+                if find_permanence(source.as_ref()) == Some(Permanence::Permanent) =>
+            {
+                ProcessScoped
+            }
+            Self::OvernightPreflightAtPrice { .. } => SymbolScoped {
+                reason: SymbolScopedReason::OvernightPreflightAtPrice,
             },
 
             Self::ClaimedHedgeOrderKind { .. }

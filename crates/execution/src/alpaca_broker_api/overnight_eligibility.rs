@@ -36,7 +36,7 @@ const SYNC_SLOT_ET: NaiveTime = match NaiveTime::from_hms_opt(19, 55, 0) {
 /// Carries the symbol it was synced for, so a snapshot looked up for
 /// one asset can never authorize an order for another: validation
 /// rejects the mismatch instead of trusting the caller's pairing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EligibilitySnapshot {
     pub symbol: Symbol,
     pub synced_at: DateTime<Utc>,
