@@ -71,147 +71,195 @@ retired_symbols = []
 
 [assets.equities.RKLB]
 extended_hours_counter_trading = "enabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.SGOV]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.SPYM]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.TSLA]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.AMZN]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.NVDA]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.MSTR]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.QSEP]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.IAU]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.COIN]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.SIVR]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.CRCL]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.PPLT]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.BMNR]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.QQQM]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.VWO]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.ARKK]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.SPCX]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.CEG]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.DRAM]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.TSM]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.ASML]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.SKHY]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.MU]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.AMD]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.AVGO]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.AMAT]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.LRCX]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.TTWO]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.GOOGL]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.INTC]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.AAPL]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.MSFT]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.LLY]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.PTY]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.HOOD]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.ORCL]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.SMCI]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.BABA]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.TQQQ]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.MCD]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.NKE]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.GRND]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.DNUT]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.FGI]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.PLBY]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.TR]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [assets.equities.WEN]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 [chains.base]
 # Trades, hedges and rebalances: everything is on, subject to the

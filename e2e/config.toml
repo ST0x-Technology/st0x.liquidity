@@ -25,6 +25,7 @@ retired_symbols = []
 
 [assets.equities.EXAMPLE]
 extended_hours_counter_trading = "disabled"
+overnight_counter_trading = "disabled"
 
 
 [chains.base]
