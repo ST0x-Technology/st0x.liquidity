@@ -12,7 +12,7 @@ use std::time::Duration;
 use apalis::prelude::Status;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
-use metrics::counter;
+use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
@@ -21,8 +21,8 @@ use tracing::{debug, error, warn};
 use st0x_config::{ChainAssets, ChainRegistry, Ctx};
 use st0x_event_sorcery::{AggregateError, LifecycleError, Projection, Store};
 use st0x_execution::{
-    ClientOrderId, CounterTradePreflight, Direction, Executor, MarketOrder, MarketSession,
-    Permanence, SupportedExecutor, Symbol,
+    ClientOrderId, CounterTradePreflight, Direction, Executor, FractionalShares, MarketOrder,
+    MarketSession, Permanence, SupportedExecutor, Symbol,
 };
 
 use crate::alerts::Notifier;
@@ -179,6 +179,37 @@ pub(crate) fn record_scan_skip(
             "reason" => reason
         )
         .increment(1);
+    }
+}
+
+/// Exports the floor a symbol keeps and the shares this scan wanted to hedge
+/// but could not place, so the residual the floor leaves unhedged is
+/// graphable. Both are gauges refreshed every scan; an unparseable value
+/// logs and leaves that gauge untouched rather than writing a wrong one.
+/// f64 export is lossy by nature and fine for monitoring, as with
+/// `position_shares`.
+fn record_hedge_floor_gauges(
+    symbol: &Symbol,
+    floor: FractionalShares,
+    requested: FractionalShares,
+    allowed: FractionalShares,
+) {
+    set_shares_gauge("hedge_floor_shares", symbol, floor);
+
+    match requested - allowed {
+        Ok(deficit) => set_shares_gauge("hedge_deficit_shares", symbol, deficit),
+        Err(error) => {
+            warn!(%symbol, %error, "hedge_deficit_shares gauge skipped: subtraction failed");
+        }
+    }
+}
+
+fn set_shares_gauge(name: &'static str, symbol: &Symbol, value: FractionalShares) {
+    match value.to_string().parse::<f64>() {
+        Ok(value) => gauge!(name, "symbol" => symbol.to_string()).set(value),
+        Err(error) => {
+            warn!(%symbol, %error, "{name} gauge skipped: could not parse shares as f64");
+        }
     }
 }
 
@@ -393,6 +424,18 @@ where
         let all_positions = self.position_projection.load_all().await?;
         let active_transfers = symbols_with_active_transfers(&self.pool).await?;
 
+        // Every known symbol starts the scan at zero deficit; the preflight
+        // below overwrites the ones it tries to hedge. Otherwise a symbol that
+        // stops being hedge-ready keeps its last deficit until restart.
+        for (symbol, _) in &all_positions {
+            record_hedge_floor_gauges(
+                symbol,
+                self.ctx.broker.hedge_floor().for_symbol(symbol),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            );
+        }
+
         // Each symbol is paired with the asset table that sizes its hedge:
         // the hedged chain enabling it, or the tightest-capped one when
         // several do. A symbol no hedged chain enables is not swept.
@@ -477,6 +520,29 @@ where
     /// if the order should proceed (possibly with reduced shares), `false` if
     /// it should be skipped entirely.
     async fn preflight_and_clamp_shares(
+        &self,
+        ready: &mut ExecutionCtx,
+        close_flatten_window_cache: &mut CloseFlattenWindowCache,
+    ) -> bool {
+        let requested = ready.shares.inner();
+        let enqueue = self
+            .preflight_and_clamp(ready, close_flatten_window_cache)
+            .await;
+        let allowed = if enqueue {
+            ready.shares.inner()
+        } else {
+            FractionalShares::ZERO
+        };
+        record_hedge_floor_gauges(
+            &ready.symbol,
+            self.ctx.broker.hedge_floor().for_symbol(&ready.symbol),
+            requested,
+            allowed,
+        );
+        enqueue
+    }
+
+    async fn preflight_and_clamp(
         &self,
         ready: &mut ExecutionCtx,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
@@ -1326,8 +1392,9 @@ mod tests {
     use st0x_evm::Chain;
     use st0x_execution::{
         AlpacaBrokerApiError, AlpacaMarketDataError, CancellationOutcome, ClientOrderId, Direction,
-        ExecutorOrderId, FractionalShares, Inventory, LimitOrder, MockExecutor, MockExecutorCtx,
-        OrderState, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
+        EquityPosition, ExecutorOrderId, FractionalShares, HedgeFloor, Inventory, LimitOrder,
+        MockExecutor, MockExecutorCtx, OrderState, Positive, SupportedExecutor, Symbol,
+        TryIntoExecutor,
     };
     use st0x_finance::Usd;
     use st0x_float_macro::float;
@@ -1674,6 +1741,7 @@ mod tests {
                             symbol.clone(),
                             EquityHedgePolicy {
                                 extended_hours_counter_trading: extended_hours,
+                                hedge_floor_shares: None,
                             },
                         )
                     })
@@ -2758,6 +2826,153 @@ mod tests {
         assert!(rendered.contains("close_flatten_blocked_total{"));
         assert!(rendered.contains("reason=\"insufficient_equity\""));
         assert!(rendered.contains("symbol=\"AAPL\""));
+    }
+
+    /// Close-flatten sells run the same scan-time preflight as every sell,
+    /// so the floor holds there with no special handling: a book of exactly
+    /// the floor leaves nothing to flatten with, and the block is labelled
+    /// as the floor, not as an empty account.
+    #[tokio::test]
+    async fn close_flatten_sell_is_held_at_the_hedge_floor() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_extended_session_close_metadata(
+                chrono::Utc::now() + chrono::Duration::seconds(300),
+                st0x_execution::PostCloseGap::MultiDayClosure,
+            )
+            .with_inventory(Inventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(1)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 100_000,
+                cash_buying_power_cents: Some(100_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            })
+            .with_hedge_floor(HedgeFloor::new(
+                FractionalShares::new(float!(1)),
+                std::collections::HashMap::new(),
+            ));
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
+        let rendered = metrics_handle.render();
+        assert!(
+            rendered.contains("close_flatten_blocked_total{")
+                && rendered.contains("reason=\"held_at_floor\"")
+                && rendered.contains("symbol=\"AAPL\""),
+            "expected a held_at_floor close-flatten block, got:\n{rendered}"
+        );
+    }
+
+    /// The residual the floor leaves unhedged must be graphable: every scan
+    /// exports the configured floor and the shares it wanted to sell but
+    /// could not, per symbol.
+    #[tokio::test]
+    async fn scan_exports_the_hedge_floor_and_the_deficit_it_leaves() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let mut cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let floor = HedgeFloor::new(
+            FractionalShares::new(float!(1)),
+            std::collections::HashMap::new(),
+        );
+        let st0x_config::BrokerCtx::AlpacaBrokerApi(broker) = &mut cfg.broker;
+        broker.hedge_floor = floor.clone();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_inventory(Inventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(3)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 100_000,
+                cash_buying_power_cents: Some(100_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            })
+            .with_hedge_floor(floor);
+        let (ctx, position) = build_ctx_with_executor(
+            pool,
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+            executor,
+        )
+        .await;
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(5)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let rendered = metrics_handle.render();
+        let sample = |name: &str| {
+            rendered
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{symbol=\"AAPL\"}}")))
+                .and_then(|line| line.rsplit_once(' '))
+                .map_or_else(
+                    || panic!("no {name} series for AAPL in:\n{rendered}"),
+                    |(_, value)| value.to_owned(),
+                )
+        };
+        assert_eq!(sample("hedge_floor_shares"), "1");
+        assert_eq!(sample("hedge_deficit_shares"), "3");
+
+        // The onchain flow reverses and nets the position out. There is
+        // nothing left to hedge, so the deficit must read zero on the next
+        // scan rather than sit at its last value until restart.
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(5)),
+            Direction::Sell,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let rendered = metrics_handle.render();
+        let sample = |name: &str| {
+            rendered
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{symbol=\"AAPL\"}}")))
+                .and_then(|line| line.rsplit_once(' '))
+                .map_or_else(
+                    || panic!("no {name} series for AAPL in:\n{rendered}"),
+                    |(_, value)| value.to_owned(),
+                )
+        };
+        assert_eq!(sample("hedge_floor_shares"), "1");
+        assert_eq!(sample("hedge_deficit_shares"), "0");
     }
 
     #[tokio::test]

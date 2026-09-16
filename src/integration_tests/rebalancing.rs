@@ -204,6 +204,7 @@ fn test_trigger_config() -> RebalancingServiceConfig {
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
+        hedge_floor: st0x_execution::HedgeFloor::default(),
         equity: ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -1875,6 +1876,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
+        hedge_floor: st0x_execution::HedgeFloor::default(),
         equity: ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -2011,6 +2013,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
+        hedge_floor: st0x_execution::HedgeFloor::default(),
         equity: ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -2111,6 +2114,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.4),
@@ -2178,6 +2182,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.1),

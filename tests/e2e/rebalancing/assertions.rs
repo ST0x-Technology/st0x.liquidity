@@ -87,6 +87,7 @@ fn hedging_with_reserve(
                         symbol.clone(),
                         EquityHedgePolicy {
                             extended_hours_counter_trading: OperationMode::Disabled,
+                            hedge_floor_shares: None,
                         },
                     )
                 })
@@ -284,6 +285,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        hedge_floor: st0x_execution::HedgeFloor::default(),
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 
@@ -385,6 +387,7 @@ where
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        hedge_floor: st0x_execution::HedgeFloor::default(),
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 

@@ -1913,6 +1913,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Mock(mock_server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
             time_in_force: TimeInForce::Day,
         });
         ctx

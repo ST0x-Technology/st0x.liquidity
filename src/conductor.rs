@@ -2857,6 +2857,7 @@ fn build_rebalancing_service(
             transfer_timeout: rebalancing_ctx.transfer_timeout,
             assets: deps.ctx.chains.primary().assets.clone(),
             cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
+            hedge_floor: deps.ctx.broker.hedge_floor().clone(),
         },
         deps.vault_registry.clone(),
         registry_ids,
@@ -4839,6 +4840,23 @@ fn log_counter_trade_skip(
                 "Skipping counter trade before broker submission: insufficient offchain equity"
             );
         }
+        // Expected once the book is down to the floor; the runbook for
+        // `InsufficientEquity` (fund the account) does not apply.
+        CounterTradeSkipReason::HeldAtFloor {
+            symbol,
+            floor,
+            available,
+        } => {
+            info!(
+                %symbol,
+                shares = %execution.shares,
+                direction = ?execution.direction,
+                source,
+                floor_shares = %floor,
+                available_shares = %available,
+                "Skipping counter trade before broker submission: sell held at the hedge floor"
+            );
+        }
         CounterTradeSkipReason::InsufficientBuyingPower {
             estimated_cost_cents,
             available_buying_power_cents,
@@ -5492,8 +5510,8 @@ mod tests {
     use st0x_evm::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiMode, AlpacaBrokerAuth, Direction, EquityPosition,
-        ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder, MockExecutor, Positive,
-        SupportedExecutor, Symbol, TimeInForce,
+        ExecutorOrderId, HedgeFloor, Inventory as ExecutionInventory, MarketOrder, MockExecutor,
+        Positive, SupportedExecutor, Symbol, TimeInForce,
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
@@ -6213,6 +6231,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -7051,6 +7070,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
                     deviation: st0x_float_macro::float!(0.2),
@@ -8134,6 +8154,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
                     deviation: st0x_float_macro::float!(0.2),
@@ -8228,6 +8249,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: crate::inventory::ImbalanceThreshold {
                     target: st0x_float_macro::float!(0.5),
                     deviation: st0x_float_macro::float!(0.2),
@@ -9333,6 +9355,7 @@ mod tests {
                             symbol.clone(),
                             st0x_config::EquityHedgePolicy {
                                 extended_hours_counter_trading: extended_hours,
+                                hedge_floor_shares: None,
                             },
                         )
                     })
@@ -11003,6 +11026,7 @@ mod tests {
                         Symbol::new("AAPL").unwrap(),
                         st0x_config::EquityHedgePolicy {
                             extended_hours_counter_trading: OperationMode::Enabled,
+                            hedge_floor_shares: None,
                         },
                     )]),
                 },
@@ -11709,6 +11733,61 @@ mod tests {
         );
     }
 
+    /// Two sells on one symbol in a batch draw down one reservation. With a
+    /// three-share book and a one-share floor the batch may sell two in
+    /// total, never three: the floored `available` in the reservation is
+    /// what the budget subtracts from.
+    #[tokio::test]
+    async fn batch_budget_never_sums_past_the_hedge_floor() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: aapl.clone(),
+                    quantity: FractionalShares::new(float!(3)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 100_000,
+                cash_buying_power_cents: Some(100_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            })
+            .with_hedge_floor(HedgeFloor::new(
+                FractionalShares::new(float!(1)),
+                std::collections::HashMap::new(),
+            ));
+
+        let mut budget = CounterTradeBatchBudget::default();
+        let mut committed = FractionalShares::ZERO;
+
+        for requested in [float!(2), float!(1)] {
+            let preflight = executor
+                .preflight_counter_trade(MarketOrder {
+                    symbol: aapl.clone(),
+                    shares: Positive::new(FractionalShares::new(requested)).unwrap(),
+                    direction: Direction::Sell,
+                    client_order_id: ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                })
+                .await
+                .unwrap();
+            let CounterTradePreflight::Allowed {
+                reservation: Some(reservation),
+            } = preflight
+            else {
+                panic!("expected an equity reservation, got {preflight:?}");
+            };
+
+            if budget.commit_reservation(&reservation).unwrap().is_none() {
+                let CounterTradeReservation::Equity { required, .. } = &reservation else {
+                    panic!("expected an equity reservation, got {reservation:?}");
+                };
+                committed = (committed + required.inner()).unwrap();
+            }
+        }
+
+        assert_eq!(committed, FractionalShares::new(float!(2)));
+    }
+
     #[tokio::test]
     async fn periodic_checker_reserves_buying_power_across_batch() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -12041,6 +12120,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -12170,6 +12250,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: threshold,
                 usdc: Some(threshold),
                 transfer_timeout: Duration::from_secs(30 * 60),
@@ -12297,6 +12378,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -12449,6 +12531,7 @@ mod tests {
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
+                hedge_floor: HedgeFloor::default(),
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -16051,6 +16134,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: 50,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
         })
     }
 

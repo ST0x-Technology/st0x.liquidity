@@ -309,6 +309,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
         };
         let broker = InstrumentedAlpacaBroker::new(
             AlpacaBrokerApi::try_from_ctx(broker_auth)
@@ -354,6 +355,7 @@ mod tests {
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
             equity: ctx.equity,
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
@@ -372,6 +374,7 @@ mod tests {
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
             equity: ctx.equity,
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,

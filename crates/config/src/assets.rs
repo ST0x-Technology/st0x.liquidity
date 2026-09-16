@@ -227,6 +227,12 @@ pub struct EquityHedgePolicy {
     /// `Position` per symbol, so the bot cannot hedge the same exposure under
     /// two session policies at once.
     pub extended_hours_counter_trading: OperationMode,
+    /// Overrides `[broker] hedge_floor_shares` for this symbol: the shares a
+    /// sell hedge or mint always leaves in the broker account. Absent means
+    /// the broker default applies; zero opts this symbol out, which is the
+    /// choice for a whole-share asset not worth a full share of exposure.
+    #[serde(default)]
+    pub hedge_floor_shares: Option<FractionalShares>,
 }
 
 /// Broker-side cash policy.
@@ -599,12 +605,14 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             EquityHedgePolicy {
                 extended_hours_counter_trading: OperationMode::Enabled,
+                hedge_floor_shares: None,
             },
         );
         symbols.insert(
             Symbol::new("RKLB").unwrap(),
             EquityHedgePolicy {
                 extended_hours_counter_trading: OperationMode::Disabled,
+                hedge_floor_shares: None,
             },
         );
 

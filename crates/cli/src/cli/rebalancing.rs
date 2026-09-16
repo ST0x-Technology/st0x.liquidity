@@ -717,6 +717,7 @@ async fn run_usdc_transfer<Writer: Write>(
         asset_cache_ttl: std::time::Duration::from_secs(3600),
         time_in_force: TimeInForce::default(),
         counter_trade_slippage_bps: alpaca_auth.counter_trade_slippage_bps,
+        hedge_floor: alpaca_auth.hedge_floor.clone(),
     };
 
     // The CLI has no telemetry writer, so broker dependency samples have nowhere
@@ -2465,6 +2466,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
         });
         ctx
     }
@@ -2480,6 +2482,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
         };
 
         Ctx {
@@ -2800,6 +2803,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {
@@ -2827,6 +2831,7 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            hedge_floor: st0x_execution::HedgeFloor::default(),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {
