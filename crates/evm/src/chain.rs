@@ -10,9 +10,7 @@ use std::str::FromStr;
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
-use crate::tokens::{
-    USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM, USDC_ROBINHOOD, USDG_ROBINHOOD,
-};
+use crate::tokens::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM, USDC_ROBINHOOD, USDG_ROBINHOOD};
 
 /// An EVM chain the bot acts on.
 ///

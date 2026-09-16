@@ -289,19 +289,29 @@ where
             .chains
             .get(&self.chain)
             .ok_or(OnChainError::UnhedgedChain { chain: self.chain })?;
+        let checkpoint = load_backfill_checkpoint(&ctx.pool, &chain_ctx.trading).await?;
+        let from_block = backfill_job_start(
+            checkpoint,
+            chain_ctx.trading.deployment_block,
+            self.from_block,
+        );
 
         backfill_range(
             chain_ctx.evm.provider(),
             &chain_ctx.trading,
             BotOperator(ctx.ctx.order_owner()),
             &ctx.pool,
-            self.from_block,
+            from_block,
             self.to_block,
             get_backfill_retry_strat(),
             ctx.job_queue.clone(),
         )
         .await
     }
+}
+
+fn backfill_job_start(checkpoint: Option<u64>, deployment_block: u64, job_from_block: u64) -> u64 {
+    backfill_start_from_checkpoint(checkpoint, deployment_block).max(job_from_block)
 }
 
 /// Derives the block to resume backfill from, given the persisted checkpoint
@@ -1308,6 +1318,16 @@ mod tests {
     #[test]
     fn backfill_start_from_checkpoint_resumes_after_checkpoint() {
         assert_eq!(backfill_start_from_checkpoint(Some(80), 50), 81);
+    }
+
+    #[test]
+    fn durable_job_retry_resumes_after_persisted_checkpoint() {
+        assert_eq!(backfill_job_start(Some(1_000), 1, 1), 1_001);
+        assert_eq!(
+            backfill_job_start(Some(500), 1, 1_000),
+            1_000,
+            "a checkpoint from an older range must not move this job backwards"
+        );
     }
 
     #[test]

@@ -1363,7 +1363,7 @@ fn build_record_bot_gas_receipt_cost_ctx(
     Ok(Arc::new(RecordBotGasReceiptCostCtx {
         base_wallet: wallet_ctx.base_wallet().clone(),
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
-        robinhood_wallet: wallet_ctx.robinhood_wallet().clone(),
+        robinhood_wallet: wallet_ctx.robinhood_wallet().cloned(),
         chainlink_feed: bot_gas_valuation.chainlink_feed,
         ledger: BotGasCostLedger::new(bot_gas_receipt_cost_store),
         job_queue,
@@ -1452,7 +1452,7 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
     };
 
     for (chain, targets) in startup_approval_targets(ctx) {
-        grant_startup_approvals(chain_wallet(wallet_ctx, chain), &targets)
+        grant_startup_approvals(chain_wallet(wallet_ctx, chain)?, &targets)
             .await
             .with_context(|| format!("startup token approvals failed on {chain}"))?;
 
@@ -1758,13 +1758,15 @@ fn build_wrapper<Signer: Wallet + Clone>(
 fn chain_wallet(
     wallet_ctx: &OnchainWalletCtx,
     chain: Chain,
-) -> &Arc<dyn Wallet<Provider = RootProvider>> {
-    match chain {
+) -> anyhow::Result<&Arc<dyn Wallet<Provider = RootProvider>>> {
+    Ok(match chain {
         Chain::Base => wallet_ctx.base_wallet(),
         Chain::Ethereum => wallet_ctx.ethereum_wallet(),
         Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
-        Chain::Robinhood => wallet_ctx.robinhood_wallet(),
-    }
+        Chain::Robinhood => wallet_ctx
+            .robinhood_wallet()
+            .ok_or(CtxError::WalletMissingChain { chain })?,
+    })
 }
 
 /// The tokenization services bound to one hedged chain: its signer, and
@@ -1821,7 +1823,7 @@ fn build_chain_tokenizations(
         .hedged_with_roles()
         .map(|(role, hedged)| {
             let chain = hedged.chain;
-            let wallet = chain_wallet(wallet_ctx, chain).clone();
+            let wallet = chain_wallet(wallet_ctx, chain)?.clone();
             let equity = if role.rebalances_equity(&hedged.assets) {
                 EquityTokenization::Rebalancing(build_equity_tokenization_services(
                     ctx,
@@ -2135,9 +2137,9 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
 /// transport chains hold funds through their signers, so a signer pointed at
 /// the wrong network must fail startup the same way.
 ///
-/// Scoped to chains the registry actually holds: the wallet builds a signer
-/// for every chain unconditionally, but a chain absent from the registry has
-/// no configured addresses to protect, and its signer endpoint is never used.
+/// Scoped to chains the registry actually holds: Robinhood's signer is absent
+/// until its chain table is configured, while a chain absent from the registry
+/// has no configured addresses to protect.
 ///
 /// Iterates [`Chain::ALL`] with an exhaustive signer match, so a future
 /// variant is covered by construction: the compiler demands its signer arm,
@@ -2153,7 +2155,7 @@ async fn confirm_transport_chain_ids(ctx: &Ctx) -> anyhow::Result<()> {
             continue;
         }
 
-        confirm_chain_id(chain_wallet(wallet_ctx, chain).provider(), chain).await?;
+        confirm_chain_id(chain_wallet(wallet_ctx, chain)?.provider(), chain).await?;
     }
 
     Ok(())
@@ -16051,8 +16053,27 @@ mod tests {
         build_mint_authorizer(
             ctx.orchestrator.as_ref().map(|config| &config.addresses),
             chain,
-            chain_wallet(&OnchainWalletCtx::stub(), chain).clone(),
+            chain_wallet(&OnchainWalletCtx::stub(), chain)
+                .unwrap()
+                .clone(),
         )
+    }
+
+    #[test]
+    fn chain_wallet_names_an_unconfigured_robinhood_signer() {
+        let error = chain_wallet(
+            &OnchainWalletCtx::stub_without_robinhood(),
+            Chain::Robinhood,
+        )
+        .err()
+        .expect("an unconfigured Robinhood signer must be rejected");
+
+        assert!(matches!(
+            error.downcast_ref::<CtxError>(),
+            Some(CtxError::WalletMissingChain {
+                chain: Chain::Robinhood
+            })
+        ));
     }
 
     /// A section with an entry for the chain: mint authorization comes up

@@ -271,17 +271,25 @@ mod tests {
         hedged: bool,
     ) -> BTreeMap<Chain, crate::chain::ChainConfig> {
         let trading = if hedged {
-            r#"[trading]
+            let cutoff = match chain {
+                Chain::Robinhood => {
+                    "ingestion_cutoff = \"confirmations\"\ningestion_cutoff_confirmations = 1"
+                }
+                Chain::Base | Chain::Ethereum | Chain::HyperEvm => "ingestion_cutoff = \"safe\"",
+            };
+            format!(
+                r#"[trading]
 orderbook = "0x1111111111111111111111111111111111111111"
 inventory_mode = "legacy"
 inventory_adapters = []
 vault_owner = "0x2222222222222222222222222222222222222222"
 deployment_block = 1
-ingestion_cutoff = "safe"
+{cutoff}
 order_fill_poll_interval_secs = 1
 "#
+            )
         } else {
-            ""
+            String::new()
         };
         BTreeMap::from([(
             chain,

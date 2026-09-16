@@ -1536,9 +1536,9 @@ pub struct WalletMeta {
 /// Validates the config/secrets pairing and RPC prerequisites for wallet
 /// construction without connecting to any chain.
 ///
-/// The wallet signs on every chain the bot holds funds on, including the ones
-/// it does not trade on, so each of those needs a `[chains.<name>]` entry
-/// carrying its `rpc_url`.
+/// The wallet signs on every established chain the bot holds funds on.
+/// Robinhood is constructed only when that chain is configured, so its
+/// observe-only introduction remains compatible with existing deployments.
 fn validate_wallet_inputs(
     wallet_config: Option<toml::Value>,
     wallet_secrets: Option<toml::Value>,
@@ -1579,7 +1579,10 @@ fn validate_wallet_inputs(
                 base: signing_chain(Chain::Base)?,
                 ethereum: signing_chain(Chain::Ethereum)?,
                 hyperevm: signing_chain(Chain::HyperEvm)?,
-                robinhood: signing_chain(Chain::Robinhood)?,
+                robinhood: chains
+                    .rpc_url(Chain::Robinhood)
+                    .map(|_| signing_chain(Chain::Robinhood))
+                    .transpose()?,
             };
 
             let wallet_meta = WalletMeta::deserialize(wallet_config.clone()).map_err(|source| {
@@ -3298,30 +3301,59 @@ mod tests {
         assert!(robinhood.trading.is_none());
     }
 
+    #[test]
+    fn wallet_validation_does_not_require_unconfigured_robinhood() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "            [chains.robinhood]\n            lifecycle = \"observe-only\"\n            required_confirmations = 1\n\n",
+                "",
+            ),
+        );
+        let full_secrets = alpaca_secrets_toml();
+        let secrets_text = std::fs::read_to_string(full_secrets.path()).unwrap();
+        let secrets = toml_file(&secrets_text.replace(
+            "            [chains.robinhood]\n            rpc_url = \"https://rpc.mainnet.chain.robinhood.com\"\n\n",
+            "",
+        ));
+
+        Ctx::validate_files(config.path(), secrets.path()).unwrap();
+    }
+
     /// The enablement predicate has to run on the real load path, not just as
-    /// a unit. HyperEVM supports prefunded trading and Robinhood signs only;
-    /// neither wires a gas-valuation source, so raising either from
-    /// "observe-only" to "active" must still be refused, naming the chain and
-    /// its missing capability.
-    #[tokio::test]
-    async fn observe_only_chains_cannot_be_raised_to_active() {
-        for chain in ["hyperevm", "robinhood"] {
-            let from = format!("[chains.{chain}]\n            lifecycle = \"observe-only\"");
-            let to = format!("[chains.{chain}]\n            lifecycle = \"active\"");
-            let config = toml_file(
-                &String::from_utf8_lossy(minimal_config_toml_bytes())
-                    .replace(from.as_str(), to.as_str()),
-            );
-            let secrets = alpaca_secrets_toml();
+    /// a unit. HyperEVM supports prefunded trading but has no gas-valuation
+    /// source, so raising it from "observe-only" to "active" is refused.
+    #[test]
+    fn hyperevm_cannot_be_raised_to_active() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "[chains.hyperevm]\n            lifecycle = \"observe-only\"",
+                "[chains.hyperevm]\n            lifecycle = \"active\"",
+            ),
+        );
+        let secrets = alpaca_secrets_toml();
 
-            let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
-            let message = error.to_string();
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let message = error.to_string();
 
-            assert!(
-                message.contains(chain) && message.contains("gas valuation"),
-                "expected the predicate to name {chain} and its missing capability, got: {message}"
-            );
-        }
+        assert!(
+            message.contains("hyperevm") && message.contains("gas valuation"),
+            "expected the predicate to name hyperevm and its missing capability, got: {message}"
+        );
+    }
+
+    /// Robinhood pays gas in ETH and has gas valuation wired, so the real load
+    /// path admits `active` when no rebalancing assets are configured.
+    #[test]
+    fn robinhood_can_be_raised_to_active_without_rebalancing() {
+        let config = toml_file(
+            &String::from_utf8_lossy(minimal_config_toml_bytes()).replace(
+                "[chains.robinhood]\n            lifecycle = \"observe-only\"",
+                "[chains.robinhood]\n            lifecycle = \"active\"",
+            ),
+        );
+        let secrets = alpaca_secrets_toml();
+
+        Ctx::validate_files(config.path(), secrets.path()).unwrap();
     }
 
     /// A disabled chain is dropped from the registry, so a wallet that signs

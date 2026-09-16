@@ -81,7 +81,7 @@ pub(crate) fn require_secure_wallet_rpc_url(url: &Url, chain: Chain) -> Result<(
     }
 }
 
-/// Pre-built signing wallets, one per chain.
+/// Pre-built signing wallets for configured chains.
 ///
 /// Independent of rebalancing — any trading mode can optionally
 /// configure a wallet for manual CLI operations.
@@ -90,7 +90,7 @@ pub struct OnchainWalletCtx {
     base: Arc<dyn Wallet<Provider = RootProvider>>,
     ethereum: Arc<dyn Wallet<Provider = RootProvider>>,
     hyperevm: Arc<dyn Wallet<Provider = RootProvider>>,
-    robinhood: Arc<dyn Wallet<Provider = RootProvider>>,
+    robinhood: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
 }
 
 /// What one chain's signer is built from: its endpoint and the confirmation
@@ -105,15 +105,14 @@ pub struct SigningChain {
 
 /// Per-chain signer parameters for every chain the wallet is built for.
 ///
-/// Named fields rather than a map so "a signer exists for every signing chain"
-/// holds by construction, and the accessors below can hand out a wallet
-/// without an `Option` the caller cannot act on. `validate_wallet_inputs`
-/// produces this from the chain registry, failing when an entry is absent.
+/// Robinhood remains optional so introducing its observe-only chain identity
+/// does not force deployed configurations to gain signing access before the
+/// trading rollout needs it.
 pub struct SigningChains {
     pub base: SigningChain,
     pub ethereum: SigningChain,
     pub hyperevm: SigningChain,
-    pub robinhood: SigningChain,
+    pub robinhood: Option<SigningChain>,
 }
 
 impl OnchainWalletCtx {
@@ -142,11 +141,13 @@ impl OnchainWalletCtx {
         require_secure_wallet_rpc_url(&base.rpc_url, Chain::Base)?;
         require_secure_wallet_rpc_url(&ethereum.rpc_url, Chain::Ethereum)?;
         require_secure_wallet_rpc_url(&hyperevm.rpc_url, Chain::HyperEvm)?;
-        require_secure_wallet_rpc_url(&robinhood.rpc_url, Chain::Robinhood)?;
+        if let Some(robinhood) = &robinhood {
+            require_secure_wallet_rpc_url(&robinhood.rpc_url, Chain::Robinhood)?;
+        }
 
         let WalletKindTag { kind } = WalletKindTag::deserialize(wallet_config.clone())?;
 
-        let (base_wallet, ethereum_wallet, hyperevm_wallet, robinhood_wallet) = tokio::try_join!(
+        let (base_wallet, ethereum_wallet, hyperevm_wallet) = tokio::try_join!(
             build_wallet(
                 &kind,
                 wallet_config.clone(),
@@ -168,19 +169,26 @@ impl OnchainWalletCtx {
                 hyperevm.rpc_url,
                 hyperevm.required_confirmations,
             ),
-            build_wallet(
-                &kind,
-                wallet_config,
-                wallet_secrets,
-                robinhood.rpc_url,
-                robinhood.required_confirmations,
-            ),
         )?;
+        let robinhood_wallet = match robinhood {
+            Some(robinhood) => Some(
+                build_wallet(
+                    &kind,
+                    wallet_config,
+                    wallet_secrets,
+                    robinhood.rpc_url,
+                    robinhood.required_confirmations,
+                )
+                .await?,
+            ),
+            None => None,
+        };
 
         info!(
             target: "wallet",
             wallet = %base_wallet.address(),
-            "Initialized onchain wallet (Base + Ethereum + HyperEVM + Robinhood)"
+            robinhood = robinhood_wallet.is_some(),
+            "Initialized onchain wallets"
         );
 
         Ok(Self {
@@ -208,8 +216,8 @@ impl OnchainWalletCtx {
         &self.hyperevm
     }
 
-    pub fn robinhood_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
-        &self.robinhood
+    pub fn robinhood_wallet(&self) -> Option<&Arc<dyn Wallet<Provider = RootProvider>>> {
+        self.robinhood.as_ref()
     }
 }
 
@@ -278,9 +286,17 @@ impl OnchainWalletCtx {
             hyperevm: st0x_evm::StubWallet::stub(address!(
                 "0x0000000000000000000000000000000000000999"
             )),
-            robinhood: st0x_evm::StubWallet::stub(address!(
+            robinhood: Some(st0x_evm::StubWallet::stub(address!(
                 "0x0000000000000000000000000000000000004663"
-            )),
+            ))),
+        }
+    }
+
+    /// Create a stub wallet context without an optional Robinhood signer.
+    pub fn stub_without_robinhood() -> Self {
+        Self {
+            robinhood: None,
+            ..Self::stub()
         }
     }
 }
@@ -298,7 +314,7 @@ impl OnchainWalletCtx {
             base: base_wallet,
             ethereum: ethereum_wallet,
             hyperevm: hyperevm_wallet,
-            robinhood: robinhood_wallet,
+            robinhood: Some(robinhood_wallet),
         }
     }
 }

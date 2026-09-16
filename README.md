@@ -24,9 +24,9 @@ remain unavailable.
 
 Robinhood Chain (4663) is declared the same way. The build can ingest fills,
 hedge, sign and value gas on it (it pays gas in ETH), so `active` is reachable;
-rebalancing is not. The shipped configuration keeps it observe-only -- a signer
-exists, nothing is ingested or signed -- until RAI-2457 adds its trading table.
-It settles in USDG.
+rebalancing remains unavailable. The shipped configuration keeps it
+observe-only: nothing is ingested or signed until RAI-2457 adds its trading
+table and signer. It settles in USDG.
 
 ## Features
 
@@ -115,7 +115,8 @@ and catch-up use fixed inclusive `eth_getLogs` limits: 1000 blocks on Base and
 Ethereum, 50 on HyperEVM. Robinhood is pinned to 1000 for the trading table
 RAI-2457 adds; the shipped observe-only Robinhood ingests nothing. These
 constants require no extra config. Catch-up queues are independent per chain;
-checkpoints advance after a whole range succeeds. See
+the checkpoint advances after each batch succeeds, so a later batch failure
+resumes at the first unscanned block rather than restarting the range. See
 [OrderFillMonitor](docs/conductor.md#orderfillmonitor) for retry behavior and
 the catch-up throughput check required before go-live.
 

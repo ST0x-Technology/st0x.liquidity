@@ -444,13 +444,17 @@ where
                     let wallet = wallet_ctx.hyperevm_wallet();
                     (wallet.provider().clone(), wallet.address())
                 }),
-            alerts
-                .low_balance_threshold_wei(Chain::Robinhood)
-                .is_some()
-                .then(|| {
-                    let wallet = wallet_ctx.robinhood_wallet();
-                    (wallet.provider().clone(), wallet.address())
-                }),
+            match alerts.low_balance_threshold_wei(Chain::Robinhood) {
+                Some(_) => {
+                    let wallet = wallet_ctx.robinhood_wallet().ok_or(
+                        ConductorSpawnError::GasWalletMismatch {
+                            chain: Chain::Robinhood,
+                        },
+                    )?;
+                    Some((wallet.provider().clone(), wallet.address()))
+                }
+                None => None,
+            },
             &notifier,
         )?)
     } else {

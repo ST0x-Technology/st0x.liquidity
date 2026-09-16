@@ -201,6 +201,13 @@ pub enum ChainConfigError {
     DepthWithoutConfirmations { tag: IngestionCutoffTag },
     #[error("[chains.<name>] ingestion_cutoff_confirmations must be non-zero")]
     ZeroConfirmationDepth,
+    #[error(
+        "[chains.{chain}] ingestion_cutoff = \"{tag:?}\" is unsupported; use \"confirmations\" because its RPC does not guarantee safe/finalized block tags"
+    )]
+    UnsupportedIngestionCutoff {
+        chain: Chain,
+        tag: IngestionCutoffTag,
+    },
     #[error("[chains.<name>] order_fill_poll_interval_secs must be non-zero")]
     ZeroOrderFillPollInterval,
 }
@@ -297,7 +304,14 @@ impl TradingConfig {
 
     /// Resolves the cutoff tag + optional depth into an [`IngestionCutoff`],
     /// failing fast on the contradictory combinations.
-    fn resolve_ingestion_cutoff(&self) -> Result<IngestionCutoff, ChainConfigError> {
+    fn resolve_ingestion_cutoff(&self, chain: Chain) -> Result<IngestionCutoff, ChainConfigError> {
+        if chain == Chain::Robinhood && self.ingestion_cutoff != IngestionCutoffTag::Confirmations {
+            return Err(ChainConfigError::UnsupportedIngestionCutoff {
+                chain,
+                tag: self.ingestion_cutoff,
+            });
+        }
+
         match (self.ingestion_cutoff, self.ingestion_cutoff_confirmations) {
             (IngestionCutoffTag::Safe, None) => Ok(IngestionCutoff::Safe),
             (IngestionCutoffTag::Finalized, None) => Ok(IngestionCutoff::Finalized),
@@ -467,7 +481,7 @@ impl HedgedChain {
             inventory_adapters: trading.inventory_adapters.clone(),
             vault_owner: trading.vault_owner,
             deployment_block: trading.deployment_block,
-            ingestion_cutoff: trading.resolve_ingestion_cutoff()?,
+            ingestion_cutoff: trading.resolve_ingestion_cutoff(chain)?,
             order_fill_poll_interval: std::time::Duration::from_secs(
                 trading.order_fill_poll_interval_secs,
             ),
@@ -794,10 +808,19 @@ impl ChainRegistry {
     pub fn validate_configs(
         configs: &BTreeMap<Chain, ChainConfig>,
     ) -> Result<&TradingConfig, ChainRegistryError> {
-        let EnabledChains { trading_table, .. } = enabled_chains(configs)?;
+        let EnabledChains {
+            enabled,
+            trading_table,
+            ..
+        } = enabled_chains(configs)?;
 
-        trading_table.validate_inventory_adapters()?;
-        trading_table.resolve_inventory_mode()?;
+        for (chain, config) in enabled {
+            if let Some(trading) = &config.trading {
+                trading.validate_inventory_adapters()?;
+                trading.resolve_inventory_mode()?;
+                trading.resolve_ingestion_cutoff(chain)?;
+            }
+        }
 
         Ok(trading_table)
     }
@@ -813,6 +836,13 @@ impl ChainRegistry {
     /// fill watcher runs against.
     pub fn hedged(&self) -> impl Iterator<Item = &HedgedChain> {
         self.hedged_with_roles().map(|(_, hedged)| hedged)
+    }
+
+    /// Every enabled chain, including transport-only observe-only entries.
+    pub fn enabled(&self) -> impl Iterator<Item = Chain> + '_ {
+        std::iter::once(self.primary.chain)
+            .chain(self.secondary.keys().copied())
+            .chain(self.transport.keys().copied())
     }
 
     /// Every hedged chain tagged with its [`ChainRole`], primary first.
@@ -1010,19 +1040,19 @@ mod tests {
 
         assert_eq!(
             with(IngestionCutoffTag::Confirmations, Some(12))
-                .resolve_ingestion_cutoff()
+                .resolve_ingestion_cutoff(Chain::Base)
                 .unwrap(),
             IngestionCutoff::Confirmations(12)
         );
         assert!(matches!(
             with(IngestionCutoffTag::Confirmations, None)
-                .resolve_ingestion_cutoff()
+                .resolve_ingestion_cutoff(Chain::Base)
                 .unwrap_err(),
             ChainConfigError::ConfirmationsWithoutDepth
         ));
         assert!(matches!(
             with(IngestionCutoffTag::Safe, Some(12))
-                .resolve_ingestion_cutoff()
+                .resolve_ingestion_cutoff(Chain::Base)
                 .unwrap_err(),
             ChainConfigError::DepthWithoutConfirmations {
                 tag: IngestionCutoffTag::Safe
@@ -1030,7 +1060,7 @@ mod tests {
         ));
         assert!(matches!(
             with(IngestionCutoffTag::Confirmations, Some(0))
-                .resolve_ingestion_cutoff()
+                .resolve_ingestion_cutoff(Chain::Base)
                 .unwrap_err(),
             ChainConfigError::ZeroConfirmationDepth
         ));
@@ -1055,7 +1085,34 @@ mod tests {
         assert_eq!(config.ingestion_cutoff, IngestionCutoffTag::Confirmations);
         assert_eq!(config.ingestion_cutoff_confirmations, Some(12));
         assert_eq!(
-            config.resolve_ingestion_cutoff().unwrap(),
+            config.resolve_ingestion_cutoff(Chain::Base).unwrap(),
+            IngestionCutoff::Confirmations(12)
+        );
+    }
+
+    #[test]
+    fn robinhood_requires_confirmation_cutoff() {
+        let with = |tag, depth| TradingConfig {
+            ingestion_cutoff: tag,
+            ingestion_cutoff_confirmations: depth,
+            ..primary_trading_config_toml(false)
+        };
+
+        for tag in [IngestionCutoffTag::Safe, IngestionCutoffTag::Finalized] {
+            assert!(matches!(
+                with(tag, None)
+                    .resolve_ingestion_cutoff(Chain::Robinhood)
+                    .unwrap_err(),
+                ChainConfigError::UnsupportedIngestionCutoff {
+                    chain: Chain::Robinhood,
+                    tag: rejected,
+                } if rejected == tag
+            ));
+        }
+        assert_eq!(
+            with(IngestionCutoffTag::Confirmations, Some(12))
+                .resolve_ingestion_cutoff(Chain::Robinhood)
+                .unwrap(),
             IngestionCutoff::Confirmations(12)
         );
     }
@@ -1524,10 +1581,21 @@ mod tests {
         let configs = BTreeMap::from([
             (Chain::Base, chain_config(Some(trading_config_toml()))),
             (Chain::Ethereum, chain_config(None)),
+            (
+                Chain::Robinhood,
+                ChainConfig {
+                    lifecycle: ChainLifecycle::ObserveOnly,
+                    required_confirmations: 1,
+                    trading: None,
+                },
+            ),
         ]);
 
-        let registry =
-            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap();
+        let registry = ChainRegistry::new(
+            &configs,
+            secrets_for(&[Chain::Base, Chain::Ethereum, Chain::Robinhood]),
+        )
+        .unwrap();
 
         assert_eq!(registry.primary().chain, Chain::Base);
         assert_eq!(
@@ -1544,6 +1612,11 @@ mod tests {
             registry.rpc_url(Chain::HyperEvm),
             None,
             "a chain with no entry has no endpoint"
+        );
+        assert_eq!(
+            registry.enabled().collect::<Vec<_>>(),
+            vec![Chain::Base, Chain::Ethereum, Chain::Robinhood],
+            "transport-only Robinhood remains visible alongside hedged chains"
         );
     }
 

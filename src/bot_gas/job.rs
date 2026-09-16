@@ -220,7 +220,7 @@ const MAX_REDRIVE_ATTEMPTS: u32 = 20;
 pub(crate) struct RecordBotGasReceiptCostCtx {
     pub(crate) base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     pub(crate) ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    pub(crate) robinhood_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    pub(crate) robinhood_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
     pub(crate) chainlink_feed: Address,
     pub(crate) ledger: BotGasCostLedger,
     /// Used to delayed-redrive a transient RPC-shaped outcome (a lagging RPC
@@ -305,10 +305,13 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
                 ctx.ethereum_wallet.provider(),
                 ctx.ethereum_wallet.address(),
             ),
-            Chain::Robinhood => (
-                ctx.robinhood_wallet.provider(),
-                ctx.robinhood_wallet.address(),
-            ),
+            Chain::Robinhood => {
+                let wallet = ctx
+                    .robinhood_wallet
+                    .as_ref()
+                    .ok_or(RecordBotGasReceiptCostError::UnwiredChain { chain: self.chain })?;
+                (wallet.provider(), wallet.address())
+            }
             Chain::HyperEvm => {
                 return Err(RecordBotGasReceiptCostError::UnwiredChain { chain: self.chain });
             }
@@ -850,7 +853,7 @@ mod tests {
         RecordBotGasReceiptCostCtx {
             base_wallet: MockWallet::with_asserter(asserter),
             ethereum_wallet: MockWallet::with_asserter(&Asserter::new()),
-            robinhood_wallet: MockWallet::with_asserter(&Asserter::new()),
+            robinhood_wallet: Some(MockWallet::with_asserter(&Asserter::new())),
             chainlink_feed: CHAINLINK_FEED,
             ledger,
             job_queue,
@@ -1618,7 +1621,7 @@ mod tests {
             let ctx = RecordBotGasReceiptCostCtx {
                 base_wallet: MockWallet::with_asserter(&base_asserter),
                 ethereum_wallet,
-                robinhood_wallet,
+                robinhood_wallet: Some(robinhood_wallet),
                 chainlink_feed: CHAINLINK_FEED,
                 ledger,
                 job_queue: RecordBotGasReceiptCostJobQueue::new(&apalis_pool),

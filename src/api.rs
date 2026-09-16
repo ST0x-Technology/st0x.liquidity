@@ -4455,6 +4455,8 @@ mod tests {
             report,
             serde_json::json!({
                 "monitor": {
+                    // Includes observe-only chains that have no fill watcher.
+                    "enabledChains": ["base"],
                     // One series per hedged chain, empty until it samples.
                     "blockLag": [{
                         "chain": "base",

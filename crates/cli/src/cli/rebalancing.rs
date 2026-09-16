@@ -151,16 +151,36 @@ fn resolve_redemption_wallet(
 pub(super) fn tokenization_network_context(
     wallet_ctx: &OnchainWalletCtx,
     network: TokenizationNetwork,
-) -> (Arc<dyn Wallet<Provider = RootProvider>>, Chain) {
+) -> anyhow::Result<(Arc<dyn Wallet<Provider = RootProvider>>, Chain)> {
     let chain = Chain::from(network);
     let wallet = match chain {
         Chain::Base => wallet_ctx.base_wallet(),
         Chain::Ethereum => wallet_ctx.ethereum_wallet(),
         Chain::HyperEvm => wallet_ctx.hyperevm_wallet(),
-        Chain::Robinhood => wallet_ctx.robinhood_wallet(),
+        Chain::Robinhood => wallet_ctx.robinhood_wallet().ok_or_else(|| {
+            anyhow::anyhow!("no Robinhood signer is configured: add [chains.robinhood] first")
+        })?,
     };
 
-    (wallet.clone(), chain)
+    Ok((wallet.clone(), chain))
+}
+
+fn require_alpaca_tokenization_network(network: TokenizationNetwork) -> anyhow::Result<()> {
+    if network == TokenizationNetwork::Robinhood {
+        anyhow::bail!(
+            "Alpaca tokenization does not support Robinhood Chain; use a documented Alpaca network"
+        );
+    }
+
+    Ok(())
+}
+
+pub(super) fn require_equity_mutation_network(network: TokenizationNetwork) -> anyhow::Result<()> {
+    if network == TokenizationNetwork::Robinhood {
+        anyhow::bail!("Robinhood Chain does not support tokenization or wrapper operations");
+    }
+
+    Ok(())
 }
 
 /// The chain an operator command acts on: its signing wallet and its
@@ -189,7 +209,7 @@ pub(super) fn hedged_chain_context(
         );
     };
 
-    let (wallet, chain) = tokenization_network_context(ctx.wallet()?, network);
+    let (wallet, chain) = tokenization_network_context(ctx.wallet()?, network)?;
 
     Ok(HedgedChainContext {
         chain,
@@ -333,6 +353,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         redemption_wallet,
         network,
     } = transfer;
+    require_equity_mutation_network(network)?;
     let chain = Chain::from(network);
 
     // A resume continues the transfer the record describes, so the recorded
@@ -1301,6 +1322,8 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write>(
     token_override: Option<Address>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    require_alpaca_tokenization_network(network)?;
+
     writeln!(stdout, "🔄 Requesting tokenization via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
@@ -1312,7 +1335,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write>(
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let wallet_ctx = ctx.wallet()?;
-    let (wallet, chain) = tokenization_network_context(wallet_ctx, network);
+    let (wallet, chain) = tokenization_network_context(wallet_ctx, network)?;
 
     let receiving_wallet = recipient.unwrap_or_else(|| wallet.address());
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
@@ -1446,6 +1469,8 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     registry: Option<PathBuf>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    require_alpaca_tokenization_network(network)?;
+
     writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
@@ -1456,7 +1481,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
 
     let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, network, ctx)?;
-    let (_, chain) = tokenization_network_context(ctx.wallet()?, network);
+    let (_, chain) = tokenization_network_context(ctx.wallet()?, network)?;
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
     // The issuer redeems only the vault's underlying, so the token comes from
@@ -2552,6 +2577,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transfer_equity_rejects_robinhood_before_loading_services() {
+        let ctx = create_alpaca_test_ctx();
+        let pool = setup_test_db().await;
+        let mut stdout = Vec::new();
+
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(1)),
+                issuer_request_id: None,
+                redemption_wallet: None,
+                network: TokenizationNetwork::Robinhood,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Robinhood Chain does not support tokenization or wrapper operations"
+        );
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_transfer_equity_requires_tokenization_config() {
         let mut ctx = create_alpaca_test_ctx();
         // The trading table is now resolved first, and resolving it needs a
@@ -3027,24 +3081,43 @@ mod tests {
         );
 
         let (base_wallet, base_chain) =
-            tokenization_network_context(&wallet_ctx, TokenizationNetwork::Base);
+            tokenization_network_context(&wallet_ctx, TokenizationNetwork::Base).unwrap();
         assert_eq!(base_wallet.address(), base_address);
         assert_eq!(base_chain, Chain::Base);
 
         let (ethereum_wallet, ethereum_chain) =
-            tokenization_network_context(&wallet_ctx, TokenizationNetwork::Ethereum);
+            tokenization_network_context(&wallet_ctx, TokenizationNetwork::Ethereum).unwrap();
         assert_eq!(ethereum_wallet.address(), ethereum_address);
         assert_eq!(ethereum_chain, Chain::Ethereum);
 
         let (hyperevm_wallet, hyperevm_chain) =
-            tokenization_network_context(&wallet_ctx, TokenizationNetwork::HyperEvm);
+            tokenization_network_context(&wallet_ctx, TokenizationNetwork::HyperEvm).unwrap();
         assert_eq!(hyperevm_wallet.address(), hyperevm_address);
         assert_eq!(hyperevm_chain, Chain::HyperEvm);
 
         let (robinhood_wallet, robinhood_chain) =
-            tokenization_network_context(&wallet_ctx, TokenizationNetwork::Robinhood);
+            tokenization_network_context(&wallet_ctx, TokenizationNetwork::Robinhood).unwrap();
         assert_eq!(robinhood_wallet.address(), robinhood_address);
         assert_eq!(robinhood_chain, Chain::Robinhood);
+    }
+
+    #[test]
+    fn alpaca_tokenization_rejects_robinhood_network() {
+        let error =
+            require_alpaca_tokenization_network(TokenizationNetwork::Robinhood).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Alpaca tokenization does not support Robinhood Chain")
+        );
+        for network in [
+            TokenizationNetwork::Base,
+            TokenizationNetwork::Ethereum,
+            TokenizationNetwork::HyperEvm,
+        ] {
+            require_alpaca_tokenization_network(network).unwrap();
+        }
     }
 
     const ETHEREUM_ORDERBOOK: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
