@@ -322,6 +322,7 @@ impl OnChainTrade {
             direction: self.direction,
             symbol: self.symbol,
             shares: Positive::new(FractionalShares::new(self.amount))?,
+            market_session: None,
             outcome: TradeOutcome::Filled,
         })
     }
