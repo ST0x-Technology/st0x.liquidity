@@ -73,6 +73,7 @@ fn chain_name(chain: Chain) -> ChainName {
         Chain::Base => ChainName::Base,
         Chain::Ethereum => ChainName::Ethereum,
         Chain::HyperEvm => ChainName::HyperEvm,
+        Chain::Robinhood => ChainName::Robinhood,
     }
 }
 

@@ -10,7 +10,7 @@ use std::str::FromStr;
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
-use crate::tokens::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
+use crate::tokens::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM, USDC_ROBINHOOD};
 
 /// An EVM chain the bot acts on.
 ///
@@ -27,12 +27,16 @@ pub enum Chain {
     /// same chain.
     #[serde(rename = "hyperevm")]
     HyperEvm,
+    /// Robinhood Chain, an Arbitrum Orbit L2 that pays gas in ETH. The
+    /// `rename_all = "snake_case"` spelling is already `robinhood`, the name
+    /// the issuer and the broker use for the same chain.
+    Robinhood,
 }
 
 impl Chain {
     /// Every variant, so callers can enumerate chains without a match that
     /// silently misses one added later.
-    pub const ALL: [Self; 3] = [Self::Base, Self::Ethereum, Self::HyperEvm];
+    pub const ALL: [Self; 4] = [Self::Base, Self::Ethereum, Self::HyperEvm, Self::Robinhood];
 
     /// The chain id the network reports over RPC.
     ///
@@ -43,6 +47,7 @@ impl Chain {
             Self::Base => 8453,
             Self::Ethereum => 1,
             Self::HyperEvm => 999,
+            Self::Robinhood => 4663,
         }
     }
 
@@ -53,6 +58,7 @@ impl Chain {
             Self::Base => USDC_BASE,
             Self::Ethereum => USDC_ETHEREUM,
             Self::HyperEvm => USDC_HYPEREVM,
+            Self::Robinhood => USDC_ROBINHOOD,
         }
     }
 
@@ -63,6 +69,7 @@ impl Chain {
             Self::Base => "base",
             Self::Ethereum => "ethereum",
             Self::HyperEvm => "hyperevm",
+            Self::Robinhood => "robinhood",
         }
     }
 }
@@ -74,7 +81,7 @@ impl fmt::Display for Chain {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("expected chain 'base', 'ethereum' or 'hyperevm'")]
+#[error("expected chain 'base', 'ethereum', 'hyperevm' or 'robinhood'")]
 pub struct ParseChainError;
 
 impl FromStr for Chain {
@@ -137,6 +144,10 @@ mod tests {
             serde_json::to_string(&Chain::HyperEvm).unwrap(),
             "\"hyperevm\""
         );
+        assert_eq!(
+            serde_json::to_string(&Chain::Robinhood).unwrap(),
+            "\"robinhood\""
+        );
     }
 
     #[test]
@@ -148,10 +159,19 @@ mod tests {
     }
 
     #[test]
+    fn robinhood_usdc_is_the_canonical_contract() {
+        assert_eq!(
+            Chain::Robinhood.usdc(),
+            alloy::primitives::address!("0x80e0e24718dbFcad49ECAA6F1e6C89A190586cA8")
+        );
+    }
+
+    #[test]
     fn chain_ids_are_pinned_literals() {
         assert_eq!(Chain::Base.chain_id(), 8453);
         assert_eq!(Chain::Ethereum.chain_id(), 1);
         assert_eq!(Chain::HyperEvm.chain_id(), 999);
+        assert_eq!(Chain::Robinhood.chain_id(), 4663);
     }
 
     #[test]
