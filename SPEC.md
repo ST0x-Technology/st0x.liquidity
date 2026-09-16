@@ -6200,17 +6200,29 @@ operational alerts.
 ### Structured log channel
 
 Alerts are emitted as structured ERROR logs: target `operational_alert`, an
-`alert = true` marker field, and the human-readable alert text in the `message`
-field. Delivery to humans happens downstream in the log pipeline (Cloud Logging
--> Grafana alert rules, maintained in t0.devops), so the bot holds no delivery
-credentials and in-process delivery cannot fail. The non-secret `[alerts]`
-config supplies only the gas-monitor thresholds and intervals; the encrypted
-secrets carry nothing for alerting. (Migration note: the retired Telegram fields
-are accepted and ignored with a deprecation warning for one release, then
-rejected -- `chat_id`/`message_thread_id` in the `[alerts]` config section, and
-a leftover `[alerts]` table (`bot_token`) in the secrets file. Deployed config
-versions still carry the former, deployed secret versions the latter, and the
-previous build required them.)
+`alert = true` marker field, an `alert_kind` discriminator, and the
+human-readable alert text in the `message` field. Fault alerts use
+`alert_kind = "fault"`; successful lifecycle notices use
+`alert_kind = "completion"`, so downstream Cloud Logging and Grafana rules can
+route routine completions separately from pages. The bot holds no external
+delivery credentials. The non-secret `[alerts]` config supplies only the
+gas-monitor thresholds and intervals; the encrypted secrets carry nothing for
+alerting. (Migration note: the retired Telegram fields are accepted and ignored
+with a deprecation warning for one release, then rejected --
+`chat_id`/`message_thread_id` in the `[alerts]` config section, and a leftover
+`[alerts]` table (`bot_token`) in the secrets file. Deployed config versions
+still carry the former, deployed secret versions the latter, and the previous
+build required them.)
+
+After a wrapper donation is confirmed, the in-container CLI POSTs the completion
+to the running bot's loopback-only `/alerts/dividend-nav-bump` endpoint. The bot
+process then emits an `operational_alert` completion event into its exported
+container log stream. The message contains the equity symbol, selected chain and
+transaction hash, and omits the literal share quantity to stay concise; this is
+not a confidentiality guarantee because the public transaction reveals the
+amount. Endpoint or stdout failure after the confirmed receipt is best-effort:
+the CLI reports it when possible but still exits successfully so an operator is
+not prompted to repeat an irreversible donation.
 
 ### BaseToAlpaca deposit send
 
