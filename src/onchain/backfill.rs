@@ -877,7 +877,9 @@ fn generate_batch_ranges(
 ) -> impl Iterator<Item = (u64, u64)> {
     // Robinhood's 1000 is an assumption to verify against the serving RPC:
     // neither the public endpoint nor Alchemy's robinhood-mainnet documents a
-    // getLogs range cap, so it inherits Base's request size.
+    // getLogs range cap, so it inherits Base's request size. The shipped
+    // observe-only Robinhood runs no backfill, so the cap must be measured
+    // before the trading table that turns its fill ingestion on lands.
     let batch_size = match chain {
         Chain::Base | Chain::Ethereum | Chain::Robinhood => 1_000,
         Chain::HyperEvm => 50,

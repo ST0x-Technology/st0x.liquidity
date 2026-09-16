@@ -62,17 +62,20 @@ only transaction-submission paths.
 Each hedged chain has its own required `order_fill_poll_interval_secs` and
 independent backfill queue. All fill scans, including startup catch-up and
 durable retries, split inclusive block ranges using explicit chain constants:
-Base, Ethereum and Robinhood use 1000 blocks per request; HyperEVM uses 50. This
-applies to both OrderBook filters and the combined inventory settlement filter.
-The partition iterator is lazy and handles the full unsigned block-number range
-without arithmetic overflow.
+Base and Ethereum use 1000 blocks per request; HyperEVM uses 50; Robinhood is
+pinned to 1000 for the trading table RAI-2457 adds and, observe-only as shipped,
+runs no fill scan. This applies to both OrderBook filters and the combined
+inventory settlement filter. The partition iterator is lazy and handles the full
+unsigned block-number range without arithmetic overflow.
 
 The 50-block HyperEVM cap follows the
 [official JSON-RPC contract](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/json-rpc).
 The 1000-block Base and Ethereum policy retains the existing request size; it is
 not a claim about every RPC provider's maximum. Robinhood inherits it as an
 assumption: neither the public endpoint nor Alchemy's `robinhood-mainnet`
-documents a range cap. Verify the selected endpoint accepts these ranges before
+documents a range cap, and the shipped observe-only Robinhood never exercises
+it, so it must be measured against the serving endpoint before RAI-2457 turns
+fill ingestion on. Verify the selected endpoint accepts these ranges before
 enabling a chain.
 
 The checkpoint advances only after the entire queued range succeeds. A failure

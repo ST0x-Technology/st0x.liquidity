@@ -204,7 +204,8 @@ required_confirmations = 1
 # Robinhood Chain (an Arbitrum Orbit L2, chain id 4663), same shape as
 # HyperEVM. Its settlement stable is USDG, pinned in code.
 [chains.robinhood]
-# A signer exists and nothing moves yet: no orderbook is watched and nothing
+# The chain can ingest fills and hedge; without a trading table this entry
+# keeps it observe-only: a signer exists, no orderbook is watched and nothing
 # is signed. Gas is ETH, so "active" is reachable once a trading table lands.
 # When it does, Base's "safe" cutoff is OP-Stack-only: use
 # ingestion_cutoff = "confirmations" with ingestion_cutoff_confirmations

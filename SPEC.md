@@ -189,9 +189,11 @@ provide gas valuation or automated rebalancing capabilities; `active` remains
 unavailable. Its vault balances are polled like any hedged chain's; automated
 rebalancing remains on Base.
 
-Robinhood Chain (chain id 4663, an Arbitrum Orbit L2) is declared the same way
-and today runs observe-only: a signer exists, nothing is ingested and nothing is
-signed. Its settlement stable is USDG at
+Robinhood Chain (chain id 4663, an Arbitrum Orbit L2) is declared the same way.
+The build provides fill ingestion, hedging, signing and gas valuation on it; the
+shipped configuration has no trading table and runs it observe-only, so a signer
+exists, nothing is ingested and nothing is signed until a trading table is
+added. Its settlement stable is USDG at
 `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 decimals), so it is the first
 chain whose stable CCTP cannot carry. It pays gas in ETH, so the Base Chainlink
 ETH/USD read values its gas and `active` is reachable without rebalancing
