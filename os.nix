@@ -153,6 +153,7 @@ in
             "/health" = apiProxy "/health";
             "/logs" = apiProxy "/logs";
             "/orders/" = apiProxy "/orders/";
+            "/overnight/" = apiProxy "/overnight/";
             "/pnl" = apiProxy "/pnl";
             "/trades" = apiProxy "/trades";
             "/transfers" = apiProxy "/transfers";
