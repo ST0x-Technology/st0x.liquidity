@@ -27,7 +27,7 @@ use crate::loader::StartupNotice;
 
 /// Chains monitored whenever alerting is configured.
 ///
-/// A hedged chain in [`HEDGED_GAS_MONITORED_CHAINS`] additionally requires
+/// A hedged chain in `HEDGED_GAS_MONITORED_CHAINS` additionally requires
 /// its own threshold.
 pub const LEGACY_GAS_MONITORED_CHAINS: [Chain; 2] = [Chain::Base, Chain::Ethereum];
 
