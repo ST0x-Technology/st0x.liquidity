@@ -1009,6 +1009,7 @@ pub(crate) struct ServerHandles {
     pub(crate) recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
     pub(crate) process_tx_cell: Arc<tokio::sync::OnceCell<crate::api::ProcessTxHandle>>,
     pub(crate) pnl_ledger: Arc<PnlLedger>,
+    pub(crate) projection_maintenance: Arc<projection_pause::ProjectionMaintenance>,
 }
 
 async fn setup_trading_schedule(
@@ -1050,6 +1051,7 @@ impl Conductor {
             recovery_cell,
             process_tx_cell,
             pnl_ledger,
+            projection_maintenance,
         }: ServerHandles,
         shutdown_token: CancellationToken,
         startup_tokens: ConductorStartupTokens,
@@ -1269,6 +1271,7 @@ impl Conductor {
             wallet_polling,
             tokenizer,
             wrappers,
+            projection_maintenance,
             shutdown_token: shutdown_token.clone(),
             startup_token: startup_tokens.apalis_monitor,
             supervisor_startup: startup_tokens.supervisor,
@@ -1288,10 +1291,6 @@ impl Conductor {
             job_queue: resume_tokenization_queue.clone(),
             notifier: notifier.clone(),
         });
-
-        // Publish the process-global projection gate before spawning the apalis
-        // monitor so every worker execution is gated from its first poll.
-        crate::conductor::projection_pause::init_projection_gate();
 
         let conductor = builder::spawn()
             .context(conductor_ctx)

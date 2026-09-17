@@ -1200,8 +1200,8 @@ where
     // projections synchronously inside `Store::send`) so a materialized-view
     // rebuild can quiesce the workers first. Held for the whole job; released on
     // return, and scoped so work the job spawns and awaits continues this slot
-    // instead of claiming a second one. Ungated until a conductor calls
-    // `init_projection_gate`.
+    // instead of claiming a second one. Ungated until server startup calls
+    // `init_projection_maintenance`.
     let projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
     crate::conductor::projection_pause::in_projection_slot(
         projection_slot,

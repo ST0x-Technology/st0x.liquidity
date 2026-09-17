@@ -4,11 +4,11 @@
 //! route, so the set of rebuildable views and their single-id support cannot
 //! drift between the two.
 //!
-//! A rebuild is not atomic with the live projection: the row is deleted, then
-//! the events are replayed. A live write that loads the view before the delete
-//! and saves after it hits the projection's optimistic lock, which is the same
-//! lost-update class this tool repairs; the next `catch_up` (startup or another
-//! rebuild) heals it. The rebuild never leaves a wrong-and-stuck row.
+//! A rebuild is not atomic on its own: it deletes rows, then replays events.
+//! Callers must exclude every concurrent `Store::send` whose projection can
+//! touch the rebuilt rows. The live ops API does so through projection
+//! maintenance; direct database callers, including the legacy `st0x-cli`,
+//! must run only while the bot is stopped.
 
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -158,7 +158,7 @@ impl ViewRebuildError {
 }
 
 /// Rebuilds `view` for `scope` by deleting the affected rows and replaying the
-/// event log. Operates directly on the store; no other service is needed.
+/// event log. The caller must exclude concurrent projection writers.
 pub async fn rebuild_view(
     pool: &SqlitePool,
     view: RebuildableView,

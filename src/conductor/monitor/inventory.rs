@@ -15,20 +15,24 @@ use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
-use crate::conductor::projection_pause::enter_projection_gate;
 use crate::inventory::Poller;
-use crate::quiesce;
 
 #[derive(Clone)]
 pub(crate) struct InventoryMonitor {
     pub(crate) poller: Arc<dyn Poller>,
     pub(crate) interval: Duration,
+    pub(crate) projection_maintenance:
+        Arc<crate::conductor::projection_pause::ProjectionMaintenance>,
 }
 
 impl InventoryMonitor {
-    async fn poll_once(&self, projection_slot: Option<quiesce::InFlight>) {
+    async fn poll_once(&self) {
+        // Snapshot processing runs its reactors inline and can write failure
+        // projections for timed-out operations. Keep the slot through the
+        // whole poll so a rebuild drains those writes before replaying rows.
+        let projection_write = self.projection_maintenance.enter().await;
         let result = self.poller.poll().await;
-        drop(projection_slot);
+        drop(projection_write);
 
         if let Err(error) = result {
             warn!(target: "inventory", ?error, "Inventory polling failed");
@@ -45,12 +49,7 @@ impl SupervisedTask for InventoryMonitor {
 
         loop {
             interval.tick().await;
-
-            // Snapshot processing runs its reactors inline and can write failure
-            // projections for timed-out operations. Keep the slot through the
-            // whole poll so a rebuild drains those writes before replaying rows.
-            let projection_slot = enter_projection_gate().await;
-            self.poll_once(projection_slot).await;
+            self.poll_once().await;
         }
     }
 }
@@ -112,22 +111,23 @@ mod tests {
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let poll_started = started.notified();
+        let projection_maintenance =
+            Arc::new(crate::conductor::projection_pause::ProjectionMaintenance::for_test());
         let monitor = InventoryMonitor {
             poller: Arc::new(BlockingPoller {
                 started: Arc::clone(&started),
                 release: Arc::clone(&release),
             }),
             interval: Duration::from_secs(10),
+            projection_maintenance: Arc::clone(&projection_maintenance),
         };
-        let (control, gate) = quiesce::quiesce(Duration::from_secs(1));
 
         let poll = tokio::spawn(async move {
-            let projection_slot = Some(gate.enter().await);
-            monitor.poll_once(projection_slot).await;
+            monitor.poll_once().await;
         });
         poll_started.await;
 
-        match timeout(Duration::from_millis(20), control.pause()).await {
+        match timeout(Duration::from_millis(20), projection_maintenance.pause()).await {
             Err(_) => {}
             Ok(_) => panic!("the pause must wait for snapshot processing to finish"),
         }
@@ -135,26 +135,30 @@ mod tests {
         release.notify_one();
         poll.await.expect("the inventory poll must finish");
 
-        let guard = control
+        let guard = projection_maintenance
             .pause()
             .await
             .expect("the pause must succeed after snapshot processing finishes");
         drop(guard);
     }
 
-    /// Drives the real `run` loop through the process global projection gate
-    /// that `init_projection_gate` wires at startup: while a rebuild
-    /// holds the pause the monitor must not poll, and it polls once the pause
-    /// is released. Pausing the global gate is process scoped, so this relies
-    /// on nextest running each test in its own process.
+    /// Drives the real `run` loop through its injected projection controller:
+    /// while a rebuild holds the pause the monitor must not poll, and it polls
+    /// once the pause is released.
     #[tokio::test]
-    async fn run_parks_on_the_global_projection_gate_while_a_rebuild_is_paused() {
-        let rebuild = crate::conductor::projection_pause::pause_projection_gate_for_test().await;
+    async fn run_parks_on_the_projection_gate_while_a_rebuild_is_paused() {
+        let projection_maintenance =
+            Arc::new(crate::conductor::projection_pause::ProjectionMaintenance::for_test());
+        let rebuild = projection_maintenance
+            .pause()
+            .await
+            .unwrap_or_else(|_| panic!("an idle projection gate must pause"));
 
         let (tx, mut rx) = unbounded_channel();
         let mut monitor = InventoryMonitor {
             poller: Arc::new(NotifyingPoller { tx, fail: false }),
             interval: Duration::from_secs(10),
+            projection_maintenance: Arc::clone(&projection_maintenance),
         };
         let handle = tokio::spawn(async move { monitor.run().await });
 
@@ -180,6 +184,9 @@ mod tests {
         let mut monitor = InventoryMonitor {
             poller: Arc::new(NotifyingPoller { tx, fail: false }),
             interval: Duration::from_secs(10),
+            projection_maintenance: Arc::new(
+                crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
+            ),
         };
 
         let handle = tokio::spawn(async move { monitor.run().await });
@@ -203,6 +210,9 @@ mod tests {
         let mut monitor = InventoryMonitor {
             poller: Arc::new(NotifyingPoller { tx, fail: true }),
             interval: Duration::from_secs(10),
+            projection_maintenance: Arc::new(
+                crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
+            ),
         };
 
         let handle = tokio::spawn(async move { monitor.run().await });

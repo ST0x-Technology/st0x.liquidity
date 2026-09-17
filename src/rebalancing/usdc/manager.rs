@@ -17626,34 +17626,37 @@ mod tests {
             BotGasReceiptCostEnqueuer::Disabled,
         );
 
-        let (control, gate) = crate::conductor::projection_pause::projection_gate_for_test();
-        let job_slot = gate.enter().await;
-        let burn_tx =
-            crate::conductor::projection_pause::in_projection_slot(Some(job_slot), async {
-                let rebuild = tokio::spawn(control.pause());
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    while !gate.is_paused() {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("the rebuild must raise the pause while the job holds its slot");
-
-                let burn_tx = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    manager.submit_and_record_burn(
-                        &id,
-                        BridgeDirection::EthereumToBase,
-                        amount_u256,
-                        recipient,
-                    ),
-                )
-                .await
-                .expect("the burn must continue the job's slot, not park behind the pause")
-                .unwrap();
-                (burn_tx, rebuild)
+        // The real process global gate that jobs and the burn enter.
+        let maintenance = crate::conductor::projection_pause::init_projection_maintenance();
+        let job_slot = crate::conductor::projection_pause::enter_projection_gate().await;
+        let burn_tx = crate::conductor::projection_pause::in_projection_slot(job_slot, async {
+            let rebuild = tokio::spawn({
+                let maintenance = Arc::clone(&maintenance);
+                async move { maintenance.pause().await }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !maintenance.is_paused() {
+                    tokio::task::yield_now().await;
+                }
             })
-            .await;
+            .await
+            .expect("the rebuild must raise the pause while the job holds its slot");
+
+            let burn_tx = tokio::time::timeout(
+                Duration::from_secs(5),
+                manager.submit_and_record_burn(
+                    &id,
+                    BridgeDirection::EthereumToBase,
+                    amount_u256,
+                    recipient,
+                ),
+            )
+            .await
+            .expect("the burn must continue the job's slot, not park behind the pause")
+            .unwrap();
+            (burn_tx, rebuild)
+        })
+        .await;
         let (burn_tx, rebuild) = burn_tx;
 
         let rebuild_guard = tokio::time::timeout(Duration::from_secs(5), rebuild)

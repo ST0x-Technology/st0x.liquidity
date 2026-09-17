@@ -17,6 +17,8 @@ pub(crate) use job::{
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
     TransferUsdcToMarketMakingJobQueue,
 };
+#[cfg(test)]
+pub(crate) use manager::RecoveredCctpMint;
 pub(crate) use manager::{
     CctpMintRecoveryError, RecheckUsdcDeposit, RecoverCctpMint, UsdcRecheckError, u256_to_usdc,
 };
