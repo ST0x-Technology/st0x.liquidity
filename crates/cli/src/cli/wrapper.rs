@@ -221,12 +221,11 @@ pub(super) struct WrapContext {
     pub(super) equities: HashMap<Symbol, WrappedEquity>,
 }
 
-/// Resolves the wallet and the symbol to address map for a wrap or unwrap.
+/// Resolves the wallet and symbol-to-address map for wrapping or redemption.
 ///
-/// Base resolves from `[chains.<name>.trading.assets.equities]` exactly as before. Non Base
-/// networks have no config source, so the registry token list is required
-/// and a stray one on Base is rejected instead of silently ignored. The
-/// resolved map must contain the requested symbol so a typo fails here with
+/// The selected chain's trading table is authoritative when present. `--registry`
+/// supplies the st0x.registry token list only when that chain has no trading table.
+/// The resolved map must contain the requested symbol so a typo fails here with
 /// the available symbols instead of deeper in the vault call.
 pub(super) fn wrap_context(
     ctx: &Ctx,
@@ -234,23 +233,17 @@ pub(super) fn wrap_context(
     registry: Option<&PathBuf>,
     symbol: &Symbol,
 ) -> anyhow::Result<WrapContext> {
-    let equities = match (network, registry) {
-        (TokenizationNetwork::Robinhood, _) => {
-            anyhow::bail!("equity wrapping is not supported on Robinhood Chain")
-        }
-        (TokenizationNetwork::Base, None) => {
-            to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols)
-        }
-        (TokenizationNetwork::Base, Some(_)) => anyhow::bail!(
-            "--registry only applies to non Base networks: Base resolves \
-             from [chains.<name>.trading.assets.equities]"
+    let chain = Chain::from(network);
+    let equities = match (ctx.chains.hedged_chain(chain), registry) {
+        (Some(trading), None) => to_wrapped_equities(&trading.assets.equities.symbols),
+        (Some(_), Some(_)) => anyhow::bail!(
+            "--registry only applies to a network without a \
+             [chains.{chain}.trading] table"
         ),
-        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, Some(path)) => {
-            load_wrapped_equities(path, Chain::from(network).chain_id())?
-        }
-        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, None) => anyhow::bail!(
-            "pass --registry with the st0x.registry token list for the \
-             selected network (token-lists/<network>.json)"
+        (None, Some(path)) => load_wrapped_equities(path, chain.chain_id())?,
+        (None, None) => anyhow::bail!(
+            "pass --registry with the st0x.registry token list for {chain} \
+             (token-lists/{chain}.json): no [chains.{chain}.trading] table lists it"
         ),
     };
 
@@ -273,7 +266,7 @@ pub(super) fn wrap_context(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, address};
     use std::io::Write as _;
 
     use st0x_config::ChainRegistry;
@@ -290,7 +283,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::{
-        TokenizationNetwork, donate_equity_command, donate_equity_with_wrapper,
+        TokenizationNetwork, WrapContext, donate_equity_command, donate_equity_with_wrapper,
         unwrap_equity_command, unwrap_equity_with_wrapper, wrap_context, wrap_equity_command,
         wrap_equity_with_wrapper,
     };
@@ -356,21 +349,92 @@ mod tests {
     }
 
     #[test]
-    fn wrap_context_rejects_robinhood_before_registry_resolution() {
-        let error = wrap_context(
-            &create_ctx_with_stub_wallet(),
+    fn wrap_context_resolves_robinhood_registry_for_redemption() {
+        let mut registry = tempfile::NamedTempFile::new().unwrap();
+        registry
+            .write_all(
+                br#"{
+                    "tokens": [{
+                        "chainId": 4663,
+                        "address": "0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826",
+                        "symbol": "wtDNUT",
+                        "extensions": {
+                            "unwrappedAddress": "0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9"
+                        }
+                    }]
+                }"#,
+            )
+            .unwrap();
+        let ctx = create_ctx_with_stub_wallet();
+
+        let WrapContext { wallet, equities } = wrap_context(
+            &ctx,
+            TokenizationNetwork::Robinhood,
+            Some(&registry.path().to_path_buf()),
+            &Symbol::new("DNUT").unwrap(),
+        )
+        .unwrap();
+        let dnut = &equities[&Symbol::new("DNUT").unwrap()];
+
+        assert_eq!(
+            wallet.address(),
+            ctx.wallet().unwrap().robinhood_wallet().unwrap().address()
+        );
+        assert_eq!(
+            dnut.derivative,
+            address!("0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826")
+        );
+        assert_eq!(
+            dnut.underlying,
+            address!("0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9")
+        );
+    }
+    #[test]
+    fn wrap_context_resolves_robinhood_trading_table_without_registry() {
+        let mut ctx = create_ctx_with_stub_wallet();
+        let underlying = address!("0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9");
+        let derivative = address!("0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826");
+        let mut equities = ChainEquities::default();
+        equities.symbols.insert(
+            Symbol::new("DNUT").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: underlying,
+                tokenized_equity_derivative: derivative,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::Robinhood)
+                .assets(ChainAssets {
+                    equities,
+                    cash: None,
+                })
+                .call(),
+        );
+
+        let WrapContext {
+            wallet,
+            equities: resolved,
+        } = wrap_context(
+            &ctx,
             TokenizationNetwork::Robinhood,
             None,
-            &Symbol::new("AAPL").unwrap(),
+            &Symbol::new("DNUT").unwrap(),
         )
-        .err()
-        .expect("Robinhood wrapping must be rejected");
+        .unwrap();
+        let dnut = &resolved[&Symbol::new("DNUT").unwrap()];
 
-        assert!(
-            error
-                .to_string()
-                .contains("equity wrapping is not supported on Robinhood Chain")
+        assert_eq!(
+            wallet.address(),
+            ctx.wallet().unwrap().robinhood_wallet().unwrap().address()
         );
+        assert_eq!(dnut.derivative, derivative);
+        assert_eq!(dnut.underlying, underlying);
     }
 
     /// AAPL listed on the primary chain but no `[wallet]`: the config checks
@@ -409,7 +473,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("only applies to non Base"),
+            error
+                .to_string()
+                .contains("only applies to a network without"),
             "expected registry rejection, got: {error}"
         );
     }
@@ -830,7 +896,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Robinhood Chain does not support tokenization or wrapper operations"
+            "Robinhood Chain does not support automated equity transfers or donations"
         );
         assert!(stdout.is_empty());
     }

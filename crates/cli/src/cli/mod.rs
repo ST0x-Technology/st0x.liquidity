@@ -445,9 +445,9 @@ pub enum Commands {
         /// chain the vault deposit lands on)
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
-        /// Path to the st0x.registry token list for the selected network
-        /// (`token-lists/<network>.json`). Required for non Base networks;
-        /// Base resolves from `[chains.<name>.trading.assets.equities]`
+        /// Path to the st0x.registry token list for the selected network.
+        /// Used only when the network has no `[chains.<name>.trading]` table;
+        /// configured networks resolve their assets from that table.
         #[arg(long = "registry")]
         registry: Option<std::path::PathBuf>,
     },
@@ -464,9 +464,9 @@ pub enum Commands {
         /// the chain the vault redeem lands on)
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
-        /// Path to the st0x.registry token list for the selected network
-        /// (`token-lists/<network>.json`). Required for non Base networks;
-        /// Base resolves from `[chains.<name>.trading.assets.equities]`
+        /// Path to the st0x.registry token list for the selected network.
+        /// Used only when the network has no `[chains.<name>.trading]` table;
+        /// configured networks resolve their assets from that table.
         #[arg(long = "registry")]
         registry: Option<std::path::PathBuf>,
     },
@@ -793,10 +793,10 @@ pub enum Commands {
         /// the tokens and therefore the chain the transfer lands on)
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
-        /// Path to the st0x.registry token list for the selected network
-        /// (`token-lists/<network>.json`). Required for non Base networks;
-        /// Base resolves from `[chains.<name>.trading.assets.equities]`. The
-        /// token sent to the issuer is attested against the vault's `asset()`
+        /// Path to the st0x.registry token list for the selected network.
+        /// Used only when the network has no `[chains.<name>.trading]` table;
+        /// configured networks resolve their assets from that table. The token
+        /// sent to the issuer is attested against the vault's `asset()`.
         #[arg(long = "registry")]
         registry: Option<std::path::PathBuf>,
     },

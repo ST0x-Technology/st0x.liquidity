@@ -1,8 +1,9 @@
-//! Resolves wrap/unwrap token addresses from an st0x.registry token list.
+//! Resolves fallback wrap/unwrap token addresses from an st0x.registry token list.
 //!
-//! Non Base networks have no `[chains.<name>.trading.assets.equities]` config source, so operators
-//! point the CLI at a per chain token list JSON from a checked out
-//! st0x.registry (`token-lists/<network>.json`). Entries are the wrapped
+//! A configured chain resolves assets from its
+//! `[chains.<name>.trading.assets.equities]` table. When the selected chain has no
+//! trading table, operators point the CLI at a per-chain token list JSON from a
+//! checked-out st0x.registry (`token-lists/<network>.json`). Entries are wrapped
 //! tokens (`wtSYM`); each carries the underlying tStock address in
 //! `extensions.unwrappedAddress` and the chain id it belongs to.
 

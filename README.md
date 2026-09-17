@@ -207,9 +207,16 @@ configured liquidity wallet for the selected network):
 cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml unwrap-equity --symbol AAPL --quantity 10.5
 ```
 
-Both commands default to Base and resolve addresses from [assets.equities]. On a
-non Base network, pass the target network and the st0x.registry token list for
-it:
+Both commands default to Base and resolve addresses from the selected chain's
+`[chains.<name>.trading.assets.equities]` table. Other configured trading chains
+resolve the same way, so do not pass `--registry`:
+
+```bash
+cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol RKLB --quantity 0.1 --network ethereum
+```
+
+When the selected network has no trading table, pass its st0x.registry token
+list as the fallback:
 
 ```bash
 cargo run -p st0x-cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol RKLB --quantity 0.1 --network ethereum --registry path/to/st0x.registry/token-lists/ethereum.json
