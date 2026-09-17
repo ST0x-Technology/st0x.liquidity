@@ -4107,6 +4107,7 @@ pub mod process_tx {
                     poll_freshness: PollFreshness::always_fresh(),
                     inventory_staleness_bound: std::time::Duration::from_secs(300),
                     cash_reserved: None,
+                    hedge_floor: st0x_execution::HedgeFloor::default(),
                     equity: ImbalanceThreshold {
                         target: st0x_float_macro::float!(0.5),
                         deviation: st0x_float_macro::float!(0.2),
