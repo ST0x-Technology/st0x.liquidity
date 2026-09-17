@@ -25,10 +25,10 @@ services. Two contracts apply to the network-aware commands:
   trading table is refused by name; the primary's addresses are never
   substituted.
 - Asset-only commands (`wrap-equity`, `unwrap-equity`, `alpaca-tokenize`,
-  `alpaca-redeem`) need no orderbook. For a chain that lists an asset but has no
-  trading table, `wrap-equity`, `unwrap-equity` and `alpaca-redeem` accept
-  `--registry` (the st0x.registry token list), and `alpaca-tokenize` accepts the
-  tStock address directly with `--token`.
+  `alpaca-redeem`) need no orderbook. They resolve assets from the selected
+  chain's trading table when it exists. Without one, `wrap-equity`,
+  `unwrap-equity` and `alpaca-redeem` accept `--registry` (the st0x.registry
+  token list), and `alpaca-tokenize` accepts the tStock address with `--token`.
 
 Where a command needs cash it uses the selected chain's pinned settlement
 stable. HyperEVM uses `USDC_HYPEREVM`
@@ -184,8 +184,8 @@ stox alpaca-redeem -s COIN -q 10
 ```
 
 The token sent to the issuer is attested against the vault's `asset()`, never
-pasted. On a non Base network pass `--registry token-lists/<network>.json`, as
-for `wrap-equity`.
+pasted. A configured chain resolves the wrapper and underlying from its trading
+table. Only a network without one needs `--registry token-lists/<network>.json`.
 
 **Step 2: Sell shares offchain**
 
@@ -273,7 +273,7 @@ Then, per asset:
 # mint onto the chain (the tStock address resolves from the chain's asset table)
 stox alpaca-tokenize -s COIN -q 10 --network ethereum -r <liquidity-wallet>
 # wrap into the ERC-4626 vault the chain's asset table lists
-stox wrap-equity -s COIN -q 10 --network ethereum --registry token-lists/ethereum.json
+stox wrap-equity -s COIN -q 10 --network ethereum
 # deposit the wrapped shares into the configured vault
 stox vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --network ethereum
 ```
