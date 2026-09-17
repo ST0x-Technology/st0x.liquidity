@@ -119,6 +119,7 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
     ctx: &Ctx,
     operations: &Operations,
 ) -> anyhow::Result<()> {
+    rebalancing::require_equity_mutation_network(network)?;
     let chain = Chain::from(network);
     writeln!(stdout, "Dividend NAV bump: {quantity} {symbol} on {chain}")?;
 
@@ -153,6 +154,7 @@ async fn dividend_bump_with_operations<Writer: Write + Send, Operations: Dividen
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use alloy::primitives::{Address, address};
     use rain_math_float::Float;
@@ -214,6 +216,50 @@ mod tests {
             Ok(())
         }
     }
+    #[derive(Default)]
+    struct CountingDividendBumpOperations {
+        buys: AtomicUsize,
+        tokenizations: AtomicUsize,
+        donations: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DividendBumpOperations for CountingDividendBumpOperations {
+        async fn buy<Writer: Write + Send>(
+            &self,
+            _stdout: &mut Writer,
+            _symbol: Symbol,
+            quantity: Positive<FractionalShares>,
+            _ctx: &Ctx,
+        ) -> anyhow::Result<Positive<FractionalShares>> {
+            self.buys.fetch_add(1, Ordering::Relaxed);
+            Ok(quantity)
+        }
+
+        async fn tokenize<Writer: Write + Send>(
+            &self,
+            _stdout: &mut Writer,
+            _symbol: Symbol,
+            _quantity: Positive<FractionalShares>,
+            _network: TokenizationNetwork,
+            _ctx: &Ctx,
+        ) -> anyhow::Result<()> {
+            self.tokenizations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn donate<Writer: Write + Send>(
+            &self,
+            _stdout: &mut Writer,
+            _symbol: Symbol,
+            _quantity: Positive<FractionalShares>,
+            _network: TokenizationNetwork,
+            _ctx: &Ctx,
+        ) -> anyhow::Result<()> {
+            self.donations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     fn test_ctx(broker: BrokerCtx) -> Ctx {
         Ctx {
@@ -263,6 +309,33 @@ mod tests {
             bot_gas_valuation: None,
             orchestrator: None,
         }
+    }
+
+    #[tokio::test]
+    async fn dividend_bump_rejects_robinhood_before_any_operation() {
+        let ctx = test_ctx(st0x_config::test_alpaca_broker_ctx());
+        let operations = CountingDividendBumpOperations::default();
+        let mut stdout = Vec::new();
+
+        let error = dividend_bump_with_operations(
+            &mut stdout,
+            Symbol::new("DNUT").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Robinhood,
+            &ctx,
+            &operations,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Robinhood Chain does not support automated equity transfers or donations"
+        );
+        assert_eq!(operations.buys.load(Ordering::Relaxed), 0);
+        assert_eq!(operations.tokenizations.load(Ordering::Relaxed), 0);
+        assert_eq!(operations.donations.load(Ordering::Relaxed), 0);
+        assert!(stdout.is_empty());
     }
 
     /// The bump must run buy -> tokenize -> donate in order and stop at the first
