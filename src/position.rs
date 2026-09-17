@@ -1309,6 +1309,25 @@ impl Position {
                 );
             })?;
 
+        let live_shares =
+            Positive::new(self.net.abs()?).map_err(|_| PositionError::ThresholdNotMet {
+                net_position: self.net,
+                threshold: self.threshold,
+            })?;
+        let live_direction = if self.net.is_negative()? {
+            Direction::Buy
+        } else {
+            Direction::Sell
+        };
+        if direction != live_direction || shares > live_shares {
+            return Err(PositionError::StaleHedgeRequest {
+                requested_direction: direction,
+                requested_shares: shares,
+                live_direction,
+                live_shares,
+            });
+        }
+
         Ok(vec![PositionEvent::OffChainOrderPlaced {
             offchain_order_id,
             shares,
@@ -1517,6 +1536,16 @@ pub enum PositionError {
     )]
     EquityTransferPending {
         reservation_id: EquityTransferReservationId,
+    },
+    #[error(
+        "Cannot place stale hedge {requested_direction:?} {requested_shares}: \
+         live position requires at most {live_direction:?} {live_shares}"
+    )]
+    StaleHedgeRequest {
+        requested_direction: Direction,
+        requested_shares: Positive<FractionalShares>,
+        live_direction: Direction,
+        live_shares: Positive<FractionalShares>,
     },
     #[error("Equity transfer reservation {reservation_id} already owns this symbol")]
     EquityTransferReservationExists {
@@ -3350,6 +3379,69 @@ mod tests {
             panic!("Expected OffChainOrderPlaced, got: {:?}", events[0]);
         };
         assert_eq!(*event_placed_at, placed_at);
+    }
+
+    #[tokio::test]
+    async fn stale_hedge_direction_and_oversize_are_rejected() {
+        let threshold = one_share_threshold();
+        let given = vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    chain: Chain::Base,
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(2)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                block_number: None,
+                seen_at: Utc::now(),
+            },
+        ];
+
+        let wrong_direction = TestHarness::<Position>::with(())
+            .given(given.clone())
+            .when(PositionCommand::PlaceOffChainOrder {
+                offchain_order_id: OffchainOrderId::new(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Buy,
+                executor: SupportedExecutor::DryRun,
+                threshold,
+            })
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            wrong_direction,
+            LifecycleError::Apply(PositionError::StaleHedgeRequest {
+                live_direction: Direction::Sell,
+                ..
+            })
+        ));
+
+        let oversize = TestHarness::<Position>::with(())
+            .given(given)
+            .when(PositionCommand::PlaceOffChainOrder {
+                offchain_order_id: OffchainOrderId::new(),
+                shares: Positive::new(FractionalShares::new(float!(3))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                threshold,
+            })
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            oversize,
+            LifecycleError::Apply(PositionError::StaleHedgeRequest {
+                live_direction: Direction::Sell,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

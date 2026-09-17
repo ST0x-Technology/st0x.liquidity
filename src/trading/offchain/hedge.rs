@@ -1683,7 +1683,10 @@ impl PlaceHedge {
         // - ThresholdNotMet: position moved below threshold since the monitor
         //   scanned -- stale job, no action needed.
         // - EquityTransferPending: a transfer won the Position claim first;
-        //   enqueue a delayed successor so the hedge is retried after release.
+        //   enqueue a delayed successor. The Position aggregate rejects it as
+        //   stale after release if intervening fills changed the required hedge.
+        // - StaleHedgeRequest: enqueue a fresh direction and safe quantity from
+        //   the live Position state returned by the aggregate.
         //
         // Everything else (lifecycle bugs, aggregate conflicts, DB errors)
         // propagates so backon retries the job.
@@ -1743,6 +1746,42 @@ impl PlaceHedge {
                     symbol = %self.symbol, %error,
                     retry_delay_secs = EQUITY_TRANSFER_REDRIVE_DELAY.as_secs(),
                     "Equity transfer owns the position; scheduled hedge retry"
+                );
+                return Ok(());
+            }
+
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::StaleHedgeRequest {
+                    requested_direction,
+                    requested_shares,
+                    live_direction,
+                    live_shares,
+                },
+            ))) => {
+                let shares = if self.shares < live_shares {
+                    self.shares
+                } else {
+                    live_shares
+                };
+                let successor = Self {
+                    direction: live_direction,
+                    shares,
+                    offchain_order_id: OffchainOrderId::new(),
+                    ..self.clone()
+                };
+                ctx.hedge_queue
+                    .clone()
+                    .push_with_delay(successor, EQUITY_TRANSFER_REDRIVE_DELAY)
+                    .await?;
+                info!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    ?requested_direction,
+                    %requested_shares,
+                    ?live_direction,
+                    %shares,
+                    retry_delay_secs = EQUITY_TRANSFER_REDRIVE_DELAY.as_secs(),
+                    "Position changed while hedge was queued; scheduled recalculated hedge"
                 );
                 return Ok(());
             }
@@ -5922,7 +5961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_reservation_redrives_hedge_until_it_can_claim_position() {
+    async fn transfer_reservation_redrive_recalculates_reversed_position() {
         let TestInfra {
             ctx,
             position_projection,
@@ -5982,17 +6021,29 @@ mod tests {
             reservation_id
         );
 
-        let payload: Vec<u8> = sqlx_apalis::query_scalar(
-            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        let (successor_row_id, payload): (String, Vec<u8>) = sqlx_apalis::query_as(
+            "SELECT id, job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
         )
         .bind(std::any::type_name::<PlaceHedge>())
         .fetch_one(&apalis_pool)
         .await
         .expect("transfer rejection must enqueue a delayed hedge successor");
-        let successor: PlaceHedge =
+        let stale_successor: PlaceHedge =
             serde_json::from_slice(&payload).expect("deserialize delayed hedge successor");
-        assert_eq!(successor.offchain_order_id, job.offchain_order_id);
+        assert_eq!(stale_successor.offchain_order_id, job.offchain_order_id);
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+            .bind(successor_row_id)
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
 
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(6.0)),
+            Direction::Sell,
+        )
+        .await;
         ctx.position
             .send(
                 &symbol,
@@ -6000,13 +6051,42 @@ mod tests {
             )
             .await
             .unwrap();
-        successor.perform(&ctx).await.unwrap();
+        stale_successor.perform(&ctx).await.unwrap();
+        assert!(
+            offchain_order_projection
+                .load_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the stale Sell must not increase the reversed short position"
+        );
+
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<PlaceHedge>())
+        .fetch_one(&apalis_pool)
+        .await
+        .expect("stale hedge must enqueue a recalculated successor");
+        let recalculated: PlaceHedge =
+            serde_json::from_slice(&payload).expect("deserialize recalculated hedge successor");
+        assert_eq!(recalculated.direction, Direction::Buy);
+        assert_eq!(
+            recalculated.shares,
+            Positive::new(FractionalShares::new(float!(3.0))).unwrap()
+        );
+        assert_ne!(
+            recalculated.offchain_order_id,
+            stale_successor.offchain_order_id
+        );
+
+        recalculated.perform(&ctx).await.unwrap();
 
         assert_eq!(offchain_order_projection.load_all().await.unwrap().len(), 1);
         let position = position_projection.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
             position.pending_offchain_order_id,
-            Some(job.offchain_order_id)
+            Some(recalculated.offchain_order_id)
         );
         assert_eq!(position.equity_transfer_reservation, None);
     }
