@@ -305,7 +305,7 @@ fn evolve_onchain_order_fill(
         accumulated_long,
         accumulated_short,
         last_acknowledged_trade_id: Some(trade_id.clone()),
-        equity_transfer_reservation: entity.reservation_after_onchain_fill(),
+        equity_transfer_reservation: entity.reservation_after_position_change(),
         last_updated: Some(seen_at),
         // Use economic block time, not ingestion time, so a delayed backfill
         // cannot make an old price look fresh.
@@ -328,7 +328,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 9;
+    const SCHEMA_VERSION: u64 = 10;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -507,6 +507,7 @@ impl EventSourced for Position {
             } => Ok(Some(Self {
                 threshold: *new_threshold,
                 last_updated: Some(*updated_at),
+                equity_transfer_reservation: entity.reservation_after_position_change(),
                 ..entity.clone()
             })),
 
@@ -519,6 +520,7 @@ impl EventSourced for Position {
                 record_position_gauge(&entity.symbol, target_net);
                 Ok(Some(Self {
                     net: *target_net,
+                    equity_transfer_reservation: entity.reservation_after_position_change(),
                     last_updated: Some(*adjusted_at),
                     last_price: price_usdc
                         .map(|price| PriceObservation {
@@ -1090,7 +1092,11 @@ impl Position {
         }
     }
 
-    fn reservation_after_onchain_fill(&self) -> Option<EquityTransferReservation> {
+    /// Any position or threshold change invalidates a tentative transfer
+    /// reservation so hedge eligibility is re-evaluated before confirmation.
+    /// A confirmed reservation already has a durable transfer owner and must
+    /// remain until that lifecycle releases it.
+    fn reservation_after_position_change(&self) -> Option<EquityTransferReservation> {
         self.equity_transfer_reservation
             .filter(|reservation| reservation.status == EquityTransferReservationStatus::Confirmed)
     }
@@ -3649,6 +3655,108 @@ mod tests {
                 .equity_transfer_reservation,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn manual_adjustment_invalidates_unconfirmed_transfer_reservation() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: FractionalShares::new(float!(2)),
+                    reason: "operator correction".to_string(),
+                    threshold,
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let confirmation = store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await;
+        assert!(matches!(
+            confirmation,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::NoEquityTransferReservation { .. }
+            )))
+        ));
+
+        let position = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.net, FractionalShares::new(float!(2)));
+        assert!(position.is_ready_for_execution(None).unwrap().is_some());
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn threshold_update_invalidates_unconfirmed_transfer_reservation() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        let new_threshold =
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(10))).unwrap());
+        store
+            .send(
+                &symbol,
+                PositionCommand::UpdateThreshold {
+                    threshold: new_threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        let confirmation = store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await;
+        assert!(matches!(
+            confirmation,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::NoEquityTransferReservation { .. }
+            )))
+        ));
+
+        let position = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.threshold, new_threshold);
+        assert_eq!(position.equity_transfer_reservation, None);
     }
 
     #[tokio::test]

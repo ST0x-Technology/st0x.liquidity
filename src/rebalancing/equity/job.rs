@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use apalis_core::error::BoxDynError;
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
@@ -190,6 +191,34 @@ pub(crate) struct TransferEquityToMarketMaking {
     pub(crate) backpressure_streak: BackpressureStreak,
 }
 
+async fn has_live_sibling_equity_transfer<JobPayload>(
+    pool: &apalis_sqlite::SqlitePool,
+    task_identity: &TaskIdentity,
+    same_owner: impl Fn(&JobPayload) -> bool,
+) -> Result<bool, BoxDynError>
+where
+    JobPayload: DeserializeOwned,
+{
+    let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+        "SELECT job FROM Jobs \
+         WHERE id <> ? AND job_type = ? \
+         AND (status IN ('Pending', 'Queued', 'Running') \
+              OR (status = 'Failed' AND attempts < max_attempts))",
+    )
+    .bind(task_identity.as_str())
+    .bind(std::any::type_name::<JobPayload>())
+    .fetch_all(pool)
+    .await?;
+
+    for payload in payloads {
+        let sibling: JobPayload = serde_json::from_slice(&payload)?;
+        if same_owner(&sibling) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
 impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
     type Output = ();
     type Error = TransferEquityToMarketMakingJobError;
@@ -417,6 +446,26 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                 issuer_request_id = %self.issuer_request_id,
                 %task_identity,
                 "Terminal mint attempt retained its guard because a lifecycle aggregate exists"
+            );
+            return Ok(());
+        }
+        if has_live_sibling_equity_transfer::<Self>(
+            ctx.job_queue.pool(),
+            task_identity,
+            |sibling| {
+                sibling.issuer_request_id == self.issuer_request_id
+                    && sibling.generation == self.generation
+            },
+        )
+        .await?
+        {
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                issuer_request_id = %self.issuer_request_id,
+                generation = ?self.generation,
+                %task_identity,
+                "Terminal mint attempt retained ownership because a sibling job row is still live"
             );
             return Ok(());
         }
@@ -715,6 +764,25 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             );
             return Ok(());
         }
+        if has_live_sibling_equity_transfer::<Self>(
+            ctx.job_queue.pool(),
+            task_identity,
+            |sibling| {
+                sibling.aggregate_id == self.aggregate_id && sibling.generation == self.generation
+            },
+        )
+        .await?
+        {
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                aggregate_id = %self.aggregate_id,
+                generation = ?self.generation,
+                %task_identity,
+                "Terminal redemption attempt retained ownership because a sibling job row is still live"
+            );
+            return Ok(());
+        }
 
         if let Some(position_store) = &ctx.position_store {
             position_store
@@ -749,9 +817,8 @@ mod tests {
 
     use alloy::primitives::{Address, TxHash, U256};
     use serde_json::json;
-    use st0x_config::ChainEquities;
-    use st0x_config::{ChainEquityAsset, OperationMode};
-    use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
+    use st0x_config::{ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_evm::Chain;
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
@@ -2379,6 +2446,74 @@ mod tests {
 
             assert_eq!(ctx.equity_in_progress.read().unwrap().get(&symbol), None);
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_mint_cleanup_preserves_ownership_while_sibling_row_is_live() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::from_parts(NonZeroU32::new(3).unwrap(), 1);
+        let mut ctx = test_ctx(Arc::new(RecordingResume::success())).await;
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation });
+
+        let position_pool = crate::test_utils::setup_test_db().await;
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(position_pool)
+            .build(())
+            .await
+            .unwrap();
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: issuer_request_id("live-sibling-mint-cleanup"),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
+            generation,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        let reservation_id = EquityTransferReservationId::from_uuid(job.issuer_request_id.0);
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        ctx.position_store = Some(position_store);
+
+        let mut queue = ctx.job_queue.clone();
+        queue.push(job.clone()).await.unwrap();
+
+        Job::on_terminal_attempt(&job, &ctx, &TaskIdentity::for_test("current-terminal-row"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&GuardState::ActiveTransfer { generation })
+        );
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation
+                .unwrap()
+                .status,
+            crate::position::EquityTransferReservationStatus::Confirmed
+        );
     }
 
     #[tokio::test]
