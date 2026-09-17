@@ -1603,18 +1603,22 @@ mod tests {
         assert_eq!(recorded[0].reason, "non_hedgeable_pair");
     }
 
-    /// An `InventoryTrade` whose USDC leg address does not match the
-    /// chain's canonical USDC -- even though its `symbol()`
-    /// reports "USDC" -- must be classified as `UnrecognizedInventoryToken`
-    /// and skipped gracefully through `perform()`, never hedged as if it
-    /// were real USDC.
+    /// An `InventoryTrade` whose cash leg address does not match the fill
+    /// chain's pinned settlement stable -- even though its `symbol()`
+    /// reports that stable's symbol -- must be classified as
+    /// `UnrecognizedInventoryToken` and skipped gracefully through
+    /// `perform()`, never hedged as if it were the real stable. Robinhood
+    /// settles in USDG, so there the spoof claims "USDG" and the recorded
+    /// skip is judged against USDG, not USDC.
     #[tokio::test]
     async fn perform_skips_inventory_trade_with_unrecognized_token() {
-        for chain in [Chain::Base, Chain::HyperEvm] {
+        for chain in [Chain::Base, Chain::HyperEvm, Chain::Robinhood] {
             let (pool, apalis_pool) = setup_test_pools().await;
             let asserter = Asserter::new();
 
-            // Ethereum USDC cannot serve as the quote token on either chain.
+            // Ethereum USDC is the settlement stable on none of the three
+            // chains, whichever symbol the spoof claims.
+            let stable_symbol = chain.settlement_stable().symbol;
             let spoof_usdc = st0x_evm::USDC_ETHEREUM;
             let equity_token = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
             let inventory_trade = InventoryTrade {
@@ -1644,21 +1648,19 @@ mod tests {
 
             // Base stays the primary: a fill on another chain is routed to
             // that chain's own secondary accounting entry, which is the only
-            // shape config validation admits for HyperEVM.
+            // shape config validation admits for HyperEVM and Robinhood.
             let fill_chain_provider = ProviderBuilder::new().connect_mocked_client(asserter);
             let idle_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
             let (primary_provider, secondary_provider) = match chain {
                 Chain::Base => (fill_chain_provider, None),
-                Chain::Ethereum | Chain::HyperEvm => (idle_provider, Some(fill_chain_provider)),
-                Chain::Robinhood => unreachable!(
-                    "robinhood is signer-only (WalletSigning, no FillIngestion) and cannot \
-                     carry a trading fill; this fixture never iterates it"
-                ),
+                Chain::Ethereum | Chain::HyperEvm | Chain::Robinhood => {
+                    (idle_provider, Some(fill_chain_provider))
+                }
             };
             let executor = MockExecutorCtx.try_into_executor().await.unwrap();
             let ctx = create_test_ctx_with_order_owner(Address::ZERO);
             let cache = SymbolCache::default();
-            cache.preload_symbol(chain, spoof_usdc, "USDC");
+            cache.preload_symbol(chain, spoof_usdc, stable_symbol);
             cache.preload_symbol(chain, equity_token, "wtAAPL");
 
             let mut accountant_ctx = build_test_accountant_ctx(
@@ -1687,11 +1689,11 @@ mod tests {
             // Should succeed (skip) rather than error -- a spoofed token address
             // must not trip the fail-stop.
             job.perform(&accountant_ctx).await.unwrap_or_else(|error| {
-                panic!("spoofed USDC on {chain} must skip, not fail: {error:?}")
+                panic!("spoofed {stable_symbol} on {chain} must skip, not fail: {error:?}")
             });
 
-            let recorded: Vec<(String, String, String)> = sqlx::query_as(
-                "SELECT chain, event_type, reason FROM skipped_fills ORDER BY log_index",
+            let recorded: Vec<(String, String, String, String)> = sqlx::query_as(
+                "SELECT chain, event_type, reason, detail FROM skipped_fills ORDER BY log_index",
             )
             .fetch_all(&pool)
             .await
@@ -1701,7 +1703,11 @@ mod tests {
                 vec![(
                     chain.to_string(),
                     "InventoryTrade".to_owned(),
-                    "unrecognized_inventory_token".to_owned()
+                    "unrecognized_inventory_token".to_owned(),
+                    format!(
+                        "InventoryTrade token {spoof_usdc} claims symbol '{stable_symbol}' but \
+                         does not match the configured canonical address for that symbol"
+                    ),
                 )],
                 "exactly one fill, recorded on {chain}, skipped as an unrecognized token"
             );

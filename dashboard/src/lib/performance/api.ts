@@ -71,7 +71,8 @@ export const fetchReliabilityReport = async (
 type PreRolloutPollHealth = Omit<ChainPollHealth, 'chain'>
 
 type InfraResponse = Omit<InfraReport, 'monitor'> & {
-  monitor: Omit<MonitorTelemetry, 'poll'> & {
+  monitor: Omit<MonitorTelemetry, 'poll' | 'enabledChains'> & {
+    enabledChains?: MonitorTelemetry['enabledChains']
     poll: ChainPollHealth[] | PreRolloutPollHealth
   }
 }
@@ -84,12 +85,13 @@ type InfraResponse = Omit<InfraReport, 'monitor'> & {
  * environment runs a backend that sends the list.
  */
 const perChainPoll = (response: InfraResponse): InfraReport => {
-  const { blockLag, poll } = response.monitor
+  const { blockLag, enabledChains = blockLag.map(({ chain }) => chain), poll } = response.monitor
 
   if (Array.isArray(poll)) {
     return {
       ...response,
       monitor: {
+        enabledChains,
         blockLag,
         poll,
       },
@@ -101,6 +103,7 @@ const perChainPoll = (response: InfraResponse): InfraReport => {
   return {
     ...response,
     monitor: {
+      enabledChains,
       blockLag,
       poll:
         primary === undefined

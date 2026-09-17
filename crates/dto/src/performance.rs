@@ -544,6 +544,8 @@ pub struct DependencyBucket {
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MonitorTelemetry {
+    /// Every enabled chain, including observe-only chains without a fill watcher.
+    pub enabled_chains: Vec<ChainName>,
     /// One block-lag series per hedged chain, the primary chain first.
     pub block_lag: Vec<ChainBlockLag>,
     /// One poll-cycle report per hedged chain, the primary chain first.
@@ -927,6 +929,7 @@ mod tests {
     #[test]
     fn monitor_telemetry_serializes_one_lag_and_poll_series_per_chain() {
         let telemetry = MonitorTelemetry {
+            enabled_chains: vec![ChainName::Base, ChainName::Robinhood],
             block_lag: vec![
                 ChainBlockLag {
                     chain: ChainName::Base,
@@ -963,6 +966,7 @@ mod tests {
         };
 
         let json = serde_json::to_value(&telemetry).expect("serialization should succeed");
+        assert_eq!(json["enabledChains"], json!(["base", "robinhood"]));
         assert_eq!(json["blockLag"][0]["chain"], json!("base"));
         assert_eq!(json["blockLag"][0]["currentLagBlocks"], json!(7));
         assert_eq!(
@@ -1003,6 +1007,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ChainName::HyperEvm).unwrap(),
             json!("hyperevm")
+        );
+        assert_eq!(
+            serde_json::to_value(ChainName::Robinhood).unwrap(),
+            json!("robinhood")
         );
     }
 }

@@ -45,6 +45,7 @@ pub(crate) async fn load_monitor_telemetry(
     let poll_summary = poll_health(pool, range, chains).await?;
 
     Ok(MonitorTelemetry {
+        enabled_chains: chains.enabled().map(chain_name).collect(),
         block_lag,
         poll: poll_summary,
     })

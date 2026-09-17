@@ -46,7 +46,7 @@ mod chain;
 pub use chain::{Chain, ParseChainError, SettlementStable};
 
 mod tokens;
-pub use tokens::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, USDC_HYPEREVM};
+pub use tokens::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, USDC_HYPEREVM, USDG_ROBINHOOD};
 
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 mod inflight_nonces;

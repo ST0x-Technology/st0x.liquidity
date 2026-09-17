@@ -379,6 +379,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn robinhood_below_threshold_reports_eth() {
+        let notifier = Arc::new(CapturingNotifier::new());
+        let mut monitor = monitor_with(U256::from(50u64), false, notifier.clone());
+        monitor.chain = Chain::Robinhood;
+        monitor.poll_once(AlertState::Normal, Instant::now()).await;
+        assert_eq!(
+            notifier.messages(),
+            vec![concat!(
+                "⚠️ Low gas: wallet 0x0000000000000000000000000000000000000000 on robinhood ",
+                "has 0.000000000000000050 ETH (threshold 0.000000000000000100 ETH)"
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn above_threshold_stays_quiet() {
         let notifier = Arc::new(CapturingNotifier::new());
         let monitor = monitor_with(U256::from(150u64), false, notifier.clone());

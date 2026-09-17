@@ -289,19 +289,29 @@ where
             .chains
             .get(&self.chain)
             .ok_or(OnChainError::UnhedgedChain { chain: self.chain })?;
+        let checkpoint = load_backfill_checkpoint(&ctx.pool, &chain_ctx.trading).await?;
+        let from_block = backfill_job_start(
+            checkpoint,
+            chain_ctx.trading.deployment_block,
+            self.from_block,
+        );
 
         backfill_range(
             chain_ctx.evm.provider(),
             &chain_ctx.trading,
             BotOperator(ctx.ctx.order_owner()),
             &ctx.pool,
-            self.from_block,
+            from_block,
             self.to_block,
             get_backfill_retry_strat(),
             ctx.job_queue.clone(),
         )
         .await
     }
+}
+
+fn backfill_job_start(checkpoint: Option<u64>, deployment_block: u64, job_from_block: u64) -> u64 {
+    backfill_start_from_checkpoint(checkpoint, deployment_block).max(job_from_block)
 }
 
 /// Derives the block to resume backfill from, given the persisted checkpoint
@@ -875,6 +885,11 @@ fn generate_batch_ranges(
     start_block: u64,
     end_block: u64,
 ) -> impl Iterator<Item = (u64, u64)> {
+    // Robinhood's 1000 is an assumption to verify against the serving RPC:
+    // neither the public endpoint nor Alchemy's robinhood-mainnet documents a
+    // getLogs range cap, so it inherits Base's request size. The shipped
+    // observe-only Robinhood runs no backfill, so the cap must be measured
+    // before the trading table that turns its fill ingestion on lands.
     let batch_size = match chain {
         Chain::Base | Chain::Ethereum | Chain::Robinhood => 1_000,
         Chain::HyperEvm => 50,
@@ -1126,6 +1141,7 @@ mod tests {
             (Chain::HyperEvm, vec![(100, 149), (150, 150)]),
             (Chain::Base, vec![(100, 150)]),
             (Chain::Ethereum, vec![(100, 150)]),
+            (Chain::Robinhood, vec![(100, 150)]),
         ] {
             let (pool, apalis_pool) = setup_test_pools().await;
             let trading = HedgedChain::test().chain(chain).call();
@@ -1305,6 +1321,16 @@ mod tests {
     }
 
     #[test]
+    fn durable_job_retry_resumes_after_persisted_checkpoint() {
+        assert_eq!(backfill_job_start(Some(1_000), 1, 1), 1_001);
+        assert_eq!(
+            backfill_job_start(Some(500), 1, 1_000),
+            1_000,
+            "a checkpoint from an older range must not move this job backwards"
+        );
+    }
+
+    #[test]
     fn backfill_start_from_checkpoint_floors_at_deployment_block() {
         assert_eq!(backfill_start_from_checkpoint(Some(20), 50), 50);
     }
@@ -1428,6 +1454,7 @@ mod tests {
             (Chain::Base, 1000),
             (Chain::Ethereum, 1000),
             (Chain::HyperEvm, 50),
+            (Chain::Robinhood, 1000),
         ] {
             for start in [0, 100, u64::MAX - 3 * cap] {
                 assert_eq!(
@@ -1471,7 +1498,7 @@ mod tests {
             start in any::<u64>(),
             length in 0_u64..5000,
             policy in prop::sample::select(vec![(Chain::Base, 1000_u64),
-                (Chain::Ethereum, 1000), (Chain::HyperEvm, 50)]),
+                (Chain::Ethereum, 1000), (Chain::HyperEvm, 50), (Chain::Robinhood, 1000)]),
         ) {
             let (chain, cap) = policy;
             let end = start + length.min(u64::MAX - start);

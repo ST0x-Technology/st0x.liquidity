@@ -220,6 +220,7 @@ const MAX_REDRIVE_ATTEMPTS: u32 = 20;
 pub(crate) struct RecordBotGasReceiptCostCtx {
     pub(crate) base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     pub(crate) ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    pub(crate) robinhood_wallet: Option<Arc<dyn Wallet<Provider = RootProvider>>>,
     pub(crate) chainlink_feed: Address,
     pub(crate) ledger: BotGasCostLedger,
     /// Used to delayed-redrive a transient RPC-shaped outcome (a lagging RPC
@@ -304,7 +305,14 @@ impl Job<RecordBotGasReceiptCostCtx> for RecordBotGasReceiptCost {
                 ctx.ethereum_wallet.provider(),
                 ctx.ethereum_wallet.address(),
             ),
-            Chain::HyperEvm | Chain::Robinhood => {
+            Chain::Robinhood => {
+                let wallet = ctx
+                    .robinhood_wallet
+                    .as_ref()
+                    .ok_or(RecordBotGasReceiptCostError::UnwiredChain { chain: self.chain })?;
+                (wallet.provider(), wallet.address())
+            }
+            Chain::HyperEvm => {
                 return Err(RecordBotGasReceiptCostError::UnwiredChain { chain: self.chain });
             }
         };
@@ -449,14 +457,14 @@ async fn fetch_receipt(
 
             receipt.map(decode_fetched_base_receipt).transpose()
         }
-        Chain::Ethereum => provider
+        // An Arbitrum Nitro receipt folds the L1 posting cost into `gasUsed`
+        // at the L2 gas price, so Robinhood carries no separate L1 fee field.
+        Chain::Ethereum | Chain::Robinhood => provider
             .get_transaction_receipt(tx_hash)
             .await
             .map(|receipt| receipt.map(|receipt| (receipt, L1DataFeeWei::ZERO)))
             .map_err(Into::into),
-        Chain::HyperEvm | Chain::Robinhood => {
-            Err(RecordBotGasReceiptCostError::UnwiredChain { chain })
-        }
+        Chain::HyperEvm => Err(RecordBotGasReceiptCostError::UnwiredChain { chain }),
     }
 }
 
@@ -845,6 +853,7 @@ mod tests {
         RecordBotGasReceiptCostCtx {
             base_wallet: MockWallet::with_asserter(asserter),
             ethereum_wallet: MockWallet::with_asserter(&Asserter::new()),
+            robinhood_wallet: Some(MockWallet::with_asserter(&Asserter::new())),
             chainlink_feed: CHAINLINK_FEED,
             ledger,
             job_queue,
@@ -1575,60 +1584,79 @@ mod tests {
         );
     }
 
+    /// Ethereum and Robinhood both pay gas in ETH on a chain with no Base
+    /// block to pin the price to: the receipt comes from that chain's own
+    /// wallet and the ETH/USD read from Base's latest block.
     #[tokio::test]
-    async fn ethereum_chain_uses_ethereum_wallet_for_receipt_and_base_wallet_for_valuation() {
-        let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
+    async fn eth_gas_chains_use_their_own_wallet_for_receipt_and_base_wallet_for_valuation() {
+        for chain in [Chain::Ethereum, Chain::Robinhood] {
+            let occurred_at = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
 
-        let base_asserter = Asserter::new();
-        base_asserter.push_success(&999u64);
-        base_asserter.push_success(&encode_decimals_return(8));
-        base_asserter.push_success(&encode_price_return(
-            I256::try_from(200_000_000_000_i64).unwrap(),
-            occurred_at,
-        ));
+            let base_asserter = Asserter::new();
+            base_asserter.push_success(&999u64);
+            base_asserter.push_success(&encode_decimals_return(8));
+            base_asserter.push_success(&encode_price_return(
+                I256::try_from(200_000_000_000_i64).unwrap(),
+                occurred_at,
+            ));
 
-        let ethereum_asserter = Asserter::new();
-        ethereum_asserter.push_success(&receipt(BOT_WALLET, Some(555)));
-        ethereum_asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
+            let receipt_asserter = Asserter::new();
+            receipt_asserter.push_success(&receipt(BOT_WALLET, Some(555)));
+            receipt_asserter.push_success(&block(occurred_at.timestamp().cast_unsigned()));
 
-        let (ledger, store) = ledger_and_store().await;
-        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
-        let ctx = RecordBotGasReceiptCostCtx {
-            base_wallet: MockWallet::with_asserter(&base_asserter),
-            ethereum_wallet: MockWallet::with_asserter(&ethereum_asserter),
-            chainlink_feed: CHAINLINK_FEED,
-            ledger,
-            job_queue: RecordBotGasReceiptCostJobQueue::new(&apalis_pool),
-        };
+            let (ledger, store) = ledger_and_store().await;
+            let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+            let idle = |asserter: &Asserter| MockWallet::with_asserter(asserter);
+            let (ethereum_wallet, robinhood_wallet) = match chain {
+                Chain::Ethereum => (
+                    MockWallet::with_asserter(&receipt_asserter),
+                    idle(&Asserter::new()),
+                ),
+                Chain::Robinhood => (
+                    idle(&Asserter::new()),
+                    MockWallet::with_asserter(&receipt_asserter),
+                ),
+                Chain::Base | Chain::HyperEvm => unreachable!("not an ETH-gas secondary"),
+            };
+            let ctx = RecordBotGasReceiptCostCtx {
+                base_wallet: MockWallet::with_asserter(&base_asserter),
+                ethereum_wallet,
+                robinhood_wallet: Some(robinhood_wallet),
+                chainlink_feed: CHAINLINK_FEED,
+                ledger,
+                job_queue: RecordBotGasReceiptCostJobQueue::new(&apalis_pool),
+            };
 
-        // `receipt()` always returns `TxHash::repeat_byte(0x11)` (the mocked
-        // transport does not inspect the request), so the job's tx_hash must
-        // match for the store lookup key below to line up with what
-        // `from_receipt` actually persists.
-        let job = RecordBotGasReceiptCost {
-            chain: Chain::Ethereum,
-            tx_hash: TxHash::repeat_byte(0x11),
-            category: BotGasOperationCategory::WalletTransfer,
-            symbol: None,
-            redrive_attempts: 0,
-        };
+            // `receipt()` always returns `TxHash::repeat_byte(0x11)` (the mocked
+            // transport does not inspect the request), so the job's tx_hash must
+            // match for the store lookup key below to line up with what
+            // `from_receipt` actually persists.
+            let job = RecordBotGasReceiptCost {
+                chain,
+                tx_hash: TxHash::repeat_byte(0x11),
+                category: BotGasOperationCategory::WalletTransfer,
+                symbol: None,
+                redrive_attempts: 0,
+            };
 
-        job.perform(&ctx).await.unwrap();
+            job.perform(&ctx).await.unwrap();
 
-        let id = super::super::BotGasReceiptCostId {
-            chain: Chain::Ethereum,
-            tx_hash: TxHash::repeat_byte(0x11),
-        };
-        let recorded = store
-            .load(&id)
-            .await
-            .unwrap()
-            .expect("cost should be recorded");
-        assert_eq!(recorded.eth_usd_price_block_number, Some(999));
-        assert_eq!(
-            recorded.native_cost_wei,
-            U256::from(21_000_000_000_000_u128)
-        );
+            let id = super::super::BotGasReceiptCostId {
+                chain,
+                tx_hash: TxHash::repeat_byte(0x11),
+            };
+            let recorded = store
+                .load(&id)
+                .await
+                .unwrap()
+                .expect("cost should be recorded");
+            assert_eq!(recorded.eth_usd_price_block_number, Some(999), "{chain}");
+            assert_eq!(
+                recorded.native_cost_wei,
+                U256::from(21_000_000_000_000_u128),
+                "{chain}"
+            );
+        }
     }
 
     /// Acceptance criterion: a cost recorded through the real

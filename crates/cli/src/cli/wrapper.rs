@@ -14,7 +14,9 @@ use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_wrapper::{WrappedEquity, Wrapper, WrapperService};
 
 use super::TokenizationNetwork;
-use super::rebalancing::{HedgedChainContext, hedged_chain_context};
+use super::rebalancing::{
+    HedgedChainContext, hedged_chain_context, require_equity_mutation_network,
+};
 use super::token_list::load_wrapped_equities;
 
 pub(super) async fn wrap_equity_command<Writer: Write>(
@@ -159,6 +161,8 @@ pub(super) async fn donate_equity_command<Writer: Write>(
     network: TokenizationNetwork,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    require_equity_mutation_network(network)?;
+
     let HedgedChainContext {
         wallet, trading, ..
     } = hedged_chain_context(ctx, network)?;
@@ -231,6 +235,9 @@ pub(super) fn wrap_context(
     symbol: &Symbol,
 ) -> anyhow::Result<WrapContext> {
     let equities = match (network, registry) {
+        (TokenizationNetwork::Robinhood, _) => {
+            anyhow::bail!("equity wrapping is not supported on Robinhood Chain")
+        }
         (TokenizationNetwork::Base, None) => {
             to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols)
         }
@@ -238,18 +245,10 @@ pub(super) fn wrap_context(
             "--registry only applies to non Base networks: Base resolves \
              from [chains.<name>.trading.assets.equities]"
         ),
-        (
-            TokenizationNetwork::Ethereum
-            | TokenizationNetwork::HyperEvm
-            | TokenizationNetwork::Robinhood,
-            Some(path),
-        ) => load_wrapped_equities(path, Chain::from(network).chain_id())?,
-        (
-            TokenizationNetwork::Ethereum
-            | TokenizationNetwork::HyperEvm
-            | TokenizationNetwork::Robinhood,
-            None,
-        ) => anyhow::bail!(
+        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, Some(path)) => {
+            load_wrapped_equities(path, Chain::from(network).chain_id())?
+        }
+        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, None) => anyhow::bail!(
             "pass --registry with the st0x.registry token list for the \
              selected network (token-lists/<network>.json)"
         ),
@@ -267,7 +266,7 @@ pub(super) fn wrap_context(
     // Config-only checks first so a typo or a missing registry fails before
     // the wallet is required.
     let wallet_ctx = ctx.wallet()?;
-    let (wallet, _chain) = super::rebalancing::tokenization_network_context(wallet_ctx, network);
+    let (wallet, _chain) = super::rebalancing::tokenization_network_context(wallet_ctx, network)?;
 
     Ok(WrapContext { wallet, equities })
 }
@@ -292,7 +291,7 @@ mod tests {
 
     use super::{
         TokenizationNetwork, donate_equity_command, donate_equity_with_wrapper,
-        unwrap_equity_command, unwrap_equity_with_wrapper, wrap_equity_command,
+        unwrap_equity_command, unwrap_equity_with_wrapper, wrap_context, wrap_equity_command,
         wrap_equity_with_wrapper,
     };
 
@@ -354,6 +353,24 @@ mod tests {
         let mut ctx = create_base_test_ctx();
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
         ctx
+    }
+
+    #[test]
+    fn wrap_context_rejects_robinhood_before_registry_resolution() {
+        let error = wrap_context(
+            &create_ctx_with_stub_wallet(),
+            TokenizationNetwork::Robinhood,
+            None,
+            &Symbol::new("AAPL").unwrap(),
+        )
+        .err()
+        .expect("Robinhood wrapping must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("equity wrapping is not supported on Robinhood Chain")
+        );
     }
 
     /// AAPL listed on the primary chain but no `[wallet]`: the config checks
@@ -794,6 +811,28 @@ mod tests {
             error.to_string().contains("Missing Withdraw event"),
             "expected unwrap error, got: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn donate_equity_rejects_robinhood_before_loading_chain_context() {
+        let ctx = create_base_test_ctx();
+        let mut stdout = Vec::new();
+
+        let error = donate_equity_command(
+            &mut stdout,
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            TokenizationNetwork::Robinhood,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Robinhood Chain does not support tokenization or wrapper operations"
+        );
+        assert!(stdout.is_empty());
     }
 
     #[tokio::test]

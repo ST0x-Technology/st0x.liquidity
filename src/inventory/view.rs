@@ -5880,12 +5880,14 @@ mod tests {
     }
 
     /// The cash figure is the primary chain's slot, so the label the
-    /// dashboard shows beside it is that chain's settlement stable.
+    /// dashboard shows beside it is that chain's settlement stable. Robinhood
+    /// is the one chain whose stable is not USDC, so a hard-coded label
+    /// cannot pass here.
     #[test]
     fn to_dto_names_the_primary_chains_settlement_stable() {
-        let dto = InventoryView::for_primary_chain(Chain::HyperEvm).to_dto();
+        let dto = InventoryView::for_primary_chain(Chain::Robinhood).to_dto();
 
-        assert_eq!(dto.usdc.symbol, "USDC");
+        assert_eq!(dto.usdc.symbol, "USDG");
     }
 
     #[test]

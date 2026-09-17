@@ -123,6 +123,7 @@ describe('fetchInfraReport', () => {
         duration: null,
       },
     ])
+    expect(report.monitor.enabledChains).toEqual(['base', 'ethereum'])
   })
 
   it('reads a pre-rollout report with no chain to attribute the poll to', async () => {
@@ -145,6 +146,7 @@ describe('fetchInfraReport', () => {
     ]
     respondWith({
       monitor: {
+        enabledChains: ['base', 'robinhood'],
         blockLag: [lagSeries('base'), lagSeries('ethereum')],
         poll,
       },
@@ -154,5 +156,6 @@ describe('fetchInfraReport', () => {
     const report = await fetchInfraReport()
 
     expect(report.monitor.poll).toEqual(poll)
+    expect(report.monitor.enabledChains).toEqual(['base', 'robinhood'])
   })
 })

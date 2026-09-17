@@ -78,7 +78,8 @@ unset INTERNAL_API_KEY
 - The `vault` field = the `tokenized_equity` address (the base token, NOT the
   derivative).
 - The `network` field is the chain the asset is listed on, spelled as the bot's
-  chain name (`base`, `ethereum`, `hyperevm`). Register once per chain.
+  chain name (`base`, `ethereum`, `hyperevm`, `robinhood`). Register once per
+  chain.
 - The `X-API-KEY` is the internal API key stored on the server. Check the `.env`
   file on the droplet if you don't know it. The `read -rsp` command above
   prompts for the key without echoing it or saving it to shell history.
@@ -185,16 +186,16 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   `inventory` when it is `managed`, so a chain that has migrated needs its
   policies on the inventory address.
 - If the asset is in orchestrator mode, `[orchestrator.addresses]` has an entry
-  for that chain (keys are chain names: `base`, `ethereum`, `hyperevm`). The
-  order is fixed per chain: deploy the `ST0xOrchestrator` there, add its address
-  to both bots' `[orchestrator.addresses]` and deploy both, extend the Turnkey
-  signing policy to `MintAuth` typed data with that chain's id and orchestrator
-  as the verifying contract, and only then cut the asset over at issuance
-  (issuance keys the mode by symbol, so the cutover applies on every chain the
-  asset is listed on). In rebalancing mode, startup refuses, naming the chain
-  and symbol, when issuance reports the asset as orchestrator-mode while the
-  chain has no entry; see "Orchestrator rollout per chain" in
-  [cli-ops.md](cli-ops.md).
+  for that chain (keys are chain names: `base`, `ethereum`, `hyperevm`,
+  `robinhood`). The order is fixed per chain: deploy the `ST0xOrchestrator`
+  there, add its address to both bots' `[orchestrator.addresses]` and deploy
+  both, extend the Turnkey signing policy to `MintAuth` typed data with that
+  chain's id and orchestrator as the verifying contract, and only then cut the
+  asset over at issuance (issuance keys the mode by symbol, so the cutover
+  applies on every chain the asset is listed on). In rebalancing mode, startup
+  refuses, naming the chain and symbol, when issuance reports the asset as
+  orchestrator-mode while the chain has no entry; see "Orchestrator rollout per
+  chain" in [cli-ops.md](cli-ops.md).
 
 **Fields:**
 

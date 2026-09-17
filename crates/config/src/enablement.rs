@@ -114,9 +114,10 @@ impl fmt::Display for ChainCapability {
 ///   but no wrapper.
 /// - HyperEVM signs, watches fills and hedges prefunded inventory. It has no
 ///   CCTP domain or wrapper, and the ETH/USD feed cannot value its HYPE gas.
-/// - Robinhood is a signer only: it pays gas in ETH but has no fill watcher,
-///   wrapper, CCTP domain, or gas-valuation feed wired here, so the only
-///   capability it claims is signing the tokenization mint/redeem legs.
+/// - Robinhood (an Arbitrum Orbit L2) can sign, watch fills and hedge; the
+///   shipped configuration has no trading table, so it stays observe-only
+///   until one lands. It pays gas in ETH, so the same ETH/USD feed values
+///   it; no CCTP domain or wrapper is wired.
 pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
     use ChainCapability::*;
 
@@ -137,7 +138,7 @@ pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
             GasValuation,
         ]),
         Chain::HyperEvm => BTreeSet::from([FillIngestion, Hedging, WalletSigning]),
-        Chain::Robinhood => BTreeSet::from([WalletSigning]),
+        Chain::Robinhood => BTreeSet::from([FillIngestion, Hedging, WalletSigning, GasValuation]),
     }
 }
 
@@ -407,6 +408,71 @@ mod tests {
                 ChainCapability::Hedging,
                 ChainCapability::WalletSigning,
             ])
+        );
+    }
+
+    /// Robinhood pays gas in ETH, so the Base ETH/USD read values it and the
+    /// chain can reach `active`, unlike HyperEVM. It still has no wrapper and
+    /// no CCTP domain, so rebalancing assets are refused by capability.
+    #[test]
+    fn robinhood_can_be_active_but_cannot_rebalance() {
+        let robinhood = Chain::Robinhood;
+
+        for lifecycle in [
+            ChainLifecycle::ObserveOnly,
+            ChainLifecycle::Prefunded,
+            ChainLifecycle::Active,
+        ] {
+            check_enablement(robinhood, lifecycle, true, None).unwrap();
+        }
+        assert_eq!(
+            provided_capabilities(robinhood),
+            BTreeSet::from([
+                ChainCapability::FillIngestion,
+                ChainCapability::Hedging,
+                ChainCapability::WalletSigning,
+                ChainCapability::GasValuation,
+            ])
+        );
+
+        let mut assets = ChainAssets::default();
+        assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: alloy::primitives::Address::repeat_byte(0x11),
+                tokenized_equity_derivative: alloy::primitives::Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        assets.cash = Some(crate::ChainCashAsset {
+            vault_ids: Vec::new(),
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        });
+        let error =
+            check_enablement(robinhood, ChainLifecycle::Active, true, Some(&assets)).unwrap_err();
+
+        let ChainEnablementError::MissingCapabilities {
+            chain,
+            lifecycle,
+            missing,
+        } = error
+        else {
+            panic!("expected MissingCapabilities, got: {error:?}")
+        };
+        assert_eq!(chain, robinhood);
+        assert_eq!(lifecycle, ChainLifecycle::Active);
+        assert_eq!(
+            missing.into_inner(),
+            vec![
+                ChainCapability::EquityRebalancing,
+                ChainCapability::CashRebalancing
+            ],
+            "no wrapper and no CCTP domain are wired for Robinhood"
         );
     }
 

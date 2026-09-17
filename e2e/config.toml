@@ -68,7 +68,7 @@ required_confirmations = 12
 lifecycle = "observe-only"
 required_confirmations = 1
 
-# Robinhood Chain, same shape as HyperEVM.
+# Robinhood Chain, same shape as HyperEVM: a signer exists and nothing moves.
 [chains.robinhood]
 lifecycle = "observe-only"
 required_confirmations = 1

@@ -202,6 +202,7 @@ const infra = (
   poll?: Partial<ChainPollHealth>,
 ): InfraReport => ({
   monitor: {
+    enabledChains: ['base'],
     blockLag: [lagSeries(overrides)],
     poll: [pollHealth(poll)],
   },

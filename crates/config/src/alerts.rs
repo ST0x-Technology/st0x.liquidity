@@ -8,9 +8,9 @@
 //! tunes the gas monitor.
 //!
 //! The plaintext `[alerts]` section is required because its thresholds gate
-//! fresh transfers. Enabled hedged HyperEVM additionally requires a HYPE
-//! threshold. The section must fully specify every field -- there are no silent
-//! threshold defaults, per the financial-integrity rule.
+//! fresh transfers. A hedged HyperEVM or Robinhood additionally requires its
+//! own threshold. The section must fully specify every field -- there are no
+//! silent threshold defaults, per the financial-integrity rule.
 
 use std::collections::BTreeMap;
 
@@ -27,8 +27,13 @@ use crate::loader::StartupNotice;
 
 /// Chains monitored whenever alerting is configured.
 ///
-/// Enabled hedged HyperEVM additionally requires its own threshold.
+/// A hedged chain in `HEDGED_GAS_MONITORED_CHAINS` additionally requires
+/// its own threshold.
 pub const LEGACY_GAS_MONITORED_CHAINS: [Chain; 2] = [Chain::Base, Chain::Ethereum];
+
+/// Chains whose signer always exists but only spends gas once the chain is
+/// hedged, so their gas monitor is selected by the chain's own config.
+const HEDGED_GAS_MONITORED_CHAINS: [Chain; 2] = [Chain::HyperEvm, Chain::Robinhood];
 
 /// Non-secret alerting settings deserialized from the plaintext config TOML.
 #[derive(Debug, Clone, Deserialize)]
@@ -62,11 +67,11 @@ pub struct AlertsConfig {
 /// Runtime alerting context assembled from the `[alerts]` config section.
 ///
 /// Constructed via [`AlertsCtx::new`], which returns `None` when the section
-/// is absent and HyperEVM does not require monitoring.
+/// is absent and no hedged secondary requires monitoring.
 #[derive(Debug, Clone)]
 pub struct AlertsCtx {
     /// Low-balance threshold in wei, per monitored chain. Validated at
-    /// construction to hold the legacy chains plus enabled hedged HyperEVM.
+    /// construction to hold the legacy chains plus every hedged secondary.
     low_balance_thresholds_wei: BTreeMap<Chain, U256>,
     pub poll_interval: std::time::Duration,
     pub realert_interval: std::time::Duration,
@@ -101,18 +106,22 @@ impl AlertsCtx {
         chains: &BTreeMap<Chain, ChainConfig>,
         startup_notices: &mut Vec<StartupNotice>,
     ) -> Result<Option<Self>, AlertsAssemblyError> {
-        let monitor_hyperevm =
-            chains
-                .get(&Chain::HyperEvm)
-                .is_some_and(|config| match config.lifecycle {
-                    ChainLifecycle::Disabled => false,
-                    ChainLifecycle::ObserveOnly
-                    | ChainLifecycle::Prefunded
-                    | ChainLifecycle::Active => config.trading.is_some(),
-                });
+        let hedged_secondaries: Vec<Chain> = HEDGED_GAS_MONITORED_CHAINS
+            .into_iter()
+            .filter(|chain| {
+                chains
+                    .get(chain)
+                    .is_some_and(|config| match config.lifecycle {
+                        ChainLifecycle::Disabled => false,
+                        ChainLifecycle::ObserveOnly
+                        | ChainLifecycle::Prefunded
+                        | ChainLifecycle::Active => config.trading.is_some(),
+                    })
+            })
+            .collect();
         let Some(config) = config else {
-            if monitor_hyperevm {
-                return Err(AlertsAssemblyError::HyperEvmRequiresAlerts);
+            if let Some(chain) = hedged_secondaries.first() {
+                return Err(AlertsAssemblyError::HedgedChainRequiresAlerts { chain: *chain });
             }
 
             startup_notices.push(StartupNotice::info(
@@ -152,7 +161,7 @@ impl AlertsCtx {
 
         let monitored_chains: Vec<_> = LEGACY_GAS_MONITORED_CHAINS
             .into_iter()
-            .chain(monitor_hyperevm.then_some(Chain::HyperEvm))
+            .chain(hedged_secondaries)
             .collect();
         for chain in config.low_balance_thresholds.keys() {
             if !monitored_chains.contains(chain) {
@@ -216,8 +225,8 @@ fn parse_threshold(chain: Chain, value: &str) -> Result<U256, AlertsAssemblyErro
 
 #[derive(Debug, Error)]
 pub enum AlertsAssemblyError {
-    #[error("enabled hedged hyperevm requires [alerts] for native-gas monitoring")]
-    HyperEvmRequiresAlerts,
+    #[error("hedged {chain} requires [alerts] for native-gas monitoring")]
+    HedgedChainRequiresAlerts { chain: Chain },
     #[error("[alerts.low_balance_thresholds] {chain} has more than 18 decimal places")]
     ExcessThresholdPrecision { chain: Chain },
     #[error("[alerts] {field} must be non-zero")]
@@ -256,22 +265,34 @@ mod tests {
 
     use super::*;
 
-    fn hyper_config(lifecycle: &str, hedged: bool) -> BTreeMap<Chain, crate::chain::ChainConfig> {
+    fn secondary_config(
+        chain: Chain,
+        lifecycle: &str,
+        hedged: bool,
+    ) -> BTreeMap<Chain, crate::chain::ChainConfig> {
         let trading = if hedged {
-            r#"[trading]
+            let cutoff = match chain {
+                Chain::Robinhood => {
+                    "ingestion_cutoff = \"confirmations\"\ningestion_cutoff_confirmations = 1"
+                }
+                Chain::Base | Chain::Ethereum | Chain::HyperEvm => "ingestion_cutoff = \"safe\"",
+            };
+            format!(
+                r#"[trading]
 orderbook = "0x1111111111111111111111111111111111111111"
 inventory_mode = "legacy"
 inventory_adapters = []
 vault_owner = "0x2222222222222222222222222222222222222222"
 deployment_block = 1
-ingestion_cutoff = "safe"
+{cutoff}
 order_fill_poll_interval_secs = 1
 "#
+            )
         } else {
-            ""
+            String::new()
         };
         BTreeMap::from([(
-            Chain::HyperEvm,
+            chain,
             toml::from_str(&format!(
                 "lifecycle = \"{lifecycle}\"\nrequired_confirmations = 1\n{trading}"
             ))
@@ -280,83 +301,78 @@ order_fill_poll_interval_secs = 1
     }
 
     #[test]
-    fn hedged_hyperevm_requires_alerts_and_its_own_positive_threshold() {
-        for lifecycle in ["prefunded", "observe-only", "active"] {
-            let chains = hyper_config(lifecycle, true);
-            assert!(matches!(
-                AlertsCtx::new(None, &chains, &mut Vec::new()),
-                Err(AlertsAssemblyError::HyperEvmRequiresAlerts)
-            ));
-            assert!(matches!(
-                AlertsCtx::new(Some(valid_config()), &chains, &mut Vec::new()),
-                Err(AlertsAssemblyError::MissingThreshold {
-                    chain: Chain::HyperEvm
-                })
-            ));
-            for value in ["0", "bad", "0.125"] {
-                let mut config = valid_config();
-                config
-                    .low_balance_thresholds
-                    .insert(Chain::HyperEvm, value.to_owned());
-                let result = AlertsCtx::new(Some(config), &chains, &mut Vec::new());
-                match value {
-                    "0" => assert!(matches!(
-                        result,
-                        Err(AlertsAssemblyError::ZeroThreshold {
-                            chain: Chain::HyperEvm
-                        })
-                    )),
-                    "bad" => assert!(matches!(
-                        result,
-                        Err(AlertsAssemblyError::InvalidThreshold {
-                            chain: Chain::HyperEvm,
-                            ..
-                        })
-                    )),
-                    _ => assert_eq!(
-                        result
-                            .unwrap()
-                            .unwrap()
-                            .low_balance_threshold_wei(Chain::HyperEvm),
-                        Some(U256::from(125_000_000_000_000_000_u64))
-                    ),
+    fn hedged_secondary_requires_alerts_and_its_own_positive_threshold() {
+        for chain in HEDGED_GAS_MONITORED_CHAINS {
+            for lifecycle in ["prefunded", "observe-only", "active"] {
+                let chains = secondary_config(chain, lifecycle, true);
+                assert!(matches!(
+                    AlertsCtx::new(None, &chains, &mut Vec::new()),
+                    Err(AlertsAssemblyError::HedgedChainRequiresAlerts { chain: missing })
+                        if missing == chain
+                ));
+                assert!(matches!(
+                    AlertsCtx::new(Some(valid_config()), &chains, &mut Vec::new()),
+                    Err(AlertsAssemblyError::MissingThreshold { chain: missing })
+                        if missing == chain
+                ));
+                for value in ["0", "bad", "0.125"] {
+                    let mut config = valid_config();
+                    config
+                        .low_balance_thresholds
+                        .insert(chain, value.to_owned());
+                    let result = AlertsCtx::new(Some(config), &chains, &mut Vec::new());
+                    match value {
+                        "0" => assert!(matches!(
+                            result,
+                            Err(AlertsAssemblyError::ZeroThreshold { chain: failed })
+                                if failed == chain
+                        )),
+                        "bad" => assert!(matches!(
+                            result,
+                            Err(AlertsAssemblyError::InvalidThreshold { chain: failed, .. })
+                                if failed == chain
+                        )),
+                        _ => assert_eq!(
+                            result.unwrap().unwrap().low_balance_threshold_wei(chain),
+                            Some(U256::from(125_000_000_000_000_000_u64))
+                        ),
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn unhedged_hyperevm_preserves_optional_alerts_and_rejects_unused_thresholds() {
-        for chains in [
-            BTreeMap::new(),
-            hyper_config("disabled", true),
-            hyper_config("observe-only", false),
-            hyper_config("prefunded", false),
-        ] {
-            assert!(matches!(
-                AlertsCtx::new(None, &chains, &mut Vec::new()),
-                Ok(None)
-            ));
-            let ctx = AlertsCtx::new(Some(valid_config()), &chains, &mut Vec::new())
-                .unwrap()
-                .unwrap();
-            assert_eq!(ctx.low_balance_threshold_wei(Chain::HyperEvm), None);
-            let mut config = valid_config();
-            config
-                .low_balance_thresholds
-                .insert(Chain::HyperEvm, "1".to_owned());
-            assert!(matches!(
-                AlertsCtx::new(Some(config), &chains, &mut Vec::new()),
-                Err(AlertsAssemblyError::UnmonitoredChain {
-                    chain: Chain::HyperEvm
-                })
-            ));
+    fn unhedged_secondary_preserves_optional_alerts_and_rejects_unused_thresholds() {
+        for chain in HEDGED_GAS_MONITORED_CHAINS {
+            for chains in [
+                BTreeMap::new(),
+                secondary_config(chain, "disabled", true),
+                secondary_config(chain, "observe-only", false),
+                secondary_config(chain, "prefunded", false),
+            ] {
+                assert!(matches!(
+                    AlertsCtx::new(None, &chains, &mut Vec::new()),
+                    Ok(None)
+                ));
+                let ctx = AlertsCtx::new(Some(valid_config()), &chains, &mut Vec::new())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(ctx.low_balance_threshold_wei(chain), None);
+                let mut config = valid_config();
+                config.low_balance_thresholds.insert(chain, "1".to_owned());
+                assert!(matches!(
+                    AlertsCtx::new(Some(config), &chains, &mut Vec::new()),
+                    Err(AlertsAssemblyError::UnmonitoredChain { chain: unmonitored })
+                        if unmonitored == chain
+                ));
+            }
         }
     }
 
     #[test]
     fn digitless_native_thresholds_are_rejected_before_the_zero_check() {
-        for chain in [Chain::Base, Chain::Ethereum, Chain::HyperEvm] {
+        for chain in Chain::ALL {
             for value in ["", "."] {
                 let error = parse_threshold(chain, value).unwrap_err();
                 assert!(
@@ -373,7 +389,7 @@ order_fill_poll_interval_secs = 1
 
     #[test]
     fn native_thresholds_reject_negative_precision_loss_and_overflow() {
-        for chain in [Chain::Base, Chain::Ethereum, Chain::HyperEvm] {
+        for chain in Chain::ALL {
             let error = parse_threshold(chain, "1.0000000000000000001").unwrap_err();
             assert!(
                 matches!(
@@ -427,7 +443,7 @@ order_fill_poll_interval_secs = 1
             let value = format!("{}{value}", "0".repeat(leading_zeros));
             let expected = U256::from(mantissa) * U256::from(10_u64.pow(18 - precision));
 
-            for chain in [Chain::Base, Chain::Ethereum, Chain::HyperEvm] {
+            for chain in Chain::ALL {
                 prop_assert_eq!(parse_threshold(chain, &value).unwrap(), expected);
             }
         }
@@ -443,7 +459,7 @@ order_fill_poll_interval_secs = 1
                 value.push_str(&"0".repeat(precision));
             }
 
-            for chain in [Chain::Base, Chain::Ethereum, Chain::HyperEvm] {
+            for chain in Chain::ALL {
                 let error = parse_threshold(chain, &value).unwrap_err();
                 prop_assert!(matches!(error, AlertsAssemblyError::ZeroThreshold { chain: failed } if failed == chain), "{error:?}");
             }
@@ -455,7 +471,7 @@ order_fill_poll_interval_secs = 1
             fraction in "[0-9]{19,40}",
         ) {
             let value = format!("{whole}.{fraction}");
-            for chain in [Chain::Base, Chain::Ethereum, Chain::HyperEvm] {
+            for chain in Chain::ALL {
                 let error = parse_threshold(chain, &value).unwrap_err();
                 prop_assert!(matches!(error, AlertsAssemblyError::ExcessThresholdPrecision { chain: failed } if failed == chain), "{error:?}");
             }
@@ -464,7 +480,7 @@ order_fill_poll_interval_secs = 1
         #[test]
         fn negative_native_thresholds_are_rejected(magnitude in any::<u128>()) {
             let value = format!("-{magnitude}");
-            for chain in [Chain::Base, Chain::Ethereum, Chain::HyperEvm] {
+            for chain in Chain::ALL {
                 let error = parse_threshold(chain, &value).unwrap_err();
                 prop_assert!(matches!(error, AlertsAssemblyError::InvalidThreshold { chain: failed, value: ref rejected, .. } if failed == chain && rejected == &value), "{error:?}");
             }
@@ -476,7 +492,7 @@ order_fill_poll_interval_secs = 1
             let scale = U512::from(1_000_000_000_000_000_000_u64);
             let value = format!("{}.{:0>18}", units / scale, units % scale);
 
-            for chain in [Chain::Base, Chain::Ethereum, Chain::HyperEvm] {
+            for chain in Chain::ALL {
                 let error = parse_threshold(chain, &value).unwrap_err();
                 prop_assert!(matches!(error, AlertsAssemblyError::InvalidThreshold { chain: failed, value: ref rejected, .. } if failed == chain && rejected == &value), "{error:?}");
             }

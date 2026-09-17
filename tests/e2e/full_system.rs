@@ -581,6 +581,10 @@ required_confirmations = 1
 lifecycle = "observe-only"
 required_confirmations = 1
 
+[chains.robinhood]
+lifecycle = "observe-only"
+required_confirmations = 1
+
 [wallet]
 kind = "private-key"
 address = "{owner}"
@@ -641,6 +645,9 @@ rpc_url = "{rpc_url}"
 rpc_url = "{ethereum_rpc_url}"
 
 [chains.hyperevm]
+rpc_url = "{ethereum_rpc_url}"
+
+[chains.robinhood]
 rpc_url = "{ethereum_rpc_url}"
 
 [broker]
