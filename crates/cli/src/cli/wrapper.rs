@@ -235,9 +235,6 @@ pub(super) fn wrap_context(
     symbol: &Symbol,
 ) -> anyhow::Result<WrapContext> {
     let equities = match (network, registry) {
-        (TokenizationNetwork::Robinhood, _) => {
-            anyhow::bail!("equity wrapping is not supported on Robinhood Chain")
-        }
         (TokenizationNetwork::Base, None) => {
             to_wrapped_equities(&ctx.chains.primary().assets.equities.symbols)
         }
@@ -245,10 +242,18 @@ pub(super) fn wrap_context(
             "--registry only applies to non Base networks: Base resolves \
              from [chains.<name>.trading.assets.equities]"
         ),
-        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, Some(path)) => {
-            load_wrapped_equities(path, Chain::from(network).chain_id())?
-        }
-        (TokenizationNetwork::Ethereum | TokenizationNetwork::HyperEvm, None) => anyhow::bail!(
+        (
+            TokenizationNetwork::Ethereum
+            | TokenizationNetwork::HyperEvm
+            | TokenizationNetwork::Robinhood,
+            Some(path),
+        ) => load_wrapped_equities(path, Chain::from(network).chain_id())?,
+        (
+            TokenizationNetwork::Ethereum
+            | TokenizationNetwork::HyperEvm
+            | TokenizationNetwork::Robinhood,
+            None,
+        ) => anyhow::bail!(
             "pass --registry with the st0x.registry token list for the \
              selected network (token-lists/<network>.json)"
         ),
@@ -273,7 +278,7 @@ pub(super) fn wrap_context(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, address};
     use std::io::Write as _;
 
     use st0x_config::ChainRegistry;
@@ -290,7 +295,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::{
-        TokenizationNetwork, donate_equity_command, donate_equity_with_wrapper,
+        TokenizationNetwork, WrapContext, donate_equity_command, donate_equity_with_wrapper,
         unwrap_equity_command, unwrap_equity_with_wrapper, wrap_context, wrap_equity_command,
         wrap_equity_with_wrapper,
     };
@@ -356,20 +361,44 @@ mod tests {
     }
 
     #[test]
-    fn wrap_context_rejects_robinhood_before_registry_resolution() {
-        let error = wrap_context(
-            &create_ctx_with_stub_wallet(),
-            TokenizationNetwork::Robinhood,
-            None,
-            &Symbol::new("AAPL").unwrap(),
-        )
-        .err()
-        .expect("Robinhood wrapping must be rejected");
+    fn wrap_context_resolves_robinhood_registry_for_redemption() {
+        let mut registry = tempfile::NamedTempFile::new().unwrap();
+        registry
+            .write_all(
+                br#"{
+                    "tokens": [{
+                        "chainId": 4663,
+                        "address": "0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826",
+                        "symbol": "wtDNUT",
+                        "extensions": {
+                            "unwrappedAddress": "0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9"
+                        }
+                    }]
+                }"#,
+            )
+            .unwrap();
+        let ctx = create_ctx_with_stub_wallet();
 
-        assert!(
-            error
-                .to_string()
-                .contains("equity wrapping is not supported on Robinhood Chain")
+        let WrapContext { wallet, equities } = wrap_context(
+            &ctx,
+            TokenizationNetwork::Robinhood,
+            Some(&registry.path().to_path_buf()),
+            &Symbol::new("DNUT").unwrap(),
+        )
+        .unwrap();
+        let dnut = &equities[&Symbol::new("DNUT").unwrap()];
+
+        assert_eq!(
+            wallet.address(),
+            ctx.wallet().unwrap().robinhood_wallet().unwrap().address()
+        );
+        assert_eq!(
+            dnut.derivative,
+            address!("0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826")
+        );
+        assert_eq!(
+            dnut.underlying,
+            address!("0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9")
         );
     }
 
@@ -830,7 +859,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Robinhood Chain does not support tokenization or wrapper operations"
+            "Robinhood Chain does not support automated equity transfers or donations"
         );
         assert!(stdout.is_empty());
     }

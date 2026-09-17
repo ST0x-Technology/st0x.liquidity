@@ -163,19 +163,9 @@ pub(super) fn tokenization_network_context(
     Ok((wallet.clone(), chain))
 }
 
-fn require_alpaca_tokenization_network(network: TokenizationNetwork) -> anyhow::Result<()> {
-    if network == TokenizationNetwork::Robinhood {
-        anyhow::bail!(
-            "Alpaca tokenization does not support Robinhood Chain; use a documented Alpaca network"
-        );
-    }
-
-    Ok(())
-}
-
 pub(super) fn require_equity_mutation_network(network: TokenizationNetwork) -> anyhow::Result<()> {
     if network == TokenizationNetwork::Robinhood {
-        anyhow::bail!("Robinhood Chain does not support tokenization or wrapper operations");
+        anyhow::bail!("Robinhood Chain does not support automated equity transfers or donations");
     }
 
     Ok(())
@@ -1319,8 +1309,6 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write>(
     token_override: Option<Address>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    require_alpaca_tokenization_network(network)?;
-
     writeln!(stdout, "🔄 Requesting tokenization via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
@@ -1466,8 +1454,6 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     registry: Option<PathBuf>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    require_alpaca_tokenization_network(network)?;
-
     writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
@@ -2597,7 +2583,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Robinhood Chain does not support tokenization or wrapper operations"
+            "Robinhood Chain does not support automated equity transfers or donations"
         );
         assert!(stdout.is_empty());
     }
@@ -3098,23 +3084,28 @@ mod tests {
         assert_eq!(robinhood_chain, Chain::Robinhood);
     }
 
-    #[test]
-    fn alpaca_tokenization_rejects_robinhood_network() {
-        let error =
-            require_alpaca_tokenization_network(TokenizationNetwork::Robinhood).unwrap_err();
+    #[tokio::test]
+    async fn alpaca_tokenize_accepts_robinhood_network() {
+        let ctx = create_alpaca_test_ctx();
+        let mut stdout = Vec::new();
 
-        assert!(
-            error
-                .to_string()
-                .contains("Alpaca tokenization does not support Robinhood Chain")
+        let error = alpaca_tokenize_command(
+            &mut stdout,
+            Symbol::new("DNUT").unwrap(),
+            FractionalShares::new(float!(1)),
+            None,
+            TokenizationNetwork::Robinhood,
+            None,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "pass --token with the robinhood tStock address for DNUT: \
+             no [chains.robinhood.trading] table lists it"
         );
-        for network in [
-            TokenizationNetwork::Base,
-            TokenizationNetwork::Ethereum,
-            TokenizationNetwork::HyperEvm,
-        ] {
-            require_alpaca_tokenization_network(network).unwrap();
-        }
     }
 
     const ETHEREUM_ORDERBOOK: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
