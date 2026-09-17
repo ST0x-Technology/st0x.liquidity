@@ -623,6 +623,7 @@ fn write_order_success<W: Write>(
     Ok(())
 }
 
+/// Processes a transaction through standalone stores and renders its recovery outcome.
 pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'static>(
     tx_hash: TxHash,
     ctx: &Ctx,

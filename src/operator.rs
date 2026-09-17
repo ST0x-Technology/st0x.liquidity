@@ -2771,6 +2771,7 @@ pub mod process_tx {
             );
         }
 
+        /// A resolved pending placement failure must allow process-tx to continue.
         #[tokio::test]
         async fn existing_pending_cleanup_reports_process_tx_continues_this_run() {
             let pool = setup_test_db().await;
@@ -2851,6 +2852,7 @@ pub mod process_tx {
             );
         }
 
+        /// Post-placement failures with broker IDs must preserve the retry anchor.
         #[tokio::test]
         async fn reconcile_loaded_post_place_state_failed_with_executor_id_preserves_the_anchor() {
             let pool = setup_test_db().await;
@@ -2931,6 +2933,7 @@ pub mod process_tx {
             );
         }
 
+        /// Missing post-placement order state must clear the pending position claim.
         #[tokio::test]
         async fn process_tx_clears_pending_order_when_post_place_order_missing() {
             let pool = setup_test_db().await;
@@ -2997,6 +3000,7 @@ pub mod process_tx {
             );
         }
 
+        /// A cancelling hedge must remain in flight until cancellation is terminal.
         #[tokio::test]
         async fn existing_cancelling_pending_order_remains_in_flight() {
             let pool = setup_test_db().await;
@@ -3078,6 +3082,7 @@ pub mod process_tx {
             );
         }
 
+        /// A cancelled hedge without a retained fill must clear its position claim.
         #[tokio::test]
         async fn existing_cancelled_pending_order_clears_position_claim() {
             let pool = setup_test_db().await;
@@ -3196,6 +3201,7 @@ pub mod process_tx {
             position_store
         }
 
+        /// Missing-order audit events must identify whether placement already ran.
         #[tokio::test]
         async fn missing_pending_order_audit_reason_names_the_placement_phase() {
             for (context, expected_reason) in [
@@ -3243,6 +3249,7 @@ pub mod process_tx {
             }
         }
 
+        /// Pending-order rejections must identify their placement phase and order.
         #[tokio::test]
         async fn pending_order_refusal_names_the_placement_phase() {
             for context in [
@@ -3320,6 +3327,7 @@ pub mod process_tx {
             }
         }
 
+        /// An unpriced terminal fill must reject reconciliation and retain the claim.
         #[tokio::test]
         async fn unpriced_terminal_fill_is_a_typed_rejection_and_keeps_the_claim() {
             let pool = setup_test_db().await;

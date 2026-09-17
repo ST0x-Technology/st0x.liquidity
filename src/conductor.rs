@@ -944,10 +944,10 @@ pub(crate) struct ServerHandles {
 }
 
 impl Conductor {
-    // `run` is the bot's startup wiring: it threads the store, queue, and
-    // rebalancing setup values into the conductor builder in one place.
-    // Extracting a phase moves those values through a helper struct without
-    // reducing complexity, so it stays one function.
+    /// Wires the bot's stores, job queues, rebalancing services, and supervised tasks.
+    ///
+    /// Extracting a phase would only move the shared setup values through a helper
+    /// struct without reducing the startup wiring's complexity.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -4545,6 +4545,7 @@ pub async fn account_for_onchain_fill(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+/// Accounts a queued onchain trade and submits its offchain hedge when eligible.
 pub async fn process_queued_trade<E: Executor>(
     executor: &E,
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
@@ -5030,6 +5031,7 @@ where
     }
 }
 
+/// Claims a position, creates its hedge order, and dispatches the persisted result.
 async fn place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
@@ -5087,6 +5089,7 @@ enum ExistingPendingOrderOutcome {
     Cleared,
 }
 
+/// Resolves a position's existing hedge claim before another placement is attempted.
 async fn reconcile_existing_pending_order(
     symbol: &Symbol,
     cqrs: &TradeProcessingCqrs,
@@ -9446,6 +9449,7 @@ mod tests {
         )
     }
 
+    /// Builds the trade-processing CQRS test fixture for the supplied chain assets.
     fn trade_processing_cqrs_with_assets(
         frameworks: &CqrsFrameworks,
         pool: &SqlitePool,
@@ -11253,6 +11257,7 @@ mod tests {
         );
     }
 
+    /// Extended-hours fills must enqueue an immediate hedge rather than place inline.
     #[tokio::test]
     async fn extended_hours_trade_enqueues_immediate_hedge_job() {
         // With extended-hours counter-trading enabled and the broker in an

@@ -233,6 +233,7 @@ pub async fn run_bot_session_with_injector(
     .await
 }
 
+/// Initializes and supervises one bot session with the supplied startup notifier.
 async fn run_bot_session_inner(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
@@ -1235,6 +1236,7 @@ mod tests {
         .unwrap();
     }
 
+    /// Startup must fail when the configured chain RPC endpoint is unreachable.
     #[tokio::test]
     async fn test_run_function_unreachable_rpc_fails_startup() {
         let mut ctx = create_test_ctx_with_order_owner(address!(
@@ -1278,6 +1280,7 @@ mod tests {
         );
     }
 
+    /// Executor initialization failures must propagate from conductor startup.
     #[tokio::test]
     async fn test_run_function_error_propagation() {
         let mut ctx = create_test_ctx_with_order_owner(address!(
