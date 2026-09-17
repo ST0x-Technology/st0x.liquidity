@@ -136,14 +136,15 @@ impl InventoryDivergenceGate {
                 request.generation == generation && fetched_at > request.requested_at
             })
     }
-    pub(crate) fn protected_offchain_equity_symbols(
-        &self,
-        fetched_at: DateTime<Utc>,
-    ) -> BTreeSet<Symbol> {
+    /// Symbols owned by an explicit reconciliation request must never be
+    /// mutated by the ordinary snapshot emitted from the same poll. The
+    /// generation-bound event that follows is the only event allowed to apply
+    /// and resolve that request; otherwise the ordinary event can advance the
+    /// watermark and make its paired reconcile event reject itself.
+    pub(crate) fn protected_offchain_equity_symbols(&self) -> BTreeSet<Symbol> {
         self.read_pending_offchain_equity()
-            .iter()
-            .filter(|(_, request)| fetched_at <= request.requested_at)
-            .map(|(symbol, _)| symbol.clone())
+            .keys()
+            .cloned()
             .collect()
     }
 
