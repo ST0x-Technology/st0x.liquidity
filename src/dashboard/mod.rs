@@ -639,7 +639,7 @@ mod tests {
     fn empty_current_state() -> Box<CurrentState> {
         Box::new(CurrentState {
             trades: Vec::new(),
-            inventory: st0x_dto::Inventory::empty(),
+            inventory: st0x_dto::Inventory::empty("USDC"),
             positions: Vec::new(),
             equity_prices: Vec::new(),
             settings: empty_settings(),
@@ -799,7 +799,7 @@ mod tests {
     async fn current_state_serializes_all_fields() {
         let state = CurrentState {
             trades: Vec::new(),
-            inventory: st0x_dto::Inventory::empty(),
+            inventory: st0x_dto::Inventory::empty("USDC"),
             positions: Vec::new(),
             equity_prices: Vec::new(),
             settings: empty_settings(),

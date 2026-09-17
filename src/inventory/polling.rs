@@ -786,7 +786,7 @@ where
                 .raindex_service
                 .get_usdc_balance::<OpenChainErrorRegistry>(
                     vault_polling.vault_owner,
-                    vault_polling.chain.usdc(),
+                    vault_polling.chain.settlement_stable().address,
                     RaindexVaultId(vault.vault_id),
                     block_number,
                 )
@@ -3648,12 +3648,12 @@ mod tests {
 
         assert_eq!(
             *base_tokens.lock().unwrap(),
-            vec![Chain::Base.usdc()],
+            vec![Chain::Base.settlement_stable().address],
             "the Base vault must be read under Base's canonical USDC"
         );
         assert_eq!(
             *ethereum_tokens.lock().unwrap(),
-            vec![Chain::Ethereum.usdc()],
+            vec![Chain::Ethereum.settlement_stable().address],
             "the Ethereum vault must be read under Ethereum's canonical USDC"
         );
     }

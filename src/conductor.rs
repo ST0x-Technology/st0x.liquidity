@@ -1403,7 +1403,7 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
 }
 
 /// The startup approval targets of every hedged chain, keyed by chain: its
-/// canonical USDC and, where the chain rebalances equity, each enabled
+/// settlement stable and, where the chain rebalances equity, each enabled
 /// equity's wrap and deposit grants -- the deposit grants against the spender
 /// its inventory mode settles through, its own orderbook or its inventory.
 fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
@@ -1419,7 +1419,7 @@ fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
                     hedged.inventory,
                     &hedged.assets,
                     hedged.orderbook,
-                    chain.usdc(),
+                    chain.settlement_stable().address,
                 ),
             )
         })
@@ -2458,7 +2458,7 @@ async fn preflight_inventory_access<Signer: Wallet + Clone>(
 }
 
 /// The tokens whose stale orderbook allowance startup revokes, per hedged
-/// chain in managed inventory mode: that chain's canonical USDC and every
+/// chain in managed inventory mode: that chain's settlement stable and every
 /// configured wrapped equity. A legacy-mode chain has no distinct inventory
 /// to have migrated from, so it has no entry.
 fn stale_allowance_revocations(ctx: &Ctx) -> BTreeMap<Chain, Vec<Address>> {
@@ -2470,7 +2470,7 @@ fn stale_allowance_revocations(ctx: &Ctx) -> BTreeMap<Chain, Vec<Address>> {
         })
         .map(|hedged| {
             let chain = hedged.chain;
-            let tokens = std::iter::once(chain.usdc())
+            let tokens = std::iter::once(chain.settlement_stable().address)
                 .chain(
                     hedged
                         .assets
@@ -4039,12 +4039,12 @@ pub(crate) async fn discover_vaults_for_trade(
         orderbook: context.orderbook,
         owner: context.order_owner,
     };
-    let usdc = trade_event.chain.usdc();
+    let settlement_stable = trade_event.chain.settlement_stable().address;
 
     for owned_vault in our_vaults {
         let vault = owned_vault.vault;
 
-        let command = if vault.token == usdc {
+        let command = if vault.token == settlement_stable {
             VaultRegistryCommand::DiscoverUsdcVault {
                 vault_id: vault.vault_id,
                 discovered_in: tx_hash,
@@ -4060,9 +4060,10 @@ pub(crate) async fn discover_vaults_for_trade(
             debug!(
                 vault_id = %vault.vault_id,
                 token = %vault.token,
-                %usdc,
+                %settlement_stable,
                 expected_equity_token = %expected_equity_token,
-                "Vault token does not match USDC or expected equity token, skipping"
+                "Vault token matches neither the settlement stable nor the expected equity \
+                 token, skipping"
             );
             continue;
         };

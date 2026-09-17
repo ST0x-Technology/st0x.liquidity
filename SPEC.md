@@ -163,13 +163,13 @@ equity's wrapped share, plus the unwrapped token of each equity the chain
 rebalances) and any failure is fatal; degraded per-chain startup is deferred to
 the chain-disable work. Each probed equity token must report 18 decimals: every
 equity quantity the bot scales is 18-decimal share-wei, so a token at another
-precision is refused by name rather than honoured. USDC is not probed, so its 6
-decimals are untouched. Each wrapped share must additionally report the equity's
-configured unwrapped token as its ERC-4626 `asset()` — the same attestation the
-tokenization preflight makes, which a hedge-only chain never reaches and a
-rebalancing secondary makes only for the equities that opt in — so a typo
-landing on another live token refuses startup instead of surfacing as the first
-unresolvable fill.
+precision is refused by name rather than honoured. The settlement stable is not
+probed: its decimals are pinned in code beside its address. Each wrapped share
+must additionally report the equity's configured unwrapped token as its ERC-4626
+`asset()` — the same attestation the tokenization preflight makes, which a
+hedge-only chain never reaches and a rebalancing secondary makes only for the
+equities that opt in — so a typo landing on another live token refuses startup
+instead of surfacing as the first unresolvable fill.
 
 The lifecycle is a strict ceiling over the chain's asset settings. The hedged
 chain with `primary = true` must be `active`; startup rejects an observe-only or
@@ -183,7 +183,7 @@ that exceeds this ceiling.
 
 HyperEVM supports prefunded fill ingestion and hedging as a hedged secondary
 with manually funded equity, USDC and native HYPE gas. Configuring HyperEVM as
-the primary chain fails validation. Its canonical USDC is
+the primary chain fails validation. Its settlement stable is USDC at
 `0xb88339CB7199b77E23DB6E890353E22632Ba630f` (6 decimals). HyperEVM does not
 provide gas valuation or automated rebalancing capabilities; `active` remains
 unavailable. Its vault balances are polled like any hedged chain's; automated
@@ -212,16 +212,17 @@ rather than a rewire. A mint or redemption transfer is not among them: it
 resolves the entry of the chain its record names (see below), so only the
 orphan-recovery aggregates still borrow the primary's. The tokenization
 preflight (below) runs once per hedged chain with that chain's wallet, orderbook
-and canonical USDC, as does the stale-allowance revoke on each chain in managed
-inventory mode. The startup MAX approvals run on every hedged chain in either
-mode, but only the USDC grant is unconditional: the equity grants (underlying to
-wrapper vault, wrapped token to the deposit spender) are made only on chains
-that rebalance equity, since a hedge-only secondary has no wrapper to approve.
-Both deposit grants name the spender that chain settles deposits through -- its
-orderbook in legacy inventory mode, its `RaindexInventory` in managed mode -- so
-the same two token identities are approved, and proved by the deploy gate, in
-either inventory mode. A hedged chain for which this build has no pinned USDC
-fails startup rather than borrowing another chain's address.
+and settlement stable, as does the stale-allowance revoke on each chain in
+managed inventory mode. The startup MAX approvals run on every hedged chain in
+either mode, but only the settlement-stable grant is unconditional: the equity
+grants (underlying to wrapper vault, wrapped token to the deposit spender) are
+made only on chains that rebalance equity, since a hedge-only secondary has no
+wrapper to approve. Both deposit grants name the spender that chain settles
+deposits through -- its orderbook in legacy inventory mode, its
+`RaindexInventory` in managed mode -- so the same two token identities are
+approved, and proved by the deploy gate, in either inventory mode. A hedged
+chain for which this build has no pinned settlement stable fails startup rather
+than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
@@ -237,11 +238,11 @@ unwrap, mint and redeem commands need no orderbook: `wrap-equity`,
 `unwrap-equity` and `alpaca-redeem` additionally accept `--registry` (the
 st0x.registry token list) for a chain that lists an asset but has no trading
 table, and `alpaca-tokenize` takes the tStock address directly with `--token`.
-USDC is the selected chain's canonical contract, refused where this build pins
-none. An operator equity transfer checks gas on the selected chain's wallet
-against its `[alerts.low_balance_thresholds]` entry and refuses a chain without
-one. The mint and redemption aggregates record the chain they run on, and both
-the server's startup recovery and the operator's resume drive an interrupted
+Cash is the selected chain's settlement stable, pinned in code. An operator
+equity transfer checks gas on the selected chain's wallet against its
+`[alerts.low_balance_thresholds]` entry and refuses a chain without one. The
+mint and redemption aggregates record the chain they run on, and both the
+server's startup recovery and the operator's resume drive an interrupted
 transfer with that chain's services. The network a transfer started on has to be
 named only for `transfer-equity --issuer-request-id`, which re-runs the transfer
 command itself, and a `--network` that disagrees with the record is refused; the
@@ -635,39 +636,40 @@ persisted checkpoint and re-scans any gap.
 
 Before any worker or rebalancer runs, and in both modes whenever a signing
 wallet is configured, startup grants the one-time MAX approvals on every hedged
-chain with that chain's wallet: that chain's canonical USDC to its deposit
+chain with that chain's wallet: that chain's settlement stable to its deposit
 spender on every hedged chain, and each wrapped equity's underlying to its
 wrapper vault and wrapped to that same deposit spender -- the chain's orderbook
 in legacy inventory mode, its `RaindexInventory` in managed mode: on the primary
 every equity with trading or rebalancing enabled, on a secondary only the
 equities with rebalancing enabled, the same selection its tokenization preflight
 attests (a hedge-only secondary has no wrapper to approve, so its allowance work
-is the USDC grant alone). Only when rebalancing is configured does it also
-revoke any stale orderbook allowance, per chain in managed inventory mode, the
-same way, and a tokenization preflight then runs per hedged chain, read-only:
-the chain's issuer redemption wallet must be configured, and every preflighted
-equity's configured vault must report the configured underlying as its `asset()`
-(the same attestation a redemption's unwrap step performs). The preflighted
-equities are, on the primary, every trading- or rebalancing-enabled equity (the
-bot may wrap or redeem any of them there), and on a secondary only its
-rebalancing-enabled equities; a hedge-only secondary is skipped with a log line
-and has no redemption-wallet requirement. Each failure is fatal and names the
-chain and, where one applies, the symbol. Then, on every preflighted chain with
-no `[orchestrator.addresses]` entry, the preflight asks issuance's per-asset
-status endpoint (the freeze gate's endpoint, through the same client) for each
-preflighted equity's `vault_mode` and refuses startup naming the chain and
-symbol when one is orchestrator-mode: its first mint would stall at the signing
-step. Chains with an entry are not queried: the entry is the only prerequisite
-this bot can see, and the Turnkey `MintAuth` policy for that chain stays
-invisible at startup, so a missing policy fails the first orchestrator-mode mint
-at signing rather than at preflight. An indeterminate mode (issuance
-unreachable, asset unknown to issuance) is warned about per chain and symbol
-rather than refused: rebalancing mode never requires issuance to be reachable at
-startup (the freeze gate fails closed per cycle and has its own `freeze_check`
-escape hatch for an issuance outage), and the per-mint mode read fails closed on
-its own: a mint whose mode cannot be read stops at mode discovery, before any
-signing. The signing-step failure is the last line only for a known
-orchestrator-mode mint without its chain's entry or `MintAuth` policy.
+is the settlement-stable grant alone). Only when rebalancing is configured does
+it also revoke any stale orderbook allowance, per chain in managed inventory
+mode, the same way, and a tokenization preflight then runs per hedged chain,
+read-only: the chain's issuer redemption wallet must be configured, and every
+preflighted equity's configured vault must report the configured underlying as
+its `asset()` (the same attestation a redemption's unwrap step performs). The
+preflighted equities are, on the primary, every trading- or rebalancing-enabled
+equity (the bot may wrap or redeem any of them there), and on a secondary only
+its rebalancing-enabled equities; a hedge-only secondary is skipped with a log
+line and has no redemption-wallet requirement. Each failure is fatal and names
+the chain and, where one applies, the symbol. Then, on every preflighted chain
+with no `[orchestrator.addresses]` entry, the preflight asks issuance's
+per-asset status endpoint (the freeze gate's endpoint, through the same client)
+for each preflighted equity's `vault_mode` and refuses startup naming the chain
+and symbol when one is orchestrator-mode: its first mint would stall at the
+signing step. Chains with an entry are not queried: the entry is the only
+prerequisite this bot can see, and the Turnkey `MintAuth` policy for that chain
+stays invisible at startup, so a missing policy fails the first
+orchestrator-mode mint at signing rather than at preflight. An indeterminate
+mode (issuance unreachable, asset unknown to issuance) is warned about per chain
+and symbol rather than refused: rebalancing mode never requires issuance to be
+reachable at startup (the freeze gate fails closed per cycle and has its own
+`freeze_check` escape hatch for an issuance outage), and the per-mint mode read
+fails closed on its own: a mint whose mode cannot be read stops at mode
+discovery, before any signing. The signing-step failure is the last line only
+for a known orchestrator-mode mint without its chain's entry or `MintAuth`
+policy.
 
 Historical backfill resumes from a persisted database checkpoint. The configured
 `deployment_block` is only the initial seed for the first startup or for an
@@ -676,8 +678,21 @@ processed block and the next startup begins at the following block. The
 checkpoint is updated only after the full backfill range succeeds, so a partial
 failure cannot skip unprocessed history.
 
-Every supported chain pins its canonical USDC contract in code, so adding a
-chain requires pinning its USDC before the code compiles.
+Every supported chain pins its settlement stable in code -- address, symbol and
+decimals, next to its chain id; USDC on every chain today -- so adding a chain
+requires pinning its stable before the code compiles. It is the cash leg
+everywhere: vault polling reads that token's vault, the fill parse scales the
+cash amount by its decimals (a fill whose moved amount the six-decimal internal
+amount cannot hold is skipped and recorded, never rounded), and the inventory
+view names it in the `symbol` field the dashboard labels the cash row with. Fill
+validation matches it two ways: an `InventoryTrade` fill must quote in the
+stable's address, while a `ClearV3`/`TakeOrderV3` fill is classified by the
+stable's symbol and its address is gated only by vault discovery, which skips a
+cash vault whose token is not the pinned address. The portfolio snapshot still
+persists its cash asset as the literal `USDC`; labelling it per chain changes
+persisted rows and is its own follow-up. Circle's USDC is exposed separately,
+`Some` only on chains whose stable is that USDC, and read by the CCTP bridge
+alone.
 
 Completed apalis jobs are operational queue records, not audit history. The
 runtime periodically deletes terminal job rows and vacuums SQLite at the
@@ -1634,8 +1649,8 @@ Within the window, a missing required poll keeps deferring the capture until
 either every slot becomes fresh (captures) or the cap is reached (abandons).
 
 **Deployed capital definition**: a day's total USD capital is the sum of cash
-(USDC) balances across every location (both trading venues plus every
-wallet-transit point) plus positive equity holdings across every location,
+(settlement-stable) balances across every location (both trading venues plus
+every wallet-transit point) plus positive equity holdings across every location,
 including the current Alpaca position at the hedging venue. Counter-trades
 consume or replenish that single broker position; they do not create a second,
 separately tracked hedge leg beside the broker inventory. Excluding Alpaca
@@ -1659,9 +1674,10 @@ true short-selling is ever added on Alpaca, this definition must be revisited:
 short-sale proceeds would inflate the counted cash, and posted maintenance
 margin would become genuinely uncounted capital.
 
-**USD marks**: USDC is treated as par (`1:1`), matching the reporting-currency
-assumption used elsewhere in `/pnl`. Equity balances are marked from the
-symbol's `Position.last_price: Option<PriceObservation>` as of capture time. A
+**USD marks**: the settlement stable (USDC today) is treated as par (`1:1`),
+matching the reporting-currency assumption used elsewhere in `/pnl`. Equity
+balances are marked from the symbol's
+`Position.last_price: Option<PriceObservation>` as of capture time. A
 `PriceObservation` carries the fill-derived USD price and the time that price
 was economically observed: `OnChainOrderFilled` uses the fill's
 `block_timestamp`, and a priced `ManualPositionAdjusted` uses `adjusted_at`.
@@ -1844,7 +1860,7 @@ systemd unit:
   and runs `validate-config` while the old process is still running. For Turnkey
   wallets it then lists policies through Turnkey's authenticated read-only API
   and proves that every startup MAX approval target on every hedged chain (that
-  chain's canonical USDC to its deposit spender -- its orderbook in legacy
+  chain's settlement stable to its deposit spender -- its orderbook in legacy
   inventory mode, its `RaindexInventory` in managed mode -- plus equity token to
   wrapper and wrapper to that same deposit spender for every equity the chain
   wraps in its role: trading or rebalancing enabled on the primary, rebalancing
@@ -1852,17 +1868,17 @@ systemd unit:
   authenticated API user can satisfy alone and whose target condition provably
   applies on that chain's id. Applicable deny policies take precedence; unknown
   allow or deny applicability, unsupported consensus, a hedged chain with no
-  pinned USDC, and missing coverage fail closed, naming the chain, symbol, token
-  contract, and spender. Only after both gates pass may activation stop the old
-  process and install the candidate files, so a policy or config failure leaves
-  the running bot untouched; a failed stop aborts before candidate files are
-  installed. It then verifies migrations, chowns data files, writes the git-rev
-  marker, touches the activation marker, and restarts the unit. The server
-  writes its PID to a systemd-managed runtime-directory file only after
-  Conductor has completed startup initialization and every essential supervised
-  runtime task has reached a pending run state. Activation waits for that PID to
-  match the unit's live main process with a bounded startup timeout. If the
-  process exits, readiness reporting fails, or the timeout expires first,
+  pinned settlement stable, and missing coverage fail closed, naming the chain,
+  symbol, token contract, and spender. Only after both gates pass may activation
+  stop the old process and install the candidate files, so a policy or config
+  failure leaves the running bot untouched; a failed stop aborts before
+  candidate files are installed. It then verifies migrations, chowns data files,
+  writes the git-rev marker, touches the activation marker, and restarts the
+  unit. The server writes its PID to a systemd-managed runtime-directory file
+  only after Conductor has completed startup initialization and every essential
+  supervised runtime task has reached a pending run state. Activation waits for
+  that PID to match the unit's live main process with a bounded startup timeout.
+  If the process exits, readiness reporting fails, or the timeout expires first,
   activation prints the unit status and recent journal, exits non-zero, and
   deploy-rs rolls the profile back. The unit remains `Type=simple` so automatic
   rollback stays compatible with service generations from before the readiness
@@ -2047,7 +2063,7 @@ The system provides two top-level capabilities:
 │  ├─ Wallet trait                       └─ Wrap/unwrap (ERC-4626)        │
 │  ├─ Provider/signer                                                     │
 │  ├─ ABI bindings (IERC20, ...)                                          │
-│  └─ Chain constants (USDC_*)                                            │
+│  └─ Chain, its settlement stable, USDC_* constants                      │
 │                                                                         │
 └─────────────────────────────────┬───────────────────────────────────────┘
                                   │

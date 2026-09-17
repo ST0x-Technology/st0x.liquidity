@@ -138,7 +138,7 @@ mod tests {
     fn current_state_serializes_all_fields() {
         let state = CurrentState {
             trades: Vec::new(),
-            inventory: Inventory::empty(),
+            inventory: Inventory::empty("USDC"),
             positions: Vec::new(),
             equity_prices: Vec::new(),
             settings: Settings {

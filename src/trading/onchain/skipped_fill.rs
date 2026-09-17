@@ -30,6 +30,9 @@ pub(crate) enum SkipReason {
     /// canonical address for the symbol its `symbol()` claims to be (a
     /// spoofed or misconfigured token supplied by an `OPERATOR_ROLE` holder).
     UnrecognizedInventoryToken,
+    /// The cash leg, truncated to the settlement stable's own grid, still
+    /// carried digits the six-decimal internal amount cannot hold.
+    UnrepresentableCashAmount,
 }
 
 impl SkipReason {
@@ -40,6 +43,7 @@ impl SkipReason {
             Self::UnintrospectableToken => "unintrospectable_token",
             Self::InvalidInventoryAmount => "invalid_inventory_amount",
             Self::UnrecognizedInventoryToken => "unrecognized_inventory_token",
+            Self::UnrepresentableCashAmount => "unrepresentable_cash_amount",
         }
     }
 }

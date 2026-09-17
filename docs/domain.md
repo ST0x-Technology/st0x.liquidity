@@ -145,13 +145,27 @@ equities appear onchain in two forms, modeled by `TokenizedSymbol<Form>`:
 - `wtCOIN` - ERC-4626 vault shares wrapping tokenized equity
   (`WrappedTokenizedShares`)
 - `AAPL` - base equity stock (offchain, at the brokerage)
-- `USDC` - stablecoin used as the quote currency onchain
+- `USDC` - the settlement stable, the quote currency onchain, on every chain
+  today
 
 Both forms resolve to the same base `Symbol` for offchain hedging (e.g. `tAAPL`
 and `wtAAPL` both resolve to `AAPL`). `WrappedTokenizedShares` is the only
 `TokenizationForm` implemented in code: Raindex events parse
 `TokenizedSymbol<WrappedTokenizedShares>` (`wt` prefix), while Alpaca
 tokenization operates on the base `Symbol` directly.
+
+### Settlement Stable
+
+The stablecoin a chain's cash leg settles in, pinned in code per `Chain` as
+address, symbol and decimals (`Chain::settlement_stable`, type
+`SettlementStable`). Vault polling reads its vault, the fill parse scales the
+cash amount by its decimals, and the inventory view carries its symbol for the
+dashboard's cash row. An `InventoryTrade` fill must quote in its address; a
+`ClearV3`/`TakeOrderV3` fill is matched by its symbol, with the address gated by
+vault discovery. The portfolio snapshot still labels cash `USDC`. USDC on every
+chain today. Circle's USDC is exposed separately (`Chain::cctp_usdc`, `Some`
+only where the stable is that USDC) for the CLI's CCTP commands alone; the
+server corridor still pins its USDC constants.
 
 ### Retired Symbol
 

@@ -4,6 +4,7 @@ import type { UsdcInventory } from '$lib/api/UsdcInventory'
 import { cashInventoryAmounts } from './inventory-cash'
 
 const usdc = (overrides: Partial<UsdcInventory>): UsdcInventory => ({
+  symbol: 'USDC',
   onchainAvailable: '100',
   onchainInflight: '0',
   offchainAvailable: '50',

@@ -174,109 +174,24 @@ where
                 .await;
                 return Ok(());
             }
-            Err(OnChainError::Validation(error @ TradeValidationError::NonPositivePrice(_))) => {
-                // An unpriceable fill (non-zero equity moved at a non-positive
-                // USDC/share price) is anomalous and possibly adversarial. Surface
-                // it loudly and skip THIS fill only -- propagating the error would
-                // exhaust the worker retries and trip the conductor-wide fail-stop,
-                // letting one crafted on-chain fill take the whole bot down.
+            Err(OnChainError::Validation(error)) => {
+                let Some((reason, summary)) = per_fill_skip(&error) else {
+                    return Err(OnChainError::Validation(error).into());
+                };
+
+                // Surface it loudly and skip THIS fill only -- propagating the
+                // error would exhaust the worker retries and trip the
+                // conductor-wide fail-stop, letting one fill take the whole
+                // bot down.
                 error!(
                     target: "hedge",
                     event_type = trade_event.event.kind(),
                     tx_hash = ?trade_event.tx_hash,
                     log_index = trade_event.log_index,
                     %error,
-                    "Skipping unpriceable on-chain fill; it is left unhedged and must be \
-                     reconciled manually"
+                    "{summary}; it is left unhedged and must be reconciled manually"
                 );
-                persist_skipped_fill(
-                    &ctx.pool,
-                    trade_event,
-                    SkipReason::UnpriceableFill,
-                    &error.to_string(),
-                )
-                .await;
-                return Ok(());
-            }
-            Err(OnChainError::Validation(
-                error @ TradeValidationError::TokenIntrospectionFailed { .. },
-            )) => {
-                // InventoryTrade token addresses come from any OPERATOR_ROLE
-                // holder on the shared inventory (Bebop hook, univ4 hook, or a
-                // future venue), not the bot's own trusted order config. A
-                // non-standard token there must not be allowed to exhaust
-                // worker retries and trip the conductor-wide fail-stop --
-                // skip THIS fill only, same as an unpriceable fill.
-                error!(
-                    target: "hedge",
-                    event_type = trade_event.event.kind(),
-                    tx_hash = ?trade_event.tx_hash,
-                    log_index = trade_event.log_index,
-                    %error,
-                    "Skipping InventoryTrade fill with an unintrospectable token; it is \
-                     left unhedged and must be reconciled manually"
-                );
-                persist_skipped_fill(
-                    &ctx.pool,
-                    trade_event,
-                    SkipReason::UnintrospectableToken,
-                    &error.to_string(),
-                )
-                .await;
-                return Ok(());
-            }
-            Err(OnChainError::Validation(
-                error @ TradeValidationError::UnrecognizedInventoryToken { .. },
-            )) => {
-                // An InventoryTrade leg's address didn't match the configured
-                // canonical address for the symbol it claims to be (USDC or
-                // the resolved equity). Same threat model as
-                // TokenIntrospectionFailed: any OPERATOR_ROLE holder can
-                // supply this token, so a spoofed/misconfigured one must not
-                // exhaust worker retries and trip the conductor-wide
-                // fail-stop -- skip THIS fill only.
-                error!(
-                    target: "hedge",
-                    event_type = trade_event.event.kind(),
-                    tx_hash = ?trade_event.tx_hash,
-                    log_index = trade_event.log_index,
-                    %error,
-                    "Skipping InventoryTrade fill with an unrecognized token address; it is \
-                     left unhedged and must be reconciled manually"
-                );
-                persist_skipped_fill(
-                    &ctx.pool,
-                    trade_event,
-                    SkipReason::UnrecognizedInventoryToken,
-                    &error.to_string(),
-                )
-                .await;
-                return Ok(());
-            }
-            Err(OnChainError::Validation(
-                error @ TradeValidationError::InvalidInventoryAmount(_),
-            )) => {
-                // InventoryTrade deposit/withdraw amounts come from any
-                // OPERATOR_ROLE holder on the shared inventory, same threat
-                // model as TokenIntrospectionFailed above: a malformed or
-                // extreme amount must not exhaust worker retries and trip
-                // the conductor-wide fail-stop -- skip THIS fill only.
-                error!(
-                    target: "hedge",
-                    event_type = trade_event.event.kind(),
-                    tx_hash = ?trade_event.tx_hash,
-                    log_index = trade_event.log_index,
-                    %error,
-                    "Skipping InventoryTrade fill with an unconvertible amount; it is \
-                     left unhedged and must be reconciled manually"
-                );
-                persist_skipped_fill(
-                    &ctx.pool,
-                    trade_event,
-                    SkipReason::InvalidInventoryAmount,
-                    &error.to_string(),
-                )
-                .await;
+                persist_skipped_fill(&ctx.pool, trade_event, reason, &error.to_string()).await;
                 return Ok(());
             }
             Err(error) => return Err(error.into()),
@@ -419,6 +334,58 @@ impl AccountForDexTrade {
         }
 
         Ok(())
+    }
+}
+
+/// The validation rejections the accountant skips per fill instead of
+/// propagating: the reason recorded for reconciliation and the log line's
+/// summary. `InventoryTrade` legs come from any `OPERATOR_ROLE` holder on the
+/// shared inventory, not the bot's own trusted order config, so a
+/// non-standard token, a spoofed address or a malformed amount there must not
+/// trip the conductor-wide fail-stop; an unpriceable fill is anomalous,
+/// possibly adversarial, and gets the same treatment, as does a cash leg the
+/// internal amount cannot hold, which is a legitimate on-chain transfer on a
+/// stable with more than six decimals. Everything else is a real bug or a
+/// node fault and propagates.
+fn per_fill_skip(error: &TradeValidationError) -> Option<(SkipReason, &'static str)> {
+    use TradeValidationError::*;
+
+    match error {
+        NonPositivePrice(_) => Some((
+            SkipReason::UnpriceableFill,
+            "Skipping unpriceable on-chain fill",
+        )),
+        TokenIntrospectionFailed { .. } => Some((
+            SkipReason::UnintrospectableToken,
+            "Skipping InventoryTrade fill with an unintrospectable token",
+        )),
+        UnrecognizedInventoryToken { .. } => Some((
+            SkipReason::UnrecognizedInventoryToken,
+            "Skipping InventoryTrade fill with an unrecognized token address",
+        )),
+        InvalidInventoryAmount(_) => Some((
+            SkipReason::InvalidInventoryAmount,
+            "Skipping InventoryTrade fill with an unconvertible amount",
+        )),
+        CashPrecisionLoss { .. } => Some((
+            SkipReason::UnrepresentableCashAmount,
+            "Skipping fill whose cash leg the internal amount cannot hold",
+        )),
+        NoTxHash
+        | NoLogIndex
+        | NoBlockNumber
+        | IntConversion(_)
+        | InvalidIndex(_)
+        | NoInputAtIndex(_)
+        | NoOutputAtIndex(_)
+        | InvalidSymbolConfiguration(..)
+        | TransactionNotFound(_)
+        | NodeReceiptMissing { .. }
+        | AfterClearMissingFromReceipt { .. }
+        | NegativeShares(_)
+        | NegativeUsdc(_)
+        | Float(_)
+        | NotTokenizedEquity { .. } => None,
     }
 }
 
@@ -887,6 +854,7 @@ mod tests {
     };
     use crate::offchain::order::{OffchainOrder, noop_order_placer};
     use crate::onchain::backfill::{BackfillRange, load_backfill_checkpoint};
+    use crate::onchain::io::Usdc;
     use crate::onchain::trade::{INVENTORY_TOKEN_DECIMALS_MAX_RETRIES, InventoryTrade};
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
@@ -1890,6 +1858,18 @@ mod tests {
         assert_eq!(recorded[0].reason, "invalid_inventory_amount");
     }
 
+    /// A cash leg the six-decimal internal amount cannot hold (an
+    /// eighteen-decimal stable moving sub-six-decimal dust) is skipped per
+    /// fill like every other validation rejection, not fail-stopped.
+    #[test]
+    fn an_unrepresentable_cash_leg_is_skipped_per_fill() {
+        let error = Usdc::from_token_amount(float!(100.0000001), 18).unwrap_err();
+
+        let (reason, _) = per_fill_skip(&error).unwrap();
+
+        assert_eq!(reason, SkipReason::UnrepresentableCashAmount);
+    }
+
     /// A hedgeable `InventoryTrade` (real USDC leg + real equity leg, from
     /// the real Bebop-routed prod settlement `0xe13a11de734768f08a9c1ef66e8de3bcb9072f8cdabce9f1d819e1ae9909d4b9`
     /// also pinned at the parser level in `onchain::trade`'s
@@ -2059,7 +2039,7 @@ mod tests {
             let (pool, apalis_pool) = setup_test_pools().await;
             let asserter = Asserter::new();
 
-            let usdc_token = chain.usdc();
+            let usdc_token = chain.settlement_stable().address;
             let equity_token = address!("0x5CdA0E1cA4ce2Af96315F7F8963c85399c172204");
             let operator = address!("0x8b8b6e0507c125934c6129563f48e48c66f86475");
 

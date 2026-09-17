@@ -49,11 +49,13 @@ impl Display for MissingPolicyCoverage {
             self.chain,
         )?;
 
+        let stable = self.chain.settlement_stable().symbol;
+
         for target in &self.missing {
             let symbol = target
                 .symbol
                 .as_ref()
-                .map_or("USDC", st0x_execution::Symbol::as_str);
+                .map_or(stable, st0x_execution::Symbol::as_str);
             writeln!(
                 formatter,
                 "- {symbol}: token {}, spender {}, purpose {:?}",
@@ -126,7 +128,7 @@ fn verify_hedged_chains(
             chain_inputs.inventory,
             &chain_inputs.assets,
             chain_inputs.orderbook,
-            chain.usdc(),
+            chain.settlement_stable().address,
         );
         let context = ApprovalPolicyContext {
             user_id: &snapshot.user_id,

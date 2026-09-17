@@ -1075,6 +1075,7 @@ impl InventoryView {
         st0x_dto::Inventory {
             per_symbol,
             usdc: UsdcInventory {
+                symbol: self.primary_chain.settlement_stable().symbol.to_string(),
                 onchain_available: usdc_onchain_available,
                 onchain_inflight: usdc_onchain_inflight,
                 offchain_available: usdc_offchain_available,
@@ -5876,6 +5877,15 @@ mod tests {
             Usdc::from_cents(200_000).unwrap(),
             "the dashboard cash figure names the primary chain"
         );
+    }
+
+    /// The cash figure is the primary chain's slot, so the label the
+    /// dashboard shows beside it is that chain's settlement stable.
+    #[test]
+    fn to_dto_names_the_primary_chains_settlement_stable() {
+        let dto = InventoryView::for_primary_chain(Chain::HyperEvm).to_dto();
+
+        assert_eq!(dto.usdc.symbol, "USDC");
     }
 
     #[test]

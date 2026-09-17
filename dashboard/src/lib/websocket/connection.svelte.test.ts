@@ -104,6 +104,7 @@ const makeCurrentState = (overrides: Partial<CurrentState> = {}): CurrentState =
   inventory: {
     perSymbol: [],
     usdc: {
+      symbol: 'USDC',
       onchainAvailable: '0',
       onchainInflight: '0',
       offchainAvailable: '0',
@@ -534,6 +535,7 @@ describe('createWebSocket', () => {
             inventory: {
               perSymbol: [],
               usdc: {
+                symbol: 'USDC',
                 onchainAvailable: '0',
                 onchainInflight: '0',
                 offchainAvailable: '0',
@@ -605,7 +607,7 @@ describe('createWebSocket', () => {
         'initial snapshot',
         {
           type: 'current_state',
-          data: { trades: [makeTrade({ shares: '0' })] }
+          data: makeCurrentState({ trades: [makeTrade({ shares: '0' })] })
         }
       ],
       [
@@ -742,6 +744,7 @@ describe('createWebSocket', () => {
           }
         ],
         usdc: {
+          symbol: 'USDC',
           onchainAvailable: '1000',
           onchainInflight: '0',
           offchainAvailable: '500',

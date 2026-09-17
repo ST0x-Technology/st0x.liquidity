@@ -7,7 +7,7 @@ use std::io::Write;
 use thiserror::Error;
 
 use st0x_config::Ctx;
-use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, SettlementStable, Wallet};
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
@@ -170,8 +170,8 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     Ok(())
 }
 
-/// Withdraws USDC from the selected chain's configured cash vault: that
-/// chain's canonical USDC and the first `vault_ids` entry of its
+/// Withdraws cash from the selected chain's configured cash vault: that
+/// chain's settlement stable and the first `vault_ids` entry of its
 /// `[chains.<name>.trading.assets.cash]` table.
 pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     stdout: &mut Writer,
@@ -180,7 +180,11 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let HedgedChainContext { chain, trading, .. } = hedged_chain_context(ctx, network)?;
-    let token = chain.usdc();
+    let SettlementStable {
+        address: token,
+        symbol,
+        ..
+    } = chain.settlement_stable();
 
     let cash = trading.assets.cash.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -197,7 +201,7 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     if cash.vault_ids.len() > 1 {
         writeln!(
             stdout,
-            "Warning: {} USDC vaults configured, using the first one: {vault_id}",
+            "Warning: {} {symbol} vaults configured, using the first one: {vault_id}",
             cash.vault_ids.len()
         )?;
     }
