@@ -139,6 +139,15 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
         .map_err(|error| Failure::Api { error, logging_url })
 }
 
+/// A single query parameter when `value` is given, none otherwise, so an
+/// omitted flag sends no query and the bot applies its default.
+fn optional_query(key: &str, value: Option<String>) -> Vec<(String, String)> {
+    value
+        .map(|value| (key.to_owned(), value))
+        .into_iter()
+        .collect()
+}
+
 async fn dispatch<A: TokenSource + Sync>(
     client: &Client<A>,
     command: Command,
@@ -175,10 +184,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 RecheckTransferType::Usdc => "usdc_bridge",
             };
             let id = encode_segment(&id);
-            let params: Vec<(String, String)> = deposit_tx
-                .map(|tx| ("deposit_tx".to_owned(), tx))
-                .into_iter()
-                .collect();
+            let params = optional_query("deposit_tx", deposit_tx);
             client
                 .post(&format!("/transfers/recheck/{kind}/{id}"), &params)
                 .await?
@@ -295,10 +301,7 @@ async fn dispatch<A: TokenSource + Sync>(
         }
         Command::Debug(Debug::ProcessTx { tx_hash, chain }) => {
             let tx_hash = encode_segment(&tx_hash);
-            let params: Vec<(String, String)> = chain
-                .map(|chain| ("chain".to_owned(), chain.wire_name().to_owned()))
-                .into_iter()
-                .collect();
+            let params = optional_query("chain", chain.map(|chain| chain.wire_name().to_owned()));
             client
                 .post(&format!("/transactions/{tx_hash}/process"), &params)
                 .await?

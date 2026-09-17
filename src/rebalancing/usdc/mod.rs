@@ -17,6 +17,8 @@ pub(crate) use job::{
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
     TransferUsdcToMarketMakingJobQueue,
 };
+#[cfg(test)]
+pub(crate) use manager::RecoveredCctpMint;
 pub use manager::{
     CrossVenueCashTransfer, DepositSendNotSuperseded, EthereumChainMissing,
     MarketMakingUsdcEndpoints, UsdcSettlementParams, deposit_send_required_confirmations,
