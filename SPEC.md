@@ -190,9 +190,10 @@ unavailable. Its vault balances are polled like any hedged chain's; automated
 rebalancing remains on Base.
 
 Robinhood Chain (chain id 4663, an Arbitrum Orbit L2) is declared the same way.
-The build provides fill ingestion, hedging, signing and gas valuation on it; the
-shipped configuration has no trading table and runs it observe-only, so nothing
-is ingested or signed until a trading table and signer are configured. Its
+The build provides fill ingestion, hedging, signing and gas valuation on it, and
+the shipped configuration runs it as a prefunded hedge-only secondary: fills on
+its orderbook are ingested, validated against USDG and hedged, while every asset
+keeps `rebalancing = "disabled"` and no inventory adapter is mapped. Its
 settlement stable is USDG at `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6
 decimals), so it is the first chain whose stable CCTP cannot carry. It pays gas
 in ETH, so the Base Chainlink ETH/USD read values its gas and `active` is
@@ -514,8 +515,7 @@ excellent async ecosystem for handling concurrent trading flows.
   governs transaction-submission paths only and does not affect fill ingestion.
   Every backfill path, including durable retries, uses the hedged chain's
   explicit policy: HyperEVM 50 blocks, Base, Ethereum and Robinhood 1000 blocks
-  per request, counted inclusively (Robinhood's inherits Base's until the
-  serving RPC's cap is measured). Adding a chain requires an explicit policy
+  per request, counted inclusively. Adding a chain requires an explicit policy
   before the code compiles. Poll intervals remain required deployment
   configuration; block limits are constants and need no new configuration field.
   The cutoff tag is configured via `ingestion_cutoff` (required field):
