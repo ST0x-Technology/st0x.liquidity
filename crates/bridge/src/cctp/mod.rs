@@ -32,8 +32,7 @@
 //!
 //! ```rust,ignore
 //! let bridge = CctpBridge::try_from_ctx(CctpCtx {
-//!     usdc_ethereum,
-//!     usdc_base,
+//!     corridor: CctpCorridor::ethereum_base()?,
 //!     ethereum_wallet,
 //!     base_wallet,
 //! })?;
@@ -314,10 +313,8 @@ fn parse_received_message(message: &[u8]) -> Result<CctpReceivedMessage<'_>, Cct
 /// Providers are obtained from the wallets via `Wallet`'s inherited
 /// [`Evm::provider()`](st0x_evm::Evm::provider).
 pub struct CctpCtx<EthWallet, BaseWallet> {
-    /// USDC token address on Ethereum
-    pub usdc_ethereum: Address,
-    /// USDC token address on Base
-    pub usdc_base: Address,
+    /// The corridor's USDC on both ends, validated at config load.
+    pub corridor: CctpCorridor,
     /// Wallet for submitting transactions on Ethereum
     pub ethereum_wallet: EthWallet,
     /// Wallet for submitting transactions on Base
@@ -380,7 +377,7 @@ impl CctpCorridor {
 }
 
 fn circle_usdc(chain: Chain) -> Result<Address, CorridorStableNotUsdc> {
-    chain.cctp_usdc().ok_or(CorridorStableNotUsdc {
+    chain.cctp_usdc().ok_or_else(|| CorridorStableNotUsdc {
         chain,
         stable: chain.settlement_stable().symbol,
     })
@@ -392,8 +389,7 @@ fn circle_usdc(chain: Chain) -> Result<Address, CorridorStableNotUsdc> {
 ///
 /// ```rust,ignore
 /// let bridge = CctpBridge::try_from_ctx(CctpCtx {
-///     usdc_ethereum: USDC_ETHEREUM,
-///     usdc_base: USDC_BASE,
+///     corridor: CctpCorridor::ethereum_base()?,
 ///     ethereum_wallet,
 ///     base_wallet,
 /// })?;
@@ -665,14 +661,14 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         let message_transmitter = MESSAGE_TRANSMITTER_V2;
 
         let ethereum = CctpEndpoint::new(
-            ctx.usdc_ethereum,
+            ctx.corridor.usdc_ethereum,
             token_messenger,
             message_transmitter,
             ctx.ethereum_wallet,
         );
 
         let base = CctpEndpoint::new(
-            ctx.usdc_base,
+            ctx.corridor.usdc_base,
             token_messenger,
             message_transmitter,
             ctx.base_wallet,

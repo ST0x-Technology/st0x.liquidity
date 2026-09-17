@@ -7,10 +7,10 @@ use std::hash::BuildHasher;
 use std::sync::Arc;
 use tracing::info;
 
-use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
+use st0x_bridge::cctp::{CctpBridge, CctpCorridor, CctpCtx, CctpError};
 use st0x_config::{ChainEquityAsset, OnchainWalletCtx};
 use st0x_event_sorcery::Store;
-use st0x_evm::{USDC_BASE, USDC_ETHEREUM, Wallet};
+use st0x_evm::Wallet;
 use st0x_execution::{AlpacaWalletService, EmptySymbolError, Symbol};
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrappedEquity;
@@ -112,6 +112,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
         broker: InstrumentedAlpacaBroker,
         wallet: Arc<AlpacaWalletService>,
         wallets: ChainWallets<Signer>,
+        corridor: CctpCorridor,
         raindex: Arc<RaindexService<Signer>>,
         settlement: UsdcSettlementParams,
     ) -> Result<Self, SpawnRebalancerError> {
@@ -121,8 +122,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
         } = wallets;
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ETHEREUM,
-                usdc_base: USDC_BASE,
+                corridor,
                 ethereum_wallet,
                 base_wallet,
                 #[cfg(feature = "test-support")]
@@ -205,9 +205,9 @@ mod tests {
 
     use st0x_config::{ChainAssets, OperationMode, RebalancingCtx};
     use st0x_event_sorcery::test_store;
-    use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::test_chain::evm_mapping_slot;
+    use st0x_evm::{Evm, USDC_ETHEREUM};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
         AlpacaWalletService, Executor, Symbol, TimeInForce,
@@ -410,8 +410,7 @@ mod tests {
 
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ETHEREUM,
-                usdc_base: USDC_BASE,
+                corridor: CctpCorridor::ethereum_base().unwrap(),
                 ethereum_wallet,
                 base_wallet: base_wallet.clone(),
                 #[cfg(feature = "test-support")]
@@ -500,6 +499,7 @@ mod tests {
             broker,
             wallet,
             wallets,
+            rebalancing_ctx.cctp_corridor,
             raindex,
             make_test_settlement(&rebalancing_ctx),
         )

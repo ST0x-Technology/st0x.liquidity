@@ -2741,6 +2741,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
         broker,
         alpaca_wallet,
         wallets,
+        rebalancing_ctx.cctp_corridor,
         raindex_service,
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,

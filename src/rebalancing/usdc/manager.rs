@@ -4884,8 +4884,8 @@ mod tests {
 
     use st0x_bridge::Bridge;
     use st0x_bridge::cctp::{
-        CctpAttestationMock, CctpBridge, CctpCtx, TestMintBurnToken, deploy_cctp_on_chain,
-        link_chains, mint_usdc, set_max_burn_amount,
+        CctpAttestationMock, CctpBridge, CctpCorridor, CctpCtx, TestMintBurnToken,
+        deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
     };
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -5835,8 +5835,7 @@ mod tests {
         wallet: Signer,
     ) -> (CctpBridge<Signer, Signer>, RaindexService<Signer>) {
         let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
-            usdc_ethereum: USDC_ADDRESS,
-            usdc_base: USDC_ADDRESS,
+            corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
             ethereum_wallet: wallet.clone(),
             base_wallet: wallet.clone(),
             #[cfg(feature = "test-support")]
@@ -5872,8 +5871,7 @@ mod tests {
         circle_api_base: String,
     ) -> (CctpBridge<Signer, Signer>, RaindexService<Signer>) {
         let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
-            usdc_ethereum: USDC_ADDRESS,
-            usdc_base: USDC_ADDRESS,
+            corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
             ethereum_wallet: wallet.clone(),
             base_wallet: wallet.clone(),
             circle_api_base,
@@ -11371,8 +11369,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: attestation.base_url(),
@@ -11563,8 +11560,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: attestation.base_url(),
@@ -11749,8 +11745,7 @@ mod tests {
             .unwrap();
 
         let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
-            usdc_ethereum: USDC_ADDRESS,
-            usdc_base: USDC_ADDRESS,
+            corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
             ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
             base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
             circle_api_base: attestation.base_url(),
@@ -15636,8 +15631,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -17146,8 +17140,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -17533,8 +17526,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -17663,8 +17655,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -17902,8 +17893,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -18103,8 +18093,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -18340,8 +18329,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -18476,8 +18464,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -18639,8 +18626,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -18844,8 +18830,7 @@ mod tests {
 
         let cctp_bridge = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
-                usdc_ethereum: USDC_ADDRESS,
-                usdc_base: USDC_ADDRESS,
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
                 circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),

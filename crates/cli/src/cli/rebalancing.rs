@@ -13,9 +13,7 @@ use uuid::Uuid;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_config::{BrokerCtx, Ctx, HedgedChain, OnchainWalletCtx};
 use st0x_event_sorcery::StoreBuilder;
-use st0x_evm::{
-    Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM, Wallet,
-};
+use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Executor,
     FractionalShares, Positive, Symbol, TimeInForce,
@@ -757,8 +755,7 @@ async fn run_usdc_transfer<Writer: Write>(
     )?);
 
     let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
-        usdc_ethereum: USDC_ETHEREUM,
-        usdc_base: USDC_BASE,
+        corridor: ctx.rebalancing.cctp_corridor,
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
         base_wallet: wallet_ctx.base_wallet().clone(),
         #[cfg(feature = "test-support")]
