@@ -37,6 +37,8 @@ use st0x_wrapper::{Wrapper, WrapperError};
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
 #[cfg(test)]
+use crate::alerts::LogNotifier;
+#[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::conductor::job::{BackpressureStreak, QueuePushError};
 use crate::equity_redemption::{
@@ -54,6 +56,8 @@ use crate::inventory::{
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
 use crate::position::{Position, PositionEvent};
+#[cfg(test)]
+use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::equity::{
     TransferEquityToHedging, TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
     TransferEquityToMarketMakingJobQueue,
@@ -76,6 +80,14 @@ use crate::usdc_rebalance::{
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
 use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
+#[cfg(test)]
+use st0x_config::{ChainCashAsset, ChainEquities};
+#[cfg(test)]
+use st0x_event_sorcery::{StoreBuilder, test_store};
+#[cfg(test)]
+use st0x_float_macro::float;
+#[cfg(test)]
+use tokio::sync::broadcast;
 
 pub(crate) use equity::{EquityRebalancingCheck, EquityRebalancingCheckScheduler};
 #[cfg(test)]
@@ -6319,16 +6331,6 @@ pub(crate) async fn wire_usdc_reactor_store(
     pool: &sqlx::SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
 ) -> (Arc<RebalancingService>, Arc<Store<UsdcRebalance>>) {
-    use crate::alerts::LogNotifier;
-    use crate::rebalancing::RebalancingSchedulers;
-    use crate::rebalancing::equity::EquityTransferServices;
-    use st0x_config::{ChainAssets, ChainCashAsset, ChainEquities, OperationMode};
-    use st0x_event_sorcery::{StoreBuilder, test_store};
-    use st0x_float_macro::float;
-    use std::collections::BTreeMap;
-    use std::time::Duration;
-    use tokio::sync::broadcast;
-
     let (event_sender, _) = broadcast::channel(16);
     let inventory = Arc::new(BroadcastingInventory::new(
         InventoryView::default(),

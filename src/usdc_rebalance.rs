@@ -950,10 +950,13 @@ pub enum UsdcRebalance {
 /// [`UsdcRebalance::pre_burn_fail_eligibility`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreBurnFailEligibility {
-    /// `WithdrawalComplete` or `BridgingSubmitting` with no recorded burn:
-    /// `FailBridging` lands the guard-clearing pre-burn terminal.
+    /// `WithdrawalComplete` or `BridgingSubmitting` with no recorded burn.
+    /// `FailBridging` creates a non-guard-holding terminal for BaseToAlpaca,
+    /// but retains the guard for AlpacaToBase because funds already left Alpaca;
+    /// that direction requires `transfer reconcile --kind usdc`.
     Eligible,
-    /// Already `BridgingFailed` with no burn evidence; nothing to do.
+    /// Already `BridgingFailed` with no burn evidence. BaseToAlpaca needs no
+    /// further guard action; AlpacaToBase still requires transfer reconciliation.
     AlreadyFailedPreBurn,
     /// A CCTP burn may already be on-chain; failing would strand the funds.
     PostBurn,
@@ -1046,7 +1049,7 @@ impl UsdcRebalance {
     }
 
     /// Classifies the state for `fail-usdc-transfer`, the operator command
-    /// that drives a stranded pre-burn rebalance to the guard-clearing
+    /// that drives a stranded pre-burn rebalance to the direction-sensitive
     /// `BridgingFailed { burn_tx_hash: None }` terminal.
     ///
     /// The SINGLE source of that rule for the CLI preflight and the ops API
@@ -1067,8 +1070,8 @@ impl UsdcRebalance {
                 pending_burn_tx: None,
                 ..
             } => PreBurnFailEligibility::Eligible,
-            // Already the pre-burn failed terminal: the guard is already in
-            // its cleared state and will not re-arm on restart.
+            // Already the pre-burn failed terminal. BaseToAlpaca is clearable;
+            // AlpacaToBase still holds the guard until transfer reconciliation.
             Self::BridgingFailed {
                 burn_tx_hash: None,
                 cctp_nonce: None,

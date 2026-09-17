@@ -557,11 +557,13 @@ Use `fail-usdc-transfer` when a USDC rebalance is stranded at
 the direction:
 
 - **BaseToAlpaca**: no funds left the source venue, so the failure is
-  non-guard-holding. The rebalancing guard clears on the next bot restart.
+  non-guard-holding. The offline command clears the rebalancing guard on the
+  next bot restart; the live route clears it immediately through the wired
+  reactor.
 - **AlpacaToBase**: the withdrawal already moved the funds off Alpaca, so the
   failure KEEPS the guard -- releasing it would let a new transfer misattribute
   those funds. Settle the funds with `transfer reconcile --kind usdc`, which
-  releases the guard; a restart re-latches it until then.
+  releases the guard; both live recovery and restart keep it latched until then.
 
 **Stop the bot before running the offline `stox fail-usdc-transfer`** to
 eliminate the race where the bot advances the transfer to `Bridging` between the
@@ -569,8 +571,10 @@ preflight and the send. The same operation is available against the live bot as
 `POST /liquidity-write/transfers/usdc/{id}/fail` (client:
 `st0x-liquidity-client debug fail-usdc-transfer <id> --reason ...`); that path
 runs under the resume lock with the USDC driver quiesced, so it does not need
-the bot stopped. Its `guardHeld` response field reports the direction split
-above.
+the bot stopped. It sends through the conductor's wired store, whose reactor
+updates the in-memory guard immediately: BaseToAlpaca clears it, while
+AlpacaToBase retains it until reconciliation. Live recovery therefore requires
+no bot restart; the `guardHeld` response reports the resulting state.
 
 `WithdrawalComplete` is unconditionally pre-burn: no CCTP burn has been
 broadcast yet, but the source withdrawal has completed in either direction. The

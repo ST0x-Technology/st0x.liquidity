@@ -892,12 +892,13 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
 }
 
 /// Drive a pre-burn `BridgingSubmitting` or `WithdrawalComplete` USDC rebalance
-/// to the guard-clearing terminal `BridgingFailed { burn_tx_hash: None }`.
+/// to `BridgingFailed { burn_tx_hash: None }`.
 ///
 /// `WithdrawalComplete` is pre-CCTP-burn: no burn intent has been recorded.
 /// However, the source withdrawal has already completed and the USDC is sitting
-/// in the market-maker wallet awaiting bridging. After clearing the guard, the
-/// operator must reconcile or handle those funds separately.
+/// in the market-maker wallet awaiting bridging. The resulting guard state is
+/// direction-sensitive: BaseToAlpaca clears after restart, while AlpacaToBase
+/// remains held until the operator reconciles the withdrawn funds.
 ///
 /// `BridgingSubmitting` records burn intent but does NOT guarantee no burn was
 /// broadcast. A crash at this state may have broadcast a CCTP burn whose
@@ -915,13 +916,13 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
 /// a guard-HOLDING `BridgingFailed`), so the aggregate does NOT serve as a
 /// safety net here.
 ///
-/// The command is CLI-direct (no running bot required). The live in-memory
-/// `usdc_in_progress` guard is NOT cleared by this command; a bot restart
-/// reconciles it. The restart outcome is direction-aware, matching
-/// `holds_rebalance_guard()`: for a BaseToAlpaca failure `recover_usdc_guard`
-/// skips the non-guard-holding `BridgingFailed { burn_tx_hash: None }` and the
-/// guard clears, whereas for an AlpacaToBase failure (funds already off Alpaca)
-/// it re-latches the guard until the operator runs `transfer reconcile`.
+/// This offline command writes directly to the local database and MUST run only
+/// while the bot is stopped. Its standalone store does not notify the running
+/// bot's reactor, so stopping the bot also eliminates the race with a worker
+/// advancing the transfer between preflight and send. When the bot is running,
+/// use the live `st0x-liquidity-client debug fail-usdc-transfer` command instead;
+/// that route quiesces the USDC driver and sends through the wired store so the
+/// in-memory guard is updated immediately.
 pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
