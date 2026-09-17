@@ -1138,19 +1138,28 @@ impl RebalancingService {
     async fn retry_pending_equity_transfer_reservation_restores(
         &self,
     ) -> Result<(), RebalancingServiceError> {
-        let pending: Vec<_> = self
+        if self
             .pending_equity_transfer_reservation_restores
             .read()
             .await
-            .iter()
-            .map(|(reservation_id, symbol)| (*reservation_id, symbol.clone()))
-            .collect();
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let (store, threshold) = self.position_authority().await?;
+        let mut pending = self
+            .pending_equity_transfer_reservation_restores
+            .write()
+            .await;
         if pending.is_empty() {
             return Ok(());
         }
 
-        let (store, threshold) = self.position_authority().await?;
-        for (reservation_id, symbol) in pending {
+        let entries: Vec<_> = pending
+            .iter()
+            .map(|(reservation_id, symbol)| (*reservation_id, symbol.clone()))
+            .collect();
+        for (reservation_id, symbol) in entries {
             match store
                 .send(
                     &symbol,
@@ -1163,10 +1172,7 @@ impl RebalancingService {
                 .await
             {
                 Ok(()) => {
-                    self.pending_equity_transfer_reservation_restores
-                        .write()
-                        .await
-                        .remove(&reservation_id);
+                    pending.remove(&reservation_id);
                 }
                 Err(AggregateError::UserError(LifecycleError::Apply(
                     PositionError::PendingExecution { .. },
@@ -1174,6 +1180,7 @@ impl RebalancingService {
                 Err(error) => return Err(error.into()),
             }
         }
+        drop(pending);
 
         Ok(())
     }
@@ -5303,7 +5310,20 @@ impl RebalancingService {
         false
     }
 
+    async fn cancel_pending_equity_transfer_reservation_restore(
+        &self,
+        reservation_id: EquityTransferReservationId,
+    ) {
+        self.pending_equity_transfer_reservation_restores
+            .write()
+            .await
+            .remove(&reservation_id);
+    }
+
     async fn queue_terminal_mint_reservation_release(&self, id: &IssuerRequestId, symbol: &Symbol) {
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        self.cancel_pending_equity_transfer_reservation_restore(reservation_id)
+            .await;
         self.pending_timed_out_mint_reservation_releases
             .write()
             .await
@@ -5337,6 +5357,9 @@ impl RebalancingService {
         id: &RedemptionAggregateId,
         symbol: &Symbol,
     ) {
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        self.cancel_pending_equity_transfer_reservation_restore(reservation_id)
+            .await;
         self.pending_timed_out_redemption_reservation_releases
             .write()
             .await
@@ -5366,12 +5389,15 @@ impl RebalancingService {
     }
 
     async fn release_timed_out_mint_reservation(&self, id: &IssuerRequestId, symbol: &Symbol) {
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        self.cancel_pending_equity_transfer_reservation_restore(reservation_id)
+            .await;
         self.pending_timed_out_mint_reservation_releases
             .write()
             .await
             .insert(id.clone(), symbol.clone());
         match self
-            .release_terminal_equity_transfer(symbol, EquityTransferReservationId::from_uuid(id.0))
+            .release_terminal_equity_transfer(symbol, reservation_id)
             .await
         {
             Ok(true) => {
@@ -5398,12 +5424,15 @@ impl RebalancingService {
         id: &RedemptionAggregateId,
         symbol: &Symbol,
     ) {
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        self.cancel_pending_equity_transfer_reservation_restore(reservation_id)
+            .await;
         self.pending_timed_out_redemption_reservation_releases
             .write()
             .await
             .insert(id.clone(), symbol.clone());
         match self
-            .release_terminal_equity_transfer(symbol, EquityTransferReservationId::from_uuid(id.0))
+            .release_terminal_equity_transfer(symbol, reservation_id)
             .await
         {
             Ok(true) => {
@@ -11700,6 +11729,120 @@ mod tests {
                 id: reservation_id,
                 status: EquityTransferReservationStatus::Confirmed,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_cancels_deferred_reservation_restore() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mint_id = issuer_request_id("terminal-deferred-restore");
+        let reservation_id = EquityTransferReservationId::from_uuid(mint_id.0);
+        trigger
+            .recover_equity_transfer_reservations(&HashSet::from([(
+                symbol.clone(),
+                reservation_id,
+            )]))
+            .await
+            .unwrap();
+        assert!(
+            trigger
+                .pending_equity_transfer_reservation_restores
+                .read()
+                .await
+                .contains_key(&reservation_id),
+            "startup recovery must defer the reservation while the hedge is pending"
+        );
+
+        trigger
+            .release_timed_out_mint_reservation(&mint_id, &symbol)
+            .await;
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id,
+                    error: "test terminal failure".to_string(),
+                    anchor: AnchorDisposition::Release,
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .retry_pending_equity_transfer_reservation_restores()
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger
+                .pending_equity_transfer_reservation_restores
+                .read()
+                .await
+                .contains_key(&reservation_id),
+            "terminal cleanup must remove the deferred restore owner"
+        );
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "a later retry sweep must not resurrect a terminal transfer reservation"
         );
     }
 
