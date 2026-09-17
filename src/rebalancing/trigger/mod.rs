@@ -776,6 +776,11 @@ pub(crate) struct RebalancingService {
     pending_timed_out_mint_reservation_releases: Arc<RwLock<HashMap<IssuerRequestId, Symbol>>>,
     pending_timed_out_redemption_reservation_releases:
         Arc<RwLock<HashMap<RedemptionAggregateId, Symbol>>>,
+    /// Reservations created by a trigger check that produced no durable job.
+    /// The exact reservation ID stays here until Position acknowledges release;
+    /// otherwise a transient store failure can permanently block hedging.
+    pending_pre_enqueue_reservation_releases:
+        Arc<RwLock<HashMap<EquityTransferReservationId, Symbol>>>,
     timed_out_usdc_rebalances: Arc<RwLock<HashMap<UsdcRebalanceId, DateTime<Utc>>>>,
     /// Requested-stage mint timeouts already logged. Issuer request ids are
     /// unique, so retaining an id suppresses duplicate warnings permanently.
@@ -935,6 +940,7 @@ impl RebalancingService {
             pending_timed_out_redemption_reservation_releases: Arc::new(
                 RwLock::new(HashMap::new()),
             ),
+            pending_pre_enqueue_reservation_releases: Arc::new(RwLock::new(HashMap::new())),
             timed_out_usdc_rebalances: Arc::new(RwLock::new(HashMap::new())),
             requested_stage_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
@@ -1115,7 +1121,7 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
-        self.retry_timeout_reservation_releases().await;
+        self.retry_pending_reservation_releases().await;
         self.prune_timeout_markers(now).await;
         self.expire_stuck_mints(now).await?;
         self.expire_stuck_redemptions(now).await?;
@@ -3388,21 +3394,6 @@ impl RebalancingService {
         }
     }
 
-    async fn release_equity_transfer(
-        &self,
-        symbol: &Symbol,
-        reservation_id: EquityTransferReservationId,
-    ) -> Result<(), equity::EquityTriggerError> {
-        let (store, _) = self.position_authority().await?;
-        store
-            .send(
-                symbol,
-                PositionCommand::ReleaseEquityTransfer { reservation_id },
-            )
-            .await?;
-        Ok(())
-    }
-
     async fn is_restart_tainted(&self, symbol: &Symbol) -> bool {
         self.inventory.read().await.is_restart_tainted(symbol)
     }
@@ -3958,6 +3949,17 @@ impl RebalancingService {
         }
         .await;
 
+        self.finish_equity_trigger_attempt(symbol, reservation_id, guard, attempt)
+            .await
+    }
+
+    async fn finish_equity_trigger_attempt(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+        guard: equity::InProgressGuard,
+        attempt: Result<bool, equity::EquityTriggerError>,
+    ) -> Result<(), equity::EquityTriggerError> {
         match attempt {
             Ok(true) => {
                 debug!(target: "rebalance", %symbol, %reservation_id, "Triggered equity rebalancing");
@@ -3965,11 +3967,13 @@ impl RebalancingService {
                 Ok(())
             }
             Ok(false) => {
-                self.release_equity_transfer(symbol, reservation_id).await?;
+                self.release_pre_enqueue_equity_transfer(symbol, reservation_id)
+                    .await;
                 Ok(())
             }
             Err(error) => {
-                self.release_equity_transfer(symbol, reservation_id).await?;
+                self.release_pre_enqueue_equity_transfer(symbol, reservation_id)
+                    .await;
                 Err(error)
             }
         }
@@ -5155,6 +5159,40 @@ impl RebalancingService {
         Ok(true)
     }
 
+    async fn release_pre_enqueue_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) {
+        self.pending_pre_enqueue_reservation_releases
+            .write()
+            .await
+            .insert(reservation_id, symbol.clone());
+
+        match self
+            .release_terminal_equity_transfer(symbol, reservation_id)
+            .await
+        {
+            Ok(true) => {
+                self.pending_pre_enqueue_reservation_releases
+                    .write()
+                    .await
+                    .remove(&reservation_id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    %reservation_id,
+                    %error,
+                    "Failed to release pre-enqueue equity transfer reservation; \
+                     retaining it for the periodic retry sweep"
+                );
+            }
+        }
+    }
+
     async fn retry_terminal_reservation_release_after_reactor(
         store: Arc<Store<Position>>,
         symbol: Symbol,
@@ -5309,7 +5347,36 @@ impl RebalancingService {
         }
     }
 
-    async fn retry_timeout_reservation_releases(&self) {
+    async fn retry_pending_reservation_releases(&self) {
+        let pending_pre_enqueue = self
+            .pending_pre_enqueue_reservation_releases
+            .read()
+            .await
+            .clone();
+        for (reservation_id, symbol) in pending_pre_enqueue {
+            match self
+                .release_terminal_equity_transfer(&symbol, reservation_id)
+                .await
+            {
+                Ok(true) => {
+                    self.pending_pre_enqueue_reservation_releases
+                        .write()
+                        .await
+                        .remove(&reservation_id);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        %reservation_id,
+                        %error,
+                        "Failed to retry pre-enqueue equity transfer reservation release"
+                    );
+                }
+            }
+        }
+
         let pending_mints = self
             .pending_timed_out_mint_reservation_releases
             .read()
@@ -19716,6 +19783,74 @@ mod tests {
                 .read()
                 .await
                 .contains_key(&id)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pre_enqueue_release_is_retained_for_retry() {
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let reservation_id = EquityTransferReservationId::generate();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+        let guard = service
+            .try_claim_equity_guard_for_transfer(&symbol)
+            .expect("test owns the transfer guard");
+        let (position_store, position_projection) = install_closed_position_store(&service).await;
+
+        service
+            .finish_equity_trigger_attempt(
+                &symbol,
+                reservation_id,
+                guard,
+                Ok::<bool, equity::EquityTriggerError>(false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service
+                .pending_pre_enqueue_reservation_releases
+                .read()
+                .await
+                .get(&reservation_id),
+            Some(&symbol)
+        );
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation
+                .unwrap()
+                .status,
+            EquityTransferReservationStatus::Confirmed
+        );
+
+        service
+            .set_position_authority(
+                position_store,
+                position_projection.clone(),
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        service.retry_pending_reservation_releases().await;
+
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+        assert!(
+            service
+                .pending_pre_enqueue_reservation_releases
+                .read()
+                .await
+                .is_empty()
         );
     }
 
