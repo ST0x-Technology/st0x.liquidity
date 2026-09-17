@@ -678,6 +678,11 @@ struct TimeoutTombstone {
     timed_out_at: DateTime<Utc>,
 }
 
+enum PendingEquityTransferReservationRestore {
+    Pending(Symbol),
+    Restoring(Symbol),
+}
+
 /// Whether a terminal equity transfer event reconciled the in-memory
 /// inventory ledger. Mirrors [`usdc::UsdcSettlementOutcome`]:
 /// `DeferredToSnapshot` means the durable event was accepted as authoritative
@@ -786,7 +791,7 @@ pub(crate) struct RebalancingService {
     /// execution on the same restore command; this sweep also covers
     /// recovery-held transfers without a runnable transfer job.
     pending_equity_transfer_reservation_restores:
-        Arc<RwLock<HashMap<EquityTransferReservationId, Symbol>>>,
+        Arc<RwLock<HashMap<EquityTransferReservationId, PendingEquityTransferReservationRestore>>>,
     timed_out_usdc_rebalances: Arc<RwLock<HashMap<UsdcRebalanceId, DateTime<Utc>>>>,
     /// Requested-stage mint timeouts already logged. Issuer request ids are
     /// unique, so retaining an id suppresses duplicate warnings permanently.
@@ -1119,7 +1124,10 @@ impl RebalancingService {
                     self.pending_equity_transfer_reservation_restores
                         .write()
                         .await
-                        .insert(*reservation_id, symbol.clone());
+                        .insert(
+                            *reservation_id,
+                            PendingEquityTransferReservationRestore::Pending(symbol.clone()),
+                        );
                     warn!(
                         target: "rebalance",
                         %symbol,
@@ -1147,18 +1155,24 @@ impl RebalancingService {
             return Ok(());
         }
         let (store, threshold) = self.position_authority().await?;
-        let mut pending = self
-            .pending_equity_transfer_reservation_restores
-            .write()
-            .await;
-        if pending.is_empty() {
-            return Ok(());
-        }
+        let entries: Vec<_> = {
+            let mut pending = self
+                .pending_equity_transfer_reservation_restores
+                .write()
+                .await;
+            pending
+                .iter_mut()
+                .filter_map(|(reservation_id, state)| match state {
+                    PendingEquityTransferReservationRestore::Pending(symbol) => {
+                        let symbol = symbol.clone();
+                        *state = PendingEquityTransferReservationRestore::Restoring(symbol.clone());
+                        Some((*reservation_id, symbol))
+                    }
+                    PendingEquityTransferReservationRestore::Restoring(_) => None,
+                })
+                .collect()
+        };
 
-        let entries: Vec<_> = pending
-            .iter()
-            .map(|(reservation_id, symbol)| (*reservation_id, symbol.clone()))
-            .collect();
         for (reservation_id, symbol) in entries {
             match store
                 .send(
@@ -1172,15 +1186,71 @@ impl RebalancingService {
                 .await
             {
                 Ok(()) => {
-                    pending.remove(&reservation_id);
+                    let canceled = {
+                        let mut pending = self
+                            .pending_equity_transfer_reservation_restores
+                            .write()
+                            .await;
+                        match pending.get(&reservation_id) {
+                            Some(PendingEquityTransferReservationRestore::Restoring(
+                                restoring_symbol,
+                            )) if restoring_symbol == &symbol => {
+                                pending.remove(&reservation_id);
+                                false
+                            }
+                            None => true,
+                            Some(_) => false,
+                        }
+                    };
+                    if canceled {
+                        store
+                            .send(
+                                &symbol,
+                                PositionCommand::ReleaseEquityTransfer { reservation_id },
+                            )
+                            .await?;
+                    }
                 }
                 Err(AggregateError::UserError(LifecycleError::Apply(
                     PositionError::PendingExecution { .. },
-                ))) => {}
-                Err(error) => return Err(error.into()),
+                ))) => {
+                    let mut pending = self
+                        .pending_equity_transfer_reservation_restores
+                        .write()
+                        .await;
+                    if matches!(
+                        pending.get(&reservation_id),
+                        Some(PendingEquityTransferReservationRestore::Restoring(
+                            restoring_symbol
+                        )) if restoring_symbol == &symbol
+                    ) {
+                        pending.insert(
+                            reservation_id,
+                            PendingEquityTransferReservationRestore::Pending(symbol),
+                        );
+                    }
+                }
+                Err(error) => {
+                    let mut pending = self
+                        .pending_equity_transfer_reservation_restores
+                        .write()
+                        .await;
+                    if matches!(
+                        pending.get(&reservation_id),
+                        Some(PendingEquityTransferReservationRestore::Restoring(
+                            restoring_symbol
+                        )) if restoring_symbol == &symbol
+                    ) {
+                        pending.insert(
+                            reservation_id,
+                            PendingEquityTransferReservationRestore::Pending(symbol),
+                        );
+                    }
+                    drop(pending);
+                    return Err(error.into());
+                }
             }
         }
-        drop(pending);
 
         Ok(())
     }
@@ -5321,29 +5391,29 @@ impl RebalancingService {
     }
 
     async fn queue_terminal_mint_reservation_release(&self, id: &IssuerRequestId, symbol: &Symbol) {
-        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
-        self.cancel_pending_equity_transfer_reservation_restore(reservation_id)
-            .await;
         self.pending_timed_out_mint_reservation_releases
             .write()
             .await
             .insert(id.clone(), symbol.clone());
 
-        let Some(store) = self.position_store.read().await.as_ref().map(Arc::clone) else {
-            warn!(
-                target: "rebalance",
-                %id,
-                %symbol,
-                "Position authority is not wired; retaining terminal mint \
-                 reservation for the periodic retry sweep"
-            );
-            return;
-        };
+        let store = self.position_store.read().await.as_ref().map(Arc::clone);
         let pending = Arc::clone(&self.pending_timed_out_mint_reservation_releases);
+        let pending_restores = Arc::clone(&self.pending_equity_transfer_reservation_restores);
         let id = id.clone();
         let symbol = symbol.clone();
         let reservation_id = EquityTransferReservationId::from_uuid(id.0);
         drop(tokio::spawn(async move {
+            pending_restores.write().await.remove(&reservation_id);
+            let Some(store) = store else {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %symbol,
+                    "Position authority is not wired; retaining terminal mint \
+                     reservation for the periodic retry sweep"
+                );
+                return;
+            };
             if Self::retry_terminal_reservation_release_after_reactor(store, symbol, reservation_id)
                 .await
             {
@@ -5357,29 +5427,29 @@ impl RebalancingService {
         id: &RedemptionAggregateId,
         symbol: &Symbol,
     ) {
-        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
-        self.cancel_pending_equity_transfer_reservation_restore(reservation_id)
-            .await;
         self.pending_timed_out_redemption_reservation_releases
             .write()
             .await
             .insert(id.clone(), symbol.clone());
 
-        let Some(store) = self.position_store.read().await.as_ref().map(Arc::clone) else {
-            warn!(
-                target: "rebalance",
-                %id,
-                %symbol,
-                "Position authority is not wired; retaining terminal redemption \
-                 reservation for the periodic retry sweep"
-            );
-            return;
-        };
+        let store = self.position_store.read().await.as_ref().map(Arc::clone);
         let pending = Arc::clone(&self.pending_timed_out_redemption_reservation_releases);
+        let pending_restores = Arc::clone(&self.pending_equity_transfer_reservation_restores);
         let id = id.clone();
         let symbol = symbol.clone();
         let reservation_id = EquityTransferReservationId::from_uuid(id.0);
         drop(tokio::spawn(async move {
+            pending_restores.write().await.remove(&reservation_id);
+            let Some(store) = store else {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %symbol,
+                    "Position authority is not wired; retaining terminal redemption \
+                     reservation for the periodic retry sweep"
+                );
+                return;
+            };
             if Self::retry_terminal_reservation_release_after_reactor(store, symbol, reservation_id)
                 .await
             {
@@ -11844,6 +11914,55 @@ mod tests {
             None,
             "a later retry sweep must not resurrect a terminal transfer reservation"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_reactor_cleanup_does_not_wait_for_deferred_restore_map() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let mint_id = issuer_request_id("terminal-post-commit-cleanup");
+        let reservation_id = EquityTransferReservationId::from_uuid(mint_id.0);
+        let mut deferred_restores = trigger
+            .pending_equity_transfer_reservation_restores
+            .write()
+            .await;
+        deferred_restores.insert(
+            reservation_id,
+            PendingEquityTransferReservationRestore::Pending(symbol.clone()),
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            trigger.queue_terminal_mint_reservation_release(&mint_id, &symbol),
+        )
+        .await
+        .expect("the terminal reactor path must not wait for the deferred-restore map");
+        drop(deferred_restores);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let restore_cleared = !trigger
+                    .pending_equity_transfer_reservation_restores
+                    .read()
+                    .await
+                    .contains_key(&reservation_id);
+                let release_finished = !trigger
+                    .pending_timed_out_mint_reservation_releases
+                    .read()
+                    .await
+                    .contains_key(&mint_id);
+                if restore_cleared && release_finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the post-commit cleanup task must cancel and release the reservation");
     }
 
     #[tokio::test]
