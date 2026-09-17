@@ -3508,14 +3508,17 @@ async fn recover_interrupted_tokenization_aggregates(
         let owned_by_transfer_job = transfer_mints
             .iter()
             .any(|row| row.task.issuer_request_id == *mint_id);
-        if !owned_by_transfer_job
-            && !is_pre_wrap_held_for_recovery(&mint, &rebalancing_service.equity_in_progress)
-        {
+        if !owned_by_transfer_job {
             let symbol = mint.symbol().clone();
             rowless_resume_reservations.insert((
                 symbol.clone(),
                 EquityTransferReservationId::from_uuid(mint_id.0),
             ));
+
+            if is_pre_wrap_held_for_recovery(&mint, &rebalancing_service.equity_in_progress) {
+                continue;
+            }
+
             resume_queue
                 .push(ResumeTokenizationAggregate {
                     target: ResumeTokenizationTarget::Mint(mint_id.clone()),
@@ -5852,6 +5855,7 @@ mod tests {
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
     use crate::onchain::mock::MockRaindex;
     use crate::onchain::trade::{InventoryTrade, OnchainTrade};
+    use crate::position::EquityTransferReservationStatus;
     use crate::rebalancing::equity::{
         EquityTransferServices, RecheckOutcome, ResumeTokenizationAggregate,
         ResumeTokenizationJobQueue, ResumeTokenizationTarget, TransferEquityToHedging,
@@ -7483,6 +7487,25 @@ mod tests {
             .await;
     }
 
+    fn recovery_equities(symbol: &Symbol, wrapped_equity_recovery: OperationMode) -> ChainEquities {
+        ChainEquities {
+            operational_limit: None,
+            symbols: std::iter::once((
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Disabled,
+                    rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery,
+                    operational_limit: None,
+                },
+            ))
+            .collect(),
+        }
+    }
+
     /// Regression: `recover_interrupted_tokenization_aggregates` must enqueue
     /// a `ResumeTokenizationAggregate` job for each interrupted aggregate and
     /// return immediately without calling any issuer (tokenizer) method.
@@ -8577,25 +8600,6 @@ mod tests {
     {
         let symbol = Symbol::new("AAPL").unwrap();
 
-        // Helper that builds a single-symbol ChainEquities with a configurable
-        // wrapped_equity_recovery mode.
-        let make_equities_config = |wrapped_equity_recovery_mode: OperationMode| ChainEquities {
-            operational_limit: None,
-            symbols: std::iter::once((
-                symbol.clone(),
-                ChainEquityAsset {
-                    tokenized_equity: alloy::primitives::Address::ZERO,
-                    tokenized_equity_derivative: alloy::primitives::Address::ZERO,
-                    vault_ids: Vec::new(),
-                    trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Enabled,
-                    wrapped_equity_recovery: wrapped_equity_recovery_mode,
-                    operational_limit: None,
-                },
-            ))
-            .collect(),
-        };
-
         // --- HeldForRecovery case: zero jobs expected ---
         // With wrapped_equity_recovery ENABLED, recover_mint_state sets the guard
         // to HeldForRecovery automatically for TokensReceived state, so
@@ -8642,7 +8646,7 @@ mod tests {
                 assets: ChainAssets {
                     // wrapped_equity_recovery ENABLED: recover_mint_state will set
                     // HeldForRecovery on TokensReceived, blocking the resume push.
-                    equities: make_equities_config(OperationMode::Enabled),
+                    equities: recovery_equities(&symbol, OperationMode::Enabled),
                     cash: None,
                 },
             },
@@ -8693,6 +8697,22 @@ mod tests {
             "HeldForRecovery + TokensReceived must be excluded from resume jobs, \
              got {held_jobs} pending jobs"
         );
+        let position = test_store::<Position>(pool.clone(), ())
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("held recovery mint must retain Position ownership");
+        let reservation = position
+            .equity_transfer_reservation
+            .expect("held recovery mint must keep its durable hedge exclusion");
+        assert_eq!(
+            reservation.id,
+            EquityTransferReservationId::from_uuid(mint_id.0)
+        );
+        assert_eq!(
+            reservation.status,
+            EquityTransferReservationStatus::Confirmed
+        );
 
         // --- Control case: recovery DISABLED keeps ActiveTransfer, job IS enqueued ---
         let (pool2, apalis_pool2) = setup_test_pools().await;
@@ -8738,7 +8758,7 @@ mod tests {
                 assets: ChainAssets {
                     // wrapped_equity_recovery DISABLED: recover_mint_state keeps
                     // ActiveTransfer, so the pre-wrap exclusion does NOT fire.
-                    equities: make_equities_config(OperationMode::Disabled),
+                    equities: recovery_equities(&symbol, OperationMode::Disabled),
                     cash: None,
                 },
             },
