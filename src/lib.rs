@@ -342,8 +342,8 @@ async fn run_bot_session_inner(
             inventory,
             recovery_cell,
             process_tx_cell,
-            projection_maintenance,
             pnl_ledger,
+            projection_maintenance,
         },
         shutdown_token.clone(),
         ConductorStartupTokens {
