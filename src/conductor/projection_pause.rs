@@ -1,28 +1,31 @@
-//! Projection-maintenance pause: quiesces every projection writer -- the apalis
-//! workers and the operator write routes -- so a rebuild can DELETE and replay a
-//! materialized view without a live projection write racing in between.
+//! Projection-maintenance pause for projection writes issued through the generic
+//! apalis worker path.
 //!
-//! Event-sorcery folds projections synchronously inside `Store::send`, so gating
-//! the send callers gates the projection writes. The two caller surfaces are the
-//! generic apalis handler [`work`](super::job::work) (every worker) and the
-//! operator HTTP write routes.
+//! Event-sorcery folds projections synchronously inside `Store::send`.
+//! [`work`](super::job::work) calls [`enter_projection_gate`] and holds the
+//! returned slot for the whole job, so pausing the gate serializes a rebuild
+//! against projection writes emitted by those workers.
 //!
-//! A thin wrapper over the shared [`Quiesce`](crate::quiesce) primitive. The
-//! worker gate is process-global: `work` is built through the worker macros with
-//! no seam to thread per-worker data, and there is exactly one conductor per
-//! process. The controller is held by the rebuild route; the route surface reads
-//! its gate from `AppState` so route tests stay isolated from the global.
+//! Operator HTTP write routes are not currently covered. Routes that call
+//! `Store::send` directly do not enter this gate and remain ungated. Publishing
+//! [`ProjectionMaintenance`] on recovery state exposes the controller but does
+//! not gate those direct-send paths.
+//!
+//! This is a thin wrapper over the shared [`Quiesce`](crate::quiesce) primitive.
+//! The worker gate is process-global: `work` is built through the worker macros
+//! with no seam to thread per-worker data, and there is exactly one conductor
+//! per process.
 
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::quiesce::{self, NotQuiesced, Quiesce, QuiesceGate, QuiesceGuard};
 
-/// How long a rebuild waits for in-flight projection writes to drain before
-/// refusing. Coarse: a write is gated for the whole job or route that emits it,
-/// so a long-running job holds the gate for its duration. A rebuild is a rare
-/// operator action taken at a quiet moment, so refusing while a long job runs
-/// and asking the operator to retry is acceptable.
+/// How long a rebuild waits for in-flight worker projection writes to drain
+/// before refusing. Coarse: a write is gated for the whole apalis job that
+/// emits it, so a long-running job holds the gate for its duration. A rebuild
+/// is a rare operator action taken at a quiet moment, so refusing while a long
+/// job runs and asking the operator to retry is acceptable.
 const PROJECTION_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Process-global worker gate, read by the generic apalis handler
@@ -36,8 +39,9 @@ static PROJECTION_GATE: OnceLock<QuiesceGate> = OnceLock::new();
 #[error("projection writers did not quiesce: a job or write is in flight")]
 pub(crate) struct ProjectionBusy;
 
-/// Controller side, held by the rebuild route. Pausing quiesces every gated
-/// projection writer -- workers and routes -- for the guard's lifetime.
+/// Controller side, held by the rebuild route. Pausing quiesces the gated
+/// worker projection writes for the guard's lifetime; direct-send routes remain
+/// outside this gate.
 pub(crate) struct ProjectionMaintenance(Quiesce);
 
 impl ProjectionMaintenance {
@@ -67,8 +71,8 @@ pub(crate) struct ProjectionMaintenanceGuard {
 
 /// Builds the projection-maintenance controller and publishes its worker gate to
 /// the process global that [`work`](super::job::work) reads. Called once at
-/// conductor startup. The returned controller is held on the recovery handle for
-/// the rebuild route to pause through.
+/// conductor startup. The returned controller lets the rebuild route pause the
+/// generic worker writers; publishing it does not gate direct-send HTTP routes.
 ///
 /// A second call (a second conductor in one test process) keeps the first gate;
 /// harmless because the production `work` is the sole global reader and there is
