@@ -2847,6 +2847,61 @@ pub(crate) enum StuckRedemptionRecoveryError {
     InvalidRequestedQuantity { aggregate_id: RedemptionAggregateId },
 }
 
+/// Returns whether `symbol` has an in-progress equity redemption.
+///
+/// This is the targeted counterpart to [`symbols_with_active_transfers`].
+/// It lets a one-symbol hedge retry avoid loading and allocating the complete
+/// active-symbol set.
+pub(crate) async fn has_active_transfer_for_symbol(
+    pool: &SqlitePool,
+    symbol: &Symbol,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "
+        WITH matching AS (
+            SELECT aggregate_id
+            FROM events
+            WHERE aggregate_type = 'EquityRedemption'
+              AND sequence = 0
+              AND COALESCE(
+                  json_extract(payload, '$.VaultWithdrawPending.symbol'),
+                  json_extract(payload, '$.VaultWithdrawSubmitted.symbol'),
+                  json_extract(payload, '$.WithdrawnFromRaindex.symbol')
+              ) = ?
+        ),
+        latest AS (
+            SELECT event.aggregate_id, MAX(event.sequence) AS max_seq
+            FROM events event
+            INNER JOIN matching
+                ON matching.aggregate_id = event.aggregate_id
+            WHERE event.aggregate_type = 'EquityRedemption'
+            GROUP BY event.aggregate_id
+        )
+        SELECT EXISTS (
+            SELECT 1
+            FROM events last_ev
+            INNER JOIN latest
+                ON last_ev.aggregate_id = latest.aggregate_id
+               AND last_ev.sequence = latest.max_seq
+            WHERE last_ev.aggregate_type = 'EquityRedemption'
+              AND last_ev.event_type IN (
+                  'EquityRedemptionEvent::VaultWithdrawPending',
+                  'EquityRedemptionEvent::VaultWithdrawSubmitted',
+                  'EquityRedemptionEvent::WithdrawnFromRaindex',
+                  'EquityRedemptionEvent::UnwrapPending',
+                  'EquityRedemptionEvent::UnwrapSubmitted',
+                  'EquityRedemptionEvent::TokensUnwrapped',
+                  'EquityRedemptionEvent::SendPending',
+                  'EquityRedemptionEvent::TokensSent',
+                  'EquityRedemptionEvent::Detected'
+              )
+        )
+        ",
+    )
+    .bind(symbol.to_string())
+    .fetch_one(pool)
+    .await
+}
 /// Returns the set of symbols that have at least one in-progress
 /// EquityRedemption aggregate (i.e. an equity transfer is in progress).
 ///
@@ -5726,6 +5781,21 @@ mod tests {
         assert_eq!(result.len(), 2, "both active redemptions should appear");
         assert!(result.contains(&Symbol::new("AAPL").unwrap()));
         assert!(result.contains(&Symbol::new("TSLA").unwrap()));
+        assert!(
+            has_active_transfer_for_symbol(&pool, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+        );
+        assert!(
+            has_active_transfer_for_symbol(&pool, &Symbol::new("TSLA").unwrap())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !has_active_transfer_for_symbol(&pool, &Symbol::new("NVDA").unwrap())
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -5772,6 +5842,16 @@ mod tests {
         assert!(
             result.is_empty(),
             "terminal redemptions should not appear, got: {result:?}"
+        );
+        assert!(
+            !has_active_transfer_for_symbol(&pool, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !has_active_transfer_for_symbol(&pool, &Symbol::new("TSLA").unwrap())
+                .await
+                .unwrap()
         );
     }
 

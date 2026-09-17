@@ -30,7 +30,7 @@ use crate::conductor::job::{
     BackpressureStreak, Job, JobQueue, Label, QueuePushError, find_backpressure, find_permanence,
 };
 use crate::conductor::{clamp_shares_to_reservation, recover_orphaned_pending_offchain_orders};
-use crate::equity_redemption::symbols_with_active_transfers;
+use crate::equity_redemption::{has_active_transfer_for_symbol, symbols_with_active_transfers};
 use crate::offchain::order::{
     CancellationReason, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
     PollOrderStatusJobQueue, TerminalPositionFinalization, position_command_for_finalization,
@@ -412,23 +412,12 @@ where
             .load(symbol)
             .await?
             .is_some_and(|position| position.equity_transfer_reservation.is_some());
-        let redemption_active = symbols_with_active_transfers(&self.pool)
-            .await?
-            .contains(symbol);
-        if position_reservation_pending || redemption_active {
-            self.check_positions_queue
-                .clone()
-                .push_with_delay(
-                    CheckPositions::for_symbol(symbol.clone()),
-                    EQUITY_TRANSFER_REDRIVE_DELAY,
-                )
-                .await?;
-            debug!(
-                %symbol,
-                retry_delay_secs = EQUITY_TRANSFER_REDRIVE_DELAY.as_secs(),
-                "Equity transfer still in progress; rescheduled fresh hedge recalculation"
-            );
-            return Ok(());
+        if position_reservation_pending {
+            return self.reschedule_after_equity_transfer(symbol).await;
+        }
+
+        if has_active_transfer_for_symbol(&self.pool, symbol).await? {
+            return self.reschedule_after_equity_transfer(symbol).await;
         }
 
         record_hedge_floor_gauges(
@@ -445,6 +434,25 @@ where
 
         self.check_and_enqueue_symbol(symbol, assets, close_flatten_window_cache)
             .await;
+        Ok(())
+    }
+
+    async fn reschedule_after_equity_transfer(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<(), CheckPositionsError> {
+        self.check_positions_queue
+            .clone()
+            .push_with_delay(
+                CheckPositions::for_symbol(symbol.clone()),
+                EQUITY_TRANSFER_REDRIVE_DELAY,
+            )
+            .await?;
+        debug!(
+            %symbol,
+            retry_delay_secs = EQUITY_TRANSFER_REDRIVE_DELAY.as_secs(),
+            "Equity transfer still in progress; rescheduled fresh hedge recalculation"
+        );
         Ok(())
     }
     async fn scan_and_enqueue(
