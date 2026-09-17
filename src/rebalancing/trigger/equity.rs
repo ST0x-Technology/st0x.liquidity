@@ -81,7 +81,7 @@ pub(crate) enum GuardState {
 /// a monotonic per-process counter. Zero is reserved for persisted job payloads
 /// created before generations were introduced; only a restored legacy owner
 /// uses it. Startup reserves persisted counters before allocating new claims.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub(crate) struct GuardGeneration(u64);
 
