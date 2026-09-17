@@ -354,8 +354,10 @@ impl std::fmt::Debug for RebalancingCtx {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
     use st0x_float_macro::float;
+
+    use super::*;
 
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
@@ -376,6 +378,18 @@ mod tests {
             target = "0.5"
             deviation = "0.3"
         "#
+    }
+
+    /// The cash corridor is resolved when the config loads, so the bridge is
+    /// built from both ends' validated USDC rather than pinned constants.
+    #[test]
+    fn rebalancing_ctx_resolves_the_ethereum_base_corridor() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+
+        let ctx = RebalancingCtx::new(&config).unwrap();
+
+        assert_eq!(ctx.cctp_corridor.usdc_ethereum(), USDC_ETHEREUM);
+        assert_eq!(ctx.cctp_corridor.usdc_base(), USDC_BASE);
     }
 
     #[test]
