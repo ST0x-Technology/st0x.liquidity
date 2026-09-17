@@ -512,6 +512,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_rebuild_matches_framework_projection_output() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap_or_else(|error| panic!("{error}"));
+        let symbol_id = symbol.to_string();
+        persist_event::<Position>(
+            &pool,
+            &symbol_id,
+            1,
+            &PositionEvent::Initialized {
+                symbol,
+                threshold: ExecutionThreshold::whole_share(),
+                initialized_at: Utc::now(),
+            },
+        )
+        .await;
+        Projection::<Position>::sqlite(pool.clone())
+            .catch_up()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let framework_row: (i64, String) =
+            sqlx::query_as("SELECT version, payload FROM position_view WHERE view_id = ?1")
+                .bind(&symbol_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+
+        rebuild_view(
+            &pool,
+            RebuildableView::Position,
+            RebuildScope::Id(symbol_id.clone()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        let rebuilt_row: (i64, String) =
+            sqlx::query_as("SELECT version, payload FROM position_view WHERE view_id = ?1")
+                .bind(&symbol_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(rebuilt_row, framework_row);
+    }
+
+    #[tokio::test]
     async fn aggregate_rebuilds_roll_back_when_event_deserialization_fails() {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap_or_else(|error| panic!("{error}"));
