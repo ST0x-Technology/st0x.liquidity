@@ -1,31 +1,18 @@
 //! CCTP bridge and recovery CLI commands.
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{B256, U256};
 use rain_math_float::Float;
 use std::io::Write;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
 use st0x_config::Ctx;
-use st0x_evm::{Chain, Evm, IERC20, IntoErrorRegistry, SettlementStable, Wallet};
+use st0x_evm::{Evm, IERC20, IntoErrorRegistry, SettlementStable, Wallet};
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
 use super::rebalancing::{HedgedChainContext, hedged_chain_context};
 use super::{CctpChain, TokenizationNetwork};
-
-/// The corridor's USDC on both ends. CCTP burns and mints Circle's USDC
-/// alone, so an end whose settlement stable is another token is refused
-/// before the bridge is built.
-fn corridor_usdc() -> anyhow::Result<(Address, Address)> {
-    let pinned = |chain: Chain| {
-        chain
-            .cctp_usdc()
-            .ok_or_else(|| anyhow::anyhow!("{chain} settles in a stable CCTP cannot bridge"))
-    };
-
-    Ok((pinned(Chain::Ethereum)?, pinned(Chain::Base)?))
-}
 
 impl CctpChain {
     /// Converts to the bridge direction (from this chain to its destination).
@@ -45,7 +32,7 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let wallet_ctx = ctx.wallet()?;
-    let (usdc_ethereum, usdc_base) = corridor_usdc()?;
+    let corridor = ctx.rebalancing.cctp_corridor;
 
     let (source_wallet, recipient_wallet) = match from {
         CctpChain::Ethereum => (
@@ -66,13 +53,13 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
             CctpChain::Ethereum => {
                 wallet_ctx
                     .ethereum_wallet()
-                    .call::<Registry, _>(usdc_ethereum, balance_call)
+                    .call::<Registry, _>(corridor.usdc_ethereum(), balance_call)
                     .await?
             }
             CctpChain::Base => {
                 wallet_ctx
                     .base_wallet()
-                    .call::<Registry, _>(usdc_base, balance_call)
+                    .call::<Registry, _>(corridor.usdc_base(), balance_call)
                     .await?
             }
         };
@@ -101,8 +88,7 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
     writeln!(stdout, "   Recipient wallet: {recipient_wallet}")?;
 
     let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
-        usdc_ethereum,
-        usdc_base,
+        corridor,
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
         base_wallet: wallet_ctx.base_wallet().clone(),
         #[cfg(feature = "test-support")]
@@ -160,10 +146,8 @@ pub(super) async fn cctp_recover_command<Writer: Write>(
     writeln!(stdout, "   Destination chain: {dest_chain:?}")?;
     writeln!(stdout, "   Polling V2 attestation API...")?;
 
-    let (usdc_ethereum, usdc_base) = corridor_usdc()?;
     let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
-        usdc_ethereum,
-        usdc_base,
+        corridor: ctx.rebalancing.cctp_corridor,
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
         base_wallet: wallet_ctx.base_wallet().clone(),
         #[cfg(feature = "test-support")]
@@ -265,7 +249,7 @@ mod tests {
     use st0x_config::{CtxError, LogFormat, LogLevel};
     use st0x_config::{HedgedChain, InventoryMode};
     use st0x_evm::OpenChainErrorRegistry;
-    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
+    use st0x_evm::{Chain, USDC_BASE, USDC_ETHEREUM};
     use st0x_finance::Usdc;
 
     use super::*;

@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use rain_math_float::Float;
 use serde::Deserialize;
+use st0x_bridge::cctp::{CctpCorridor, CorridorStableNotUsdc};
+#[cfg(any(test, feature = "test-support"))]
+use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
 
@@ -50,6 +53,8 @@ pub enum RebalancingCtxError {
          before the circuit opens (suggested value: 5)"
     )]
     ZeroMaxBurnRevertRedrives,
+    #[error("[rebalancing] cash corridor: {0}")]
+    CctpCorridor(#[from] CorridorStableNotUsdc),
     #[error("invalid wallet config: {0}")]
     WalletConfig(#[from] toml::de::Error),
     #[error(transparent)]
@@ -175,6 +180,9 @@ pub struct RebalancingCtx {
     /// Whether the dividend freeze guard is wired for equity rebalancing.
     /// See [`RebalancingConfig::freeze_check`].
     pub freeze_check: OperationMode,
+    /// The cash corridor's USDC on both ends, resolved at load so the bridge
+    /// never meets a chain settling in another stable.
+    pub cctp_corridor: CctpCorridor,
     /// Circle attestation/fee API base URL (test-only override).
     #[cfg(feature = "test-support")]
     pub circle_api_base: String,
@@ -228,6 +236,7 @@ impl RebalancingCtx {
             settlement_retry_deadline: Duration::from_secs(config.settlement_retry_deadline_secs),
             max_burn_revert_redrives: config.max_burn_revert_redrives,
             freeze_check: config.freeze_check,
+            cctp_corridor: CctpCorridor::ethereum_base()?,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -268,6 +277,7 @@ impl RebalancingCtx {
             settlement_retry_deadline,
             max_burn_revert_redrives,
             freeze_check,
+            cctp_corridor: CctpCorridor::with_tokens(USDC_ETHEREUM, USDC_BASE),
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -313,6 +323,7 @@ impl RebalancingCtx {
             settlement_retry_deadline,
             max_burn_revert_redrives,
             freeze_check,
+            cctp_corridor: CctpCorridor::with_tokens(USDC_ETHEREUM, USDC_BASE),
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
@@ -354,8 +365,10 @@ impl std::fmt::Debug for RebalancingCtx {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
     use st0x_float_macro::float;
+
+    use super::*;
 
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
@@ -376,6 +389,18 @@ mod tests {
             target = "0.5"
             deviation = "0.3"
         "#
+    }
+
+    /// The cash corridor is resolved when the config loads, so the bridge is
+    /// built from both ends' validated USDC rather than pinned constants.
+    #[test]
+    fn rebalancing_ctx_resolves_the_ethereum_base_corridor() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+
+        let ctx = RebalancingCtx::new(&config).unwrap();
+
+        assert_eq!(ctx.cctp_corridor.usdc_ethereum(), USDC_ETHEREUM);
+        assert_eq!(ctx.cctp_corridor.usdc_base(), USDC_BASE);
     }
 
     #[test]

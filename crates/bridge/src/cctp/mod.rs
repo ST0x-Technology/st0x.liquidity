@@ -32,8 +32,7 @@
 //!
 //! ```rust,ignore
 //! let bridge = CctpBridge::try_from_ctx(CctpCtx {
-//!     usdc_ethereum,
-//!     usdc_base,
+//!     corridor: CctpCorridor::ethereum_base()?,
 //!     ethereum_wallet,
 //!     base_wallet,
 //! })?;
@@ -81,7 +80,7 @@ use serde::Deserialize;
 use st0x_float_macro::float;
 use tracing::{debug, info, warn};
 
-use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{Chain, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
 use crate::BridgeDirection;
@@ -314,10 +313,8 @@ fn parse_received_message(message: &[u8]) -> Result<CctpReceivedMessage<'_>, Cct
 /// Providers are obtained from the wallets via `Wallet`'s inherited
 /// [`Evm::provider()`](st0x_evm::Evm::provider).
 pub struct CctpCtx<EthWallet, BaseWallet> {
-    /// USDC token address on Ethereum
-    pub usdc_ethereum: Address,
-    /// USDC token address on Base
-    pub usdc_base: Address,
+    /// The corridor's USDC on both ends, validated at config load.
+    pub corridor: CctpCorridor,
     /// Wallet for submitting transactions on Ethereum
     pub ethereum_wallet: EthWallet,
     /// Wallet for submitting transactions on Base
@@ -333,14 +330,66 @@ pub struct CctpCtx<EthWallet, BaseWallet> {
     pub message_transmitter: Address,
 }
 
+/// The corridor's USDC on both ends, resolved from each chain's pinned stable.
+///
+/// CCTP burns and mints Circle's USDC alone, so the bridge takes its tokens
+/// from here and nowhere else: an end settling in another stable is refused
+/// when the corridor is built, not at the first burn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CctpCorridor {
+    usdc_ethereum: Address,
+    usdc_base: Address,
+}
+
+/// A corridor end whose settlement stable is not Circle's USDC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the CCTP corridor needs Circle's USDC on both ends, but {chain} settles in {stable}")]
+pub struct CorridorStableNotUsdc {
+    pub chain: Chain,
+    pub stable: &'static str,
+}
+
+impl CctpCorridor {
+    /// The Ethereum <-> Base corridor, the only pair the bridge has domains for.
+    pub fn ethereum_base() -> Result<Self, CorridorStableNotUsdc> {
+        Ok(Self {
+            usdc_ethereum: circle_usdc(Chain::Ethereum)?,
+            usdc_base: circle_usdc(Chain::Base)?,
+        })
+    }
+
+    /// A corridor over locally deployed mock tokens.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn with_tokens(usdc_ethereum: Address, usdc_base: Address) -> Self {
+        Self {
+            usdc_ethereum,
+            usdc_base,
+        }
+    }
+
+    pub const fn usdc_ethereum(self) -> Address {
+        self.usdc_ethereum
+    }
+
+    pub const fn usdc_base(self) -> Address {
+        self.usdc_base
+    }
+}
+
+fn circle_usdc(chain: Chain) -> Result<Address, CorridorStableNotUsdc> {
+    chain.cctp_usdc().ok_or_else(|| CorridorStableNotUsdc {
+        chain,
+        stable: chain.settlement_stable().symbol,
+    })
+}
+
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// let bridge = CctpBridge::try_from_ctx(CctpCtx {
-///     usdc_ethereum: USDC_ETHEREUM,
-///     usdc_base: USDC_BASE,
+///     corridor: CctpCorridor::ethereum_base()?,
 ///     ethereum_wallet,
 ///     base_wallet,
 /// })?;
@@ -612,14 +661,14 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         let message_transmitter = MESSAGE_TRANSMITTER_V2;
 
         let ethereum = CctpEndpoint::new(
-            ctx.usdc_ethereum,
+            ctx.corridor.usdc_ethereum,
             token_messenger,
             message_transmitter,
             ctx.ethereum_wallet,
         );
 
         let base = CctpEndpoint::new(
-            ctx.usdc_base,
+            ctx.corridor.usdc_base,
             token_messenger,
             message_transmitter,
             ctx.base_wallet,
@@ -1338,11 +1387,38 @@ mod tests {
     use st0x_evm::Evm;
     use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
+    use st0x_evm::{Chain, USDC_BASE, USDC_ETHEREUM};
 
     use super::evm::MintRecoveryConfig;
     use super::*;
     use crate::{Attestation, Bridge};
+
+    #[test]
+    fn the_ethereum_base_corridor_resolves_circles_usdc_on_both_ends() {
+        let corridor = CctpCorridor::ethereum_base().unwrap();
+
+        assert_eq!(corridor.usdc_ethereum(), USDC_ETHEREUM);
+        assert_eq!(corridor.usdc_base(), USDC_BASE);
+    }
+
+    /// Robinhood settles in USDG, which CCTP neither burns nor mints: that end
+    /// is refused by chain and stable, before any token is approved.
+    #[test]
+    fn a_corridor_end_settling_in_another_stable_is_refused_by_name() {
+        let refused = circle_usdc(Chain::Robinhood).unwrap_err();
+
+        assert_eq!(
+            refused,
+            CorridorStableNotUsdc {
+                chain: Chain::Robinhood,
+                stable: "USDG",
+            }
+        );
+        assert_eq!(
+            refused.to_string(),
+            "the CCTP corridor needs Circle's USDC on both ends, but robinhood settles in USDG"
+        );
+    }
 
     // --- is_revert unit tests ---
 

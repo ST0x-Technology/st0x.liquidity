@@ -705,7 +705,11 @@ address is gated only by vault discovery, which skips a cash vault whose token
 is not the pinned address. The portfolio snapshot still persists its cash asset
 as the literal `USDC`; labelling it per chain changes persisted rows and is its
 own follow-up. Circle's USDC is exposed separately, `Some` only on chains whose
-stable is that USDC, and read by the CCTP bridge alone.
+stable is that USDC, and read by the CCTP bridge alone. The CCTP corridor is
+USDC-only: when the config loads, both of its ends (Ethereum and Base) resolve
+to Circle's USDC, and an end whose settlement stable is another token is refused
+by chain and stable symbol, so such a corridor fails at startup rather than at
+its first cash rebalance.
 
 Completed apalis jobs are operational queue records, not audit history. The
 runtime periodically deletes terminal job rows and vacuums SQLite at the

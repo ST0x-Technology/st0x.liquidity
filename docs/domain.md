@@ -164,8 +164,9 @@ dashboard's cash row. An `InventoryTrade` fill must quote in its address; a
 `ClearV3`/`TakeOrderV3` fill is matched by its symbol, with the address gated by
 vault discovery. The portfolio snapshot still labels cash `USDC`. USDC on Base,
 Ethereum and HyperEVM; USDG on Robinhood. Circle's USDC is exposed separately
-(`Chain::cctp_usdc`, `Some` only where the stable is that USDC) for the CLI's
-CCTP commands alone; the server corridor still pins its USDC constants.
+(`Chain::cctp_usdc`, `Some` only where the stable is that USDC) and read only by
+the bridge's `CctpCorridor`, which resolves both corridor ends at config load
+and refuses an end settling in another stable by chain and symbol.
 
 ### Retired Symbol
 
