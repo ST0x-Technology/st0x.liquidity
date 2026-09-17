@@ -2586,6 +2586,7 @@ struct Position {
     accumulated_long: FractionalShares,
     accumulated_short: FractionalShares,
     pending_execution_id: Option<ExecutionId>,
+    equity_transfer_reservation: Option<EquityTransferReservation>,
     threshold: ExecutionThreshold,
     last_price_usdc: Option<Float>,  // Last known USDC price per share; drives
                                      // dollar-threshold hedging. None until a
@@ -2618,6 +2619,22 @@ enum PositionCommand {
         direction: Direction,
         price_usdc: Decimal,
         block_timestamp: DateTime<Utc>,
+    },
+    ReserveEquityTransfer {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        reservation_id: EquityTransferReservationId,
+    },
+    ConfirmEquityTransfer {
+        reservation_id: EquityTransferReservationId,
+    },
+    ReleaseEquityTransfer {
+        reservation_id: EquityTransferReservationId,
+    },
+    RestoreEquityTransferReservation {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        reservation_id: EquityTransferReservationId,
     },
     PlaceOffChainOrder {
         execution_id: ExecutionId,
@@ -2660,6 +2677,18 @@ enum PositionEvent {
         price_usdc: Decimal,
         block_timestamp: DateTime<Utc>,
         seen_at: DateTime<Utc>,
+    },
+    EquityTransferReserved {
+        reservation_id: EquityTransferReservationId,
+        reserved_at: DateTime<Utc>,
+    },
+    EquityTransferReservationConfirmed {
+        reservation_id: EquityTransferReservationId,
+        confirmed_at: DateTime<Utc>,
+    },
+    EquityTransferReservationReleased {
+        reservation_id: EquityTransferReservationId,
+        released_at: DateTime<Utc>,
     },
     OffChainOrderPlaced {
         execution_id: ExecutionId,
@@ -2736,6 +2765,18 @@ enum TriggerReason {
 - Direction of offchain order must be opposite to accumulated position (positive
   net = sell, negative net = buy)
 - Cannot have multiple pending executions for same symbol
+- Equity transfer admission is serialized on this aggregate. A reservation is
+  accepted only when no offchain order is pending, no transfer reservation
+  exists, and the current net position is below the hedge threshold. A nonzero
+  position whose dollar threshold cannot be valued is rejected fail-closed.
+- `PlaceOffChainOrder` is rejected while any transfer reservation owns the
+  symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
+  confirmation of that exact ID must succeed immediately before the transfer job
+  is durably queued. Confirmed reservations survive queue handoff and restart.
+- No-op sizing, sizing failure, queue failure, terminal transfer events, and
+  terminal job attempts that never created an aggregate release only their exact
+  reservation ID. Startup retains reservations owned by live durable transfer
+  jobs, restores missing legacy ownership, and releases crash-orphaned claims.
 - OnChain fills are always applied (blockchain facts are immutable)
 - Threshold is passed as a parameter to commands that need it
 
@@ -4768,8 +4809,9 @@ the TokenizedEquityMint, EquityRedemption, or UsdcRebalance aggregate.
 
 #### Coordination with Position Aggregate
 
-**Position Aggregate** tracks net exposure from arbitrage trading but does NOT
-know about cross-venue inventory.
+**Position Aggregate** tracks net exposure from arbitrage trading and owns the
+durable per-symbol exclusion between hedge placement and cross-venue equity
+transfer dispatch. It does not calculate cross-venue inventory imbalances.
 
 **InventoryView** listens to:
 
@@ -4827,7 +4869,10 @@ know about cross-venue inventory.
   ordering heals unchanged-value polls and placement events delivered after
   their own terminal event without requiring a restart, while never treating the
   Position store's lead over the inventory reactor as proof that its local side
-  effects have completed
+  effects have completed This pending-order mirror exists only to suppress
+  ambiguous broker snapshots; it is not transfer-admission authority and the
+  rebalancer does not re-read it before dispatch. Transfer admission uses the
+  atomic Position reservation protocol described above.
 - `TokenizedEquityMintEvent::MintAccepted` - Moves shares to inflight (leaving
   Alpaca)
 - `TokenizedEquityMintEvent::TokensReceived` - Moves from inflight to Raindex

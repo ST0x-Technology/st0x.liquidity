@@ -43,6 +43,7 @@ use crate::conductor::job::{
     BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
+use crate::position::{EquityTransferReservationId, Position, PositionCommand};
 use crate::rebalancing::trigger::{GuardGeneration, GuardState, remove_active_transfer};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 
@@ -107,6 +108,9 @@ pub(crate) struct TransferEquityToMarketMakingCtx {
     /// transitioning the guard. Absent/pre-receipt/terminal states propagate
     /// `Err` so apalis retries normally.
     pub(crate) mint_store: Arc<Store<TokenizedEquityMint>>,
+    /// Position authority used only by the terminal-attempt hook when the
+    /// transfer failed before creating its lifecycle aggregate.
+    pub(crate) position_store: Option<Arc<Store<Position>>>,
     /// The same per-chain services map the aggregates read. Used to gate the
     /// `HeldForRecovery` handoff on `wrapped_equity_recovery = "enabled"` for
     /// the symbol on the job's own chain -- the same predicate the inventory
@@ -401,6 +405,19 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
             return Ok(());
         }
 
+        if let Some(position_store) = &ctx.position_store {
+            position_store
+                .send(
+                    &self.symbol,
+                    PositionCommand::ReleaseEquityTransfer {
+                        reservation_id: EquityTransferReservationId::from_uuid(
+                            self.issuer_request_id.0,
+                        ),
+                    },
+                )
+                .await?;
+        }
+
         let released =
             remove_active_transfer(&ctx.equity_in_progress, &self.symbol, self.generation);
         warn!(
@@ -535,6 +552,9 @@ pub(crate) struct TransferEquityToHedgingCtx {
     pub(crate) transfer: Arc<dyn ResumeEquityToHedging>,
     pub(crate) equity_in_progress: Arc<RwLock<HashMap<Symbol, GuardState>>>,
     pub(crate) redemption_store: Arc<Store<EquityRedemption>>,
+    /// Position authority used only when all attempts fail before the
+    /// redemption aggregate is created.
+    pub(crate) position_store: Option<Arc<Store<Position>>>,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget.
@@ -666,6 +686,17 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             return Ok(());
         }
 
+        if let Some(position_store) = &ctx.position_store {
+            position_store
+                .send(
+                    &self.symbol,
+                    PositionCommand::ReleaseEquityTransfer {
+                        reservation_id: EquityTransferReservationId::from_uuid(self.aggregate_id.0),
+                    },
+                )
+                .await?;
+        }
+
         let released =
             remove_active_transfer(&ctx.equity_in_progress, &self.symbol, self.generation);
         warn!(
@@ -793,6 +824,7 @@ mod tests {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             mint_store,
+            position_store: None,
             transfer_services,
             job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
         }
@@ -2113,6 +2145,7 @@ mod tests {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             redemption_store: Arc::new(test_store(pool, services)),
+            position_store: None,
             job_queue,
         }
     }

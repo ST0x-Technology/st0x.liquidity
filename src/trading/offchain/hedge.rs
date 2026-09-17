@@ -1679,6 +1679,8 @@ impl PlaceHedge {
         //   or the order sits in Submitted until the next bot restart.
         // - ThresholdNotMet: position moved below threshold since the monitor
         //   scanned -- stale job, no action needed.
+        // - EquityTransferPending: a transfer won the Position claim first;
+        //   its terminal event schedules a fresh check after releasing it.
         //
         // Everything else (lifecycle bugs, aggregate conflicts, DB errors)
         // propagates so backon retries the job.
@@ -1722,6 +1724,17 @@ impl PlaceHedge {
                     target: "hedge",
                     symbol = %self.symbol, %error,
                     "Position below execution threshold, skipping"
+                );
+                return Ok(());
+            }
+
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                ref error @ PositionError::EquityTransferPending { .. },
+            ))) => {
+                info!(
+                    target: "hedge",
+                    symbol = %self.symbol, %error,
+                    "Equity transfer owns the position, skipping stale hedge job"
                 );
                 return Ok(());
             }
@@ -2151,7 +2164,9 @@ mod tests {
         BrokerOrderPlacement, ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand,
         OrderPlacementResult, OrderPlacer,
     };
-    use crate::position::{AnchorDisposition, Position, PositionCommand, TradeId};
+    use crate::position::{
+        AnchorDisposition, EquityTransferReservationId, Position, PositionCommand, TradeId,
+    };
     use crate::test_utils::TEST_POLL_INTERVAL;
 
     type CapturedPlacements = Arc<StdMutex<Vec<(ClientOrderId, Positive<FractionalShares>)>>>;
@@ -5895,6 +5910,55 @@ mod tests {
         assert_eq!(
             position_after_second.pending_offchain_order_id, first_pending_id,
             "Second hedge must not change the pending order"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_reservation_makes_place_hedge_a_safe_stale_job() {
+        let TestInfra {
+            ctx,
+            position_projection,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(0.5)),
+            Direction::Buy,
+        )
+        .await;
+        let reservation_id = EquityTransferReservationId::generate();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+
+        hedge_job(&symbol, 0.5, Direction::Sell)
+            .perform(&ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            offchain_order_projection
+                .load_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.pending_offchain_order_id, None);
+        assert_eq!(
+            position.equity_transfer_reservation.unwrap().id,
+            reservation_id
         );
     }
 

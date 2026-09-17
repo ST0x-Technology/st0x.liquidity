@@ -44,6 +44,9 @@ impl HedgeLatencyProjection {
             // Dedup bookkeeping only (ADR 0010): no performance signal.
             PositionEvent::Initialized { .. }
             | PositionEvent::ThresholdUpdated { .. }
+            | PositionEvent::EquityTransferReserved { .. }
+            | PositionEvent::EquityTransferReservationConfirmed { .. }
+            | PositionEvent::EquityTransferReservationReleased { .. }
             | PositionEvent::OnChainFillApplied { .. }
             | PositionEvent::OnChainFillSettled { .. }
             | PositionEvent::FailedOrderAnchorReleased { .. } => Ok(()),

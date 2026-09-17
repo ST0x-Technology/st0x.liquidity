@@ -45,6 +45,10 @@ pub(crate) enum EquityTriggerError {
     Wrapper(#[from] WrapperError),
     #[error("Float arithmetic error during truncation: {0}")]
     Float(#[from] FloatError),
+    #[error("position authority is not wired")]
+    PositionAuthorityNotWired,
+    #[error("position reservation command failed: {0}")]
+    PositionReservation(String),
 }
 
 /// Discriminates why the equity in-progress slot is held.
