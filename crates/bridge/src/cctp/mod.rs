@@ -81,7 +81,7 @@ use serde::Deserialize;
 use st0x_float_macro::float;
 use tracing::{debug, info, warn};
 
-use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{Chain, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
 use crate::BridgeDirection;
@@ -331,6 +331,59 @@ pub struct CctpCtx<EthWallet, BaseWallet> {
     /// `MessageTransmitterV2` contract address (test-only override).
     #[cfg(any(test, feature = "test-support"))]
     pub message_transmitter: Address,
+}
+
+/// The corridor's USDC on both ends, resolved from each chain's pinned stable.
+///
+/// CCTP burns and mints Circle's USDC alone, so the bridge takes its tokens
+/// from here and nowhere else: an end settling in another stable is refused
+/// when the corridor is built, not at the first burn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CctpCorridor {
+    usdc_ethereum: Address,
+    usdc_base: Address,
+}
+
+/// A corridor end whose settlement stable is not Circle's USDC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the CCTP corridor needs Circle's USDC on both ends, but {chain} settles in {stable}")]
+pub struct CorridorStableNotUsdc {
+    pub chain: Chain,
+    pub stable: &'static str,
+}
+
+impl CctpCorridor {
+    /// The Ethereum <-> Base corridor, the only pair the bridge has domains for.
+    pub fn ethereum_base() -> Result<Self, CorridorStableNotUsdc> {
+        Ok(Self {
+            usdc_ethereum: circle_usdc(Chain::Ethereum)?,
+            usdc_base: circle_usdc(Chain::Base)?,
+        })
+    }
+
+    /// A corridor over locally deployed mock tokens.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn with_tokens(usdc_ethereum: Address, usdc_base: Address) -> Self {
+        Self {
+            usdc_ethereum,
+            usdc_base,
+        }
+    }
+
+    pub const fn usdc_ethereum(self) -> Address {
+        self.usdc_ethereum
+    }
+
+    pub const fn usdc_base(self) -> Address {
+        self.usdc_base
+    }
+}
+
+fn circle_usdc(chain: Chain) -> Result<Address, CorridorStableNotUsdc> {
+    chain.cctp_usdc().ok_or(CorridorStableNotUsdc {
+        chain,
+        stable: chain.settlement_stable().symbol,
+    })
 }
 
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
