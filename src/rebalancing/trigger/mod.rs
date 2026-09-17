@@ -26,7 +26,8 @@ use uuid::Uuid;
 use rain_math_float::Float;
 use st0x_config::{ChainAssets, ExecutionThreshold, OperationMode};
 use st0x_event_sorcery::{
-    AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
+    AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, SendError,
+    Store, deps,
 };
 use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, HedgeFloor, Positive, SharesConversionError, Symbol};
@@ -154,8 +155,8 @@ pub(crate) enum RebalancingServiceError {
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
     ApalisSqlx(#[from] sqlx_apalis::Error),
-    #[error("position reservation command failed: {0}")]
-    PositionReservation(String),
+    #[error(transparent)]
+    PositionReservation(#[from] SendError<Position>),
     #[error("failed to re-arm a stranded USDC transfer job at startup: {0}")]
     RearmEnqueue(#[from] QueuePushError),
 }
@@ -1266,12 +1267,21 @@ impl RebalancingService {
                     MintTrackingStage::Requested => continue,
                 };
 
-                if let Err(error) = store.send(&id, command).await {
-                    warn!(
-                        target: "rebalance",
-                        %id, %error,
-                        "Failed to emit timeout failure event for mint"
-                    );
+                match store.send(&id, command).await {
+                    Ok(()) => {
+                        self.release_terminal_equity_transfer(
+                            &tracking.symbol,
+                            EquityTransferReservationId::from_uuid(id.0),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "rebalance",
+                            %id, %error,
+                            "Failed to emit timeout failure event for mint"
+                        );
+                    }
                 }
             }
         }
@@ -1345,14 +1355,23 @@ impl RebalancingService {
                     }
                 };
 
-                if let Some(command) = command
-                    && let Err(error) = store.send(&id, command).await
-                {
-                    warn!(
-                        target: "rebalance",
-                        %id, %error,
-                        "Failed to emit timeout failure event for redemption"
-                    );
+                if let Some(command) = command {
+                    match store.send(&id, command).await {
+                        Ok(()) => {
+                            self.release_terminal_equity_transfer(
+                                &tracking.symbol,
+                                EquityTransferReservationId::from_uuid(id.0),
+                            )
+                            .await?;
+                        }
+                        Err(error) => {
+                            warn!(
+                                target: "rebalance",
+                                %id, %error,
+                                "Failed to emit timeout failure event for redemption"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3038,9 +3057,7 @@ impl RebalancingService {
                 );
                 Ok(false)
             }
-            Err(error) => Err(equity::EquityTriggerError::PositionReservation(
-                error.to_string(),
-            )),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -3074,9 +3091,7 @@ impl RebalancingService {
                 );
                 Ok(false)
             }
-            Err(error) => Err(equity::EquityTriggerError::PositionReservation(
-                error.to_string(),
-            )),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -3091,8 +3106,8 @@ impl RebalancingService {
                 symbol,
                 PositionCommand::ReleaseEquityTransfer { reservation_id },
             )
-            .await
-            .map_err(|error| equity::EquityTriggerError::PositionReservation(error.to_string()))
+            .await?;
+        Ok(())
     }
 
     async fn is_restart_tainted(&self, symbol: &Symbol) -> bool {
@@ -4836,8 +4851,8 @@ impl RebalancingService {
                 symbol,
                 PositionCommand::ReleaseEquityTransfer { reservation_id },
             )
-            .await
-            .map_err(|error| RebalancingServiceError::PositionReservation(error.to_string()))
+            .await?;
+        Ok(())
     }
 
     /// Clears the in-progress flag for an equity symbol.
@@ -18485,6 +18500,81 @@ mod tests {
             .await;
     }
 
+    async fn attach_live_equity_stores(
+        service: &Arc<RebalancingService>,
+    ) -> (
+        Arc<Store<TokenizedEquityMint>>,
+        Arc<Store<EquityRedemption>>,
+    ) {
+        let pool = crate::test_utils::setup_test_db().await;
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(services)
+            .await
+            .unwrap();
+        service
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool, ())),
+            )
+            .await;
+        (mint_store, redemption_store)
+    }
+
+    async fn seed_confirmed_transfer_reservation(
+        service: &RebalancingService,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) {
+        let position_store = service
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+    }
+
     /// An operator failure dispatched through the conductor-owned store must
     /// reach this live reactor and release a requested mint's symbol guard.
     /// The timeout sweeper intentionally never expires this stage, so a
@@ -18575,6 +18665,116 @@ mod tests {
                 .contains_key(&symbol),
             "the live reactor must release the requested mint guard"
         );
+    }
+
+    #[tokio::test]
+    async fn mint_timeout_releases_confirmed_transfer_reservation() {
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = issuer_request_id("timed-out-mint-release");
+        let service = make_trigger_with_inventory(InventoryView::default().with_equity(
+            symbol.clone(),
+            shares(100),
+            shares(0),
+        ))
+        .await;
+        let (mint_store, _) = attach_live_equity_stores(&service).await;
+
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service.mint_tracking.read().await.get(&id).unwrap().stage,
+            MintTrackingStage::Accepted
+        );
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+
+        service
+            .expire_stuck_mints(Utc::now() + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+
+        let position = service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn redemption_timeout_releases_confirmed_transfer_reservation() {
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = redemption_aggregate_id("timed-out-redemption-release");
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let service = make_trigger_with_inventory(inventory).await;
+        let (_, redemption_store) = attach_live_equity_stores(&service).await;
+
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    amount: U256::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+
+        service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+
+        let position = service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
     }
 
     #[tokio::test]

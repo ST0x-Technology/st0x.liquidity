@@ -574,6 +574,9 @@ const TRANSIENT_RESCHEDULE_LIMIT: u32 = 3;
 /// transient failure, matching the supervised worker's retry backoff.
 const TRANSIENT_RESCHEDULE_BASE: Duration = Duration::from_secs(1);
 
+/// Keeps a hedge live while an equity transfer owns the Position claim.
+const EQUITY_TRANSFER_REDRIVE_DELAY: Duration = Duration::from_secs(1);
+
 /// Keeps a stalled alert channel from serialising every other symbol behind a
 /// dead-letter on the concurrency-one hedge worker.
 const DEAD_LETTER_ALERT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1727,7 +1730,7 @@ impl PlaceHedge {
         // - ThresholdNotMet: position moved below threshold since the monitor
         //   scanned -- stale job, no action needed.
         // - EquityTransferPending: a transfer won the Position claim first;
-        //   its terminal event schedules a fresh check after releasing it.
+        //   enqueue a delayed successor so the hedge is retried after release.
         //
         // Everything else (lifecycle bugs, aggregate conflicts, DB errors)
         // propagates so backon retries the job.
@@ -1778,10 +1781,15 @@ impl PlaceHedge {
             Err(AggregateError::UserError(LifecycleError::Apply(
                 ref error @ PositionError::EquityTransferPending { .. },
             ))) => {
+                ctx.hedge_queue
+                    .clone()
+                    .push_with_delay(self.clone(), EQUITY_TRANSFER_REDRIVE_DELAY)
+                    .await?;
                 info!(
                     target: "hedge",
                     symbol = %self.symbol, %error,
-                    "Equity transfer owns the position, skipping stale hedge job"
+                    retry_delay_secs = EQUITY_TRANSFER_REDRIVE_DELAY.as_secs(),
+                    "Equity transfer owns the position; scheduled hedge retry"
                 );
                 return Ok(());
             }
@@ -6026,11 +6034,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_reservation_makes_place_hedge_a_safe_stale_job() {
+    async fn transfer_reservation_redrives_hedge_until_it_can_claim_position() {
         let TestInfra {
             ctx,
             position_projection,
             offchain_order_projection,
+            apalis_pool,
             ..
         } = create_hedge_ctx(succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -6053,11 +6062,23 @@ mod tests {
             )
             .await
             .unwrap();
-
-        hedge_job(&symbol, 0.5, Direction::Sell)
-            .perform(&ctx)
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
             .await
             .unwrap();
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.5)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = hedge_job(&symbol, 3.0, Direction::Sell);
+        job.perform(&ctx).await.unwrap();
 
         assert!(
             offchain_order_projection
@@ -6072,6 +6093,34 @@ mod tests {
             position.equity_transfer_reservation.unwrap().id,
             reservation_id
         );
+
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<PlaceHedge>())
+        .fetch_one(&apalis_pool)
+        .await
+        .expect("transfer rejection must enqueue a delayed hedge successor");
+        let successor: PlaceHedge =
+            serde_json::from_slice(&payload).expect("deserialize delayed hedge successor");
+        assert_eq!(successor.offchain_order_id, job.offchain_order_id);
+
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::ReleaseEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        successor.perform(&ctx).await.unwrap();
+
+        assert_eq!(offchain_order_projection.load_all().await.unwrap().len(), 1);
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(job.offchain_order_id)
+        );
+        assert_eq!(position.equity_transfer_reservation, None);
     }
 
     #[tokio::test]
