@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 
-use super::BroadcastingInventory;
+use super::{BroadcastingInventory, divergence::ReconciliationGeneration};
 
 use st0x_event_sorcery::{CompactionPolicy, DomainEvent, EventSourced, Never, Nil};
 use st0x_evm::Chain;
@@ -66,31 +66,35 @@ impl FromStr for InventorySnapshotId {
     }
 }
 
-fn equity_events(
+fn reconciled_equity_events(
     chain: Chain,
     balances: BTreeMap<Symbol, FractionalShares>,
     fetched_at: DateTime<Utc>,
     block_number: Option<u64>,
+    generations: BTreeMap<Symbol, ReconciliationGeneration>,
 ) -> Vec<InventorySnapshotEvent> {
-    vec![InventorySnapshotEvent::OnchainEquity {
+    vec![InventorySnapshotEvent::OnchainEquityReconciled {
         chain,
         balances,
         fetched_at,
         block_number,
+        generations,
     }]
 }
 
-fn usdc_events(
+fn reconciled_usdc_events(
     chain: Chain,
     usdc_balance: Usdc,
     fetched_at: DateTime<Utc>,
     block_number: Option<u64>,
+    generation: ReconciliationGeneration,
 ) -> Vec<InventorySnapshotEvent> {
-    vec![InventorySnapshotEvent::OnchainUsdc {
+    vec![InventorySnapshotEvent::OnchainUsdcReconciled {
         chain,
         usdc_balance,
         fetched_at,
         block_number,
+        generation,
     }]
 }
 
@@ -225,25 +229,26 @@ impl EventSourced for InventorySnapshot {
                 balances,
                 block_number,
                 fetched_at,
-            }
-            | ReconcileOnchainEquity {
-                chain,
-                balances,
-                block_number,
-                fetched_at,
             } => InventorySnapshotEvent::OnchainEquity {
                 chain,
                 balances,
                 fetched_at,
                 block_number,
             },
-            OnchainUsdc {
+            ReconcileOnchainEquity {
                 chain,
-                usdc_balance,
+                balances,
                 block_number,
                 fetched_at,
-            }
-            | ReconcileOnchainUsdc {
+                generations,
+            } => InventorySnapshotEvent::OnchainEquityReconciled {
+                chain,
+                balances,
+                fetched_at,
+                block_number,
+                generations,
+            },
+            OnchainUsdc {
                 chain,
                 usdc_balance,
                 block_number,
@@ -253,6 +258,19 @@ impl EventSourced for InventorySnapshot {
                 usdc_balance,
                 fetched_at,
                 block_number,
+            },
+            ReconcileOnchainUsdc {
+                chain,
+                usdc_balance,
+                block_number,
+                fetched_at,
+                generation,
+            } => InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain,
+                usdc_balance,
+                fetched_at,
+                block_number,
+                generation,
             },
             OffchainEquity {
                 positions,
@@ -267,12 +285,14 @@ impl EventSourced for InventorySnapshot {
                 fetched_at,
                 ledger_position,
                 consecutive_polls,
+                generation,
             } => InventorySnapshotEvent::OffchainEquityReconciled {
                 symbol,
                 position,
                 fetched_at,
                 ledger_position,
                 consecutive_polls,
+                generation,
             },
             ReconcileOffchainUsd {
                 usd_balance_cents,
@@ -362,54 +382,39 @@ impl EventSourced for InventorySnapshot {
                 balances,
                 block_number,
                 fetched_at,
-            } => {
-                // Per-chain comparison: one chain's poll must never be
-                // compared against (or suppress) another chain's balances.
-                // A never-polled chain equals an empty read: a snapshot is
-                // the complete venue picture, so emitting the first empty
-                // poll would zero every tracked symbol on that chain.
-                let unchanged = self
-                    .onchain_equity
-                    .get(&chain)
-                    .map_or(balances.is_empty(), |current| *current == balances);
-                if unchanged {
-                    return Ok(vec![]);
-                }
-                Ok(vec![InventorySnapshotEvent::OnchainEquity {
-                    chain,
-                    balances,
-                    fetched_at,
-                    block_number,
-                }])
-            }
+            } => Ok(self.onchain_equity_events(chain, balances, fetched_at, block_number)),
             ReconcileOnchainEquity {
                 chain,
                 balances,
                 block_number,
                 fetched_at,
-            } => Ok(equity_events(chain, balances, fetched_at, block_number)),
+                generations,
+            } => Ok(reconciled_equity_events(
+                chain,
+                balances,
+                fetched_at,
+                block_number,
+                generations,
+            )),
             OnchainUsdc {
                 chain,
                 usdc_balance,
                 block_number,
                 fetched_at,
-            } => {
-                if self.onchain_usdc.get(&chain) == Some(&usdc_balance) {
-                    return Ok(vec![]);
-                }
-                Ok(vec![InventorySnapshotEvent::OnchainUsdc {
-                    chain,
-                    usdc_balance,
-                    fetched_at,
-                    block_number,
-                }])
-            }
+            } => Ok(self.onchain_usdc_events(chain, usdc_balance, fetched_at, block_number)),
             ReconcileOnchainUsdc {
                 chain,
                 usdc_balance,
                 block_number,
                 fetched_at,
-            } => Ok(usdc_events(chain, usdc_balance, fetched_at, block_number)),
+                generation,
+            } => Ok(reconciled_usdc_events(
+                chain,
+                usdc_balance,
+                fetched_at,
+                block_number,
+                generation,
+            )),
             OffchainEquity {
                 positions,
                 fetched_at,
@@ -432,12 +437,14 @@ impl EventSourced for InventorySnapshot {
                 fetched_at,
                 ledger_position,
                 consecutive_polls,
+                generation,
             } => Ok(vec![InventorySnapshotEvent::OffchainEquityReconciled {
                 symbol,
                 position,
                 fetched_at,
                 ledger_position,
                 consecutive_polls,
+                generation,
             }]),
             // Like its equity twin: always emits, bypassing the value
             // dedupe -- the state it corrects is "stored value already
@@ -570,6 +577,51 @@ impl EventSourced for InventorySnapshot {
 }
 
 impl InventorySnapshot {
+    fn onchain_equity_events(
+        &self,
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+    ) -> Vec<InventorySnapshotEvent> {
+        // Per-chain comparison: one chain's poll must never be compared
+        // against (or suppress) another chain's balances. A never-polled
+        // chain equals an empty read because the snapshot is complete.
+        let unchanged = self
+            .onchain_equity
+            .get(&chain)
+            .map_or(balances.is_empty(), |current| *current == balances);
+        if unchanged {
+            return vec![];
+        }
+
+        vec![InventorySnapshotEvent::OnchainEquity {
+            chain,
+            balances,
+            fetched_at,
+            block_number,
+        }]
+    }
+
+    fn onchain_usdc_events(
+        &self,
+        chain: Chain,
+        usdc_balance: Usdc,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+    ) -> Vec<InventorySnapshotEvent> {
+        if self.onchain_usdc.get(&chain) == Some(&usdc_balance) {
+            return vec![];
+        }
+
+        vec![InventorySnapshotEvent::OnchainUsdc {
+            chain,
+            usdc_balance,
+            fetched_at,
+            block_number,
+        }]
+    }
+
     /// Fold persisted snapshot fields into the in-memory [`InventoryView`].
     ///
     /// Each field is applied as it is emitted -- no intermediate event
@@ -719,6 +771,13 @@ impl InventorySnapshot {
                 balances,
                 fetched_at,
                 block_number,
+            }
+            | InventorySnapshotEvent::OnchainEquityReconciled {
+                chain,
+                balances,
+                fetched_at,
+                block_number,
+                ..
             } if self
                 .onchain_equity_fetched_at
                 .get(chain)
@@ -736,6 +795,13 @@ impl InventorySnapshot {
                 usdc_balance,
                 fetched_at,
                 block_number,
+            }
+            | InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain,
+                usdc_balance,
+                fetched_at,
+                block_number,
+                ..
             } if self
                 .onchain_usdc_fetched_at
                 .get(chain)
@@ -802,7 +868,9 @@ impl InventorySnapshot {
                 self.offchain_usd_fetched_at = Some(*fetched_at);
             }
             InventorySnapshotEvent::OnchainEquity { .. }
+            | InventorySnapshotEvent::OnchainEquityReconciled { .. }
             | InventorySnapshotEvent::OnchainUsdc { .. }
+            | InventorySnapshotEvent::OnchainUsdcReconciled { .. }
             | InventorySnapshotEvent::OffchainEquity { .. }
             | InventorySnapshotEvent::OffchainEquityReconciled { .. }
             | InventorySnapshotEvent::OffchainUsdReconciled { .. }
@@ -867,6 +935,7 @@ pub(crate) enum InventorySnapshotCommand {
         balances: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
         block_number: Option<u64>,
+        generations: BTreeMap<Symbol, ReconciliationGeneration>,
     },
     OnchainUsdc {
         chain: Chain,
@@ -883,6 +952,7 @@ pub(crate) enum InventorySnapshotCommand {
         usdc_balance: Usdc,
         fetched_at: DateTime<Utc>,
         block_number: Option<u64>,
+        generation: ReconciliationGeneration,
     },
     OffchainEquity {
         positions: BTreeMap<Symbol, FractionalShares>,
@@ -910,6 +980,9 @@ pub(crate) enum InventorySnapshotCommand {
         ledger_position: Option<FractionalShares>,
         /// Consecutive polls that observed the divergence.
         consecutive_polls: u32,
+        /// Explicit deferred-reconciliation generation claimed before the
+        /// broker read. Persistent-divergence reconciles do not use this gate.
+        generation: Option<ReconciliationGeneration>,
     },
     /// The venue-level cash twin of `ReconcileOffchainEquity`: force record
     /// the available cash the broker reported after the poller confirmed a
@@ -993,6 +1066,14 @@ pub(crate) enum InventorySnapshotEvent {
         #[serde(default)]
         block_number: Option<u64>,
     },
+    /// Explicit forced reconciliation for the requested symbols only.
+    OnchainEquityReconciled {
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+        generations: BTreeMap<Symbol, ReconciliationGeneration>,
+    },
     #[serde(alias = "OnchainCash")]
     OnchainUsdc {
         #[serde(default = "crate::onchain::legacy_chain")]
@@ -1004,6 +1085,14 @@ pub(crate) enum InventorySnapshotEvent {
         /// backward-compatibility).
         #[serde(default)]
         block_number: Option<u64>,
+    },
+    /// Explicit forced reconciliation for one cash request generation.
+    OnchainUsdcReconciled {
+        chain: Chain,
+        usdc_balance: Usdc,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+        generation: ReconciliationGeneration,
     },
     OffchainEquity {
         positions: BTreeMap<Symbol, FractionalShares>,
@@ -1022,6 +1111,10 @@ pub(crate) enum InventorySnapshotEvent {
         ledger_position: Option<FractionalShares>,
         /// Consecutive polls that observed the divergence.
         consecutive_polls: u32,
+        /// Explicit deferred-reconciliation generation. `None` denotes the
+        /// independent persistent-divergence recovery path.
+        #[serde(default)]
+        generation: Option<ReconciliationGeneration>,
     },
     /// Forced venue-level cash reconciliation, emitted after the poller
     /// confirmed a persistent divergence between the broker's available
@@ -1087,7 +1180,9 @@ impl InventorySnapshotEvent {
     pub(crate) fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Self::OnchainEquity { fetched_at, .. }
+            | Self::OnchainEquityReconciled { fetched_at, .. }
             | Self::OnchainUsdc { fetched_at, .. }
+            | Self::OnchainUsdcReconciled { fetched_at, .. }
             | Self::OffchainEquity { fetched_at, .. }
             | Self::OffchainEquityReconciled { fetched_at, .. }
             | Self::OffchainUsdReconciled { fetched_at, .. }
@@ -1108,7 +1203,13 @@ impl DomainEvent for InventorySnapshotEvent {
     fn event_type(&self) -> String {
         match self {
             Self::OnchainEquity { .. } => "InventorySnapshotEvent::OnchainEquity".to_string(),
+            Self::OnchainEquityReconciled { .. } => {
+                "InventorySnapshotEvent::OnchainEquityReconciled".to_string()
+            }
             Self::OnchainUsdc { .. } => "InventorySnapshotEvent::OnchainUsdc".to_string(),
+            Self::OnchainUsdcReconciled { .. } => {
+                "InventorySnapshotEvent::OnchainUsdcReconciled".to_string()
+            }
             Self::OffchainEquity { .. } => "InventorySnapshotEvent::OffchainEquity".to_string(),
             Self::OffchainUsdReconciled { .. } => {
                 "InventorySnapshotEvent::OffchainUsdReconciled".to_string()
@@ -2734,6 +2835,7 @@ mod tests {
         let balances = BTreeMap::from([(symbol, test_shares(10))]);
         let stored_at = Utc::now();
         let reconciled_at = stored_at + chrono::Duration::seconds(60);
+        let generation = ReconciliationGeneration::for_test(1);
 
         let equity_events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::OnchainEquity {
@@ -2747,13 +2849,14 @@ mod tests {
                 balances,
                 fetched_at: reconciled_at,
                 block_number: Some(200),
+                generations: BTreeMap::from([(test_symbol("AAPL"), generation)]),
             })
             .await
             .events();
         assert!(
             matches!(
                 equity_events.as_slice(),
-                [InventorySnapshotEvent::OnchainEquity {
+                [InventorySnapshotEvent::OnchainEquityReconciled {
                     block_number: Some(200),
                     ..
                 }]
@@ -2774,13 +2877,14 @@ mod tests {
                 usdc_balance,
                 fetched_at: reconciled_at,
                 block_number: Some(200),
+                generation,
             })
             .await
             .events();
         assert!(
             matches!(
                 usdc_events.as_slice(),
-                [InventorySnapshotEvent::OnchainUsdc {
+                [InventorySnapshotEvent::OnchainUsdcReconciled {
                     block_number: Some(200),
                     ..
                 }]
@@ -2842,6 +2946,7 @@ mod tests {
                 fetched_at,
                 ledger_position: Some(test_shares(136)),
                 consecutive_polls: 3,
+                generation: None,
             })
             .await
             .events();
@@ -2853,6 +2958,7 @@ mod tests {
             fetched_at: event_fetched_at,
             ledger_position,
             consecutive_polls,
+            ..
         } = &events[0]
         else {
             panic!(
@@ -2888,6 +2994,7 @@ mod tests {
                 fetched_at: reconciled_at,
                 ledger_position: Some(test_shares(136)),
                 consecutive_polls: 3,
+                generation: None,
             },
         ])
         .unwrap()
@@ -2934,6 +3041,7 @@ mod tests {
                 fetched_at: stale_at,
                 ledger_position: None,
                 consecutive_polls: 3,
+                generation: None,
             },
         ])
         .unwrap()
