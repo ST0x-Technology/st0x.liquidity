@@ -300,9 +300,10 @@ mod tests {
         let (control, gate) = quiesce(TEST_TIMEOUT);
         let executing = gate.enter().await;
 
-        let cancelled = tokio::time::timeout(Duration::from_millis(10), control.pause()).await;
         assert!(
-            cancelled.is_err(),
+            tokio::time::timeout(Duration::from_millis(10), control.pause())
+                .await
+                .is_err(),
             "the outer timeout must cancel a pause waiting for an in-flight execution"
         );
 
