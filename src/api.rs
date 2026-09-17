@@ -1355,9 +1355,15 @@ pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
 /// quiesce window. The guard resumes the driver when dropped.
 async fn quiesce_usdc_driver(
     pause: &UsdcDriverPause,
+    rebalance_id: &UsdcRebalanceId,
+    resume_direction: Option<RebalanceDirection>,
 ) -> Result<UsdcDriverPauseGuard, (StatusCode, Json<ErrorResponse>)> {
     pause.pause().await.map_err(|DriverNotQuiesced| {
-        warn!("USDC driver did not quiesce for an operator write; refusing");
+        warn!(
+            %rebalance_id,
+            ?resume_direction,
+            "USDC driver did not quiesce for an operator write; refusing"
+        );
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -1728,7 +1734,8 @@ async fn recheck_transfer(
             // and hold them parked for the whole recheck. Not bounded here:
             // dropping the recheck mid step could strand the aggregate, and each
             // call inside it is already transport bounded.
-            let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause).await?;
+            let _driver_paused =
+                quiesce_usdc_driver(&handle.usdc_driver_pause, &rebalance_id, None).await?;
 
             let outcome = handle
                 .usdc_recheck
@@ -1879,7 +1886,8 @@ async fn resume_usdc_transfer(
     // Quiesce the workers so the resume's preflight (durable holder scan and
     // job row dedupe) and its enqueue cannot straddle an execution already in
     // flight for the same aggregate.
-    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause).await?;
+    let _driver_paused =
+        quiesce_usdc_driver(&handle.usdc_driver_pause, &rebalance_id, Some(direction)).await?;
 
     handle
         .rebalancing_service
@@ -8376,11 +8384,16 @@ mod tests {
     /// A write route must refuse with 503 while a transfer is executing, and
     /// the refusal must leave the driver running rather than flagged paused.
     #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
     async fn quiesce_usdc_driver_returns_503_while_a_transfer_executes() {
         let (control, gate) = usdc_driver_pause();
+        let rebalance_id = UsdcRebalanceId(uuid!("11111111-2222-3333-4444-555555555555"));
+        let direction = RebalanceDirection::BaseToAlpaca;
         let _executing = gate.enter().await;
 
-        let Err((status, Json(body))) = quiesce_usdc_driver(&control).await else {
+        let Err((status, Json(body))) =
+            quiesce_usdc_driver(&control, &rebalance_id, Some(direction)).await
+        else {
             panic!("a quiesce with an execution in flight must be refused");
         };
 
@@ -8393,6 +8406,8 @@ mod tests {
             !gate.is_paused(),
             "a refused quiesce must not leave the driver paused"
         );
+        assert!(logs_contain(&format!("rebalance_id={rebalance_id}")));
+        assert!(logs_contain("resume_direction=Some(BaseToAlpaca)"));
     }
 
     /// With no execution in flight the route gets its guard at once, the
@@ -8402,7 +8417,10 @@ mod tests {
     async fn quiesce_usdc_driver_parks_the_driver_until_the_guard_drops() {
         let (control, gate) = usdc_driver_pause();
 
-        let guard = quiesce_usdc_driver(&control).await.unwrap();
+        let rebalance_id = UsdcRebalanceId(uuid!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        let guard = quiesce_usdc_driver(&control, &rebalance_id, None)
+            .await
+            .unwrap();
         assert!(gate.is_paused());
 
         drop(guard);
