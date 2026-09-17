@@ -758,9 +758,11 @@ pub(crate) struct RebalancingService {
     suppressed_inflight_symbols: Arc<RwLock<HashMap<Symbol, DateTime<Utc>>>>,
     timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, TimeoutTombstone>>>,
     timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, TimeoutTombstone>>>,
-    /// Timeout terminal commands that committed but whose matching Position
-    /// reservation release has not succeeded yet. Retried every sweep; startup
-    /// orphan reconciliation covers a process exit while either map is live.
+    /// Terminal transfer reservations whose release is pending. Lifecycle
+    /// reactors queue these instead of writing Position synchronously inside
+    /// another aggregate's SQLite transaction. A detached post-transaction
+    /// retry handles the normal path, the periodic sweep handles transient
+    /// failures, and startup orphan reconciliation covers process exit.
     pending_timed_out_mint_reservation_releases: Arc<RwLock<HashMap<IssuerRequestId, Symbol>>>,
     pending_timed_out_redemption_reservation_releases:
         Arc<RwLock<HashMap<RedemptionAggregateId, Symbol>>>,
@@ -811,6 +813,8 @@ type EquityInventoryUpdate = Box<
 >;
 
 const TIMEOUT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const TERMINAL_RESERVATION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
+const TERMINAL_RESERVATION_RELEASE_ATTEMPTS: u32 = 5;
 
 #[derive(Debug)]
 enum UsdcTimeoutCleanup {
@@ -2586,7 +2590,7 @@ impl RebalancingService {
                 // lock so no snapshot can advance the watermark in
                 // between. A skipped leg is normal operation, not an
                 // error.
-                let primary_chain = {
+                let (primary_chain, equity_reconciled, usdc_reconciled) = {
                     let mut inventory = self.inventory.write().await;
                     let primary_chain = inventory.primary_chain();
                     let on_primary = trade_id.chain == primary_chain;
@@ -2629,6 +2633,69 @@ impl RebalancingService {
 
                     let apply_equity_leg = (on_primary || equity_slot_seeded) && !equity_absorbed;
                     let apply_usdc_leg = (on_primary || usdc_slot_seeded) && !usdc_absorbed;
+                    let requested_usdc = Usdc::new(usdc_value);
+                    let mut equity_reconciled = true;
+                    let mut usdc_reconciled = true;
+
+                    // A terminal transfer or a later wall-clock snapshot can
+                    // reduce available inventory before this durable fill
+                    // event reaches the reactor. The block watermark cannot
+                    // prove absorption in that ordering, but rejecting the
+                    // fill leaves Position committed while aborting both
+                    // inventory legs. Consume the tracked remainder to zero
+                    // instead; the next block-pinned snapshot supplies the
+                    // exact authoritative balance. Do not schedule a rebalance
+                    // from the clamped leg before that reconciliation.
+                    let equity_delta = if apply_equity_leg && equity_op == Operator::Remove {
+                        let available = inventory
+                            .onchain_equity_available_at(&symbol, trade_id.chain)
+                            .unwrap_or(FractionalShares::ZERO);
+                        if available.inner().lt(amount.inner())? {
+                            equity_reconciled = false;
+                            warn!(
+                                target: "rebalance",
+                                %symbol,
+                                chain = %trade_id.chain,
+                                ?block_number,
+                                requested = %amount,
+                                available = %available,
+                                "Onchain fill arrived after inventory had already \
+                                 moved below its equity delta; consuming the \
+                                 tracked remainder and deferring exact \
+                                 reconciliation to the next pinned snapshot"
+                            );
+                            available
+                        } else {
+                            *amount
+                        }
+                    } else {
+                        *amount
+                    };
+                    let usdc_delta = if apply_usdc_leg && equity_op.inverse() == Operator::Remove {
+                        let available = inventory
+                            .onchain_usdc_available_at(trade_id.chain)
+                            .unwrap_or(Usdc::ZERO);
+                        if available.inner().lt(requested_usdc.inner())? {
+                            usdc_reconciled = false;
+                            warn!(
+                                target: "rebalance",
+                                %symbol,
+                                chain = %trade_id.chain,
+                                ?block_number,
+                                requested = %requested_usdc,
+                                available = %available,
+                                "Onchain fill arrived after inventory had already \
+                                 moved below its cash delta; consuming the \
+                                 tracked remainder and deferring exact \
+                                 reconciliation to the next pinned snapshot"
+                            );
+                            available
+                        } else {
+                            requested_usdc
+                        }
+                    } else {
+                        requested_usdc
+                    };
 
                     // Chain-addressed: inventory is not fungible
                     // across chains, so a fill credits and debits the
@@ -2640,7 +2707,7 @@ impl RebalancingService {
                         updated = updated.update_equity_at(
                             &symbol,
                             trade_id.chain,
-                            Inventory::available(Venue::MarketMaking, equity_op, *amount),
+                            Inventory::available(Venue::MarketMaking, equity_op, equity_delta),
                             timestamp,
                         )?;
                     }
@@ -2650,21 +2717,28 @@ impl RebalancingService {
                             Inventory::available(
                                 Venue::MarketMaking,
                                 equity_op.inverse(),
-                                Usdc::new(usdc_value),
+                                usdc_delta,
                             ),
                             timestamp,
                         )?;
                     }
                     *inventory = updated;
-                    primary_chain
+                    drop(inventory);
+                    (primary_chain, equity_reconciled, usdc_reconciled)
                 };
                 // Only the primary chain rebalances: a secondary is
                 // prefunded and holds its own inventory, so its fill
                 // must not schedule work against the primary chain's
-                // balances.
+                // balances. A clamped leg waits for the next pinned
+                // snapshot instead of sizing a transfer from an
+                // acknowledged intermediate balance.
                 if trade_id.chain == primary_chain {
-                    self.equity_scheduler.enqueue_check(symbol).await;
-                    self.usdc_scheduler.enqueue_check().await;
+                    if equity_reconciled {
+                        self.equity_scheduler.enqueue_check(symbol).await;
+                    }
+                    if usdc_reconciled {
+                        self.usdc_scheduler.enqueue_check().await;
+                    }
                 }
 
                 Ok(())
@@ -4860,6 +4934,100 @@ impl RebalancingService {
         Ok(true)
     }
 
+    async fn retry_terminal_reservation_release_after_reactor(
+        store: Arc<Store<Position>>,
+        symbol: Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> bool {
+        for attempt in 1..=TERMINAL_RESERVATION_RELEASE_ATTEMPTS {
+            tokio::time::sleep(TERMINAL_RESERVATION_RELEASE_RETRY_DELAY * attempt).await;
+            match store
+                .send(
+                    &symbol,
+                    PositionCommand::ReleaseEquityTransfer { reservation_id },
+                )
+                .await
+            {
+                Ok(()) => return true,
+                Err(error) if attempt == TERMINAL_RESERVATION_RELEASE_ATTEMPTS => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        %reservation_id,
+                        %error,
+                        "Failed to release terminal equity transfer reservation \
+                         after the lifecycle transaction committed; retaining it \
+                         for the periodic retry sweep"
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        false
+    }
+
+    async fn queue_terminal_mint_reservation_release(&self, id: &IssuerRequestId, symbol: &Symbol) {
+        self.pending_timed_out_mint_reservation_releases
+            .write()
+            .await
+            .insert(id.clone(), symbol.clone());
+
+        let Some(store) = self.position_store.read().await.as_ref().map(Arc::clone) else {
+            warn!(
+                target: "rebalance",
+                %id,
+                %symbol,
+                "Position authority is not wired; retaining terminal mint \
+                 reservation for the periodic retry sweep"
+            );
+            return;
+        };
+        let pending = Arc::clone(&self.pending_timed_out_mint_reservation_releases);
+        let id = id.clone();
+        let symbol = symbol.clone();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        drop(tokio::spawn(async move {
+            if Self::retry_terminal_reservation_release_after_reactor(store, symbol, reservation_id)
+                .await
+            {
+                pending.write().await.remove(&id);
+            }
+        }));
+    }
+
+    async fn queue_terminal_redemption_reservation_release(
+        &self,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+    ) {
+        self.pending_timed_out_redemption_reservation_releases
+            .write()
+            .await
+            .insert(id.clone(), symbol.clone());
+
+        let Some(store) = self.position_store.read().await.as_ref().map(Arc::clone) else {
+            warn!(
+                target: "rebalance",
+                %id,
+                %symbol,
+                "Position authority is not wired; retaining terminal redemption \
+                 reservation for the periodic retry sweep"
+            );
+            return;
+        };
+        let pending = Arc::clone(&self.pending_timed_out_redemption_reservation_releases);
+        let id = id.clone();
+        let symbol = symbol.clone();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        drop(tokio::spawn(async move {
+            if Self::retry_terminal_reservation_release_after_reactor(store, symbol, reservation_id)
+                .await
+            {
+                pending.write().await.remove(&id);
+            }
+        }));
+    }
+
     async fn release_timed_out_mint_reservation(&self, id: &IssuerRequestId, symbol: &Symbol) {
         self.pending_timed_out_mint_reservation_releases
             .write()
@@ -6281,7 +6449,7 @@ impl RebalancingService {
                  inflight suppression so snapshot polls resume recording the \
                  symbol; balances heal on the next poll"
             );
-            self.release_timed_out_mint_reservation(&id, &tombstone.symbol)
+            self.queue_terminal_mint_reservation_release(&id, &tombstone.symbol)
                 .await;
             drop(event_sync_guard);
             self.equity_scheduler.enqueue_check(tombstone.symbol).await;
@@ -6351,11 +6519,8 @@ impl RebalancingService {
 
         let is_terminal = if Self::is_terminal_mint_event(&event) {
             self.mint_tracking.write().await.remove(&id);
-            self.release_terminal_equity_transfer(
-                &symbol,
-                EquityTransferReservationId::from_uuid(id.0),
-            )
-            .await?;
+            self.queue_terminal_mint_reservation_release(&id, &symbol)
+                .await;
             self.clear_equity_in_progress(&symbol);
             debug!(target: "rebalance", %symbol, "Cleared equity in-progress flag after mint terminal event");
             true
@@ -6427,7 +6592,7 @@ impl RebalancingService {
                  inflight suppression so snapshot polls resume recording the \
                  symbol; balances heal on the next poll"
             );
-            self.release_timed_out_redemption_reservation(&id, &tombstone.symbol)
+            self.queue_terminal_redemption_reservation_release(&id, &tombstone.symbol)
                 .await;
             drop(event_sync_guard);
             self.equity_scheduler.enqueue_check(tombstone.symbol).await;
@@ -6528,11 +6693,8 @@ impl RebalancingService {
                 drop(inventory);
                 drop(suppressed);
             }
-            self.release_terminal_equity_transfer(
-                &symbol,
-                EquityTransferReservationId::from_uuid(id.0),
-            )
-            .await?;
+            self.queue_terminal_redemption_reservation_release(&id, &symbol)
+                .await;
             self.clear_equity_in_progress(&symbol);
             debug!(
                 target: "rebalance",
@@ -13044,6 +13206,71 @@ mod tests {
             inventory.usdc_available(Venue::MarketMaking),
             Some(usdc(7000)),
             "a fill past the snapshot block must apply its USDC leg"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn onchain_fill_underflow_consumes_remainder_and_defers_to_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), FractionalShares::ZERO, shares(50))
+            .with_usdc(usdc(1000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor);
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), FractionalShares::ZERO)]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(1000),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        // A lifecycle/snapshot update has already reduced tracked equity to
+        // zero when the later durable sell fill arrives. The fill reactor must
+        // not abort and lose its independent cash leg.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(10), Direction::Sell, Some(101)),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "the stale tracked remainder is consumed without going negative"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(2500)),
+            "the independent cash leg still applies while equity waits for a snapshot"
         );
         drop(inventory);
     }

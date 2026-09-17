@@ -1373,7 +1373,6 @@ impl InventoryView {
     /// The market-making equity available in an explicit chain's slot.
     /// [`Self::equity_available`] resolves the primary chain, so a test
     /// covering a secondary chain reads through here instead.
-    #[cfg(test)]
     pub(crate) fn onchain_equity_available_at(
         &self,
         symbol: &Symbol,
@@ -1399,7 +1398,6 @@ impl InventoryView {
     }
 
     /// The market-making USDC available in an explicit chain's slot.
-    #[cfg(test)]
     pub(crate) fn onchain_usdc_available_at(&self, chain: Chain) -> Option<Usdc> {
         self.usdc
             .get_venue(Venue::MarketMaking, chain)
