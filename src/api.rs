@@ -1363,12 +1363,13 @@ pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
 /// quiesce window. The guard resumes the driver when dropped.
 async fn quiesce_usdc_driver(
     pause: &UsdcDriverPause,
-    rebalance_id: &UsdcRebalanceId,
+    rebalance_id: Option<&UsdcRebalanceId>,
     resume_direction: Option<RebalanceDirection>,
 ) -> Result<UsdcDriverPauseGuard, (StatusCode, Json<ErrorResponse>)> {
     pause.pause().await.map_err(|DriverNotQuiesced| {
+        let rebalance_id = rebalance_id.map(ToString::to_string);
         warn!(
-            %rebalance_id,
+            rebalance_id = %rebalance_id.as_deref().unwrap_or("unavailable"),
             ?resume_direction,
             "USDC driver did not quiesce for an operator write; refusing"
         );
@@ -1746,7 +1747,7 @@ async fn recheck_transfer(
             // dropping the recheck mid step could strand the aggregate, and each
             // call inside it is already transport bounded.
             let _driver_paused =
-                quiesce_usdc_driver(&handle.usdc_driver_pause, &rebalance_id, None).await?;
+                quiesce_usdc_driver(&handle.usdc_driver_pause, Some(&rebalance_id), None).await?;
 
             let outcome = handle
                 .usdc_recheck
@@ -1897,8 +1898,12 @@ async fn resume_usdc_transfer(
     // Quiesce the workers so the resume's preflight (durable holder scan and
     // job row dedupe) and its enqueue cannot straddle an execution already in
     // flight for the same aggregate.
-    let _driver_paused =
-        quiesce_usdc_driver(&handle.usdc_driver_pause, &rebalance_id, Some(direction)).await?;
+    let _driver_paused = quiesce_usdc_driver(
+        &handle.usdc_driver_pause,
+        Some(&rebalance_id),
+        Some(direction),
+    )
+    .await?;
 
     handle
         .rebalancing_service
@@ -2423,7 +2428,7 @@ async fn fail_usdc_transfer(
     })?;
     let _projection_write = state.projection_maintenance.enter().await;
 
-    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, &id, None).await?;
+    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, Some(&id), None).await?;
 
     let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
     Ok(Json(response))
@@ -2740,7 +2745,11 @@ async fn complete_cctp_mint_recovery(
             }),
         )
     })?;
-    let _driver_paused = quiesce_usdc_driver(driver_pause).await?;
+    let resume_direction = match direction {
+        BridgeDirection::EthereumToBase => RebalanceDirection::AlpacaToBase,
+        BridgeDirection::BaseToEthereum => RebalanceDirection::BaseToAlpaca,
+    };
+    let _driver_paused = quiesce_usdc_driver(driver_pause, None, Some(resume_direction)).await?;
 
     let recovered = recovery
         .submit_recovered_cctp_mint(direction, burn_tx, attestation)
@@ -9057,7 +9066,7 @@ mod tests {
         let _executing = gate.enter().await;
 
         let Err((status, Json(body))) =
-            quiesce_usdc_driver(&control, &rebalance_id, Some(direction)).await
+            quiesce_usdc_driver(&control, Some(&rebalance_id), Some(direction)).await
         else {
             panic!("a quiesce with an execution in flight must be refused");
         };
@@ -9082,10 +9091,7 @@ mod tests {
     async fn quiesce_usdc_driver_parks_the_driver_until_the_guard_drops() {
         let (control, gate) = usdc_driver_pause();
 
-        let rebalance_id = UsdcRebalanceId(uuid!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
-        let guard = quiesce_usdc_driver(&control, &rebalance_id, None)
-            .await
-            .unwrap();
+        let guard = quiesce_usdc_driver(&control, None, None).await.unwrap();
         assert!(gate.is_paused());
 
         drop(guard);
