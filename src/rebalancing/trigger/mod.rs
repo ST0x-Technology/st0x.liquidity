@@ -6355,6 +6355,7 @@ pub(crate) async fn wire_usdc_reactor_store(
             }),
         },
         cash_reserved: None,
+        hedge_floor: HedgeFloor::default(),
     };
     let service = Arc::new(RebalancingService::new(
         config,
