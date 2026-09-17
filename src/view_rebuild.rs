@@ -4,16 +4,19 @@
 //! route, so the set of rebuildable views and their single-id support cannot
 //! drift between the two.
 //!
-//! A rebuild is not atomic on its own: it deletes rows, then replays events.
-//! Callers must exclude every concurrent `Store::send` whose projection can
-//! touch the rebuilt rows. The live ops API does so through projection
-//! maintenance; direct database callers, including the legacy `st0x-cli`,
-//! must run only while the bot is stopped.
+//! Rebuilds replace each affected aggregate view atomically: row deletion and
+//! event replay share one SQLite transaction, so a replay failure preserves the
+//! previous materialized rows. Callers must still exclude concurrent
+//! `Store::send` projection writers. The live ops API does so through projection
+//! maintenance; direct database callers, including the legacy `st0x-cli`, must
+//! run only while the bot is stopped.
 
-use serde::Deserialize;
-use sqlx::SqlitePool;
-use st0x_event_sorcery::{Projection, ProjectionError};
+use serde::{Deserialize, Serialize};
+use sqlx::{AssertSqlSafe, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
+
+use st0x_event_sorcery::{EventSourced, LifecycleError, Projection, ProjectionError, Table};
+use st0x_execution::{EmptySymbolError, Symbol};
 
 use crate::offchain::order::{OffchainOrder, OffchainOrderId};
 use crate::performance::equity_timing::EquityTimingProjection;
@@ -22,7 +25,6 @@ use crate::performance::reliability::LifecycleFailureProjection;
 use crate::portfolio_snapshot::PortfolioSnapshotProjection;
 use crate::position::Position;
 use crate::vault_registry::{ParseVaultRegistryIdError, VaultRegistry, VaultRegistryId};
-use st0x_execution::{EmptySymbolError, Symbol};
 
 /// A view or read model an operator may rebuild. Kebab-cased for both the
 /// CLI value and the wire (`position`, `offchain-order`, ...).
@@ -157,6 +159,205 @@ impl ViewRebuildError {
     }
 }
 
+/// Local mirror of event-sorcery's private lifecycle state. The serialized
+/// shape must remain identical because the framework deserializes these rows.
+#[derive(Default, Serialize)]
+#[serde(bound = "")]
+enum RebuiltLifecycle<Entity>
+where
+    Entity: EventSourced,
+{
+    #[default]
+    Uninitialized,
+    Live(Entity),
+    Failed {
+        error: LifecycleError<Entity>,
+        last_valid_entity: Option<Box<Entity>>,
+    },
+}
+
+impl<Entity> RebuiltLifecycle<Entity>
+where
+    Entity: EventSourced,
+{
+    fn apply(&mut self, event: Entity::Event) {
+        *self = match std::mem::take(self) {
+            Self::Uninitialized => Entity::originate(&event).map_or_else(
+                || Self::Failed {
+                    error: LifecycleError::EventCantOriginate { event },
+                    last_valid_entity: None,
+                },
+                Self::Live,
+            ),
+            Self::Live(entity) => match Entity::evolve(&entity, &event) {
+                Ok(Some(next)) => Self::Live(next),
+                Ok(None) => Self::Failed {
+                    error: LifecycleError::UnexpectedEvent {
+                        entity: Box::new(entity.clone()),
+                        event,
+                    },
+                    last_valid_entity: Some(Box::new(entity)),
+                },
+                Err(error) => Self::Failed {
+                    error: LifecycleError::Apply(error),
+                    last_valid_entity: Some(Box::new(entity)),
+                },
+            },
+            Self::Failed {
+                error,
+                last_valid_entity,
+            } => Self::Failed {
+                error: LifecycleError::AlreadyFailed {
+                    failure: Box::new(error),
+                    event,
+                },
+                last_valid_entity,
+            },
+        };
+    }
+}
+
+/// Transaction-aware rebuild operations missing from event-sorcery's public
+/// projection API. Keeping the transaction caller-owned makes deletion and
+/// replay one atomic operation.
+trait TransactionalProjection<Entity>
+where
+    Entity: EventSourced<Materialized = Table>,
+{
+    async fn rebuild_in(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &Entity::Id,
+    ) -> Result<(), ProjectionError<Entity>>;
+
+    async fn rebuild_all_in(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+    ) -> Result<(), ProjectionError<Entity>>;
+}
+
+impl<Entity> TransactionalProjection<Entity> for Projection<Entity>
+where
+    Entity: EventSourced<Materialized = Table>,
+{
+    async fn rebuild_in(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &Entity::Id,
+    ) -> Result<(), ProjectionError<Entity>> {
+        let Table(table) = Entity::PROJECTION;
+        let view_id = id.to_string();
+
+        sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE view_id = ?1"
+        )))
+        .bind(&view_id)
+        .execute(&mut **transaction)
+        .await?;
+
+        replay_projection::<Entity>(transaction, table, &view_id).await
+    }
+
+    async fn rebuild_all_in(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+    ) -> Result<(), ProjectionError<Entity>> {
+        let Table(table) = Entity::PROJECTION;
+        let aggregate_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT aggregate_id FROM events \
+             WHERE aggregate_type = ?1 ORDER BY aggregate_id",
+        )
+        .bind(Entity::AGGREGATE_TYPE)
+        .fetch_all(&mut **transaction)
+        .await?;
+
+        sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
+            .execute(&mut **transaction)
+            .await?;
+
+        for aggregate_id in aggregate_ids {
+            replay_projection::<Entity>(transaction, table, &aggregate_id).await?;
+        }
+
+        Ok(())
+    }
+}
+
+async fn replay_projection<Entity>(
+    transaction: &mut Transaction<'_, Sqlite>,
+    table: &str,
+    aggregate_id: &str,
+) -> Result<(), ProjectionError<Entity>>
+where
+    Entity: EventSourced<Materialized = Table>,
+{
+    let events: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT sequence, payload FROM events \
+         WHERE aggregate_type = ?1 AND aggregate_id = ?2 \
+         ORDER BY sequence ASC",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .bind(aggregate_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let Some((max_sequence, _)) = events.last() else {
+        return Ok(());
+    };
+    let max_sequence = *max_sequence;
+    let mut lifecycle = RebuiltLifecycle::<Entity>::default();
+
+    for (_, payload) in events {
+        let event: Entity::Event =
+            serde_json::from_str(&payload).map_err(|source| ProjectionError::Serde {
+                aggregate_id: aggregate_id.to_owned(),
+                source,
+            })?;
+        lifecycle.apply(event);
+    }
+
+    let payload = serde_json::to_string(&lifecycle).map_err(|source| ProjectionError::Serde {
+        aggregate_id: aggregate_id.to_owned(),
+        source,
+    })?;
+
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO {table} (view_id, version, payload) VALUES (?1, ?2, ?3)"
+    )))
+    .bind(aggregate_id)
+    .bind(max_sequence)
+    .bind(payload)
+    .execute(&mut **transaction)
+    .await?;
+
+    Ok(())
+}
+
+async fn rebuild_projection<Entity>(
+    pool: &SqlitePool,
+    id: &Entity::Id,
+) -> Result<(), ProjectionError<Entity>>
+where
+    Entity: EventSourced<Materialized = Table>,
+{
+    let projection = Projection::<Entity>::sqlite(pool.clone());
+    let mut transaction = pool.begin().await?;
+    projection.rebuild_in(&mut transaction, id).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn rebuild_all_projections<Entity>(pool: &SqlitePool) -> Result<(), ProjectionError<Entity>>
+where
+    Entity: EventSourced<Materialized = Table>,
+{
+    let projection = Projection::<Entity>::sqlite(pool.clone());
+    let mut transaction = pool.begin().await?;
+    projection.rebuild_all_in(&mut transaction).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 /// Rebuilds `view` for `scope` by deleting the affected rows and replaying the
 /// event log. The caller must exclude concurrent projection writers.
 pub async fn rebuild_view(
@@ -172,15 +373,13 @@ pub async fn rebuild_view(
                         id: id.to_owned(),
                         source,
                     })?;
-            Projection::<Position>::sqlite(pool.clone())
-                .rebuild(&symbol)
+            rebuild_projection::<Position>(pool, &symbol)
                 .await
                 .map_err(ViewRebuildError::Position)?;
             None
         }
         (RebuildableView::Position, RebuildScope::All) => {
-            Projection::<Position>::sqlite(pool.clone())
-                .rebuild_all()
+            rebuild_all_projections::<Position>(pool)
                 .await
                 .map_err(ViewRebuildError::Position)?;
             None
@@ -192,15 +391,13 @@ pub async fn rebuild_view(
                         id: id.to_owned(),
                         source,
                     })?;
-            Projection::<OffchainOrder>::sqlite(pool.clone())
-                .rebuild(&order_id)
+            rebuild_projection::<OffchainOrder>(pool, &order_id)
                 .await
                 .map_err(ViewRebuildError::OffchainOrder)?;
             None
         }
         (RebuildableView::OffchainOrder, RebuildScope::All) => {
-            Projection::<OffchainOrder>::sqlite(pool.clone())
-                .rebuild_all()
+            rebuild_all_projections::<OffchainOrder>(pool)
                 .await
                 .map_err(ViewRebuildError::OffchainOrder)?;
             None
@@ -212,15 +409,13 @@ pub async fn rebuild_view(
                         id: id.to_owned(),
                         source,
                     })?;
-            Projection::<VaultRegistry>::sqlite(pool.clone())
-                .rebuild(&registry_id)
+            rebuild_projection::<VaultRegistry>(pool, &registry_id)
                 .await
                 .map_err(ViewRebuildError::VaultRegistry)?;
             None
         }
         (RebuildableView::VaultRegistry, RebuildScope::All) => {
-            Projection::<VaultRegistry>::sqlite(pool.clone())
-                .rebuild_all()
+            rebuild_all_projections::<VaultRegistry>(pool)
                 .await
                 .map_err(ViewRebuildError::VaultRegistry)?;
             None
@@ -267,8 +462,12 @@ pub async fn rebuild_view(
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use st0x_config::ExecutionThreshold;
+
     use super::*;
-    use crate::test_utils::setup_test_db;
+    use crate::position::PositionEvent;
+    use crate::test_utils::{persist_event, setup_test_db};
 
     #[tokio::test]
     async fn read_models_refuse_a_single_id() {
@@ -310,6 +509,67 @@ mod tests {
             std::error::Error::source(&error).is_some(),
             "the parse error must remain the source",
         );
+    }
+
+    #[tokio::test]
+    async fn aggregate_rebuilds_roll_back_when_event_deserialization_fails() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap_or_else(|error| panic!("{error}"));
+        let symbol_id = symbol.to_string();
+        persist_event::<Position>(
+            &pool,
+            &symbol_id,
+            1,
+            &PositionEvent::Initialized {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
+                initialized_at: Utc::now(),
+            },
+        )
+        .await;
+        Projection::<Position>::sqlite(pool.clone())
+            .catch_up()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let before: (i64, String) =
+            sqlx::query_as("SELECT version, payload FROM position_view WHERE view_id = ?1")
+                .bind(&symbol_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
+             event_type, event_version, payload, metadata) \
+             VALUES (?1, ?2, 2, 'Corrupt', '1', '{', '{}')",
+        )
+        .bind(Position::AGGREGATE_TYPE)
+        .bind(&symbol_id)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        for scope in [RebuildScope::Id(symbol_id.clone()), RebuildScope::All] {
+            let error = rebuild_view(&pool, RebuildableView::Position, scope)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ViewRebuildError::Position(ProjectionError::Serde { .. })
+                ),
+                "{error}"
+            );
+
+            let after: (i64, String) =
+                sqlx::query_as("SELECT version, payload FROM position_view WHERE view_id = ?1")
+                    .bind(&symbol_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(after, before);
+        }
     }
 
     #[tokio::test]
