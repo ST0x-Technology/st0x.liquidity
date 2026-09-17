@@ -24,7 +24,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use rain_math_float::Float;
-use st0x_config::{ChainAssets, OperationMode};
+use st0x_config::{ChainAssets, ExecutionThreshold, OperationMode};
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
 };
@@ -53,7 +53,10 @@ use crate::inventory::{
 };
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
-use crate::position::{Position, PositionEvent};
+use crate::position::{
+    EquityTransferReservationId, EquityTransferReservationStatus, Position, PositionCommand,
+    PositionError, PositionEvent,
+};
 use crate::rebalancing::equity::{
     TransferEquityToHedging, TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
     TransferEquityToMarketMakingJobQueue,
@@ -151,6 +154,8 @@ pub(crate) enum RebalancingServiceError {
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
     ApalisSqlx(#[from] sqlx_apalis::Error),
+    #[error("position reservation command failed: {0}")]
+    PositionReservation(String),
     #[error("failed to re-arm a stranded USDC transfer job at startup: {0}")]
     RearmEnqueue(#[from] QueuePushError),
 }
@@ -777,6 +782,12 @@ pub(crate) struct RebalancingService {
     /// Set after construction via `set_stores` because the stores
     /// are built after the trigger (the trigger is a Reactor dependency
     /// of the stores' query manifest).
+    /// Durable, source-side authority shared by hedge and equity-transfer
+    /// admission. Attached after query construction to break the reactor/store
+    /// construction cycle.
+    position_store: RwLock<Option<Arc<Store<Position>>>>,
+    position_projection: RwLock<Option<Arc<Projection<Position>>>>,
+    position_threshold: RwLock<Option<ExecutionThreshold>>,
     mint_store: RwLock<Option<Arc<Store<TokenizedEquityMint>>>>,
     redemption_store: RwLock<Option<Arc<Store<EquityRedemption>>>>,
     usdc_store: RwLock<Option<Arc<Store<UsdcRebalance>>>>,
@@ -907,6 +918,9 @@ impl RebalancingService {
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
+            position_store: RwLock::new(None),
+            position_projection: RwLock::new(None),
+            position_threshold: RwLock::new(None),
             mint_store: RwLock::new(None),
             redemption_store: RwLock::new(None),
             usdc_store: RwLock::new(None),
@@ -927,6 +941,16 @@ impl RebalancingService {
         *self.mint_store.write().await = Some(mint_store);
         *self.redemption_store.write().await = Some(redemption_store);
         *self.usdc_store.write().await = Some(usdc_store);
+    }
+    pub(crate) async fn set_position_authority(
+        &self,
+        position_store: Arc<Store<Position>>,
+        position_projection: Arc<Projection<Position>>,
+        threshold: ExecutionThreshold,
+    ) {
+        *self.position_store.write().await = Some(position_store);
+        *self.position_projection.write().await = Some(position_projection);
+        *self.position_threshold.write().await = Some(threshold);
     }
 
     /// Attach the issuance freeze-status reader so the equity trigger can skip
@@ -982,6 +1006,67 @@ impl RebalancingService {
             .write_without_broadcast()
             .await
             .set_pending_offchain_orders(pending_orders);
+        Ok(())
+    }
+    /// Reconciles durable Position reservations with durable live transfer
+    /// jobs after restart. Unconfirmed claims and confirmed claims with no
+    /// owning job are crash orphans and are released; live jobs restore or
+    /// confirm their exact reservation before workers start.
+    pub(crate) async fn recover_equity_transfer_reservations(
+        &self,
+        active: &HashSet<(Symbol, EquityTransferReservationId)>,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("position authority store is not wired"))?;
+        let projection = self
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("position authority projection is not wired"))?;
+        let threshold = self
+            .position_threshold
+            .read()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("position authority threshold is not wired"))?;
+
+        for (symbol, position) in projection.load_all().await? {
+            let Some(reservation) = position.equity_transfer_reservation else {
+                continue;
+            };
+            let owned = reservation.status == EquityTransferReservationStatus::Confirmed
+                && active.contains(&(symbol.clone(), reservation.id));
+            if !owned {
+                store
+                    .send(
+                        &symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: reservation.id,
+                        },
+                    )
+                    .await?;
+            }
+        }
+
+        for (symbol, reservation_id) in active {
+            store
+                .send(
+                    symbol,
+                    PositionCommand::RestoreEquityTransferReservation {
+                        symbol: symbol.clone(),
+                        threshold,
+                        reservation_id: *reservation_id,
+                    },
+                )
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -2028,7 +2113,7 @@ impl RebalancingService {
         use InventorySnapshotEvent::*;
         use RebalancingServiceError::{
             ApalisSqlx, EquityTrigger, Float, MissingRedemptionInventory, MissingUsdcBridgedAmount,
-            MissingUsdcTrackingContext, Projection, RearmEnqueue,
+            MissingUsdcTrackingContext, PositionReservation, Projection, RearmEnqueue,
             SettledUsdcExceedsInitiatedAmount, SharesConversion, Sqlx,
         };
 
@@ -2046,6 +2131,7 @@ impl RebalancingService {
             | SettledUsdcExceedsInitiatedAmount { .. }
             | Sqlx(_)
             | ApalisSqlx(_)
+            | PositionReservation(_)
             | RearmEnqueue(_)) => {
                 return Err(other);
             }
@@ -2638,6 +2724,9 @@ impl Reactor for RebalancingService {
                     }
                     Initialized { .. }
                     | ThresholdUpdated { .. }
+                    | EquityTransferReserved { .. }
+                    | EquityTransferReservationConfirmed { .. }
+                    | EquityTransferReservationReleased { .. }
                     // Dedup bookkeeping only (ADR 0010): no inventory effect.
                     | OnChainFillApplied { .. }
                     | OnChainFillSettled { .. }
@@ -2868,11 +2957,125 @@ impl RebalancingService {
         )
     }
 
+    #[cfg(test)]
     async fn has_pending_offchain_order(&self, symbol: &Symbol) -> bool {
         self.inventory
             .read()
             .await
             .has_pending_offchain_order(symbol)
+    }
+
+    async fn position_authority(
+        &self,
+    ) -> Result<(Arc<Store<Position>>, ExecutionThreshold), equity::EquityTriggerError> {
+        let store = self
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(equity::EquityTriggerError::PositionAuthorityNotWired)?;
+        let threshold = self
+            .position_threshold
+            .read()
+            .await
+            .as_ref()
+            .copied()
+            .ok_or(equity::EquityTriggerError::PositionAuthorityNotWired)?;
+        Ok((store, threshold))
+    }
+
+    async fn try_reserve_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> Result<bool, equity::EquityTriggerError> {
+        let (store, threshold) = self.position_authority().await?;
+        match store
+            .send(
+                symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(AggregateError::UserError(LifecycleError::Apply(error)))
+                if matches!(
+                    &error,
+                    PositionError::PendingExecution { .. }
+                        | PositionError::EquityTransferReservationExists { .. }
+                        | PositionError::EquityTransferBlockedByHedge { .. }
+                        | PositionError::EquityTransferHedgeEligibilityUnknown { .. }
+                ) =>
+            {
+                debug!(
+                    target: "rebalance",
+                    %symbol,
+                    %reservation_id,
+                    reason = %error,
+                    "Skipped equity trigger: Position rejected transfer reservation"
+                );
+                Ok(false)
+            }
+            Err(error) => Err(equity::EquityTriggerError::PositionReservation(
+                error.to_string(),
+            )),
+        }
+    }
+
+    async fn confirm_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> Result<bool, equity::EquityTriggerError> {
+        let (store, _) = self.position_authority().await?;
+        match store
+            .send(
+                symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(AggregateError::UserError(LifecycleError::Apply(error)))
+                if matches!(
+                    &error,
+                    PositionError::NoEquityTransferReservation { .. }
+                        | PositionError::EquityTransferReservationMismatch { .. }
+                ) =>
+            {
+                debug!(
+                    target: "rebalance",
+                    %symbol,
+                    %reservation_id,
+                    reason = %error,
+                    "Skipped equity dispatch: reservation was invalidated or replaced"
+                );
+                Ok(false)
+            }
+            Err(error) => Err(equity::EquityTriggerError::PositionReservation(
+                error.to_string(),
+            )),
+        }
+    }
+
+    async fn release_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> Result<(), equity::EquityTriggerError> {
+        let (store, _) = self.position_authority().await?;
+        store
+            .send(
+                symbol,
+                PositionCommand::ReleaseEquityTransfer { reservation_id },
+            )
+            .await
+            .map_err(|error| equity::EquityTriggerError::PositionReservation(error.to_string()))
     }
 
     async fn is_restart_tainted(&self, symbol: &Symbol) -> bool {
@@ -3282,11 +3485,6 @@ impl RebalancingService {
             }
         }
 
-        if self.has_pending_offchain_order(symbol).await {
-            debug!(target: "rebalance", %symbol, "Skipped equity trigger: offchain hedge order pending");
-            return Ok(());
-        }
-
         // A pending snapshot divergence means the view's balance for this
         // symbol is suspect: a transfer sized off it would likely fail, and
         // a failed attempt arms the guards again and marks the symbol busy,
@@ -3352,78 +3550,97 @@ impl RebalancingService {
             return Ok(());
         }
 
-        let operation = match self.build_equity_operation(symbol).await {
-            Ok(Some(operation)) => operation,
-            Ok(None) => return Ok(()),
-            Err(equity::EquityTriggerError::Wrapper(WrapperError::SymbolNotConfigured(symbol))) => {
+        let reservation_id = EquityTransferReservationId::generate();
+        if !self
+            .try_reserve_equity_transfer(symbol, reservation_id)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let attempt = async {
+            let operation = match self.build_equity_operation(symbol).await {
+                Ok(Some(operation)) => operation,
+                Ok(None) => return Ok(false),
+                Err(equity::EquityTriggerError::Wrapper(WrapperError::SymbolNotConfigured(
+                    symbol,
+                ))) => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        "Skipped equity trigger: symbol not configured"
+                    );
+                    return Ok(false);
+                }
+                Err(equity::EquityTriggerError::TokenNotInRegistry(symbol)) => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        "Skipped equity trigger: symbol not in vault registry"
+                    );
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+
+            // The restart taint needs no matching re-check: it is only seeded
+            // at boot, so it cannot appear during sizing. Snapshot divergence
+            // can appear and still suppresses dispatch, but hedge admission is
+            // decided exclusively by the Position reservation below.
+            if self.divergence_gate.is_engaged(symbol) {
                 warn!(
                     target: "rebalance",
                     %symbol,
-                    "Skipped equity trigger: symbol not configured"
+                    "Skipped equity trigger before dispatch: snapshot divergence \
+                     detected during operation sizing"
                 );
-                return Ok(());
+                return Ok(false);
             }
-            Err(equity::EquityTriggerError::TokenNotInRegistry(symbol)) => {
-                warn!(
-                    target: "rebalance",
-                    %symbol,
-                    "Skipped equity trigger: symbol not in vault registry"
-                );
-                return Ok(());
+
+            if !self.confirm_equity_transfer(symbol, reservation_id).await? {
+                return Ok(false);
             }
-            Err(error) => return Err(error),
-        };
 
-        // Re-check immediately before dispatch: an OffChainOrderPlaced for this
-        // symbol may have landed during the awaits in build_equity_operation.
-        // This narrows but cannot fully close the gap: the in-memory set is a
-        // reactor-lagged projection of the position aggregate's
-        // pending_offchain_order_id, so a just-committed OffChainOrderPlaced
-        // not yet seen by the reactor is invisible here (and the mint path
-        // awaits its Jobs-table dedupe query between this check and the
-        // push). Closing that fully needs a source-side reservation, not a
-        // reactor-lagged projection.
-        if self.has_pending_offchain_order(symbol).await {
-            debug!(
-                target: "rebalance",
-                %symbol,
-                "Skipped equity trigger before dispatch: offchain hedge order became pending"
-            );
-            return Ok(());
-        }
-
-        // The restart taint needs no matching re-check: it is only seeded
-        // at boot, so it cannot appear during the build.
-        if self.divergence_gate.is_engaged(symbol) {
-            warn!(
-                target: "rebalance",
-                %symbol,
-                "Skipped equity trigger before dispatch: snapshot divergence \
-                 detected during operation sizing"
-            );
-            return Ok(());
-        }
-
-        let dispatched = match operation {
-            TriggeredOperation::Mint { symbol, quantity } => {
-                self.enqueue_transfer_equity_to_market_making(symbol, quantity, guard.generation())
+            Ok(match operation {
+                TriggeredOperation::Mint { symbol, quantity } => {
+                    self.enqueue_transfer_equity_to_market_making_with_reservation(
+                        symbol,
+                        quantity,
+                        guard.generation(),
+                        reservation_id,
+                    )
                     .await
-            }
-            TriggeredOperation::Redemption {
-                symbol, quantity, ..
-            } => {
-                self.enqueue_transfer_equity_to_hedging(symbol, quantity, guard.generation())
+                }
+                TriggeredOperation::Redemption {
+                    symbol, quantity, ..
+                } => {
+                    self.enqueue_transfer_equity_to_hedging_with_reservation(
+                        symbol,
+                        quantity,
+                        guard.generation(),
+                        reservation_id,
+                    )
                     .await
-            }
-        };
-
-        if !dispatched {
-            return Ok(());
+                }
+            })
         }
+        .await;
 
-        debug!(target: "rebalance", %symbol, "Triggered equity rebalancing");
-        guard.defuse();
-        Ok(())
+        match attempt {
+            Ok(true) => {
+                debug!(target: "rebalance", %symbol, %reservation_id, "Triggered equity rebalancing");
+                guard.defuse();
+                Ok(())
+            }
+            Ok(false) => {
+                self.release_equity_transfer(symbol, reservation_id).await?;
+                Ok(())
+            }
+            Err(error) => {
+                self.release_equity_transfer(symbol, reservation_id).await?;
+                Err(error)
+            }
+        }
     }
 
     async fn load_token_address(
@@ -4340,15 +4557,31 @@ impl RebalancingService {
     }
 
     /// Enqueues a [`TransferEquityToMarketMaking`] apalis job for a
-    /// hedging->market-making equity mint. Generates a fresh
-    /// `IssuerRequestId` at push time so apalis retries (and bot restarts
-    /// that re-pick the job row) hit the same aggregate. Returns `true` on
-    /// successful enqueue.
+    /// hedging->market-making equity mint. The aggregate id reuses the
+    /// Position reservation UUID so terminal lifecycle events can release the
+    /// exact owner across process restarts. Returns `true` on successful enqueue.
+    #[cfg(test)]
     async fn enqueue_transfer_equity_to_market_making(
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
         generation: equity::GuardGeneration,
+    ) -> bool {
+        self.enqueue_transfer_equity_to_market_making_with_reservation(
+            symbol,
+            quantity,
+            generation,
+            EquityTransferReservationId::generate(),
+        )
+        .await
+    }
+
+    async fn enqueue_transfer_equity_to_market_making_with_reservation(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        generation: equity::GuardGeneration,
+        reservation_id: EquityTransferReservationId,
     ) -> bool {
         // A non-terminal row in flight longer than this is treated as likely
         // stuck: the suppression is logged at warn (with the row id and age)
@@ -4406,7 +4639,7 @@ impl RebalancingService {
             }
         }
 
-        let issuer_request_id = IssuerRequestId::generate();
+        let issuer_request_id = IssuerRequestId(reservation_id.into_uuid());
         // The allocation planner is what will choose a chain per operation;
         // until then every rebalance runs on the primary chain, and the job
         // records it so the saga and its resume agree on where it ran.
@@ -4450,12 +4683,29 @@ impl RebalancingService {
 
     /// Sibling of [`Self::enqueue_transfer_equity_to_market_making`] for the
     /// redemption (market-making -> hedging) direction. Same per-symbol
-    /// Jobs-table dedupe; same fresh-id-at-push-time contract.
+    /// Jobs-table dedupe and reservation-derived aggregate id.
+    #[cfg(test)]
     async fn enqueue_transfer_equity_to_hedging(
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
         generation: equity::GuardGeneration,
+    ) -> bool {
+        self.enqueue_transfer_equity_to_hedging_with_reservation(
+            symbol,
+            quantity,
+            generation,
+            EquityTransferReservationId::generate(),
+        )
+        .await
+    }
+
+    async fn enqueue_transfer_equity_to_hedging_with_reservation(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        generation: equity::GuardGeneration,
+        reservation_id: EquityTransferReservationId,
     ) -> bool {
         const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
 
@@ -4510,7 +4760,7 @@ impl RebalancingService {
             }
         }
 
-        let aggregate_id = RedemptionAggregateId::generate();
+        let aggregate_id = RedemptionAggregateId(reservation_id.into_uuid());
         let chain = self.inventory.read().await.primary_chain();
 
         let push = queue
@@ -4547,6 +4797,30 @@ impl RebalancingService {
                 false
             }
         }
+    }
+
+    async fn release_terminal_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> Result<(), RebalancingServiceError> {
+        let Some(store) = self.position_store.read().await.as_ref().map(Arc::clone) else {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                %reservation_id,
+                "Position authority is not wired; retaining terminal transfer reservation"
+            );
+            return Ok(());
+        };
+
+        store
+            .send(
+                symbol,
+                PositionCommand::ReleaseEquityTransfer { reservation_id },
+            )
+            .await
+            .map_err(|error| RebalancingServiceError::PositionReservation(error.to_string()))
     }
 
     /// Clears the in-progress flag for an equity symbol.
@@ -5889,6 +6163,11 @@ impl RebalancingService {
                  inflight suppression so snapshot polls resume recording the \
                  symbol; balances heal on the next poll"
             );
+            self.release_terminal_equity_transfer(
+                &tombstone.symbol,
+                EquityTransferReservationId::from_uuid(id.0),
+            )
+            .await?;
             drop(event_sync_guard);
             self.equity_scheduler.enqueue_check(tombstone.symbol).await;
             return Ok(());
@@ -5957,6 +6236,11 @@ impl RebalancingService {
 
         let is_terminal = if Self::is_terminal_mint_event(&event) {
             self.mint_tracking.write().await.remove(&id);
+            self.release_terminal_equity_transfer(
+                &symbol,
+                EquityTransferReservationId::from_uuid(id.0),
+            )
+            .await?;
             self.clear_equity_in_progress(&symbol);
             debug!(target: "rebalance", %symbol, "Cleared equity in-progress flag after mint terminal event");
             true
@@ -6028,6 +6312,11 @@ impl RebalancingService {
                  inflight suppression so snapshot polls resume recording the \
                  symbol; balances heal on the next poll"
             );
+            self.release_terminal_equity_transfer(
+                &tombstone.symbol,
+                EquityTransferReservationId::from_uuid(id.0),
+            )
+            .await?;
             drop(event_sync_guard);
             self.equity_scheduler.enqueue_check(tombstone.symbol).await;
             return Ok(());
@@ -6127,6 +6416,11 @@ impl RebalancingService {
                 drop(inventory);
                 drop(suppressed);
             }
+            self.release_terminal_equity_transfer(
+                &symbol,
+                EquityTransferReservationId::from_uuid(id.0),
+            )
+            .await?;
             self.clear_equity_in_progress(&symbol);
             debug!(
                 target: "rebalance",
@@ -10111,7 +10405,11 @@ mod tests {
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        Arc::new(RebalancingService::new(
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let trigger = Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             BTreeMap::from([(
@@ -10129,7 +10427,15 @@ mod tests {
             )]),
             RebalancingSchedulers::new(&apalis_pool),
             notifier,
-        ))
+        ));
+        trigger
+            .set_position_authority(
+                position,
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        trigger
     }
 
     async fn make_trigger_with_inventory_and_registry(
@@ -10380,7 +10686,11 @@ mod tests {
 
         seed_vault_registry(&pool, symbol, Chain::Base).await;
 
-        Arc::new(RebalancingService::new(
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let trigger = Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             BTreeMap::from([(
@@ -10395,7 +10705,227 @@ mod tests {
             BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
-        ))
+        ));
+        trigger
+            .set_position_authority(
+                position,
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        trigger
+    }
+    #[tokio::test]
+    async fn incident_order_transfer_reservation_prevents_redemption() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(80), shares(20)),
+            &symbol,
+        )
+        .await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(1),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        let position = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn equity_transfer_reservation_survives_queue_handoff() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(80), shares(20)),
+            &symbol,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let jobs = take_pending_equity_redemption_jobs(&trigger).await;
+        assert_eq!(jobs.len(), 1);
+        let position = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        let reservation = position
+            .equity_transfer_reservation
+            .expect("queued transfer must retain its Position reservation");
+        assert_eq!(
+            reservation.status,
+            EquityTransferReservationStatus::Confirmed
+        );
+        assert_eq!(reservation.id.into_uuid(), jobs[0].aggregate_id.0);
+    }
+
+    #[tokio::test]
+    async fn no_equity_operation_releases_position_reservation() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let position = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retains_active_and_releases_orphan_reservations() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::generate();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+
+        let restored_symbol = Symbol::new("MSFT").unwrap();
+        let restored_reservation_id = EquityTransferReservationId::generate();
+
+        trigger
+            .recover_equity_transfer_reservations(&HashSet::from([
+                (symbol.clone(), reservation_id),
+                (restored_symbol.clone(), restored_reservation_id),
+            ]))
+            .await
+            .unwrap();
+        let projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                id: reservation_id,
+                status: EquityTransferReservationStatus::Confirmed,
+            })
+        );
+        assert_eq!(
+            projection
+                .load(&restored_symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                id: restored_reservation_id,
+                status: EquityTransferReservationStatus::Confirmed,
+            })
+        );
+
+        trigger
+            .recover_equity_transfer_reservations(&HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+        assert_eq!(
+            projection
+                .load(&restored_symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
     }
 
     #[tokio::test]
@@ -11851,7 +12381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redemption_rejected_via_reactor_is_terminal() {
+    async fn redemption_rejected_releases_transfer_reservation_via_reactor() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
@@ -11877,6 +12407,32 @@ mod tests {
         }
 
         let id = redemption_aggregate_id("redemption-rejected");
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
 
         harness
             .receive::<EquityRedemption>(
@@ -11899,6 +12455,18 @@ mod tests {
                 .contains_key(&symbol),
             "In-progress flag should be cleared after terminal RedemptionRejected"
         );
+        let position = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
     }
 
     #[tokio::test]

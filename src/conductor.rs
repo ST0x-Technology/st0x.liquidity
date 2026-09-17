@@ -106,7 +106,8 @@ use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::portfolio_snapshot::{PortfolioSnapshot, PortfolioSnapshotProjection};
 use crate::position::{
-    AnchorDisposition, Position, PositionCommand, PositionError, PositionEvent, TradeId,
+    AnchorDisposition, EquityTransferReservationId, Position, PositionCommand, PositionError,
+    PositionEvent, TradeId,
 };
 use crate::position_check::{
     FailedAnchorRecoveryAction, HedgeScanSkipReason, failed_anchor_recovery_action,
@@ -3174,6 +3175,13 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
                 built.usdc.clone(),
             )
             .await;
+        rebalancing_service
+            .set_position_authority(
+                built.position.clone(),
+                built.position_projection.clone(),
+                deps.ctx.execution_threshold,
+            )
+            .await;
 
         let recovery_transfer = Arc::new(
             CrossVenueEquityTransfer::new(
@@ -3276,6 +3284,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             transfer: recovery_transfer.clone(),
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             mint_store: built.mint.clone(),
+            position_store: Some(built.position.clone()),
             transfer_services: equity_transfer_services,
             job_queue: transfer_equity_to_market_making_queue,
         });
@@ -3284,6 +3293,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             transfer: recovery_transfer.clone(),
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             redemption_store: built.redemption.clone(),
+            position_store: Some(built.position.clone()),
             job_queue: transfer_equity_to_hedging_queue,
         });
 
@@ -3594,7 +3604,7 @@ async fn recover_interrupted_tokenization_aggregates(
         !row.is_terminal() || interrupted_redemptions.contains(&row.task.aggregate_id)
     });
 
-    restore_live_transfer_job_guards(
+    let active_reservations = restore_live_transfer_job_guards(
         &rebalancing_service.equity_in_progress,
         &transfer_mints,
         &transfer_redemptions,
@@ -3602,6 +3612,9 @@ async fn recover_interrupted_tokenization_aggregates(
         &redemption_store,
     )
     .await?;
+    rebalancing_service
+        .recover_equity_transfer_reservations(&active_reservations)
+        .await?;
 
     recover_stuck_redemptions(pool, inventory).await?;
 
@@ -3670,7 +3683,7 @@ async fn restore_live_transfer_job_guards(
     redemptions: &[DurableTransferJob<TransferEquityToHedging>],
     mint_store: &Store<TokenizedEquityMint>,
     redemption_store: &Store<EquityRedemption>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HashSet<(Symbol, EquityTransferReservationId)>> {
     let mut owners = HashMap::new();
 
     for row in mints {
@@ -3711,6 +3724,19 @@ async fn restore_live_transfer_job_guards(
         }
     }
 
+    let active_reservations = owners
+        .iter()
+        .map(|(symbol, owner)| {
+            let reservation_id = match &owner.target {
+                ResumeTokenizationTarget::Mint(id) => EquityTransferReservationId::from_uuid(id.0),
+                ResumeTokenizationTarget::Redemption(id) => {
+                    EquityTransferReservationId::from_uuid(id.0)
+                }
+            };
+            (symbol.clone(), reservation_id)
+        })
+        .collect();
+
     let mut guard = match equity_in_progress.write() {
         Ok(guard) => guard,
         Err(poison) => poison.into_inner(),
@@ -3729,7 +3755,7 @@ async fn restore_live_transfer_job_guards(
     }
     drop(guard);
 
-    Ok(())
+    Ok(active_reservations)
 }
 
 struct TransferGuardOwner {
@@ -5533,7 +5559,9 @@ pub fn is_expected_place_offchain_order_rejection(error: &SendError<Position>) -
     matches!(
         error,
         AggregateError::UserError(LifecycleError::Apply(
-            PositionError::PendingExecution { .. } | PositionError::ThresholdNotMet { .. },
+            PositionError::PendingExecution { .. }
+                | PositionError::ThresholdNotMet { .. }
+                | PositionError::EquityTransferPending { .. },
         ))
     )
 }
@@ -7429,6 +7457,17 @@ mod tests {
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        rebalancing_service
+            .set_position_authority(
+                position,
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
 
         let resume_queue = ResumeTokenizationJobQueue::new(&apalis_pool);
 
@@ -8515,6 +8554,17 @@ mod tests {
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         );
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        rebalancing_service
+            .set_position_authority(
+                position,
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
 
         let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
             pool.clone(),

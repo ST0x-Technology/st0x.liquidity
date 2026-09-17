@@ -2452,6 +2452,7 @@ mod tests {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             mint_store: Arc::new(test_store(cqrs_pool, services)),
+            position_store: None,
             transfer_services: EquityTransferServices::panicking(),
             job_queue,
         })
@@ -2508,6 +2509,7 @@ mod tests {
             }),
             equity_in_progress: equity_in_progress.clone(),
             redemption_store,
+            position_store: None,
             job_queue: queue.clone(),
         });
         let monitor = register_transfer_equity_to_hedging_worker(
