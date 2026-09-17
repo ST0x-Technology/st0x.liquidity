@@ -2764,6 +2764,10 @@ enum TriggerReason {
     $1.00 minimum trade value)
 - Direction of offchain order must be opposite to accumulated position (positive
   net = sell, negative net = buy)
+- Offchain placement is rejected as stale when the requested direction differs
+  from the live position direction or the requested shares exceed the live
+  absolute net. Callers must re-derive the hedge from the current position and
+  retry.
 - Cannot have multiple pending executions for same symbol
 - Equity transfer admission is serialized on this aggregate. A reservation is
   accepted only when no offchain order is pending, no transfer reservation
@@ -2777,6 +2781,8 @@ enum TriggerReason {
   terminal job attempts that never created an aggregate release only their exact
   reservation ID. Startup retains reservations owned by live durable transfer
   jobs, restores missing legacy ownership, and releases crash-orphaned claims.
+  When a pending hedge prevents restoration, transfer execution remains deferred
+  until the hedge clears and the exact reservation is restored.
 - OnChain fills are always applied (blockchain facts are immutable)
 - Threshold is passed as a parameter to commands that need it
 
@@ -4869,7 +4875,7 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   ordering heals unchanged-value polls and placement events delivered after
   their own terminal event without requiring a restart, while never treating the
   Position store's lead over the inventory reactor as proof that its local side
-  effects have completed This pending-order mirror exists only to suppress
+  effects have completed. This pending-order mirror exists only to suppress
   ambiguous broker snapshots; it is not transfer-admission authority and the
   rebalancer does not re-read it before dispatch. Transfer admission uses the
   atomic Position reservation protocol described above.

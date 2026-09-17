@@ -22,17 +22,19 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use st0x_event_sorcery::{SendError, Store};
+use st0x_event_sorcery::SendError;
 use st0x_execution::Symbol;
 use st0x_tokenization::IssuerRequestId;
 
+use super::job::{PositionReservationAuthority, restore_position_reservation};
 use super::{CrossVenueEquityTransfer, MintError, RedemptionError};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
-use crate::conductor::job::{BackpressureStreak, Job, JobQueue, Label};
+use crate::conductor::job::{BackpressureStreak, Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::position::{EquityTransferReservationId, Position, PositionCommand};
+use crate::trading::offchain::hedge::EQUITY_TRANSFER_REDRIVE_DELAY;
 
 /// Apalis queue type for [`ResumeTokenizationAggregate`].
 pub(crate) type ResumeTokenizationJobQueue = JobQueue<ResumeTokenizationAggregate>;
@@ -95,7 +97,7 @@ pub(crate) struct ResumeTokenizationCtx {
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
     /// Position authority holding the reservation that excludes concurrent
     /// hedges while this generic resume drives the aggregate.
-    pub(crate) position_store: Arc<Store<Position>>,
+    pub(crate) position_authority: PositionReservationAuthority,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget. This is the startup
@@ -114,6 +116,8 @@ pub(crate) enum ResumeTokenizationJobError {
     Redemption(#[from] RedemptionError),
     #[error(transparent)]
     PositionReservation(#[from] SendError<Position>),
+    #[error(transparent)]
+    Enqueue(#[from] QueuePushError),
 }
 
 impl BotGasFailureClassifier for ResumeTokenizationJobError {
@@ -121,7 +125,7 @@ impl BotGasFailureClassifier for ResumeTokenizationJobError {
         match self {
             Self::Mint(inner) => inner.is_bot_gas_enqueue_failure(),
             Self::Redemption(inner) => inner.is_bot_gas_enqueue_failure(),
-            Self::PositionReservation(_) => false,
+            Self::PositionReservation(_) | Self::Enqueue(_) => false,
         }
     }
 }
@@ -158,6 +162,30 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
     }
 
     async fn perform(&self, ctx: &ResumeTokenizationCtx) -> Result<Self::Output, Self::Error> {
+        let (position_store, position_threshold) = &ctx.position_authority;
+        if let Some(symbol) = &self.symbol {
+            let reservation_id = match &self.target {
+                ResumeTokenizationTarget::Mint(id) => EquityTransferReservationId::from_uuid(id.0),
+                ResumeTokenizationTarget::Redemption(id) => {
+                    EquityTransferReservationId::from_uuid(id.0)
+                }
+            };
+            if !restore_position_reservation(
+                position_store,
+                symbol,
+                *position_threshold,
+                reservation_id,
+            )
+            .await?
+            {
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue
+                    .push_with_delay(self.clone(), EQUITY_TRANSFER_REDRIVE_DELAY)
+                    .await?;
+                return Ok(());
+            }
+        }
+
         let result = match &self.target {
             ResumeTokenizationTarget::Mint(issuer_request_id) => ctx
                 .transfer
@@ -181,7 +209,7 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
                         EquityTransferReservationId::from_uuid(id.0)
                     }
                 };
-                ctx.position_store
+                position_store
                     .send(
                         symbol,
                         PositionCommand::ReleaseEquityTransfer { reservation_id },
@@ -297,7 +325,7 @@ mod tests {
 
         let ctx = ResumeTokenizationCtx {
             transfer,
-            position_store,
+            position_authority: (position_store, ExecutionThreshold::whole_share()),
             job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
         };
         (ctx, mint_store, redemption_store, tokenizer)
@@ -691,7 +719,7 @@ mod tests {
 
         let ctx = ResumeTokenizationCtx {
             transfer,
-            position_store,
+            position_authority: (position_store, ExecutionThreshold::whole_share()),
             job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
         };
         let job = ResumeTokenizationAggregate {
@@ -793,7 +821,7 @@ mod tests {
         };
         let ctx = ResumeTokenizationCtx {
             transfer,
-            position_store,
+            position_authority: (position_store, ExecutionThreshold::whole_share()),
             job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
         };
 
@@ -906,7 +934,8 @@ mod tests {
             .unwrap();
 
         let reservation_id = EquityTransferReservationId::from_uuid(id.0);
-        ctx.position_store
+        ctx.position_authority
+            .0
             .send(
                 &symbol,
                 PositionCommand::ReserveEquityTransfer {
@@ -917,7 +946,8 @@ mod tests {
             )
             .await
             .unwrap();
-        ctx.position_store
+        ctx.position_authority
+            .0
             .send(
                 &symbol,
                 PositionCommand::ConfirmEquityTransfer { reservation_id },
@@ -944,7 +974,8 @@ mod tests {
             "reconciliation must preserve both provider identifiers: {reconciled:?}"
         );
         let position = ctx
-            .position_store
+            .position_authority
+            .0
             .load(&symbol)
             .await
             .unwrap()
@@ -1008,7 +1039,8 @@ mod tests {
         let calls_before = tokenizer.call_count();
 
         let reservation_id = EquityTransferReservationId::from_uuid(id.0);
-        ctx.position_store
+        ctx.position_authority
+            .0
             .send(
                 &symbol,
                 PositionCommand::ReserveEquityTransfer {
@@ -1019,7 +1051,8 @@ mod tests {
             )
             .await
             .unwrap();
-        ctx.position_store
+        ctx.position_authority
+            .0
             .send(
                 &symbol,
                 PositionCommand::ConfirmEquityTransfer { reservation_id },
@@ -1048,7 +1081,8 @@ mod tests {
             "resume must drive the SendPending redemption to Completed, got {resumed:?}"
         );
         let position = ctx
-            .position_store
+            .position_authority
+            .0
             .load(&symbol)
             .await
             .unwrap()

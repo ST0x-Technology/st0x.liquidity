@@ -781,6 +781,12 @@ pub(crate) struct RebalancingService {
     /// otherwise a transient store failure can permanently block hedging.
     pending_pre_enqueue_reservation_releases:
         Arc<RwLock<HashMap<EquityTransferReservationId, Symbol>>>,
+    /// Active transfer reservations that could not be restored at startup
+    /// because a hedge still owned the Position. Durable transfer jobs gate
+    /// execution on the same restore command; this sweep also covers
+    /// recovery-held transfers without a runnable transfer job.
+    pending_equity_transfer_reservation_restores:
+        Arc<RwLock<HashMap<EquityTransferReservationId, Symbol>>>,
     timed_out_usdc_rebalances: Arc<RwLock<HashMap<UsdcRebalanceId, DateTime<Utc>>>>,
     /// Requested-stage mint timeouts already logged. Issuer request ids are
     /// unique, so retaining an id suppresses duplicate warnings permanently.
@@ -941,6 +947,7 @@ impl RebalancingService {
                 RwLock::new(HashMap::new()),
             ),
             pending_pre_enqueue_reservation_releases: Arc::new(RwLock::new(HashMap::new())),
+            pending_equity_transfer_reservation_restores: Arc::new(RwLock::new(HashMap::new())),
             timed_out_usdc_rebalances: Arc::new(RwLock::new(HashMap::new())),
             requested_stage_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
@@ -1042,8 +1049,10 @@ impl RebalancingService {
     /// Reconciles durable Position reservations with every transfer aggregate
     /// startup will continue, whether through a transfer-job row, a recovery
     /// handoff, or a generic resume job. Unowned claims are crash orphans and
-    /// are released; active owners restore their exact reservation before
-    /// workers start.
+    /// are released. Active owners restore their exact reservation before
+    /// workers start unless a pending hedge still owns the Position; that
+    /// expected conflict is retained for the periodic retry sweep, while
+    /// runnable transfer jobs also restore ownership before any side effect.
     pub(crate) async fn recover_equity_transfer_reservations(
         &self,
         active: &HashSet<(Symbol, EquityTransferReservationId)>,
@@ -1087,7 +1096,7 @@ impl RebalancingService {
         }
 
         for (symbol, reservation_id) in active {
-            store
+            match store
                 .send(
                     symbol,
                     PositionCommand::RestoreEquityTransferReservation {
@@ -1096,7 +1105,74 @@ impl RebalancingService {
                         reservation_id: *reservation_id,
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(()) => {
+                    self.pending_equity_transfer_reservation_restores
+                        .write()
+                        .await
+                        .remove(reservation_id);
+                }
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    PositionError::PendingExecution { offchain_order_id },
+                ))) => {
+                    self.pending_equity_transfer_reservation_restores
+                        .write()
+                        .await
+                        .insert(*reservation_id, symbol.clone());
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        %reservation_id,
+                        %offchain_order_id,
+                        "Deferred transfer reservation restoration until the pending hedge clears"
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn retry_pending_equity_transfer_reservation_restores(
+        &self,
+    ) -> Result<(), RebalancingServiceError> {
+        let pending: Vec<_> = self
+            .pending_equity_transfer_reservation_restores
+            .read()
+            .await
+            .iter()
+            .map(|(reservation_id, symbol)| (*reservation_id, symbol.clone()))
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let (store, threshold) = self.position_authority().await?;
+        for (reservation_id, symbol) in pending {
+            match store
+                .send(
+                    &symbol,
+                    PositionCommand::RestoreEquityTransferReservation {
+                        symbol: symbol.clone(),
+                        threshold,
+                        reservation_id,
+                    },
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.pending_equity_transfer_reservation_restores
+                        .write()
+                        .await
+                        .remove(&reservation_id);
+                }
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    PositionError::PendingExecution { .. },
+                ))) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
 
         Ok(())
@@ -1122,6 +1198,8 @@ impl RebalancingService {
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
         self.retry_pending_reservation_releases().await;
+        self.retry_pending_equity_transfer_reservation_restores()
+            .await?;
         self.prune_timeout_markers(now).await;
         self.expire_stuck_mints(now).await?;
         self.expire_stuck_redemptions(now).await?;
@@ -11516,6 +11594,112 @@ mod tests {
                 .unwrap()
                 .equity_transfer_reservation,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retries_reservation_after_pending_hedge_clears() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let reservation_id = EquityTransferReservationId::generate();
+        trigger
+            .recover_equity_transfer_reservations(&HashSet::from([(
+                symbol.clone(),
+                reservation_id,
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the transfer reservation must remain deferred while the hedge is pending"
+        );
+
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id,
+                    error: "test terminal failure".to_string(),
+                    anchor: AnchorDisposition::Release,
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .retry_pending_equity_transfer_reservation_restores()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                id: reservation_id,
+                status: EquityTransferReservationStatus::Confirmed,
+            })
         );
     }
 

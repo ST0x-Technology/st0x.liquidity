@@ -44,8 +44,7 @@ use crate::trading::offchain::close_flatten::{
 use crate::trading::offchain::hedge::{
     EQUITY_TRANSFER_REDRIVE_DELAY, HedgeJobQueue, PlaceHedge, ReferencePriceError,
     TransientFailureStreak, acquire_counter_trade_submission_file_lock, alert_dead_letter,
-    apply_slippage, push_anchor_recovery_job_if_absent,
-    resolve_extended_hours_reference_price,
+    apply_slippage, push_anchor_recovery_job_if_absent, resolve_extended_hours_reference_price,
 };
 use crate::trading::onchain::trade_accountant::{DeadLetterReason, SymbolScopedReason};
 
@@ -552,6 +551,9 @@ where
             .filter(|(symbol, position)| {
                 if position.last_failed_offchain_order_id.is_some() {
                     record_scan_skip(symbol, HedgeScanSkipReason::AnchoredOrder, None);
+                    false
+                } else if position.equity_transfer_reservation.is_some() {
+                    debug!(%symbol, "Skipping hedge: Position transfer reservation in progress");
                     false
                 } else {
                     true
@@ -2088,6 +2090,57 @@ mod tests {
             count_jobs(&apalis_pool, &check_positions_job_type()).await,
             1,
             "the targeted recalculation must retry while Position owns a transfer reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_scan_skips_position_with_equity_transfer_reservation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, position) =
+            build_ctx(pool, apalis_pool.clone(), cfg, Duration::from_secs(60)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(0.5)),
+            Direction::Buy,
+        )
+        .await;
+        let reservation_id = EquityTransferReservationId::generate();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "the periodic scan must not enqueue a hedge for a reserved Position"
         );
     }
 
