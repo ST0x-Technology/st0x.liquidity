@@ -2090,18 +2090,6 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         "Expected a completed mint request after restart"
     );
 
-    // The finalized-block fill monitor ingests fills a few blocks behind the
-    // tip, so the per-fill hedges settle shortly after the mint completes.
-    // Wait for every hedge fill before the one-shot broker-state assertion.
-    poll_for_events_with_timeout(
-        &mut bot2,
-        &infra.db_path,
-        "OffchainOrderEvent::Filled",
-        i64::try_from(take_results.len())?,
-        Duration::from_secs(120),
-    )
-    .await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(float!(22.5))
@@ -2113,11 +2101,14 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         .expected_net(float!(0))
         .build()];
 
+    // The transfer reservation coalesces fills received while the mint is
+    // active. Verify the resulting aggregate hedge, not the number of broker
+    // orders used to reach the neutral position.
     poll_for_hedge_completion(
         &mut bot2,
         &infra.db_path,
         &expected_positions[0],
-        Duration::from_secs(30),
+        Duration::from_secs(120),
     )
     .await;
 

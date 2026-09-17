@@ -12884,6 +12884,7 @@ mod tests {
 
         let orderbook = address!("0x0000000000000000000000000000000000000001");
         let order_owner = address!("0x0000000000000000000000000000000000000002");
+        let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // Start balanced: 50 onchain, 50 offchain.
         let initial_inventory = InventoryView::default()
@@ -12931,6 +12932,23 @@ mod tests {
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        vault_registry
+            .send(
+                &VaultRegistryId {
+                    chain: Chain::Base,
+                    orderbook,
+                    owner: order_owner,
+                },
+                VaultRegistryCommand::SeedEquityVaultFromConfig {
+                    token: test_token,
+                    vault_id: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    symbol: symbol.clone(),
+                },
+            )
+            .await
+            .unwrap();
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
@@ -12976,11 +12994,13 @@ mod tests {
             .build(())
             .await
             .unwrap();
+        let position_threshold =
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(100))).unwrap());
         trigger
             .set_position_authority(
                 Arc::clone(&position_store),
                 position_projection,
-                ExecutionThreshold::whole_share(),
+                position_threshold,
             )
             .await;
 
@@ -12990,9 +13010,7 @@ mod tests {
                 &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::shares(
-                        Positive::new(FractionalShares::new(float!(100))).unwrap(),
-                    ),
+                    threshold: position_threshold,
                     trade_id: TradeId {
                         chain: Chain::Base,
                         tx_hash: TxHash::random(),
