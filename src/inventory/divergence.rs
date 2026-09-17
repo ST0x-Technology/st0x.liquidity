@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::warn;
 
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Usdc;
 
@@ -34,12 +35,15 @@ use super::BroadcastingInventory;
 #[derive(Debug, Default)]
 pub(crate) struct InventoryDivergenceGate {
     symbols: RwLock<HashSet<Symbol>>,
+    /// Explicit venue snapshots required after inventory bookkeeping was
+    /// deferred. These are separate from broker-divergence detection so a
+    /// matching offchain poll cannot accidentally clear an onchain repair.
+    pending_offchain_equity: RwLock<HashSet<Symbol>>,
+    pending_onchain_equity: RwLock<HashSet<(Chain, Symbol)>>,
+    pending_onchain_cash: RwLock<HashSet<Chain>>,
     /// Venue-level flag for a detected but unresolved `OffchainUsd`
     /// divergence. One flag, not a set: the Hedging cash balance is one
-    /// number. While engaged, the USDC rebalancing trigger skips dispatch
-    /// -- a bridge sized off a diverged cash balance moves the wrong
-    /// amount and marks the venue busy, freezing the very counter that
-    /// resolves the divergence.
+    /// number.
     cash: AtomicBool,
 }
 
@@ -54,6 +58,11 @@ impl InventoryDivergenceGate {
 
     pub(crate) fn is_engaged(&self, symbol: &Symbol) -> bool {
         self.read_symbols().contains(symbol)
+            || self.read_pending_offchain_equity().contains(symbol)
+            || self
+                .read_pending_onchain_equity()
+                .iter()
+                .any(|(_, pending_symbol)| pending_symbol == symbol)
     }
 
     pub(crate) fn engage_cash(&self) {
@@ -65,7 +74,50 @@ impl InventoryDivergenceGate {
     }
 
     pub(crate) fn is_cash_engaged(&self) -> bool {
-        self.cash.load(Ordering::SeqCst)
+        self.cash.load(Ordering::SeqCst) || !self.read_pending_onchain_cash().is_empty()
+    }
+
+    pub(crate) fn request_offchain_equity_reconcile(&self, symbol: &Symbol) {
+        self.write_pending_offchain_equity().insert(symbol.clone());
+    }
+
+    pub(crate) fn pending_offchain_equity_reconciles(&self) -> Vec<Symbol> {
+        self.read_pending_offchain_equity()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn resolve_offchain_equity_reconcile(&self, symbol: &Symbol) {
+        self.write_pending_offchain_equity().remove(symbol);
+    }
+
+    pub(crate) fn request_onchain_equity_reconcile(&self, chain: Chain, symbol: &Symbol) {
+        self.write_pending_onchain_equity()
+            .insert((chain, symbol.clone()));
+    }
+
+    pub(crate) fn has_pending_onchain_equity_reconcile(&self, chain: Chain) -> bool {
+        self.read_pending_onchain_equity()
+            .iter()
+            .any(|(pending_chain, _)| *pending_chain == chain)
+    }
+
+    pub(crate) fn resolve_onchain_equity_reconcile(&self, chain: Chain, symbol: &Symbol) {
+        self.write_pending_onchain_equity()
+            .remove(&(chain, symbol.clone()));
+    }
+
+    pub(crate) fn request_onchain_cash_reconcile(&self, chain: Chain) {
+        self.write_pending_onchain_cash().insert(chain);
+    }
+
+    pub(crate) fn has_pending_onchain_cash_reconcile(&self, chain: Chain) -> bool {
+        self.read_pending_onchain_cash().contains(&chain)
+    }
+
+    pub(crate) fn resolve_onchain_cash_reconcile(&self, chain: Chain) {
+        self.write_pending_onchain_cash().remove(&chain);
     }
 
     fn read_symbols(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Symbol>> {
@@ -86,6 +138,46 @@ impl InventoryDivergenceGate {
             );
             poisoned.into_inner()
         })
+    }
+
+    fn read_pending_offchain_equity(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Symbol>> {
+        self.pending_offchain_equity
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_pending_offchain_equity(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<Symbol>> {
+        self.pending_offchain_equity
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn read_pending_onchain_equity(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashSet<(Chain, Symbol)>> {
+        self.pending_onchain_equity
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_pending_onchain_equity(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashSet<(Chain, Symbol)>> {
+        self.pending_onchain_equity
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn read_pending_onchain_cash(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Chain>> {
+        self.pending_onchain_cash
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_pending_onchain_cash(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<Chain>> {
+        self.pending_onchain_cash
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 

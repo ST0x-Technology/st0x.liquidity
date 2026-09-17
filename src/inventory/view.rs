@@ -36,6 +36,8 @@ pub enum InventoryViewError {
     Float(#[from] FloatError),
     #[error("failed to convert USD balance cents {0} to USDC")]
     UsdBalanceConversion(i64),
+    #[error("inventory delta was deferred pending an authoritative venue snapshot")]
+    DeferredSnapshotReconciliation,
 }
 
 /// A change that aligns one in-memory hedge-order gate with durable Position

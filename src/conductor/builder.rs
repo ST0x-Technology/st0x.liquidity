@@ -520,6 +520,7 @@ where
         order_placer: order_placer.clone(),
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
+        check_positions_queue: check_positions_queue.clone(),
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock: counter_trade_submission_lock.clone(),
         close_flatten_policy,

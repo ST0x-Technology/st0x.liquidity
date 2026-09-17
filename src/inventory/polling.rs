@@ -737,20 +737,28 @@ where
                 actual: fetched_tokens,
             });
         }
-
         let symbols: Vec<Symbol> = balances.keys().cloned().collect();
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OnchainEquity {
-                    chain: vault_polling.chain,
-                    balances,
-                    fetched_at,
-                    block_number: Some(block_number),
-                },
-            )
-            .await?;
+        let command = if self.divergence_recovery.as_ref().is_some_and(|recovery| {
+            recovery
+                .gate
+                .has_pending_onchain_equity_reconcile(vault_polling.chain)
+        }) {
+            InventorySnapshotCommand::ReconcileOnchainEquity {
+                chain: vault_polling.chain,
+                balances,
+                fetched_at,
+                block_number: Some(block_number),
+            }
+        } else {
+            InventorySnapshotCommand::OnchainEquity {
+                chain: vault_polling.chain,
+                balances,
+                fetched_at,
+                block_number: Some(block_number),
+            }
+        };
+        self.snapshot.send(snapshot_id, command).await?;
 
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
@@ -803,17 +811,26 @@ where
             .copied()
             .try_fold(vault_balances[0], |acc, balance| acc + balance)?;
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OnchainUsdc {
-                    chain: vault_polling.chain,
-                    usdc_balance,
-                    fetched_at,
-                    block_number: Some(block_number),
-                },
-            )
-            .await?;
+        let command = if self.divergence_recovery.as_ref().is_some_and(|recovery| {
+            recovery
+                .gate
+                .has_pending_onchain_cash_reconcile(vault_polling.chain)
+        }) {
+            InventorySnapshotCommand::ReconcileOnchainUsdc {
+                chain: vault_polling.chain,
+                usdc_balance,
+                fetched_at,
+                block_number: Some(block_number),
+            }
+        } else {
+            InventorySnapshotCommand::OnchainUsdc {
+                chain: vault_polling.chain,
+                usdc_balance,
+                fetched_at,
+                block_number: Some(block_number),
+            }
+        };
+        self.snapshot.send(snapshot_id, command).await?;
 
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
@@ -1012,6 +1029,31 @@ where
                 },
             )
             .await?;
+
+        if let Some(recovery) = &self.divergence_recovery {
+            for symbol in recovery.gate.pending_offchain_equity_reconciles() {
+                let ledger_position = recovery
+                    .inventory
+                    .read()
+                    .await
+                    .equity_available(&symbol, Venue::Hedging);
+                self.snapshot
+                    .send(
+                        snapshot_id,
+                        InventorySnapshotCommand::ReconcileOffchainEquity {
+                            position: positions
+                                .get(&symbol)
+                                .copied()
+                                .unwrap_or(FractionalShares::ZERO),
+                            symbol,
+                            fetched_at,
+                            ledger_position,
+                            consecutive_polls: 0,
+                        },
+                    )
+                    .await?;
+            }
+        }
 
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves these slots falsely fresh.
