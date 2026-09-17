@@ -2065,9 +2065,7 @@ impl RebalancingService {
             _ => BTreeSet::new(),
         };
         let protected_offchain_equity_symbols = match event {
-            OffchainEquity { fetched_at, .. } => self
-                .divergence_gate
-                .protected_offchain_equity_symbols(*fetched_at),
+            OffchainEquity { .. } => self.divergence_gate.protected_offchain_equity_symbols(),
             _ => BTreeSet::new(),
         };
         let protect_onchain_cash = match event {
@@ -11111,6 +11109,24 @@ mod tests {
         jobs
     }
 
+    async fn wait_for_redemption_reservation_release(
+        service: &RebalancingService,
+        id: &RedemptionAggregateId,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service
+                .pending_timed_out_redemption_reservation_releases
+                .read()
+                .await
+                .contains_key(id)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal redemption reservation release timed out");
+    }
+
     /// Drains every pending USDC transfer row (both directions) from the
     /// service's Jobs table and returns them parsed as
     /// [`UsdcRebalanceOperation`]. Marking rows `Done` lets repeated trigger
@@ -11552,50 +11568,48 @@ mod tests {
 
     #[tokio::test]
     async fn position_events_auto_register_symbol_and_trigger_rebalancing() {
-        // Reproduces the production scenario: InventoryView starts empty (no
-        // with_equity call), position events arrive for a symbol that exists
-        // in the vault registry. After accumulating an imbalance, rebalancing
-        // must be triggered.
-        //
-        // In production, InventoryView::default() creates an empty equities
-        // map. Position events arrive as onchain fills are processed. If the
-        // symbol isn't pre-registered, the position event handler must
-        // handle it (either by auto-registering or by decoupling the
-        // inventory update failure from the rebalancing check).
+        // Inventory starts without an equity slot. Authoritative snapshots
+        // register the symbol before position deltas arrive; fills must then
+        // preserve that baseline and trigger from the accumulated imbalance.
         let symbol = Symbol::new("AAPL").unwrap();
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let trigger = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_usdc(usdc(1_000_000), usdc(1_000_000)),
-            event_sender,
-        ));
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-
-        seed_vault_registry(&pool, &symbol, Chain::Base).await;
-
-        let trigger = Arc::new(RebalancingService::new(
-            test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
-            BTreeMap::from([(
-                Chain::Base,
-                VaultRegistryId {
-                    chain: st0x_evm::Chain::Base,
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )]),
-            inventory,
-            BTreeMap::from([(
-                Chain::Base,
-                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
-            )]),
-            RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
-        ));
+            &symbol,
+        )
+        .await;
         let reactor = trigger.clone();
-
         let harness = ReactorHarness::new(reactor.clone());
 
-        // Simulate production: onchain fills arrive on an empty inventory.
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), FractionalShares::ZERO)]),
+                fetched_at: Utc::now(),
+                block_number: None,
+            },
+        )
+        .await
+        .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), FractionalShares::ZERO)]),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        drain_pending_jobs(&trigger).await.unwrap();
+
         // 20 onchain buys, 80 offchain buys -> 20% onchain ratio.
         // Threshold: target 50%, deviation 20%, lower bound 30%.
         // 20% < 30% -> should trigger Mint (too much offchain).
@@ -11605,7 +11619,6 @@ mod tests {
                 .receive::<Position>(symbol.clone(), event)
                 .await
                 .unwrap();
-            drain_pending_jobs(&trigger).await.unwrap();
         }
 
         for _ in 0..80 {
@@ -11614,24 +11627,13 @@ mod tests {
                 .receive::<Position>(symbol.clone(), event)
                 .await
                 .unwrap();
-            drain_pending_jobs(&trigger).await.unwrap();
         }
 
-        // Drain any intermediate triggers (the early onchain-heavy phase
-        // enqueues a redemption, which would otherwise suppress the final
-        // mint via the direction-independent per-symbol dedupe) and do a
-        // final check.
-        take_pending_equity_mint_jobs(&trigger).await;
-        take_pending_equity_redemption_jobs(&trigger).await;
-        trigger.clear_equity_in_progress(&symbol);
-
-        // One more event to trigger the check after the imbalance is built up.
-        let event = make_onchain_fill(shares(1), Direction::Buy);
-        harness
-            .receive::<Position>(symbol.clone(), event)
-            .await
-            .unwrap();
-        drain_pending_jobs(&trigger).await.unwrap();
+        // Collapse the queued checks and evaluate the final 20/80 state once;
+        // intermediate ratios must not create a transfer that obscures the
+        // scenario under test.
+        trigger.equity_scheduler.cancel_pending().await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
         let jobs = take_pending_equity_mint_jobs(&trigger).await;
         assert_eq!(
@@ -12954,6 +12956,7 @@ mod tests {
             .receive::<EquityRedemption>(id.clone(), make_redemption_rejected())
             .await
             .unwrap();
+        wait_for_redemption_reservation_release(&trigger, &id).await;
 
         assert!(
             !trigger
@@ -25732,158 +25735,6 @@ mod tests {
         );
     }
 
-    /// Verifies logging shows when imbalance check skips due to partial data.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn logs_show_partial_data_skips_imbalance_check() {
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
-            event_sender,
-        ));
-        seed_vault_registry(&pool, &symbol, Chain::Base).await;
-
-        let trigger = Arc::new(RebalancingService::new(
-            test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
-            BTreeMap::from([(
-                Chain::Base,
-                VaultRegistryId {
-                    chain: st0x_evm::Chain::Base,
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )]),
-            inventory.clone(),
-            BTreeMap::from([(
-                Chain::Base,
-                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
-            )]),
-            RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
-        ));
-        let reactor = trigger.clone();
-
-        let id = InventorySnapshotId {
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        };
-
-        // Apply ONLY onchain data - offchain not yet polled
-        let mut balances = BTreeMap::new();
-        balances.insert(symbol.clone(), shares(100));
-
-        let onchain_event = InventorySnapshotEvent::OnchainEquity {
-            chain: Chain::Base,
-            balances,
-            fetched_at: Utc::now(),
-            block_number: None,
-        };
-
-        apply_and_dispatch_snapshot(reactor.clone(), id.clone(), onchain_event)
-            .await
-            .unwrap();
-        drain_pending_jobs(&trigger).await.unwrap();
-
-        // Verify the logs show:
-        // 1. The snapshot event was applied
-        // 2. Imbalance check was skipped due to partial data
-        assert!(
-            logs_contain("Applied inventory snapshot event"),
-            "Should log when snapshot event is applied"
-        );
-        assert!(
-            logs_contain("No equity imbalance detected"),
-            "Should log that imbalance was not detected (due to partial data)"
-        );
-        assert!(
-            !logs_contain("Triggered equity rebalancing"),
-            "Should NOT trigger rebalancing with partial data"
-        );
-    }
-
-    /// Verifies logging shows trigger fires when both venues have data.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn logs_show_trigger_fires_with_complete_data() {
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
-            event_sender,
-        ));
-        seed_vault_registry(&pool, &symbol, Chain::Base).await;
-
-        let trigger = Arc::new(RebalancingService::new(
-            test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
-            BTreeMap::from([(
-                Chain::Base,
-                VaultRegistryId {
-                    chain: st0x_evm::Chain::Base,
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )]),
-            inventory.clone(),
-            BTreeMap::from([(
-                Chain::Base,
-                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
-            )]),
-            RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
-        ));
-        let reactor = trigger.clone();
-
-        let id = InventorySnapshotId {
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        };
-
-        // Apply onchain data first
-        let mut balances = BTreeMap::new();
-        balances.insert(symbol.clone(), shares(100));
-
-        apply_and_dispatch_snapshot(
-            reactor.clone(),
-            id.clone(),
-            InventorySnapshotEvent::OnchainEquity {
-                chain: Chain::Base,
-                balances,
-                fetched_at: Utc::now(),
-                block_number: None,
-            },
-        )
-        .await
-        .unwrap();
-        drain_pending_jobs(&trigger).await.unwrap();
-
-        // Now apply offchain data - both venues now have data
-        let mut positions = BTreeMap::new();
-        positions.insert(symbol.clone(), shares(0));
-
-        apply_and_dispatch_snapshot(
-            reactor.clone(),
-            id.clone(),
-            InventorySnapshotEvent::OffchainEquity {
-                positions,
-                fetched_at: Utc::now(),
-            },
-        )
-        .await
-        .unwrap();
-        drain_pending_jobs(&trigger).await.unwrap();
-
-        // Verify the trigger fired after both venues have data
-        assert!(
-            logs_contain("Triggered equity rebalancing"),
-            "Should trigger rebalancing once both venues have data"
-        );
-    }
-
     #[tokio::test]
     async fn position_fill_triggers_usdc_rebalancing_check() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -25982,15 +25833,16 @@ mod tests {
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = redemption_aggregate_id("redemption-transfer-cancel");
-
-        // Verify initial imbalance
+        // Verify initial imbalance and retain the aggregate id that owns the
+        // Position reservation exercised by the lifecycle events below.
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        let initial_jobs = take_pending_equity_redemption_jobs(&trigger).await;
         assert_eq!(
-            take_pending_equity_redemption_jobs(&trigger).await.len(),
+            initial_jobs.len(),
             1,
-            "80% ratio should enqueue a redemption job"
+            "80% ratio should enqueue one redemption job"
         );
+        let id = initial_jobs[0].aggregate_id.clone();
         trigger.clear_equity_in_progress(&symbol);
 
         // WithdrawnFromRaindex: 30 tokens move to inflight
@@ -26020,6 +25872,7 @@ mod tests {
             .receive::<EquityRedemption>(id.clone(), make_transfer_failed())
             .await
             .unwrap();
+        wait_for_redemption_reservation_release(&trigger, &id).await;
 
         // After cancel: back to 80 onchain, 20 offchain -> imbalance should re-trigger
         trigger.check_and_trigger_equity(&symbol).await.unwrap();

@@ -630,6 +630,17 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .expected_net(float!(0))
         .build()];
 
+    // Mint completion and hedge completion are independent asynchronous
+    // lifecycles. Wait for the Position aggregate to reach the expected net
+    // before inspecting broker state.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
+
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
         .take_results(&take_results)
@@ -1028,6 +1039,17 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
         .expected_accumulated_short(float!(0))
         .expected_net(float!(0))
         .build()];
+
+    // Redemption completion can win the race with the independently queued
+    // hedge. Drive the bot until the Position aggregate is neutral before
+    // asserting the broker order.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     let redemption_wallet_balance_after =
         crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
