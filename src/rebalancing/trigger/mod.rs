@@ -15,7 +15,7 @@ use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -43,6 +43,7 @@ use crate::conductor::job::{BackpressureStreak, QueuePushError};
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
+use crate::inventory::divergence::ReconciliationGeneration;
 use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
@@ -698,6 +699,15 @@ enum ZombieJobKillOutcome {
     Killed,
     NoLongerInFlight,
     StillInFlight,
+}
+
+struct SnapshotReconciliation {
+    protected_onchain_equity_symbols: BTreeSet<Symbol>,
+    protected_offchain_equity_symbols: BTreeSet<Symbol>,
+    protect_onchain_cash: bool,
+    accepted_onchain_equity: BTreeMap<Symbol, ReconciliationGeneration>,
+    accepted_onchain_cash: Option<ReconciliationGeneration>,
+    accepted_offchain_equity: Option<ReconciliationGeneration>,
 }
 
 /// Service that folds CQRS events into rebalancing state and
@@ -2031,6 +2041,121 @@ impl RebalancingService {
         Ok(())
     }
 
+    fn snapshot_reconciliation(&self, event: &InventorySnapshotEvent) -> SnapshotReconciliation {
+        use InventorySnapshotEvent::*;
+
+        let protected_onchain_equity_symbols = match event {
+            OnchainEquity {
+                chain,
+                fetched_at,
+                block_number,
+                ..
+            }
+            | OnchainEquityReconciled {
+                chain,
+                fetched_at,
+                block_number,
+                ..
+            } => self.divergence_gate.protected_onchain_equity_symbols(
+                *chain,
+                *fetched_at,
+                *block_number,
+            ),
+            _ => BTreeSet::new(),
+        };
+        let protected_offchain_equity_symbols = match event {
+            OffchainEquity { fetched_at, .. } => self
+                .divergence_gate
+                .protected_offchain_equity_symbols(*fetched_at),
+            _ => BTreeSet::new(),
+        };
+        let protect_onchain_cash = match event {
+            OnchainUsdc {
+                chain,
+                fetched_at,
+                block_number,
+                ..
+            }
+            | OnchainUsdcReconciled {
+                chain,
+                fetched_at,
+                block_number,
+                ..
+            } => self.divergence_gate.protects_onchain_cash_snapshot(
+                *chain,
+                *fetched_at,
+                *block_number,
+            ),
+            _ => false,
+        };
+        let accepted_onchain_equity = match event {
+            OnchainEquityReconciled {
+                chain,
+                balances,
+                fetched_at,
+                block_number,
+                generations,
+            } => generations
+                .iter()
+                .filter(|(symbol, generation)| {
+                    balances.contains_key(*symbol)
+                        && self.divergence_gate.accepts_onchain_equity_reconcile(
+                            *chain,
+                            symbol,
+                            **generation,
+                            *fetched_at,
+                            *block_number,
+                        )
+                })
+                .map(|(symbol, generation)| (symbol.clone(), *generation))
+                .collect(),
+            _ => BTreeMap::new(),
+        };
+        let accepted_onchain_cash = match event {
+            OnchainUsdcReconciled {
+                chain,
+                fetched_at,
+                block_number,
+                generation,
+                ..
+            } if self.divergence_gate.accepts_onchain_cash_reconcile(
+                *chain,
+                *generation,
+                *fetched_at,
+                *block_number,
+            ) =>
+            {
+                Some(*generation)
+            }
+            _ => None,
+        };
+        let accepted_offchain_equity = match event {
+            OffchainEquityReconciled {
+                symbol,
+                fetched_at,
+                generation: Some(generation),
+                ..
+            } if self.divergence_gate.accepts_offchain_equity_reconcile(
+                symbol,
+                *generation,
+                *fetched_at,
+            ) =>
+            {
+                Some(*generation)
+            }
+            _ => None,
+        };
+
+        SnapshotReconciliation {
+            protected_onchain_equity_symbols,
+            protected_offchain_equity_symbols,
+            protect_onchain_cash,
+            accepted_onchain_equity,
+            accepted_onchain_cash,
+            accepted_offchain_equity,
+        }
+    }
+
     /// Fold the snapshot event into the view, then enqueue any
     /// follow-up imbalance checks the event implies. A failed apply
     /// (including recovery) short-circuits enqueueing so rebalancing
@@ -2061,90 +2186,116 @@ impl RebalancingService {
             }
             _ => None,
         };
-        let force_onchain_reconciliation = match &event {
-            OnchainEquity { chain, .. } => self
-                .divergence_gate
-                .has_pending_onchain_equity_reconcile(*chain),
-            OnchainUsdc { chain, .. } => self
-                .divergence_gate
-                .has_pending_onchain_cash_reconcile(*chain),
-            _ => false,
-        };
+        let SnapshotReconciliation {
+            protected_onchain_equity_symbols,
+            protected_offchain_equity_symbols,
+            protect_onchain_cash,
+            accepted_onchain_equity: accepted_onchain_equity_reconciliations,
+            accepted_onchain_cash: accepted_onchain_cash_reconciliation,
+            accepted_offchain_equity: accepted_offchain_equity_reconciliation,
+        } = self.snapshot_reconciliation(&event);
+        let forced_onchain_equity_symbols = accepted_onchain_equity_reconciliations
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
 
         let mut inventory = self.inventory.write().await;
-        let resolve_offchain_reconciliation = match &event {
-            OffchainEquityReconciled {
-                symbol, fetched_at, ..
-            } => inventory
-                .equity_reconciliation_busy(symbol, *fetched_at)?
-                .is_none(),
-            _ => false,
-        };
+        let resolve_offchain_reconciliation = accepted_offchain_equity_reconciliation.is_some()
+            && match &event {
+                OffchainEquityReconciled {
+                    symbol, fetched_at, ..
+                } => inventory
+                    .equity_reconciliation_busy(symbol, *fetched_at)?
+                    .is_none(),
+                _ => false,
+            };
 
-        let updated = if force_onchain_reconciliation {
-            inventory.clone().force_apply_snapshot_event(
-                &event,
+        let updated = match &event {
+            OnchainEquity {
+                chain,
+                balances,
+                block_number,
+                ..
+            } => inventory.clone().apply_guarded_equity_snapshot(
+                Venue::MarketMaking,
+                *chain,
+                balances.iter(),
+                fetched_at,
+                *block_number,
                 now,
-                Arc::new(InventoryViewError::DeferredSnapshotReconciliation),
-            )
-        } else {
-            match &event {
-                OnchainEquity {
-                    chain,
-                    balances,
-                    block_number,
-                    ..
-                } => inventory.clone().apply_equity_snapshot(
-                    Venue::MarketMaking,
-                    *chain,
-                    balances.iter(),
+                &protected_onchain_equity_symbols,
+            ),
+
+            OnchainEquityReconciled {
+                chain,
+                balances,
+                block_number,
+                ..
+            } => inventory.clone().apply_reconciled_onchain_equity_snapshot(
+                *chain,
+                balances.iter(),
+                fetched_at,
+                *block_number,
+                now,
+                &forced_onchain_equity_symbols,
+                &protected_onchain_equity_symbols,
+            ),
+
+            OnchainUsdc { .. } | OnchainUsdcReconciled { .. } if protect_onchain_cash => {
+                Ok(inventory.clone())
+            }
+
+            OnchainUsdcReconciled {
+                chain,
+                usdc_balance,
+                block_number,
+                ..
+            } if accepted_onchain_cash_reconciliation.is_some() => inventory
+                .clone()
+                .apply_reconciled_onchain_usdc_snapshot(*chain, *usdc_balance, *block_number, now),
+
+            OffchainEquity { positions, .. } => {
+                let primary_chain = inventory.primary_chain();
+                inventory.clone().apply_guarded_equity_snapshot(
+                    Venue::Hedging,
+                    primary_chain,
+                    positions.iter(),
                     fetched_at,
-                    *block_number,
+                    None,
                     now,
-                ),
+                    &protected_offchain_equity_symbols,
+                )
+            }
 
-                OffchainEquity { positions, .. } => {
-                    let primary_chain = inventory.primary_chain();
-                    inventory.clone().apply_equity_snapshot(
-                        Venue::Hedging,
-                        primary_chain,
-                        positions.iter(),
-                        fetched_at,
-                        None,
-                        now,
-                    )
-                }
+            OffchainEquityReconciled {
+                generation: Some(_),
+                ..
+            } if accepted_offchain_equity_reconciliation.is_none() => Ok(inventory.clone()),
 
-                // The reconcile arms validate busyness themselves under the
-                // write lock, so the generic apply path is the correct route
-                // here too. `OnchainUsdc` also routes through it (not a direct
-                // `update_usdc`) so the view's block-watermark bookkeeping for
-                // absorbed onchain fills has a single implementation.
-                OnchainUsdc { .. }
-                | OffchainEquityReconciled { .. }
-                | OffchainUsdReconciled { .. }
-                | OffchainUsd { .. }
-                | OffchainCashBuyingPower { .. }
-                | OffchainCashWithdrawable { .. }
-                | AlpacaUsdc { .. }
-                | EthereumUsdc { .. }
-                | BaseWalletUsdc { .. }
-                | BaseWalletUnwrappedEquity { .. }
-                | BaseWalletWrappedEquity { .. } => {
-                    inventory.clone().apply_snapshot_event(&event, now)
-                }
+            // The reconcile arms validate busyness themselves under the
+            // write lock, so the generic apply path is the correct route
+            // here too. Onchain USDC also routes through it when its claimed
+            // request is stale, preserving the ordinary snapshot guards.
+            OnchainUsdc { .. }
+            | OnchainUsdcReconciled { .. }
+            | OffchainEquityReconciled { .. }
+            | OffchainUsdReconciled { .. }
+            | OffchainUsd { .. }
+            | OffchainCashBuyingPower { .. }
+            | OffchainCashWithdrawable { .. }
+            | AlpacaUsdc { .. }
+            | EthereumUsdc { .. }
+            | BaseWalletUsdc { .. }
+            | BaseWalletUnwrappedEquity { .. }
+            | BaseWalletWrappedEquity { .. } => inventory.clone().apply_snapshot_event(&event, now),
 
-                InflightEquity { .. } => {
-                    if let Some((mints, redemptions)) = &filtered_inflight {
-                        inventory.clone().apply_inflight_snapshot(
-                            mints,
-                            redemptions,
-                            fetched_at,
-                            now,
-                        )
-                    } else {
-                        Ok(inventory.clone())
-                    }
+            InflightEquity { .. } => {
+                if let Some((mints, redemptions)) = &filtered_inflight {
+                    inventory
+                        .clone()
+                        .apply_inflight_snapshot(mints, redemptions, fetched_at, now)
+                } else {
+                    Ok(inventory.clone())
                 }
             }
         }?;
@@ -2152,28 +2303,25 @@ impl RebalancingService {
         *inventory = updated;
         drop(inventory);
 
-        if force_onchain_reconciliation {
-            match &event {
-                OnchainEquity {
-                    chain, balances, ..
-                } => {
-                    for symbol in balances.keys() {
-                        self.divergence_gate
-                            .resolve_onchain_equity_reconcile(*chain, symbol);
-                    }
-                }
-                OnchainUsdc { chain, .. } => {
-                    self.divergence_gate.resolve_onchain_cash_reconcile(*chain);
-                }
-                _ => {}
+        if let OnchainEquityReconciled { chain, .. } = &event {
+            for (symbol, generation) in accepted_onchain_equity_reconciliations {
+                self.divergence_gate
+                    .resolve_onchain_equity_reconcile(*chain, &symbol, generation);
             }
         }
-        if resolve_offchain_reconciliation {
-            let OffchainEquityReconciled { symbol, .. } = &event else {
-                unreachable!("resolution flag is set only for offchain equity reconciliation");
-            };
+        if let (OnchainUsdcReconciled { chain, .. }, Some(generation)) =
+            (&event, accepted_onchain_cash_reconciliation)
+        {
             self.divergence_gate
-                .resolve_offchain_equity_reconcile(symbol);
+                .resolve_onchain_cash_reconcile(*chain, generation);
+        }
+        if let (true, OffchainEquityReconciled { symbol, .. }, Some(generation)) = (
+            resolve_offchain_reconciliation,
+            &event,
+            accepted_offchain_equity_reconciliation,
+        ) {
+            self.divergence_gate
+                .resolve_offchain_equity_reconcile(symbol, generation);
         }
 
         trace!(target: "rebalance", "Applied inventory snapshot event");
@@ -2224,6 +2372,17 @@ impl RebalancingService {
         // retry would pass vacuously against empty state. Drop the event
         // instead: the poller's read-back keeps the gate and counter, and
         // the next quiet poll re-escalates with a fresh reading.
+        if matches!(
+            &event,
+            OnchainEquityReconciled { .. } | OnchainUsdcReconciled { .. }
+        ) {
+            warn!(
+                target: "rebalance",
+                ?inventory_error,
+                "Skipping force-apply recovery for a generation-bound onchain reconcile event"
+            );
+            return Ok(());
+        }
         if let OffchainEquityReconciled { symbol, .. } = &event {
             warn!(
                 target: "rebalance",
@@ -2294,7 +2453,9 @@ impl RebalancingService {
             // return above drops them before this match. They are listed
             // only to keep the match exhaustive.
             OnchainEquity { .. }
+            | OnchainEquityReconciled { .. }
             | OnchainUsdc { .. }
+            | OnchainUsdcReconciled { .. }
             | OffchainEquity { .. }
             | OffchainEquityReconciled { .. }
             | OffchainUsdReconciled { .. }
@@ -2328,21 +2489,6 @@ impl RebalancingService {
         drop(inventory);
         drop(suppression_guard);
 
-        match &event {
-            OnchainEquity {
-                chain, balances, ..
-            } => {
-                for symbol in balances.keys() {
-                    self.divergence_gate
-                        .resolve_onchain_equity_reconcile(*chain, symbol);
-                }
-            }
-            OnchainUsdc { chain, .. } => {
-                self.divergence_gate.resolve_onchain_cash_reconcile(*chain);
-            }
-            _ => {}
-        }
-
         debug!(target: "rebalance", "Force-applied inventory snapshot after recovery");
 
         self.enqueue_checks_for_snapshot(&event).await;
@@ -2366,7 +2512,7 @@ impl RebalancingService {
             // offchain polling seeds every configured symbol explicitly, and
             // onchain polling emits a key for every vault in the monotonic
             // registry.
-            OnchainEquity { balances, .. } => {
+            OnchainEquity { balances, .. } | OnchainEquityReconciled { balances, .. } => {
                 for symbol in balances.keys() {
                     self.equity_scheduler.enqueue_check(symbol.clone()).await;
                 }
@@ -2398,6 +2544,7 @@ impl RebalancingService {
             // the imbalance would remain unresolved until some unrelated
             // USDC balance event happened to arrive.
             OnchainUsdc { .. }
+            | OnchainUsdcReconciled { .. }
             | OffchainUsd { .. }
             | OffchainUsdReconciled { .. }
             | OffchainCashWithdrawable { .. } => {
@@ -2784,12 +2931,15 @@ impl RebalancingService {
                 };
 
                 if !equity_reconciled {
-                    self.divergence_gate
-                        .request_onchain_equity_reconcile(trade_id.chain, &symbol);
+                    self.divergence_gate.request_onchain_equity_reconcile(
+                        trade_id.chain,
+                        &symbol,
+                        *block_number,
+                    );
                 }
                 if !usdc_reconciled {
                     self.divergence_gate
-                        .request_onchain_cash_reconcile(trade_id.chain);
+                        .request_onchain_cash_reconcile(trade_id.chain, *block_number);
                 }
                 // Only the primary chain rebalances: a secondary is
                 // prefunded and holds its own inventory, so its fill
@@ -3487,7 +3637,7 @@ impl RebalancingService {
 
         if matches!(outcome, EquitySettlementOutcome::DeferredToSnapshot) {
             self.divergence_gate
-                .request_onchain_equity_reconcile(chain, symbol);
+                .request_onchain_equity_reconcile(chain, symbol, None);
             self.divergence_gate
                 .request_offchain_equity_reconcile(symbol);
         }
@@ -13393,17 +13543,21 @@ mod tests {
             "an unrelated venue snapshot must not clear the onchain repair gate"
         );
 
+        let generations = trigger
+            .divergence_gate()
+            .claim_pending_onchain_equity_reconciles(Chain::Base);
         apply_and_dispatch_snapshot(
             trigger.clone(),
             InventorySnapshotId {
                 orderbook: TEST_ORDERBOOK,
                 owner: TEST_ORDER_OWNER,
             },
-            InventorySnapshotEvent::OnchainEquity {
+            InventorySnapshotEvent::OnchainEquityReconciled {
                 chain: Chain::Base,
                 balances: BTreeMap::from([(symbol.clone(), shares(7))]),
                 fetched_at: Utc::now(),
                 block_number: Some(102),
+                generations,
             },
         )
         .await
@@ -13479,14 +13633,19 @@ mod tests {
             "the independent additive equity leg remained exact"
         );
 
+        let generation = trigger
+            .divergence_gate()
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("cash reconciliation request");
         apply_and_dispatch_snapshot(
             trigger.clone(),
             snapshot_id,
-            InventorySnapshotEvent::OnchainUsdc {
+            InventorySnapshotEvent::OnchainUsdcReconciled {
                 chain: Chain::Base,
                 usdc_balance: usdc(25),
                 fetched_at: Utc::now(),
                 block_number: Some(102),
+                generation,
             },
         )
         .await
@@ -13503,6 +13662,210 @@ mod tests {
             !trigger.divergence_gate().is_cash_engaged(),
             "the cash gate clears only after authoritative onchain reconciliation"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_cannot_satisfy_or_clear_newer_reconciliation_generation() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(10), shares(50)),
+            &symbol,
+        )
+        .await;
+
+        let stale_fetched_at = Utc::now();
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .update_equity(
+                    &symbol,
+                    Inventory::available(Venue::MarketMaking, Operator::Add, shares(1)),
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+
+        let first_generation = trigger.divergence_gate().request_onchain_equity_reconcile(
+            Chain::Base,
+            &symbol,
+            Some(101),
+        );
+        let first_claim = BTreeMap::from([(symbol.clone(), first_generation)]);
+        trigger
+            .divergence_gate()
+            .request_onchain_equity_reconcile(Chain::Base, &symbol, Some(102));
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(5))]),
+                fetched_at: stale_fetched_at,
+                block_number: Some(100),
+            })
+            .await
+            .unwrap();
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(6))]),
+                fetched_at: stale_fetched_at,
+                block_number: Some(101),
+                generations: first_claim,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(11)),
+            "ordinary and superseded snapshots must preserve the post-fetch delta"
+        );
+        assert!(
+            trigger.divergence_gate().is_engaged(&symbol),
+            "a superseded generation must not clear the newer request"
+        );
+
+        let current_claim = trigger
+            .divergence_gate()
+            .claim_pending_onchain_equity_reconciles(Chain::Base);
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(12))]),
+                fetched_at: Utc::now(),
+                block_number: Some(102),
+                generations: current_claim,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(12))
+        );
+        assert!(!trigger.divergence_gate().is_engaged(&symbol));
+    }
+
+    #[tokio::test]
+    async fn symbol_reconciliation_preserves_other_symbol_inflight_balance() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(aapl.clone(), shares(10), shares(50))
+            .with_equity(tsla.clone(), shares(20), shares(50))
+            .update_equity(
+                &tsla,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(5)),
+                Utc::now(),
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &aapl).await;
+
+        trigger
+            .divergence_gate()
+            .request_onchain_equity_reconcile(Chain::Base, &aapl, Some(101));
+        let generations = trigger
+            .divergence_gate()
+            .claim_pending_onchain_equity_reconciles(Chain::Base);
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(aapl.clone(), shares(11)), (tsla.clone(), shares(25))]),
+                fetched_at: Utc::now(),
+                block_number: Some(101),
+                generations,
+            })
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&aapl, Venue::MarketMaking),
+            Some(shares(11))
+        );
+        assert_eq!(
+            inventory.equity_available(&tsla, Venue::MarketMaking),
+            Some(shares(15)),
+            "TSLA available remains reserved while its redemption is inflight"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&tsla, Venue::MarketMaking),
+            Some(shares(5)),
+            "AAPL reconciliation must not clear TSLA inflight"
+        );
+        drop(inventory);
+        assert!(!trigger.divergence_gate().is_engaged(&aapl));
+    }
+
+    #[tokio::test]
+    async fn superseded_offchain_reconciliation_cannot_force_or_clear_newer_request() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(136)),
+            &symbol,
+        )
+        .await;
+
+        let first_generation = trigger
+            .divergence_gate()
+            .request_offchain_equity_reconcile(&symbol);
+        let current_generation = trigger
+            .divergence_gate()
+            .request_offchain_equity_reconcile(&symbol);
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(0),
+                fetched_at: Utc::now() + chrono::Duration::seconds(1),
+                ledger_position: Some(shares(136)),
+                consecutive_polls: 0,
+                generation: Some(first_generation),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(136))
+        );
+        assert!(trigger.divergence_gate().is_engaged(&symbol));
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(0),
+                fetched_at: Utc::now() + chrono::Duration::seconds(1),
+                ledger_position: Some(shares(136)),
+                consecutive_polls: 0,
+                generation: Some(current_generation),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO)
+        );
+        assert!(!trigger.divergence_gate().is_engaged(&symbol));
     }
 
     #[tokio::test]
@@ -28202,6 +28565,7 @@ mod tests {
                 fetched_at: now + chrono::Duration::seconds(1),
                 ledger_position: Some(shares(136)),
                 consecutive_polls: 3,
+                generation: None,
             },
         )
         .await
@@ -28260,6 +28624,7 @@ mod tests {
                     fetched_at: Utc::now(),
                     ledger_position: Some(shares(136)),
                     consecutive_polls: 3,
+                    generation: None,
                 },
             )
             .await

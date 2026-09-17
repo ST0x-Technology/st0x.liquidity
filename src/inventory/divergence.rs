@@ -10,10 +10,13 @@
 //! configured threshold is reached it escalates a forced reconcile
 //! through the `InventorySnapshot` aggregate.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use st0x_evm::Chain;
@@ -21,6 +24,22 @@ use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Usdc;
 
 use super::BroadcastingInventory;
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct ReconciliationGeneration(u64);
+impl ReconciliationGeneration {
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReconciliationRequest {
+    generation: ReconciliationGeneration,
+    requested_at: DateTime<Utc>,
+    minimum_block: Option<u64>,
+}
 
 /// Symbols with a detected but unresolved offchain snapshot divergence.
 ///
@@ -38,9 +57,10 @@ pub(crate) struct InventoryDivergenceGate {
     /// Explicit venue snapshots required after inventory bookkeeping was
     /// deferred. These are separate from broker-divergence detection so a
     /// matching offchain poll cannot accidentally clear an onchain repair.
-    pending_offchain_equity: RwLock<HashSet<Symbol>>,
-    pending_onchain_equity: RwLock<HashSet<(Chain, Symbol)>>,
-    pending_onchain_cash: RwLock<HashSet<Chain>>,
+    pending_offchain_equity: RwLock<HashMap<Symbol, ReconciliationRequest>>,
+    pending_onchain_equity: RwLock<HashMap<(Chain, Symbol), ReconciliationRequest>>,
+    pending_onchain_cash: RwLock<HashMap<Chain, ReconciliationRequest>>,
+    next_reconciliation_generation: AtomicU64,
     /// Venue-level flag for a detected but unresolved `OffchainUsd`
     /// divergence. One flag, not a set: the Hedging cash balance is one
     /// number.
@@ -58,10 +78,10 @@ impl InventoryDivergenceGate {
 
     pub(crate) fn is_engaged(&self, symbol: &Symbol) -> bool {
         self.read_symbols().contains(symbol)
-            || self.read_pending_offchain_equity().contains(symbol)
+            || self.read_pending_offchain_equity().contains_key(symbol)
             || self
                 .read_pending_onchain_equity()
-                .iter()
+                .keys()
                 .any(|(_, pending_symbol)| pending_symbol == symbol)
     }
 
@@ -77,47 +97,236 @@ impl InventoryDivergenceGate {
         self.cash.load(Ordering::SeqCst) || !self.read_pending_onchain_cash().is_empty()
     }
 
-    pub(crate) fn request_offchain_equity_reconcile(&self, symbol: &Symbol) {
-        self.write_pending_offchain_equity().insert(symbol.clone());
+    pub(crate) fn request_offchain_equity_reconcile(
+        &self,
+        symbol: &Symbol,
+    ) -> ReconciliationGeneration {
+        let request = self.new_reconciliation_request(None);
+        self.write_pending_offchain_equity()
+            .insert(symbol.clone(), request);
+        request.generation
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_offchain_equity_reconciles(&self) -> Vec<Symbol> {
         self.read_pending_offchain_equity()
-            .iter()
+            .keys()
             .cloned()
             .collect()
     }
 
-    pub(crate) fn resolve_offchain_equity_reconcile(&self, symbol: &Symbol) {
-        self.write_pending_offchain_equity().remove(symbol);
+    pub(crate) fn claim_pending_offchain_equity_reconciles(
+        &self,
+    ) -> Vec<(Symbol, ReconciliationGeneration)> {
+        self.read_pending_offchain_equity()
+            .iter()
+            .map(|(symbol, request)| (symbol.clone(), request.generation))
+            .collect()
     }
 
-    pub(crate) fn request_onchain_equity_reconcile(&self, chain: Chain, symbol: &Symbol) {
+    pub(crate) fn accepts_offchain_equity_reconcile(
+        &self,
+        symbol: &Symbol,
+        generation: ReconciliationGeneration,
+        fetched_at: DateTime<Utc>,
+    ) -> bool {
+        self.read_pending_offchain_equity()
+            .get(symbol)
+            .is_some_and(|request| {
+                request.generation == generation && fetched_at > request.requested_at
+            })
+    }
+    pub(crate) fn protected_offchain_equity_symbols(
+        &self,
+        fetched_at: DateTime<Utc>,
+    ) -> BTreeSet<Symbol> {
+        self.read_pending_offchain_equity()
+            .iter()
+            .filter(|(_, request)| fetched_at <= request.requested_at)
+            .map(|(symbol, _)| symbol.clone())
+            .collect()
+    }
+
+    pub(crate) fn resolve_offchain_equity_reconcile(
+        &self,
+        symbol: &Symbol,
+        generation: ReconciliationGeneration,
+    ) {
+        let mut pending = self.write_pending_offchain_equity();
+        if pending
+            .get(symbol)
+            .is_some_and(|request| request.generation == generation)
+        {
+            pending.remove(symbol);
+        }
+    }
+
+    pub(crate) fn request_onchain_equity_reconcile(
+        &self,
+        chain: Chain,
+        symbol: &Symbol,
+        minimum_block: Option<u64>,
+    ) -> ReconciliationGeneration {
+        let request = self.new_reconciliation_request(minimum_block);
         self.write_pending_onchain_equity()
-            .insert((chain, symbol.clone()));
+            .insert((chain, symbol.clone()), request);
+        request.generation
     }
 
-    pub(crate) fn has_pending_onchain_equity_reconcile(&self, chain: Chain) -> bool {
+    pub(crate) fn claim_pending_onchain_equity_reconciles(
+        &self,
+        chain: Chain,
+    ) -> BTreeMap<Symbol, ReconciliationGeneration> {
         self.read_pending_onchain_equity()
             .iter()
+            .filter(|((pending_chain, _), _)| *pending_chain == chain)
+            .map(|((_, symbol), request)| (symbol.clone(), request.generation))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_onchain_equity_reconcile(&self, chain: Chain) -> bool {
+        self.read_pending_onchain_equity()
+            .keys()
             .any(|(pending_chain, _)| *pending_chain == chain)
     }
 
-    pub(crate) fn resolve_onchain_equity_reconcile(&self, chain: Chain, symbol: &Symbol) {
-        self.write_pending_onchain_equity()
-            .remove(&(chain, symbol.clone()));
+    pub(crate) fn accepts_onchain_equity_reconcile(
+        &self,
+        chain: Chain,
+        symbol: &Symbol,
+        generation: ReconciliationGeneration,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+    ) -> bool {
+        self.read_pending_onchain_equity()
+            .get(&(chain, symbol.clone()))
+            .is_some_and(|request| {
+                Self::request_accepts_snapshot(request, generation, fetched_at, block_number)
+            })
+    }
+    pub(crate) fn protected_onchain_equity_symbols(
+        &self,
+        chain: Chain,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+    ) -> BTreeSet<Symbol> {
+        self.read_pending_onchain_equity()
+            .iter()
+            .filter(|((pending_chain, _), request)| {
+                *pending_chain == chain
+                    && !Self::request_is_covered_by_snapshot(request, fetched_at, block_number)
+            })
+            .map(|((_, symbol), _)| symbol.clone())
+            .collect()
     }
 
-    pub(crate) fn request_onchain_cash_reconcile(&self, chain: Chain) {
-        self.write_pending_onchain_cash().insert(chain);
+    pub(crate) fn resolve_onchain_equity_reconcile(
+        &self,
+        chain: Chain,
+        symbol: &Symbol,
+        generation: ReconciliationGeneration,
+    ) {
+        let key = (chain, symbol.clone());
+        let mut pending = self.write_pending_onchain_equity();
+        if pending
+            .get(&key)
+            .is_some_and(|request| request.generation == generation)
+        {
+            pending.remove(&key);
+        }
     }
 
-    pub(crate) fn has_pending_onchain_cash_reconcile(&self, chain: Chain) -> bool {
-        self.read_pending_onchain_cash().contains(&chain)
+    pub(crate) fn request_onchain_cash_reconcile(
+        &self,
+        chain: Chain,
+        minimum_block: Option<u64>,
+    ) -> ReconciliationGeneration {
+        let request = self.new_reconciliation_request(minimum_block);
+        self.write_pending_onchain_cash().insert(chain, request);
+        request.generation
     }
 
-    pub(crate) fn resolve_onchain_cash_reconcile(&self, chain: Chain) {
-        self.write_pending_onchain_cash().remove(&chain);
+    pub(crate) fn claim_pending_onchain_cash_reconcile(
+        &self,
+        chain: Chain,
+    ) -> Option<ReconciliationGeneration> {
+        self.read_pending_onchain_cash()
+            .get(&chain)
+            .map(|request| request.generation)
+    }
+
+    pub(crate) fn accepts_onchain_cash_reconcile(
+        &self,
+        chain: Chain,
+        generation: ReconciliationGeneration,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+    ) -> bool {
+        self.read_pending_onchain_cash()
+            .get(&chain)
+            .is_some_and(|request| {
+                Self::request_accepts_snapshot(request, generation, fetched_at, block_number)
+            })
+    }
+    pub(crate) fn protects_onchain_cash_snapshot(
+        &self,
+        chain: Chain,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+    ) -> bool {
+        self.read_pending_onchain_cash()
+            .get(&chain)
+            .is_some_and(|request| {
+                !Self::request_is_covered_by_snapshot(request, fetched_at, block_number)
+            })
+    }
+
+    pub(crate) fn resolve_onchain_cash_reconcile(
+        &self,
+        chain: Chain,
+        generation: ReconciliationGeneration,
+    ) {
+        let mut pending = self.write_pending_onchain_cash();
+        if pending
+            .get(&chain)
+            .is_some_and(|request| request.generation == generation)
+        {
+            pending.remove(&chain);
+        }
+    }
+
+    fn new_reconciliation_request(&self, minimum_block: Option<u64>) -> ReconciliationRequest {
+        let generation = self
+            .next_reconciliation_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        ReconciliationRequest {
+            generation: ReconciliationGeneration(generation),
+            requested_at: Utc::now(),
+            minimum_block,
+        }
+    }
+
+    fn request_accepts_snapshot(
+        request: &ReconciliationRequest,
+        generation: ReconciliationGeneration,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+    ) -> bool {
+        request.generation == generation
+            && Self::request_is_covered_by_snapshot(request, fetched_at, block_number)
+    }
+
+    fn request_is_covered_by_snapshot(
+        request: &ReconciliationRequest,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+    ) -> bool {
+        request.minimum_block.map_or_else(
+            || fetched_at > request.requested_at,
+            |minimum_block| block_number.is_some_and(|block_number| block_number >= minimum_block),
+        )
     }
 
     fn read_symbols(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Symbol>> {
@@ -140,13 +349,17 @@ impl InventoryDivergenceGate {
         })
     }
 
-    fn read_pending_offchain_equity(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Symbol>> {
+    fn read_pending_offchain_equity(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<Symbol, ReconciliationRequest>> {
         self.pending_offchain_equity
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn write_pending_offchain_equity(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<Symbol>> {
+    fn write_pending_offchain_equity(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<Symbol, ReconciliationRequest>> {
         self.pending_offchain_equity
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -154,7 +367,7 @@ impl InventoryDivergenceGate {
 
     fn read_pending_onchain_equity(
         &self,
-    ) -> std::sync::RwLockReadGuard<'_, HashSet<(Chain, Symbol)>> {
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<(Chain, Symbol), ReconciliationRequest>> {
         self.pending_onchain_equity
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -162,19 +375,23 @@ impl InventoryDivergenceGate {
 
     fn write_pending_onchain_equity(
         &self,
-    ) -> std::sync::RwLockWriteGuard<'_, HashSet<(Chain, Symbol)>> {
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<(Chain, Symbol), ReconciliationRequest>> {
         self.pending_onchain_equity
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn read_pending_onchain_cash(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Chain>> {
+    fn read_pending_onchain_cash(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<Chain, ReconciliationRequest>> {
         self.pending_onchain_cash
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn write_pending_onchain_cash(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<Chain>> {
+    fn write_pending_onchain_cash(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<Chain, ReconciliationRequest>> {
         self.pending_onchain_cash
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
