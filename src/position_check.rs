@@ -407,10 +407,15 @@ where
         symbol: &Symbol,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
     ) -> Result<(), CheckPositionsError> {
-        if symbols_with_active_transfers(&self.pool)
+        let position_reservation_pending = self
+            .position_projection
+            .load(symbol)
             .await?
-            .contains(symbol)
-        {
+            .is_some_and(|position| position.equity_transfer_reservation.is_some());
+        let redemption_active = symbols_with_active_transfers(&self.pool)
+            .await?
+            .contains(symbol);
+        if position_reservation_pending || redemption_active {
             self.check_positions_queue
                 .clone()
                 .push_with_delay(
@@ -1590,7 +1595,9 @@ mod tests {
         CounterTradeOrderKind, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
         OrderPlacementResult, PollOrderStatus, ReconcileOrderFillJobQueue,
     };
-    use crate::position::{AnchorDisposition, PositionCommand, TradeId};
+    use crate::position::{
+        AnchorDisposition, EquityTransferReservationId, PositionCommand, TradeId,
+    };
     use crate::test_utils::{TEST_POLL_INTERVAL, setup_test_pools};
 
     async fn build_ctx(
@@ -2018,6 +2025,61 @@ mod tests {
             count_jobs(&apalis_pool, &check_positions_job_type()).await,
             1,
             "The scan must reschedule itself despite the outage"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_recheck_stays_live_until_position_reservation_releases() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, position) =
+            build_ctx(pool, apalis_pool.clone(), cfg, Duration::from_secs(60)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(0.5)),
+            Direction::Buy,
+        )
+        .await;
+        let reservation_id = EquityTransferReservationId::generate();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::for_symbol(symbol)
+            .perform(&ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
+        assert_eq!(
+            count_jobs(&apalis_pool, &check_positions_job_type()).await,
+            1,
+            "the targeted recalculation must retry while Position owns a transfer reservation"
         );
     }
 

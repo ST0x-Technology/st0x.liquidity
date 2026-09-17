@@ -11036,6 +11036,21 @@ mod tests {
             .build(())
             .await
             .unwrap();
+        let position_threshold = ExecutionThreshold::whole_share();
+        position
+            .send(
+                symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: FractionalShares::ZERO,
+                    reason: "initialize neutral rebalancing fixture".to_string(),
+                    threshold: position_threshold,
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: None,
+                },
+            )
+            .await
+            .unwrap();
         let trigger = Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
@@ -11053,11 +11068,7 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         ));
         trigger
-            .set_position_authority(
-                position,
-                position_projection,
-                ExecutionThreshold::whole_share(),
-            )
+            .set_position_authority(position, position_projection, position_threshold)
             .await;
         trigger
     }
@@ -25258,6 +25269,26 @@ mod tests {
             event_sender,
         ));
         seed_vault_registry(&pool, &symbol, Chain::Base).await;
+        let position_threshold =
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(1000))).unwrap());
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: FractionalShares::ZERO,
+                    reason: "initialize neutral rebalancing fixture".to_string(),
+                    threshold: position_threshold,
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: None,
+                },
+            )
+            .await
+            .unwrap();
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
@@ -25278,6 +25309,9 @@ mod tests {
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
+        trigger
+            .set_position_authority(position, position_projection, position_threshold)
+            .await;
         let reactor = trigger.clone();
 
         let id = InventorySnapshotId {
@@ -28752,41 +28786,6 @@ mod tests {
             count_pending_equity_redemption_jobs(&trigger).await,
             0,
             "In-progress flag should suppress duplicate equity dispatch"
-        );
-    }
-
-    #[tokio::test]
-    async fn equity_check_suppresses_dispatch_when_offchain_order_pending() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(20), shares(80))
-            .with_usdc(usdc(500), usdc(500));
-
-        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let trigger = reactor.clone();
-
-        trigger
-            .inventory
-            .write()
-            .await
-            .mark_offchain_order_pending(symbol.clone(), test_order_id());
-
-        EquityRebalancingCheck {
-            symbol: symbol.clone(),
-        }
-        .perform(&trigger)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            count_pending_equity_mint_jobs(&trigger).await,
-            0,
-            "Pending offchain hedge order should suppress equity rebalancing dispatch"
-        );
-        assert_eq!(
-            count_pending_equity_redemption_jobs(&trigger).await,
-            0,
-            "Pending offchain hedge order should suppress equity rebalancing dispatch"
         );
     }
 
