@@ -179,7 +179,7 @@ mod tests {
     use st0x_dto::Statement;
     use st0x_event_sorcery::test_store;
     use st0x_evm::Chain;
-    use st0x_execution::{Direction, FractionalShares, Symbol};
+    use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
     use st0x_tokenization::mock::MockTokenizer;
@@ -533,6 +533,13 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let built = manifest.build(pool.clone(), services).await.unwrap();
+        rebalancing_service
+            .set_position_authority(
+                Arc::clone(&built.position),
+                Arc::clone(&built.position_projection),
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
 
         built
             .position
@@ -540,7 +547,9 @@ mod tests {
                 &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
+                    threshold: ExecutionThreshold::shares(
+                        Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                    ),
                     trade_id: TradeId {
                         chain: Chain::Base,
                         tx_hash: TxHash::ZERO,

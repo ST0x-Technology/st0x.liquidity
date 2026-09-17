@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
-use st0x_event_sorcery::Store;
+use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
@@ -132,13 +132,15 @@ pub(crate) enum TransferEquityToMarketMakingJobError {
     Transfer(#[from] MintTransferError),
     #[error(transparent)]
     Enqueue(#[from] QueuePushError),
+    #[error(transparent)]
+    PositionReservation(#[from] SendError<Position>),
 }
 
 impl BotGasFailureClassifier for TransferEquityToMarketMakingJobError {
     fn is_bot_gas_enqueue_failure(&self) -> bool {
         match self {
             Self::Transfer(inner) => inner.is_bot_gas_enqueue_failure(),
-            Self::Enqueue(_) => false,
+            Self::Enqueue(_) | Self::PositionReservation(_) => false,
         }
     }
 }
@@ -221,10 +223,24 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
             )
             .await;
 
-        // Success needs no post-processing. Only a `PostReceipt` error (Alpaca
-        // already delivered the tokens onchain) gets the recovery handoff below;
-        // any other transfer error propagates for apalis to retry.
+        // The terminal lifecycle reactor runs inside the mint aggregate's
+        // SQLite transaction, so it cannot synchronously write the Position
+        // aggregate without risking `database is locked`. Release ownership
+        // here, after the transfer command and all of its reactors have
+        // committed, before the worker can return and hedging can resume.
         let Err(transfer_error) = result else {
+            if let Some(position_store) = &ctx.position_store {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.issuer_request_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
             return Ok(());
         };
 
@@ -568,13 +584,15 @@ pub(crate) enum TransferEquityToHedgingJobError {
     Transfer(#[from] Box<RedemptionError>),
     #[error(transparent)]
     Enqueue(#[from] QueuePushError),
+    #[error(transparent)]
+    PositionReservation(#[from] SendError<Position>),
 }
 
 impl BotGasFailureClassifier for TransferEquityToHedgingJobError {
     fn is_bot_gas_enqueue_failure(&self) -> bool {
         match self {
             Self::Transfer(inner) => inner.is_bot_gas_enqueue_failure(),
-            Self::Enqueue(_) => false,
+            Self::Enqueue(_) | Self::PositionReservation(_) => false,
         }
     }
 }
@@ -638,6 +656,18 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             .await;
 
         let Err(error) = result else {
+            if let Some(position_store) = &ctx.position_store {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.aggregate_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
             return Ok(());
         };
 

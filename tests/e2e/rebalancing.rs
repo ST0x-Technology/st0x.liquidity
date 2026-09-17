@@ -452,6 +452,18 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
         .expected_net(float!(0))
         .build()];
 
+    // The mint terminal event releases the Position reservation; the deferred
+    // hedge is then placed and polled asynchronously. Wait for that observable
+    // completion instead of racing the broker mock while its order is still
+    // `New`.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
+
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
         .take_results(&take_results)

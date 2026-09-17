@@ -12695,11 +12695,18 @@ mod tests {
         ));
         let reactor = trigger.clone();
 
-        let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(Arc::clone(&reactor))
             .build(())
             .await
             .unwrap();
+        trigger
+            .set_position_authority(
+                Arc::clone(&position_store),
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
 
         // Acknowledge a fill -> fires position events -> trigger should react.
         position_store
@@ -12707,7 +12714,9 @@ mod tests {
                 &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
+                    threshold: ExecutionThreshold::shares(
+                        Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                    ),
                     trade_id: TradeId {
                         chain: Chain::Base,
                         tx_hash: TxHash::random(),
@@ -12819,11 +12828,18 @@ mod tests {
         ));
         let reactor = trigger.clone();
 
-        let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(Arc::clone(&reactor))
             .build(())
             .await
             .unwrap();
+        trigger
+            .set_position_authority(
+                Arc::clone(&position_store),
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
 
         // Add 50 onchain shares via CQRS -> trigger applies to inventory.
         position_store
@@ -12831,7 +12847,9 @@ mod tests {
                 &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
+                    threshold: ExecutionThreshold::shares(
+                        Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                    ),
                     trade_id: TradeId {
                         chain: Chain::Base,
                         tx_hash: TxHash::random(),
@@ -12953,11 +12971,18 @@ mod tests {
         ));
         let reactor = trigger.clone();
 
-        let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(reactor.clone())
             .build(())
             .await
             .unwrap();
+        trigger
+            .set_position_authority(
+                Arc::clone(&position_store),
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
 
         // Small onchain fill: 55/105 = 52.4%, within 30%-70%.
         position_store
@@ -12965,7 +12990,9 @@ mod tests {
                 &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
+                    threshold: ExecutionThreshold::shares(
+                        Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                    ),
                     trade_id: TradeId {
                         chain: Chain::Base,
                         tx_hash: TxHash::random(),
@@ -13106,11 +13133,18 @@ mod tests {
         ));
         let reactor = trigger.clone();
 
-        let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(Arc::clone(&reactor))
             .build(())
             .await
             .unwrap();
+        trigger
+            .set_position_authority(
+                Arc::clone(&position_store),
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
 
         (position_store, pool, apalis_pool, symbol, reactor)
     }
@@ -13133,7 +13167,9 @@ mod tests {
                 &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
+                    threshold: ExecutionThreshold::shares(
+                        Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                    ),
                     trade_id: TradeId {
                         chain: Chain::Base,
                         tx_hash: TxHash::random(),
@@ -13171,7 +13207,9 @@ mod tests {
                 &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
+                    threshold: ExecutionThreshold::shares(
+                        Positive::new(FractionalShares::new(float!(100))).unwrap(),
+                    ),
                     trade_id: TradeId {
                         chain: Chain::Base,
                         tx_hash: TxHash::random(),
