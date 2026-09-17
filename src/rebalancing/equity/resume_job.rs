@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 use st0x_event_sorcery::SendError;
 use st0x_execution::Symbol;
@@ -68,9 +69,9 @@ impl fmt::Display for ResumeTokenizationTarget {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ResumeTokenizationAggregate {
     pub(crate) target: ResumeTokenizationTarget,
-    /// Symbol whose durable Position reservation this resume owns. Rows
-    /// written before generic resumes acquired reservations deserialize as
-    /// `None` and therefore cannot release an unrelated claim.
+    /// Symbol whose durable Position reservation this resume owns. Legacy rows
+    /// written before this field existed deserialize as `None` and are
+    /// discarded fail-closed; startup enqueues a fresh symbol-bearing row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) symbol: Option<Symbol>,
     /// Count of consecutive broker rate-limit (429) reschedules leading up to
@@ -162,28 +163,34 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
     }
 
     async fn perform(&self, ctx: &ResumeTokenizationCtx) -> Result<Self::Output, Self::Error> {
+        let Some(symbol) = &self.symbol else {
+            warn!(
+                target: "tokenization",
+                resume_target = %self.target,
+                "Discarding legacy symbol-less tokenization resume row; startup owns the guarded replacement"
+            );
+            return Ok(());
+        };
         let (position_store, position_threshold) = &ctx.position_authority;
-        if let Some(symbol) = &self.symbol {
-            let reservation_id = match &self.target {
-                ResumeTokenizationTarget::Mint(id) => EquityTransferReservationId::from_uuid(id.0),
-                ResumeTokenizationTarget::Redemption(id) => {
-                    EquityTransferReservationId::from_uuid(id.0)
-                }
-            };
-            if !restore_position_reservation(
-                position_store,
-                symbol,
-                *position_threshold,
-                reservation_id,
-            )
-            .await?
-            {
-                let mut job_queue = ctx.job_queue.clone();
-                job_queue
-                    .push_with_delay(self.clone(), EQUITY_TRANSFER_REDRIVE_DELAY)
-                    .await?;
-                return Ok(());
+        let reservation_id = match &self.target {
+            ResumeTokenizationTarget::Mint(id) => EquityTransferReservationId::from_uuid(id.0),
+            ResumeTokenizationTarget::Redemption(id) => {
+                EquityTransferReservationId::from_uuid(id.0)
             }
+        };
+        if !restore_position_reservation(
+            position_store,
+            symbol,
+            *position_threshold,
+            reservation_id,
+        )
+        .await?
+        {
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue
+                .push_with_delay(self.clone(), EQUITY_TRANSFER_REDRIVE_DELAY)
+                .await?;
+            return Ok(());
         }
 
         let result = match &self.target {
@@ -200,22 +207,12 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
         };
 
         let Err(error) = result else {
-            if let Some(symbol) = &self.symbol {
-                let reservation_id = match &self.target {
-                    ResumeTokenizationTarget::Mint(id) => {
-                        EquityTransferReservationId::from_uuid(id.0)
-                    }
-                    ResumeTokenizationTarget::Redemption(id) => {
-                        EquityTransferReservationId::from_uuid(id.0)
-                    }
-                };
-                position_store
-                    .send(
-                        symbol,
-                        PositionCommand::ReleaseEquityTransfer { reservation_id },
-                    )
-                    .await?;
-            }
+            position_store
+                .send(
+                    symbol,
+                    PositionCommand::ReleaseEquityTransfer { reservation_id },
+                )
+                .await?;
             return Ok(());
         };
 
@@ -410,7 +407,7 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
-            symbol: None,
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -465,7 +462,7 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
-            symbol: None,
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -548,7 +545,7 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id),
-            symbol: None,
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -600,7 +597,7 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id.clone()),
-            symbol: None,
+            symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
         };
         Job::perform(&job, &ctx).await.unwrap();
@@ -724,7 +721,7 @@ mod tests {
         };
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
-            symbol: None,
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -793,7 +790,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
-                    symbol,
+                    symbol: symbol.clone(),
                     chain: Chain::Base,
                     quantity: float!(1.0),
                     token: Address::ZERO,
@@ -816,7 +813,7 @@ mod tests {
         let calls_before_resume = tokenizer.call_count();
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id.clone()),
-            symbol: None,
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
         };
         let ctx = ResumeTokenizationCtx {
@@ -855,16 +852,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn legacy_symbol_less_resume_is_discarded_before_transfer() {
+        let (ctx, _, _, _) = build_ctx().await;
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(issuer_request_id("legacy-symbol-less")),
+            symbol: None,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a legacy symbol-less row must be discarded without invoking transfer");
+    }
+
     /// `perform` on a `Mint` target with a non-existent aggregate propagates
     /// the error so apalis retries.
     #[tokio::test]
     async fn perform_mint_target_propagates_error_for_missing_aggregate() {
         let (ctx, _, _, _tokenizer) = build_ctx().await;
         let id = issuer_request_id("resume-mint-missing");
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
-            symbol: None,
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
         };
 
@@ -884,10 +896,11 @@ mod tests {
     async fn perform_redemption_target_propagates_error_for_missing_aggregate() {
         let (ctx, _, _, _tokenizer) = build_ctx().await;
         let id = redemption_aggregate_id("resume-redemption-missing");
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id),
-            symbol: None,
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
         };
 

@@ -5772,6 +5772,32 @@ mod tests {
     }
 
     #[test]
+    fn is_ready_for_execution_waits_for_equity_transfer_reservation() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(float!(1.212)),
+            accumulated_long: FractionalShares::new(float!(1.212)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_offchain_order_id: None,
+            equity_transfer_reservation: Some(EquityTransferReservation {
+                id: EquityTransferReservationId::generate(),
+                status: EquityTransferReservationStatus::Confirmed,
+            }),
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
+            threshold: ExecutionThreshold::whole_share(),
+            last_updated: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
+        };
+
+        assert_eq!(position.is_ready_for_execution(None).unwrap(), None);
+    }
+
+    #[test]
     fn is_ready_for_execution_returns_fractional_buy_for_negative_position() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),

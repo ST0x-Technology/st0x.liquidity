@@ -2841,7 +2841,12 @@ enum TriggerReason {
   reservation ID. Startup retains reservations owned by live durable transfer
   jobs, restores missing legacy ownership, and releases crash-orphaned claims.
   When a pending hedge prevents restoration, transfer execution remains deferred
-  until the hedge clears and the exact reservation is restored.
+  until the hedge clears and the exact reservation is restored. Terminal cleanup
+  removes that deferred owner before releasing the reservation and serializes
+  with the retry sweep, so a completed or failed transfer cannot be resurrected.
+  A legacy generic resume row without a symbol is discarded before it can call
+  the transfer service; startup enqueues the fresh symbol-bearing replacement
+  that must restore ownership first.
 - OnChain fills are always applied (blockchain facts are immutable)
 - Threshold is passed as a parameter to commands that need it
 
