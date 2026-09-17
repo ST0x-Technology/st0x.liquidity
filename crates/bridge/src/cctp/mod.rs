@@ -1338,11 +1338,38 @@ mod tests {
     use st0x_evm::Evm;
     use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
+    use st0x_evm::{Chain, USDC_BASE, USDC_ETHEREUM};
 
     use super::evm::MintRecoveryConfig;
     use super::*;
     use crate::{Attestation, Bridge};
+
+    #[test]
+    fn the_ethereum_base_corridor_resolves_circles_usdc_on_both_ends() {
+        let corridor = CctpCorridor::ethereum_base().unwrap();
+
+        assert_eq!(corridor.usdc_ethereum(), USDC_ETHEREUM);
+        assert_eq!(corridor.usdc_base(), USDC_BASE);
+    }
+
+    /// Robinhood settles in USDG, which CCTP neither burns nor mints: that end
+    /// is refused by chain and stable, before any token is approved.
+    #[test]
+    fn a_corridor_end_settling_in_another_stable_is_refused_by_name() {
+        let refused = circle_usdc(Chain::Robinhood).unwrap_err();
+
+        assert_eq!(
+            refused,
+            CorridorStableNotUsdc {
+                chain: Chain::Robinhood,
+                stable: "USDG",
+            }
+        );
+        assert_eq!(
+            refused.to_string(),
+            "the CCTP corridor needs Circle's USDC on both ends, but robinhood settles in USDG"
+        );
+    }
 
     // --- is_revert unit tests ---
 
