@@ -42,9 +42,9 @@ use crate::trading::offchain::close_flatten::{
     CloseFlattenCrossRamp, CloseFlattenPolicy, CloseFlattenWindow, preflight_skip_reason_label,
 };
 use crate::trading::offchain::hedge::{
-    HedgeJobQueue, PlaceHedge, ReferencePriceError, TransientFailureStreak,
-    acquire_counter_trade_submission_file_lock, alert_dead_letter, apply_slippage,
-    push_anchor_recovery_job_if_absent, resolve_extended_hours_reference_price,
+    EQUITY_TRANSFER_REDRIVE_DELAY, HedgeJobQueue, PlaceHedge, ReferencePriceError,
+    TransientFailureStreak, acquire_counter_trade_submission_file_lock, alert_dead_letter,
+    apply_slippage, push_anchor_recovery_job_if_absent, resolve_extended_hours_reference_price,
 };
 use crate::trading::onchain::trade_accountant::{DeadLetterReason, SymbolScopedReason};
 
@@ -288,24 +288,19 @@ fn backstop_sizing_assets<'registry>(
         })
 }
 
-/// A durable, self-rescheduling job that scans every position and enqueues a
-/// [`PlaceHedge`] for any symbol whose net exposure has crossed the execution
-/// threshold.
+/// A durable position scan job.
 ///
-/// The scan reads positions from the projection on each run. A single instance
-/// is enqueued at startup; each run re-enqueues itself with a delay equal to
-/// the configured check interval.
-///
-/// The job is stateless. In particular, the extended-hours cancel-and-replace
-/// pass is level-triggered -- every scan that observes a Regular session sweeps
-/// for still-live extended-hours orders -- so no previously-observed session
-/// needs to be carried between runs. (An earlier edge-triggered design carried
-/// a `last_seen_session` payload field; the empty braces keep old payloads
-/// deserializing cleanly by ignoring it.)
+/// The default payload scans every position and reschedules itself at the
+/// configured interval. [`Self::for_symbol`] creates a one-shot recalculation
+/// used after a queued hedge loses a race with a transfer or becomes stale:
+/// it re-runs readiness plus the complete broker preflight before creating a
+/// replacement [`PlaceHedge`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct CheckPositions {
     #[serde(default)]
     pub(crate) one_shot: bool,
+    #[serde(default)]
+    symbol: Option<Symbol>,
 }
 
 #[derive(Debug, Default)]
@@ -342,6 +337,12 @@ where
 
     async fn perform(&self, ctx: &CheckPositionsCtx<E>) -> Result<Self::Output, Self::Error> {
         let mut close_flatten_window_cache = CloseFlattenWindowCache::default();
+
+        if let Some(symbol) = &self.symbol {
+            ctx.check_and_enqueue_one(symbol, &mut close_flatten_window_cache)
+                .await?;
+            return Ok(());
+        }
 
         // Every tick, independent of the feature flag: clear any position
         // whose pending order has gone terminal (e.g. a cancellation the
@@ -396,10 +397,69 @@ where
     }
 }
 
+impl CheckPositions {
+    pub(crate) fn for_symbol(symbol: Symbol) -> Self {
+        Self {
+            symbol: Some(symbol),
+            ..Default::default()
+        }
+    }
+
+    /// A one-shot full scan that runs every position check once but does not
+    /// reschedule itself. Enqueued at trading-schedule boundaries; distinct from
+    /// [`Self::for_symbol`], which targets a single symbol after a hedge race.
+    pub(crate) fn one_shot() -> Self {
+        Self {
+            one_shot: true,
+            ..Default::default()
+        }
+    }
+}
+
 impl<E> CheckPositionsCtx<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
 {
+    async fn check_and_enqueue_one(
+        &self,
+        symbol: &Symbol,
+        close_flatten_window_cache: &mut CloseFlattenWindowCache,
+    ) -> Result<(), CheckPositionsError> {
+        if symbols_with_active_transfers(&self.pool)
+            .await?
+            .contains(symbol)
+        {
+            self.check_positions_queue
+                .clone()
+                .push_with_delay(
+                    CheckPositions::for_symbol(symbol.clone()),
+                    EQUITY_TRANSFER_REDRIVE_DELAY,
+                )
+                .await?;
+            debug!(
+                %symbol,
+                retry_delay_secs = EQUITY_TRANSFER_REDRIVE_DELAY.as_secs(),
+                "Equity transfer still in progress; rescheduled fresh hedge recalculation"
+            );
+            return Ok(());
+        }
+
+        record_hedge_floor_gauges(
+            symbol,
+            self.ctx.broker.hedge_floor().for_symbol(symbol),
+            FractionalShares::ZERO,
+            FractionalShares::ZERO,
+        );
+
+        let Some(assets) = backstop_sizing_assets(&self.ctx.chains, symbol) else {
+            debug!(%symbol, "Skipping hedge recalculation: no hedged chain enables the symbol");
+            return Ok(());
+        };
+
+        self.check_and_enqueue_symbol(symbol, assets, close_flatten_window_cache)
+            .await;
+        Ok(())
+    }
     async fn scan_and_enqueue(
         &self,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
@@ -2397,10 +2457,7 @@ mod tests {
             Direction::Buy,
         )
         .await;
-        CheckPositions { one_shot: true }
-            .perform(&ctx)
-            .await
-            .unwrap();
+        CheckPositions::one_shot().perform(&ctx).await.unwrap();
         assert_eq!(
             count_jobs(&apalis_pool, &check_positions_job_type()).await,
             0
@@ -3168,7 +3225,10 @@ mod tests {
         )
         .await;
 
-        CheckPositions::default().perform(&ctx).await.unwrap();
+        CheckPositions::for_symbol(symbol.clone())
+            .perform(&ctx)
+            .await
+            .unwrap();
 
         assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
         let rendered = metrics_handle.render();

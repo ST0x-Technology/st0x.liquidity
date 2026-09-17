@@ -2061,66 +2061,120 @@ impl RebalancingService {
             }
             _ => None,
         };
+        let force_onchain_reconciliation = match &event {
+            OnchainEquity { chain, .. } => self
+                .divergence_gate
+                .has_pending_onchain_equity_reconcile(*chain),
+            OnchainUsdc { chain, .. } => self
+                .divergence_gate
+                .has_pending_onchain_cash_reconcile(*chain),
+            _ => false,
+        };
 
         let mut inventory = self.inventory.write().await;
+        let resolve_offchain_reconciliation = match &event {
+            OffchainEquityReconciled {
+                symbol, fetched_at, ..
+            } => inventory
+                .equity_reconciliation_busy(symbol, *fetched_at)?
+                .is_none(),
+            _ => false,
+        };
 
-        let updated = match &event {
-            OnchainEquity {
-                chain,
-                balances,
-                block_number,
-                ..
-            } => inventory.clone().apply_equity_snapshot(
-                Venue::MarketMaking,
-                *chain,
-                balances.iter(),
-                fetched_at,
-                *block_number,
+        let updated = if force_onchain_reconciliation {
+            inventory.clone().force_apply_snapshot_event(
+                &event,
                 now,
-            ),
-
-            OffchainEquity { positions, .. } => {
-                let primary_chain = inventory.primary_chain();
-                inventory.clone().apply_equity_snapshot(
-                    Venue::Hedging,
-                    primary_chain,
-                    positions.iter(),
+                Arc::new(InventoryViewError::DeferredSnapshotReconciliation),
+            )
+        } else {
+            match &event {
+                OnchainEquity {
+                    chain,
+                    balances,
+                    block_number,
+                    ..
+                } => inventory.clone().apply_equity_snapshot(
+                    Venue::MarketMaking,
+                    *chain,
+                    balances.iter(),
                     fetched_at,
-                    None,
+                    *block_number,
                     now,
-                )
-            }
+                ),
 
-            // The reconcile arms validate busyness themselves under the
-            // write lock, so the generic apply path is the correct route
-            // here too. `OnchainUsdc` also routes through it (not a direct
-            // `update_usdc`) so the view's block-watermark bookkeeping for
-            // absorbed onchain fills has a single implementation.
-            OnchainUsdc { .. }
-            | OffchainEquityReconciled { .. }
-            | OffchainUsdReconciled { .. }
-            | OffchainUsd { .. }
-            | OffchainCashBuyingPower { .. }
-            | OffchainCashWithdrawable { .. }
-            | AlpacaUsdc { .. }
-            | EthereumUsdc { .. }
-            | BaseWalletUsdc { .. }
-            | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => inventory.clone().apply_snapshot_event(&event, now),
+                OffchainEquity { positions, .. } => {
+                    let primary_chain = inventory.primary_chain();
+                    inventory.clone().apply_equity_snapshot(
+                        Venue::Hedging,
+                        primary_chain,
+                        positions.iter(),
+                        fetched_at,
+                        None,
+                        now,
+                    )
+                }
 
-            InflightEquity { .. } => {
-                if let Some((mints, redemptions)) = &filtered_inflight {
-                    inventory
-                        .clone()
-                        .apply_inflight_snapshot(mints, redemptions, fetched_at, now)
-                } else {
-                    Ok(inventory.clone())
+                // The reconcile arms validate busyness themselves under the
+                // write lock, so the generic apply path is the correct route
+                // here too. `OnchainUsdc` also routes through it (not a direct
+                // `update_usdc`) so the view's block-watermark bookkeeping for
+                // absorbed onchain fills has a single implementation.
+                OnchainUsdc { .. }
+                | OffchainEquityReconciled { .. }
+                | OffchainUsdReconciled { .. }
+                | OffchainUsd { .. }
+                | OffchainCashBuyingPower { .. }
+                | OffchainCashWithdrawable { .. }
+                | AlpacaUsdc { .. }
+                | EthereumUsdc { .. }
+                | BaseWalletUsdc { .. }
+                | BaseWalletUnwrappedEquity { .. }
+                | BaseWalletWrappedEquity { .. } => {
+                    inventory.clone().apply_snapshot_event(&event, now)
+                }
+
+                InflightEquity { .. } => {
+                    if let Some((mints, redemptions)) = &filtered_inflight {
+                        inventory.clone().apply_inflight_snapshot(
+                            mints,
+                            redemptions,
+                            fetched_at,
+                            now,
+                        )
+                    } else {
+                        Ok(inventory.clone())
+                    }
                 }
             }
         }?;
 
         *inventory = updated;
         drop(inventory);
+
+        if force_onchain_reconciliation {
+            match &event {
+                OnchainEquity {
+                    chain, balances, ..
+                } => {
+                    for symbol in balances.keys() {
+                        self.divergence_gate
+                            .resolve_onchain_equity_reconcile(*chain, symbol);
+                    }
+                }
+                OnchainUsdc { chain, .. } => {
+                    self.divergence_gate.resolve_onchain_cash_reconcile(*chain);
+                }
+                _ => {}
+            }
+        }
+        if resolve_offchain_reconciliation {
+            let OffchainEquityReconciled { symbol, .. } = &event else {
+                unreachable!("resolution flag is set only for offchain equity reconciliation");
+            };
+            self.divergence_gate
+                .resolve_offchain_equity_reconcile(symbol);
+        }
 
         trace!(target: "rebalance", "Applied inventory snapshot event");
 
@@ -2236,19 +2290,11 @@ impl RebalancingService {
         *inventory = inventory.reset_preserving_offchain_order_state();
 
         let updated = match &event {
-            OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
-                Inventory::force_on_snapshot(
-                    Venue::MarketMaking,
-                    *usdc_balance,
-                    recovery_reason.clone(),
-                ),
-                now,
-            ),
-
             // The reconcile events never reach here at runtime -- the early
             // return above drops them before this match. They are listed
             // only to keep the match exhaustive.
             OnchainEquity { .. }
+            | OnchainUsdc { .. }
             | OffchainEquity { .. }
             | OffchainEquityReconciled { .. }
             | OffchainUsdReconciled { .. }
@@ -2281,6 +2327,21 @@ impl RebalancingService {
         *inventory = updated;
         drop(inventory);
         drop(suppression_guard);
+
+        match &event {
+            OnchainEquity {
+                chain, balances, ..
+            } => {
+                for symbol in balances.keys() {
+                    self.divergence_gate
+                        .resolve_onchain_equity_reconcile(*chain, symbol);
+                }
+            }
+            OnchainUsdc { chain, .. } => {
+                self.divergence_gate.resolve_onchain_cash_reconcile(*chain);
+            }
+            _ => {}
+        }
 
         debug!(target: "rebalance", "Force-applied inventory snapshot after recovery");
 
@@ -2575,25 +2636,17 @@ impl RebalancingService {
                 let quantity: Float = (*amount).into();
                 let usdc_value = (*price_usdc * quantity)?;
 
-                // Each delta leg yields to a pinned onchain snapshot
-                // that provably already contains it: a vaultBalance2
-                // read at block N includes every fill at a block <= N
-                // (ADR 0018). The same reasoning covers a secondary
-                // chain's slot no snapshot has seeded yet (that
-                // chain's first poll has not landed): its first snapshot
-                // contains the fill, so the leg waits rather than
-                // debiting an empty slot or inventing one that holds
-                // only the delta. The primary chain is different: its
-                // unseeded slot is the normal cold state, the fill
-                // creates it and the primary's poll reconciles it
-                // shortly after. Checked and applied under one write
-                // lock so no snapshot can advance the watermark in
-                // between. A skipped leg is normal operation, not an
-                // error.
+                // Each delta leg yields to a pinned onchain snapshot that
+                // provably already contains it. An unseeded slot has no known
+                // base value, and an underflow proves local bookkeeping is no
+                // longer exact; both cases skip that leg and engage a
+                // persistent reconciliation gate. The next successful pinned
+                // poll is forced through aggregate deduplication and replaces
+                // the slot from authoritative chain state before rebalancing
+                // can resume.
                 let (primary_chain, equity_reconciled, usdc_reconciled) = {
                     let mut inventory = self.inventory.write().await;
                     let primary_chain = inventory.primary_chain();
-                    let on_primary = trade_id.chain == primary_chain;
                     let equity_slot_seeded =
                         inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
                     let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
@@ -2604,20 +2657,6 @@ impl RebalancingService {
                     );
                     let usdc_absorbed = inventory
                         .onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
-
-                    if !on_primary && (!equity_slot_seeded || !usdc_slot_seeded) {
-                        info!(
-                            target: "rebalance",
-                            %symbol,
-                            chain = %trade_id.chain,
-                            equity_slot_seeded,
-                            usdc_slot_seeded,
-                            "Skipping onchain fill delta leg(s) on a \
-                             secondary chain slot no onchain snapshot \
-                             has seeded yet; the chain's first snapshot \
-                             contains the fill"
-                        );
-                    }
 
                     if equity_absorbed || usdc_absorbed {
                         info!(
@@ -2631,77 +2670,94 @@ impl RebalancingService {
                         );
                     }
 
-                    let apply_equity_leg = (on_primary || equity_slot_seeded) && !equity_absorbed;
-                    let apply_usdc_leg = (on_primary || usdc_slot_seeded) && !usdc_absorbed;
+                    let mut apply_equity_leg = equity_slot_seeded && !equity_absorbed;
+                    let mut apply_usdc_leg = usdc_slot_seeded && !usdc_absorbed;
                     let requested_usdc = Usdc::new(usdc_value);
-                    let mut equity_reconciled = true;
-                    let mut usdc_reconciled = true;
+                    let mut equity_reconciled = equity_absorbed || equity_slot_seeded;
+                    let mut usdc_reconciled = usdc_absorbed || usdc_slot_seeded;
+
+                    if !equity_slot_seeded && !equity_absorbed {
+                        warn!(
+                            target: "rebalance",
+                            %symbol,
+                            chain = %trade_id.chain,
+                            ?block_number,
+                            "Onchain fill reached an uninitialized equity slot; \
+                             deferring the leg to an authoritative pinned snapshot"
+                        );
+                    }
+                    if !usdc_slot_seeded && !usdc_absorbed {
+                        warn!(
+                            target: "rebalance",
+                            %symbol,
+                            chain = %trade_id.chain,
+                            ?block_number,
+                            "Onchain fill reached an uninitialized cash slot; \
+                             deferring the leg to an authoritative pinned snapshot"
+                        );
+                    }
 
                     // A terminal transfer or a later wall-clock snapshot can
                     // reduce available inventory before this durable fill
-                    // event reaches the reactor. The block watermark cannot
-                    // prove absorption in that ordering, but rejecting the
-                    // fill leaves Position committed while aborting both
-                    // inventory legs. Consume the tracked remainder to zero
-                    // instead; the next block-pinned snapshot supplies the
-                    // exact authoritative balance. Do not schedule a rebalance
-                    // from the clamped leg before that reconciliation.
+                    // event reaches the reactor. Consume a known remainder to
+                    // zero, but never manufacture zero for an absent slot.
                     let equity_delta = if apply_equity_leg && equity_op == Operator::Remove {
-                        let available = inventory
-                            .onchain_equity_available_at(&symbol, trade_id.chain)
-                            .unwrap_or(FractionalShares::ZERO);
-                        if available.inner().lt(amount.inner())? {
-                            equity_reconciled = false;
-                            warn!(
-                                target: "rebalance",
-                                %symbol,
-                                chain = %trade_id.chain,
-                                ?block_number,
-                                requested = %amount,
-                                available = %available,
-                                "Onchain fill arrived after inventory had already \
-                                 moved below its equity delta; consuming the \
-                                 tracked remainder and deferring exact \
-                                 reconciliation to the next pinned snapshot"
-                            );
-                            available
-                        } else {
-                            *amount
+                        match inventory.onchain_equity_available_at(&symbol, trade_id.chain) {
+                            Some(available) if available.inner().lt(amount.inner())? => {
+                                equity_reconciled = false;
+                                warn!(
+                                    target: "rebalance",
+                                    %symbol,
+                                    chain = %trade_id.chain,
+                                    ?block_number,
+                                    requested = %amount,
+                                    available = %available,
+                                    "Onchain fill arrived after inventory had already \
+                                     moved below its equity delta; consuming the \
+                                     tracked remainder and deferring exact \
+                                     reconciliation to a pinned snapshot"
+                                );
+                                available
+                            }
+                            Some(_) => *amount,
+                            None => {
+                                apply_equity_leg = false;
+                                equity_reconciled = false;
+                                *amount
+                            }
                         }
                     } else {
                         *amount
                     };
                     let usdc_delta = if apply_usdc_leg && equity_op.inverse() == Operator::Remove {
-                        let available = inventory
-                            .onchain_usdc_available_at(trade_id.chain)
-                            .unwrap_or(Usdc::ZERO);
-                        if available.inner().lt(requested_usdc.inner())? {
-                            usdc_reconciled = false;
-                            warn!(
-                                target: "rebalance",
-                                %symbol,
-                                chain = %trade_id.chain,
-                                ?block_number,
-                                requested = %requested_usdc,
-                                available = %available,
-                                "Onchain fill arrived after inventory had already \
-                                 moved below its cash delta; consuming the \
-                                 tracked remainder and deferring exact \
-                                 reconciliation to the next pinned snapshot"
-                            );
-                            available
-                        } else {
-                            requested_usdc
+                        match inventory.onchain_usdc_available_at(trade_id.chain) {
+                            Some(available) if available.inner().lt(requested_usdc.inner())? => {
+                                usdc_reconciled = false;
+                                warn!(
+                                    target: "rebalance",
+                                    %symbol,
+                                    chain = %trade_id.chain,
+                                    ?block_number,
+                                    requested = %requested_usdc,
+                                    available = %available,
+                                    "Onchain fill arrived after inventory had already \
+                                     moved below its cash delta; consuming the \
+                                     tracked remainder and deferring exact \
+                                     reconciliation to a pinned snapshot"
+                                );
+                                available
+                            }
+                            Some(_) => requested_usdc,
+                            None => {
+                                apply_usdc_leg = false;
+                                usdc_reconciled = false;
+                                requested_usdc
+                            }
                         }
                     } else {
                         requested_usdc
                     };
 
-                    // Chain-addressed: inventory is not fungible
-                    // across chains, so a fill credits and debits the
-                    // slots of the chain it filled on. Routing it
-                    // through the venue-addressed writers would move
-                    // the primary chain's balances instead.
                     let mut updated = inventory.clone();
                     if apply_equity_leg {
                         updated = updated.update_equity_at(
@@ -2726,6 +2782,15 @@ impl RebalancingService {
                     drop(inventory);
                     (primary_chain, equity_reconciled, usdc_reconciled)
                 };
+
+                if !equity_reconciled {
+                    self.divergence_gate
+                        .request_onchain_equity_reconcile(trade_id.chain, &symbol);
+                }
+                if !usdc_reconciled {
+                    self.divergence_gate
+                        .request_onchain_cash_reconcile(trade_id.chain);
+                }
                 // Only the primary chain rebalances: a secondary is
                 // prefunded and holds its own inventory, so its fill
                 // must not schedule work against the primary chain's
@@ -3371,9 +3436,9 @@ impl RebalancingService {
     /// Erroring here would strand the movement unrecorded AND abort the rest
     /// of the reactor arm, leaving tracking and the in-progress guard latched
     /// until restart. Instead the durable event is treated as authoritative:
-    /// the residual inflight is zeroed (a no-op when already zero) so
-    /// `has_inflight()` clears, the immediate available bookkeeping is
-    /// skipped, and the next venue snapshot polls heal both sides.
+    /// the residual inflight is zeroed, both venue balances are gated, and
+    /// the next authoritative onchain and offchain snapshots are forced
+    /// through deduplication before rebalancing can resume.
     ///
     /// Only [`InventoryError::InsufficientInflight`] defers -- it is the shape
     /// recovery creates and only `Complete`/`Cancel` updates can produce it.
@@ -3419,6 +3484,13 @@ impl RebalancingService {
             Err(error) => return Err(error.into()),
         };
         drop(inventory);
+
+        if matches!(outcome, EquitySettlementOutcome::DeferredToSnapshot) {
+            self.divergence_gate
+                .request_onchain_equity_reconcile(chain, symbol);
+            self.divergence_gate
+                .request_offchain_equity_reconcile(symbol);
+        }
 
         Ok(outcome)
     }
@@ -13027,7 +13099,16 @@ mod tests {
         );
         drop(inventory);
 
-        assert!(logs_contain("no onchain snapshot has seeded"));
+        assert!(logs_contain("uninitialized equity slot"));
+        assert!(logs_contain("uninitialized cash slot"));
+        assert!(
+            trigger.divergence_gate().is_engaged(&symbol),
+            "the unsnapshotted equity slot must remain gated until a pinned poll"
+        );
+        assert!(
+            trigger.divergence_gate().is_cash_engaged(),
+            "the unsnapshotted cash slot must remain gated until a pinned poll"
+        );
         assert_eq!(count_pending_equity_check_jobs(&trigger).await, 0);
         assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 0);
     }
@@ -13211,7 +13292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn onchain_fill_underflow_consumes_remainder_and_defers_to_snapshot() {
+    async fn onchain_fill_underflow_gates_until_forced_pinned_snapshot() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), FractionalShares::ZERO, shares(50))
@@ -13273,6 +13354,178 @@ mod tests {
             "the independent cash leg still applies while equity waits for a snapshot"
         );
         drop(inventory);
+
+        assert!(
+            trigger.divergence_gate().is_engaged(&symbol),
+            "the acknowledged intermediate balance must gate equity rebalancing"
+        );
+        assert!(
+            !trigger.divergence_gate().is_cash_engaged(),
+            "the independent additive cash leg remained exact"
+        );
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            trigger.divergence_gate().is_engaged(&symbol),
+            "an unrelated venue snapshot must not clear the onchain repair gate"
+        );
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(7))]),
+                fetched_at: Utc::now(),
+                block_number: Some(102),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(7)),
+            "the next pinned snapshot must replace the intermediate balance"
+        );
+        assert!(
+            !trigger.divergence_gate().is_engaged(&symbol),
+            "the gate clears only after authoritative onchain reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn onchain_cash_underflow_gates_until_forced_pinned_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(Usdc::ZERO, usdc(10000));
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor);
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: Usdc::ZERO,
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(10), Direction::Buy, Some(101)),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.divergence_gate().is_cash_engaged(),
+            "the acknowledged intermediate cash balance must gate USDC rebalancing"
+        );
+        assert!(
+            !trigger.divergence_gate().is_engaged(&symbol),
+            "the independent additive equity leg remained exact"
+        );
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(25),
+                fetched_at: Utc::now(),
+                block_number: Some(102),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::MarketMaking),
+            Some(usdc(25))
+        );
+        assert!(
+            !trigger.divergence_gate().is_cash_engaged(),
+            "the cash gate clears only after authoritative onchain reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn equity_settlement_underflow_gates_both_authoritative_snapshots() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory(InventoryView::default().with_equity(
+            symbol.clone(),
+            shares(80),
+            shares(20),
+        ))
+        .await;
+
+        let outcome = trigger
+            .apply_equity_update_or_defer(
+                &symbol,
+                Chain::Base,
+                Venue::Hedging,
+                RebalancingService::cancel_equity_transfer_update(Venue::Hedging, shares(10)),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            EquitySettlementOutcome::DeferredToSnapshot
+        ));
+        let gate = trigger.divergence_gate();
+        assert!(gate.is_engaged(&symbol));
+        assert!(gate.has_pending_onchain_equity_reconcile(Chain::Base));
+        assert_eq!(
+            gate.pending_offchain_equity_reconciles(),
+            vec![symbol],
+            "a skipped settlement update must force both venue snapshots"
+        );
     }
 
     #[tokio::test]

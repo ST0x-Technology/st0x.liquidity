@@ -43,6 +43,7 @@ use crate::offchain::order::{
     push_poll_job_if_absent,
 };
 use crate::position::{AnchorDisposition, Position, PositionCommand, PositionError};
+use crate::position_check::{CheckPositions, CheckPositionsJobQueue};
 use crate::trading::offchain::close_flatten::{CloseFlattenCrossRamp, CloseFlattenPolicy};
 use crate::trading::onchain::trade_accountant::{
     ClaimedHedgeOrderKindCause, DeadLetterReason, ErrorScope, SymbolScopedReason,
@@ -268,6 +269,11 @@ pub(crate) struct HedgeCtx {
     /// budget. Previously missing -- `HedgeCtx` held `poll_status_queue` for
     /// `recover_pending_poll_status` but no handle to its own job type.
     pub(crate) hedge_queue: HedgeJobQueue,
+    /// One-shot position recalculations used after a queued hedge is rejected
+    /// as stale or loses the Position claim to an equity transfer. The
+    /// recalculation repeats broker preflight instead of reusing this job's
+    /// stale direction, quantity, or reservation.
+    pub(crate) check_positions_queue: CheckPositionsJobQueue,
     /// Per-symbol asset config. Gates the extended-hours limit path: only a
     /// symbol with `extended_hours_counter_trading = enabled` may place a limit
     /// order during an Extended session. A disabled symbol skips (the
@@ -575,7 +581,7 @@ const TRANSIENT_RESCHEDULE_LIMIT: u32 = 3;
 const TRANSIENT_RESCHEDULE_BASE: Duration = Duration::from_secs(1);
 
 /// Keeps a hedge live while an equity transfer owns the Position claim.
-const EQUITY_TRANSFER_REDRIVE_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const EQUITY_TRANSFER_REDRIVE_DELAY: Duration = Duration::from_secs(1);
 
 /// Keeps a stalled alert channel from serialising every other symbol behind a
 /// dead-letter on the concurrency-one hedge worker.
@@ -1729,11 +1735,10 @@ impl PlaceHedge {
         //   or the order sits in Submitted until the next bot restart.
         // - ThresholdNotMet: position moved below threshold since the monitor
         //   scanned -- stale job, no action needed.
-        // - EquityTransferPending: a transfer won the Position claim first;
-        //   enqueue a delayed successor. The Position aggregate rejects it as
-        //   stale after release if intervening fills changed the required hedge.
-        // - StaleHedgeRequest: enqueue a fresh direction and safe quantity from
-        //   the live Position state returned by the aggregate.
+        // - EquityTransferPending / StaleHedgeRequest: discard this job and
+        //   enqueue a delayed one-shot position calculation. The fresh scan
+        //   re-runs readiness plus the complete broker preflight before it
+        //   creates any replacement hedge.
         //
         // Everything else (lifecycle bugs, aggregate conflicts, DB errors)
         // propagates so backon retries the job.
@@ -1784,15 +1789,18 @@ impl PlaceHedge {
             Err(AggregateError::UserError(LifecycleError::Apply(
                 ref error @ PositionError::EquityTransferPending { .. },
             ))) => {
-                ctx.hedge_queue
+                ctx.check_positions_queue
                     .clone()
-                    .push_with_delay(self.clone(), EQUITY_TRANSFER_REDRIVE_DELAY)
+                    .push_with_delay(
+                        CheckPositions::for_symbol(self.symbol.clone()),
+                        EQUITY_TRANSFER_REDRIVE_DELAY,
+                    )
                     .await?;
                 info!(
                     target: "hedge",
                     symbol = %self.symbol, %error,
                     retry_delay_secs = EQUITY_TRANSFER_REDRIVE_DELAY.as_secs(),
-                    "Equity transfer owns the position; scheduled hedge retry"
+                    "Equity transfer owns the position; scheduled fresh hedge preflight"
                 );
                 return Ok(());
             }
@@ -1805,20 +1813,12 @@ impl PlaceHedge {
                     live_shares,
                 },
             ))) => {
-                let shares = if self.shares < live_shares {
-                    self.shares
-                } else {
-                    live_shares
-                };
-                let successor = Self {
-                    direction: live_direction,
-                    shares,
-                    offchain_order_id: OffchainOrderId::new(),
-                    ..self.clone()
-                };
-                ctx.hedge_queue
+                ctx.check_positions_queue
                     .clone()
-                    .push_with_delay(successor, EQUITY_TRANSFER_REDRIVE_DELAY)
+                    .push_with_delay(
+                        CheckPositions::for_symbol(self.symbol.clone()),
+                        EQUITY_TRANSFER_REDRIVE_DELAY,
+                    )
                     .await?;
                 info!(
                     target: "hedge",
@@ -1826,9 +1826,9 @@ impl PlaceHedge {
                     ?requested_direction,
                     %requested_shares,
                     ?live_direction,
-                    %shares,
+                    %live_shares,
                     retry_delay_secs = EQUITY_TRANSFER_REDRIVE_DELAY.as_secs(),
-                    "Position changed while hedge was queued; scheduled recalculated hedge"
+                    "Position changed while hedge was queued; scheduled fresh hedge preflight"
                 );
                 return Ok(());
             }
@@ -2626,6 +2626,7 @@ mod tests {
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: HedgeJobQueue::new(&apalis_pool),
+            check_positions_queue: CheckPositionsJobQueue::new(&apalis_pool),
             // The placer doubles as the session source; the default stubs
             // report a Regular session, so these ctxs exercise the regular
             // market-order path. AAPL is enabled for extended hours so the
@@ -6073,7 +6074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfer_reservation_redrive_recalculates_reversed_position() {
+    async fn transfer_and_stale_redrives_enqueue_fresh_position_checks() {
         let TestInfra {
             ctx,
             position_projection,
@@ -6132,19 +6133,17 @@ mod tests {
             position.equity_transfer_reservation.unwrap().id,
             reservation_id
         );
-
-        let (successor_row_id, payload): (String, Vec<u8>) = sqlx_apalis::query_as(
+        let (recheck_row_id, payload): (String, Vec<u8>) = sqlx_apalis::query_as(
             "SELECT id, job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
         )
-        .bind(std::any::type_name::<PlaceHedge>())
+        .bind(std::any::type_name::<CheckPositions>())
         .fetch_one(&apalis_pool)
         .await
-        .expect("transfer rejection must enqueue a delayed hedge successor");
-        let stale_successor: PlaceHedge =
-            serde_json::from_slice(&payload).expect("deserialize delayed hedge successor");
-        assert_eq!(stale_successor.offchain_order_id, job.offchain_order_id);
+        .expect("transfer rejection must enqueue a delayed position recalculation");
+        serde_json::from_slice::<CheckPositions>(&payload)
+            .expect("deserialize delayed position recalculation");
         sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
-            .bind(successor_row_id)
+            .bind(recheck_row_id)
             .execute(&apalis_pool)
             .await
             .unwrap();
@@ -6163,7 +6162,8 @@ mod tests {
             )
             .await
             .unwrap();
-        stale_successor.perform(&ctx).await.unwrap();
+        job.perform(&ctx).await.unwrap();
+
         assert!(
             offchain_order_projection
                 .load_all()
@@ -6172,35 +6172,26 @@ mod tests {
                 .is_empty(),
             "the stale Sell must not increase the reversed short position"
         );
-
         let payload: Vec<u8> = sqlx_apalis::query_scalar(
             "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
         )
-        .bind(std::any::type_name::<PlaceHedge>())
+        .bind(std::any::type_name::<CheckPositions>())
         .fetch_one(&apalis_pool)
         .await
-        .expect("stale hedge must enqueue a recalculated successor");
-        let recalculated: PlaceHedge =
-            serde_json::from_slice(&payload).expect("deserialize recalculated hedge successor");
-        assert_eq!(recalculated.direction, Direction::Buy);
+        .expect("stale hedge must enqueue a fresh position recalculation");
+        serde_json::from_slice::<CheckPositions>(&payload)
+            .expect("deserialize stale position recalculation");
         assert_eq!(
-            recalculated.shares,
-            Positive::new(FractionalShares::new(float!(3.0))).unwrap()
+            sqlx_apalis::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+            )
+            .bind(std::any::type_name::<PlaceHedge>())
+            .fetch_one(&apalis_pool)
+            .await
+            .unwrap(),
+            0,
+            "redrives must not reuse stale PlaceHedge broker preflight"
         );
-        assert_ne!(
-            recalculated.offchain_order_id,
-            stale_successor.offchain_order_id
-        );
-
-        recalculated.perform(&ctx).await.unwrap();
-
-        assert_eq!(offchain_order_projection.load_all().await.unwrap().len(), 1);
-        let position = position_projection.load(&symbol).await.unwrap().unwrap();
-        assert_eq!(
-            position.pending_offchain_order_id,
-            Some(recalculated.offchain_order_id)
-        );
-        assert_eq!(position.equity_transfer_reservation, None);
     }
 
     #[tokio::test]
@@ -6787,6 +6778,7 @@ mod tests {
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: HedgeJobQueue::new(&apalis_pool),
+            check_positions_queue: CheckPositionsJobQueue::new(&apalis_pool),
             order_placer: placer,
             assets: extended_hours_assets("AAPL", true),
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),
@@ -8314,6 +8306,7 @@ mod tests {
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: HedgeJobQueue::new(&apalis_pool),
+            check_positions_queue: CheckPositionsJobQueue::new(&apalis_pool),
             order_placer: placer,
             assets,
             close_flatten_policy: CloseFlattenPolicy::from_secs(900).unwrap(),

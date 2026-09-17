@@ -66,6 +66,34 @@ impl FromStr for InventorySnapshotId {
     }
 }
 
+fn equity_events(
+    chain: Chain,
+    balances: BTreeMap<Symbol, FractionalShares>,
+    fetched_at: DateTime<Utc>,
+    block_number: Option<u64>,
+) -> Vec<InventorySnapshotEvent> {
+    vec![InventorySnapshotEvent::OnchainEquity {
+        chain,
+        balances,
+        fetched_at,
+        block_number,
+    }]
+}
+
+fn usdc_events(
+    chain: Chain,
+    usdc_balance: Usdc,
+    fetched_at: DateTime<Utc>,
+    block_number: Option<u64>,
+) -> Vec<InventorySnapshotEvent> {
+    vec![InventorySnapshotEvent::OnchainUsdc {
+        chain,
+        usdc_balance,
+        fetched_at,
+        block_number,
+    }]
+}
+
 /// State tracking the latest inventory snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InventorySnapshot {
@@ -197,6 +225,12 @@ impl EventSourced for InventorySnapshot {
                 balances,
                 block_number,
                 fetched_at,
+            }
+            | ReconcileOnchainEquity {
+                chain,
+                balances,
+                block_number,
+                fetched_at,
             } => InventorySnapshotEvent::OnchainEquity {
                 chain,
                 balances,
@@ -204,6 +238,12 @@ impl EventSourced for InventorySnapshot {
                 block_number,
             },
             OnchainUsdc {
+                chain,
+                usdc_balance,
+                block_number,
+                fetched_at,
+            }
+            | ReconcileOnchainUsdc {
                 chain,
                 usdc_balance,
                 block_number,
@@ -342,6 +382,12 @@ impl EventSourced for InventorySnapshot {
                     block_number,
                 }])
             }
+            ReconcileOnchainEquity {
+                chain,
+                balances,
+                block_number,
+                fetched_at,
+            } => Ok(equity_events(chain, balances, fetched_at, block_number)),
             OnchainUsdc {
                 chain,
                 usdc_balance,
@@ -358,6 +404,12 @@ impl EventSourced for InventorySnapshot {
                     block_number,
                 }])
             }
+            ReconcileOnchainUsdc {
+                chain,
+                usdc_balance,
+                block_number,
+                fetched_at,
+            } => Ok(usdc_events(chain, usdc_balance, fetched_at, block_number)),
             OffchainEquity {
                 positions,
                 fetched_at,
@@ -808,12 +860,28 @@ pub(crate) enum InventorySnapshotCommand {
         /// balances already contain.
         block_number: Option<u64>,
     },
+    /// Force record a complete pinned onchain equity snapshot after delta
+    /// bookkeeping was deferred. Always emits, bypassing value deduplication.
+    ReconcileOnchainEquity {
+        chain: Chain,
+        balances: BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+    },
     OnchainUsdc {
         chain: Chain,
         usdc_balance: Usdc,
         /// Time the onchain cycle began selecting its pinned block.
         fetched_at: DateTime<Utc>,
         /// Block the poller pinned this cycle's `vaultBalance2` reads to.
+        block_number: Option<u64>,
+    },
+    /// Force record a pinned onchain cash snapshot after delta bookkeeping
+    /// was deferred. Always emits, bypassing value deduplication.
+    ReconcileOnchainUsdc {
+        chain: Chain,
+        usdc_balance: Usdc,
+        fetched_at: DateTime<Utc>,
         block_number: Option<u64>,
     },
     OffchainEquity {
@@ -2657,6 +2725,67 @@ mod tests {
             events.len(),
             0,
             "an unchanged balance must dedupe regardless of the newer block"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_onchain_snapshots_emit_even_when_values_are_unchanged() {
+        let symbol = test_symbol("AAPL");
+        let balances = BTreeMap::from([(symbol, test_shares(10))]);
+        let stored_at = Utc::now();
+        let reconciled_at = stored_at + chrono::Duration::seconds(60);
+
+        let equity_events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: balances.clone(),
+                fetched_at: stored_at,
+                block_number: Some(100),
+            }])
+            .when(InventorySnapshotCommand::ReconcileOnchainEquity {
+                chain: Chain::Base,
+                balances,
+                fetched_at: reconciled_at,
+                block_number: Some(200),
+            })
+            .await
+            .events();
+        assert!(
+            matches!(
+                equity_events.as_slice(),
+                [InventorySnapshotEvent::OnchainEquity {
+                    block_number: Some(200),
+                    ..
+                }]
+            ),
+            "forced equity reconciliation must bypass unchanged-value deduplication"
+        );
+
+        let usdc_balance = Usdc::from_str("5000").unwrap();
+        let usdc_events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance,
+                fetched_at: stored_at,
+                block_number: Some(100),
+            }])
+            .when(InventorySnapshotCommand::ReconcileOnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance,
+                fetched_at: reconciled_at,
+                block_number: Some(200),
+            })
+            .await
+            .events();
+        assert!(
+            matches!(
+                usdc_events.as_slice(),
+                [InventorySnapshotEvent::OnchainUsdc {
+                    block_number: Some(200),
+                    ..
+                }]
+            ),
+            "forced cash reconciliation must bypass unchanged-value deduplication"
         );
     }
 
