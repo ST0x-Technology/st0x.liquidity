@@ -868,11 +868,14 @@ impl EventSourced for Position {
                 }])
             }
 
-            UpdateThreshold { threshold } => Ok(vec![PositionEvent::ThresholdUpdated {
-                old_threshold: self.threshold,
-                new_threshold: threshold,
-                updated_at: Utc::now(),
-            }]),
+            UpdateThreshold { threshold } => {
+                self.validate_operator_mutation_allowed()?;
+                Ok(vec![PositionEvent::ThresholdUpdated {
+                    old_threshold: self.threshold,
+                    new_threshold: threshold,
+                    updated_at: Utc::now(),
+                }])
+            }
 
             ManuallyAdjustPosition {
                 target_net,
@@ -881,6 +884,8 @@ impl EventSourced for Position {
                 price_usdc,
                 ..
             } => {
+                self.validate_operator_mutation_allowed()?;
+
                 if let Some(pending) = self.pending_offchain_order_id {
                     return Err(PositionError::ManualAdjustmentBlockedByPendingExecution {
                         offchain_order_id: pending,
@@ -1099,6 +1104,20 @@ impl Position {
     fn reservation_after_position_change(&self) -> Option<EquityTransferReservation> {
         self.equity_transfer_reservation
             .filter(|reservation| reservation.status == EquityTransferReservationStatus::Confirmed)
+    }
+
+    fn validate_operator_mutation_allowed(&self) -> Result<(), PositionError> {
+        if let Some(EquityTransferReservation {
+            id: reservation_id,
+            status: EquityTransferReservationStatus::Confirmed,
+        }) = self.equity_transfer_reservation
+        {
+            return Err(
+                PositionError::OperatorMutationBlockedByConfirmedEquityTransfer { reservation_id },
+            );
+        }
+
+        Ok(())
     }
 
     fn evolve_equity_transfer_reservation(&self, event: &PositionEvent) -> Option<Self> {
@@ -1581,6 +1600,13 @@ pub enum PositionError {
     EquityTransferReservationMismatch {
         expected: EquityTransferReservationId,
         actual: EquityTransferReservationId,
+    },
+    #[error(
+        "Cannot manually adjust the position or update its threshold while confirmed equity \
+         transfer reservation {reservation_id} owns this symbol"
+    )]
+    OperatorMutationBlockedByConfirmedEquityTransfer {
+        reservation_id: EquityTransferReservationId,
     },
     #[error(
         "Cannot acknowledge onchain fill: trade {trade_id} \
@@ -3757,6 +3783,86 @@ mod tests {
         let position = projection.load(&symbol).await.unwrap().unwrap();
         assert_eq!(position.threshold, new_threshold);
         assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn confirmed_transfer_reservation_blocks_operator_mutations() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+
+        let adjustment = store
+            .send(
+                &symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: FractionalShares::new(float!(2)),
+                    reason: "operator correction".to_string(),
+                    threshold,
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            adjustment,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::OperatorMutationBlockedByConfirmedEquityTransfer {
+                    reservation_id: actual
+                }
+            ))) if actual == reservation_id
+        ));
+
+        let threshold_update = store
+            .send(
+                &symbol,
+                PositionCommand::UpdateThreshold {
+                    threshold: ExecutionThreshold::shares(
+                        Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                    ),
+                },
+            )
+            .await;
+        assert!(matches!(
+            threshold_update,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::OperatorMutationBlockedByConfirmedEquityTransfer {
+                    reservation_id: actual
+                }
+            ))) if actual == reservation_id
+        ));
+
+        let position = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.net, FractionalShares::ZERO);
+        assert_eq!(position.threshold, threshold);
+        assert_eq!(
+            position.equity_transfer_reservation,
+            Some(EquityTransferReservation {
+                id: reservation_id,
+                status: EquityTransferReservationStatus::Confirmed,
+            })
+        );
     }
 
     #[tokio::test]
