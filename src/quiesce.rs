@@ -295,6 +295,30 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_waiting_pause_releases_the_flag_and_serializer() {
+        let (control, gate) = quiesce(TEST_TIMEOUT);
+        let executing = gate.enter().await;
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(10), control.pause()).await;
+        assert!(
+            cancelled.is_err(),
+            "the outer timeout must cancel a pause waiting for an in-flight execution"
+        );
+
+        drop(executing);
+        drop(
+            gate.try_enter()
+                .expect("cancelling a pause must lower the gate flag"),
+        );
+
+        let guard = tokio::time::timeout(Duration::from_millis(10), control.pause())
+            .await
+            .expect("cancelling a pause must release the serialization permit")
+            .expect("an idle gate must quiesce");
+        drop(guard);
+    }
+
     // The join handle holds the second pause guard as its output and is used
     // twice (the `is_finished` poll and the `await`), which the nursery lint
     // misreads as a single-use temporary.
