@@ -1033,10 +1033,11 @@ impl RebalancingService {
             .set_pending_offchain_orders(pending_orders);
         Ok(())
     }
-    /// Reconciles durable Position reservations with durable live transfer
-    /// jobs after restart. Unconfirmed claims and confirmed claims with no
-    /// owning job are crash orphans and are released; live jobs restore or
-    /// confirm their exact reservation before workers start.
+    /// Reconciles durable Position reservations with every transfer aggregate
+    /// startup will continue, whether through a transfer-job row, a recovery
+    /// handoff, or a generic resume job. Unowned claims are crash orphans and
+    /// are released; active owners restore their exact reservation before
+    /// workers start.
     pub(crate) async fn recover_equity_transfer_reservations(
         &self,
         active: &HashSet<(Symbol, EquityTransferReservationId)>,
