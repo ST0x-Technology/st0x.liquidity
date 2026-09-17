@@ -1482,15 +1482,15 @@ impl Position {
     /// - `shares`: Full fractional amount, optionally
     ///   capped by `shares_limit`
     ///
-    /// Returns `Ok(None)` if threshold is not met or no
-    /// price available for dollar-value threshold.
+    /// Returns `Ok(None)` if an offchain order or equity transfer is pending,
+    /// the threshold is not met, or no price is available for a dollar-value threshold.
     ///
     /// Returns `Err` on arithmetic overflow.
     pub fn is_ready_for_execution(
         &self,
         shares_limit: Option<Positive<FractionalShares>>,
     ) -> Result<Option<(Direction, FractionalShares)>, PositionError> {
-        if self.pending_offchain_order_id.is_some() {
+        if self.pending_offchain_order_id.is_some() || self.equity_transfer_reservation.is_some() {
             return Ok(None);
         }
 

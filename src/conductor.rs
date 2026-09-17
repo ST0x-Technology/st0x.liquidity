@@ -11745,6 +11745,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extended_hours_fill_defers_hedge_during_equity_transfer_reservation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (mut cqrs, assets) = trade_processing_cqrs_with_assets(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+            extended_hours_assets(&symbol),
+        );
+        cqrs.hedging = hedging_for(&assets, OperationMode::Enabled);
+        let reservation_id = EquityTransferReservationId::generate();
+        cqrs.position
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        cqrs.position
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(10)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 1_000_000,
+                cash_buying_power_cents: Some(1_000_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+
+        let result = process_queued_trade(
+            &executor,
+            &make_trade_event(78),
+            test_trade_with_amount_and_direction(float!(5), 78, Direction::Buy),
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, None);
+        assert_eq!(
+            executor.market_session_status_call_count(),
+            0,
+            "a transfer reservation must stop readiness before broker preflight"
+        );
+        assert!(
+            offchain_order_projection
+                .load_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the immediate fill path must not place an offchain order"
+        );
+        let hedge_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<
+                crate::trading::offchain::hedge::PlaceHedge,
+            >())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            hedge_jobs, 0,
+            "the immediate fill path must not enqueue a stale hedge"
+        );
+        let position = cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            position.equity_transfer_reservation.map(|claim| claim.id),
+            Some(reservation_id)
+        );
+        assert!(
+            position.net.inner().eq(float!(5)).unwrap(),
+            "the fill must remain accumulated for recalculation after release"
+        );
+    }
+
+    #[tokio::test]
     async fn extended_hours_trade_preserves_requested_quantity_in_immediate_hedge_job() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) =

@@ -25,8 +25,8 @@ pub struct ExecutionCtx {
 /// Loads the position from the CQRS view and checks if the net exposure
 /// exceeds the configured threshold. Also verifies the market is open
 /// and the asset is enabled. The Position aggregate already tracks pending
-/// executions -- `is_ready_for_execution` returns `None` if one is already
-/// in flight.
+/// executions and equity transfers -- `is_ready_for_execution` returns `None`
+/// while either owns the symbol.
 pub async fn check_execution_readiness<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,
