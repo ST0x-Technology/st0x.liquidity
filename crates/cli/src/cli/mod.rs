@@ -958,8 +958,8 @@ pub enum ViewCommand {
     ///
     /// Use as an escape hatch when a view becomes corrupted (e.g., due to lost
     /// updates from optimistic lock conflicts). Deletes the view row(s) and
-    /// replays all events to reconstruct correct state. Operates directly on the
-    /// local CQRS state; does not require the running bot.
+    /// replays all events to reconstruct correct state. Operates directly on
+    /// local CQRS state, outside the live projection gate; stop the bot first.
     Rebuild {
         /// Aggregate type to rebuild (position, offchain-order, vault-registry)
         #[arg(short = 'a', long = "aggregate")]

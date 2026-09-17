@@ -163,6 +163,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     /// capture job resolves each wrapped balance through the service of the
     /// chain that balance sits on.
     pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
+    pub(crate) projection_maintenance: Arc<super::projection_pause::ProjectionMaintenance>,
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) startup_token: StartupToken,
     pub(crate) supervisor_startup: SupervisorStartupTokens,
@@ -422,6 +423,7 @@ where
     let inventory_monitor = InventoryMonitor {
         poller: polling_service,
         interval: std::time::Duration::from_secs(context.ctx.inventory_poll_interval_secs),
+        projection_maintenance: context.projection_maintenance,
     };
 
     // Build the gas monitors before `context.provider` is consumed by the

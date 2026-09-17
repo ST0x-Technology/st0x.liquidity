@@ -1339,14 +1339,6 @@ pub(crate) struct RecoveryHandle {
     /// to the durable outcome. A standalone store would bypass the reactor and
     /// leave the running bot latched with `guardHeld: false` reported.
     pub(crate) usdc_store: Arc<Store<UsdcRebalance>>,
-    /// Projection-maintenance pause control (RAI-2436): a rebuild route quiesces
-    /// every projection writer through it before it deletes and replays a
-    /// materialized view. Consumed by the `rebuild_materialized_view` route in
-    /// `rai-2248-view-cctp-recovery`, restacked on top of this branch; unread
-    /// here until that route lands.
-    #[allow(dead_code)]
-    pub(crate) projection_maintenance:
-        Arc<crate::conductor::projection_pause::ProjectionMaintenance>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
@@ -1493,6 +1485,7 @@ async fn resume_transfers(
                 }),
             )
         })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let mints_attempted = mints.len();
     let redemptions_attempted = redemptions.len();
@@ -1595,6 +1588,7 @@ async fn fail_transfer(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     crate::operator::equity_transfer::fail_transfer_in_process(
         &handle.mint_store,
@@ -1701,6 +1695,7 @@ async fn recheck_transfer(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let outcome = match kind {
         TransferKind::EquityMint => {
@@ -2222,6 +2217,7 @@ async fn reconcile_usdc_transfer(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     reconcile_stuck_usdc_transfer(&handle.usdc_store, &id, reason).await
 }
@@ -2297,6 +2293,7 @@ async fn clear_pending_usdc_burn(
             }),
         ));
     }
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
         .build(())
@@ -2424,6 +2421,7 @@ async fn fail_usdc_transfer(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, &id, None).await?;
 
@@ -2531,10 +2529,10 @@ struct RebuildViewResponse {
 }
 
 /// Rebuilds a materialized view or read model by deleting its rows and
-/// replaying the event log, the escape hatch for a view corrupted by a lost
-/// update. Store only: no service, lock, or driver pause is involved, and a
-/// live write racing the rebuild lands in the same lost-update class the next
-/// catch-up repairs (see `view_rebuild`).
+/// replaying the event log, the escape hatch for a corrupted view. Available
+/// only after startup completes. The projection-maintenance guard first drains
+/// live apalis jobs, inventory polling, and direct HTTP writers, then excludes
+/// new writers through the full delete/replay window.
 ///
 /// Mirrors `stox view rebuild`; the `{view}` segment is the CLI's
 /// `--aggregate` value (`position`, `offchain-order`, `vault-registry`,
@@ -2566,6 +2564,28 @@ async fn rebuild_materialized_view(
             ));
         }
     };
+    if !state.health.is_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "View rebuild is unavailable until startup completes".to_string(),
+            }),
+        ));
+    }
+
+    let _projection_paused = state
+        .projection_maintenance
+        .pause()
+        .await
+        .map_err(|error| {
+            warn!(%error, "Projection writers did not quiesce for view rebuild");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Projection writes are still in flight; retry the rebuild".to_string(),
+                }),
+            )
+        })?;
 
     let rebuilt = rebuild_view(&state.pool, view, scope)
         .await
@@ -2824,6 +2844,7 @@ async fn reconcile_equity_transfer(
                     }),
                 )
             })?;
+            let _projection_write = state.projection_maintenance.enter().await;
             let entity = load_entity::<TokenizedEquityMint>(&state.pool, &mint_id)
                 .await
                 .map_err(ops_store_error)?
@@ -2864,6 +2885,7 @@ async fn reconcile_equity_transfer(
                     }),
                 )
             })?;
+            let _projection_write = state.projection_maintenance.enter().await;
             let entity = load_entity::<EquityRedemption>(&state.pool, &redemption_id)
                 .await
                 .map_err(ops_store_error)?
@@ -2988,6 +3010,7 @@ async fn release_position_hedge(
 ) -> Result<Json<ReleaseHedgeResponse>, (StatusCode, Json<ErrorResponse>)> {
     let symbol = Symbol::new(&symbol).map_err(ops_precondition_error)?;
     let order_id = OffchainOrderId::from_str(&request.order_id).map_err(ops_precondition_error)?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let outcome = release_pending_offchain_order(&state.pool, &symbol, order_id, &request.reason)
         .await
@@ -3042,6 +3065,7 @@ async fn set_position_exposure(
         })
         .transpose()?;
     let threshold = state.ctx.execution_threshold;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let previous_net = set_position(
         &state.pool,
@@ -3242,6 +3266,7 @@ async fn process_transaction(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     // A hung RPC endpoint that accepts the connection but never responds would
     // otherwise park this request forever (RAI-2218), so bound the transport
@@ -3354,6 +3379,7 @@ async fn set_portfolio_snapshot_mark(
         source: request.source,
         reason: request.reason,
     };
+    let _projection_write = state.projection_maintenance.enter().await;
     let formatted_mark = set_equity_mark(&state.pool, &state.ctx, &correction)
         .await
         .map_err(ops_operator_error)?
@@ -3685,6 +3711,9 @@ mod tests {
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+            projection_maintenance: Arc::new(
+                crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
+            ),
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
             health: crate::startup::HealthGate::default(),
@@ -7758,9 +7787,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_view_is_unavailable_until_startup_completes() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        let response = rebuild_materialized_view(
+            State(state),
+            Path("position".to_string()),
+            Json(RebuildViewRequest {
+                id: Some("AAPL".to_string()),
+                all: false,
+            }),
+        )
+        .await;
+
+        let Err((status, Json(error))) = response else {
+            panic!("a live rebuild must wait for startup");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.error.contains("startup completes"), "{}", error.error);
+    }
+
+    /// Deterministic reproduction of the lost-update window: an actual
+    /// `Store::send` owns a writer slot before the rebuild starts. The route
+    /// must wait, then replay the event the writer committed before releasing
+    /// its slot.
+    #[tokio::test]
+    async fn rebuild_waits_for_an_in_flight_projection_write() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+        let symbol: Symbol = "AAPL".parse().unwrap();
+        seed_position_pnl_fill(&state.pool, &symbol).await;
+
+        let maintenance = Arc::clone(&state.projection_maintenance);
+        let writer_maintenance = Arc::clone(&maintenance);
+        let writer_pool = state.pool.clone();
+        let writer_symbol = symbol.clone();
+        let threshold = state.ctx.execution_threshold;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let _projection_write = writer_maintenance.enter().await;
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            set_position(
+                &writer_pool,
+                &writer_symbol,
+                FractionalShares::new(float!(2)),
+                "concurrent operator correction",
+                threshold,
+                Some(float!(100)),
+            )
+            .await
+            .unwrap();
+        });
+        entered_rx.await.unwrap();
+
+        let rebuild_state = state.clone();
+        let rebuild = tokio::spawn(async move {
+            rebuild_materialized_view(
+                State(rebuild_state),
+                Path("position".to_string()),
+                Json(RebuildViewRequest {
+                    id: Some("AAPL".to_string()),
+                    all: false,
+                }),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !maintenance.is_paused() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the rebuild must request the projection pause");
+        assert!(
+            !rebuild.is_finished(),
+            "the rebuild must wait for the in-flight writer"
+        );
+
+        release_tx.send(()).unwrap();
+        writer.await.unwrap();
+        let response = rebuild.await.unwrap();
+        assert!(
+            response.is_ok(),
+            "the rebuild must run after the writer drains"
+        );
+
+        let (net_position,): (String,) =
+            sqlx::query_as("SELECT net_position FROM position_view WHERE view_id = ?1")
+                .bind(symbol.to_string())
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            net_position,
+            FractionalShares::new(float!(2)).to_string(),
+            "replay must include the event committed by the drained writer"
+        );
+    }
+
+    #[tokio::test]
     async fn rebuild_view_replays_one_position_from_its_events() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
+        state.health.set_ready();
         let symbol: Symbol = "AAPL".parse().unwrap();
         seed_position_pnl_fill(&state.pool, &symbol).await;
         // Corrupt the view so the rebuild is observable: an empty payload the
@@ -7801,6 +7933,7 @@ mod tests {
     async fn rebuild_view_reports_the_replay_count_for_a_read_model() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
+        state.health.set_ready();
 
         let resp = rebuild_materialized_view(
             State(state.clone()),
@@ -7825,6 +7958,7 @@ mod tests {
     async fn rebuild_view_refuses_a_single_id_for_a_read_model() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
+        state.health.set_ready();
 
         let resp = rebuild_materialized_view(
             State(state.clone()),
@@ -8512,6 +8646,36 @@ mod tests {
             serde_json::to_value(response).unwrap(),
             serde_json::json!({ "symbol": "MSTR", "previous_net": "0", "target_net": "5" })
         );
+    }
+
+    #[tokio::test]
+    async fn direct_http_projection_write_waits_for_rebuild_pause() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let paused = state.projection_maintenance.pause().await.unwrap();
+        let write_state = state.clone();
+        let mut write = tokio::spawn(async move {
+            set_position_exposure(
+                State(write_state),
+                Path("MSTR".to_string()),
+                Json(SetPositionRequest {
+                    target_net: "5".to_string(),
+                    price_usdc: Some("150".to_string()),
+                    reason: "manual correction".to_string(),
+                }),
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut write)
+                .await
+                .is_err(),
+            "a direct HTTP writer must park while rebuild maintenance is paused"
+        );
+
+        drop(paused);
+        let response = write.await.unwrap();
+        assert!(response.is_ok(), "the writer must resume after the rebuild");
     }
 
     #[tokio::test]

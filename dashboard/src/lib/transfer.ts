@@ -90,21 +90,21 @@ export const statusStyle = (status: string): StatusStyle => {
   if (lower.includes('completed') || lower.includes('deposited') || lower.includes('confirmed')) {
     return {
       text: 'text-green-500',
-      dot: 'bg-green-500',
+      dot: 'bg-green-500'
     }
   }
 
   if (lower.includes('reconciled')) {
     return {
       text: 'text-amber-500',
-      dot: 'bg-amber-500',
+      dot: 'bg-amber-500'
     }
   }
 
   if (lower.includes('failed') || lower.includes('rejected')) {
     return {
       text: 'text-destructive',
-      dot: 'bg-destructive',
+      dot: 'bg-destructive'
     }
   }
 
@@ -316,10 +316,7 @@ export const transferRecoveryCommands = (params: {
   const prefix = commandPrefix(params.deployment)
   if (prefix === null) return []
 
-  if (
-    params.status.toLowerCase() === 'completed' ||
-    params.status.toLowerCase() === 'reconciled'
-  )
+  if (params.status.toLowerCase() === 'completed' || params.status.toLowerCase() === 'reconciled')
     return []
 
   if (params.kind === 'usdc_bridge') {
@@ -523,7 +520,7 @@ export const tradeRecoveryCommands = (params: {
   commands.push({
     command: `${prefix} view rebuild -a position --id ${symbol}`,
     label: 'Rebuild view',
-    description: 'Replay all events to reconstruct a corrupted position view.',
+    description: 'Stop the bot, then replay all events to reconstruct a corrupted position view.',
     mode: 'direct-db'
   })
 
@@ -638,7 +635,8 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
       {
         command:
           'stox view rebuild -a <position|offchain-order|vault-registry> (--id <id> | --all)',
-        description: 'Replay all events to reconstruct a corrupted materialized view.',
+        description:
+          'Stop the bot, then replay all events to reconstruct a corrupted materialized view.',
         whenToUse: 'A view became corrupted (e.g. lost updates from optimistic-lock conflicts).',
         appliesTo: 'Position / offchain-order / vault-registry views',
         mode: 'direct-db'

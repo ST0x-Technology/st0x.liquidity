@@ -748,6 +748,9 @@ mod tests {
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),
+            projection_maintenance: Arc::new(
+                crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
+            ),
             pnl_report_admission: pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
             health: crate::startup::HealthGate::default(),

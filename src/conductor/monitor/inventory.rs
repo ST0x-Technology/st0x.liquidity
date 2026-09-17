@@ -19,6 +19,8 @@ use crate::inventory::Poller;
 pub(crate) struct InventoryMonitor {
     pub(crate) poller: Arc<dyn Poller>,
     pub(crate) interval: Duration,
+    pub(crate) projection_maintenance:
+        Arc<crate::conductor::projection_pause::ProjectionMaintenance>,
 }
 
 impl SupervisedTask for InventoryMonitor {
@@ -30,6 +32,7 @@ impl SupervisedTask for InventoryMonitor {
 
         loop {
             interval.tick().await;
+            let _projection_write = self.projection_maintenance.enter().await;
 
             if let Err(error) = self.poller.poll().await {
                 warn!(target: "inventory", ?error, "Inventory polling failed");
@@ -81,6 +84,9 @@ mod tests {
         let mut monitor = InventoryMonitor {
             poller: Arc::new(NotifyingPoller { tx, fail: false }),
             interval: Duration::from_secs(10),
+            projection_maintenance: Arc::new(
+                crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
+            ),
         };
 
         let handle = tokio::spawn(async move { monitor.run().await });
@@ -104,6 +110,9 @@ mod tests {
         let mut monitor = InventoryMonitor {
             poller: Arc::new(NotifyingPoller { tx, fail: true }),
             interval: Duration::from_secs(10),
+            projection_maintenance: Arc::new(
+                crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
+            ),
         };
 
         let handle = tokio::spawn(async move { monitor.run().await });
