@@ -403,51 +403,11 @@ impl EventSourced for Position {
                 }))
             }
 
-            EquityTransferReserved {
-                reservation_id,
-                reserved_at,
-            } => Ok(Some(Self {
-                equity_transfer_reservation: Some(EquityTransferReservation {
-                    id: *reservation_id,
-                    status: EquityTransferReservationStatus::Reserved,
-                }),
-                last_updated: Some(*reserved_at),
-                ..entity.clone()
-            })),
-
-            EquityTransferReservationConfirmed {
-                reservation_id,
-                confirmed_at,
-            } if entity
-                .equity_transfer_reservation
-                .is_some_and(|reservation| reservation.id == *reservation_id) =>
-            {
-                Ok(Some(Self {
-                    equity_transfer_reservation: Some(EquityTransferReservation {
-                        id: *reservation_id,
-                        status: EquityTransferReservationStatus::Confirmed,
-                    }),
-                    last_updated: Some(*confirmed_at),
-                    ..entity.clone()
-                }))
+            event @ (EquityTransferReserved { .. }
+            | EquityTransferReservationConfirmed { .. }
+            | EquityTransferReservationReleased { .. }) => {
+                Ok(entity.evolve_equity_transfer_reservation(event))
             }
-
-            EquityTransferReservationReleased {
-                reservation_id,
-                released_at,
-            } if entity
-                .equity_transfer_reservation
-                .is_some_and(|reservation| reservation.id == *reservation_id) =>
-            {
-                Ok(Some(Self {
-                    equity_transfer_reservation: None,
-                    last_updated: Some(*released_at),
-                    ..entity.clone()
-                }))
-            }
-
-            EquityTransferReservationConfirmed { .. }
-            | EquityTransferReservationReleased { .. } => Ok(None),
             OffChainOrderPlaced { .. } if entity.pending_offchain_order_id.is_some() => Ok(None),
 
             OffChainOrderPlaced {
@@ -1133,6 +1093,59 @@ impl Position {
     fn reservation_after_onchain_fill(&self) -> Option<EquityTransferReservation> {
         self.equity_transfer_reservation
             .filter(|reservation| reservation.status == EquityTransferReservationStatus::Confirmed)
+    }
+
+    fn evolve_equity_transfer_reservation(&self, event: &PositionEvent) -> Option<Self> {
+        use PositionEvent::{
+            EquityTransferReservationConfirmed, EquityTransferReservationReleased,
+            EquityTransferReserved,
+        };
+
+        match event {
+            EquityTransferReserved {
+                reservation_id,
+                reserved_at,
+            } => Some(Self {
+                equity_transfer_reservation: Some(EquityTransferReservation {
+                    id: *reservation_id,
+                    status: EquityTransferReservationStatus::Reserved,
+                }),
+                last_updated: Some(*reserved_at),
+                ..self.clone()
+            }),
+            EquityTransferReservationConfirmed {
+                reservation_id,
+                confirmed_at,
+            } if self
+                .equity_transfer_reservation
+                .is_some_and(|reservation| reservation.id == *reservation_id) =>
+            {
+                Some(Self {
+                    equity_transfer_reservation: Some(EquityTransferReservation {
+                        id: *reservation_id,
+                        status: EquityTransferReservationStatus::Confirmed,
+                    }),
+                    last_updated: Some(*confirmed_at),
+                    ..self.clone()
+                })
+            }
+            EquityTransferReservationReleased {
+                reservation_id,
+                released_at,
+            } if self
+                .equity_transfer_reservation
+                .is_some_and(|reservation| reservation.id == *reservation_id) =>
+            {
+                Some(Self {
+                    equity_transfer_reservation: None,
+                    last_updated: Some(*released_at),
+                    ..self.clone()
+                })
+            }
+            EquityTransferReservationConfirmed { .. }
+            | EquityTransferReservationReleased { .. } => None,
+            _ => unreachable!("called only for equity transfer reservation events"),
+        }
     }
 
     fn reserve_equity_transfer_events(
@@ -1990,8 +2003,8 @@ impl PartialEq for PositionEvent {
                     reservation_id: r2,
                     reserved_at: a2,
                 },
-            ) => r1 == r2 && a1 == a2,
-            (
+            )
+            | (
                 Self::EquityTransferReservationConfirmed {
                     reservation_id: r1,
                     confirmed_at: a1,
@@ -2000,8 +2013,8 @@ impl PartialEq for PositionEvent {
                     reservation_id: r2,
                     confirmed_at: a2,
                 },
-            ) => r1 == r2 && a1 == a2,
-            (
+            )
+            | (
                 Self::EquityTransferReservationReleased {
                     reservation_id: r1,
                     released_at: a1,

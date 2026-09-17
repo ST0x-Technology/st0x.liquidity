@@ -3107,15 +3107,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         // the saga uses there.
         let primary_equity_services = equity_transfer_services.for_chain(primary_chain)?.clone();
 
-        let transfer_usdc_to_hedging_queue = deps.schedulers.transfer_usdc_to_hedging.clone();
-        let transfer_usdc_to_market_making_queue =
-            deps.schedulers.transfer_usdc_to_market_making.clone();
-        let transfer_equity_to_market_making_queue =
-            deps.schedulers.transfer_equity_to_market_making.clone();
-        let transfer_equity_to_hedging_queue = deps.schedulers.transfer_equity_to_hedging.clone();
-
-        let notifier = deps.notifier.clone();
-
         let rebalancing_service =
             build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
 
@@ -3223,15 +3214,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let deliver_mint_authorization_ctx = Arc::new(DeliverMintAuthorizationCtx {
             deliverer: mint_authorization.issuance_client,
             mint_store: built.mint.clone(),
-            notifier: notifier.clone(),
+            notifier: deps.notifier.clone(),
             job_queue: mint_authorization.queue.clone(),
         });
 
         let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
             transfer: usdc_handles.resume_alpaca_to_base,
-            job_queue: transfer_usdc_to_market_making_queue,
+            job_queue: deps.schedulers.transfer_usdc_to_market_making.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
-            notifier: notifier.clone(),
+            notifier: deps.notifier.clone(),
             usdc_guard: Arc::new(DurableCheckedGuardRelease {
                 pool: deps.pool.clone(),
                 store: usdc_store,
@@ -3243,9 +3234,9 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
             transfer: usdc_handles.resume_base_to_alpaca,
             timeout: rebalancing_ctx.transfer_attempt_timeout,
-            job_queue: transfer_usdc_to_hedging_queue,
+            job_queue: deps.schedulers.transfer_usdc_to_hedging.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
-            notifier,
+            notifier: deps.notifier.clone(),
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {
@@ -3254,7 +3245,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             mint_store: built.mint.clone(),
             position_store: Some(built.position.clone()),
             transfer_services: equity_transfer_services,
-            job_queue: transfer_equity_to_market_making_queue,
+            job_queue: deps.schedulers.transfer_equity_to_market_making.clone(),
         });
 
         let transfer_equity_to_hedging_ctx = Arc::new(TransferEquityToHedgingCtx {
@@ -3262,7 +3253,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             redemption_store: built.redemption.clone(),
             position_store: Some(built.position.clone()),
-            job_queue: transfer_equity_to_hedging_queue,
+            job_queue: deps.schedulers.transfer_equity_to_hedging.clone(),
         });
 
         Ok(RebalancingInfrastructure {

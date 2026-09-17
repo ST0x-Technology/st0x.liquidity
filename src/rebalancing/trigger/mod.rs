@@ -2526,6 +2526,128 @@ impl RebalancingService {
             .await;
         }
     }
+    async fn apply_onchain_fill_to_inventory(
+        &self,
+        symbol: Symbol,
+        event: &PositionEvent,
+        timestamp: DateTime<Utc>,
+    ) -> Result<(), RebalancingServiceError> {
+        use PositionEvent::*;
+
+        match event {
+            OnChainOrderFilled {
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_number,
+                ..
+            } => {
+                let equity_op: Operator = (*direction).into();
+                let quantity: Float = (*amount).into();
+                let usdc_value = (*price_usdc * quantity)?;
+
+                // Each delta leg yields to a pinned onchain snapshot
+                // that provably already contains it: a vaultBalance2
+                // read at block N includes every fill at a block <= N
+                // (ADR 0018). The same reasoning covers a secondary
+                // chain's slot no snapshot has seeded yet (that
+                // chain's first poll has not landed): its first snapshot
+                // contains the fill, so the leg waits rather than
+                // debiting an empty slot or inventing one that holds
+                // only the delta. The primary chain is different: its
+                // unseeded slot is the normal cold state, the fill
+                // creates it and the primary's poll reconciles it
+                // shortly after. Checked and applied under one write
+                // lock so no snapshot can advance the watermark in
+                // between. A skipped leg is normal operation, not an
+                // error.
+                let primary_chain = {
+                    let mut inventory = self.inventory.write().await;
+                    let primary_chain = inventory.primary_chain();
+                    let on_primary = trade_id.chain == primary_chain;
+                    let equity_slot_seeded =
+                        inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
+                    let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
+                    let equity_absorbed = inventory.onchain_fill_absorbed_by_equity_snapshot(
+                        &symbol,
+                        trade_id.chain,
+                        *block_number,
+                    );
+                    let usdc_absorbed = inventory
+                        .onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
+
+                    if !on_primary && (!equity_slot_seeded || !usdc_slot_seeded) {
+                        info!(
+                            target: "rebalance",
+                            %symbol,
+                            chain = %trade_id.chain,
+                            equity_slot_seeded,
+                            usdc_slot_seeded,
+                            "Skipping onchain fill delta leg(s) on a \
+                             secondary chain slot no onchain snapshot \
+                             has seeded yet; the chain's first snapshot \
+                             contains the fill"
+                        );
+                    }
+
+                    if equity_absorbed || usdc_absorbed {
+                        info!(
+                            target: "rebalance",
+                            %symbol,
+                            ?block_number,
+                            equity_absorbed,
+                            usdc_absorbed,
+                            "Skipping onchain fill delta leg(s) already \
+                             absorbed by a pinned onchain snapshot"
+                        );
+                    }
+
+                    let apply_equity_leg = (on_primary || equity_slot_seeded) && !equity_absorbed;
+                    let apply_usdc_leg = (on_primary || usdc_slot_seeded) && !usdc_absorbed;
+
+                    // Chain-addressed: inventory is not fungible
+                    // across chains, so a fill credits and debits the
+                    // slots of the chain it filled on. Routing it
+                    // through the venue-addressed writers would move
+                    // the primary chain's balances instead.
+                    let mut updated = inventory.clone();
+                    if apply_equity_leg {
+                        updated = updated.update_equity_at(
+                            &symbol,
+                            trade_id.chain,
+                            Inventory::available(Venue::MarketMaking, equity_op, *amount),
+                            timestamp,
+                        )?;
+                    }
+                    if apply_usdc_leg {
+                        updated = updated.update_usdc_at(
+                            trade_id.chain,
+                            Inventory::available(
+                                Venue::MarketMaking,
+                                equity_op.inverse(),
+                                Usdc::new(usdc_value),
+                            ),
+                            timestamp,
+                        )?;
+                    }
+                    *inventory = updated;
+                    primary_chain
+                };
+                // Only the primary chain rebalances: a secondary is
+                // prefunded and holds its own inventory, so its fill
+                // must not schedule work against the primary chain's
+                // balances.
+                if trade_id.chain == primary_chain {
+                    self.equity_scheduler.enqueue_check(symbol).await;
+                    self.usdc_scheduler.enqueue_check().await;
+                }
+
+                Ok(())
+            }
+            _ => unreachable!("called only for onchain fill events"),
+        }
+    }
 }
 
 deps!(
@@ -2550,116 +2672,11 @@ impl Reactor for RebalancingService {
         event
             .on(|symbol, event| async move {
                 use PositionEvent::*;
-
                 let timestamp = event.timestamp();
                 let (equity_update, usdc_update, offchain_order_id) = match &event {
-                    OnChainOrderFilled {
-                        trade_id,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        ..
-                    } => {
-                        let equity_op: Operator = (*direction).into();
-                        let quantity: Float = (*amount).into();
-                        let usdc_value = (*price_usdc * quantity)?;
-
-                        // Each delta leg yields to a pinned onchain snapshot
-                        // that provably already contains it: a vaultBalance2
-                        // read at block N includes every fill at a block <= N
-                        // (ADR 0018). The same reasoning covers a secondary
-                        // chain's slot no snapshot has seeded yet (that
-                        // chain's first poll has not landed): its first snapshot
-                        // contains the fill, so the leg waits rather than
-                        // debiting an empty slot or inventing one that holds
-                        // only the delta. The primary chain is different: its
-                        // unseeded slot is the normal cold state, the fill
-                        // creates it and the primary's poll reconciles it
-                        // shortly after. Checked and applied under one write
-                        // lock so no snapshot can advance the watermark in
-                        // between. A skipped leg is normal operation, not an
-                        // error.
-                        let primary_chain = {
-                            let mut inventory = self.inventory.write().await;
-                            let primary_chain = inventory.primary_chain();
-                            let on_primary = trade_id.chain == primary_chain;
-                            let equity_slot_seeded =
-                                inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
-                            let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
-                            let equity_absorbed = inventory
-                                .onchain_fill_absorbed_by_equity_snapshot(&symbol, trade_id.chain, *block_number);
-                            let usdc_absorbed =
-                                inventory.onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
-
-                            if !on_primary && (!equity_slot_seeded || !usdc_slot_seeded) {
-                                info!(
-                                    target: "rebalance",
-                                    %symbol,
-                                    chain = %trade_id.chain,
-                                    equity_slot_seeded,
-                                    usdc_slot_seeded,
-                                    "Skipping onchain fill delta leg(s) on a \
-                                     secondary chain slot no onchain snapshot \
-                                     has seeded yet; the chain's first snapshot \
-                                     contains the fill"
-                                );
-                            }
-
-                            if equity_absorbed || usdc_absorbed {
-                                info!(
-                                    target: "rebalance",
-                                    %symbol,
-                                    ?block_number,
-                                    equity_absorbed,
-                                    usdc_absorbed,
-                                    "Skipping onchain fill delta leg(s) already \
-                                     absorbed by a pinned onchain snapshot"
-                                );
-                            }
-
-                            let apply_equity_leg =
-                                (on_primary || equity_slot_seeded) && !equity_absorbed;
-                            let apply_usdc_leg = (on_primary || usdc_slot_seeded) && !usdc_absorbed;
-
-                            // Chain-addressed: inventory is not fungible
-                            // across chains, so a fill credits and debits the
-                            // slots of the chain it filled on. Routing it
-                            // through the venue-addressed writers would move
-                            // the primary chain's balances instead.
-                            let mut updated = inventory.clone();
-                            if apply_equity_leg {
-                                updated = updated.update_equity_at(
-                                    &symbol,
-                                    trade_id.chain,
-                                    Inventory::available(Venue::MarketMaking, equity_op, *amount),
-                                    timestamp,
-                                )?;
-                            }
-                            if apply_usdc_leg {
-                                updated = updated.update_usdc_at(
-                                    trade_id.chain,
-                                    Inventory::available(
-                                        Venue::MarketMaking,
-                                        equity_op.inverse(),
-                                        Usdc::new(usdc_value),
-                                    ),
-                                    timestamp,
-                                )?;
-                            }
-                            *inventory = updated;
-                            primary_chain
-                        };
-
-                        // Only the primary chain rebalances: a secondary is
-                        // prefunded and holds its own inventory, so its fill
-                        // must not schedule work against the primary chain's
-                        // balances.
-                        if trade_id.chain == primary_chain {
-                            self.equity_scheduler.enqueue_check(symbol).await;
-                            self.usdc_scheduler.enqueue_check().await;
-                        }
-
+                    OnChainOrderFilled { .. } => {
+                        self.apply_onchain_fill_to_inventory(symbol, &event, timestamp)
+                            .await?;
                         return Ok(());
                     }
                     OffChainOrderFilled {
