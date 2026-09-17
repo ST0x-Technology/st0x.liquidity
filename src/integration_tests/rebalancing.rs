@@ -716,7 +716,10 @@ async fn equity_offchain_imbalance_triggers_mint() {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
-        position_store: Some(Arc::clone(&position_cqrs)),
+        position_authority: Some((
+            Arc::clone(&position_cqrs),
+            ExecutionThreshold::whole_share(),
+        )),
         transfer_services: EquityTransferServices::panicking(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
@@ -966,7 +969,10 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         transfer: equity_transfer,
         equity_in_progress: service.equity_in_progress.clone(),
         redemption_store: Arc::new(test_store(pool.clone(), cleanup_services)),
-        position_store: Some(Arc::clone(&position_cqrs)),
+        position_authority: Some((
+            Arc::clone(&position_cqrs),
+            ExecutionThreshold::whole_share(),
+        )),
         job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -1750,7 +1756,10 @@ async fn mint_api_failure_preserves_requested_intent() {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
-        position_store: Some(Arc::clone(&position_cqrs)),
+        position_authority: Some((
+            Arc::clone(&position_cqrs),
+            ExecutionThreshold::whole_share(),
+        )),
         transfer_services: EquityTransferServices::panicking(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
@@ -2389,7 +2398,10 @@ async fn mint_accepted_sets_offchain_inflight() {
                 transfer: equity_transfer,
                 equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
                 mint_store,
-                position_store: Some(Arc::clone(&position_cqrs)),
+                position_authority: Some((
+                    Arc::clone(&position_cqrs),
+                    ExecutionThreshold::whole_share(),
+                )),
                 transfer_services: EquityTransferServices::panicking(),
                 job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
             };
@@ -2618,7 +2630,10 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         transfer: Arc::clone(&equity_transfer) as _,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
-        position_store: Some(Arc::clone(&position_cqrs)),
+        position_authority: Some((
+            Arc::clone(&position_cqrs),
+            ExecutionThreshold::whole_share(),
+        )),
         transfer_services: EquityTransferServices::panicking(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };

@@ -1105,7 +1105,7 @@ impl Conductor {
 
         let resume_tokenization_ctx = Arc::new(ResumeTokenizationCtx {
             transfer: recovery_transfer.clone(),
-            position_store: resume_position_store,
+            position_authority: (resume_position_store, ctx.execution_threshold),
             job_queue: resume_tokenization_queue.clone(),
         });
 
@@ -3278,7 +3278,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             transfer: recovery_transfer.clone(),
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             mint_store: built.mint.clone(),
-            position_store: Some(built.position.clone()),
+            position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
             transfer_services: equity_transfer_services,
             job_queue: deps.schedulers.transfer_equity_to_market_making.clone(),
         });
@@ -3287,7 +3287,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             transfer: recovery_transfer.clone(),
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             redemption_store: built.redemption.clone(),
-            position_store: Some(built.position.clone()),
+            position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
             job_queue: deps.schedulers.transfer_equity_to_hedging.clone(),
         });
 
@@ -5612,7 +5612,8 @@ pub fn is_expected_place_offchain_order_rejection(error: &SendError<Position>) -
         AggregateError::UserError(LifecycleError::Apply(
             PositionError::PendingExecution { .. }
                 | PositionError::ThresholdNotMet { .. }
-                | PositionError::EquityTransferPending { .. },
+                | PositionError::EquityTransferPending { .. }
+                | PositionError::StaleHedgeRequest { .. },
         ))
     )
 }
@@ -5966,10 +5967,24 @@ mod tests {
     use crate::unwrapped_equity_recovery::{
         UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
     };
+
     use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_lookup::MockVaultLookup;
     use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
     use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
+    #[test]
+    fn stale_hedge_request_is_an_expected_placement_rejection() {
+        let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
+        let error =
+            AggregateError::UserError(LifecycleError::Apply(PositionError::StaleHedgeRequest {
+                requested_direction: Direction::Buy,
+                requested_shares: shares,
+                live_direction: Direction::Sell,
+                live_shares: shares,
+            }));
+
+        assert!(is_expected_place_offchain_order_rejection(&error));
+    }
 
     struct TaskDropFlag(Arc<AtomicBool>);
 
