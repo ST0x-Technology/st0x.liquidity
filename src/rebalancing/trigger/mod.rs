@@ -758,6 +758,12 @@ pub(crate) struct RebalancingService {
     suppressed_inflight_symbols: Arc<RwLock<HashMap<Symbol, DateTime<Utc>>>>,
     timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, TimeoutTombstone>>>,
     timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, TimeoutTombstone>>>,
+    /// Timeout terminal commands that committed but whose matching Position
+    /// reservation release has not succeeded yet. Retried every sweep; startup
+    /// orphan reconciliation covers a process exit while either map is live.
+    pending_timed_out_mint_reservation_releases: Arc<RwLock<HashMap<IssuerRequestId, Symbol>>>,
+    pending_timed_out_redemption_reservation_releases:
+        Arc<RwLock<HashMap<RedemptionAggregateId, Symbol>>>,
     timed_out_usdc_rebalances: Arc<RwLock<HashMap<UsdcRebalanceId, DateTime<Utc>>>>,
     /// Requested-stage mint timeouts already logged. Issuer request ids are
     /// unique, so retaining an id suppresses duplicate warnings permanently.
@@ -911,6 +917,10 @@ impl RebalancingService {
             suppressed_inflight_symbols: Arc::new(RwLock::new(HashMap::new())),
             timed_out_mints: Arc::new(RwLock::new(HashMap::new())),
             timed_out_redemptions: Arc::new(RwLock::new(HashMap::new())),
+            pending_timed_out_mint_reservation_releases: Arc::new(RwLock::new(HashMap::new())),
+            pending_timed_out_redemption_reservation_releases: Arc::new(
+                RwLock::new(HashMap::new()),
+            ),
             timed_out_usdc_rebalances: Arc::new(RwLock::new(HashMap::new())),
             requested_stage_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
@@ -1090,6 +1100,7 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
+        self.retry_timeout_reservation_releases().await;
         self.prune_timeout_markers(now).await;
         self.expire_stuck_mints(now).await?;
         self.expire_stuck_redemptions(now).await?;
@@ -1269,11 +1280,8 @@ impl RebalancingService {
 
                 match store.send(&id, command).await {
                     Ok(()) => {
-                        self.release_terminal_equity_transfer(
-                            &tracking.symbol,
-                            EquityTransferReservationId::from_uuid(id.0),
-                        )
-                        .await?;
+                        self.release_timed_out_mint_reservation(&id, &tracking.symbol)
+                            .await;
                     }
                     Err(error) => {
                         warn!(
@@ -1358,11 +1366,8 @@ impl RebalancingService {
                 if let Some(command) = command {
                     match store.send(&id, command).await {
                         Ok(()) => {
-                            self.release_terminal_equity_transfer(
-                                &tracking.symbol,
-                                EquityTransferReservationId::from_uuid(id.0),
-                            )
-                            .await?;
+                            self.release_timed_out_redemption_reservation(&id, &tracking.symbol)
+                                .await;
                         }
                         Err(error) => {
                             warn!(
@@ -4835,7 +4840,7 @@ impl RebalancingService {
         &self,
         symbol: &Symbol,
         reservation_id: EquityTransferReservationId,
-    ) -> Result<(), RebalancingServiceError> {
+    ) -> Result<bool, RebalancingServiceError> {
         let Some(store) = self.position_store.read().await.as_ref().map(Arc::clone) else {
             warn!(
                 target: "rebalance",
@@ -4843,7 +4848,7 @@ impl RebalancingService {
                 %reservation_id,
                 "Position authority is not wired; retaining terminal transfer reservation"
             );
-            return Ok(());
+            return Ok(false);
         };
 
         store
@@ -4852,7 +4857,88 @@ impl RebalancingService {
                 PositionCommand::ReleaseEquityTransfer { reservation_id },
             )
             .await?;
-        Ok(())
+        Ok(true)
+    }
+
+    async fn release_timed_out_mint_reservation(&self, id: &IssuerRequestId, symbol: &Symbol) {
+        self.pending_timed_out_mint_reservation_releases
+            .write()
+            .await
+            .insert(id.clone(), symbol.clone());
+        match self
+            .release_terminal_equity_transfer(symbol, EquityTransferReservationId::from_uuid(id.0))
+            .await
+        {
+            Ok(true) => {
+                self.pending_timed_out_mint_reservation_releases
+                    .write()
+                    .await
+                    .remove(id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %symbol,
+                    %error,
+                    "Failed to release timed-out mint reservation; retaining it for retry"
+                );
+            }
+        }
+    }
+
+    async fn release_timed_out_redemption_reservation(
+        &self,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+    ) {
+        self.pending_timed_out_redemption_reservation_releases
+            .write()
+            .await
+            .insert(id.clone(), symbol.clone());
+        match self
+            .release_terminal_equity_transfer(symbol, EquityTransferReservationId::from_uuid(id.0))
+            .await
+        {
+            Ok(true) => {
+                self.pending_timed_out_redemption_reservation_releases
+                    .write()
+                    .await
+                    .remove(id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %symbol,
+                    %error,
+                    "Failed to release timed-out redemption reservation; retaining it for retry"
+                );
+            }
+        }
+    }
+
+    async fn retry_timeout_reservation_releases(&self) {
+        let pending_mints = self
+            .pending_timed_out_mint_reservation_releases
+            .read()
+            .await
+            .clone();
+        for (id, symbol) in pending_mints {
+            self.release_timed_out_mint_reservation(&id, &symbol).await;
+        }
+
+        let pending_redemptions = self
+            .pending_timed_out_redemption_reservation_releases
+            .read()
+            .await
+            .clone();
+        for (id, symbol) in pending_redemptions {
+            self.release_timed_out_redemption_reservation(&id, &symbol)
+                .await;
+        }
     }
 
     /// Clears the in-progress flag for an equity symbol.
@@ -6195,11 +6281,8 @@ impl RebalancingService {
                  inflight suppression so snapshot polls resume recording the \
                  symbol; balances heal on the next poll"
             );
-            self.release_terminal_equity_transfer(
-                &tombstone.symbol,
-                EquityTransferReservationId::from_uuid(id.0),
-            )
-            .await?;
+            self.release_timed_out_mint_reservation(&id, &tombstone.symbol)
+                .await;
             drop(event_sync_guard);
             self.equity_scheduler.enqueue_check(tombstone.symbol).await;
             return Ok(());
@@ -6344,11 +6427,8 @@ impl RebalancingService {
                  inflight suppression so snapshot polls resume recording the \
                  symbol; balances heal on the next poll"
             );
-            self.release_terminal_equity_transfer(
-                &tombstone.symbol,
-                EquityTransferReservationId::from_uuid(id.0),
-            )
-            .await?;
+            self.release_timed_out_redemption_reservation(&id, &tombstone.symbol)
+                .await;
             drop(event_sync_guard);
             self.equity_scheduler.enqueue_check(tombstone.symbol).await;
             return Ok(());
@@ -18575,6 +18655,36 @@ mod tests {
             .unwrap();
     }
 
+    async fn install_closed_position_store(
+        service: &RebalancingService,
+    ) -> (Arc<Store<Position>>, Arc<Projection<Position>>) {
+        let position_store = service
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let position_projection = service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let pool = crate::test_utils::setup_test_db().await;
+        let closed_store = Arc::new(test_store::<Position>(pool.clone(), ()));
+        pool.close().await;
+        service
+            .set_position_authority(
+                closed_store,
+                position_projection.clone(),
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        (position_store, position_projection)
+    }
+
     /// An operator failure dispatched through the conductor-owned store must
     /// reach this live reactor and release a requested mint's symbol guard.
     /// The timeout sweeper intentionally never expires this stage, so a
@@ -18668,7 +18778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_timeout_releases_confirmed_transfer_reservation() {
+    async fn mint_timeout_retries_failed_transfer_reservation_release() {
         let symbol = Symbol::new("tAAPL").unwrap();
         let id = issuer_request_id("timed-out-mint-release");
         let service = make_trigger_with_inventory(InventoryView::default().with_equity(
@@ -18707,28 +18817,52 @@ mod tests {
         );
         let reservation_id = EquityTransferReservationId::from_uuid(id.0);
         seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+        let (position_store, position_projection) = install_closed_position_store(&service).await;
 
         service
             .expire_stuck_mints(Utc::now() + ChronoDuration::hours(24))
             .await
             .unwrap();
 
-        let position = service
-            .position_projection
-            .read()
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position.equity_transfer_reservation.unwrap().status,
+            EquityTransferReservationStatus::Confirmed
+        );
+        assert!(
+            service
+                .pending_timed_out_mint_reservation_releases
+                .read()
+                .await
+                .contains_key(&id)
+        );
+        assert!(!service.mint_tracking.read().await.contains_key(&id));
+
+        service
+            .set_position_authority(
+                position_store,
+                position_projection.clone(),
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        service
+            .expire_stuck_operations(Utc::now() + ChronoDuration::hours(25))
             .await
-            .as_ref()
-            .cloned()
-            .unwrap()
-            .load(&symbol)
-            .await
-            .unwrap()
             .unwrap();
+
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
         assert_eq!(position.equity_transfer_reservation, None);
+        assert!(
+            !service
+                .pending_timed_out_mint_reservation_releases
+                .read()
+                .await
+                .contains_key(&id)
+        );
     }
 
     #[tokio::test]
-    async fn redemption_timeout_releases_confirmed_transfer_reservation() {
+    async fn redemption_timeout_retries_failed_transfer_reservation_release() {
         let symbol = Symbol::new("tAAPL").unwrap();
         let id = redemption_aggregate_id("timed-out-redemption-release");
         let inventory = InventoryView::default()
@@ -18757,24 +18891,48 @@ mod tests {
             .unwrap();
         let reservation_id = EquityTransferReservationId::from_uuid(id.0);
         seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+        let (position_store, position_projection) = install_closed_position_store(&service).await;
 
         service
             .expire_stuck_redemptions(Utc::now() + ChronoDuration::hours(24))
             .await
             .unwrap();
 
-        let position = service
-            .position_projection
-            .read()
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position.equity_transfer_reservation.unwrap().status,
+            EquityTransferReservationStatus::Confirmed
+        );
+        assert!(
+            service
+                .pending_timed_out_redemption_reservation_releases
+                .read()
+                .await
+                .contains_key(&id)
+        );
+        assert!(!service.redemption_tracking.read().await.contains_key(&id));
+
+        service
+            .set_position_authority(
+                position_store,
+                position_projection.clone(),
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        service
+            .expire_stuck_operations(Utc::now() + ChronoDuration::hours(25))
             .await
-            .as_ref()
-            .cloned()
-            .unwrap()
-            .load(&symbol)
-            .await
-            .unwrap()
             .unwrap();
+
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
         assert_eq!(position.equity_transfer_reservation, None);
+        assert!(
+            !service
+                .pending_timed_out_redemption_reservation_releases
+                .read()
+                .await
+                .contains_key(&id)
+        );
     }
 
     #[tokio::test]
