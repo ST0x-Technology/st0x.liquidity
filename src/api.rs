@@ -2410,7 +2410,7 @@ async fn fail_usdc_transfer(
         )
     })?;
 
-    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause).await?;
+    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, &id, None).await?;
 
     let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
     Ok(Json(response))
