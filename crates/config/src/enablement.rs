@@ -114,10 +114,10 @@ impl fmt::Display for ChainCapability {
 ///   but no wrapper.
 /// - HyperEVM signs, watches fills and hedges prefunded inventory. It has no
 ///   CCTP domain or wrapper, and the ETH/USD feed cannot value its HYPE gas.
-/// - Robinhood (an Arbitrum Orbit L2) can sign, watch fills and hedge; the
-///   shipped configuration has no trading table, so it stays observe-only
-///   until one lands. It pays gas in ETH, so the same ETH/USD feed values
-///   it; no CCTP domain or wrapper is wired.
+/// - Robinhood (an Arbitrum Orbit L2) signs, watches fills and hedges
+///   prefunded inventory; the shipped configuration runs it hedge-only. It
+///   pays gas in ETH, so the same ETH/USD feed values it; no CCTP domain or
+///   wrapper is wired.
 pub fn provided_capabilities(chain: Chain) -> BTreeSet<ChainCapability> {
     use ChainCapability::*;
 

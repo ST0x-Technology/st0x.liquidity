@@ -201,18 +201,55 @@ required_confirmations = 12
 lifecycle = "observe-only"
 required_confirmations = 1
 
-# Robinhood Chain (an Arbitrum Orbit L2, chain id 4663), same shape as
-# HyperEVM. Its settlement stable is USDG, pinned in code.
+# Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): a prefunded
+# hedge-only secondary. Fills on its orderbook are ingested, validated against
+# USDG (its settlement stable, pinned in code) and hedged; inventory is topped
+# up by hand and the prefunded lifecycle refuses any asset that enables
+# rebalancing (no wrapper or CCTP domain is wired there anyway). Gas is ETH,
+# so "active" is reachable, but rebalancing assets stay refused by capability.
 [chains.robinhood]
-# The chain can ingest fills and hedge; without a trading table this entry
-# keeps it observe-only: a signer exists, no orderbook is watched and nothing
-# is signed. Gas is ETH, so "active" is reachable once a trading table lands.
-# When it does, Base's "safe" cutoff is OP-Stack-only: use
-# ingestion_cutoff = "confirmations" with ingestion_cutoff_confirmations
-# covering parent-chain finality (~13 min) at Robinhood's ~100 ms block
-# cadence.
-lifecycle = "observe-only"
-required_confirmations = 1
+lifecycle = "prefunded"
+# ~1 s at Robinhood's ~100 ms block cadence: enough for a load-balanced RPC
+# to have seen the startup USDG approval before it is treated as settled.
+required_confirmations = 10
+
+[chains.robinhood.trading]
+# RaindexV6 on Robinhood Chain.
+orderbook = "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"
+inventory_mode = "managed"
+# No venue adapters: Bebop is off on Robinhood.
+inventory_adapters = []
+# The single RaindexInventory on 4663; it owns the orders and vaults, so it
+# is the vault owner too.
+inventory = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
+vault_owner = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
+# The orderbook's deployment block on 4663.
+deployment_block = 59557818
+# Base's "safe" cutoff is OP-Stack-only and Robinhood's RPC does not guarantee
+# the safe/finalized tags (both fail config validation here), so ingest at a
+# fixed depth: 8000 blocks is ~13 min at the ~100 ms cadence, covering
+# parent-chain finality.
+ingestion_cutoff = "confirmations"
+ingestion_cutoff_confirmations = 8000
+order_fill_poll_interval_secs = 5
+primary = false
+# No redemption_wallet: a hedge-only chain redeems nothing.
+
+[chains.robinhood.trading.assets.cash]
+# The USDG vault the orders quote against; polled, never rebalanced.
+vault_id = "0xfab"
+rebalancing = "disabled"
+
+# The same [assets.equities.SYM] broker policy serves every chain the symbol
+# is listed on; only the per-chain listing repeats.
+[chains.robinhood.trading.assets.equities.EXAMPLE]
+tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+trading = "enabled"
+# The prefunded lifecycle caps this at "disabled".
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
 
 [wallet]
 kind = "private-key"
@@ -353,9 +390,10 @@ realert_interval = 43200
 # Native-gas balance below which alerts fire, as decimal strings in the chain's
 # native token (ETH for Base/Ethereum/Robinhood, HYPE for HyperEVM). Base and
 # Ethereum thresholds are required whenever [alerts] is present. A positive
-# hyperevm or robinhood threshold is also required once that chain is hedged.
-# Disabled, absent, and transport-only configurations of those two chains
-# reject an unused threshold.
+# hyperevm or robinhood threshold is also required once that chain is hedged,
+# as robinhood is above. Disabled, absent, and transport-only configurations
+# of those two chains reject an unused threshold.
 [alerts.low_balance_thresholds]
 base = "0.05"
 ethereum = "0.05"
+robinhood = "0.001"

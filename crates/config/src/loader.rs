@@ -3056,7 +3056,8 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::{ChainLifecycle, ExecutionThreshold, InventoryModeTag};
+    use crate::chain::IngestionCutoffTag;
+    use crate::{ChainLifecycle, ChainRole, ExecutionThreshold, InventoryModeTag};
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -8694,6 +8695,105 @@ mod tests {
             .expect("staging config must include [broker.travel_rule]")
             .validated()
             .unwrap();
+    }
+
+    /// The shipped prod and staging configs run Robinhood Chain as a
+    /// prefunded hedge-only secondary: fills on the two launch equities are
+    /// ingested and hedged, nothing is rebalanced, and Bebop is not mapped.
+    #[test]
+    fn shipped_configs_hedge_robinhood_prefunded_without_rebalancing() {
+        let orderbook = address!("0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20");
+        let inventory = address!("0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30");
+        let expected_equities = BTreeMap::from([
+            (
+                Symbol::new("DNUT").unwrap(),
+                (
+                    address!("0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9"),
+                    address!("0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826"),
+                ),
+            ),
+            (
+                Symbol::new("FGI").unwrap(),
+                (
+                    address!("0xfEa217600e2b00bBB2172a99345016a0cEb7d29f"),
+                    address!("0x685DFd386968B58D895F934485820C479C79a8bB"),
+                ),
+            ),
+        ]);
+
+        for (name, config_str) in [
+            ("prod", include_str!("../../../config/prod/st0x-hedge.toml")),
+            (
+                "staging",
+                include_str!("../../../config/staging/st0x-hedge.toml"),
+            ),
+        ] {
+            let config: Config = toml::from_str(config_str).unwrap();
+            let robinhood = config
+                .chains
+                .get(&Chain::Robinhood)
+                .unwrap_or_else(|| panic!("{name} config must declare [chains.robinhood]"));
+            assert_eq!(robinhood.lifecycle, ChainLifecycle::Prefunded, "{name}");
+
+            let trading = robinhood
+                .trading
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} config must hedge fills on Robinhood"));
+            assert!(!trading.primary, "{name}: Robinhood is a secondary");
+            assert_eq!(trading.orderbook, orderbook, "{name}");
+            assert_eq!(trading.inventory_mode, InventoryModeTag::Managed, "{name}");
+            assert_eq!(trading.inventory, Some(inventory), "{name}");
+            assert_eq!(trading.vault_owner, inventory, "{name}");
+            assert_eq!(trading.deployment_block, 59_557_818, "{name}");
+            assert_eq!(
+                trading.ingestion_cutoff,
+                IngestionCutoffTag::Confirmations,
+                "{name}: Robinhood has no OP-Stack safe tag"
+            );
+            assert_eq!(trading.ingestion_cutoff_confirmations, Some(8000), "{name}");
+            assert_eq!(
+                trading.inventory_adapters,
+                InventoryAdapters::default(),
+                "{name}: Bebop is off on Robinhood"
+            );
+            assert_eq!(
+                trading.redemption_wallet, None,
+                "{name}: a hedge-only chain redeems nothing"
+            );
+
+            let equities: BTreeMap<Symbol, (Address, Address)> = trading
+                .assets
+                .equities
+                .symbols
+                .iter()
+                .map(|(symbol, equity)| {
+                    assert_eq!(equity.trading, OperationMode::Enabled, "{name} {symbol}");
+                    assert_eq!(
+                        equity.rebalancing,
+                        OperationMode::Disabled,
+                        "{name} {symbol}"
+                    );
+                    (
+                        symbol.clone(),
+                        (equity.tokenized_equity, equity.tokenized_equity_derivative),
+                    )
+                })
+                .collect();
+            assert_eq!(equities, expected_equities, "{name}");
+            assert!(
+                !ChainRole::Secondary.rebalances_equity(&trading.assets),
+                "{name}: no Robinhood equity may opt into rebalancing"
+            );
+
+            let alerts = AlertsCtx::new(config.alerts, &config.chains, &mut Vec::new())
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: a hedged Robinhood requires [alerts]"));
+            assert_eq!(
+                alerts.low_balance_threshold_wei(Chain::Robinhood),
+                Some(U256::from(1_000_000_000_000_000_u64)),
+                "{name}: the Robinhood gas threshold is 0.001 ETH"
+            );
+        }
     }
 
     #[test]

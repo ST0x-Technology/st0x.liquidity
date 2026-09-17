@@ -284,6 +284,67 @@ required_confirmations = 12
 lifecycle = "observe-only"
 required_confirmations = 1
 
+# Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): a prefunded
+# hedge-only secondary. Fills on its orderbook are ingested, validated
+# against USDG (pinned in code) and hedged; inventory is topped up by hand
+# and no asset may enable rebalancing (no wrapper or CCTP domain is wired
+# there). Gas is ETH. There is one Robinhood deployment, so staging watches
+# the same orderbook and inventory as prod.
+
+[chains.robinhood]
+lifecycle = "prefunded"
+# ~1 s at the ~100 ms block cadence: enough for a load-balanced RPC to have
+# seen the startup USDG approval before it is treated as settled.
+required_confirmations = 10
+
+[chains.robinhood.trading]
+# RaindexV6 on Robinhood Chain (st0x.raindex-deploy docs/CHAINS.md).
+orderbook = "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"
+inventory_mode = "managed"
+# No venue adapters: Bebop is off on Robinhood.
+inventory_adapters = []
+# The single RaindexInventory on 4663; it owns the orders and vaults, so it
+# is the vault owner too. The bot wallet must hold OPERATOR_ROLE on it.
+inventory = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
+vault_owner = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
+# Backfill floor: the orderbook's deployment block on 4663 (no code at the
+# block before it, code from this one on).
+deployment_block = 59557818
+# Base's "safe" cutoff is OP-Stack-only and this RPC does not guarantee the
+# safe/finalized tags, so ingest at a fixed depth: 8000 blocks is ~13 min at
+# the ~100 ms cadence, covering parent-chain finality.
+ingestion_cutoff = "confirmations"
+ingestion_cutoff_confirmations = 8000
+order_fill_poll_interval_secs = 5
+primary = false
+# No redemption_wallet: a hedge-only chain redeems nothing.
+
+[chains.robinhood.trading.assets.cash]
+# The USDG vault the orders quote against; polled, never rebalanced.
+vault_id = "0xfab"
+rebalancing = "disabled"
+
+# The two launch equities, addresses from st0x.registry
+# token-lists/robinhood.json (tokenized_equity = unwrappedAddress,
+# tokenized_equity_derivative = the wt token). Their broker policy tables
+# [assets.equities.DNUT] / [assets.equities.FGI] are shared with Base.
+
+[chains.robinhood.trading.assets.equities.DNUT]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9"
+tokenized_equity_derivative = "0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826"
+
+[chains.robinhood.trading.assets.equities.FGI]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xfEa217600e2b00bBB2172a99345016a0cEb7d29f"
+tokenized_equity_derivative = "0x685DFd386968B58D895F934485820C479C79a8bB"
+
 [wallet]
 kind = "turnkey"
 # Keyless Turnkey authentication (GCP only): requests are stamped by this
@@ -365,6 +426,9 @@ realert_interval = 1
 [alerts.low_balance_thresholds]
 base = "0.05"
 ethereum = "0.05"
+# Robinhood only pays for the startup USDG approval (~50k gas at ~0.05 gwei,
+# under 0.00001 ETH), so 0.001 ETH is hundreds of approvals of headroom.
+robinhood = "0.001"
 
 # USDC vault and rebalancing settings.
 [chains.base.trading.assets.cash]

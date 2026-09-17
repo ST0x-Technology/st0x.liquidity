@@ -22,11 +22,12 @@ HyperEVM chain requires an explicit HYPE threshold in
 configuration. Active mode, gas valuation and automated rebalancing on HyperEVM
 remain unavailable.
 
-Robinhood Chain (4663) is declared the same way. The build can ingest fills,
-hedge, sign and value gas on it (it pays gas in ETH), so `active` is reachable;
-rebalancing remains unavailable. The shipped configuration keeps it
-observe-only: nothing is ingested or signed until RAI-2457 adds its trading
-table and signer. It settles in USDG.
+Robinhood Chain (4663) is declared the same way and ships as a prefunded
+hedge-only secondary: fills on its two launch equities (wtDNUT, wtFGI) are
+ingested, validated against USDG and hedged, with `rebalancing = "disabled"` on
+every asset and no inventory adapter mapped. The build can also value its gas
+(it pays gas in ETH), so `active` is reachable; rebalancing remains unavailable
+there.
 
 ## Features
 
@@ -111,12 +112,11 @@ offchain polls that must diverge from the inventory view before the poller
 escalates a forced snapshot reconciliation).
 
 Each hedged chain requires its own `order_fill_poll_interval_secs`. Fill polling
-and catch-up use fixed inclusive `eth_getLogs` limits: 1000 blocks on Base and
-Ethereum, 50 on HyperEVM. Robinhood is pinned to 1000 for the trading table
-RAI-2457 adds; the shipped observe-only Robinhood ingests nothing. These
-constants require no extra config. Catch-up queues are independent per chain;
-the checkpoint advances after each batch succeeds, so a later batch failure
-resumes at the first unscanned block rather than restarting the range. See
+and catch-up use fixed inclusive `eth_getLogs` limits: 1000 blocks on Base,
+Ethereum and Robinhood, 50 on HyperEVM. These constants require no extra config.
+Catch-up queues are independent per chain; the checkpoint advances after each
+batch succeeds, so a later batch failure resumes at the first unscanned block
+rather than restarting the range. See
 [OrderFillMonitor](docs/conductor.md#orderfillmonitor) for retry behavior and
 the catch-up throughput check required before go-live.
 
