@@ -39,7 +39,8 @@ use st0x_hedge::operator::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand,
 };
 use st0x_hedge::operator::usdc_rebalance::{
-    RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
+    PreBurnFailEligibility, RebalanceDirection, ReconcileReason, UsdcRebalance,
+    UsdcRebalanceCommand, UsdcRebalanceId,
 };
 use st0x_hedge::operator::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use st0x_hedge::operator::vault_registry::{VaultRegistry, VaultRegistryId};
@@ -835,21 +836,38 @@ async fn run_usdc_transfer<Writer: Write>(
 }
 
 /// Outcome of reloading a USDC rebalance immediately after sending `FailBridging`.
-/// A pre-burn `BridgingFailed` is the intended guard-clearing result; anything
-/// else means the transfer raced past us (a burn was recorded concurrently) or
-/// landed in an unexpected state.
+/// A pre-burn `BridgingFailed` clears the guard only for BaseToAlpaca; the
+/// AlpacaToBase leg keeps it (funds already left Alpaca). Anything else means the
+/// transfer raced past us (a burn was recorded concurrently) or landed in an
+/// unexpected state.
 #[derive(Debug, PartialEq)]
 enum FailBridgingOutcome {
     GuardCleared,
+    /// Pre-burn `BridgingFailed` that STILL holds the guard: an AlpacaToBase
+    /// transfer whose withdrawal already moved the funds off Alpaca. No burn
+    /// was recorded, but the guard is retained until the operator reconciles.
+    GuardHeldPreBurn,
     ConcurrentBurn,
     Unexpected,
 }
 
 fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingOutcome {
     match state {
-        Some(UsdcRebalance::BridgingFailed {
-            burn_tx_hash: None, ..
-        }) => FailBridgingOutcome::GuardCleared,
+        // No burn recorded, but the guard result is direction-aware: an
+        // AlpacaToBase pre-burn failure keeps the guard (funds are off Alpaca),
+        // whereas a BaseToAlpaca one clears it. Classify on the durable
+        // `holds_rebalance_guard()` rather than the burn hash alone.
+        Some(
+            failed @ UsdcRebalance::BridgingFailed {
+                burn_tx_hash: None, ..
+            },
+        ) => {
+            if failed.holds_rebalance_guard() {
+                FailBridgingOutcome::GuardHeldPreBurn
+            } else {
+                FailBridgingOutcome::GuardCleared
+            }
+        }
         Some(UsdcRebalance::BridgingFailed { .. }) => FailBridgingOutcome::ConcurrentBurn,
         None
         | Some(
@@ -874,12 +892,13 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
 }
 
 /// Drive a pre-burn `BridgingSubmitting` or `WithdrawalComplete` USDC rebalance
-/// to the guard-clearing terminal `BridgingFailed { burn_tx_hash: None }`.
+/// to `BridgingFailed { burn_tx_hash: None }`.
 ///
 /// `WithdrawalComplete` is pre-CCTP-burn: no burn intent has been recorded.
 /// However, the source withdrawal has already completed and the USDC is sitting
-/// in the market-maker wallet awaiting bridging. After clearing the guard, the
-/// operator must reconcile or handle those funds separately.
+/// in the market-maker wallet awaiting bridging. The resulting guard state is
+/// direction-sensitive: BaseToAlpaca clears after restart, while AlpacaToBase
+/// remains held until the operator reconciles the withdrawn funds.
 ///
 /// `BridgingSubmitting` records burn intent but does NOT guarantee no burn was
 /// broadcast. A crash at this state may have broadcast a CCTP burn whose
@@ -892,15 +911,18 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
 /// Refuses all post-burn states (any state where `burn_tx_hash` or `cctp_nonce`
 /// is recorded, or any post-burn leg: `Bridging`, `AwaitingAttestation`,
 /// `Attested`, `Bridged`, and later deposit legs). The preflight is the
-/// authoritative guard: `transition_fail_bridging` ACCEPTS post-burn `Bridging`/
-/// `Attested` (emitting a guard-HOLDING `BridgingFailed`), so the aggregate does
-/// NOT serve as a safety net here.
+/// authoritative guard, via [`UsdcRebalance::pre_burn_fail_eligibility`]:
+/// `transition_fail_bridging` ACCEPTS post-burn `Bridging`/`Attested` (emitting
+/// a guard-HOLDING `BridgingFailed`), so the aggregate does NOT serve as a
+/// safety net here.
 ///
-/// The command is CLI-direct (no running bot required). The live in-memory
-/// `usdc_in_progress` guard is NOT cleared by this command. A bot restart is
-/// required: `recover_usdc_guard` on startup skips
-/// `BridgingFailed { burn_tx_hash: None }` (non-guard-holding) and does not
-/// re-latch the guard.
+/// This offline command writes directly to the local database and MUST run only
+/// while the bot is stopped. Its standalone store does not notify the running
+/// bot's reactor, so stopping the bot also eliminates the race with a worker
+/// advancing the transfer between preflight and send. When the bot is running,
+/// use the live `st0x-liquidity-client debug fail-usdc-transfer` command instead;
+/// that route quiesces the USDC driver and sends through the wired store so the
+/// in-memory guard is updated immediately.
 pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
@@ -921,122 +943,42 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         );
     };
 
-    // AUTHORITATIVE post-burn guard: transition_fail_bridging accepts Bridging/
-    // AwaitingAttestation/Attested and emits guard-HOLDING BridgingFailed.
-    // This preflight is the only thing preventing an operator from accidentally
-    // clearing the guard on a transfer where CCTP may have already broadcast.
-    // Uses exhaustive match so new UsdcRebalance variants cause a compile error.
-    // BaseToAlpaca ConversionFailed is post-deposit/post-burn (holds the guard
-    // per holds_rebalance_guard()); AlpacaToBase ConversionFailed is pre-withdrawal.
-    let is_post_burn = match &state {
-        UsdcRebalance::Bridging { .. }
-        | UsdcRebalance::AwaitingAttestation { .. }
-        | UsdcRebalance::Attested { .. }
-        | UsdcRebalance::Bridged { .. }
-        | UsdcRebalance::DepositInitiated { .. }
-        | UsdcRebalance::DepositConfirmed { .. }
-        | UsdcRebalance::DepositFailed { .. }
-        | UsdcRebalance::Reconciled { .. }
-        | UsdcRebalance::ConversionFailed {
-            direction: RebalanceDirection::BaseToAlpaca,
-            ..
+    match state.pre_burn_fail_eligibility() {
+        PreBurnFailEligibility::Eligible => {}
+        PreBurnFailEligibility::PostBurn => {
+            anyhow::bail!(
+                "fail-usdc-transfer: transfer {id} is in a post-burn state. \
+                 A CCTP burn may have already been broadcast. Refusing to act -- \
+                 use `transfer resume` to adopt/await a recorded in-flight burn \
+                 (BridgingSubmitting with a recorded tx), `clear-pending-burn` if the \
+                 recorded burn was dropped and verified absent on-chain, or \
+                 `transfer reconcile` for a confirmed post-burn failure."
+            );
         }
-        // A recorded pending burn (`pending_burn_tx: Some`) means a CCTP burn was
-        // broadcast and durably recorded before its receipt was confirmed. Treat it
-        // as POST-burn so `fail-usdc-transfer` cannot clear the guard while a burn
-        // may already be on-chain (use `transfer resume`, which checks burn_status
-        // and adopts/waits/pages). Only `pending_burn_tx: None` is genuinely pre-burn.
-        | UsdcRebalance::BridgingSubmitting {
-            pending_burn_tx: Some(_),
-            ..
-        } => true,
-        UsdcRebalance::BridgingFailed { burn_tx_hash, .. } => burn_tx_hash.is_some(),
-        UsdcRebalance::Converting { .. }
-        | UsdcRebalance::ConversionComplete { .. }
-        | UsdcRebalance::ConversionFailed {
-            direction: RebalanceDirection::AlpacaToBase,
-            ..
+        // Already the pre-burn failed terminal, so there is nothing to fail
+        // again. Whether the operator is done depends on the direction: an
+        // AlpacaToBase failure still holds the guard (the withdrawn funds are
+        // off Alpaca) until `transfer reconcile` settles them, whereas a
+        // BaseToAlpaca failure is already in its cleared state.
+        PreBurnFailEligibility::AlreadyFailedPreBurn => {
+            if state.holds_rebalance_guard() {
+                anyhow::bail!(
+                    "fail-usdc-transfer: transfer {id} is already in pre-burn BridgingFailed \
+                     (burn_tx_hash: None), but the rebalancing guard is still held because the \
+                     withdrawn funds left Alpaca. Settle them with `transfer reconcile --kind \
+                     usdc` to release the guard."
+                );
+            }
+            anyhow::bail!(
+                "fail-usdc-transfer: transfer {id} is already in pre-burn BridgingFailed \
+                 (burn_tx_hash: None). The rebalancing guard is already in its cleared state \
+                 and will not re-arm on restart. No action needed."
+            );
         }
-        | UsdcRebalance::WithdrawalSubmitting { .. }
-        | UsdcRebalance::Withdrawing { .. }
-        | UsdcRebalance::WithdrawalFailed { .. }
-        | UsdcRebalance::WithdrawalComplete { .. }
-        | UsdcRebalance::BridgingSubmitting {
-            pending_burn_tx: None,
-            ..
-        } => false,
-    };
-
-    if is_post_burn {
-        anyhow::bail!(
-            "fail-usdc-transfer: transfer {id} is in a post-burn state. \
-             A CCTP burn may have already been broadcast. Refusing to act -- \
-             use `transfer resume` to adopt/await a recorded in-flight burn \
-             (BridgingSubmitting with a recorded tx), `clear-pending-burn` if the \
-             recorded burn was dropped and verified absent on-chain, or \
-             `transfer reconcile` for a confirmed post-burn failure."
-        );
-    }
-
-    // Early check: already in the pre-burn failed terminal. The guard is already
-    // cleared (holds_rebalance_guard() returns false for burn_tx_hash: None) and
-    // will not re-arm on restart. No action is needed and re-running would be a
-    // no-op at best; return a clear error so the operator knows the state is good.
-    if matches!(
-        state,
-        UsdcRebalance::BridgingFailed {
-            burn_tx_hash: None,
-            cctp_nonce: None,
-            ..
-        }
-    ) {
-        anyhow::bail!(
-            "fail-usdc-transfer: transfer {id} is already in pre-burn BridgingFailed \
-             (burn_tx_hash: None). The rebalancing guard is already in its cleared state \
-             and will not re-arm on restart. No action needed."
-        );
-    }
-
-    // Second gate: only BridgingSubmitting and WithdrawalComplete are accepted
-    // by transition_fail_bridging. Pre-bridge states (Converting, Withdrawing,
-    // etc.) return BridgingNotInitiated. Give the operator a clear error instead
-    // of surfacing the internal aggregate error message.
-    //
-    // Exhaustive match: new UsdcRebalance variants must be placed explicitly so
-    // the compiler flags unhandled variants at the gate boundary.
-    //
-    // Note: BridgingFailed reaches here only when burn_tx_hash is Some (the
-    // early idempotency check above consumed burn_tx_hash:None, and is_post_burn
-    // above rejected burn_tx_hash:Some via the post-burn gate). It is listed in
-    // the bail group for exhaustiveness.
-    match &state {
-        UsdcRebalance::WithdrawalComplete { .. }
-        | UsdcRebalance::BridgingSubmitting {
-            pending_burn_tx: None,
-            ..
-        } => {}
-        // `BridgingSubmitting { pending_burn_tx: Some(_) }` was already rejected by
-        // the post-burn gate above (a recorded burn may be on-chain); listed here
-        // for match exhaustiveness.
-        UsdcRebalance::BridgingSubmitting {
-            pending_burn_tx: Some(_),
-            ..
-        }
-        | UsdcRebalance::Converting { .. }
-        | UsdcRebalance::ConversionComplete { .. }
-        | UsdcRebalance::ConversionFailed { .. }
-        | UsdcRebalance::Withdrawing { .. }
-        | UsdcRebalance::WithdrawalSubmitting { .. }
-        | UsdcRebalance::WithdrawalFailed { .. }
-        | UsdcRebalance::Bridging { .. }
-        | UsdcRebalance::AwaitingAttestation { .. }
-        | UsdcRebalance::Attested { .. }
-        | UsdcRebalance::Bridged { .. }
-        | UsdcRebalance::BridgingFailed { .. }
-        | UsdcRebalance::DepositInitiated { .. }
-        | UsdcRebalance::DepositConfirmed { .. }
-        | UsdcRebalance::DepositFailed { .. }
-        | UsdcRebalance::Reconciled { .. } => {
+        // Pre-bridge states (Converting, Withdrawing, etc.) are rejected by
+        // transition_fail_bridging with BridgingNotInitiated. Give the operator
+        // a clear error instead of surfacing the internal aggregate error.
+        PreBurnFailEligibility::NotAtBridgeBoundary => {
             anyhow::bail!(
                 "fail-usdc-transfer is only valid from BridgingSubmitting (no recorded burn) \
                  or WithdrawalComplete; transfer {id} is in {state:?}. Refusing to act."
@@ -1077,6 +1019,15 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
                 "USDC transfer {id} transitioned to BridgingFailed (pre-burn, no burn \
                  recorded at transition time). The rebalancing guard will clear on the \
                  next bot restart."
+            )?;
+        }
+        FailBridgingOutcome::GuardHeldPreBurn => {
+            writeln!(
+                stdout,
+                "USDC transfer {id} transitioned to BridgingFailed (pre-burn, no burn \
+                 recorded at transition time). The withdrawn funds already left Alpaca, so \
+                 the rebalancing guard remains HELD and re-arms on restart. Settle the \
+                 funds and release the guard with `transfer reconcile --kind usdc`."
             )?;
         }
         FailBridgingOutcome::ConcurrentBurn => {
@@ -3516,6 +3467,39 @@ mod tests {
             .unwrap();
     }
 
+    /// Seeds an AlpacaToBase transfer to `WithdrawalComplete`: the conversion
+    /// leg runs first, then the Alpaca withdrawal confirms. The funds are off
+    /// Alpaca, so a pre-burn failure from here holds the guard.
+    async fn seed_to_alpaca_to_base_withdrawal_complete(
+        store: &st0x_event_sorcery::Store<UsdcRebalance>,
+        id: Uuid,
+    ) {
+        let usdc_id = UsdcRebalanceId(id);
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
+        for command in [
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xA70B)),
+            },
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: ConversionAmounts::new(amount, amount),
+            },
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::OnchainTx(b256!(
+                    "0x00000000000000000000000000000000000000000000000000000000000000a7"
+                )),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        ] {
+            store.send(&usdc_id, command).await.unwrap();
+        }
+    }
+
     // Seeds from WithdrawalComplete to BridgingSubmitting via BeginBridging.
     async fn seed_to_bridging_submitting(
         store: &st0x_event_sorcery::Store<UsdcRebalance>,
@@ -3742,6 +3726,64 @@ mod tests {
         assert!(
             err_msg.contains("No action needed"),
             "Error must tell the operator no action is needed; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_usdc_transfer_directs_alpaca_to_base_to_reconcile_when_already_failed() {
+        // An AlpacaToBase transfer failed pre-burn from WithdrawalComplete lands
+        // in BridgingFailed { burn_tx_hash: None } but STILL holds the guard: the
+        // withdrawal moved the funds off Alpaca. Re-running the command must send
+        // the operator to `transfer reconcile`, not claim no action is needed.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0009);
+
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_alpaca_to_base_withdrawal_complete(&store, id).await;
+
+        // First run fails the pre-burn transfer. Because the funds already left
+        // Alpaca, the success message must report the guard is still held and
+        // send the operator to reconcile -- NOT that it clears on restart.
+        let mut stdout = Vec::new();
+        fail_usdc_transfer_command(&mut stdout, id, &"manual fail".parse().unwrap(), &pool)
+            .await
+            .unwrap();
+        let first_run = String::from_utf8(stdout).unwrap();
+        assert!(
+            first_run.contains("guard remains HELD"),
+            "AlpacaToBase pre-burn failure must report the guard is still held; got: {first_run}"
+        );
+        assert!(
+            first_run.contains("transfer reconcile --kind usdc"),
+            "it must direct the operator to reconcile; got: {first_run}"
+        );
+        assert!(
+            !first_run.contains("guard will clear"),
+            "it must not claim the guard clears on restart; got: {first_run}"
+        );
+
+        // Second run: already BridgingFailed, but AlpacaToBase still holds the
+        // guard, so the operator must be directed to reconcile.
+        let mut stdout = Vec::new();
+        let err_msg =
+            fail_usdc_transfer_command(&mut stdout, id, &"re-fail".parse().unwrap(), &pool)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err_msg.contains("already in pre-burn BridgingFailed"),
+            "got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("transfer reconcile --kind usdc"),
+            "AlpacaToBase re-fail must direct the operator to reconcile; got: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("No action needed"),
+            "the guard is still held, so it must not say no action is needed; got: {err_msg}"
         );
     }
 
@@ -4279,6 +4321,29 @@ mod tests {
             classify_fail_bridging_reload(pre_burn_state.as_ref()),
             FailBridgingOutcome::GuardCleared,
             "pre-burn BridgingFailed must classify as GuardCleared"
+        );
+
+        // Case 1b: AlpacaToBase pre-burn BridgingFailed (GuardHeldPreBurn).
+        // Same "no burn recorded" shape as Case 1, but the withdrawal already
+        // moved the funds off Alpaca, so the guard is retained -- the classifier
+        // must read the direction-aware guard, not the burn hash alone.
+        let id_guard_held = Uuid::from_u128(0xC1A5_0004);
+        seed_to_alpaca_to_base_withdrawal_complete(&store, id_guard_held).await;
+        store
+            .send(
+                &UsdcRebalanceId(id_guard_held),
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "alpaca-to-base pre-burn test".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let guard_held_state = store.load(&UsdcRebalanceId(id_guard_held)).await.unwrap();
+        assert_eq!(
+            classify_fail_bridging_reload(guard_held_state.as_ref()),
+            FailBridgingOutcome::GuardHeldPreBurn,
+            "AlpacaToBase pre-burn BridgingFailed still holds the guard, so it must \
+             classify as GuardHeldPreBurn, not GuardCleared"
         );
 
         // Case 2: post-burn BridgingFailed (ConcurrentBurn).

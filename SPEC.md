@@ -5143,21 +5143,42 @@ verify on-chain that no recent CCTP burn left the market-maker wallet before
 using `fail-usdc-transfer` on a `BridgingSubmitting` transfer. Using it when a
 burn was already broadcast will strand the burned funds.
 
-The `fail-usdc-transfer` CLI command sends `FailBridging { reason }`, which
-emits `BridgingFailed { burn_tx_hash: None, cctp_nonce: None }`. The guard
-outcome depends on the direction. For a BaseToAlpaca transfer no funds left the
-source venue: `holds_rebalance_guard()` returns false, and the guard is NOT
-re-latched on the next startup. For an AlpacaToBase transfer the withdrawal
+The `fail-usdc-transfer` operation sends `FailBridging { reason }`, which emits
+`BridgingFailed { burn_tx_hash: None, cctp_nonce: None }`. It runs two ways. The
+offline `stox fail-usdc-transfer` CLI operates directly on the local CQRS state
+with the bot stopped -- the bot must be stopped to eliminate the race where a
+worker advances the transfer to `Bridging` between the preflight and the send.
+The live ops-API route `POST /liquidity-write/transfers/usdc/{id}/fail` (client:
+`st0x-liquidity-client debug fail-usdc-transfer`) runs in the bot process and
+does NOT require stopping it: it holds the shared resume lock (so it cannot race
+`/transfers/usdc/resume` or `/transfers/recheck`) and quiesces the USDC driver
+through the recovery handle's `usdc_driver_pause` for the duration of the send,
+so no worker can advance the transfer or adopt a burn between the preflight and
+the send. Both send the same `FailBridging` command; the eligibility gate
+(`pre_burn_fail_eligibility`) is the single source shared by both, so both
+refuse the same post-burn states.
+
+The guard outcome depends on the direction. For a BaseToAlpaca transfer no funds
+left the source venue: `holds_rebalance_guard()` returns false, and the guard is
+NOT re-latched on the next startup. For an AlpacaToBase transfer the withdrawal
 already completed, so the funds are off Alpaca: `holds_rebalance_guard()`
 returns true, the guard IS re-latched on the next startup, and the operator
 settles the funds with `transfer reconcile --kind usdc`, which releases the
-guard. The command is valid ONLY from `BridgingSubmitting` or
-`WithdrawalComplete` -- it is refused for all post-burn states (`Bridging`,
-`AwaitingAttestation`, `Attested`, `Bridged`, `DepositInitiated`,
-`DepositConfirmed`, `DepositFailed`, `Reconciled`, or any `BridgingFailed` with
-a recorded `burn_tx_hash`). The live in-memory guard is NOT cleared without a
-restart: `recover_usdc_guard` on boot skips non-guard-holding aggregates, so
-automatic USDC rebalancing resumes on the next restart.
+guard. The live route reports this split in its `guardHeld` response field. The
+command is valid ONLY from `BridgingSubmitting` or `WithdrawalComplete` -- it is
+refused for all post-burn states (`Bridging`, `AwaitingAttestation`, `Attested`,
+`Bridged`, `DepositInitiated`, `DepositConfirmed`, `DepositFailed`,
+`Reconciled`, or any `BridgingFailed` with a recorded `burn_tx_hash`). The two
+surfaces differ in how the in-memory guard is reconciled. The live route sends
+`FailBridging` through the conductor-built wired store, so the rebalancing
+reactor runs in-process and reconciles the in-memory guard and inventory
+immediately: it clears the guard for a non-guard-holding (BaseToAlpaca) outcome
+and keeps it latched for an AlpacaToBase one, matching the reported `guardHeld`.
+The offline CLI writes through a standalone store the (stopped) bot's reactor
+never observes, so its outcome is reconciled on the next startup:
+`recover_usdc_guard` clears a non-guard-holding aggregate and re-latches an
+AlpacaToBase one until the operator reconciles. Either way, once the guard is
+released automatic USDC rebalancing resumes.
 
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further
