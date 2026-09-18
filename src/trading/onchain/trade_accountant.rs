@@ -698,7 +698,6 @@ pub enum SymbolScopedReason {
 }
 
 impl SymbolScopedReason {
-    /// Returns the bounded metrics label for this symbol-scoped failure stage.
     pub(crate) const fn metric_label(self) -> &'static str {
         match self {
             Self::MarkFetch => "mark_fetch",

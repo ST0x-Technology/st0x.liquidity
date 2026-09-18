@@ -120,7 +120,6 @@ impl TradeProtocol {
         serde_json::to_value(self.entry(trade))
     }
 
-    /// Adapts a trade to the response shape selected by this protocol version.
     pub(crate) const fn entry(self, trade: &Trade) -> TradeEntry<'_> {
         match self {
             Self::LegacyFills | Self::TerminalOutcomesV2 => {
@@ -728,7 +727,6 @@ mod tests {
         assert!(asset.rebalancing);
     }
 
-    /// Builds an application state with migrated in-memory storage for dashboard tests.
     async fn create_test_state() -> AppState {
         let (sender, _) = broadcast::channel(256);
         let pool = SqlitePool::connect(":memory:").await.unwrap();
