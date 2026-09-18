@@ -502,9 +502,10 @@ impl Executor for MockExecutor {
             session,
             session_opens_at: None,
             regular_session_closes_at: self.regular_session_closes_at_override,
-            extended_session_closes_at: (session == MarketSession::Extended)
-                .then(|| self.extended_session_closes_at_override)
-                .flatten(),
+            extended_session_closes_at: match session {
+                MarketSession::Extended => self.extended_session_closes_at_override,
+                _ => None,
+            },
             post_close_gap: if session == MarketSession::Extended {
                 self.post_close_gap_override
             } else {

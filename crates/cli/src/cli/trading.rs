@@ -69,7 +69,7 @@ impl OrderPlacer for CliOrderPlacer {
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
-            placed_at: Utc::now(),
+            placed_at: placement.placed_at,
             is_extended_hours: placement.extended_hours,
             limit_price: placement.limit_price,
         })

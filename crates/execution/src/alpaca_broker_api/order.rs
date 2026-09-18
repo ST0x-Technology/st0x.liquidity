@@ -569,9 +569,6 @@ pub(super) async fn place_market_order(
     })
 }
 
-/// Converts the broker-reported limit price into the domain type, failing
-/// fast on a non-positive value rather than silently dropping it.
-
 fn broker_order_placed_at(
     order_id: Uuid,
     created_at: Option<DateTime<Utc>>,
@@ -585,6 +582,8 @@ fn broker_order_placed_at(
         })
 }
 
+/// Converts the broker-reported limit price into the domain type, failing
+/// fast on a non-positive value rather than silently dropping it.
 pub(super) fn parse_limit_price(
     limit_price: Option<Float>,
 ) -> Result<Option<Positive<Usd>>, AlpacaBrokerApiError> {
