@@ -1,36 +1,32 @@
-//! Projection-maintenance pause for projection writes issued through the generic
-//! apalis worker path.
+//! Projection-maintenance pause for every in-process projection writer.
 //!
 //! Event-sorcery folds projections synchronously inside `Store::send`.
-//! [`work`](super::job::work) calls [`enter_projection_gate`] and holds the
-//! returned slot for the whole job, so pausing the gate serializes a rebuild
-//! against projection writes emitted by those workers.
-//!
-//! Operator HTTP write routes are not currently covered. Routes that call
-//! `Store::send` directly do not enter this gate and remain ungated. Publishing
-//! [`ProjectionMaintenance`] on recovery state exposes the controller but does
-//! not gate those direct-send paths.
+//! [`work`](super::job::work) claims a slot for generic apalis jobs, the
+//! inventory monitor claims one around each poll, and operator HTTP handlers
+//! claim one around direct write operations. A rebuild pauses the shared gate,
+//! waits for existing slots to drain, and holds the pause through delete and
+//! replay.
 //!
 //! This is a thin wrapper over the shared [`Quiesce`](crate::quiesce) primitive.
-//! The worker gate is process-global: `work` is built through the worker macros
-//! with no seam to thread per-worker data, and there is exactly one conductor
-//! per process.
+//! The apalis worker side is process-global because `work` is built through
+//! worker macros with no seam to thread per-worker data. The controller also
+//! owns a clone of the same gate for explicitly wired writers.
 
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::quiesce::{self, NotQuiesced, Quiesce, QuiesceGate, QuiesceGuard};
 
-/// How long a rebuild waits for in-flight worker projection writes to drain
-/// before refusing. Coarse: a write is gated for the whole apalis job that
-/// emits it, so a long-running job holds the gate for its duration. A rebuild
-/// is a rare operator action taken at a quiet moment, so refusing while a long
-/// job runs and asking the operator to retry is acceptable.
+/// How long a rebuild waits for in-flight projection writers to drain before
+/// refusing. Coarse: generic apalis jobs and inventory polls hold their slots
+/// for the whole operation. A rebuild is a rare operator action taken at a
+/// quiet moment, so refusing while a long operation runs and asking the
+/// operator to retry is acceptable.
 const PROJECTION_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Process-global worker gate, read by the generic apalis handler
-/// [`work`](super::job::work). Set once at conductor startup, before any worker
-/// is built, by [`init_projection_maintenance`].
+/// [`work`](super::job::work). Set once during server startup, before the
+/// conductor builds any worker, by [`init_projection_maintenance`].
 static PROJECTION_GATE: OnceLock<QuiesceGate> = OnceLock::new();
 
 /// Projection writers did not quiesce within [`PROJECTION_QUIESCE_TIMEOUT`], so
@@ -39,28 +35,45 @@ static PROJECTION_GATE: OnceLock<QuiesceGate> = OnceLock::new();
 #[error("projection writers did not quiesce: a job or write is in flight")]
 pub(crate) struct ProjectionBusy;
 
-/// Controller side, held by the rebuild route. Pausing quiesces the gated
-/// worker projection writes for the guard's lifetime; direct-send routes remain
-/// outside this gate.
-pub(crate) struct ProjectionMaintenance(Quiesce);
+/// Shared controller and explicit-writer side of projection maintenance.
+pub(crate) struct ProjectionMaintenance {
+    control: Quiesce,
+    gate: QuiesceGate,
+}
 
 impl ProjectionMaintenance {
-    /// Requests a pause and returns once every gated projection writer has
-    /// drained and none can start. The guard resumes them when dropped, so a
-    /// caller cannot forget to resume on an error or panic path. Returns
+    fn new() -> Self {
+        let (control, gate) = quiesce::quiesce(PROJECTION_QUIESCE_TIMEOUT);
+        Self { control, gate }
+    }
+
+    /// Claims a slot for an explicitly wired projection writer, parking while a
+    /// rebuild is paused. The caller holds the returned token for its complete
+    /// read/write operation.
+    pub(crate) async fn enter(&self) -> ProjectionWrite {
+        ProjectionWrite {
+            _inner: self.gate.enter().await,
+        }
+    }
+
+    /// Requests a pause and returns once every projection writer has drained
+    /// and none can start. The guard resumes them when dropped, so a caller
+    /// cannot forget to resume on an error or panic path. Returns
     /// [`ProjectionBusy`] when writers are still in flight after
     /// [`PROJECTION_QUIESCE_TIMEOUT`], leaving them running.
-    // Consumed by the `rebuild_materialized_view` route in
-    // `rai-2248-view-cctp-recovery`, restacked on top of this branch (RAI-2436);
-    // remove this allow when that route lands the `pause()` call site.
-    #[allow(dead_code)]
     pub(crate) async fn pause(&self) -> Result<ProjectionMaintenanceGuard, ProjectionBusy> {
-        self.0
+        self.control
             .pause()
             .await
             .map(|guard| ProjectionMaintenanceGuard { _inner: guard })
             .map_err(|NotQuiesced| ProjectionBusy)
     }
+}
+
+/// An explicitly wired projection writer's claim on the shared maintenance
+/// gate.
+pub(crate) struct ProjectionWrite {
+    _inner: quiesce::InFlight,
 }
 
 /// Resumes the gated writers when dropped, via the inner [`QuiesceGuard`]'s
@@ -69,18 +82,17 @@ pub(crate) struct ProjectionMaintenanceGuard {
     _inner: QuiesceGuard,
 }
 
-/// Builds the projection-maintenance controller and publishes its worker gate to
-/// the process global that [`work`](super::job::work) reads. Called once at
-/// conductor startup. The returned controller lets the rebuild route pause the
-/// generic worker writers; publishing it does not gate direct-send HTTP routes.
+/// Builds the projection-maintenance controller and publishes its apalis-worker
+/// gate to the process global that [`work`](super::job::work) reads. Called once
+/// before the conductor and HTTP server start.
 ///
-/// A second call (a second conductor in one test process) keeps the first gate;
-/// harmless because the production `work` is the sole global reader and there is
-/// one conductor per process.
+/// A second call (a second conductor in one test process) keeps the first
+/// process-global gate. Production has one conductor; isolated tests use
+/// [`ProjectionMaintenance::for_test`] instead.
 pub(crate) fn init_projection_maintenance() -> ProjectionMaintenance {
-    let (control, gate) = quiesce::quiesce(PROJECTION_QUIESCE_TIMEOUT);
-    let _ = PROJECTION_GATE.set(gate);
-    ProjectionMaintenance(control)
+    let maintenance = ProjectionMaintenance::new();
+    let _ = PROJECTION_GATE.set(maintenance.gate.clone());
+    maintenance
 }
 
 /// Claims a projection-write slot for the generic apalis handler
@@ -99,12 +111,14 @@ pub(crate) async fn enter_projection_gate() -> Option<quiesce::InFlight> {
 
 #[cfg(test)]
 impl ProjectionMaintenance {
-    /// A controller wired to a fresh, non-global gate, so a test drives the pause
-    /// against its own writers without touching the process-global
-    /// [`PROJECTION_GATE`] that `work` reads.
-    fn with_gate_for_test() -> (Self, QuiesceGate) {
-        let (control, gate) = quiesce::quiesce(PROJECTION_QUIESCE_TIMEOUT);
-        (Self(control), gate)
+    /// A controller wired to a fresh, non-global gate, so tests cannot park
+    /// another test's process-global workers.
+    pub(crate) fn for_test() -> Self {
+        Self::new()
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.gate.is_paused()
     }
 }
 
@@ -122,13 +136,12 @@ mod tests {
     #[allow(clippy::significant_drop_tightening)]
     #[tokio::test]
     async fn pause_drains_an_in_flight_writer_then_blocks_new_ones() {
-        let (control, gate) = ProjectionMaintenance::with_gate_for_test();
-        let writing = gate.enter().await;
+        let control = std::sync::Arc::new(ProjectionMaintenance::for_test());
+        let writing = control.enter().await;
 
-        // The pause cannot complete while a write is in flight. The guard owns
-        // watch-sender clones, not a borrow of `control`, so it stays valid after
-        // the spawned task drops `control`.
-        let pause = tokio::spawn(async move { control.pause().await.ok() });
+        // The pause cannot complete while a write is in flight.
+        let pause_control = std::sync::Arc::clone(&control);
+        let pause = tokio::spawn(async move { pause_control.pause().await.ok() });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             !pause.is_finished(),
@@ -144,13 +157,13 @@ mod tests {
 
         // No new writer may claim the gate while the pause is held.
         assert!(
-            gate.try_enter().is_none(),
+            control.gate.try_enter().is_none(),
             "a held pause must block new projection writers"
         );
 
         drop(guard);
         assert!(
-            gate.try_enter().is_some(),
+            control.gate.try_enter().is_some(),
             "resuming must admit projection writers again"
         );
     }

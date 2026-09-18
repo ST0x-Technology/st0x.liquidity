@@ -20,6 +20,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
+use st0x_bridge::BridgeDirection;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -75,7 +76,8 @@ use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
 };
 use crate::rebalancing::usdc::{
-    DriverNotQuiesced, RecheckUsdcDeposit, UsdcDriverPause, UsdcDriverPauseGuard, UsdcRecheckError,
+    CctpMintRecoveryError, DriverNotQuiesced, RecheckUsdcDeposit, RecoverCctpMint, UsdcDriverPause,
+    UsdcDriverPauseGuard, UsdcRecheckError,
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
@@ -85,6 +87,7 @@ use crate::usdc_rebalance::{
     PreBurnFailEligibility, RebalanceDirection, ReconcileReason, UsdcRebalance,
     UsdcRebalanceCommand, UsdcRebalanceId,
 };
+use crate::view_rebuild::{RebuildScope, RebuildableView, rebuild_view};
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
@@ -1322,6 +1325,10 @@ pub(crate) struct RecoveryHandle {
     /// Runs in the bot process, so the recovery events reach the live
     /// trigger reactor and clear the in-progress guard without a restart.
     pub(crate) usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    /// Operator `cctp complete-mint` entry point: polls the attestation for a
+    /// burn and submits the destination mint through the bot's own bridge and
+    /// wallet, under the driver pause so no worker drives the same mint.
+    pub(crate) cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     /// Pause control for the USDC rebalancing driver. A write route that must
     /// read then mutate a USDC rebalance, or spend the rebalancing wallet,
     /// quiesces the workers through it first and resumes them on every exit.
@@ -1332,14 +1339,6 @@ pub(crate) struct RecoveryHandle {
     /// to the durable outcome. A standalone store would bypass the reactor and
     /// leave the running bot latched with `guardHeld: false` reported.
     pub(crate) usdc_store: Arc<Store<UsdcRebalance>>,
-    /// Projection-maintenance pause control (RAI-2436): a rebuild route quiesces
-    /// every projection writer through it before it deletes and replays a
-    /// materialized view. Consumed by the `rebuild_materialized_view` route in
-    /// `rai-2248-view-cctp-recovery`, restacked on top of this branch; unread
-    /// here until that route lands.
-    #[allow(dead_code)]
-    pub(crate) projection_maintenance:
-        Arc<crate::conductor::projection_pause::ProjectionMaintenance>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
@@ -1364,12 +1363,13 @@ pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
 /// quiesce window. The guard resumes the driver when dropped.
 async fn quiesce_usdc_driver(
     pause: &UsdcDriverPause,
-    rebalance_id: &UsdcRebalanceId,
+    rebalance_id: Option<&UsdcRebalanceId>,
     resume_direction: Option<RebalanceDirection>,
 ) -> Result<UsdcDriverPauseGuard, (StatusCode, Json<ErrorResponse>)> {
     pause.pause().await.map_err(|DriverNotQuiesced| {
+        let rebalance_id = rebalance_id.map(ToString::to_string);
         warn!(
-            %rebalance_id,
+            rebalance_id = %rebalance_id.as_deref().unwrap_or("unavailable"),
             ?resume_direction,
             "USDC driver did not quiesce for an operator write; refusing"
         );
@@ -1486,6 +1486,7 @@ async fn resume_transfers(
                 }),
             )
         })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let mints_attempted = mints.len();
     let redemptions_attempted = redemptions.len();
@@ -1588,6 +1589,7 @@ async fn fail_transfer(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     crate::operator::equity_transfer::fail_transfer_in_process(
         &handle.mint_store,
@@ -1694,6 +1696,7 @@ async fn recheck_transfer(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let outcome = match kind {
         TransferKind::EquityMint => {
@@ -1744,7 +1747,7 @@ async fn recheck_transfer(
             // dropping the recheck mid step could strand the aggregate, and each
             // call inside it is already transport bounded.
             let _driver_paused =
-                quiesce_usdc_driver(&handle.usdc_driver_pause, &rebalance_id, None).await?;
+                quiesce_usdc_driver(&handle.usdc_driver_pause, Some(&rebalance_id), None).await?;
 
             let outcome = handle
                 .usdc_recheck
@@ -1895,8 +1898,12 @@ async fn resume_usdc_transfer(
     // Quiesce the workers so the resume's preflight (durable holder scan and
     // job row dedupe) and its enqueue cannot straddle an execution already in
     // flight for the same aggregate.
-    let _driver_paused =
-        quiesce_usdc_driver(&handle.usdc_driver_pause, &rebalance_id, Some(direction)).await?;
+    let _driver_paused = quiesce_usdc_driver(
+        &handle.usdc_driver_pause,
+        Some(&rebalance_id),
+        Some(direction),
+    )
+    .await?;
 
     handle
         .rebalancing_service
@@ -2215,6 +2222,7 @@ async fn reconcile_usdc_transfer(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     reconcile_stuck_usdc_transfer(&handle.usdc_store, &id, reason).await
 }
@@ -2290,6 +2298,7 @@ async fn clear_pending_usdc_burn(
             }),
         ));
     }
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(state.pool.clone())
         .build(())
@@ -2417,8 +2426,9 @@ async fn fail_usdc_transfer(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
-    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, &id, None).await?;
+    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, Some(&id), None).await?;
 
     let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
     Ok(Json(response))
@@ -2503,6 +2513,298 @@ async fn fail_pre_burn_usdc_transfer(
     })
 }
 
+/// Wire contract for the view rebuild route: exactly one of `id` (one
+/// aggregate's view) or `all: true` (every row).
+#[derive(Deserialize)]
+struct RebuildViewRequest {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RebuildViewResponse {
+    view: &'static str,
+    /// The rebuilt aggregate id, or `null` for a whole-view rebuild.
+    id: Option<String>,
+    /// Events replayed; reported by the read models only.
+    replayed: Option<u64>,
+}
+
+/// Rebuilds a materialized view or read model by deleting its rows and
+/// replaying the event log, the escape hatch for a corrupted view. Available
+/// only after startup completes. The projection-maintenance guard first drains
+/// live apalis jobs, inventory polling, and direct HTTP writers, then excludes
+/// new writers through the full delete/replay window.
+///
+/// Mirrors `stox view rebuild`; the `{view}` segment is the CLI's
+/// `--aggregate` value (`position`, `offchain-order`, `vault-registry`,
+/// `rebalance-timing`, `equity-timing`, `lifecycle-failure`,
+/// `portfolio-snapshot`).
+async fn rebuild_materialized_view(
+    State(state): State<AppState>,
+    Path(view): Path<String>,
+    Json(request): Json<RebuildViewRequest>,
+) -> Result<Json<RebuildViewResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let view = <RebuildableView as clap::ValueEnum>::from_str(&view, false).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Unknown view {view:?}"),
+            }),
+        )
+    })?;
+
+    let scope = match (request.id, request.all) {
+        (Some(id), false) => RebuildScope::Id(id),
+        (None, true) => RebuildScope::All,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "pass exactly one of id or all: true".to_string(),
+                }),
+            ));
+        }
+    };
+    if !state.health.is_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "View rebuild is unavailable until startup completes".to_string(),
+            }),
+        ));
+    }
+
+    let _projection_paused = state
+        .projection_maintenance
+        .pause()
+        .await
+        .map_err(|error| {
+            warn!(%error, "Projection writers did not quiesce for view rebuild");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Projection writes are still in flight; retry the rebuild".to_string(),
+                }),
+            )
+        })?;
+
+    let rebuilt = rebuild_view(&state.pool, view, scope)
+        .await
+        .map_err(|error| {
+            if error.is_caller_error() {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: error.to_string(),
+                    }),
+                )
+            } else {
+                ops_store_error(error)
+            }
+        })?;
+
+    let id = match rebuilt.scope {
+        RebuildScope::Id(id) => Some(id),
+        RebuildScope::All => None,
+    };
+    info!(view = %rebuilt.view, ?id, replayed = ?rebuilt.replayed, "View rebuilt via API");
+    Ok(Json(RebuildViewResponse {
+        view: rebuilt.view.name(),
+        id,
+        replayed: rebuilt.replayed,
+    }))
+}
+
+/// Wire contract for the CCTP mint recovery route.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteCctpMintRequest {
+    /// Transaction hash of the burn on the source chain.
+    burn_tx: String,
+    /// Chain the burn happened on; the mint lands on the other one.
+    source_chain: CctpSourceChain,
+}
+
+/// The burn's chain, kebab-cased on the wire (`ethereum`, `base`), matching
+/// the CLI's `--source-chain` value.
+#[derive(Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "kebab-case")]
+enum CctpSourceChain {
+    Ethereum,
+    Base,
+}
+
+impl CctpSourceChain {
+    const fn bridge_direction(self) -> BridgeDirection {
+        match self {
+            Self::Ethereum => BridgeDirection::EthereumToBase,
+            Self::Base => BridgeDirection::BaseToEthereum,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteCctpMintResponse {
+    mint_tx: String,
+    /// USDC minted to the recipient, net of the fee. `null` if the on-chain
+    /// amounts could not be decoded; the mint is still final.
+    amount_received: Option<String>,
+    fee_collected: Option<String>,
+    /// Whether the bot-gas cost was recorded. `false` means the mint landed but
+    /// the gas enqueue failed and must be re-recorded out of band.
+    gas_recorded: bool,
+}
+
+/// Completes the destination mint of a CCTP burn whose mint never landed
+/// (attestation polling interrupted, bot crashed after the burn). Polls
+/// Circle for the attestation and submits `receiveMessage` through the bot's
+/// own bridge and wallet. Live RPC only; touches no aggregate. After the mint
+/// lands, bring the stuck `UsdcRebalance` back in sync with `resume-usdc`
+/// (non-terminal: adopts the mint) or `reconcile-usdc` (post-burn terminal).
+///
+/// The attestation poll (bounded to 60 attempts, 5s apart) runs before the
+/// resume lock and the driver pause are taken, since it is read only and can
+/// take minutes: a burn Circle has not attested yet must not park unrelated
+/// USDC work. The resume lock and the driver pause are held only around the
+/// mint submission, which spends the wallet and races the driver. A burn not
+/// attested yet is reported as 502 and is retryable.
+///
+/// Mirrors `stox cctp complete-mint`.
+async fn complete_cctp_mint(
+    State(state): State<AppState>,
+    Json(request): Json<CompleteCctpMintRequest>,
+) -> Result<Json<CompleteCctpMintResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let burn_tx: TxHash = request.burn_tx.parse().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid burn tx hash: {error}"),
+            }),
+        )
+    })?;
+    let direction = request.source_chain.bridge_direction();
+
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    complete_cctp_mint_recovery(
+        handle.cctp_mint_recovery.as_ref(),
+        &state.resume_lock,
+        &handle.usdc_driver_pause,
+        direction,
+        burn_tx,
+    )
+    .await
+}
+
+/// Maps a failed CCTP mint recovery to its HTTP response, logging the internal
+/// detail at the call site.
+fn cctp_recovery_failure(
+    error: &CctpMintRecoveryError,
+    burn_tx: TxHash,
+    direction: BridgeDirection,
+) -> (StatusCode, Json<ErrorResponse>) {
+    error!(?error, %burn_tx, ?direction, "CCTP mint recovery failed");
+    let (status, message) = cctp_mint_recovery_error_response(error);
+    (status, Json(ErrorResponse { error: message }))
+}
+
+/// The lock-ordered half of [`complete_cctp_mint`]. Polls Circle for the burn's
+/// attestation WITHOUT the resume lock or the driver pause, then takes both only
+/// around the mint submission and the post-mint gas handling. Keeping the poll
+/// lock free is the point: it is read only and can take minutes, so a burn that
+/// Circle has not attested yet must not park unrelated USDC work.
+async fn complete_cctp_mint_recovery(
+    recovery: &dyn RecoverCctpMint,
+    resume_lock: &ResumeLock,
+    driver_pause: &UsdcDriverPause,
+    direction: BridgeDirection,
+    burn_tx: TxHash,
+) -> Result<Json<CompleteCctpMintResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let attestation = recovery
+        .poll_recovery_attestation(direction, burn_tx)
+        .await
+        .map_err(|error| cctp_recovery_failure(&error, burn_tx, direction))?;
+
+    let _guard = resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A resume or recheck operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+    let resume_direction = match direction {
+        BridgeDirection::EthereumToBase => RebalanceDirection::AlpacaToBase,
+        BridgeDirection::BaseToEthereum => RebalanceDirection::BaseToAlpaca,
+    };
+    let _driver_paused = quiesce_usdc_driver(driver_pause, None, Some(resume_direction)).await?;
+
+    let recovered = recovery
+        .submit_recovered_cctp_mint(direction, burn_tx, attestation)
+        .await
+        .map_err(|error| cctp_recovery_failure(&error, burn_tx, direction))?;
+
+    info!(
+        %burn_tx,
+        ?direction,
+        mint_tx = %recovered.mint_tx,
+        gas_recorded = recovered.gas_recorded,
+        "CCTP mint recovered via API"
+    );
+    Ok(Json(CompleteCctpMintResponse {
+        mint_tx: recovered.mint_tx.to_string(),
+        amount_received: recovered
+            .amounts
+            .as_ref()
+            .map(|amounts| amounts.amount_received.to_string()),
+        fee_collected: recovered
+            .amounts
+            .as_ref()
+            .map(|amounts| amounts.fee_collected.to_string()),
+        gas_recorded: recovered.gas_recorded,
+    }))
+}
+
+/// Maps a [`CctpMintRecoveryError`]. An inconclusive mint (the destination mint
+/// may already have landed but could not be confirmed) is an explicit retryable
+/// 502 that tells the operator to verify on-chain and that re-running is safe. A
+/// retryable attestation failure (Circle has not attested yet, or a transient
+/// transport hiccup) is a 502 with the typed message. A hard failure (a complete
+/// but malformed attestation, a deterministic mint failure, an amount decode, or
+/// a gas-ledger enqueue) is a 500 whose detail is logged at the call site rather
+/// than returned.
+fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCode, String) {
+    if error.is_mint_inconclusive() {
+        (
+            StatusCode::BAD_GATEWAY,
+            "CCTP mint recovery is inconclusive: the destination mint may already \
+             have landed but its outcome could not be confirmed. Verify on-chain \
+             whether the mint exists; re-running complete-mint is safe, since a \
+             consumed CCTP nonce cannot be minted twice."
+                .to_string(),
+        )
+    } else if error.is_retryable() {
+        (StatusCode::BAD_GATEWAY, error.to_string())
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CCTP mint recovery failed".to_string(),
+        )
+    }
+}
+
 /// Wire contract for the equity reconcile route (mint or redemption).
 #[derive(Deserialize)]
 struct ReconcileEquityRequest {
@@ -2551,6 +2853,7 @@ async fn reconcile_equity_transfer(
                     }),
                 )
             })?;
+            let _projection_write = state.projection_maintenance.enter().await;
             let entity = load_entity::<TokenizedEquityMint>(&state.pool, &mint_id)
                 .await
                 .map_err(ops_store_error)?
@@ -2591,6 +2894,7 @@ async fn reconcile_equity_transfer(
                     }),
                 )
             })?;
+            let _projection_write = state.projection_maintenance.enter().await;
             let entity = load_entity::<EquityRedemption>(&state.pool, &redemption_id)
                 .await
                 .map_err(ops_store_error)?
@@ -2715,6 +3019,7 @@ async fn release_position_hedge(
 ) -> Result<Json<ReleaseHedgeResponse>, (StatusCode, Json<ErrorResponse>)> {
     let symbol = Symbol::new(&symbol).map_err(ops_precondition_error)?;
     let order_id = OffchainOrderId::from_str(&request.order_id).map_err(ops_precondition_error)?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let outcome = release_pending_offchain_order(&state.pool, &symbol, order_id, &request.reason)
         .await
@@ -2769,6 +3074,7 @@ async fn set_position_exposure(
         })
         .transpose()?;
     let threshold = state.ctx.execution_threshold;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     let previous_net = set_position(
         &state.pool,
@@ -2969,6 +3275,7 @@ async fn process_transaction(
             }),
         )
     })?;
+    let _projection_write = state.projection_maintenance.enter().await;
 
     // A hung RPC endpoint that accepts the connection but never responds would
     // otherwise park this request forever (RAI-2218), so bound the transport
@@ -3081,6 +3388,7 @@ async fn set_portfolio_snapshot_mark(
         source: request.source,
         reason: request.reason,
     };
+    let _projection_write = state.projection_maintenance.enter().await;
     let formatted_mark = set_equity_mark(&state.pool, &state.ctx, &correction)
         .await
         .map_err(ops_operator_error)?
@@ -3230,6 +3538,14 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             "/liquidity-write/transactions/{tx_hash}/process",
             post(process_transaction),
         )
+        .route(
+            "/liquidity-write/views/{view}/rebuild",
+            post(rebuild_materialized_view),
+        )
+        .route(
+            "/liquidity-write/cctp/complete-mint",
+            post(complete_cctp_mint),
+        )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
             async move { require_iap(verifier, request, next).await }
@@ -3324,9 +3640,9 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use alloy::primitives::{Address, TxHash};
+    use alloy::primitives::{Address, Bytes, TxHash};
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
@@ -3376,7 +3692,9 @@ mod tests {
     };
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
-    use crate::rebalancing::usdc::{UsdcTransferError, usdc_driver_pause};
+    use crate::rebalancing::usdc::{
+        RecoveredCctpMint, UsdcDriverGate, UsdcTransferError, usdc_driver_pause,
+    };
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::usdc_rebalance::{ConversionAmounts, RebalanceDirection, TransferRef};
 
@@ -3402,6 +3720,9 @@ mod tests {
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+            projection_maintenance: Arc::new(
+                crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
+            ),
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
             health: crate::startup::HealthGate::default(),
@@ -6369,6 +6690,8 @@ mod tests {
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
             ("POST", "/liquidity-write/transactions/x/process"),
+            ("POST", "/liquidity-write/views/position/rebuild"),
+            ("POST", "/liquidity-write/cctp/complete-mint"),
         ] {
             let response = app
                 .clone()
@@ -6419,6 +6742,8 @@ mod tests {
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
             ("POST", "/liquidity-write/transactions/x/process"),
+            ("POST", "/liquidity-write/views/position/rebuild"),
+            ("POST", "/liquidity-write/cctp/complete-mint"),
         ] {
             let response = app
                 .clone()
@@ -7471,6 +7796,467 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_view_is_unavailable_until_startup_completes() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        let response = rebuild_materialized_view(
+            State(state),
+            Path("position".to_string()),
+            Json(RebuildViewRequest {
+                id: Some("AAPL".to_string()),
+                all: false,
+            }),
+        )
+        .await;
+
+        let Err((status, Json(error))) = response else {
+            panic!("a live rebuild must wait for startup");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.error.contains("startup completes"), "{}", error.error);
+    }
+
+    /// Deterministic reproduction of the lost-update window: an actual
+    /// `Store::send` owns a writer slot before the rebuild starts. The route
+    /// must wait, then replay the event the writer committed before releasing
+    /// its slot.
+    #[tokio::test]
+    async fn rebuild_waits_for_an_in_flight_projection_write() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+        let symbol: Symbol = "AAPL".parse().unwrap();
+        seed_position_pnl_fill(&state.pool, &symbol).await;
+
+        let maintenance = Arc::clone(&state.projection_maintenance);
+        let writer_maintenance = Arc::clone(&maintenance);
+        let writer_pool = state.pool.clone();
+        let writer_symbol = symbol.clone();
+        let threshold = state.ctx.execution_threshold;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            let _projection_write = writer_maintenance.enter().await;
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            set_position(
+                &writer_pool,
+                &writer_symbol,
+                FractionalShares::new(float!(2)),
+                "concurrent operator correction",
+                threshold,
+                Some(float!(100)),
+            )
+            .await
+            .unwrap();
+        });
+        entered_rx.await.unwrap();
+
+        let rebuild_state = state.clone();
+        let rebuild = tokio::spawn(async move {
+            rebuild_materialized_view(
+                State(rebuild_state),
+                Path("position".to_string()),
+                Json(RebuildViewRequest {
+                    id: Some("AAPL".to_string()),
+                    all: false,
+                }),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !maintenance.is_paused() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the rebuild must request the projection pause");
+        assert!(
+            !rebuild.is_finished(),
+            "the rebuild must wait for the in-flight writer"
+        );
+
+        release_tx.send(()).unwrap();
+        writer.await.unwrap();
+        let response = rebuild.await.unwrap();
+        assert!(
+            response.is_ok(),
+            "the rebuild must run after the writer drains"
+        );
+
+        let (net_position,): (String,) =
+            sqlx::query_as("SELECT net_position FROM position_view WHERE view_id = ?1")
+                .bind(symbol.to_string())
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            net_position,
+            FractionalShares::new(float!(2)).to_string(),
+            "replay must include the event committed by the drained writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_replays_one_position_from_its_events() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        let symbol: Symbol = "AAPL".parse().unwrap();
+        seed_position_pnl_fill(&state.pool, &symbol).await;
+        // Corrupt the view so the rebuild is observable: an empty payload the
+        // replay must replace with the folded position.
+        sqlx::query("UPDATE position_view SET payload = '{}' WHERE view_id = ?1")
+            .bind(symbol.to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let resp = rebuild_materialized_view(
+            State(state.clone()),
+            Path("position".to_string()),
+            Json(RebuildViewRequest {
+                id: Some("AAPL".to_string()),
+                all: false,
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("a seeded position must rebuild");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "view": "position", "id": "AAPL", "replayed": null }),
+        );
+        let (payload,): (String,) =
+            sqlx::query_as("SELECT payload FROM position_view WHERE view_id = ?1")
+                .bind(symbol.to_string())
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_ne!(payload, "{}", "the replay must rewrite the corrupted row");
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_reports_the_replay_count_for_a_read_model() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let resp = rebuild_materialized_view(
+            State(state.clone()),
+            Path("rebalance-timing".to_string()),
+            Json(RebuildViewRequest {
+                id: None,
+                all: true,
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("a whole-model rebuild must succeed on an empty store");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "view": "rebalance-timing", "id": null, "replayed": 0 }),
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_refuses_a_single_id_for_a_read_model() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let resp = rebuild_materialized_view(
+            State(state.clone()),
+            Path("equity-timing".to_string()),
+            Json(RebuildViewRequest {
+                id: Some("x".to_string()),
+                all: false,
+            }),
+        )
+        .await;
+
+        let Err((status, Json(error))) = resp else {
+            panic!("a read model must refuse a single id");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("whole read model"), "{}", error.error);
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_refuses_an_ambiguous_scope_and_an_unknown_view() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        for (view, request) in [
+            (
+                "position",
+                RebuildViewRequest {
+                    id: Some("AAPL".to_string()),
+                    all: true,
+                },
+            ),
+            (
+                "position",
+                RebuildViewRequest {
+                    id: None,
+                    all: false,
+                },
+            ),
+            (
+                "not-a-view",
+                RebuildViewRequest {
+                    id: None,
+                    all: true,
+                },
+            ),
+        ] {
+            let resp = rebuild_materialized_view(
+                State(state.clone()),
+                Path(view.to_string()),
+                Json(request),
+            )
+            .await;
+            let Err((status, _)) = resp else {
+                panic!("{view}: expected a refusal");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{view}");
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_cctp_mint_returns_503_before_conductor_ready() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let resp = complete_cctp_mint(
+            State(state.clone()),
+            Json(CompleteCctpMintRequest {
+                burn_tx: TxHash::repeat_byte(0x33).to_string(),
+                source_chain: CctpSourceChain::Base,
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn complete_cctp_mint_rejects_a_malformed_burn_hash_before_the_readiness_gate() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let resp = complete_cctp_mint(
+            State(state.clone()),
+            Json(CompleteCctpMintRequest {
+                burn_tx: "not-a-hash".to_string(),
+                source_chain: CctpSourceChain::Ethereum,
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A `RecoverCctpMint` whose attestation poll records whether the resume
+    /// lock is free and the driver is unpaused at poll time, then reports the
+    /// burn as not yet attested. `submit` must never run for an unattested burn.
+    struct PollProbe {
+        resume_lock: Arc<ResumeLock>,
+        gate: UsdcDriverGate,
+        lock_free_at_poll: Arc<AtomicBool>,
+        driver_free_at_poll: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl RecoverCctpMint for PollProbe {
+        async fn poll_recovery_attestation(
+            &self,
+            _direction: BridgeDirection,
+            burn_tx: TxHash,
+        ) -> Result<st0x_bridge::cctp::AttestationResponse, CctpMintRecoveryError> {
+            self.lock_free_at_poll
+                .store(self.resume_lock.0.try_lock().is_ok(), Ordering::SeqCst);
+            self.driver_free_at_poll
+                .store(self.gate.try_enter().is_some(), Ordering::SeqCst);
+            Err(CctpMintRecoveryError::Attestation {
+                burn_tx,
+                source: st0x_bridge::cctp::CctpError::PlaceholderNonce,
+            })
+        }
+
+        async fn submit_recovered_cctp_mint(
+            &self,
+            _direction: BridgeDirection,
+            _burn_tx: TxHash,
+            _attestation: st0x_bridge::cctp::AttestationResponse,
+        ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
+            unreachable!("submit must not run while the burn is unattested")
+        }
+    }
+
+    /// The attestation poll must not park unrelated USDC work: while a burn is
+    /// still unattested, the resume lock stays free and the driver stays
+    /// unpaused, and only the (never reached) mint submission would take them.
+    #[tokio::test]
+    async fn complete_cctp_mint_poll_does_not_park_usdc_work_while_unattested() {
+        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let (pause, gate) = usdc_driver_pause();
+        let lock_free = Arc::new(AtomicBool::new(false));
+        let driver_free = Arc::new(AtomicBool::new(false));
+        let probe = PollProbe {
+            resume_lock: resume_lock.clone(),
+            gate: gate.clone(),
+            lock_free_at_poll: lock_free.clone(),
+            driver_free_at_poll: driver_free.clone(),
+        };
+
+        let resp = complete_cctp_mint_recovery(
+            &probe,
+            &resume_lock,
+            &pause,
+            BridgeDirection::BaseToEthereum,
+            TxHash::repeat_byte(0x11),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("an unattested burn must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            lock_free.load(Ordering::SeqCst),
+            "the resume lock must be free while the attestation is still pending",
+        );
+        assert!(
+            driver_free.load(Ordering::SeqCst),
+            "the USDC driver must not be paused while the attestation is still pending",
+        );
+    }
+
+    #[test]
+    fn cctp_source_chain_maps_to_the_mint_destination() {
+        assert_eq!(
+            CctpSourceChain::Ethereum.bridge_direction(),
+            BridgeDirection::EthereumToBase
+        );
+        assert_eq!(
+            CctpSourceChain::Base.bridge_direction(),
+            BridgeDirection::BaseToEthereum
+        );
+        let parsed: CctpSourceChain = serde_json::from_str("\"base\"").unwrap();
+        assert!(matches!(parsed, CctpSourceChain::Base));
+    }
+
+    #[test]
+    fn cctp_mint_recovery_error_response_distinguishes_recoverability() {
+        let burn_tx = TxHash::repeat_byte(0x33);
+        let attestation = CctpMintRecoveryError::Attestation {
+            burn_tx,
+            source: st0x_bridge::cctp::CctpError::PlaceholderNonce,
+        };
+        let (status, message) = cctp_mint_recovery_error_response(&attestation);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(message.contains(&burn_tx.to_string()), "{message}");
+
+        // A complete but malformed attestation is a hard failure: retrying
+        // cannot fix it, so it is a 500 with the detail withheld, not a 502.
+        let malformed = CctpMintRecoveryError::Attestation {
+            burn_tx,
+            source: st0x_bridge::cctp::CctpError::MalformedAttestation {
+                source: st0x_bridge::cctp::AttestationError::MissingField {
+                    field: "attestation",
+                },
+            },
+        };
+        let (status, message) = cctp_mint_recovery_error_response(&malformed);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "CCTP mint recovery failed");
+
+        let mint = CctpMintRecoveryError::Mint {
+            burn_tx,
+            source: st0x_bridge::cctp::CctpError::MintAndWithdrawEventNotFound,
+        };
+        let (status, message) = cctp_mint_recovery_error_response(&mint);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "CCTP mint recovery failed");
+    }
+
+    /// A `RecoverCctpMint` whose burn attests, but whose mint submission comes
+    /// back inconclusive: the destination mint may already exist.
+    struct InconclusiveMint;
+
+    #[async_trait::async_trait]
+    impl RecoverCctpMint for InconclusiveMint {
+        async fn poll_recovery_attestation(
+            &self,
+            _direction: BridgeDirection,
+            _burn_tx: TxHash,
+        ) -> Result<st0x_bridge::cctp::AttestationResponse, CctpMintRecoveryError> {
+            // A full CCTP envelope with a non-placeholder nonce (byte 43 = 1).
+            let mut message = vec![0u8; 200];
+            message[43] = 1;
+            Ok(st0x_bridge::cctp::AttestationResponse::for_test(
+                Bytes::from(message),
+                Bytes::from(vec![0u8; 65]),
+            )
+            .unwrap())
+        }
+
+        async fn submit_recovered_cctp_mint(
+            &self,
+            _direction: BridgeDirection,
+            burn_tx: TxHash,
+            _attestation: st0x_bridge::cctp::AttestationResponse,
+        ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
+            Err(CctpMintRecoveryError::Mint {
+                burn_tx,
+                source: st0x_bridge::cctp::CctpError::MintRecoveryInconclusive {
+                    recovery_error: Box::new(st0x_bridge::cctp::CctpError::PlaceholderNonce),
+                },
+            })
+        }
+    }
+
+    /// Route test: an inconclusive mint (the destination mint may already exist)
+    /// must be reported as an explicit retryable 502 that tells the operator to
+    /// verify on-chain, not collapsed into the generic 500 of a deterministic
+    /// mint failure.
+    #[tokio::test]
+    async fn complete_cctp_mint_reports_an_inconclusive_mint_as_retryable() {
+        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let (pause, _gate) = usdc_driver_pause();
+
+        let resp = complete_cctp_mint_recovery(
+            &InconclusiveMint,
+            &resume_lock,
+            &pause,
+            BridgeDirection::BaseToEthereum,
+            TxHash::repeat_byte(0x11),
+        )
+        .await;
+
+        let Err((status, Json(body))) = resp else {
+            panic!("an inconclusive mint must be reported as an error");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            body.error.contains("inconclusive") && body.error.contains("Verify on-chain"),
+            "{}",
+            body.error,
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_equity_transfer_reconciles_a_failed_mint() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
@@ -7872,6 +8658,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_http_projection_write_waits_for_rebuild_pause() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let paused = state.projection_maintenance.pause().await.unwrap();
+        let write_state = state.clone();
+        let mut write = tokio::spawn(async move {
+            set_position_exposure(
+                State(write_state),
+                Path("MSTR".to_string()),
+                Json(SetPositionRequest {
+                    target_net: "5".to_string(),
+                    price_usdc: Some("150".to_string()),
+                    reason: "manual correction".to_string(),
+                }),
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut write)
+                .await
+                .is_err(),
+            "a direct HTTP writer must park while rebuild maintenance is paused"
+        );
+
+        drop(paused);
+        let response = write.await.unwrap();
+        assert!(response.is_ok(), "the writer must resume after the rebuild");
+    }
+
+    #[tokio::test]
     async fn set_portfolio_snapshot_mark_returns_the_recorded_mark() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
         let day = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
@@ -8250,7 +9066,7 @@ mod tests {
         let _executing = gate.enter().await;
 
         let Err((status, Json(body))) =
-            quiesce_usdc_driver(&control, &rebalance_id, Some(direction)).await
+            quiesce_usdc_driver(&control, Some(&rebalance_id), Some(direction)).await
         else {
             panic!("a quiesce with an execution in flight must be refused");
         };
@@ -8275,10 +9091,7 @@ mod tests {
     async fn quiesce_usdc_driver_parks_the_driver_until_the_guard_drops() {
         let (control, gate) = usdc_driver_pause();
 
-        let rebalance_id = UsdcRebalanceId(uuid!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
-        let guard = quiesce_usdc_driver(&control, &rebalance_id, None)
-            .await
-            .unwrap();
+        let guard = quiesce_usdc_driver(&control, None, None).await.unwrap();
         assert!(gate.is_paused());
 
         drop(guard);

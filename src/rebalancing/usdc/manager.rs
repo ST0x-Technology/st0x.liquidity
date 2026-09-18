@@ -4857,6 +4857,194 @@ where
     }
 }
 
+/// A recovered CCTP mint. The destination-chain `receiveMessage` is final once
+/// this exists, so `mint_tx` is always present; the post-mint bookkeeping is
+/// best effort and degrades into the remaining fields rather than discarding the
+/// hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredCctpMint {
+    pub(crate) mint_tx: TxHash,
+    /// Minted amount and fee, `None` only if the on-chain `U256` values could
+    /// not be decoded. The mint is final regardless; `mint_tx` is authoritative.
+    pub(crate) amounts: Option<RecoveredMintAmounts>,
+    /// Whether the bot-gas cost was enqueued for ADR 0017 accounting. `false`
+    /// means the mint landed but the enqueue failed; the failure is logged with
+    /// the mint tx and chain so it can be re-recorded out of band. A
+    /// re-`complete-mint` is unnecessary and unsafe for this: the nonce is
+    /// already consumed.
+    pub(crate) gas_recorded: bool,
+}
+
+/// The decoded amounts of a recovered mint, present together or not at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredMintAmounts {
+    /// USDC minted to the recipient, net of the fee.
+    pub(crate) amount_received: Usdc,
+    pub(crate) fee_collected: Usdc,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CctpMintRecoveryError {
+    /// Circle has not attested the burn within the polling window, or the
+    /// attestation call failed; retryable once the attestation is complete.
+    #[error("attestation not available for burn {burn_tx}: {source}")]
+    Attestation {
+        burn_tx: TxHash,
+        #[source]
+        source: CctpError,
+    },
+    /// `receiveMessage` failed or its receipt could not be read.
+    #[error("mint failed for burn {burn_tx}: {source}")]
+    Mint {
+        burn_tx: TxHash,
+        #[source]
+        source: CctpError,
+    },
+}
+
+impl CctpMintRecoveryError {
+    /// Whether the operator should retry. Circle not having attested the burn
+    /// yet, or a transient transport hiccup, is retryable. A complete but
+    /// malformed attestation is a definitively hard failure (see
+    /// [`CctpError::MalformedAttestation`]) that retrying cannot fix, as is a
+    /// deterministic mint submission failure.
+    pub(crate) fn is_retryable(&self) -> bool {
+        // Retryable only for an attestation that is not definitively malformed:
+        // Circle has not attested yet, or a transient transport hiccup. A
+        // malformed complete attestation and a failed mint are hard failures
+        // retrying cannot fix.
+        matches!(
+            self,
+            Self::Attestation { source, .. }
+                if !matches!(source, CctpError::MalformedAttestation { .. })
+        )
+    }
+
+    /// Whether the mint's outcome is unknown: the `receiveMessage` submission
+    /// errored and the recovery probe could neither confirm the mint landed nor
+    /// prove the nonce unconsumed, so the destination mint may already exist
+    /// (see [`CctpError::MintRecoveryInconclusive`]). The operator should verify
+    /// on-chain; re-running is safe because a consumed CCTP nonce cannot be
+    /// minted twice.
+    pub(crate) fn is_mint_inconclusive(&self) -> bool {
+        matches!(
+            self,
+            Self::Mint {
+                source: CctpError::MintRecoveryInconclusive { .. },
+                ..
+            }
+        )
+    }
+}
+
+/// Two-phase entry point for the operator `cctp complete-mint` recovery of a
+/// burn whose destination mint never completed.
+///
+/// [`Self::poll_recovery_attestation`] polls Circle for the burn's attestation. It
+/// is read only, touches no aggregate and no wallet, and is bounded but can take
+/// minutes, so the caller runs it without the resume lock or the driver pause: a
+/// burn Circle has not attested yet must not park unrelated USDC work.
+/// [`Self::submit_recovered_cctp_mint`] submits `receiveMessage` and records the
+/// mint gas; it spends the wallet and can race the driver, so the caller holds
+/// the resume lock and quiesces the USDC driver across it only.
+#[async_trait::async_trait]
+pub(crate) trait RecoverCctpMint: Send + Sync + 'static {
+    async fn poll_recovery_attestation(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+    ) -> Result<AttestationResponse, CctpMintRecoveryError>;
+
+    async fn submit_recovered_cctp_mint(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+        attestation: AttestationResponse,
+    ) -> Result<RecoveredCctpMint, CctpMintRecoveryError>;
+}
+
+#[async_trait::async_trait]
+impl<Signer, B> RecoverCctpMint for CrossVenueCashTransfer<Signer, B>
+where
+    Signer: Wallet + Send + Sync + 'static,
+    B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
+{
+    async fn poll_recovery_attestation(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+    ) -> Result<AttestationResponse, CctpMintRecoveryError> {
+        self.cctp_bridge
+            .poll_attestation(direction, burn_tx)
+            .await
+            .map_err(|source| CctpMintRecoveryError::Attestation { burn_tx, source })
+    }
+
+    async fn submit_recovered_cctp_mint(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+        attestation: AttestationResponse,
+    ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
+        let receipt = self
+            .cctp_bridge
+            .mint(direction, &attestation)
+            .await
+            .map_err(|source| CctpMintRecoveryError::Mint { burn_tx, source })?;
+
+        // The mint is now FINAL on-chain. Nothing below may discard `receipt.tx`:
+        // the post-mint bookkeeping degrades into the outcome instead of erroring.
+        let mint_chain = match direction {
+            BridgeDirection::EthereumToBase => Chain::Base,
+            BridgeDirection::BaseToEthereum => Chain::Ethereum,
+        };
+
+        // Record the mint's gas for ADR 0017 accounting, as every other CCTP
+        // mint site does. A failed enqueue does not undo the mint, so log it with
+        // the tx and chain for out-of-band re-recording and report it as not
+        // recorded rather than failing the whole recovery.
+        let gas_recorded = match self
+            .enqueue_bot_gas_cost(mint_chain, receipt.tx, BotGasOperationCategory::CctpMint)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                error!(
+                    target: "rebalance",
+                    ?error,
+                    mint_tx = %receipt.tx,
+                    chain = %mint_chain,
+                    "CCTP mint landed but the bot-gas enqueue failed; the mint is final -- re-record the gas cost out of band"
+                );
+                false
+            }
+        };
+
+        let amounts = match (u256_to_usdc(receipt.amount), u256_to_usdc(receipt.fee)) {
+            (Ok(amount_received), Ok(fee_collected)) => Some(RecoveredMintAmounts {
+                amount_received,
+                fee_collected,
+            }),
+            (amount, fee) => {
+                error!(
+                    target: "rebalance",
+                    mint_tx = %receipt.tx,
+                    ?amount,
+                    ?fee,
+                    "CCTP mint landed but its amounts could not be decoded; the mint is final"
+                );
+                None
+            }
+        };
+
+        Ok(RecoveredCctpMint {
+            mint_tx: receipt.tx,
+            amounts,
+            gas_recorded,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::node_bindings::Anvil;
@@ -4922,6 +5110,15 @@ mod tests {
         // `send_alpaca_deposit_enqueues_wallet_transfer_bot_gas_job` opts in via
         // `with_send_usdc_tx`.
         send_usdc_tx: Option<TxHash>,
+        // Opt-in for the operator `recover_cctp_mint` path: the attestation the
+        // poll returns and the receipt the mint returns. Every other test
+        // leaves these `None`, so an unexpected walk into either method still
+        // panics loudly. Gated with the constructor it feeds, which needs the
+        // bridge crate's test-support attestation builder.
+        #[cfg(feature = "test-support")]
+        recover_attestation_message: Option<Vec<u8>>,
+        #[cfg(feature = "test-support")]
+        recover_mint_receipt: Option<st0x_bridge::MintReceipt>,
     }
 
     impl MockBridge {
@@ -4934,6 +5131,10 @@ mod tests {
                 confirm_revert_count: 1,
                 burn_status: None,
                 send_usdc_tx: None,
+                #[cfg(feature = "test-support")]
+                recover_attestation_message: None,
+                #[cfg(feature = "test-support")]
+                recover_mint_receipt: None,
             }
         }
 
@@ -4959,6 +5160,17 @@ mod tests {
 
         fn with_send_usdc_tx(mut self, tx_hash: TxHash) -> Self {
             self.send_usdc_tx = Some(tx_hash);
+            self
+        }
+
+        #[cfg(feature = "test-support")]
+        fn with_recover_mint(
+            mut self,
+            message: Vec<u8>,
+            receipt: st0x_bridge::MintReceipt,
+        ) -> Self {
+            self.recover_attestation_message = Some(message);
+            self.recover_mint_receipt = Some(receipt);
             self
         }
     }
@@ -5037,6 +5249,13 @@ mod tests {
             _direction: BridgeDirection,
             _burn_tx: TxHash,
         ) -> Result<AttestationResponse, CctpError> {
+            #[cfg(feature = "test-support")]
+            if let Some(message) = &self.recover_attestation_message {
+                return AttestationResponse::for_test(
+                    Bytes::from(message.clone()),
+                    Bytes::from(vec![0xabu8; 65]),
+                );
+            }
             unimplemented!("MockBridge: poll_attestation not used in this test")
         }
 
@@ -5045,6 +5264,14 @@ mod tests {
             _direction: BridgeDirection,
             _attestation: &AttestationResponse,
         ) -> Result<st0x_bridge::MintReceipt, CctpError> {
+            #[cfg(feature = "test-support")]
+            if let Some(receipt) = &self.recover_mint_receipt {
+                return Ok(st0x_bridge::MintReceipt {
+                    tx: receipt.tx,
+                    amount: receipt.amount,
+                    fee: receipt.fee,
+                });
+            }
             unimplemented!("MockBridge: mint not used in this test")
         }
 
@@ -17084,6 +17311,119 @@ mod tests {
         assert_eq!(jobs[0].chain, Chain::Ethereum);
         assert_eq!(jobs[0].tx_hash, send_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// The operator `cctp complete-mint` recovery must record the mint's gas on
+    /// the bot-gas ledger, like every other CCTP mint site, so the operator's
+    /// action stays visible to gas-cost/P&L reconciliation (ADR 0017). The mint
+    /// lands on the chain opposite the burn.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn recover_cctp_mint_enqueues_bot_gas_cost() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let mint_tx =
+            fixed_bytes!("0xeeee000000000000000000000000000000000000000000000000000000000001");
+        let (manager, apalis_pool, _server) = manager_with_bot_gas_queue(
+            cqrs,
+            wallet,
+            MockBridge::new().with_recover_mint(
+                valid_cctp_message(),
+                st0x_bridge::MintReceipt {
+                    tx: mint_tx,
+                    amount: usdc_to_u256(usdc("100")).unwrap(),
+                    fee: usdc_to_u256(usdc("1")).unwrap(),
+                },
+            ),
+        )
+        .await;
+
+        let attestation = manager
+            .poll_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
+            .await
+            .unwrap();
+        let recovered = manager
+            .submit_recovered_cctp_mint(
+                BridgeDirection::BaseToEthereum,
+                TxHash::repeat_byte(0x11),
+                attestation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.mint_tx, mint_tx);
+        assert!(recovered.gas_recorded, "the enqueue succeeded");
+        let amounts = recovered.amounts.expect("amounts decode from the receipt");
+        assert_eq!(amounts.amount_received, usdc("100"));
+        assert_eq!(amounts.fee_collected, usdc("1"));
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::CctpMint);
+        // BaseToEthereum burns on Base and mints on Ethereum.
+        assert_eq!(jobs[0].chain, Chain::Ethereum);
+        assert_eq!(jobs[0].tx_hash, mint_tx);
+        assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// The destination mint is final before the bot-gas enqueue runs. If the
+    /// enqueue fails, the recovery must still return the mint hash and amounts
+    /// (flagged as gas not recorded) rather than losing the final mint in a
+    /// generic failure.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn recover_cctp_mint_preserves_the_hash_when_the_gas_enqueue_fails() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let mint_tx =
+            fixed_bytes!("0xeeee000000000000000000000000000000000000000000000000000000000002");
+        let (manager, apalis_pool, _server) = manager_with_bot_gas_queue(
+            cqrs,
+            wallet,
+            MockBridge::new().with_recover_mint(
+                valid_cctp_message(),
+                st0x_bridge::MintReceipt {
+                    tx: mint_tx,
+                    amount: usdc_to_u256(usdc("100")).unwrap(),
+                    fee: usdc_to_u256(usdc("1")).unwrap(),
+                },
+            ),
+        )
+        .await;
+
+        // Close the queue's pool so the post-mint bot-gas enqueue fails.
+        apalis_pool.close().await;
+
+        let attestation = manager
+            .poll_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
+            .await
+            .unwrap();
+        let recovered = manager
+            .submit_recovered_cctp_mint(
+                BridgeDirection::BaseToEthereum,
+                TxHash::repeat_byte(0x11),
+                attestation,
+            )
+            .await
+            .expect("a final mint must not be lost when the gas enqueue fails");
+
+        assert_eq!(
+            recovered.mint_tx, mint_tx,
+            "the final mint hash must be preserved"
+        );
+        assert!(
+            !recovered.gas_recorded,
+            "the enqueue failed, so gas is reported as not recorded"
+        );
+        let amounts = recovered
+            .amounts
+            .expect("amounts still decode from the receipt");
+        assert_eq!(amounts.amount_received, usdc("100"));
     }
 
     /// Acceptance criterion: resuming an Alpaca->Base transfer stalled at
