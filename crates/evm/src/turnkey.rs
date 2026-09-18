@@ -1181,13 +1181,16 @@ where
         )
         .await
     }
-    fn discard_prepared(&self, prepared: &PreparedTransaction) {
-        self.nonce_manager.invalidate();
+    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
+        let _guard = self.send_lock.lock().await;
+        self.nonce_manager
+            .release_prepared_nonce(self.address, prepared.nonce())
+            .await;
         tracing::warn!(
             target: "wallet",
             tx_hash = %prepared.tx_hash(),
             nonce = prepared.nonce(),
-            "Discarding unpersisted prepared transaction and invalidating nonce cache"
+            "Discarding unpersisted prepared transaction and releasing its nonce reservation"
         );
     }
 

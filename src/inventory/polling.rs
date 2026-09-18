@@ -2179,7 +2179,7 @@ mod tests {
             panic!("MockEthereumWallet::broadcast_prepared should not be called in polling tests")
         }
 
-        fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
             panic!("MockEthereumWallet::discard_prepared should not be called in polling tests");
         }
 
@@ -2246,7 +2246,7 @@ mod tests {
             panic!("MockBaseWallet::broadcast_prepared should not be called in polling tests")
         }
 
-        fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
             panic!("MockBaseWallet::discard_prepared should not be called in polling tests");
         }
 

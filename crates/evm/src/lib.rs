@@ -712,9 +712,9 @@ pub trait Wallet: Evm {
         prepared: &PreparedTransaction,
         note: &str,
     ) -> Result<TxHash, EvmError>;
-    /// Releases local nonce-cache state for a prepared transaction that could
-    /// not be persisted and therefore will never be broadcast.
-    fn discard_prepared(&self, prepared: &PreparedTransaction);
+    /// Releases this prepared transaction's nonce reservation after persistence
+    /// failed and the transaction will never be broadcast.
+    async fn discard_prepared(&self, prepared: &PreparedTransaction);
 
     /// Submit a signed transaction and return the tx hash immediately,
     /// without waiting for confirmation.
@@ -954,8 +954,8 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
     ) -> Result<TxHash, EvmError> {
         (**self).broadcast_prepared(prepared, note).await
     }
-    fn discard_prepared(&self, prepared: &PreparedTransaction) {
-        (**self).discard_prepared(prepared);
+    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
+        (**self).discard_prepared(prepared).await;
     }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {

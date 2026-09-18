@@ -357,7 +357,7 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
-    fn discard_prepared_withdraw(&self, _: &PreparedTransaction) {
+    async fn discard_prepared_withdraw(&self, _: &PreparedTransaction) {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
@@ -1555,7 +1555,10 @@ impl CrossVenueEquityTransfer {
             // proves these signed bytes were not persisted and will never be
             // broadcast by recovery.
             if matches!(self.redemption_store.load(aggregate_id).await, Ok(None)) {
-                chain_services.raindex.discard_prepared_withdraw(&prepared);
+                chain_services
+                    .raindex
+                    .discard_prepared_withdraw(&prepared)
+                    .await;
             }
             return Err(error.into());
         }

@@ -1872,8 +1872,8 @@ mod tests {
             self.inner.broadcast_prepared(prepared, note).await
         }
 
-        fn discard_prepared(&self, prepared: &PreparedTransaction) {
-            self.inner.discard_prepared(prepared);
+        async fn discard_prepared(&self, prepared: &PreparedTransaction) {
+            self.inner.discard_prepared(prepared).await;
         }
 
         async fn send_pending(
