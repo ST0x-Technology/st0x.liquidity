@@ -130,7 +130,6 @@ pub struct OffchainOrderPlacement {
     placed_at: Option<DateTime<Utc>>,
 }
 
-#[allow(dead_code)]
 fn missing_pending_limit_price_failure(order_id: OffchainOrderId) -> OffchainOrderCommand {
     OffchainOrderCommand::MarkPlacementFailed {
         error: PlaceOffchainOrderError::PendingLimitPriceMissing { order_id }.to_string(),
@@ -239,23 +238,17 @@ pub async fn place_offchain_order_at_broker(
         placed_at,
     } = placement;
 
-    let admission = order_placer
-        .prepare_placement(
-            &MarketOrder {
-                symbol: symbol.clone(),
-                shares,
-                direction,
-                client_order_id: client_order_id.clone(),
-            },
-            &kind,
-        )
-        .await
-        .map_err(|source| PlaceOffchainOrderError::Admission { source })?;
-    let reserved_placed_at = match &admission {
-        PlacementAdmission::Recovered(result) => Some(result.placed_at),
-        PlacementAdmission::New | PlacementAdmission::Deferred => placed_at,
-    };
+    // Admission gates this attempt's request (a Market recovery attempt must
+    // never re-drive a stored extended-hours limit), while the broker call
+    // below replays the durable terms. Keep the requested kind for the
+    // admission check; `kind` is shadowed by the durable terms after load.
+    let admission_kind = kind.clone();
 
+    // Record intent before any admission or broker call so every outcome
+    // below -- Deferred, admission error, broker failure -- retains a
+    // recoverable Pending order instead of stranding a live broker order
+    // with no local record. Re-sends are replay-validated (same
+    // symbol/direction/executor is a no-op), so retries are safe.
     store
         .send(
             offchain_order_id,
@@ -267,20 +260,20 @@ pub async fn place_offchain_order_at_broker(
                 client_order_id: client_order_id.clone(),
                 kind: kind.clone(),
                 buying_power_reservation,
-                placed_at: reserved_placed_at,
+                placed_at,
             },
         )
         .await?;
-
-    if matches!(admission, PlacementAdmission::Deferred) {
-        return Err(PlaceOffchainOrderError::Deferred);
-    }
 
     // Only call the broker while the order is still Pending. A retry whose
     // outcome already landed (Submitted, or a terminal state) must not place a
     // second time. An exhaustive match forces a conscious decision for any
     // future state rather than letting it silently skip placement.
-    let broker_kind = kind;
+    //
+    // The broker call replays the DURABLE Pending terms, not this attempt's
+    // request: a retry may carry a different kind (e.g. a Market recovery
+    // attempt for a stored extended-hours limit), and the recorded intent is
+    // authoritative.
     let placed = store.load(offchain_order_id).await?;
     let (symbol, shares, direction, client_order_id, kind) = match placed {
         Some(OffchainOrder::Pending {
@@ -288,17 +281,27 @@ pub async fn place_offchain_order_at_broker(
             shares,
             direction,
             client_order_id: durable_client_order_id,
+            limit_price,
+            market_session,
+            close_flatten,
             ..
         }) => {
-            let kind = match &broker_kind {
-                CounterTradeOrderKind::Market => CounterTradeOrderKind::Market,
+            let kind = if market_session == MarketSession::Extended {
+                let Some(limit_price) = limit_price else {
+                    store
+                        .send(
+                            offchain_order_id,
+                            missing_pending_limit_price_failure(*offchain_order_id),
+                        )
+                        .await?;
+                    return Ok(store.load(offchain_order_id).await?);
+                };
                 CounterTradeOrderKind::ExtendedHoursLimit {
                     limit_price,
                     close_flatten,
-                } => CounterTradeOrderKind::ExtendedHoursLimit {
-                    limit_price: *limit_price,
-                    close_flatten: *close_flatten,
-                },
+                }
+            } else {
+                CounterTradeOrderKind::Market
             };
             (
                 symbol,
@@ -326,6 +329,22 @@ pub async fn place_offchain_order_at_broker(
         Direction::Sell => "sell",
     };
 
+    // Admission sees the requested kind: a schedule-aware Market recovery
+    // must defer in the Extended session instead of re-driving the stored
+    // extended-hours limit. The broker call below still replays the durable
+    // terms once admission passes.
+    let admission = order_placer
+        .prepare_placement(
+            &MarketOrder {
+                symbol: symbol.clone(),
+                shares,
+                direction,
+                client_order_id: client_order_id.clone(),
+            },
+            &admission_kind,
+        )
+        .await
+        .map_err(|source| PlaceOffchainOrderError::Admission { source })?;
     let placement = match admission {
         PlacementAdmission::Deferred => return Err(PlaceOffchainOrderError::Deferred),
         PlacementAdmission::Recovered(placement) => Ok(placement),
