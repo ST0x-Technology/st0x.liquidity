@@ -5144,6 +5144,7 @@ impl RebalancingService {
                 chain,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await;
 
@@ -5262,6 +5263,7 @@ impl RebalancingService {
                 generation,
                 chain,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await;
 
@@ -20390,8 +20392,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20435,8 +20437,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20477,8 +20479,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20544,6 +20546,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20607,8 +20610,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20670,6 +20673,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20729,8 +20733,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20775,8 +20779,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20833,8 +20837,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20898,6 +20902,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -20960,8 +20965,8 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: FractionalShares::new(float!(1)),
                     generation: equity::GuardGeneration::default(),
-
                     backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
                 })
                 .await
                 .unwrap();
@@ -21032,8 +21037,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -21057,6 +21062,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();

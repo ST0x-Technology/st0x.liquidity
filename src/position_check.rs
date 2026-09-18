@@ -52,7 +52,7 @@ pub(crate) type CheckPositionsJobQueue = JobQueue<CheckPositions>;
 const MAX_CONCURRENT_EXTENDED_HOURS_CANCELLATIONS: usize = 8;
 const EQUITY_TRANSFER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
-fn equity_transfer_retry_delay(attempts: u32) -> Duration {
+pub(crate) fn equity_transfer_retry_delay(attempts: u32) -> Duration {
     let factor = 2_u32.saturating_pow(attempts);
     EQUITY_TRANSFER_REDRIVE_DELAY
         .saturating_mul(factor)

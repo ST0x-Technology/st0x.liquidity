@@ -39,7 +39,7 @@ use crate::conductor::job::{
 };
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::position::{EquityTransferReservationId, Position, PositionCommand};
-use crate::trading::offchain::hedge::EQUITY_TRANSFER_REDRIVE_DELAY;
+use crate::position_check::equity_transfer_retry_delay;
 
 /// Apalis queue type for [`ResumeTokenizationAggregate`].
 pub(crate) type ResumeTokenizationJobQueue = JobQueue<ResumeTokenizationAggregate>;
@@ -92,6 +92,10 @@ pub(crate) struct ResumeTokenizationAggregate {
     /// so the payload schema is ready when that follow-up lands.
     #[serde(default)]
     pub(crate) backpressure_streak: BackpressureStreak,
+    /// Number of consecutive reservation-restoration deferrals. Persisted in
+    /// the replacement payload so a long-lived hedge backs off across rows.
+    #[serde(default)]
+    pub(crate) position_reservation_retry_attempts: u32,
 }
 
 /// Dependencies the job needs.
@@ -190,10 +194,12 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
         )
         .await?
         {
+            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
+            let mut retry = self.clone();
+            retry.position_reservation_retry_attempts =
+                self.position_reservation_retry_attempts.saturating_add(1);
             let mut job_queue = ctx.job_queue.clone();
-            job_queue
-                .push_with_delay(self.clone(), EQUITY_TRANSFER_REDRIVE_DELAY)
-                .await?;
+            job_queue.push_with_delay(retry, retry_delay).await?;
             return Ok(());
         }
 
@@ -304,6 +310,7 @@ mod tests {
     use st0x_config::{ChainEquities, ExecutionThreshold};
     use st0x_event_sorcery::test_store;
     use st0x_evm::Chain;
+    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor};
     use st0x_float_macro::float;
     use st0x_raindex::{Raindex, RaindexVaultId};
     use st0x_tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
@@ -317,7 +324,9 @@ mod tests {
     };
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::native_gas::ConfiguredGasReadiness;
+    use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
+    use crate::position::TradeId;
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
@@ -482,6 +491,7 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(id),
             symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Terminal aggregate: resume_mint returns Ok(()) immediately.
@@ -537,6 +547,7 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(id),
             symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let calls_before = tokenizer.call_count();
@@ -620,6 +631,7 @@ mod tests {
             target: ResumeTokenizationTarget::Redemption(id),
             symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Completed aggregate is terminal: resume_redemption returns Ok(()).
@@ -672,6 +684,7 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(id.clone()),
             symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         Job::perform(&job, &ctx).await.unwrap();
 
@@ -796,6 +809,7 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(id),
             symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::perform(&job, &ctx)
@@ -888,6 +902,7 @@ mod tests {
             target: ResumeTokenizationTarget::Redemption(id.clone()),
             symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let ctx = ResumeTokenizationCtx {
             transfer,
@@ -913,6 +928,7 @@ mod tests {
         .fetch_one(&apalis_pool)
         .await
         .unwrap();
+
         let redriven: ResumeTokenizationAggregate = serde_json::from_slice(&payload).unwrap();
         assert!(matches!(
             redriven.target,
@@ -926,12 +942,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_hedge_backs_off_generic_resume_reservation_restoration() {
+        let (ctx, _, _, tokenizer) = build_ctx().await;
+        let id = issuer_request_id("resume-deferred-by-hedge");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let position_store = &ctx.position_authority.0;
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(10)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id.clone()),
+            symbol: Some(symbol),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 3,
+        };
+
+        let calls_before = tokenizer.call_count();
+        let scheduled_after = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert_eq!(
+            tokenizer.call_count(),
+            calls_before,
+            "the aggregate must not resume before its Position reservation is restored"
+        );
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_one(ctx.job_queue.pool())
+        .await
+        .unwrap();
+        let retry: ResumeTokenizationAggregate = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(retry.target, ResumeTokenizationTarget::Mint(id));
+        assert_eq!(retry.position_reservation_retry_attempts, 4);
+        assert!(
+            run_at >= scheduled_after + 8,
+            "the fourth reservation retry must use the shared 8-second backoff"
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_symbol_less_resume_is_discarded_before_transfer() {
         let (ctx, _, _, _) = build_ctx().await;
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(issuer_request_id("legacy-symbol-less")),
             symbol: None,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::perform(&job, &ctx)
@@ -951,6 +1039,7 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(id),
             symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -975,6 +1064,7 @@ mod tests {
             target: ResumeTokenizationTarget::Redemption(id),
             symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1018,6 +1108,7 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(id),
             symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let task_identity =
             crate::conductor::job::TaskIdentity::for_test("orphaned-terminal-resume");
@@ -1085,6 +1176,7 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(id),
             symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::on_terminal_attempt(
@@ -1141,6 +1233,7 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(id),
             symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let mut queue = ctx.job_queue.clone();
         queue.push(job.clone()).await.unwrap();
@@ -1226,6 +1319,7 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(id.clone()),
             symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         Job::perform(&job, &ctx).await.unwrap();
 
@@ -1331,6 +1425,7 @@ mod tests {
             target: ResumeTokenizationTarget::Redemption(id.clone()),
             symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         Job::perform(&job, &ctx).await.unwrap();
 
@@ -1370,11 +1465,13 @@ mod tests {
             target: ResumeTokenizationTarget::Mint(mint_id.clone()),
             symbol: None,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let expected_mint = json!({
             "target": { "Mint": mint_id.to_string() },
             "backpressure_streak": 0_u32,
+            "position_reservation_retry_attempts": 0_u32,
         });
         assert_eq!(serde_json::to_value(&mint_job).unwrap(), expected_mint);
 
@@ -1389,16 +1486,19 @@ mod tests {
             roundtripped_mint.backpressure_streak,
             BackpressureStreak::default()
         );
+        assert_eq!(roundtripped_mint.position_reservation_retry_attempts, 0);
 
         let redemption_job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
             symbol: None,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let expected_redemption = json!({
             "target": { "Redemption": redemption_id.to_string() },
             "backpressure_streak": 0_u32,
+            "position_reservation_retry_attempts": 0_u32,
         });
         assert_eq!(
             serde_json::to_value(&redemption_job).unwrap(),
@@ -1416,6 +1516,10 @@ mod tests {
             roundtripped_redemption.backpressure_streak,
             BackpressureStreak::default()
         );
+        assert_eq!(
+            roundtripped_redemption.position_reservation_retry_attempts,
+            0
+        );
     }
 
     /// Mandatory RAI-1494 test (M1): a row enqueued before `backpressure_streak`
@@ -1427,5 +1531,6 @@ mod tests {
 
         let job: ResumeTokenizationAggregate = serde_json::from_value(legacy_payload).unwrap();
         assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+        assert_eq!(job.position_reservation_retry_attempts, 0);
     }
 }

@@ -3556,6 +3556,7 @@ async fn recover_interrupted_tokenization_aggregates(
                     target: ResumeTokenizationTarget::Mint(mint_id.clone()),
                     symbol: Some(symbol),
                     backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
                 })
                 .await?;
         }
@@ -3598,6 +3599,7 @@ async fn recover_interrupted_tokenization_aggregates(
                     target: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
                     symbol: Some(symbol),
                     backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
                 })
                 .await?;
         }
@@ -7846,6 +7848,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(10)),
                 generation: GuardGeneration::from_parts(NonZeroU32::new(9).unwrap(), 1),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -7903,6 +7906,7 @@ mod tests {
                 chain: Chain::Base,
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -7947,6 +7951,7 @@ mod tests {
                 chain: Chain::Base,
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -7960,6 +7965,7 @@ mod tests {
                 chain: Chain::Base,
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -8033,6 +8039,7 @@ mod tests {
                 chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -8044,6 +8051,7 @@ mod tests {
                 chain: Chain::Base,
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -8119,6 +8127,7 @@ mod tests {
                 chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             },
             status: Status::Pending,
             attempts: 0,
@@ -8192,6 +8201,7 @@ mod tests {
                 chain: Chain::Base,
                 generation: GuardGeneration::from_parts(NonZeroU32::new(10).unwrap(), 1),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             },
             status: Status::Done,
             attempts: 0,
@@ -8251,6 +8261,7 @@ mod tests {
             chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let rows = vec![
             DurableTransferJob {
@@ -8343,6 +8354,7 @@ mod tests {
                 chain: Chain::Base,
                 generation: GuardGeneration::from_parts(NonZeroU32::new(7).unwrap(), 12),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -8400,8 +8412,8 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: GuardGeneration::from_parts(NonZeroU32::new(1).unwrap(), 1),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -8489,6 +8501,7 @@ mod tests {
                 chain: Chain::Base,
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();

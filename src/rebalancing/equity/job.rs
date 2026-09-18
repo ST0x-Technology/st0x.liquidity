@@ -46,9 +46,9 @@ use crate::conductor::job::{
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::position::{EquityTransferReservationId, Position, PositionCommand, PositionError};
+use crate::position_check::equity_transfer_retry_delay;
 use crate::rebalancing::trigger::{GuardGeneration, GuardState, remove_active_transfer};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
-use crate::trading::offchain::hedge::EQUITY_TRANSFER_REDRIVE_DELAY;
 
 /// Delay before re-enqueueing an equity transfer job after a bot-gas receipt
 /// cost enqueue failure. Mirrors `SETTLEMENT_REDRIVE_DELAY` in the USDC
@@ -191,6 +191,10 @@ pub(crate) struct TransferEquityToMarketMaking {
     /// lands.
     #[serde(default)]
     pub(crate) backpressure_streak: BackpressureStreak,
+    /// Number of consecutive reservation-restoration deferrals. Persisted in
+    /// the replacement payload so a long-lived hedge backs off across rows.
+    #[serde(default)]
+    pub(crate) position_reservation_retry_attempts: u32,
 }
 
 pub(crate) type PositionReservationAuthority = (Arc<Store<Position>>, ExecutionThreshold);
@@ -280,16 +284,20 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
             )
             .await?
         {
+            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
+            let mut retry = self.clone();
+            retry.position_reservation_retry_attempts =
+                self.position_reservation_retry_attempts.saturating_add(1);
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
                 issuer_request_id = %self.issuer_request_id,
+                position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
+                retry_delay_secs = retry_delay.as_secs(),
                 "Pending hedge deferred equity mint reservation restoration; rescheduling"
             );
             let mut job_queue = ctx.job_queue.clone();
-            job_queue
-                .push_with_delay(self.clone(), EQUITY_TRANSFER_REDRIVE_DELAY)
-                .await?;
+            job_queue.push_with_delay(retry, retry_delay).await?;
             return Ok(());
         }
 
@@ -725,6 +733,10 @@ pub(crate) struct TransferEquityToHedging {
     /// ready when that follow-up lands.
     #[serde(default)]
     pub(crate) backpressure_streak: BackpressureStreak,
+    /// Number of consecutive reservation-restoration deferrals. Persisted in
+    /// the replacement payload so a long-lived hedge backs off across rows.
+    #[serde(default)]
+    pub(crate) position_reservation_retry_attempts: u32,
 }
 
 impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
@@ -759,16 +771,20 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             )
             .await?
         {
+            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
+            let mut retry = self.clone();
+            retry.position_reservation_retry_attempts =
+                self.position_reservation_retry_attempts.saturating_add(1);
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
                 aggregate_id = %self.aggregate_id,
+                position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
+                retry_delay_secs = retry_delay.as_secs(),
                 "Pending hedge deferred equity redemption reservation restoration; rescheduling"
             );
             let mut job_queue = ctx.job_queue.clone();
-            job_queue
-                .push_with_delay(self.clone(), EQUITY_TRANSFER_REDRIVE_DELAY)
-                .await?;
+            job_queue.push_with_delay(retry, retry_delay).await?;
             return Ok(());
         }
 
@@ -1003,6 +1019,46 @@ mod tests {
         }
     }
 
+    async fn pending_hedge_position() -> (Arc<Store<Position>>, Symbol) {
+        let (position_pool, _) = crate::test_utils::setup_test_pools().await;
+        let position_store = Arc::new(test_store::<Position>(position_pool, ()));
+        let symbol = Symbol::new("AAPL").unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(10)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        (position_store, symbol)
+    }
+
     /// Records the resume call and returns a configurable outcome, so the
     /// job's `perform` can be tested without broker/onchain setup.
     struct RecordingResume {
@@ -1111,6 +1167,7 @@ mod tests {
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -1158,6 +1215,7 @@ mod tests {
                     quantity,
                     generation: GuardGeneration::default(),
                     backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
                 })
                 .await
                 .expect_err("push to a closed pool must fail");
@@ -1196,6 +1254,7 @@ mod tests {
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -1260,6 +1319,7 @@ mod tests {
                     quantity,
                     generation: GuardGeneration::default(),
                     backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
                 })
                 .await
                 .expect_err("push to a closed pool must fail");
@@ -1293,6 +1353,7 @@ mod tests {
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::perform(&job, &ctx)
@@ -1314,42 +1375,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_hedge_defers_transfer_until_reservation_can_be_restored() {
-        let (position_pool, _) = crate::test_utils::setup_test_pools().await;
-        let position_store = Arc::new(test_store::<Position>(position_pool, ()));
-        let symbol = Symbol::new("AAPL").unwrap();
-        position_store
-            .send(
-                &symbol,
-                PositionCommand::AcknowledgeOnChainFill {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                    trade_id: TradeId {
-                        chain: Chain::Base,
-                        tx_hash: TxHash::random(),
-                        log_index: 1,
-                    },
-                    amount: FractionalShares::new(float!(10)),
-                    direction: Direction::Buy,
-                    price_usdc: float!(150),
-                    block_timestamp: chrono::Utc::now(),
-                    block_number: None,
-                },
-            )
-            .await
-            .unwrap();
-        position_store
-            .send(
-                &symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id: OffchainOrderId::new(),
-                    shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::DryRun,
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
+        let (position_store, symbol) = pending_hedge_position().await;
 
         let stub = Arc::new(RecordingResume::success());
         let mut ctx = test_ctx(Arc::clone(&stub) as Arc<dyn ResumeEquityToMarketMaking>).await;
@@ -1361,24 +1387,73 @@ mod tests {
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 3,
         };
-
+        let scheduled_after = chrono::Utc::now().timestamp();
         Job::perform(&job, &ctx).await.unwrap();
 
         assert!(
             stub.captured.lock().unwrap().is_none(),
             "the transfer must not run before its Position reservation is restored"
         );
-        let pending_count: i64 = sqlx_apalis::query_scalar(
-            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
         )
         .bind(std::any::type_name::<TransferEquityToMarketMaking>())
         .fetch_one(ctx.job_queue.pool())
         .await
         .unwrap();
-        assert_eq!(
-            pending_count, 1,
-            "the deferred transfer must be retried after the pending hedge can clear"
+        let retry: TransferEquityToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(retry.position_reservation_retry_attempts, 4);
+        assert!(
+            run_at >= scheduled_after + 8,
+            "the fourth reservation retry must use the shared 8-second backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_hedge_backs_off_redemption_reservation_restoration() {
+        let (position_store, symbol) = pending_hedge_position().await;
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let stub = Arc::new(RecordingRedemptionResume {
+            fail: false,
+            captured: Mutex::new(None),
+        });
+        let mut ctx = redemption_test_ctx(
+            stub.clone(),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: redemption_aggregate_id("redemption-deferred-by-hedge"),
+            symbol,
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 3,
+        };
+
+        let scheduled_after = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert!(
+            stub.captured.lock().unwrap().is_none(),
+            "the redemption must not run before its Position reservation is restored"
+        );
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let retry: TransferEquityToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(retry.position_reservation_retry_attempts, 4);
+        assert!(
+            run_at >= scheduled_after + 8,
+            "the fourth reservation retry must use the shared 8-second backoff"
         );
     }
 
@@ -1392,8 +1467,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -1416,8 +1491,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1447,8 +1522,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1539,8 +1614,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // TokensWrapped propagates Err: apalis retries resume_mint (idempotent
@@ -1604,8 +1679,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // VaultDepositSubmitted propagates Err so apalis retries the transfer job,
@@ -1678,8 +1753,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Must return Ok(()) — apalis does not retry; UnwrappedEquityRecovery takes over.
@@ -1749,8 +1824,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Must return Ok(()) — apalis does not retry; UnwrappedEquityRecovery takes over.
@@ -1821,8 +1896,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Must return Ok(()) so apalis marks the stale job Done -- no retry.
@@ -1889,8 +1964,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1971,8 +2046,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -2053,8 +2128,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Terminal aggregate must propagate Err — it is not a recoverable state.
@@ -2122,8 +2197,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Idempotent: guard already held, state is recoverable -> still Ok(()).
@@ -2175,8 +2250,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -2203,6 +2278,7 @@ mod tests {
             quantity: FractionalShares::new(float!(2.5)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let expected = json!({
@@ -2212,6 +2288,7 @@ mod tests {
             "chain": "base",
             "generation": 0_u64,
             "backpressure_streak": 0_u32,
+            "position_reservation_retry_attempts": 0_u32,
         });
 
         assert_eq!(serde_json::to_value(&job).unwrap(), expected);
@@ -2223,6 +2300,10 @@ mod tests {
         assert_eq!(roundtripped.quantity, job.quantity);
         assert_eq!(roundtripped.generation, job.generation);
         assert_eq!(roundtripped.backpressure_streak, job.backpressure_streak);
+        assert_eq!(
+            roundtripped.position_reservation_retry_attempts,
+            job.position_reservation_retry_attempts
+        );
 
         // Old rows without the generation/backpressure_streak fields must
         // deserialize to 0 for both (RAI-1494's
@@ -2244,6 +2325,10 @@ mod tests {
             BackpressureStreak::default(),
             "missing backpressure_streak must default to 0"
         );
+        assert_eq!(
+            legacy.position_reservation_retry_attempts, 0,
+            "missing position_reservation_retry_attempts must default to 0"
+        );
     }
 
     #[test]
@@ -2255,6 +2340,7 @@ mod tests {
         });
         let job: TransferEquityToMarketMaking = serde_json::from_value(legacy_payload).unwrap();
         assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+        assert_eq!(job.position_reservation_retry_attempts, 0);
     }
 
     #[test]
@@ -2267,6 +2353,7 @@ mod tests {
         let job: TransferEquityToHedging = serde_json::from_value(legacy_payload).unwrap();
         assert_eq!(job.generation, GuardGeneration::default());
         assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+        assert_eq!(job.position_reservation_retry_attempts, 0);
     }
 
     /// Records the redemption resume call and returns a configurable outcome.
@@ -2308,6 +2395,7 @@ mod tests {
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak(4),
+            position_reservation_retry_attempts: 0,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -2448,6 +2536,7 @@ mod tests {
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -2515,6 +2604,7 @@ mod tests {
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -2545,6 +2635,7 @@ mod tests {
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -2580,6 +2671,7 @@ mod tests {
                 chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             };
             let task_identity = TaskIdentity::for_test("terminal-mint-cleanup");
 
@@ -2616,6 +2708,7 @@ mod tests {
             chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let reservation_id = EquityTransferReservationId::from_uuid(job.issuer_request_id.0);
         position_store
@@ -2692,6 +2785,7 @@ mod tests {
             chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::on_terminal_attempt(
@@ -2726,6 +2820,7 @@ mod tests {
             chain: Chain::Base,
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let old_job = TransferEquityToMarketMaking {
             issuer_request_id: issuer_request_id("old-terminal-mint-cleanup"),
@@ -2734,6 +2829,7 @@ mod tests {
             chain: Chain::Base,
             generation: GuardGeneration::from_parts(NonZeroU32::new(3).unwrap(), 2),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let task_identity = TaskIdentity::for_test("preserved-mint-cleanup");
 
@@ -2762,6 +2858,7 @@ mod tests {
             chain: Chain::Base,
             generation: current_generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::on_terminal_attempt(&current_job, &ctx, &task_identity)
@@ -2797,6 +2894,7 @@ mod tests {
             chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::on_terminal_attempt(
@@ -2845,6 +2943,7 @@ mod tests {
                 chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             };
 
             Job::on_terminal_attempt(
@@ -2899,6 +2998,7 @@ mod tests {
             chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::on_terminal_attempt(
@@ -2924,6 +3024,7 @@ mod tests {
             quantity: FractionalShares::new(float!(2.5)),
             generation: GuardGeneration::from_parts(NonZeroU32::new(1).unwrap(), 1),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let expected = json!({
@@ -2933,6 +3034,7 @@ mod tests {
             "quantity": "2.5",
             "generation": 4_294_967_297_u64,
             "backpressure_streak": 0_u32,
+            "position_reservation_retry_attempts": 0_u32,
         });
         assert_eq!(serde_json::to_value(&job).unwrap(), expected);
         let deserialized: TransferEquityToHedging = serde_json::from_value(expected).unwrap();
@@ -2941,6 +3043,10 @@ mod tests {
         assert_eq!(deserialized.symbol, job.symbol);
         assert_eq!(deserialized.quantity, job.quantity);
         assert_eq!(deserialized.generation, job.generation);
+        assert_eq!(
+            deserialized.position_reservation_retry_attempts,
+            job.position_reservation_retry_attempts
+        );
     }
 
     /// Rows queued before the payload carried a chain were all Base.
@@ -2972,6 +3078,7 @@ mod tests {
             chain: Chain::Ethereum,
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let serialized = serde_json::to_value(&mint).unwrap();
         assert_eq!(serialized["chain"], json!("ethereum"));
@@ -2986,6 +3093,7 @@ mod tests {
             chain: Chain::Ethereum,
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let serialized = serde_json::to_value(&redemption).unwrap();
         assert_eq!(serialized["chain"], json!("ethereum"));
