@@ -2468,6 +2468,7 @@ mod tests {
                     "qty": quantity,
                     "side": side,
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2527,6 +2528,7 @@ mod tests {
                     "qty": "10",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2586,6 +2588,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2652,6 +2655,7 @@ mod tests {
                     "status": "new",
                     "extended_hours": true,
                     "limit_price": "24.20",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });

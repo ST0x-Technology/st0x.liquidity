@@ -251,9 +251,6 @@ pub async fn place_offchain_order_at_broker(
         )
         .await
         .map_err(|source| PlaceOffchainOrderError::Admission { source })?;
-    if matches!(admission, PlacementAdmission::Deferred) {
-        return Err(PlaceOffchainOrderError::Deferred);
-    }
     let reserved_placed_at = match &admission {
         PlacementAdmission::Recovered(result) => Some(result.placed_at),
         PlacementAdmission::New | PlacementAdmission::Deferred => placed_at,
@@ -274,6 +271,10 @@ pub async fn place_offchain_order_at_broker(
             },
         )
         .await?;
+
+    if matches!(admission, PlacementAdmission::Deferred) {
+        return Err(PlaceOffchainOrderError::Deferred);
+    }
 
     // Only call the broker while the order is still Pending. A retry whose
     // outcome already landed (Submitted, or a terminal state) must not place a
