@@ -900,6 +900,7 @@ async fn setup_trading_schedule(
 }
 
 impl Conductor {
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
         ctx: Ctx,
