@@ -126,10 +126,10 @@ impl Drop for UsdcDriverPauseGuard {
     }
 }
 
-/// Driver side of the pause, one clone per worker. A worker calls
-/// [`Self::enter`] at the top of each execution and holds the returned
-/// [`InFlight`] token for the execution's lifetime; the trigger's check and
-/// sweep claim through [`Self::try_enter`], which never parks.
+/// Driver side of the pause, one clone per worker. A worker and the queued
+/// trigger check call [`Self::enter`] at the top of each execution and hold the
+/// returned [`InFlight`] token for the execution's lifetime; the inline trigger
+/// sweep claims through [`Self::try_enter`], which never parks.
 #[derive(Clone)]
 pub(crate) struct UsdcDriverGate {
     pause: watch::Receiver<bool>,
@@ -168,9 +168,9 @@ impl UsdcDriverGate {
 
     /// Claims an in-flight slot without parking: `None` when a pause is
     /// requested or held, so a caller that must not block, like the trigger's
-    /// check or sweep running inline on a reactor, skips its work instead.
-    /// A returned token makes a pause wait for that work to finish, exactly
-    /// as it waits for a worker execution.
+    /// inline sweep, skips its work instead. A returned token makes a pause
+    /// wait for that work to finish, exactly as it waits for a worker
+    /// execution.
     ///
     /// Claims then re-reads the flag for the same reason [`Self::enter`] does.
     pub(crate) fn try_enter(&self) -> Option<InFlight> {
@@ -424,7 +424,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
             !pauser.is_finished(),
-            "a pause must wait for a claimed sweep or check to finish"
+            "a pause must wait for a claimed nonblocking operation to finish"
         );
         assert!(
             gate.try_enter().is_none(),
