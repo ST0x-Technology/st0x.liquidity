@@ -3600,6 +3600,32 @@ impl RebalancingService {
         .await
     }
 
+    async fn build_equity_operation_or_skip(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<TriggeredOperation>, equity::EquityTriggerError> {
+        match self.build_equity_operation(symbol).await {
+            Ok(operation) => Ok(operation),
+            Err(equity::EquityTriggerError::Wrapper(WrapperError::SymbolNotConfigured(symbol))) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    "Skipped equity trigger: symbol not configured"
+                );
+                Ok(None)
+            }
+            Err(equity::EquityTriggerError::TokenNotInRegistry(symbol)) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    "Skipped equity trigger: symbol not in vault registry"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn try_claim_usdc_guard(&self) -> Option<usdc::InProgressGuard> {
         usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
     }
@@ -4032,6 +4058,15 @@ impl RebalancingService {
             return Ok(());
         }
 
+        // Most checks are balanced or below the configured imbalance threshold.
+        // Size once before taking the durable Position reservation so that
+        // common no-op checks append no reservation/release events. Inventory
+        // can change after this read, so the post-reservation sizing below
+        // remains authoritative.
+        if self.build_equity_operation_or_skip(symbol).await?.is_none() {
+            return Ok(());
+        }
+
         let reservation_id = EquityTransferReservationId::generate();
         if !self
             .try_reserve_equity_transfer(symbol, reservation_id)
@@ -4041,28 +4076,8 @@ impl RebalancingService {
         }
 
         let attempt = async {
-            let operation = match self.build_equity_operation(symbol).await {
-                Ok(Some(operation)) => operation,
-                Ok(None) => return Ok(false),
-                Err(equity::EquityTriggerError::Wrapper(WrapperError::SymbolNotConfigured(
-                    symbol,
-                ))) => {
-                    warn!(
-                        target: "rebalance",
-                        %symbol,
-                        "Skipped equity trigger: symbol not configured"
-                    );
-                    return Ok(false);
-                }
-                Err(equity::EquityTriggerError::TokenNotInRegistry(symbol)) => {
-                    warn!(
-                        target: "rebalance",
-                        %symbol,
-                        "Skipped equity trigger: symbol not in vault registry"
-                    );
-                    return Ok(false);
-                }
-                Err(error) => return Err(error),
+            let Some(operation) = self.build_equity_operation_or_skip(symbol).await? else {
+                return Ok(false);
             };
 
             // The restart taint needs no matching re-check: it is only seeded
@@ -11443,6 +11458,17 @@ mod tests {
         wrapper: Arc<MockWrapper>,
         config: RebalancingServiceConfig,
     ) -> Arc<RebalancingService> {
+        make_trigger_with_inventory_registry_wrapper_and_pool(inventory, symbol, wrapper, config)
+            .await
+            .0
+    }
+
+    async fn make_trigger_with_inventory_registry_wrapper_and_pool(
+        inventory: InventoryView,
+        symbol: &Symbol,
+        wrapper: Arc<MockWrapper>,
+        config: RebalancingServiceConfig,
+    ) -> (Arc<RebalancingService>, SqlitePool) {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
@@ -11470,7 +11496,7 @@ mod tests {
             .unwrap();
         let trigger = Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             BTreeMap::from([(
                 Chain::Base,
                 VaultRegistryId {
@@ -11487,7 +11513,7 @@ mod tests {
         trigger
             .set_position_authority(position, position_projection, position_threshold)
             .await;
-        trigger
+        (trigger, pool)
     }
     #[tokio::test]
     async fn incident_order_transfer_reservation_prevents_redemption() {
@@ -11545,13 +11571,22 @@ mod tests {
     #[tokio::test]
     async fn equity_transfer_reservation_survives_queue_handoff() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let trigger = make_trigger_with_inventory_and_registry(
+        let wrapper = Arc::new(MockWrapper::new());
+        let trigger = make_trigger_with_inventory_registry_and_wrapper(
             InventoryView::default().with_equity(symbol.clone(), shares(80), shares(20)),
             &symbol,
+            Arc::clone(&wrapper),
+            test_config(),
         )
         .await;
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            wrapper.ratio_calls(),
+            2,
+            "an actionable check must size before and after taking the reservation"
+        );
 
         let jobs = take_pending_equity_redemption_jobs(&trigger).await;
         assert_eq!(jobs.len(), 1);
@@ -11577,28 +11612,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_equity_operation_releases_position_reservation() {
+    async fn balanced_equity_checks_do_not_append_position_events() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let trigger = make_trigger_with_inventory_and_registry(
+        let (trigger, pool) = make_trigger_with_inventory_registry_wrapper_and_pool(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
+            Arc::new(MockWrapper::new()),
+            test_config(),
         )
         .await;
 
-        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        for _ in 0..2 {
+            trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        }
 
-        let position = trigger
-            .position_projection
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .unwrap()
-            .load(&symbol)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(position.equity_transfer_reservation, None);
+        let reservation_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = 'Position' \
+               AND event_type LIKE 'PositionEvent::EquityTransfer%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            reservation_events, 0,
+            "balanced checks must not append Position reservation events"
+        );
     }
 
     #[tokio::test]
