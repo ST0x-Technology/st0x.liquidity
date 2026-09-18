@@ -1,6 +1,6 @@
 # ADR 0008: Counter-trading (broker hedging) during a dividend freeze
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-15
 - **Linear:** RAI-1055 (parent RAI-1033 — Dividends Issuance + Liquidity Bots
   MVP, milestone M1 — wtStock NAV bump MVP)
@@ -72,7 +72,7 @@ These were established by reading the current code, not assumed:
    (`src/onchain/accumulator.rs`, `crates/execution/.../executor.rs`). No
    freeze-specific handling is needed for that.
 
-## Decision (proposed — pending stakeholder review)
+## Decision
 
 **Do not halt counter-trading/broker hedging during a dividend freeze. Hedging
 continues unconditionally; the freeze affects only supply operations (mints and
