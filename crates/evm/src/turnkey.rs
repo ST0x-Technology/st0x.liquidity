@@ -1273,7 +1273,6 @@ mod tests {
     use alloy::consensus::{TxEip1559, TxLegacy};
     use alloy::eips::eip2718::Encodable2718;
     use alloy::eips::eip2930::AccessList;
-    use alloy::network::TransactionBuilder as _;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{TxKind, U256};
     use alloy::providers::ext::AnvilApi;
