@@ -60,7 +60,7 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::usdc::{
     TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
-    TransferUsdcToMarketMakingJobQueue,
+    TransferUsdcToMarketMakingJobQueue, UsdcDriverGate,
 };
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
@@ -724,6 +724,11 @@ pub(crate) struct RebalancingService {
     /// [`Self::divergence_gate`].
     divergence_gate: Arc<InventoryDivergenceGate>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
+    /// Driver pause gate, attached by the conductor once the USDC workers are
+    /// built. Unset in tests that never wire a pause, where the trigger runs
+    /// unpaused. A queued check parks behind a held pause; the inline sweep
+    /// skips and relies on its next caller.
+    usdc_driver_gate: std::sync::OnceLock<UsdcDriverGate>,
     notifier: Arc<dyn crate::alerts::Notifier>,
     /// The ERC-4626 wrapper on each hedged chain: a symbol's derivative and
     /// its share ratio are that chain's, never another's.
@@ -883,6 +888,7 @@ impl RebalancingService {
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             divergence_gate: Arc::default(),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
+            usdc_driver_gate: std::sync::OnceLock::new(),
             notifier,
             wrappers,
             equity_scheduler,
@@ -1279,6 +1285,24 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
+        // The sweep relatches, clears, and re-arms under the guard an operator
+        // operation may be mutating, and it runs from the check job, the
+        // equity check, and inline on the snapshot reactor. Claim the driver
+        // without parking so a pause waits for an active sweep and a held
+        // pause skips the sweep; the next caller sweeps once it resumes.
+        let _in_flight = if let Some(gate) = self.usdc_driver_gate.get() {
+            let Some(in_flight) = gate.try_enter() else {
+                debug!(
+                    target: "rebalance",
+                    "Skipping stuck USDC sweep: driver paused by an operator operation"
+                );
+                return Ok(());
+            };
+            Some(in_flight)
+        } else {
+            None
+        };
+
         // Select ids to examine this tick. The selection is intentionally broad:
         //
         // - Post-burn entries are ALWAYS selected regardless of elapsed time.
@@ -2925,6 +2949,12 @@ impl RebalancingService {
         usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
     }
 
+    /// Attaches the USDC driver pause gate once the conductor has built the
+    /// workers. Attached once per boot; a second attach is ignored.
+    pub(crate) fn attach_usdc_driver_gate(&self, gate: UsdcDriverGate) {
+        let _ = self.usdc_driver_gate.set(gate);
+    }
+
     async fn load_mint_tracking(&self, id: &IssuerRequestId) -> Option<MintTracking> {
         let Some(tracking) = self.mint_tracking.read().await.get(id).cloned() else {
             warn!(target: "rebalance", id = %id, "Mint event for untracked aggregate");
@@ -3460,6 +3490,17 @@ impl RebalancingService {
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
+        // Hold a claim on the driver for the whole check so an operator
+        // operation's pause waits for an active check. A check already queued
+        // while the pause is held parks until the operator finishes instead of
+        // dropping the imbalance that caused it; unlike the inline sweep, this
+        // apalis worker has its own execution budget and can safely wait.
+        let _in_flight = if let Some(gate) = self.usdc_driver_gate.get() {
+            Some(gate.enter().await)
+        } else {
+            None
+        };
+
         self.expire_stuck_operations_with_logging().await;
 
         let Some((threshold, usdc_limit, reserved)) = self.usdc_rebalancing_params() else {
@@ -6318,6 +6359,7 @@ mod tests {
     };
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
+    use crate::rebalancing::usdc::usdc_driver_pause;
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
@@ -12822,6 +12864,41 @@ mod tests {
             count_pending_equity_redemption_jobs(&trigger).await,
             0,
             "Inventory should be balanced after redemption completion (50/50)"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_check_waits_for_operator_pause_then_processes_imbalance() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let (pause, gate) = usdc_driver_pause();
+        trigger.attach_usdc_driver_gate(gate);
+        let pause_guard = pause.pause().await.unwrap();
+
+        let check_trigger = Arc::clone(&trigger);
+        let mut check = tokio::spawn(async move { check_trigger.check_and_trigger_usdc().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut check)
+                .await
+                .is_err(),
+            "a queued USDC check must remain pending while the operator pause is held"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "the paused check must not dispatch a transfer"
+        );
+
+        drop(pause_guard);
+        tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .expect("the USDC check must resume when the operator pause ends")
+            .expect("the resumed USDC check task must complete");
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "the resumed check must process the imbalance without another balance event"
         );
     }
 
