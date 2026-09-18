@@ -169,11 +169,11 @@ vault_owner = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
 # Backfill floor: the orderbook's deployment block on 4663 (no code at the
 # block before it, code from this one on).
 deployment_block = 59557818
-# Base's "safe" cutoff is OP-Stack-only and this RPC does not guarantee the
-# safe/finalized tags, so ingest at a fixed depth: 8000 blocks is ~13 min at
-# the ~100 ms cadence, covering parent-chain finality.
+# Robinhood is a sequencer-ordered Arbitrum Orbit rollup, so a sequenced fill
+# cannot reorg short of a chain-level failure; the cutoff only covers RPC node
+# lag (600 blocks is ~1 min at ~100 ms), and hedge lag is the price risk.
 ingestion_cutoff = "confirmations"
-ingestion_cutoff_confirmations = 8000
+ingestion_cutoff_confirmations = 600
 order_fill_poll_interval_secs = 5
 primary = false
 # No redemption_wallet: a hedge-only chain redeems nothing.

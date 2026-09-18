@@ -8750,7 +8750,7 @@ mod tests {
                 IngestionCutoffTag::Confirmations,
                 "{name}: Robinhood has no OP-Stack safe tag"
             );
-            assert_eq!(trading.ingestion_cutoff_confirmations, Some(8000), "{name}");
+            assert_eq!(trading.ingestion_cutoff_confirmations, Some(600), "{name}");
             assert_eq!(
                 trading.inventory_adapters,
                 InventoryAdapters::default(),
