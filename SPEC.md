@@ -3266,7 +3266,7 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 
 ```mermaid
 stateDiagram-v2
-    [*] --> VaultWithdrawSubmitting: Redeem (persists intent)
+    [*] --> VaultWithdrawSubmitting: Redeem (persists signed transaction)
     VaultWithdrawSubmitting --> VaultWithdrawSubmitted: RecordWithdrawSubmission
     VaultWithdrawSubmitted --> WithdrawnFromRaindex: ConfirmWithdraw
     WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
@@ -3279,13 +3279,13 @@ stateDiagram-v2
     Pending --> Failed
 ```
 
-- `Redeem` persists `VaultWithdrawSubmitting` with the chain, token, vault ID,
-  target amount, and pre-submission chain head before any withdrawal is
-  broadcast
-- the orchestrator submits the withdrawal outside the aggregate transition and
-  records its hash with `RecordWithdrawSubmission`
-- resume scans from the recorded chain head and adopts the matching
-  `OperatorWithdraw`; it submits only after a finality-gated scan proves absence
+- the orchestrator prepares and signs the withdrawal before `Redeem`, which
+  persists `VaultWithdrawSubmitting` with the chain, token, vault ID, target
+  amount, and exact transaction bytes before any broadcast
+- the orchestrator broadcasts that persisted transaction outside the aggregate
+  transition and records its hash with `RecordWithdrawSubmission`
+- resume rebroadcasts the same signed bytes; it never creates a second
+  withdrawal transaction
 - `VaultWithdrawSubmitted` tracks the known transaction hash until
   `ConfirmWithdraw` confirms the receipt
 - `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but are not
@@ -3310,7 +3310,9 @@ enum EquityRedemption {
         token: Address,
         vault_id: RaindexVaultId,
         wrapped_amount: U256,
+        // Version-7 scan lower bound; zero for prepared transactions.
         from_block: u64,
+        prepared: PreparedTransaction,
         submitting_at: DateTime<Utc>,
     },
     VaultWithdrawSubmitted {
@@ -3385,7 +3387,7 @@ enum EquityRedemption {
 
 ```rust
 enum EquityRedemptionCommand {
-    // Initialize: persists the withdrawal intent without an external call.
+    // Initialize: persists the exact signed withdrawal without broadcasting it.
     Redeem {
         symbol: Symbol,
         chain: Chain,
@@ -3393,9 +3395,11 @@ enum EquityRedemptionCommand {
         token: Address,
         vault_id: RaindexVaultId,
         amount: U256,
+        // Version-7 compatibility field; zero for new commands.
         from_block: u64,
+        prepared: PreparedTransaction,
     },
-    // Records a transaction returned or adopted by the orchestrator.
+    // Records the persisted transaction's hash after broadcast.
     RecordWithdrawSubmission { tx_hash: TxHash },
     // Confirms the recorded transaction.
     ConfirmWithdraw,
@@ -3427,7 +3431,11 @@ enum EquityRedemptionEvent {
         token: Address,
         vault_id: RaindexVaultId,
         wrapped_amount: U256,
+        // Version-7 scan lower bound; zero for prepared transactions.
         from_block: u64,
+        // None only when replaying a version-7 event; such an aggregate
+        // fails closed into the legacy operator-reconciliation state.
+        prepared: Option<PreparedTransaction>,
         submitting_at: DateTime<Utc>,
     },
     VaultWithdrawSubmitted {
@@ -3506,27 +3514,29 @@ and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
 the replayed `Failed` state materializes the operator's reason.
 
 Vault withdrawal submission is an irreversible uncertainty boundary. The
-aggregate transition that creates `VaultWithdrawSubmitting` is pure: it performs
-no RPC lookup, signing, or broadcast. The orchestrator then submits exactly once
-in that invocation. If submission or recording the returned hash fails, the
-aggregate remains `VaultWithdrawSubmitting`; no failure event may erase the
-intent.
+orchestrator prepares and signs the transaction, then the pure aggregate
+transition creates `VaultWithdrawSubmitting` with its exact hash, nonce, and raw
+bytes before any broadcast. The orchestrator broadcasts only those persisted
+bytes. If broadcast or recording the returned hash fails, the aggregate remains
+`VaultWithdrawSubmitting`; no failure event may erase the prepared transaction.
 
-Every later invocation reconciles before acting. It scans
-`OperatorWithdraw`/legacy `WithdrawV2` events from the recorded `from_block`,
-filtered to this bot's operator, token, and vault. A matching event with the
-requested amount is adopted and its transaction hash recorded. A different
-amount is a typed fail-closed error. An inconclusive or anomalous scan is
-retryable and never broadcasts. Only a confirmations-deep, repeated empty scan
-permits one fresh submission.
+Every later invocation rebroadcasts the same raw transaction. A crash before the
+first broadcast and an RPC response lost after acceptance therefore enter the
+same idempotent recovery path: neither can allocate a new nonce or create a
+second withdrawal. An RPC `already known` response is accepted as evidence that
+the identical signed transaction reached a node and returns the locally computed
+transaction hash.
 
-An RPC `already known` response is accepted as evidence that the identical
-signed transaction reached a node. The wallet keeps its nonce cache intact and
-returns the transaction hash when the response carries one; otherwise the
-submission remains indeterminate and the persisted intent is reconciled from
-chain logs. Legacy `VaultWithdrawPending` aggregates predate the recorded chain
-head and are never automatically resubmitted; an operator must resolve them
-conservatively.
+Receipt timeout, a node lagging the required block, or otherwise inconclusive
+withdrawal reconciliation is not bounded by Apalis's ordinary retry budget. The
+resume job returns success only after durably enqueueing a delayed replacement
+with no attempt cap, and retains the position reservation while the transaction
+remains unresolved.
+
+Legacy `VaultWithdrawPending` aggregates and version-7 `VaultWithdrawSubmitting`
+events without prepared transaction bytes are never automatically submitted;
+replay places them in the operator-reconciliation state so an operator must
+resolve them conservatively.
 
 ##### Aggregate Services
 
@@ -3547,11 +3557,11 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
 ##### Business Rules
 
 - `Redeem` only from uninitialized state; emits only the durable
-  `VaultWithdrawSubmitting` intent and never calls Raindex
+  `VaultWithdrawSubmitting` transaction and never broadcasts it
 - `RecordWithdrawSubmission` only from `VaultWithdrawSubmitting`
 - `ConfirmWithdraw` only from `VaultWithdrawSubmitted`
-- a resume from `VaultWithdrawSubmitting` always scans before any submission;
-  retries never blindly repeat a possibly accepted withdrawal
+- a resume from `VaultWithdrawSubmitting` always rebroadcasts the exact
+  persisted bytes; retries never sign or submit a different withdrawal
 - if a later transfer step fails after withdrawal, the aggregate retains the
   withdrawal transaction for recovery and audit
 - `ConfirmUnwrap` records the token the vault reports as its `asset()` at the

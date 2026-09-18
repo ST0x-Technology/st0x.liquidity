@@ -2741,6 +2741,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
                 vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                 amount: U256::from(10_000_000_000_000_000_000_u128),
                 from_block: 0,
+                prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
             },
         )
         .await

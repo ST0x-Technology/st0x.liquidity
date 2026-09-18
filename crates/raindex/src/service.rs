@@ -14,16 +14,19 @@
 //! OrderBook V6 uses a custom float format (B256) for amounts. All conversions between
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
 use alloy::sol;
-use alloy::sol_types::{SolError, SolEvent};
+use alloy::sol_types::{SolCall, SolError, SolEvent};
 use async_trait::async_trait;
 use rain_math_float::Float;
 use tracing::{debug, info, warn};
 
-use st0x_evm::{Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, USDC_BASE, Wallet};
+use st0x_evm::{
+    Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, PreparedTransaction, USDC_BASE,
+    Wallet,
+};
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
@@ -673,6 +676,47 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 
         self.submit_deposit4_to_vault(token, vault_id, amount, decimals)
             .await
+    }
+
+    async fn prepare_withdraw(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        target_amount: U256,
+        decimals: u8,
+    ) -> Result<PreparedTransaction, RaindexError> {
+        if target_amount.is_zero() {
+            return Err(RaindexError::ZeroAmount);
+        }
+
+        let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
+        let calldata = Bytes::from(
+            IRaindexInventory::withdraw4Call {
+                token,
+                vaultId: vault_id.0,
+                targetAmount: amount_float.get_inner(),
+                tasks: Vec::new(),
+            }
+            .abi_encode(),
+        );
+
+        Ok(self
+            .evm
+            .prepare_pending(self.inventory_address, calldata, "withdraw4 from vault")
+            .await?)
+    }
+
+    async fn broadcast_prepared_withdraw(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, RaindexError> {
+        Ok(self
+            .evm
+            .broadcast_prepared(prepared, "withdraw4 from vault")
+            .await?)
+    }
+    fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction) {
+        self.evm.discard_prepared(prepared);
     }
 
     async fn submit_withdraw(

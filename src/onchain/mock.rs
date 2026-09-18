@@ -5,14 +5,14 @@ use alloy::primitives::{Address, Bloom, Log as PrimitiveLog, TxHash, U256};
 use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::sol_types::SolEvent;
 #[cfg(test)]
-use alloy::transports::RpcError;
+use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
 use st0x_evm::EvmError;
-use st0x_evm::IERC20;
+use st0x_evm::{IERC20, PreparedTransaction};
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 
 /// Whether `submit_deposit` should succeed, fail generically, or fail
@@ -218,28 +218,6 @@ impl MockRaindex {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_current_block(mut self, current_block: u64) -> Self {
-        self.current_block = current_block;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_recent_withdrawal(self, tx_hash: TxHash, amount: U256) -> Self {
-        {
-            let Ok(mut recent_withdrawal) = self.recent_withdrawal.lock() else {
-                panic!("mock recent-withdrawal mutex poisoned");
-            };
-            *recent_withdrawal = Some((tx_hash, amount));
-        }
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn remembering_submitted_withdrawal(mut self) -> Self {
-        self.remember_submitted_withdrawal = true;
-        self
-    }
-    #[cfg(test)]
     pub(crate) fn accepting_withdraw_then_losing_response(mut self) -> Self {
         self.remember_submitted_withdrawal = true;
         self.withdraw_behavior = WithdrawBehavior::AcceptThenLoseResponse;
@@ -322,42 +300,63 @@ impl Raindex for MockRaindex {
         }
     }
 
-    async fn submit_withdraw(
+    async fn prepare_withdraw(
         &self,
         token: Address,
         _vault_id: RaindexVaultId,
         target_amount: U256,
         _decimals: u8,
+    ) -> Result<PreparedTransaction, RaindexError> {
+        let Ok(mut withdraw_transfer) = self.withdraw_transfer.lock() else {
+            panic!("mock withdrawal-transfer mutex poisoned");
+        };
+        *withdraw_transfer = Some(WithdrawCall {
+            token,
+            amount: target_amount,
+        });
+        Ok(PreparedTransaction::for_test(self.withdraw_tx, 0))
+    }
+
+    async fn broadcast_prepared_withdraw(
+        &self,
+        prepared: &PreparedTransaction,
     ) -> Result<TxHash, RaindexError> {
         self.withdraw_submissions.fetch_add(1, Ordering::SeqCst);
-        {
-            let Ok(mut withdraw_transfer) = self.withdraw_transfer.lock() else {
-                panic!("mock withdrawal-transfer mutex poisoned");
-            };
-            *withdraw_transfer = Some(WithdrawCall {
-                token,
-                amount: target_amount,
-            });
-        }
-
         if self.remember_submitted_withdrawal {
+            let amount = self
+                .withdraw_transfer
+                .lock()
+                .unwrap_or_else(|_| panic!("mock withdrawal-transfer mutex poisoned"))
+                .map(|call| call.amount)
+                .unwrap_or_default();
             let Ok(mut recent_withdrawal) = self.recent_withdrawal.lock() else {
                 panic!("mock recent-withdrawal mutex poisoned");
             };
-            *recent_withdrawal = Some((self.withdraw_tx, target_amount));
+            *recent_withdrawal = Some((prepared.tx_hash(), amount));
         }
 
         match self.withdraw_behavior {
-            WithdrawBehavior::Succeed => Ok(self.withdraw_tx),
+            WithdrawBehavior::Succeed => Ok(prepared.tx_hash()),
             #[cfg(test)]
             WithdrawBehavior::AcceptThenLoseResponse => Err(RaindexError::Evm(
-                EvmError::Transport(RpcError::ErrorResp(alloy::rpc::json_rpc::ErrorPayload {
-                    code: -32000,
-                    message: "connection reset after transaction broadcast".into(),
-                    data: None,
-                })),
+                EvmError::Transport(TransportErrorKind::backend_gone()),
             )),
         }
+    }
+
+    fn discard_prepared_withdraw(&self, _prepared: &PreparedTransaction) {}
+
+    async fn submit_withdraw(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        target_amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, RaindexError> {
+        let prepared = self
+            .prepare_withdraw(token, vault_id, target_amount, decimals)
+            .await?;
+        self.broadcast_prepared_withdraw(&prepared).await
     }
 
     async fn current_block(&self) -> Result<u64, RaindexError> {

@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 
 use st0x_config::ChainEquities;
 use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
-use st0x_evm::{Chain, IERC20};
+use st0x_evm::{Chain, IERC20, PreparedTransaction};
 use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Network, Symbol};
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
@@ -835,17 +835,42 @@ impl Raindex for FixtureRaindex {
         unimplemented!("FixtureRaindex: redemption fixture never calls submit_deposit")
     }
 
-    async fn submit_withdraw(
+    async fn prepare_withdraw(
         &self,
         token: Address,
         _vault_id: RaindexVaultId,
         target_amount: U256,
         _decimals: u8,
-    ) -> Result<TxHash, RaindexError> {
+    ) -> Result<PreparedTransaction, RaindexError> {
         *self.pending_withdraw.lock().await = Some((token, target_amount));
-        Ok(TxHash::left_padding_from(
-            simulated_transfer_uuid("redeem-withdraw-tx", self.day).as_bytes(),
+        Ok(PreparedTransaction::for_test(
+            TxHash::left_padding_from(
+                simulated_transfer_uuid("redeem-withdraw-tx", self.day).as_bytes(),
+            ),
+            0,
         ))
+    }
+
+    async fn broadcast_prepared_withdraw(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, RaindexError> {
+        Ok(prepared.tx_hash())
+    }
+
+    fn discard_prepared_withdraw(&self, _prepared: &PreparedTransaction) {}
+
+    async fn submit_withdraw(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        target_amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, RaindexError> {
+        let prepared = self
+            .prepare_withdraw(token, vault_id, target_amount, decimals)
+            .await?;
+        self.broadcast_prepared_withdraw(&prepared).await
     }
 
     async fn current_block(&self) -> Result<u64, RaindexError> {
@@ -1150,6 +1175,7 @@ pub async fn seed_simulated_equity_redemption_history(
                     amount: wrapped_amount,
                     from_block: withdraw_block.saturating_sub(1),
                     submitting_at: pending_at,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await?;

@@ -12,7 +12,7 @@ use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 
-use st0x_evm::EvmError;
+use st0x_evm::{EvmError, PreparedTransaction};
 
 #[cfg(feature = "rain")]
 mod service;
@@ -155,6 +155,16 @@ impl RaindexError {
             | Self::MissingOperatorRole { .. } => false,
         }
     }
+    /// `true` when reconciliation may succeed after the transaction or RPC
+    /// backend becomes visible. These errors require durable redrive rather than
+    /// a finite worker retry budget.
+    pub fn is_reconciliation_pending(&self) -> bool {
+        match self {
+            Self::ScanInconclusive { .. } | Self::RpcTransport(_) => true,
+            Self::Evm(error) => error.is_confirmation_pending(),
+            _ => false,
+        }
+    }
 }
 
 /// Abstraction for Raindex (Rain OrderBook) operations.
@@ -184,6 +194,30 @@ pub trait Raindex: Send + Sync {
         amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError>;
+
+    /// Fill and sign a vault withdrawal without broadcasting it.
+    ///
+    /// Persist the returned identity before calling
+    /// [`broadcast_prepared_withdraw`](Raindex::broadcast_prepared_withdraw).
+    async fn prepare_withdraw(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        target_amount: U256,
+        decimals: u8,
+    ) -> Result<PreparedTransaction, RaindexError>;
+
+    /// Broadcast an exact withdrawal transaction prepared earlier.
+    ///
+    /// Repeated calls submit identical signed bytes and therefore cannot create
+    /// a second withdrawal at another nonce.
+    async fn broadcast_prepared_withdraw(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, RaindexError>;
+    /// Releases wallet-local nonce state when a prepared withdrawal could not
+    /// be persisted and will never be broadcast.
+    fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction);
 
     /// Submit a vault withdrawal without waiting for confirmation.
     ///

@@ -6,13 +6,13 @@
 //!
 //! # State flow
 //!
-//! New redemptions persist `VaultWithdrawSubmitting` before broadcast, then
-//! advance through submitted, withdrawn, unwrapped, sent, provider-pending, and
-//! terminal states as each externally observable step completes.
+//! New redemptions prepare and sign the withdrawal, persist those exact bytes in
+//! `VaultWithdrawSubmitting` before broadcast, then advance through submitted,
+//! withdrawn, unwrapped, sent, provider-pending, and terminal states.
 //!
-//! - `Redeem` persists vault-withdrawal intent before any transaction is broadcast
-//! - `VaultWithdrawSubmitting` tracks that intent until its transaction is adopted
-//!   from chain history or submitted once and recorded
+//! - `Redeem` persists the exact signed vault withdrawal before any broadcast
+//! - `VaultWithdrawSubmitting` retains that identity until the same bytes are
+//!   broadcast and their transaction hash is recorded
 //! - `WithdrawnFromRaindex` tracks tokens withdrawn, awaiting unwrap
 //! - `UnwrapTokens` unwraps ERC-4626 shares into underlying tokens
 //! - `TokensUnwrapped` tracks unwrapped tokens, ready to send
@@ -23,11 +23,11 @@
 //! # Services
 //!
 //! The aggregate uses `EquityTransferServices` for confirmation, unwrap, and
-//! issuer-transfer side effects. Vault withdrawal submission is deliberately
-//! outside the aggregate transition: the orchestrator first persists
-//! `VaultWithdrawSubmitting`, then broadcasts, then records the transaction hash.
-//! If broadcasting or hash persistence fails, resume reconciles the durable intent
-//! against finalized Raindex logs before deciding whether submission is safe.
+//! issuer-transfer side effects. Vault withdrawal preparation and broadcast are
+//! deliberately outside the aggregate transition: the orchestrator signs first,
+//! persists `VaultWithdrawSubmitting`, broadcasts those exact bytes, then records
+//! the transaction hash. A crash or ambiguous RPC response is recovered by
+//! rebroadcasting the persisted transaction, never by creating a new withdrawal.
 //!
 //! # Error Handling
 //!
@@ -54,7 +54,7 @@ use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
-use st0x_evm::{Chain, EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS};
+use st0x_evm::{Chain, EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS, PreparedTransaction};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
 use st0x_raindex::RaindexVaultId;
@@ -111,6 +111,12 @@ impl FromStr for RedemptionAggregateId {
 pub fn redemption_aggregate_id(label: &str) -> RedemptionAggregateId {
     RedemptionAggregateId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
 }
+/// Deterministic prepared withdrawal identity for aggregate fixtures that do
+/// not exercise wallet signing.
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepared_withdrawal_for_test() -> PreparedTransaction {
+    PreparedTransaction::for_test(TxHash::ZERO, 0)
+}
 
 /// Errors that can occur during equity redemption operations.
 ///
@@ -132,6 +138,18 @@ pub enum EquityRedemptionError {
          amount {amount}: {error_message}"
     )]
     RaindexWithdrawFailed {
+        token: Address,
+        amount: U256,
+        error_message: String,
+    },
+    /// A prepared/submitted withdrawal has an unresolved network outcome.
+    /// Kept distinct so the durable resume job can bypass its finite retry
+    /// budget without parsing an error string.
+    #[error(
+        "Raindex vault withdrawal reconciliation pending for token {token}, \
+         amount {amount}: {error_message}"
+    )]
+    RaindexWithdrawReconciliationPending {
         token: Address,
         amount: U256,
         error_message: String,
@@ -298,7 +316,9 @@ pub enum EquityRedemptionCommand {
         token: Address,
         vault_id: RaindexVaultId,
         amount: U256,
+        /// Version-7 scan lower bound; zero for prepared transactions.
         from_block: u64,
+        prepared: PreparedTransaction,
     },
     /// Test/fixture-only: identical to `Redeem` but takes `submitting_at`
     /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
@@ -311,7 +331,9 @@ pub enum EquityRedemptionCommand {
         token: Address,
         vault_id: RaindexVaultId,
         amount: U256,
+        /// Version-7 scan lower bound; zero for prepared transactions.
         from_block: u64,
+        prepared: PreparedTransaction,
         submitting_at: DateTime<Utc>,
     },
     /// Waits for a previously submitted withdrawal to confirm.
@@ -380,9 +402,9 @@ pub enum EquityRedemptionCommand {
     /// Operator or timeout-driven failure from `WithdrawnFromRaindex` or
     /// `TokensUnwrapped` states.
     FailTransfer { reason: String },
-    /// Records a vault withdrawal transaction returned by the first submission
-    /// or adopted from the resume scan. Pure: the side effect runs in the
-    /// orchestrator after `VaultWithdrawSubmitting` is durable.
+    /// Records the hash of the exact prepared withdrawal after broadcast. Pure:
+    /// the side effect runs in the orchestrator after
+    /// `VaultWithdrawSubmitting` is durable.
     RecordWithdrawSubmission { tx_hash: TxHash },
     /// Test/fixture-only: identical to `RecordWithdrawSubmission` but takes
     /// `submitted_at` explicitly instead of stamping `Utc::now()`.
@@ -473,7 +495,7 @@ pub enum EquityRedemptionEvent {
         wrapped_amount: U256,
         pending_at: DateTime<Utc>,
     },
-    /// Vault withdrawal intent persisted before any submission.
+    /// Exact signed vault withdrawal persisted before its first broadcast.
     VaultWithdrawSubmitting {
         symbol: Symbol,
         chain: Chain,
@@ -485,7 +507,13 @@ pub enum EquityRedemptionEvent {
         token: Address,
         vault_id: RaindexVaultId,
         wrapped_amount: U256,
+        /// Version-7 scan lower bound; zero for prepared transactions.
         from_block: u64,
+        /// Exact signed withdrawal persisted before its first broadcast.
+        /// `None` only for version-7 events; replay maps those records to the
+        /// legacy operator-reconciliation state instead of broadcasting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepared: Option<PreparedTransaction>,
         submitting_at: DateTime<Utc>,
     },
     /// Vault withdrawal transaction submitted, pending confirmation.
@@ -700,6 +728,7 @@ fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) 
                 vault_id: v1,
                 wrapped_amount: w1,
                 from_block: b1,
+                prepared: p1,
                 submitting_at: sa1,
             },
             VaultWithdrawSubmitting {
@@ -710,6 +739,7 @@ fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) 
                 vault_id: v2,
                 wrapped_amount: w2,
                 from_block: b2,
+                prepared: p2,
                 submitting_at: sa2,
             },
         ) => Some(
@@ -720,6 +750,7 @@ fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) 
                 && v1 == v2
                 && w1 == w2
                 && b1 == b2
+                && p1 == p2
                 && sa1 == sa2,
         ),
         (
@@ -991,7 +1022,7 @@ pub enum EquityRedemption {
         wrapped_amount: U256,
         pending_at: DateTime<Utc>,
     },
-    /// Vault withdrawal intent persisted before any submission.
+    /// Exact signed vault withdrawal persisted before its first broadcast.
     VaultWithdrawSubmitting {
         symbol: Symbol,
         chain: Chain,
@@ -1003,7 +1034,10 @@ pub enum EquityRedemption {
         token: Address,
         vault_id: RaindexVaultId,
         wrapped_amount: U256,
+        /// Version-7 scan lower bound; zero for prepared transactions.
         from_block: u64,
+        /// Exact signed withdrawal persisted before its first broadcast.
+        prepared: PreparedTransaction,
         submitting_at: DateTime<Utc>,
     },
 
@@ -1548,8 +1582,11 @@ impl EventSourced for EquityRedemption {
     // so a resume resolves the transfer's own chain instead of assuming the
     // primary. Bumped to clear snapshots whose state predates the field.
     // v7: new redemptions originate as `VaultWithdrawSubmitting`, carrying the
-    // durable chain-scan lower bound and vault identity before broadcast.
-    const SCHEMA_VERSION: u64 = 7;
+    // durable vault identity and chain-scan lower bound before broadcast.
+    // v8: `VaultWithdrawSubmitting` now persists `PreparedTransaction`, making
+    // every first and repeated broadcast byte-identical. Version-7 events
+    // without this field replay into the legacy fail-closed state.
+    const SCHEMA_VERSION: u64 = 8;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
@@ -1577,17 +1614,33 @@ impl EventSourced for EquityRedemption {
                 vault_id,
                 wrapped_amount,
                 from_block,
+                prepared,
                 submitting_at,
-            } => Some(Self::VaultWithdrawSubmitting {
-                symbol: symbol.clone(),
-                chain: *chain,
-                quantity: *quantity,
-                token: *token,
-                vault_id: *vault_id,
-                wrapped_amount: *wrapped_amount,
-                from_block: *from_block,
-                submitting_at: *submitting_at,
-            }),
+            } => prepared.as_ref().map_or_else(
+                || {
+                    Some(Self::VaultWithdrawPending {
+                        symbol: symbol.clone(),
+                        chain: *chain,
+                        quantity: *quantity,
+                        token: *token,
+                        wrapped_amount: *wrapped_amount,
+                        pending_at: *submitting_at,
+                    })
+                },
+                |prepared| {
+                    Some(Self::VaultWithdrawSubmitting {
+                        symbol: symbol.clone(),
+                        chain: *chain,
+                        quantity: *quantity,
+                        token: *token,
+                        vault_id: *vault_id,
+                        wrapped_amount: *wrapped_amount,
+                        from_block: *from_block,
+                        prepared: prepared.clone(),
+                        submitting_at: *submitting_at,
+                    })
+                },
+            ),
             // Legacy: old aggregates start with VaultWithdrawSubmitted
             VaultWithdrawSubmitted {
                 symbol,
@@ -2151,6 +2204,7 @@ impl EventSourced for EquityRedemption {
                 vault_id,
                 amount,
                 from_block,
+                prepared,
             } => Ok(vec![VaultWithdrawSubmitting {
                 symbol,
                 chain,
@@ -2159,6 +2213,7 @@ impl EventSourced for EquityRedemption {
                 vault_id,
                 wrapped_amount: amount,
                 from_block,
+                prepared: Some(prepared),
                 submitting_at: Utc::now(),
             }]),
             #[cfg(any(test, feature = "test-support"))]
@@ -2171,6 +2226,7 @@ impl EventSourced for EquityRedemption {
                 amount,
                 from_block,
                 submitting_at,
+                prepared,
             } => Ok(vec![VaultWithdrawSubmitting {
                 symbol,
                 chain,
@@ -2179,6 +2235,7 @@ impl EventSourced for EquityRedemption {
                 vault_id,
                 wrapped_amount: amount,
                 from_block,
+                prepared: Some(prepared),
                 submitting_at,
             }]),
             RecordWithdrawSubmission { .. }
@@ -2421,8 +2478,8 @@ impl EventSourced for EquityRedemption {
 }
 
 impl EquityRedemption {
-    /// Records a transaction returned by the first submission or adopted from
-    /// the chain scan. No external call occurs inside the aggregate transition.
+    /// Records the hash of the exact persisted transaction after broadcast.
+    /// No external call occurs inside the aggregate transition.
     fn transition_record_withdraw_submission(
         &self,
         tx_hash: TxHash,
@@ -2474,10 +2531,21 @@ impl EquityRedemption {
                     .raindex
                     .confirm_tx_receipt(*tx_hash)
                     .await
-                    .map_err(|error| EquityRedemptionError::RaindexWithdrawFailed {
-                        token: *token,
-                        amount: *wrapped_amount,
-                        error_message: error.to_string(),
+                    .map_err(|error| {
+                        let error_message = error.to_string();
+                        if error.is_reconciliation_pending() {
+                            EquityRedemptionError::RaindexWithdrawReconciliationPending {
+                                token: *token,
+                                amount: *wrapped_amount,
+                                error_message,
+                            }
+                        } else {
+                            EquityRedemptionError::RaindexWithdrawFailed {
+                                token: *token,
+                                amount: *wrapped_amount,
+                                error_message,
+                            }
+                        }
                     })?;
                 let raindex_withdraw_block = receipt
                     .block_number
@@ -3463,6 +3531,7 @@ mod tests {
             vault_id: RaindexVaultId(B256::repeat_byte(0x42)),
             wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
             from_block: 123,
+            prepared: Some(prepared_withdrawal_for_test()),
             submitting_at: Utc::now(),
         }
     }
@@ -3536,6 +3605,7 @@ mod tests {
                 vault_id,
                 amount,
                 from_block: 123,
+                prepared: prepared_withdrawal_for_test(),
             })
             .await
             .events();
@@ -3617,6 +3687,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -3727,6 +3798,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -3791,6 +3863,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -3870,6 +3943,7 @@ mod tests {
                 amount: U256::from(50_250_000_000_000_000_000_u128),
                 from_block: 123,
                 submitting_at,
+                prepared: prepared_withdrawal_for_test(),
             })
             .await
             .events();
@@ -4013,6 +4087,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -4309,6 +4384,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: requested_amount,
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -4369,6 +4445,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: requested_amount,
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -4438,6 +4515,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -4511,6 +4589,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -5007,6 +5086,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -5084,6 +5164,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -5207,6 +5288,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -5306,6 +5388,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -5322,6 +5405,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -5349,6 +5433,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -5407,6 +5492,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -7191,6 +7277,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_submitting_event_without_prepared_transaction_fails_closed() {
+        let legacy = serde_json::json!({
+            "VaultWithdrawSubmitting": {
+                "symbol": "AAPL",
+                "chain": "base",
+                "quantity": "10",
+                "token": "0x0000000000000000000000000000000000000001",
+                "vault_id": format!("{:#x}", B256::repeat_byte(0x42)),
+                "wrapped_amount": "10000000000000000000",
+                "from_block": 123,
+                "submitting_at": "2026-01-01T00:00:00Z",
+            }
+        });
+        let event: EquityRedemptionEvent = serde_json::from_value(legacy).unwrap();
+
+        let state = replay::<EquityRedemption>(vec![event]).unwrap().unwrap();
+
+        assert!(matches!(
+            state,
+            EquityRedemption::VaultWithdrawPending { .. }
+        ));
+    }
+
+    #[test]
     fn vault_withdraw_pending_event_roundtrips_its_chain() {
         let event = EquityRedemptionEvent::VaultWithdrawPending {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -7223,6 +7333,7 @@ mod tests {
                 vault_id: RaindexVaultId(B256::ZERO),
                 amount: U256::from(50_250_000_000_000_000_000_u128),
                 from_block: 0,
+                prepared: prepared_withdrawal_for_test(),
             })
             .await
             .events();

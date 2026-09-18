@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 pub(crate) use std::time::Duration;
 
+use alloy::consensus::Transaction;
+use alloy::eips::eip2718::Encodable2718;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
 pub(crate) use alloy::primitives::{U256, utils::parse_units};
@@ -28,7 +30,7 @@ use tokio::task::JoinHandle;
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_config::{BrokerCtx, Ctx};
 use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
-use st0x_evm::{Chain, Evm, EvmError, Wallet};
+use st0x_evm::{Chain, Evm, EvmError, PreparedTransaction, Wallet};
 use st0x_execution::alpaca_broker_api::{
     AlpacaBrokerMock, OrderSide, OrderStatus, TEST_API_KEY, TEST_API_SECRET, TransferDirection,
     TransferStatus,
@@ -168,6 +170,56 @@ impl Wallet for TestWallet {
         // here, so the caller-computed digest is signed directly.
         Ok(self.signer.sign_hash(&expected_digest).await?)
     }
+
+    async fn prepare_pending(
+        &self,
+        contract: Address,
+        calldata: alloy::primitives::Bytes,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        tracing::info!(%contract, note, "Preparing local test wallet call");
+        let envelope = self
+            .signing_provider
+            .fill(
+                TransactionRequest::default()
+                    .to(contract)
+                    .input(calldata.into()),
+            )
+            .await?
+            .try_into_envelope()
+            .map_err(|_| EvmError::TransactionPreparation)?;
+        let nonce = envelope.nonce();
+        let raw = alloy::primitives::Bytes::from(envelope.encoded_2718());
+        Ok(PreparedTransaction::from_raw(nonce, raw))
+    }
+
+    async fn broadcast_prepared(
+        &self,
+        prepared: &PreparedTransaction,
+        note: &str,
+    ) -> Result<alloy::primitives::TxHash, EvmError> {
+        let tx_hash = prepared.tx_hash();
+        match self
+            .read_provider
+            .send_raw_transaction(prepared.raw())
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(%tx_hash, note, "Broadcast prepared local test wallet call");
+                Ok(tx_hash)
+            }
+            Err(error) => {
+                let error = EvmError::from(error);
+                if error.is_already_known() {
+                    Ok(tx_hash)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn discard_prepared(&self, _prepared: &PreparedTransaction) {}
 
     async fn send_pending(
         &self,
