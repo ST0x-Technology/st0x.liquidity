@@ -168,6 +168,7 @@ pub(crate) struct AppState {
     pub(crate) equity_prices: dashboard::equity_price::EquityPriceStore,
     pub(crate) settings: st0x_dto::Settings,
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
+    pub(crate) process_tx: Arc<tokio::sync::OnceCell<api::ProcessTxHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
@@ -265,6 +266,7 @@ async fn run_bot_session_inner(
 
     let shutdown_token = CancellationToken::new();
     let recovery_cell = Arc::new(tokio::sync::OnceCell::new());
+    let process_tx_cell = Arc::new(tokio::sync::OnceCell::new());
     let resume_lock = Arc::new(api::ResumeLock(tokio::sync::Mutex::new(())));
 
     // Pre-bind both server ports synchronously so a port-in-use failure
@@ -295,6 +297,7 @@ async fn run_bot_session_inner(
         equity_prices,
         settings: dashboard::settings_from_ctx(&ctx),
         recovery: recovery_cell.clone(),
+        process_tx: process_tx_cell.clone(),
         resume_lock,
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),
@@ -332,6 +335,7 @@ async fn run_bot_session_inner(
             event_sender,
             inventory,
             recovery_cell,
+            process_tx_cell,
             pnl_ledger,
         },
         shutdown_token.clone(),
@@ -1258,6 +1262,7 @@ mod tests {
                 event_sender: create_test_event_sender(),
                 inventory: create_test_inventory(),
                 recovery_cell: Arc::new(tokio::sync::OnceCell::new()),
+                process_tx_cell: Arc::new(tokio::sync::OnceCell::new()),
                 pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
             },
             tokio_util::sync::CancellationToken::new(),
@@ -1294,6 +1299,7 @@ mod tests {
                 event_sender: create_test_event_sender(),
                 inventory: create_test_inventory(),
                 recovery_cell: Arc::new(tokio::sync::OnceCell::new()),
+                process_tx_cell: Arc::new(tokio::sync::OnceCell::new()),
                 pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
             },
             tokio_util::sync::CancellationToken::new(),
