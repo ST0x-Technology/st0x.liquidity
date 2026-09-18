@@ -130,6 +130,7 @@ pub struct OffchainOrderPlacement {
     placed_at: Option<DateTime<Utc>>,
 }
 
+#[allow(dead_code)]
 fn missing_pending_limit_price_failure(order_id: OffchainOrderId) -> OffchainOrderCommand {
     OffchainOrderCommand::MarkPlacementFailed {
         error: PlaceOffchainOrderError::PendingLimitPriceMissing { order_id }.to_string(),
@@ -258,6 +259,7 @@ pub async fn place_offchain_order_at_broker(
     // outcome already landed (Submitted, or a terminal state) must not place a
     // second time. An exhaustive match forces a conscious decision for any
     // future state rather than letting it silently skip placement.
+    let broker_kind = kind;
     let placed = store.load(offchain_order_id).await?;
     let (symbol, shares, direction, client_order_id, kind) = match placed {
         Some(OffchainOrder::Pending {
@@ -265,27 +267,17 @@ pub async fn place_offchain_order_at_broker(
             shares,
             direction,
             client_order_id: durable_client_order_id,
-            limit_price,
-            market_session,
-            close_flatten,
             ..
         }) => {
-            let kind = if market_session == MarketSession::Extended {
-                let Some(limit_price) = limit_price else {
-                    store
-                        .send(
-                            offchain_order_id,
-                            missing_pending_limit_price_failure(*offchain_order_id),
-                        )
-                        .await?;
-                    return Ok(store.load(offchain_order_id).await?);
-                };
+            let kind = match &broker_kind {
+                CounterTradeOrderKind::Market => CounterTradeOrderKind::Market,
                 CounterTradeOrderKind::ExtendedHoursLimit {
                     limit_price,
                     close_flatten,
-                }
-            } else {
-                CounterTradeOrderKind::Market
+                } => CounterTradeOrderKind::ExtendedHoursLimit {
+                    limit_price: *limit_price,
+                    close_flatten: *close_flatten,
+                },
             };
             (
                 symbol,
