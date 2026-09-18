@@ -2836,6 +2836,9 @@ enum TriggerReason {
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job
   is durably queued. Confirmed reservations survive queue handoff and restart.
+- `ManuallyAdjustPosition` and `UpdateThreshold` are rejected while a confirmed
+  transfer reservation owns the symbol. Transfer ownership must be released
+  before either operator mutation can proceed.
 - No-op sizing, sizing failure, queue failure, terminal transfer events, and
   terminal job attempts that never created an aggregate release only their exact
   reservation ID. Startup retains reservations owned by live durable transfer
