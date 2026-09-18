@@ -498,16 +498,18 @@ impl Executor for MockExecutor {
         }
 
         let session = self.market_session().await?;
-        Ok(if session == MarketSession::Extended {
-            MarketSessionStatus {
-                session,
-                session_opens_at: None,
-                regular_session_closes_at: self.regular_session_closes_at_override,
-                extended_session_closes_at: self.extended_session_closes_at_override,
-                post_close_gap: self.post_close_gap_override,
-            }
-        } else {
-            MarketSessionStatus::without_close_metadata(session)
+        Ok(MarketSessionStatus {
+            session,
+            session_opens_at: None,
+            regular_session_closes_at: self.regular_session_closes_at_override,
+            extended_session_closes_at: (session == MarketSession::Extended)
+                .then(|| self.extended_session_closes_at_override)
+                .flatten(),
+            post_close_gap: if session == MarketSession::Extended {
+                self.post_close_gap_override
+            } else {
+                PostCloseGap::Unavailable
+            },
         })
     }
 

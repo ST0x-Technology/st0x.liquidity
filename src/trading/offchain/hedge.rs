@@ -2339,6 +2339,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("test-order-123"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -2352,6 +2353,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("test-limit-order-123"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: order.extended_hours,
                     limit_price: Some(order.limit_price),
                 })
@@ -2391,6 +2393,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("test-order-123"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -2933,6 +2936,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("anchored-broker-order"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: true,
                     limit_price: Some(order.limit_price),
                 })
@@ -3115,6 +3119,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("fresh-partial-order"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -4945,6 +4950,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("test-order-123"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -5315,6 +5321,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("accepted-after-rate-limit"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -6037,6 +6044,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("market-order-1"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -6050,6 +6058,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("limit-order-1"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: order.extended_hours,
                     limit_price: Some(order.limit_price),
                 })
@@ -6115,6 +6124,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("close-flatten-order"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: true,
                     limit_price: Some(order.limit_price),
                 })
@@ -6272,6 +6282,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("recovered-live-order"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: true,
                     limit_price: Some(order.limit_price),
                 })
@@ -7357,6 +7368,7 @@ mod tests {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("recorded-order"),
                 placed_shares: order.shares,
+                placed_at: Utc::now(),
                 is_extended_hours: order.extended_hours,
                 limit_price: Some(order.limit_price),
             })
@@ -8030,6 +8042,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("market-1"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -8043,6 +8056,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("limit-1"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: order.extended_hours,
                     limit_price: Some(order.limit_price),
                 })

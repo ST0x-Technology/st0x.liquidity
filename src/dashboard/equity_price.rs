@@ -416,10 +416,18 @@ impl EquityPriceMonitor {
                     ServerFrame::Error(frame) => self.apply_error(frame).await,
                     ServerFrame::Halt(frame) => {
                         if let Some(expected) = self.expected.get(&frame.asset) {
-                            info!(symbol = %expected.symbol, asset = %frame.asset, halted = frame.halted,
-                                "Pricing halt status changed");
-                            if frame.halted {
-                                self.set_unavailable(&expected.symbol).await;
+                            if expected.traded.get(&frame.chain_id).is_none() {
+                                debug!(
+                                    asset = %frame.asset,
+                                    chain_id = frame.chain_id,
+                                    "Ignoring halt for an untraded chain"
+                                );
+                            } else {
+                                info!(symbol = %expected.symbol, asset = %frame.asset, halted = frame.halted,
+                                    "Pricing halt status changed");
+                                if frame.halted {
+                                    self.set_unavailable(&expected.symbol).await;
+                                }
                             }
                         } else {
                             debug!(asset = %frame.asset, "Ignoring halt for an unrequested asset");

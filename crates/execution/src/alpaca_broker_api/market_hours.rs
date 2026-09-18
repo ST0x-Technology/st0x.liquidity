@@ -294,14 +294,14 @@ async fn session_and_close_at(
         "Checked market session"
     );
 
+    let session_open = local_market_time_to_utc(today, today_calendar.session_open)?;
+    let regular_close = local_market_time_to_utc(today, today_calendar.close)?;
     Ok(SessionAndClose {
         session,
-        session_opens_at: Some(local_market_time_to_utc(
-            today,
-            today_calendar.session_open,
-        )?),
-        regular_session_closes_at: Some(local_market_time_to_utc(today, today_calendar.close)?),
-        extended_session_closes_at: Some(extended_session_closes_at),
+        session_opens_at: (session == MarketSession::Extended).then_some(session_open),
+        regular_session_closes_at: (session == MarketSession::Regular).then_some(regular_close),
+        extended_session_closes_at: (session == MarketSession::Extended)
+            .then_some(extended_session_closes_at),
         today,
     })
 }
@@ -1453,6 +1453,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(status.session(), MarketSession::Overnight);
+        assert_eq!(status.session_opens_at, None);
+        assert_eq!(status.regular_session_closes_at, None);
+        assert_eq!(status.extended_session_closes_at, None);
         lookahead_mock.assert_calls(0);
     }
 

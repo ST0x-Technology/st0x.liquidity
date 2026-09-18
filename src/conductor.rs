@@ -9536,6 +9536,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -9549,6 +9550,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: order.extended_hours,
                     limit_price: Some(order.limit_price),
                 })
@@ -12444,6 +12446,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -12461,6 +12464,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: order.extended_hours,
                     limit_price: Some(order.limit_price),
                 })
@@ -14080,6 +14084,7 @@ mod tests {
                         0.5
                     )))
                     .unwrap(),
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -14096,6 +14101,7 @@ mod tests {
                         0.5
                     )))
                     .unwrap(),
+                    placed_at: Utc::now(),
                     is_extended_hours: order.extended_hours,
                     limit_price: Some(order.limit_price),
                 })

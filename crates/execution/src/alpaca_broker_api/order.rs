@@ -524,8 +524,17 @@ pub(super) async fn place_market_order(
     // extended-hours limit order (e.g. a regular-hours market retry after a
     // lost extended-hours placement response), and the caller's convergence
     // sweep keys off the recorded `extended_hours` flag.
-    let (order_id, shares, extended_hours, limit_price) = match client.place_order(&request).await {
-        Ok(response) => (response.id, placed_shares, false, None),
+    let (order_id, shares, extended_hours, limit_price, placed_at) = match client
+        .place_order(&request)
+        .await
+    {
+        Ok(response) => (
+            response.id,
+            placed_shares,
+            false,
+            None,
+            broker_order_placed_at(response.id, response.created_at, response.submitted_at)?,
+        ),
         Err(error) if is_duplicate_client_order_id(&error) => {
             warn!(
                 %error,
@@ -541,10 +550,9 @@ pub(super) async fn place_market_order(
             (
                 existing.id,
                 existing.quantity,
-                // No request terms to fall back to for a market request: an
-                // omitted echo most plausibly means a plain market order.
                 existing.extended_hours.unwrap_or(false),
                 parse_limit_price(existing.limit_price)?,
+                broker_order_placed_at(existing.id, existing.created_at, existing.submitted_at)?,
             )
         }
         Err(error) => return Err(error),
@@ -555,7 +563,7 @@ pub(super) async fn place_market_order(
         symbol: market_order.symbol,
         shares,
         direction: market_order.direction,
-        placed_at: Utc::now(),
+        placed_at,
         extended_hours,
         limit_price,
     })
@@ -563,6 +571,20 @@ pub(super) async fn place_market_order(
 
 /// Converts the broker-reported limit price into the domain type, failing
 /// fast on a non-positive value rather than silently dropping it.
+
+fn broker_order_placed_at(
+    order_id: Uuid,
+    created_at: Option<DateTime<Utc>>,
+    submitted_at: Option<DateTime<Utc>>,
+) -> Result<DateTime<Utc>, AlpacaBrokerApiError> {
+    created_at
+        .or(submitted_at)
+        .ok_or_else(|| AlpacaBrokerApiError::IncompleteOrder {
+            order_id: ExecutorOrderId::new(&order_id.to_string()),
+            field: MissingOrderField::PlacedAt,
+        })
+}
+
 pub(super) fn parse_limit_price(
     limit_price: Option<Float>,
 ) -> Result<Option<Positive<Usd>>, AlpacaBrokerApiError> {
@@ -600,12 +622,14 @@ pub(super) async fn recover_order_by_client_id(
             field: MissingOrderField::Price,
         });
     }
+    let placed_at =
+        broker_order_placed_at(existing.id, existing.created_at, existing.submitted_at)?;
     Ok(Some(OrderPlacement {
         order_id: existing.id.to_string(),
         symbol: existing.symbol,
         shares: existing.quantity,
         direction,
-        placed_at: Utc::now(),
+        placed_at,
         extended_hours,
         limit_price,
     }))
@@ -707,7 +731,7 @@ pub(super) async fn place_limit_order(
     // Fresh placements report the REQUEST's terms; adoptions report the
     // ADOPTED order's terms -- see the matching comment in
     // `place_market_order`.
-    let (order_id, shares, extended_hours, limit_price) = match client
+    let (order_id, shares, extended_hours, limit_price, placed_at) = match client
         .place_limit_order(&request)
         .await
     {
@@ -716,6 +740,7 @@ pub(super) async fn place_limit_order(
             placed_shares,
             limit_order.extended_hours,
             Some(*limit_order.limit_price.as_price()),
+            broker_order_placed_at(response.id, response.created_at, response.submitted_at)?,
         ),
         Err(error) if is_duplicate_client_order_id(&error) => {
             warn!(
@@ -742,6 +767,7 @@ pub(super) async fn place_limit_order(
                     .unwrap_or(limit_order.extended_hours),
                 parse_limit_price(existing.limit_price)?
                     .or(Some(*limit_order.limit_price.as_price())),
+                broker_order_placed_at(existing.id, existing.created_at, existing.submitted_at)?,
             )
         }
         Err(error) => return Err(error),
@@ -752,7 +778,7 @@ pub(super) async fn place_limit_order(
         symbol: limit_order.symbol,
         shares,
         direction: limit_order.direction,
-        placed_at: Utc::now(),
+        placed_at,
         extended_hours,
         limit_price,
     })
@@ -859,7 +885,7 @@ fn terminal_broker_time(
         return Ok(time);
     }
     Err(AlpacaBrokerApiError::IncompleteOrder {
-        order_id: ExecutorOrderId::new(order_id),
+        order_id: ExecutorOrderId::new(&order_id.to_string()),
         field,
     })
 }

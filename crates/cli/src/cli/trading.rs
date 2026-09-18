@@ -69,6 +69,7 @@ impl OrderPlacer for CliOrderPlacer {
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
+            placed_at: Utc::now(),
             is_extended_hours: placement.extended_hours,
             limit_price: placement.limit_price,
         })
@@ -1851,6 +1852,7 @@ mod tests {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
                 placed_shares: order.shares,
+                placed_at: Utc::now(),
                 is_extended_hours: false,
                 limit_price: None,
             })
@@ -1863,6 +1865,7 @@ mod tests {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
                 placed_shares: order.shares,
+                placed_at: Utc::now(),
                 is_extended_hours: order.extended_hours,
                 limit_price: Some(order.limit_price),
             })

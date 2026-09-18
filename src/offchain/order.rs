@@ -239,6 +239,26 @@ pub async fn place_offchain_order_at_broker(
         placed_at,
     } = placement;
 
+    let admission = order_placer
+        .prepare_placement(
+            &MarketOrder {
+                symbol: symbol.clone(),
+                shares,
+                direction,
+                client_order_id: client_order_id.clone(),
+            },
+            &kind,
+        )
+        .await
+        .map_err(|source| PlaceOffchainOrderError::Admission { source })?;
+    if matches!(admission, PlacementAdmission::Deferred) {
+        return Err(PlaceOffchainOrderError::Deferred);
+    }
+    let reserved_placed_at = match &admission {
+        PlacementAdmission::Recovered(result) => Some(result.placed_at),
+        PlacementAdmission::New | PlacementAdmission::Deferred => placed_at,
+    };
+
     store
         .send(
             offchain_order_id,
@@ -250,7 +270,7 @@ pub async fn place_offchain_order_at_broker(
                 client_order_id: client_order_id.clone(),
                 kind: kind.clone(),
                 buying_power_reservation,
-                placed_at,
+                placed_at: reserved_placed_at,
             },
         )
         .await?;
@@ -305,18 +325,6 @@ pub async fn place_offchain_order_at_broker(
         Direction::Sell => "sell",
     };
 
-    let admission = order_placer
-        .prepare_placement(
-            &MarketOrder {
-                symbol: symbol.clone(),
-                shares,
-                direction,
-                client_order_id: client_order_id.clone(),
-            },
-            &kind,
-        )
-        .await
-        .map_err(|source| PlaceOffchainOrderError::Admission { source })?;
     let placement = match admission {
         PlacementAdmission::Deferred => return Err(PlaceOffchainOrderError::Deferred),
         PlacementAdmission::Recovered(placement) => Ok(placement),
@@ -2730,6 +2738,8 @@ fn reconcile_terminal_fill(
 pub struct OrderPlacementResult {
     pub executor_order_id: ExecutorOrderId,
     pub placed_shares: Positive<FractionalShares>,
+    /// Broker-side placement time used by reprice/cancel sweeps.
+    pub placed_at: DateTime<Utc>,
     /// Whether the broker holds the order as extended-hours. Usually echoes
     /// the requested kind, but a duplicate-`client_order_id` placement adopts
     /// the order a prior attempt already created -- possibly with different
@@ -2960,6 +2970,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
             return Ok(PlacementAdmission::Recovered(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new(&existing.order_id),
                 placed_shares: existing.shares,
+                placed_at: existing.placed_at,
                 is_extended_hours: existing.extended_hours,
                 limit_price: existing.limit_price,
             }));
@@ -3002,6 +3013,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
+            placed_at: placement.placed_at,
             is_extended_hours: placement.extended_hours,
             limit_price: placement.limit_price,
         })
@@ -3015,6 +3027,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
+            placed_at: placement.placed_at,
             is_extended_hours: placement.extended_hours,
             limit_price: placement.limit_price,
         })
@@ -3141,6 +3154,7 @@ pub fn noop_order_placer() -> Arc<dyn OrderPlacer> {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("noop"),
                 placed_shares: noop_placed_shares(order.shares),
+                placed_at: Utc::now(),
                 is_extended_hours: false,
                 limit_price: None,
             })
@@ -3153,6 +3167,7 @@ pub fn noop_order_placer() -> Arc<dyn OrderPlacer> {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("noop-limit"),
                 placed_shares: noop_placed_shares(order.shares),
+                placed_at: Utc::now(),
                 is_extended_hours: order.extended_hours,
                 limit_price: Some(order.limit_price),
             })
@@ -4799,6 +4814,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("OVERFILL"),
                     placed_shares: Positive::new(FractionalShares::new(overfilled)).unwrap(),
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -4909,6 +4925,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("REPLAYED"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: true,
                     limit_price: Some(order.limit_price),
                 })
@@ -5070,6 +5087,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ADOPTED_EXT_LIMIT"),
                         placed_shares: order.shares,
+                        placed_at: Utc::now(),
                         is_extended_hours: true,
                         limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
                     })
@@ -6129,6 +6147,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("ORD-OK"),
                     placed_shares: noop_placed_shares(order.shares),
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -6474,6 +6493,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-CANCELLED"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -6548,6 +6568,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-CANCELLED-PRICED"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -6637,6 +6658,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -6725,6 +6747,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-GONE"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7047,6 +7070,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7141,6 +7165,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7221,6 +7246,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7314,6 +7340,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7405,6 +7432,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7497,6 +7525,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7584,6 +7613,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7687,6 +7717,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7769,6 +7800,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7995,6 +8027,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-NEG-FILL"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -8075,6 +8108,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-NEG-UNPRICED"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -8152,6 +8186,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-NEG-PARTIAL"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
