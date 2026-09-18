@@ -501,7 +501,10 @@ impl Executor for MockExecutor {
         Ok(MarketSessionStatus {
             session,
             session_opens_at: None,
-            regular_session_closes_at: self.regular_session_closes_at_override,
+            regular_session_closes_at: match session {
+                MarketSession::Regular => self.regular_session_closes_at_override,
+                _ => None,
+            },
             extended_session_closes_at: match session {
                 MarketSession::Extended => self.extended_session_closes_at_override,
                 _ => None,
@@ -832,6 +835,18 @@ mod tests {
         assert_eq!(status.session(), MarketSession::Extended);
         assert_eq!(status.extended_session_closes_at, Some(closes_at));
         assert_eq!(status.post_close_gap, PostCloseGap::MultiDayClosure);
+    }
+
+    #[tokio::test]
+    async fn market_session_status_omits_regular_close_on_non_regular_sessions() {
+        let closes_at = Utc::now();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Closed)
+            .with_regular_session_closes_at(closes_at);
+
+        let status = executor.market_session_status().await.unwrap();
+        assert_eq!(status.session(), MarketSession::Closed);
+        assert_eq!(status.regular_session_closes_at, None);
     }
 
     #[tokio::test]

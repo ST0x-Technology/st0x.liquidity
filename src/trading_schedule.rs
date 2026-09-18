@@ -1148,9 +1148,7 @@ mod tests {
             .with_schedule(Some(store));
         let close = Utc::now();
         let placer = ExecutorOrderPlacer {
-            executor: MockExecutor::new()
-                .with_market_session(MarketSession::Closed)
-                .with_regular_session_closes_at(close),
+            executor: MockExecutor::new().with_regular_session_closes_at(close),
             close_flatten_policy: Some(policy),
         };
         let order = MarketOrder {

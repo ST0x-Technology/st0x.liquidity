@@ -1809,6 +1809,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         })
@@ -1836,6 +1837,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         })
@@ -2139,6 +2141,7 @@ mod tests {
                     "qty": "1951",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2446,6 +2449,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2527,6 +2531,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2671,6 +2676,7 @@ mod tests {
                     "qty": "1951",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2756,6 +2762,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });

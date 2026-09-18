@@ -533,7 +533,13 @@ pub(super) async fn place_market_order(
             placed_shares,
             false,
             None,
-            broker_order_placed_at(response.id, response.created_at, response.submitted_at)?,
+            broker_order_placed_at(
+                client,
+                response.id,
+                response.created_at,
+                response.submitted_at,
+            )
+            .await?,
         ),
         Err(error) if is_duplicate_client_order_id(&error) => {
             warn!(
@@ -552,7 +558,13 @@ pub(super) async fn place_market_order(
                 existing.quantity,
                 existing.extended_hours.unwrap_or(false),
                 parse_limit_price(existing.limit_price)?,
-                broker_order_placed_at(existing.id, existing.created_at, existing.submitted_at)?,
+                broker_order_placed_at(
+                    client,
+                    existing.id,
+                    existing.created_at,
+                    existing.submitted_at,
+                )
+                .await?,
             )
         }
         Err(error) => return Err(error),
@@ -569,17 +581,36 @@ pub(super) async fn place_market_order(
     })
 }
 
-fn broker_order_placed_at(
+async fn broker_order_placed_at(
+    client: &AlpacaBrokerApiClient,
     order_id: Uuid,
     created_at: Option<DateTime<Utc>>,
     submitted_at: Option<DateTime<Utc>>,
 ) -> Result<DateTime<Utc>, AlpacaBrokerApiError> {
-    created_at
-        .or(submitted_at)
-        .ok_or_else(|| AlpacaBrokerApiError::IncompleteOrder {
-            order_id: ExecutorOrderId::new(&order_id.to_string()),
-            field: MissingOrderField::PlacedAt,
-        })
+    if let Some(placed_at) = created_at.or(submitted_at) {
+        return Ok(placed_at);
+    }
+
+    warn!(
+        %order_id,
+        "Placement response omitted created_at/submitted_at; reconciling via get_order"
+    );
+    let response = client.get_order(order_id).await?;
+    if let Some(placed_at) = response.created_at.or(response.submitted_at) {
+        return Ok(placed_at);
+    }
+    if let Some(updated_at) = response.updated_at {
+        warn!(
+            %order_id,
+            "Reconciled order still omitted created/submitted_at; using updated_at"
+        );
+        return Ok(updated_at);
+    }
+
+    Err(AlpacaBrokerApiError::IncompleteOrder {
+        order_id: ExecutorOrderId::new(&order_id.to_string()),
+        field: MissingOrderField::PlacedAt,
+    })
 }
 
 /// Converts the broker-reported limit price into the domain type, failing
@@ -621,8 +652,13 @@ pub(super) async fn recover_order_by_client_id(
             field: MissingOrderField::Price,
         });
     }
-    let placed_at =
-        broker_order_placed_at(existing.id, existing.created_at, existing.submitted_at)?;
+    let placed_at = broker_order_placed_at(
+        client,
+        existing.id,
+        existing.created_at,
+        existing.submitted_at,
+    )
+    .await?;
     Ok(Some(OrderPlacement {
         order_id: existing.id.to_string(),
         symbol: existing.symbol,
@@ -739,7 +775,13 @@ pub(super) async fn place_limit_order(
             placed_shares,
             limit_order.extended_hours,
             Some(*limit_order.limit_price.as_price()),
-            broker_order_placed_at(response.id, response.created_at, response.submitted_at)?,
+            broker_order_placed_at(
+                client,
+                response.id,
+                response.created_at,
+                response.submitted_at,
+            )
+            .await?,
         ),
         Err(error) if is_duplicate_client_order_id(&error) => {
             warn!(
@@ -766,7 +808,13 @@ pub(super) async fn place_limit_order(
                     .unwrap_or(limit_order.extended_hours),
                 parse_limit_price(existing.limit_price)?
                     .or(Some(*limit_order.limit_price.as_price())),
-                broker_order_placed_at(existing.id, existing.created_at, existing.submitted_at)?,
+                broker_order_placed_at(
+                    client,
+                    existing.id,
+                    existing.created_at,
+                    existing.submitted_at,
+                )
+                .await?,
             )
         }
         Err(error) => return Err(error),
@@ -1488,6 +1536,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -1538,6 +1587,7 @@ mod tests {
                     "qty": "50",
                     "side": "sell",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -1676,6 +1726,7 @@ mod tests {
                     "qty": "7",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -1705,6 +1756,124 @@ mod tests {
         // A fresh adoption of a plain market order carries no session terms.
         assert!(!placement.extended_hours);
         assert_eq!(placement.limit_price, None);
+    }
+
+    #[tokio::test]
+    async fn place_market_order_reconciles_missing_placement_timestamps_via_get_order() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let order_id = "904837e3-3b76-47ec-b432-046db621571b";
+        let created_at = "2026-09-17T10:15:29Z";
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200).json_body(json!({
+                "id": order_id,
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "buy",
+                "status": "new",
+                "filled_avg_price": null
+            }));
+        });
+        let reconcile_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200).json_body(json!({
+                "id": order_id,
+                "symbol": "AAPL",
+                "qty": "1",
+                "side": "buy",
+                "status": "new",
+                "filled_avg_price": null,
+                "created_at": created_at
+            }));
+        });
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let placement = place_market_order(
+            &client,
+            MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(uuid!(
+                    "33333333-3333-4333-8333-333333333333"
+                )),
+            },
+            TimeInForce::Day,
+        )
+        .await
+        .unwrap();
+        place_mock.assert();
+        reconcile_mock.assert();
+        assert_eq!(placement.order_id, order_id);
+        assert_eq!(
+            placement.placed_at,
+            created_at.parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_market_adoption_reconciles_missing_lookup_timestamps_via_get_order() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client_order_uuid = uuid!("66666666-6666-4666-8666-666666666666");
+        let existing_order_id = "904837e3-3b76-47ec-b432-046db621571b";
+        let created_at = "2026-09-17T10:15:29Z";
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422).json_body(duplicate_client_order_id_body());
+        });
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET).path(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id",
+            );
+            then.status(200).json_body(json!({
+                "id": existing_order_id,
+                "symbol": "AAPL",
+                "qty": "7",
+                "side": "buy",
+                "status": "new",
+                "filled_avg_price": null
+            }));
+        });
+        let reconcile_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{existing_order_id}"
+            ));
+            then.status(200).json_body(json!({
+                "id": existing_order_id,
+                "symbol": "AAPL",
+                "qty": "7",
+                "side": "buy",
+                "status": "new",
+                "filled_avg_price": null,
+                "created_at": created_at
+            }));
+        });
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let placement = place_market_order(
+            &client,
+            MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(client_order_uuid),
+            },
+            TimeInForce::Day,
+        )
+        .await
+        .unwrap();
+        place_mock.assert();
+        lookup_mock.assert();
+        reconcile_mock.assert();
+        assert_eq!(placement.order_id, existing_order_id);
+        assert_eq!(
+            placement.placed_at,
+            created_at.parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     /// The duplicate-422 warn log includes the Alpaca-reported numeric code
@@ -1790,6 +1959,7 @@ mod tests {
                     "qty": "7",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null,
                     "type": "limit",
                     "limit_price": "195.25",
@@ -1912,6 +2082,7 @@ mod tests {
                     "qty": "7",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2032,6 +2203,7 @@ mod tests {
                     "qty": "10",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2170,6 +2342,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2224,6 +2397,7 @@ mod tests {
                     "qty": "50",
                     "side": "sell",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2357,6 +2531,7 @@ mod tests {
                     "qty": "1",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -4108,6 +4283,7 @@ mod tests {
                     "qty": "0.996350331",
                     "side": "sell",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -4198,6 +4374,7 @@ mod tests {
                     "qty": "0.996350331",
                     "side": "sell",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
