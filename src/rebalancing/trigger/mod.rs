@@ -1119,7 +1119,9 @@ impl RebalancingService {
                         .remove(reservation_id);
                 }
                 Err(AggregateError::UserError(LifecycleError::Apply(
-                    PositionError::PendingExecution { offchain_order_id },
+                    error @ (PositionError::PendingExecution { .. }
+                    | PositionError::EquityTransferBlockedByHedge { .. }
+                    | PositionError::EquityTransferHedgeEligibilityUnknown { .. }),
                 ))) => {
                     self.pending_equity_transfer_reservation_restores
                         .write()
@@ -1132,8 +1134,8 @@ impl RebalancingService {
                         target: "rebalance",
                         %symbol,
                         %reservation_id,
-                        %offchain_order_id,
-                        "Deferred transfer reservation restoration until the pending hedge clears"
+                        %error,
+                        "Deferred transfer reservation restoration until hedge admission is clear"
                     );
                 }
                 Err(error) => return Err(error.into()),
@@ -1212,7 +1214,9 @@ impl RebalancingService {
                     }
                 }
                 Err(AggregateError::UserError(LifecycleError::Apply(
-                    PositionError::PendingExecution { .. },
+                    PositionError::PendingExecution { .. }
+                    | PositionError::EquityTransferBlockedByHedge { .. }
+                    | PositionError::EquityTransferHedgeEligibilityUnknown { .. },
                 ))) => {
                     let mut pending = self
                         .pending_equity_transfer_reservation_restores
@@ -11781,6 +11785,49 @@ mod tests {
                     offchain_order_id,
                     error: "test terminal failure".to_string(),
                     anchor: AnchorDisposition::Release,
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .retry_pending_equity_transfer_reservation_restores()
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "clearing a failed order must not let the transfer pre-empt hedge-ready exposure"
+        );
+
+        let replacement_order_id = OffchainOrderId::new();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: replacement_order_id,
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::CompleteOffChainOrder {
+                    offchain_order_id: replacement_order_id,
+                    shares_filled: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor_order_id: ExecutorOrderId::new("replacement-hedge"),
+                    price: Usd::new(float!(150)),
+                    broker_timestamp: Utc::now(),
                 },
             )
             .await

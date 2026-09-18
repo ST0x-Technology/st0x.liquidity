@@ -2783,6 +2783,11 @@ enum TriggerReason {
   confirmed owner. The CLI releases ownership only after successful completion
   or when a failed invocation left no live aggregate; an interrupted live
   aggregate keeps ownership so hedging cannot race its next resume.
+- A fresh transfer refused by the gas-readiness preflight releases its exact
+  `Position` reservation before enqueueing the delayed redrive, so a low wallet
+  cannot suppress hedging. The replacement job may recreate a missing confirmed
+  reservation only under the same pending-order, hedge-readiness, and price
+  eligibility checks as fresh transfer admission.
 - `ManuallyAdjustPosition` and `UpdateThreshold` are rejected while a confirmed
   transfer reservation owns the symbol. Transfer ownership must be released
   before either operator mutation can proceed.
@@ -2790,18 +2795,18 @@ enum TriggerReason {
   terminal job attempts that never created an aggregate release only their exact
   reservation ID. Startup retains reservations owned by live durable transfer
   jobs, restores missing legacy ownership, and releases crash-orphaned claims.
-  When a pending hedge prevents restoration, transfer execution remains deferred
-  until the hedge clears and the exact reservation is restored. Every mint,
-  redemption, and startup-resume payload persists its deferral count and uses
-  the symbol-scoped hedge retry schedule (1/2/4/8/16 seconds, then 30 seconds
-  capped), avoiding a new completed queue row every second for a long-lived
-  order. Terminal cleanup removes that deferred owner in its post-commit task.
-  The retry sweep marks an attempt in flight, releases the map before writing
-  Position, and compensates with an exact-ID release when terminal cleanup
-  cancelled the in-flight owner, so a completed or failed transfer cannot be
-  resurrected. A legacy generic resume row without a symbol is discarded before
-  it can call the transfer service; startup enqueues the fresh symbol-bearing
-  replacement that must restore ownership first.
+  When a pending or hedge-ready position prevents restoration, transfer
+  execution remains deferred until the hedge clears and the exact reservation is
+  restored. Every mint, redemption, and startup-resume payload persists its
+  deferral count and uses the symbol-scoped hedge retry schedule (1/2/4/8/16
+  seconds, then 30 seconds capped), avoiding a new completed queue row every
+  second for a long-lived order. Terminal cleanup removes that deferred owner in
+  its post-commit task. The retry sweep marks an attempt in flight, releases the
+  map before writing Position, and compensates with an exact-ID release when
+  terminal cleanup cancelled the in-flight owner, so a completed or failed
+  transfer cannot be resurrected. A legacy generic resume row without a symbol
+  is discarded before it can call the transfer service; startup enqueues the
+  fresh symbol-bearing replacement that must restore ownership first.
 - OnChain fills are always applied (blockchain facts are immutable)
 - Threshold is passed as a parameter to commands that need it
 
