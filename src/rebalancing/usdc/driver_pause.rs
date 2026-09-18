@@ -24,8 +24,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 /// a transfer is genuinely moving funds is refused rather than parking the
 /// caller for that long. The operations that need a pause target a transfer
 /// that is stuck or failed, where no execution is running and the pause
-/// confirms at once.
-const DRIVER_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
+/// confirms at once. Keep this well below the operator client's 30-second
+/// request timeout so a refusal reaches the caller and a late grant leaves
+/// time for the recovery handler to finish.
+const DRIVER_QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// In-flight executions did not finish within [`DRIVER_QUIESCE_TIMEOUT`], so
 /// the caller must not mutate state the live driver would race.
