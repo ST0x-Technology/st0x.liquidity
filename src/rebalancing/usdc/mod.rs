@@ -311,40 +311,40 @@ pub enum UsdcTransferError {
          (nominal amount: {nominal}); waiting for withdrawal to settle on-chain"
     )]
     WalletUsdcInsufficient { id: UsdcRebalanceId, nominal: Usdc },
-    /// The wallet holds MORE USDC than the nominal amount for this rebalance.
-    /// The wallet-empty-between-rebalances invariant is broken: ambient or
-    /// residual USDC from a prior rebalance is present and cannot be
-    /// distinguished from this withdrawal's funds. The aggregate is moved to
-    /// `BridgingFailed` for operator reconciliation; no burn is attempted.
+    /// The wallet holds more than the nominal amount plus the tolerated 0.01
+    /// USDC dust ceiling for this rebalance. Ambient or residual USDC beyond
+    /// that ceiling cannot be distinguished from this withdrawal's funds. The
+    /// aggregate is moved to `BridgingFailed` for operator reconciliation; no
+    /// burn is attempted.
     #[error(
         "USDC rebalance {id}: market-maker wallet holds {balance} USDC, \
-         which exceeds the nominal {nominal}; ambient/residual USDC detected \
-         (wallet-empty invariant broken); failed for operator reconciliation"
+         which exceeds the nominal {nominal} plus the 0.01 USDC dust ceiling; \
+         ambient/residual USDC detected; failed for operator reconciliation"
     )]
     WalletUsdcAmbientBalance {
         id: UsdcRebalanceId,
         balance: Usdc,
         nominal: Usdc,
     },
-    /// The market-maker wallet already holds USDC before the Alpaca leg
-    /// starts. The wallet-empty invariant cannot hold at burn time, so the
-    /// transfer refuses up front -- before the conversion, so no cash leaves
-    /// Alpaca and NO aggregate event is emitted. Unlike
-    /// [`Self::WalletUsdcAmbientBalance`] (settlement-time, aggregate moved
-    /// to `BridgingFailed`, guard cleared by the terminal event), this
-    /// refusal has no aggregate, so the job layer must release the
-    /// in-progress guard itself and alert the operator to sweep the wallet.
+    /// The market-maker wallet holds more than the tolerated 0.01 USDC dust
+    /// ceiling before the Alpaca leg starts. Settlement could not safely
+    /// attribute that excess, so the transfer refuses up front before the
+    /// conversion. No cash leaves Alpaca and no aggregate event is emitted.
+    /// Unlike [`Self::WalletUsdcAmbientBalance`] (settlement time, aggregate
+    /// moved to `BridgingFailed`, guard cleared by the terminal event), this
+    /// refusal has no aggregate, so the job layer must release the in-progress
+    /// guard itself and alert the operator to sweep the wallet.
     ///
-    /// Refuses on ANY non-zero balance, dust included. The wallet address is
-    /// public on-chain, so third-party dust can force refusals (one alert
-    /// per trigger cycle until swept) -- an accepted fail-closed trade-off:
-    /// proceeding with ambient funds is what stranded real withdrawals, and
-    /// a sweep restores service with no funds at risk.
+    /// A balance at or below 0.01 USDC is tolerated so a third party cannot
+    /// wedge the public wallet with a fraction-of-a-cent transfer. The later
+    /// settlement burn is capped at the nominal withdrawal; tolerated dust
+    /// remains bounded in the wallet and cannot make the destination settlement
+    /// exceed the initiated amount.
     #[error(
         "cannot start Alpaca->Base rebalance {id}: market-maker wallet \
          already holds {balance} USDC before the withdrawal (nominal \
-         {nominal}); wallet-empty invariant cannot hold at burn time -- \
-         sweep the wallet, the transfer was refused before any Alpaca call"
+         {nominal}), exceeding the 0.01 USDC dust ceiling; sweep the wallet, \
+         the transfer was refused before any Alpaca call"
     )]
     WalletUsdcAmbientPreflight {
         id: UsdcRebalanceId,

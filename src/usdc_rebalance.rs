@@ -86,16 +86,6 @@ use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Store, Table};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Id, Usdc};
-use st0x_float_macro::float;
-
-/// Ambient USDC tolerated in the market-maker wallet without failing an
-/// AlpacaToBase rebalance. A `BeginBridging` burn may exceed the nominal by up to
-/// this much: the public wallet address lets anyone send a fraction of a cent, so
-/// the pre-flight and settlement checks tolerate the same slack and the
-/// settlement burn sweeps the whole wallet (draining it to zero) rather than
-/// wedging or leaving a persistent smudge (RAI-2495). Single source of truth,
-/// shared with the operational checks in `rebalancing::usdc::manager`.
-pub(crate) const AMBIENT_DUST_THRESHOLD: Usdc = Usdc::new(float!(0.01));
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -245,7 +235,7 @@ pub enum UsdcRebalanceError {
     /// range `(0, nominal]`. The manager only emits `0 < burn <= nominal`, so
     /// this rejects a malformed event before it is persisted and trusted by
     /// crash-safe resume.
-    #[error("burn amount {burn_amount} is outside the valid range (0, {nominal} + dust]")]
+    #[error("burn amount {burn_amount} is outside the valid range (0, {nominal}]")]
     InvalidBurnAmount { burn_amount: Usdc, nominal: Usdc },
     /// A `BeginBridging` burn amount could not be compared against the nominal
     /// amount because the underlying `Float` comparison errored. We fail closed
@@ -3037,13 +3027,10 @@ impl UsdcRebalance {
             | Self::Withdrawing { .. }
             | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
             Self::WithdrawalComplete { amount, .. } => {
-                // Reject a burn amount outside `(0, nominal + dust]` before
-                // persisting: zero, or above the nominal-plus-dust ceiling, both
-                // signal a broken upstream invariant that crash-safe resume must
-                // not trust. Up to AMBIENT_DUST_THRESHOLD of ambient dust may ride
-                // along with a burn (the same slack the pre-flight and settlement
-                // checks tolerate), so the wallet sweeps to zero without wedging.
-                // `None` is the legacy path and stays accepted.
+                // Reject a burn amount outside `(0, nominal]` before persisting:
+                // zero or above the nominal amount signals a broken upstream
+                // invariant that crash-safe resume must not trust. `None` is the
+                // legacy path and stays accepted.
                 //
                 // Use the fallible `Float` comparisons and FAIL CLOSED: `Usdc`'s
                 // `PartialEq`/`PartialOrd` collapse a compare error to `false`,
@@ -3053,10 +3040,7 @@ impl UsdcRebalance {
                 if let Some(burn_amount) = burn_amount {
                     let out_of_range = burn_amount
                         .eq(&Usdc::ZERO)
-                        .and_then(|is_zero| {
-                            let ceiling = (*amount + AMBIENT_DUST_THRESHOLD)?;
-                            Ok(is_zero || burn_amount.gt(&ceiling)?)
-                        })
+                        .and_then(|is_zero| Ok(is_zero || burn_amount.gt(amount)?))
                         .inspect_err(|error| {
                             warn!(
                                 ?error,
@@ -4660,14 +4644,12 @@ mod tests {
         );
     }
 
-    /// `BeginBridging` with a burn amount above `nominal + AMBIENT_DUST_THRESHOLD`
-    /// is rejected before any `BridgingSubmitting` event is persisted: it signals
-    /// genuine ambient USDC, not tolerated dust.
+    /// `BeginBridging` with a burn amount above nominal is rejected before any
+    /// `BridgingSubmitting` event is persisted.
     #[tokio::test]
-    async fn begin_bridging_rejects_burn_amount_above_nominal_plus_dust() {
+    async fn begin_bridging_rejects_burn_amount_above_nominal() {
         let nominal = Usdc::new(float!(1000.00));
-        // 0.02 above nominal, past the 0.01 dust tolerance.
-        let above = Usdc::new(float!(1000.02));
+        let above = Usdc::new(float!(1000.01));
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
@@ -4695,50 +4677,8 @@ mod tests {
                 LifecycleError::Apply(UsdcRebalanceError::InvalidBurnAmount { burn_amount, nominal: n })
                     if burn_amount == above && n == nominal
             ),
-            "expected InvalidBurnAmount for a burn above nominal + dust, got: {error:?}"
+            "expected InvalidBurnAmount for a burn above nominal, got: {error:?}"
         );
-    }
-
-    /// A burn up to `nominal + AMBIENT_DUST_THRESHOLD` is accepted: tolerated
-    /// ambient dust rides along so the settlement burn sweeps the wallet to zero
-    /// instead of wedging or leaving a smudge (RAI-2495).
-    #[tokio::test]
-    async fn begin_bridging_accepts_burn_amount_within_dust_tolerance() {
-        let nominal = Usdc::new(float!(1000.00));
-        // Exactly nominal + the 0.01 dust tolerance.
-        let within = Usdc::new(float!(1000.01));
-
-        let events = TestHarness::<UsdcRebalance>::with(())
-            .given(vec![
-                UsdcRebalanceEvent::Initiated {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    amount: nominal,
-                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-                    initiated_at: Utc::now(),
-                },
-                UsdcRebalanceEvent::WithdrawalConfirmed {
-                    confirmed_at: Utc::now(),
-                    withdrawal_tx: None,
-                },
-            ])
-            .when(UsdcRebalanceCommand::BeginBridging {
-                from_block: 42,
-                burn_amount: Some(within),
-            })
-            .await
-            .events();
-
-        assert_eq!(events.len(), 1);
-        let UsdcRebalanceEvent::BridgingSubmitting {
-            from_block,
-            burn_amount,
-            ..
-        } = &events[0]
-        else {
-            panic!("Expected BridgingSubmitting; got: {events:?}");
-        };
-        assert_eq!(*from_block, 42);
-        assert_eq!(*burn_amount, Some(within));
     }
 
     /// `BeginBridging` with a zero burn amount is rejected before any
