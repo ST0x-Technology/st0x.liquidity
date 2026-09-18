@@ -26,9 +26,7 @@ use st0x_config::{
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Store, StoreBuilder, test_store};
 use st0x_evm::{Chain, IERC20};
-use st0x_execution::{
-    Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
-};
+use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexVaultId};
@@ -55,7 +53,6 @@ use crate::inventory::{
 };
 use crate::mint_authorization::ConfiguredMintAuthorizer;
 use crate::native_gas::ConfiguredGasReadiness;
-use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{
@@ -248,11 +245,19 @@ async fn build_position_cqrs_with_service(
     pool: &SqlitePool,
     service: &Arc<RebalancingService>,
 ) -> Arc<Store<Position>> {
-    let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
+    let (store, projection) = StoreBuilder::<Position>::new(pool.clone())
         .with(Arc::clone(service))
         .build(())
         .await
         .unwrap();
+
+    service
+        .set_position_authority(
+            Arc::clone(&store),
+            projection,
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
 
     store
 }
@@ -324,6 +329,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
 enum Imbalance<'a> {
     Equity {
         position_cqrs: &'a Store<Position>,
+        inventory: &'a Arc<BroadcastingInventory>,
         symbol: &'a Symbol,
         onchain: Float,
         offchain: Float,
@@ -389,58 +395,39 @@ async fn drain_pending_usdc_transfer_jobs(
 async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
     match imbalance {
         Imbalance::Equity {
+            inventory,
             position_cqrs,
             symbol,
             onchain,
             offchain,
         } => {
+            // Inventory imbalance and execution exposure are distinct facts.
+            // Seed venue balances directly, then initialize a neutral Position
+            // with a deliberately high hedge threshold so the test's small
+            // trigger fill can exercise rebalancing without being admitted as
+            // hedgeable exposure first.
+            {
+                let mut guard = inventory.write().await;
+                let taken = std::mem::take(&mut *guard);
+                *guard = taken.with_equity(
+                    symbol.clone(),
+                    FractionalShares::new(onchain),
+                    FractionalShares::new(offchain),
+                );
+            }
+
             position_cqrs
                 .send(
                     symbol,
-                    PositionCommand::AcknowledgeOnChainFill {
+                    PositionCommand::ManuallyAdjustPosition {
                         symbol: symbol.clone(),
-                        threshold: ExecutionThreshold::whole_share(),
-                        trade_id: TradeId {
-                            chain: Chain::Base,
-                            tx_hash: TxHash::random(),
-                            log_index: 0,
-                        },
-                        amount: FractionalShares::new(onchain),
-                        direction: Direction::Buy,
-                        price_usdc: float!(150.0),
-                        block_timestamp: Utc::now(),
-                        block_number: None,
-                    },
-                )
-                .await
-                .unwrap();
-
-            let offchain_order_id = OffchainOrderId::new();
-
-            position_cqrs
-                .send(
-                    symbol,
-                    PositionCommand::PlaceOffChainOrder {
-                        offchain_order_id,
-                        shares: Positive::new(FractionalShares::new(offchain)).unwrap(),
-                        direction: Direction::Buy,
-                        executor: SupportedExecutor::AlpacaBrokerApi,
-                        threshold: ExecutionThreshold::whole_share(),
-                    },
-                )
-                .await
-                .unwrap();
-
-            position_cqrs
-                .send(
-                    symbol,
-                    PositionCommand::CompleteOffChainOrder {
-                        offchain_order_id,
-                        shares_filled: Positive::new(FractionalShares::new(offchain)).unwrap(),
-                        direction: Direction::Buy,
-                        executor_order_id: ExecutorOrderId::new("ORD1"),
-                        price: Usd::new(float!(150)),
-                        broker_timestamp: Utc::now(),
+                        target_net: FractionalShares::ZERO,
+                        reason: "initialize neutral rebalancing fixture".to_string(),
+                        threshold: ExecutionThreshold::shares(
+                            Positive::new(FractionalShares::new(float!(1000))).unwrap(),
+                        ),
+                        expected_net: Some(FractionalShares::ZERO),
+                        price_usdc: None,
                     },
                 )
                 .await
@@ -572,13 +559,14 @@ async fn equity_offchain_imbalance_triggers_mint() {
         symbol,
         aggregate_id,
         service,
-        inventory: _,
+        inventory,
         position_cqrs,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain.
     // Without VaultRegistry seeded, the trigger silently skips Mint operations.
     build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
         position_cqrs: &position_cqrs,
         symbol: &symbol,
         onchain: float!(20),
@@ -728,6 +716,10 @@ async fn equity_offchain_imbalance_triggers_mint() {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
+        position_authority: Some((
+            Arc::clone(&position_cqrs),
+            ExecutionThreshold::whole_share(),
+        )),
         transfer_services: EquityTransferServices::panicking(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
@@ -757,22 +749,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
-                "PositionEvent::OnChainOrderFilled",
-            ),
-            ExpectedEvent::new(
-                "Position",
-                &aggregate_id,
-                "PositionEvent::OnChainFillApplied",
-            ),
-            ExpectedEvent::new(
-                "Position",
-                &aggregate_id,
-                "PositionEvent::OffChainOrderPlaced",
-            ),
-            ExpectedEvent::new(
-                "Position",
-                &aggregate_id,
-                "PositionEvent::OffChainOrderFilled",
+                "PositionEvent::ManualPositionAdjusted",
             ),
             ExpectedEvent::new(
                 "VaultRegistry",
@@ -788,6 +765,16 @@ async fn equity_offchain_imbalance_triggers_mint() {
                 "Position",
                 &aggregate_id,
                 "PositionEvent::OnChainFillApplied",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::EquityTransferReserved",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::EquityTransferReservationConfirmed",
             ),
             ExpectedEvent::new(
                 "TokenizedEquityMint",
@@ -824,18 +811,23 @@ async fn equity_offchain_imbalance_triggers_mint() {
                 &mint_agg_id,
                 "TokenizedEquityMintEvent::DepositedIntoRaindex",
             ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::EquityTransferReservationReleased",
+            ),
         ],
     )
     .await;
 
-    let mint_requested = &events[8].payload["MintRequested"];
+    let mint_requested = &events[7].payload["MintRequested"];
     assert_eq!(
         mint_requested["symbol"].as_str().unwrap(),
         "AAPL",
         "MintRequested should target the correct symbol"
     );
 
-    let mint_accepted = &events[9].payload["MintAccepted"];
+    let mint_accepted = &events[8].payload["MintAccepted"];
     assert_eq!(
         mint_accepted["tokenization_request_id"].as_str().unwrap(),
         "mint_int_test",
@@ -868,7 +860,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         symbol,
         aggregate_id,
         service,
-        inventory: _,
+        inventory,
         position_cqrs,
     } = setup_equity_trigger().await;
     let server = MockServer::start();
@@ -921,6 +913,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     );
 
     build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
         position_cqrs: &position_cqrs,
         symbol: &symbol,
         onchain: float!(79),
@@ -976,6 +969,10 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         transfer: equity_transfer,
         equity_in_progress: service.equity_in_progress.clone(),
         redemption_store: Arc::new(test_store(pool.clone(), cleanup_services)),
+        position_authority: Some((
+            Arc::clone(&position_cqrs),
+            ExecutionThreshold::whole_share(),
+        )),
         job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -1020,22 +1017,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
-                "PositionEvent::OnChainOrderFilled",
-            ),
-            ExpectedEvent::new(
-                "Position",
-                &aggregate_id,
-                "PositionEvent::OnChainFillApplied",
-            ),
-            ExpectedEvent::new(
-                "Position",
-                &aggregate_id,
-                "PositionEvent::OffChainOrderPlaced",
-            ),
-            ExpectedEvent::new(
-                "Position",
-                &aggregate_id,
-                "PositionEvent::OffChainOrderFilled",
+                "PositionEvent::ManualPositionAdjusted",
             ),
             ExpectedEvent::new(
                 "VaultRegistry",
@@ -1051,6 +1033,16 @@ async fn equity_onchain_imbalance_triggers_redemption() {
                 "Position",
                 &aggregate_id,
                 "PositionEvent::OnChainFillApplied",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::EquityTransferReserved",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::EquityTransferReservationConfirmed",
             ),
             ExpectedEvent::new(
                 "EquityRedemption",
@@ -1102,26 +1094,31 @@ async fn equity_onchain_imbalance_triggers_redemption() {
                 &redemption_agg_id,
                 "EquityRedemptionEvent::Completed",
             ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::EquityTransferReservationReleased",
+            ),
         ],
     )
     .await;
 
     assert_eq!(
-        events[8].payload["VaultWithdrawPending"]["symbol"]
+        events[7].payload["VaultWithdrawPending"]["symbol"]
             .as_str()
             .unwrap(),
         "AAPL",
         "VaultWithdrawPending should target the correct symbol"
     );
     assert_eq!(
-        events[15].payload["TokensSent"]["redemption_tx"]
+        events[14].payload["TokensSent"]["redemption_tx"]
             .as_str()
             .unwrap(),
         format!("{expected_tx_hash:#x}"),
         "TokensSent redemption_tx should match the deterministic Anvil hash"
     );
     assert_eq!(
-        events[16].payload["Detected"]["tokenization_request_id"]
+        events[15].payload["Detected"]["tokenization_request_id"]
             .as_str()
             .unwrap(),
         "redeem_int_test",
@@ -1675,12 +1672,13 @@ async fn mint_api_failure_preserves_requested_intent() {
         symbol,
         aggregate_id,
         service,
-        inventory: _,
+        inventory,
         position_cqrs,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
     build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
         position_cqrs: &position_cqrs,
         symbol: &symbol,
         onchain: float!(20),
@@ -1758,6 +1756,10 @@ async fn mint_api_failure_preserves_requested_intent() {
         transfer: equity_transfer,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
+        position_authority: Some((
+            Arc::clone(&position_cqrs),
+            ExecutionThreshold::whole_share(),
+        )),
         transfer_services: EquityTransferServices::panicking(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
@@ -1791,22 +1793,7 @@ async fn mint_api_failure_preserves_requested_intent() {
             ExpectedEvent::new(
                 "Position",
                 &aggregate_id,
-                "PositionEvent::OnChainOrderFilled",
-            ),
-            ExpectedEvent::new(
-                "Position",
-                &aggregate_id,
-                "PositionEvent::OnChainFillApplied",
-            ),
-            ExpectedEvent::new(
-                "Position",
-                &aggregate_id,
-                "PositionEvent::OffChainOrderPlaced",
-            ),
-            ExpectedEvent::new(
-                "Position",
-                &aggregate_id,
-                "PositionEvent::OffChainOrderFilled",
+                "PositionEvent::ManualPositionAdjusted",
             ),
             ExpectedEvent::new(
                 "VaultRegistry",
@@ -1822,6 +1809,16 @@ async fn mint_api_failure_preserves_requested_intent() {
                 "Position",
                 &aggregate_id,
                 "PositionEvent::OnChainFillApplied",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::EquityTransferReserved",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::EquityTransferReservationConfirmed",
             ),
             ExpectedEvent::new(
                 "TokenizedEquityMint",
@@ -2255,6 +2252,7 @@ async fn mint_accepted_sets_offchain_inflight() {
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
     build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
         position_cqrs: &position_cqrs,
         symbol: &symbol,
         onchain: float!("20"),
@@ -2400,6 +2398,10 @@ async fn mint_accepted_sets_offchain_inflight() {
                 transfer: equity_transfer,
                 equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
                 mint_store,
+                position_authority: Some((
+                    Arc::clone(&position_cqrs),
+                    ExecutionThreshold::whole_share(),
+                )),
                 transfer_services: EquityTransferServices::panicking(),
                 job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
             };
@@ -2479,6 +2481,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
     build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
         position_cqrs: &position_cqrs,
         symbol: &symbol,
         onchain: float!("20"),
@@ -2627,6 +2630,10 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         transfer: Arc::clone(&equity_transfer) as _,
         equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
         mint_store,
+        position_authority: Some((
+            Arc::clone(&position_cqrs),
+            ExecutionThreshold::whole_share(),
+        )),
         transfer_services: EquityTransferServices::panicking(),
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
@@ -2679,6 +2686,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
 
     // Build inventory: 80 onchain, 20 offchain = 80% ratio -> TooMuchOnchain
     build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
         position_cqrs: &position_cqrs,
         symbol: &symbol,
         onchain: float!("80"),

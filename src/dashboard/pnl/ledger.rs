@@ -452,6 +452,9 @@ async fn ingest_position(
         // inventory).
         PositionEvent::Initialized { .. }
         | PositionEvent::ThresholdUpdated { .. }
+        | PositionEvent::EquityTransferReserved { .. }
+        | PositionEvent::EquityTransferReservationConfirmed { .. }
+        | PositionEvent::EquityTransferReservationReleased { .. }
         | PositionEvent::OnChainFillApplied { .. }
         | PositionEvent::OnChainFillSettled { .. }
         | PositionEvent::OffChainOrderFailed { .. }

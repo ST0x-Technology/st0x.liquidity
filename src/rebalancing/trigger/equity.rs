@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
+use st0x_event_sorcery::SendError;
 use tracing::{debug, trace, warn};
 
 use st0x_execution::{FractionalShares, Positive, Symbol};
@@ -20,6 +21,7 @@ use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold, Venue,
 };
+use crate::position::Position;
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
 const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
@@ -45,6 +47,10 @@ pub(crate) enum EquityTriggerError {
     Wrapper(#[from] WrapperError),
     #[error("Float arithmetic error during truncation: {0}")]
     Float(#[from] FloatError),
+    #[error("position authority is not wired")]
+    PositionAuthorityNotWired,
+    #[error(transparent)]
+    PositionReservation(#[from] SendError<Position>),
 }
 
 /// Discriminates why the equity in-progress slot is held.
@@ -75,7 +81,7 @@ pub(crate) enum GuardState {
 /// a monotonic per-process counter. Zero is reserved for persisted job payloads
 /// created before generations were introduced; only a restored legacy owner
 /// uses it. Startup reserves persisted counters before allocating new claims.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub(crate) struct GuardGeneration(u64);
 

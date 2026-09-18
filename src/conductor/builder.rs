@@ -520,6 +520,7 @@ where
         order_placer: order_placer.clone(),
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
+        check_positions_queue: check_positions_queue.clone(),
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock: counter_trade_submission_lock.clone(),
         close_flatten_policy,
@@ -2420,6 +2421,7 @@ mod tests {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             mint_store: Arc::new(test_store(cqrs_pool, services)),
+            position_authority: None,
             transfer_services: EquityTransferServices::panicking(),
             job_queue,
         })
@@ -2463,6 +2465,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -2476,6 +2479,7 @@ mod tests {
             }),
             equity_in_progress: equity_in_progress.clone(),
             redemption_store,
+            position_authority: None,
             job_queue: queue.clone(),
         });
         let monitor = register_transfer_equity_to_hedging_worker(
@@ -2497,6 +2501,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -2718,6 +2723,7 @@ mod tests {
                 generation,
 
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -2767,6 +2773,7 @@ mod tests {
                 generation: GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();

@@ -15,7 +15,7 @@ use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -24,9 +24,10 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use rain_math_float::Float;
-use st0x_config::{ChainAssets, OperationMode};
+use st0x_config::{ChainAssets, ExecutionThreshold, OperationMode};
 use st0x_event_sorcery::{
-    AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
+    AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, SendError,
+    Store, deps,
 };
 use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, HedgeFloor, Positive, SharesConversionError, Symbol};
@@ -42,6 +43,7 @@ use crate::conductor::job::{BackpressureStreak, QueuePushError};
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
+use crate::inventory::divergence::ReconciliationGeneration;
 use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
@@ -53,7 +55,10 @@ use crate::inventory::{
 };
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
-use crate::position::{Position, PositionEvent};
+use crate::position::{
+    EquityTransferReservationId, EquityTransferReservationStatus, Position, PositionCommand,
+    PositionError, PositionEvent,
+};
 use crate::rebalancing::equity::{
     TransferEquityToHedging, TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
     TransferEquityToMarketMakingJobQueue,
@@ -151,6 +156,8 @@ pub(crate) enum RebalancingServiceError {
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
     ApalisSqlx(#[from] sqlx_apalis::Error),
+    #[error(transparent)]
+    PositionReservation(#[from] SendError<Position>),
     #[error("failed to re-arm a stranded USDC transfer job at startup: {0}")]
     RearmEnqueue(#[from] QueuePushError),
 }
@@ -671,6 +678,11 @@ struct TimeoutTombstone {
     timed_out_at: DateTime<Utc>,
 }
 
+enum PendingEquityTransferReservationRestore {
+    Pending(Symbol),
+    Restoring(Symbol),
+}
+
 /// Whether a terminal equity transfer event reconciled the in-memory
 /// inventory ledger. Mirrors [`usdc::UsdcSettlementOutcome`]:
 /// `DeferredToSnapshot` means the durable event was accepted as authoritative
@@ -692,6 +704,15 @@ enum ZombieJobKillOutcome {
     Killed,
     NoLongerInFlight,
     StillInFlight,
+}
+
+struct SnapshotReconciliation {
+    protected_onchain_equity_symbols: BTreeSet<Symbol>,
+    protected_offchain_equity_symbols: BTreeSet<Symbol>,
+    protect_onchain_cash: bool,
+    accepted_onchain_equity: BTreeMap<Symbol, ReconciliationGeneration>,
+    accepted_onchain_cash: Option<ReconciliationGeneration>,
+    accepted_offchain_equity: Option<ReconciliationGeneration>,
 }
 
 /// Service that folds CQRS events into rebalancing state and
@@ -752,6 +773,25 @@ pub(crate) struct RebalancingService {
     suppressed_inflight_symbols: Arc<RwLock<HashMap<Symbol, DateTime<Utc>>>>,
     timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, TimeoutTombstone>>>,
     timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, TimeoutTombstone>>>,
+    /// Terminal transfer reservations whose release is pending. Lifecycle
+    /// reactors queue these instead of writing Position synchronously inside
+    /// another aggregate's SQLite transaction. A detached post-transaction
+    /// retry handles the normal path, the periodic sweep handles transient
+    /// failures, and startup orphan reconciliation covers process exit.
+    pending_timed_out_mint_reservation_releases: Arc<RwLock<HashMap<IssuerRequestId, Symbol>>>,
+    pending_timed_out_redemption_reservation_releases:
+        Arc<RwLock<HashMap<RedemptionAggregateId, Symbol>>>,
+    /// Reservations created by a trigger check that produced no durable job.
+    /// The exact reservation ID stays here until Position acknowledges release;
+    /// otherwise a transient store failure can permanently block hedging.
+    pending_pre_enqueue_reservation_releases:
+        Arc<RwLock<HashMap<EquityTransferReservationId, Symbol>>>,
+    /// Active transfer reservations that could not be restored at startup
+    /// because a hedge still owned the Position. Durable transfer jobs gate
+    /// execution on the same restore command; this sweep also covers
+    /// recovery-held transfers without a runnable transfer job.
+    pending_equity_transfer_reservation_restores:
+        Arc<RwLock<HashMap<EquityTransferReservationId, PendingEquityTransferReservationRestore>>>,
     timed_out_usdc_rebalances: Arc<RwLock<HashMap<UsdcRebalanceId, DateTime<Utc>>>>,
     /// Requested-stage mint timeouts already logged. Issuer request ids are
     /// unique, so retaining an id suppresses duplicate warnings permanently.
@@ -777,6 +817,12 @@ pub(crate) struct RebalancingService {
     /// Set after construction via `set_stores` because the stores
     /// are built after the trigger (the trigger is a Reactor dependency
     /// of the stores' query manifest).
+    /// Durable, source-side authority shared by hedge and equity-transfer
+    /// admission. Attached after query construction to break the reactor/store
+    /// construction cycle.
+    position_store: RwLock<Option<Arc<Store<Position>>>>,
+    position_projection: RwLock<Option<Arc<Projection<Position>>>>,
+    position_threshold: RwLock<Option<ExecutionThreshold>>,
     mint_store: RwLock<Option<Arc<Store<TokenizedEquityMint>>>>,
     redemption_store: RwLock<Option<Arc<Store<EquityRedemption>>>>,
     usdc_store: RwLock<Option<Arc<Store<UsdcRebalance>>>>,
@@ -793,6 +839,8 @@ type EquityInventoryUpdate = Box<
 >;
 
 const TIMEOUT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const TERMINAL_RESERVATION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
+const TERMINAL_RESERVATION_RELEASE_ATTEMPTS: u32 = 5;
 
 #[derive(Debug)]
 enum UsdcTimeoutCleanup {
@@ -899,6 +947,12 @@ impl RebalancingService {
             suppressed_inflight_symbols: Arc::new(RwLock::new(HashMap::new())),
             timed_out_mints: Arc::new(RwLock::new(HashMap::new())),
             timed_out_redemptions: Arc::new(RwLock::new(HashMap::new())),
+            pending_timed_out_mint_reservation_releases: Arc::new(RwLock::new(HashMap::new())),
+            pending_timed_out_redemption_reservation_releases: Arc::new(
+                RwLock::new(HashMap::new()),
+            ),
+            pending_pre_enqueue_reservation_releases: Arc::new(RwLock::new(HashMap::new())),
+            pending_equity_transfer_reservation_restores: Arc::new(RwLock::new(HashMap::new())),
             timed_out_usdc_rebalances: Arc::new(RwLock::new(HashMap::new())),
             requested_stage_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
@@ -907,6 +961,9 @@ impl RebalancingService {
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
+            position_store: RwLock::new(None),
+            position_projection: RwLock::new(None),
+            position_threshold: RwLock::new(None),
             mint_store: RwLock::new(None),
             redemption_store: RwLock::new(None),
             usdc_store: RwLock::new(None),
@@ -927,6 +984,16 @@ impl RebalancingService {
         *self.mint_store.write().await = Some(mint_store);
         *self.redemption_store.write().await = Some(redemption_store);
         *self.usdc_store.write().await = Some(usdc_store);
+    }
+    pub(crate) async fn set_position_authority(
+        &self,
+        position_store: Arc<Store<Position>>,
+        position_projection: Arc<Projection<Position>>,
+        threshold: ExecutionThreshold,
+    ) {
+        *self.position_store.write().await = Some(position_store);
+        *self.position_projection.write().await = Some(position_projection);
+        *self.position_threshold.write().await = Some(threshold);
     }
 
     /// Attach the issuance freeze-status reader so the equity trigger can skip
@@ -984,6 +1051,213 @@ impl RebalancingService {
             .set_pending_offchain_orders(pending_orders);
         Ok(())
     }
+    /// Reconciles durable Position reservations with every transfer aggregate
+    /// startup will continue, whether through a transfer-job row, a recovery
+    /// handoff, or a generic resume job. Unowned claims are crash orphans and
+    /// are released. Active owners restore their exact reservation before
+    /// workers start unless a pending hedge still owns the Position; that
+    /// expected conflict is retained for the periodic retry sweep, while
+    /// runnable transfer jobs also restore ownership before any side effect.
+    pub(crate) async fn recover_equity_transfer_reservations(
+        &self,
+        active: &HashSet<(Symbol, EquityTransferReservationId)>,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("position authority store is not wired"))?;
+        let projection = self
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("position authority projection is not wired"))?;
+        let threshold = self
+            .position_threshold
+            .read()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("position authority threshold is not wired"))?;
+
+        for (symbol, position) in projection.load_all().await? {
+            let Some(reservation) = position.equity_transfer_reservation else {
+                continue;
+            };
+            let owned = reservation.status == EquityTransferReservationStatus::Confirmed
+                && active.contains(&(symbol.clone(), reservation.id));
+            if !owned {
+                store
+                    .send(
+                        &symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: reservation.id,
+                        },
+                    )
+                    .await?;
+            }
+        }
+
+        for (symbol, reservation_id) in active {
+            match store
+                .send(
+                    symbol,
+                    PositionCommand::RestoreEquityTransferReservation {
+                        symbol: symbol.clone(),
+                        threshold,
+                        reservation_id: *reservation_id,
+                    },
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.pending_equity_transfer_reservation_restores
+                        .write()
+                        .await
+                        .remove(reservation_id);
+                }
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    error @ (PositionError::PendingExecution { .. }
+                    | PositionError::EquityTransferBlockedByHedge { .. }
+                    | PositionError::EquityTransferHedgeEligibilityUnknown { .. }),
+                ))) => {
+                    self.pending_equity_transfer_reservation_restores
+                        .write()
+                        .await
+                        .insert(
+                            *reservation_id,
+                            PendingEquityTransferReservationRestore::Pending(symbol.clone()),
+                        );
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        %reservation_id,
+                        %error,
+                        "Deferred transfer reservation restoration until hedge admission is clear"
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn retry_pending_equity_transfer_reservation_restores(
+        &self,
+    ) -> Result<(), RebalancingServiceError> {
+        if self
+            .pending_equity_transfer_reservation_restores
+            .read()
+            .await
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let (store, threshold) = self.position_authority().await?;
+        let entries: Vec<_> = {
+            let mut pending = self
+                .pending_equity_transfer_reservation_restores
+                .write()
+                .await;
+            pending
+                .iter_mut()
+                .filter_map(|(reservation_id, state)| match state {
+                    PendingEquityTransferReservationRestore::Pending(symbol) => {
+                        let symbol = symbol.clone();
+                        *state = PendingEquityTransferReservationRestore::Restoring(symbol.clone());
+                        Some((*reservation_id, symbol))
+                    }
+                    PendingEquityTransferReservationRestore::Restoring(_) => None,
+                })
+                .collect()
+        };
+
+        for (reservation_id, symbol) in entries {
+            match store
+                .send(
+                    &symbol,
+                    PositionCommand::RestoreEquityTransferReservation {
+                        symbol: symbol.clone(),
+                        threshold,
+                        reservation_id,
+                    },
+                )
+                .await
+            {
+                Ok(()) => {
+                    let canceled = {
+                        let mut pending = self
+                            .pending_equity_transfer_reservation_restores
+                            .write()
+                            .await;
+                        match pending.get(&reservation_id) {
+                            Some(PendingEquityTransferReservationRestore::Restoring(
+                                restoring_symbol,
+                            )) if restoring_symbol == &symbol => {
+                                pending.remove(&reservation_id);
+                                false
+                            }
+                            None => true,
+                            Some(_) => false,
+                        }
+                    };
+                    if canceled {
+                        store
+                            .send(
+                                &symbol,
+                                PositionCommand::ReleaseEquityTransfer { reservation_id },
+                            )
+                            .await?;
+                    }
+                }
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    PositionError::PendingExecution { .. }
+                    | PositionError::EquityTransferBlockedByHedge { .. }
+                    | PositionError::EquityTransferHedgeEligibilityUnknown { .. },
+                ))) => {
+                    let mut pending = self
+                        .pending_equity_transfer_reservation_restores
+                        .write()
+                        .await;
+                    if matches!(
+                        pending.get(&reservation_id),
+                        Some(PendingEquityTransferReservationRestore::Restoring(
+                            restoring_symbol
+                        )) if restoring_symbol == &symbol
+                    ) {
+                        pending.insert(
+                            reservation_id,
+                            PendingEquityTransferReservationRestore::Pending(symbol),
+                        );
+                    }
+                }
+                Err(error) => {
+                    let mut pending = self
+                        .pending_equity_transfer_reservation_restores
+                        .write()
+                        .await;
+                    if matches!(
+                        pending.get(&reservation_id),
+                        Some(PendingEquityTransferReservationRestore::Restoring(
+                            restoring_symbol
+                        )) if restoring_symbol == &symbol
+                    ) {
+                        pending.insert(
+                            reservation_id,
+                            PendingEquityTransferReservationRestore::Pending(symbol),
+                        );
+                    }
+                    drop(pending);
+                    return Err(error.into());
+                }
+            }
+        }
+
+        Ok(())
+    }
 
     async fn pending_offchain_orders(
         position_projection: &Projection<Position>,
@@ -1004,6 +1278,9 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
+        self.retry_pending_reservation_releases().await;
+        self.retry_pending_equity_transfer_reservation_restores()
+            .await?;
         self.prune_timeout_markers(now).await;
         self.expire_stuck_mints(now).await?;
         self.expire_stuck_redemptions(now).await?;
@@ -1181,12 +1458,18 @@ impl RebalancingService {
                     MintTrackingStage::Requested => continue,
                 };
 
-                if let Err(error) = store.send(&id, command).await {
-                    warn!(
-                        target: "rebalance",
-                        %id, %error,
-                        "Failed to emit timeout failure event for mint"
-                    );
+                match store.send(&id, command).await {
+                    Ok(()) => {
+                        self.release_timed_out_mint_reservation(&id, &tracking.symbol)
+                            .await;
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "rebalance",
+                            %id, %error,
+                            "Failed to emit timeout failure event for mint"
+                        );
+                    }
                 }
             }
         }
@@ -1260,14 +1543,20 @@ impl RebalancingService {
                     }
                 };
 
-                if let Some(command) = command
-                    && let Err(error) = store.send(&id, command).await
-                {
-                    warn!(
-                        target: "rebalance",
-                        %id, %error,
-                        "Failed to emit timeout failure event for redemption"
-                    );
+                if let Some(command) = command {
+                    match store.send(&id, command).await {
+                        Ok(()) => {
+                            self.release_timed_out_redemption_reservation(&id, &tracking.symbol)
+                                .await;
+                        }
+                        Err(error) => {
+                            warn!(
+                                target: "rebalance",
+                                %id, %error,
+                                "Failed to emit timeout failure event for redemption"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1918,6 +2207,119 @@ impl RebalancingService {
         Ok(())
     }
 
+    fn snapshot_reconciliation(&self, event: &InventorySnapshotEvent) -> SnapshotReconciliation {
+        use InventorySnapshotEvent::*;
+
+        let protected_onchain_equity_symbols = match event {
+            OnchainEquity {
+                chain,
+                fetched_at,
+                block_number,
+                ..
+            }
+            | OnchainEquityReconciled {
+                chain,
+                fetched_at,
+                block_number,
+                ..
+            } => self.divergence_gate.protected_onchain_equity_symbols(
+                *chain,
+                *fetched_at,
+                *block_number,
+            ),
+            _ => BTreeSet::new(),
+        };
+        let protected_offchain_equity_symbols = match event {
+            OffchainEquity { .. } => self.divergence_gate.protected_offchain_equity_symbols(),
+            _ => BTreeSet::new(),
+        };
+        let protect_onchain_cash = match event {
+            OnchainUsdc {
+                chain,
+                fetched_at,
+                block_number,
+                ..
+            }
+            | OnchainUsdcReconciled {
+                chain,
+                fetched_at,
+                block_number,
+                ..
+            } => self.divergence_gate.protects_onchain_cash_snapshot(
+                *chain,
+                *fetched_at,
+                *block_number,
+            ),
+            _ => false,
+        };
+        let accepted_onchain_equity = match event {
+            OnchainEquityReconciled {
+                chain,
+                balances,
+                fetched_at,
+                block_number,
+                generations,
+            } => generations
+                .iter()
+                .filter(|(symbol, generation)| {
+                    balances.contains_key(*symbol)
+                        && self.divergence_gate.accepts_onchain_equity_reconcile(
+                            *chain,
+                            symbol,
+                            **generation,
+                            *fetched_at,
+                            *block_number,
+                        )
+                })
+                .map(|(symbol, generation)| (symbol.clone(), *generation))
+                .collect(),
+            _ => BTreeMap::new(),
+        };
+        let accepted_onchain_cash = match event {
+            OnchainUsdcReconciled {
+                chain,
+                fetched_at,
+                block_number,
+                generation,
+                ..
+            } if self.divergence_gate.accepts_onchain_cash_reconcile(
+                *chain,
+                *generation,
+                *fetched_at,
+                *block_number,
+            ) =>
+            {
+                Some(*generation)
+            }
+            _ => None,
+        };
+        let accepted_offchain_equity = match event {
+            OffchainEquityReconciled {
+                symbol,
+                fetched_at,
+                generation: Some(generation),
+                ..
+            } if self.divergence_gate.accepts_offchain_equity_reconcile(
+                symbol,
+                *generation,
+                *fetched_at,
+            ) =>
+            {
+                Some(*generation)
+            }
+            _ => None,
+        };
+
+        SnapshotReconciliation {
+            protected_onchain_equity_symbols,
+            protected_offchain_equity_symbols,
+            protect_onchain_cash,
+            accepted_onchain_equity,
+            accepted_onchain_cash,
+            accepted_offchain_equity,
+        }
+    }
+
     /// Fold the snapshot event into the view, then enqueue any
     /// follow-up imbalance checks the event implies. A failed apply
     /// (including recovery) short-circuits enqueueing so rebalancing
@@ -1948,8 +2350,29 @@ impl RebalancingService {
             }
             _ => None,
         };
+        let SnapshotReconciliation {
+            protected_onchain_equity_symbols,
+            protected_offchain_equity_symbols,
+            protect_onchain_cash,
+            accepted_onchain_equity: accepted_onchain_equity_reconciliations,
+            accepted_onchain_cash: accepted_onchain_cash_reconciliation,
+            accepted_offchain_equity: accepted_offchain_equity_reconciliation,
+        } = self.snapshot_reconciliation(&event);
+        let forced_onchain_equity_symbols = accepted_onchain_equity_reconciliations
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
 
         let mut inventory = self.inventory.write().await;
+        let resolve_offchain_reconciliation = accepted_offchain_equity_reconciliation.is_some()
+            && match &event {
+                OffchainEquityReconciled {
+                    symbol, fetched_at, ..
+                } => inventory
+                    .equity_reconciliation_busy(symbol, *fetched_at)?
+                    .is_none(),
+                _ => false,
+            };
 
         let updated = match &event {
             OnchainEquity {
@@ -1957,33 +2380,68 @@ impl RebalancingService {
                 balances,
                 block_number,
                 ..
-            } => inventory.clone().apply_equity_snapshot(
+            } => inventory.clone().apply_guarded_equity_snapshot(
                 Venue::MarketMaking,
                 *chain,
                 balances.iter(),
                 fetched_at,
                 *block_number,
                 now,
+                &protected_onchain_equity_symbols,
             ),
+
+            OnchainEquityReconciled {
+                chain,
+                balances,
+                block_number,
+                ..
+            } => inventory.clone().apply_reconciled_onchain_equity_snapshot(
+                *chain,
+                balances.iter(),
+                fetched_at,
+                *block_number,
+                now,
+                &forced_onchain_equity_symbols,
+                &protected_onchain_equity_symbols,
+            ),
+
+            OnchainUsdc { .. } | OnchainUsdcReconciled { .. } if protect_onchain_cash => {
+                Ok(inventory.clone())
+            }
+
+            OnchainUsdcReconciled {
+                chain,
+                usdc_balance,
+                block_number,
+                ..
+            } if accepted_onchain_cash_reconciliation.is_some() => inventory
+                .clone()
+                .apply_reconciled_onchain_usdc_snapshot(*chain, *usdc_balance, *block_number, now),
 
             OffchainEquity { positions, .. } => {
                 let primary_chain = inventory.primary_chain();
-                inventory.clone().apply_equity_snapshot(
+                inventory.clone().apply_guarded_equity_snapshot(
                     Venue::Hedging,
                     primary_chain,
                     positions.iter(),
                     fetched_at,
                     None,
                     now,
+                    &protected_offchain_equity_symbols,
                 )
             }
 
+            OffchainEquityReconciled {
+                generation: Some(_),
+                ..
+            } if accepted_offchain_equity_reconciliation.is_none() => Ok(inventory.clone()),
+
             // The reconcile arms validate busyness themselves under the
             // write lock, so the generic apply path is the correct route
-            // here too. `OnchainUsdc` also routes through it (not a direct
-            // `update_usdc`) so the view's block-watermark bookkeeping for
-            // absorbed onchain fills has a single implementation.
+            // here too. Onchain USDC also routes through it when its claimed
+            // request is stale, preserving the ordinary snapshot guards.
             OnchainUsdc { .. }
+            | OnchainUsdcReconciled { .. }
             | OffchainEquityReconciled { .. }
             | OffchainUsdReconciled { .. }
             | OffchainUsd { .. }
@@ -2009,6 +2467,27 @@ impl RebalancingService {
         *inventory = updated;
         drop(inventory);
 
+        if let OnchainEquityReconciled { chain, .. } = &event {
+            for (symbol, generation) in accepted_onchain_equity_reconciliations {
+                self.divergence_gate
+                    .resolve_onchain_equity_reconcile(*chain, &symbol, generation);
+            }
+        }
+        if let (OnchainUsdcReconciled { chain, .. }, Some(generation)) =
+            (&event, accepted_onchain_cash_reconciliation)
+        {
+            self.divergence_gate
+                .resolve_onchain_cash_reconcile(*chain, generation);
+        }
+        if let (true, OffchainEquityReconciled { symbol, .. }, Some(generation)) = (
+            resolve_offchain_reconciliation,
+            &event,
+            accepted_offchain_equity_reconciliation,
+        ) {
+            self.divergence_gate
+                .resolve_offchain_equity_reconcile(symbol, generation);
+        }
+
         trace!(target: "rebalance", "Applied inventory snapshot event");
 
         self.enqueue_checks_for_snapshot(&event).await;
@@ -2028,7 +2507,7 @@ impl RebalancingService {
         use InventorySnapshotEvent::*;
         use RebalancingServiceError::{
             ApalisSqlx, EquityTrigger, Float, MissingRedemptionInventory, MissingUsdcBridgedAmount,
-            MissingUsdcTrackingContext, Projection, RearmEnqueue,
+            MissingUsdcTrackingContext, PositionReservation, Projection, RearmEnqueue,
             SettledUsdcExceedsInitiatedAmount, SharesConversion, Sqlx,
         };
 
@@ -2046,6 +2525,7 @@ impl RebalancingService {
             | SettledUsdcExceedsInitiatedAmount { .. }
             | Sqlx(_)
             | ApalisSqlx(_)
+            | PositionReservation(_)
             | RearmEnqueue(_)) => {
                 return Err(other);
             }
@@ -2056,6 +2536,17 @@ impl RebalancingService {
         // retry would pass vacuously against empty state. Drop the event
         // instead: the poller's read-back keeps the gate and counter, and
         // the next quiet poll re-escalates with a fresh reading.
+        if matches!(
+            &event,
+            OnchainEquityReconciled { .. } | OnchainUsdcReconciled { .. }
+        ) {
+            warn!(
+                target: "rebalance",
+                ?inventory_error,
+                "Skipping force-apply recovery for a generation-bound onchain reconcile event"
+            );
+            return Ok(());
+        }
         if let OffchainEquityReconciled { symbol, .. } = &event {
             warn!(
                 target: "rebalance",
@@ -2122,19 +2613,13 @@ impl RebalancingService {
         *inventory = inventory.reset_preserving_offchain_order_state();
 
         let updated = match &event {
-            OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
-                Inventory::force_on_snapshot(
-                    Venue::MarketMaking,
-                    *usdc_balance,
-                    recovery_reason.clone(),
-                ),
-                now,
-            ),
-
             // The reconcile events never reach here at runtime -- the early
             // return above drops them before this match. They are listed
             // only to keep the match exhaustive.
             OnchainEquity { .. }
+            | OnchainEquityReconciled { .. }
+            | OnchainUsdc { .. }
+            | OnchainUsdcReconciled { .. }
             | OffchainEquity { .. }
             | OffchainEquityReconciled { .. }
             | OffchainUsdReconciled { .. }
@@ -2191,7 +2676,7 @@ impl RebalancingService {
             // offchain polling seeds every configured symbol explicitly, and
             // onchain polling emits a key for every vault in the monotonic
             // registry.
-            OnchainEquity { balances, .. } => {
+            OnchainEquity { balances, .. } | OnchainEquityReconciled { balances, .. } => {
                 for symbol in balances.keys() {
                     self.equity_scheduler.enqueue_check(symbol.clone()).await;
                 }
@@ -2223,6 +2708,7 @@ impl RebalancingService {
             // the imbalance would remain unresolved until some unrelated
             // USDC balance event happened to arrive.
             OnchainUsdc { .. }
+            | OnchainUsdcReconciled { .. }
             | OffchainUsd { .. }
             | OffchainUsdReconciled { .. }
             | OffchainCashWithdrawable { .. } => {
@@ -2440,6 +2926,205 @@ impl RebalancingService {
             .await;
         }
     }
+    async fn apply_onchain_fill_to_inventory(
+        &self,
+        symbol: Symbol,
+        event: &PositionEvent,
+        timestamp: DateTime<Utc>,
+    ) -> Result<(), RebalancingServiceError> {
+        use PositionEvent::*;
+
+        match event {
+            OnChainOrderFilled {
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_number,
+                ..
+            } => {
+                let equity_op: Operator = (*direction).into();
+                let quantity: Float = (*amount).into();
+                let usdc_value = (*price_usdc * quantity)?;
+
+                // Each delta leg yields to a pinned onchain snapshot that
+                // provably already contains it. An unseeded slot has no known
+                // base value, and an underflow proves local bookkeeping is no
+                // longer exact; both cases skip that leg and engage a
+                // persistent reconciliation gate. The next successful pinned
+                // poll is forced through aggregate deduplication and replaces
+                // the slot from authoritative chain state before rebalancing
+                // can resume.
+                let (primary_chain, equity_reconciled, usdc_reconciled) = {
+                    let mut inventory = self.inventory.write().await;
+                    let primary_chain = inventory.primary_chain();
+                    let equity_slot_seeded =
+                        inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
+                    let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
+                    let equity_absorbed = inventory.onchain_fill_absorbed_by_equity_snapshot(
+                        &symbol,
+                        trade_id.chain,
+                        *block_number,
+                    );
+                    let usdc_absorbed = inventory
+                        .onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
+
+                    if equity_absorbed || usdc_absorbed {
+                        info!(
+                            target: "rebalance",
+                            %symbol,
+                            ?block_number,
+                            equity_absorbed,
+                            usdc_absorbed,
+                            "Skipping onchain fill delta leg(s) already \
+                             absorbed by a pinned onchain snapshot"
+                        );
+                    }
+
+                    let mut apply_equity_leg = equity_slot_seeded && !equity_absorbed;
+                    let mut apply_usdc_leg = usdc_slot_seeded && !usdc_absorbed;
+                    let requested_usdc = Usdc::new(usdc_value);
+                    let mut equity_reconciled = equity_absorbed || equity_slot_seeded;
+                    let mut usdc_reconciled = usdc_absorbed || usdc_slot_seeded;
+
+                    if !equity_slot_seeded && !equity_absorbed {
+                        warn!(
+                            target: "rebalance",
+                            %symbol,
+                            chain = %trade_id.chain,
+                            ?block_number,
+                            "Onchain fill reached an uninitialized equity slot; \
+                             deferring the leg to an authoritative pinned snapshot"
+                        );
+                    }
+                    if !usdc_slot_seeded && !usdc_absorbed {
+                        warn!(
+                            target: "rebalance",
+                            %symbol,
+                            chain = %trade_id.chain,
+                            ?block_number,
+                            "Onchain fill reached an uninitialized cash slot; \
+                             deferring the leg to an authoritative pinned snapshot"
+                        );
+                    }
+
+                    // A terminal transfer or a later wall-clock snapshot can
+                    // reduce available inventory before this durable fill
+                    // event reaches the reactor. Consume a known remainder to
+                    // zero, but never manufacture zero for an absent slot.
+                    let equity_delta = if apply_equity_leg && equity_op == Operator::Remove {
+                        match inventory.onchain_equity_available_at(&symbol, trade_id.chain) {
+                            Some(available) if available.inner().lt(amount.inner())? => {
+                                equity_reconciled = false;
+                                warn!(
+                                    target: "rebalance",
+                                    %symbol,
+                                    chain = %trade_id.chain,
+                                    ?block_number,
+                                    requested = %amount,
+                                    available = %available,
+                                    "Onchain fill arrived after inventory had already \
+                                     moved below its equity delta; consuming the \
+                                     tracked remainder and deferring exact \
+                                     reconciliation to a pinned snapshot"
+                                );
+                                available
+                            }
+                            Some(_) => *amount,
+                            None => {
+                                apply_equity_leg = false;
+                                equity_reconciled = false;
+                                *amount
+                            }
+                        }
+                    } else {
+                        *amount
+                    };
+                    let usdc_delta = if apply_usdc_leg && equity_op.inverse() == Operator::Remove {
+                        match inventory.onchain_usdc_available_at(trade_id.chain) {
+                            Some(available) if available.inner().lt(requested_usdc.inner())? => {
+                                usdc_reconciled = false;
+                                warn!(
+                                    target: "rebalance",
+                                    %symbol,
+                                    chain = %trade_id.chain,
+                                    ?block_number,
+                                    requested = %requested_usdc,
+                                    available = %available,
+                                    "Onchain fill arrived after inventory had already \
+                                     moved below its cash delta; consuming the \
+                                     tracked remainder and deferring exact \
+                                     reconciliation to a pinned snapshot"
+                                );
+                                available
+                            }
+                            Some(_) => requested_usdc,
+                            None => {
+                                apply_usdc_leg = false;
+                                usdc_reconciled = false;
+                                requested_usdc
+                            }
+                        }
+                    } else {
+                        requested_usdc
+                    };
+
+                    let mut updated = inventory.clone();
+                    if apply_equity_leg {
+                        updated = updated.update_equity_at(
+                            &symbol,
+                            trade_id.chain,
+                            Inventory::available(Venue::MarketMaking, equity_op, equity_delta),
+                            timestamp,
+                        )?;
+                    }
+                    if apply_usdc_leg {
+                        updated = updated.update_usdc_at(
+                            trade_id.chain,
+                            Inventory::available(
+                                Venue::MarketMaking,
+                                equity_op.inverse(),
+                                usdc_delta,
+                            ),
+                            timestamp,
+                        )?;
+                    }
+                    *inventory = updated;
+                    drop(inventory);
+                    (primary_chain, equity_reconciled, usdc_reconciled)
+                };
+
+                if !equity_reconciled {
+                    self.divergence_gate.request_onchain_equity_reconcile(
+                        trade_id.chain,
+                        &symbol,
+                        *block_number,
+                    );
+                }
+                if !usdc_reconciled {
+                    self.divergence_gate
+                        .request_onchain_cash_reconcile(trade_id.chain, *block_number);
+                }
+                // Only the primary chain rebalances: a secondary is
+                // prefunded and holds its own inventory, so its fill
+                // must not schedule work against the primary chain's
+                // balances. A clamped leg waits for the next pinned
+                // snapshot instead of sizing a transfer from an
+                // acknowledged intermediate balance.
+                if trade_id.chain == primary_chain {
+                    if equity_reconciled {
+                        self.equity_scheduler.enqueue_check(symbol).await;
+                    }
+                    if usdc_reconciled {
+                        self.usdc_scheduler.enqueue_check().await;
+                    }
+                }
+
+                Ok(())
+            }
+            _ => unreachable!("called only for onchain fill events"),
+        }
+    }
 }
 
 deps!(
@@ -2464,116 +3149,11 @@ impl Reactor for RebalancingService {
         event
             .on(|symbol, event| async move {
                 use PositionEvent::*;
-
                 let timestamp = event.timestamp();
                 let (equity_update, usdc_update, offchain_order_id) = match &event {
-                    OnChainOrderFilled {
-                        trade_id,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        ..
-                    } => {
-                        let equity_op: Operator = (*direction).into();
-                        let quantity: Float = (*amount).into();
-                        let usdc_value = (*price_usdc * quantity)?;
-
-                        // Each delta leg yields to a pinned onchain snapshot
-                        // that provably already contains it: a vaultBalance2
-                        // read at block N includes every fill at a block <= N
-                        // (ADR 0018). The same reasoning covers a secondary
-                        // chain's slot no snapshot has seeded yet (that
-                        // chain's first poll has not landed): its first snapshot
-                        // contains the fill, so the leg waits rather than
-                        // debiting an empty slot or inventing one that holds
-                        // only the delta. The primary chain is different: its
-                        // unseeded slot is the normal cold state, the fill
-                        // creates it and the primary's poll reconciles it
-                        // shortly after. Checked and applied under one write
-                        // lock so no snapshot can advance the watermark in
-                        // between. A skipped leg is normal operation, not an
-                        // error.
-                        let primary_chain = {
-                            let mut inventory = self.inventory.write().await;
-                            let primary_chain = inventory.primary_chain();
-                            let on_primary = trade_id.chain == primary_chain;
-                            let equity_slot_seeded =
-                                inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
-                            let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
-                            let equity_absorbed = inventory
-                                .onchain_fill_absorbed_by_equity_snapshot(&symbol, trade_id.chain, *block_number);
-                            let usdc_absorbed =
-                                inventory.onchain_fill_absorbed_by_usdc_snapshot(trade_id.chain, *block_number);
-
-                            if !on_primary && (!equity_slot_seeded || !usdc_slot_seeded) {
-                                info!(
-                                    target: "rebalance",
-                                    %symbol,
-                                    chain = %trade_id.chain,
-                                    equity_slot_seeded,
-                                    usdc_slot_seeded,
-                                    "Skipping onchain fill delta leg(s) on a \
-                                     secondary chain slot no onchain snapshot \
-                                     has seeded yet; the chain's first snapshot \
-                                     contains the fill"
-                                );
-                            }
-
-                            if equity_absorbed || usdc_absorbed {
-                                info!(
-                                    target: "rebalance",
-                                    %symbol,
-                                    ?block_number,
-                                    equity_absorbed,
-                                    usdc_absorbed,
-                                    "Skipping onchain fill delta leg(s) already \
-                                     absorbed by a pinned onchain snapshot"
-                                );
-                            }
-
-                            let apply_equity_leg =
-                                (on_primary || equity_slot_seeded) && !equity_absorbed;
-                            let apply_usdc_leg = (on_primary || usdc_slot_seeded) && !usdc_absorbed;
-
-                            // Chain-addressed: inventory is not fungible
-                            // across chains, so a fill credits and debits the
-                            // slots of the chain it filled on. Routing it
-                            // through the venue-addressed writers would move
-                            // the primary chain's balances instead.
-                            let mut updated = inventory.clone();
-                            if apply_equity_leg {
-                                updated = updated.update_equity_at(
-                                    &symbol,
-                                    trade_id.chain,
-                                    Inventory::available(Venue::MarketMaking, equity_op, *amount),
-                                    timestamp,
-                                )?;
-                            }
-                            if apply_usdc_leg {
-                                updated = updated.update_usdc_at(
-                                    trade_id.chain,
-                                    Inventory::available(
-                                        Venue::MarketMaking,
-                                        equity_op.inverse(),
-                                        Usdc::new(usdc_value),
-                                    ),
-                                    timestamp,
-                                )?;
-                            }
-                            *inventory = updated;
-                            primary_chain
-                        };
-
-                        // Only the primary chain rebalances: a secondary is
-                        // prefunded and holds its own inventory, so its fill
-                        // must not schedule work against the primary chain's
-                        // balances.
-                        if trade_id.chain == primary_chain {
-                            self.equity_scheduler.enqueue_check(symbol).await;
-                            self.usdc_scheduler.enqueue_check().await;
-                        }
-
+                    OnChainOrderFilled { .. } => {
+                        self.apply_onchain_fill_to_inventory(symbol, &event, timestamp)
+                            .await?;
                         return Ok(());
                     }
                     OffChainOrderFilled {
@@ -2638,6 +3218,9 @@ impl Reactor for RebalancingService {
                     }
                     Initialized { .. }
                     | ThresholdUpdated { .. }
+                    | EquityTransferReserved { .. }
+                    | EquityTransferReservationConfirmed { .. }
+                    | EquityTransferReservationReleased { .. }
                     // Dedup bookkeeping only (ADR 0010): no inventory effect.
                     | OnChainFillApplied { .. }
                     | OnChainFillSettled { .. }
@@ -2868,11 +3451,106 @@ impl RebalancingService {
         )
     }
 
+    #[cfg(test)]
     async fn has_pending_offchain_order(&self, symbol: &Symbol) -> bool {
         self.inventory
             .read()
             .await
             .has_pending_offchain_order(symbol)
+    }
+
+    async fn position_authority(
+        &self,
+    ) -> Result<(Arc<Store<Position>>, ExecutionThreshold), equity::EquityTriggerError> {
+        let store = self
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(equity::EquityTriggerError::PositionAuthorityNotWired)?;
+        let threshold = self
+            .position_threshold
+            .read()
+            .await
+            .as_ref()
+            .copied()
+            .ok_or(equity::EquityTriggerError::PositionAuthorityNotWired)?;
+        Ok((store, threshold))
+    }
+
+    async fn try_reserve_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> Result<bool, equity::EquityTriggerError> {
+        let (store, threshold) = self.position_authority().await?;
+        match store
+            .send(
+                symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(AggregateError::UserError(LifecycleError::Apply(error)))
+                if matches!(
+                    &error,
+                    PositionError::PendingExecution { .. }
+                        | PositionError::EquityTransferReservationExists { .. }
+                        | PositionError::EquityTransferBlockedByHedge { .. }
+                        | PositionError::EquityTransferHedgeEligibilityUnknown { .. }
+                ) =>
+            {
+                debug!(
+                    target: "rebalance",
+                    %symbol,
+                    %reservation_id,
+                    reason = %error,
+                    "Skipped equity trigger: Position rejected transfer reservation"
+                );
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn confirm_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> Result<bool, equity::EquityTriggerError> {
+        let (store, _) = self.position_authority().await?;
+        match store
+            .send(
+                symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(AggregateError::UserError(LifecycleError::Apply(error)))
+                if matches!(
+                    &error,
+                    PositionError::NoEquityTransferReservation { .. }
+                        | PositionError::EquityTransferReservationMismatch { .. }
+                ) =>
+            {
+                debug!(
+                    target: "rebalance",
+                    %symbol,
+                    %reservation_id,
+                    reason = %error,
+                    "Skipped equity dispatch: reservation was invalidated or replaced"
+                );
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn is_restart_tainted(&self, symbol: &Symbol) -> bool {
@@ -2920,6 +3598,32 @@ impl RebalancingService {
             self.config.hedge_floor.for_symbol(symbol),
         )
         .await
+    }
+
+    async fn build_equity_operation_or_skip(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<TriggeredOperation>, equity::EquityTriggerError> {
+        match self.build_equity_operation(symbol).await {
+            Ok(operation) => Ok(operation),
+            Err(equity::EquityTriggerError::Wrapper(WrapperError::SymbolNotConfigured(symbol))) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    "Skipped equity trigger: symbol not configured"
+                );
+                Ok(None)
+            }
+            Err(equity::EquityTriggerError::TokenNotInRegistry(symbol)) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    "Skipped equity trigger: symbol not in vault registry"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn try_claim_usdc_guard(&self) -> Option<usdc::InProgressGuard> {
@@ -3057,9 +3761,9 @@ impl RebalancingService {
     /// Erroring here would strand the movement unrecorded AND abort the rest
     /// of the reactor arm, leaving tracking and the in-progress guard latched
     /// until restart. Instead the durable event is treated as authoritative:
-    /// the residual inflight is zeroed (a no-op when already zero) so
-    /// `has_inflight()` clears, the immediate available bookkeeping is
-    /// skipped, and the next venue snapshot polls heal both sides.
+    /// the residual inflight is zeroed, both venue balances are gated, and
+    /// the next authoritative onchain and offchain snapshots are forced
+    /// through deduplication before rebalancing can resume.
     ///
     /// Only [`InventoryError::InsufficientInflight`] defers -- it is the shape
     /// recovery creates and only `Complete`/`Cancel` updates can produce it.
@@ -3105,6 +3809,13 @@ impl RebalancingService {
             Err(error) => return Err(error.into()),
         };
         drop(inventory);
+
+        if matches!(outcome, EquitySettlementOutcome::DeferredToSnapshot) {
+            self.divergence_gate
+                .request_onchain_equity_reconcile(chain, symbol, None);
+            self.divergence_gate
+                .request_offchain_equity_reconcile(symbol);
+        }
 
         Ok(outcome)
     }
@@ -3282,11 +3993,6 @@ impl RebalancingService {
             }
         }
 
-        if self.has_pending_offchain_order(symbol).await {
-            debug!(target: "rebalance", %symbol, "Skipped equity trigger: offchain hedge order pending");
-            return Ok(());
-        }
-
         // A pending snapshot divergence means the view's balance for this
         // symbol is suspect: a transfer sized off it would likely fail, and
         // a failed attempt arms the guards again and marks the symbol busy,
@@ -3352,78 +4058,99 @@ impl RebalancingService {
             return Ok(());
         }
 
-        let operation = match self.build_equity_operation(symbol).await {
-            Ok(Some(operation)) => operation,
-            Ok(None) => return Ok(()),
-            Err(equity::EquityTriggerError::Wrapper(WrapperError::SymbolNotConfigured(symbol))) => {
+        // Most checks are balanced or below the configured imbalance threshold.
+        // Size once before taking the durable Position reservation so that
+        // common no-op checks append no reservation/release events. Inventory
+        // can change after this read, so the post-reservation sizing below
+        // remains authoritative.
+        if self.build_equity_operation_or_skip(symbol).await?.is_none() {
+            return Ok(());
+        }
+
+        let reservation_id = EquityTransferReservationId::generate();
+        if !self
+            .try_reserve_equity_transfer(symbol, reservation_id)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let attempt = async {
+            let Some(operation) = self.build_equity_operation_or_skip(symbol).await? else {
+                return Ok(false);
+            };
+
+            // The restart taint needs no matching re-check: it is only seeded
+            // at boot, so it cannot appear during sizing. Snapshot divergence
+            // can appear and still suppresses dispatch, but hedge admission is
+            // decided exclusively by the Position reservation below.
+            if self.divergence_gate.is_engaged(symbol) {
                 warn!(
                     target: "rebalance",
                     %symbol,
-                    "Skipped equity trigger: symbol not configured"
+                    "Skipped equity trigger before dispatch: snapshot divergence \
+                     detected during operation sizing"
                 );
-                return Ok(());
+                return Ok(false);
             }
-            Err(equity::EquityTriggerError::TokenNotInRegistry(symbol)) => {
-                warn!(
-                    target: "rebalance",
-                    %symbol,
-                    "Skipped equity trigger: symbol not in vault registry"
-                );
-                return Ok(());
+
+            if !self.confirm_equity_transfer(symbol, reservation_id).await? {
+                return Ok(false);
             }
-            Err(error) => return Err(error),
-        };
 
-        // Re-check immediately before dispatch: an OffChainOrderPlaced for this
-        // symbol may have landed during the awaits in build_equity_operation.
-        // This narrows but cannot fully close the gap: the in-memory set is a
-        // reactor-lagged projection of the position aggregate's
-        // pending_offchain_order_id, so a just-committed OffChainOrderPlaced
-        // not yet seen by the reactor is invisible here (and the mint path
-        // awaits its Jobs-table dedupe query between this check and the
-        // push). Closing that fully needs a source-side reservation, not a
-        // reactor-lagged projection.
-        if self.has_pending_offchain_order(symbol).await {
-            debug!(
-                target: "rebalance",
-                %symbol,
-                "Skipped equity trigger before dispatch: offchain hedge order became pending"
-            );
-            return Ok(());
-        }
-
-        // The restart taint needs no matching re-check: it is only seeded
-        // at boot, so it cannot appear during the build.
-        if self.divergence_gate.is_engaged(symbol) {
-            warn!(
-                target: "rebalance",
-                %symbol,
-                "Skipped equity trigger before dispatch: snapshot divergence \
-                 detected during operation sizing"
-            );
-            return Ok(());
-        }
-
-        let dispatched = match operation {
-            TriggeredOperation::Mint { symbol, quantity } => {
-                self.enqueue_transfer_equity_to_market_making(symbol, quantity, guard.generation())
+            Ok(match operation {
+                TriggeredOperation::Mint { symbol, quantity } => {
+                    self.enqueue_transfer_equity_to_market_making_with_reservation(
+                        symbol,
+                        quantity,
+                        guard.generation(),
+                        reservation_id,
+                    )
                     .await
-            }
-            TriggeredOperation::Redemption {
-                symbol, quantity, ..
-            } => {
-                self.enqueue_transfer_equity_to_hedging(symbol, quantity, guard.generation())
+                }
+                TriggeredOperation::Redemption {
+                    symbol, quantity, ..
+                } => {
+                    self.enqueue_transfer_equity_to_hedging_with_reservation(
+                        symbol,
+                        quantity,
+                        guard.generation(),
+                        reservation_id,
+                    )
                     .await
-            }
-        };
-
-        if !dispatched {
-            return Ok(());
+                }
+            })
         }
+        .await;
 
-        debug!(target: "rebalance", %symbol, "Triggered equity rebalancing");
-        guard.defuse();
-        Ok(())
+        self.finish_equity_trigger_attempt(symbol, reservation_id, guard, attempt)
+            .await
+    }
+
+    async fn finish_equity_trigger_attempt(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+        guard: equity::InProgressGuard,
+        attempt: Result<bool, equity::EquityTriggerError>,
+    ) -> Result<(), equity::EquityTriggerError> {
+        match attempt {
+            Ok(true) => {
+                debug!(target: "rebalance", %symbol, %reservation_id, "Triggered equity rebalancing");
+                guard.defuse();
+                Ok(())
+            }
+            Ok(false) => {
+                self.release_pre_enqueue_equity_transfer(symbol, reservation_id)
+                    .await;
+                Ok(())
+            }
+            Err(error) => {
+                self.release_pre_enqueue_equity_transfer(symbol, reservation_id)
+                    .await;
+                Err(error)
+            }
+        }
     }
 
     async fn load_token_address(
@@ -4340,15 +5067,31 @@ impl RebalancingService {
     }
 
     /// Enqueues a [`TransferEquityToMarketMaking`] apalis job for a
-    /// hedging->market-making equity mint. Generates a fresh
-    /// `IssuerRequestId` at push time so apalis retries (and bot restarts
-    /// that re-pick the job row) hit the same aggregate. Returns `true` on
-    /// successful enqueue.
+    /// hedging->market-making equity mint. The aggregate id reuses the
+    /// Position reservation UUID so terminal lifecycle events can release the
+    /// exact owner across process restarts. Returns `true` on successful enqueue.
+    #[cfg(test)]
     async fn enqueue_transfer_equity_to_market_making(
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
         generation: equity::GuardGeneration,
+    ) -> bool {
+        self.enqueue_transfer_equity_to_market_making_with_reservation(
+            symbol,
+            quantity,
+            generation,
+            EquityTransferReservationId::generate(),
+        )
+        .await
+    }
+
+    async fn enqueue_transfer_equity_to_market_making_with_reservation(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        generation: equity::GuardGeneration,
+        reservation_id: EquityTransferReservationId,
     ) -> bool {
         // A non-terminal row in flight longer than this is treated as likely
         // stuck: the suppression is logged at warn (with the row id and age)
@@ -4406,7 +5149,7 @@ impl RebalancingService {
             }
         }
 
-        let issuer_request_id = IssuerRequestId::generate();
+        let issuer_request_id = IssuerRequestId(reservation_id.into_uuid());
         // The allocation planner is what will choose a chain per operation;
         // until then every rebalance runs on the primary chain, and the job
         // records it so the saga and its resume agree on where it ran.
@@ -4420,6 +5163,7 @@ impl RebalancingService {
                 chain,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await;
 
@@ -4450,12 +5194,29 @@ impl RebalancingService {
 
     /// Sibling of [`Self::enqueue_transfer_equity_to_market_making`] for the
     /// redemption (market-making -> hedging) direction. Same per-symbol
-    /// Jobs-table dedupe; same fresh-id-at-push-time contract.
+    /// Jobs-table dedupe and reservation-derived aggregate id.
+    #[cfg(test)]
     async fn enqueue_transfer_equity_to_hedging(
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
         generation: equity::GuardGeneration,
+    ) -> bool {
+        self.enqueue_transfer_equity_to_hedging_with_reservation(
+            symbol,
+            quantity,
+            generation,
+            EquityTransferReservationId::generate(),
+        )
+        .await
+    }
+
+    async fn enqueue_transfer_equity_to_hedging_with_reservation(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        generation: equity::GuardGeneration,
+        reservation_id: EquityTransferReservationId,
     ) -> bool {
         const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
 
@@ -4510,7 +5271,7 @@ impl RebalancingService {
             }
         }
 
-        let aggregate_id = RedemptionAggregateId::generate();
+        let aggregate_id = RedemptionAggregateId(reservation_id.into_uuid());
         let chain = self.inventory.read().await.primary_chain();
 
         let push = queue
@@ -4521,6 +5282,7 @@ impl RebalancingService {
                 generation,
                 chain,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await;
 
@@ -4546,6 +5308,290 @@ impl RebalancingService {
                 );
                 false
             }
+        }
+    }
+
+    async fn release_terminal_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> Result<bool, RebalancingServiceError> {
+        let Some(store) = self.position_store.read().await.as_ref().map(Arc::clone) else {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                %reservation_id,
+                "Position authority is not wired; retaining terminal transfer reservation"
+            );
+            return Ok(false);
+        };
+
+        store
+            .send(
+                symbol,
+                PositionCommand::ReleaseEquityTransfer { reservation_id },
+            )
+            .await?;
+        Ok(true)
+    }
+
+    async fn release_pre_enqueue_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) {
+        self.pending_pre_enqueue_reservation_releases
+            .write()
+            .await
+            .insert(reservation_id, symbol.clone());
+
+        match self
+            .release_terminal_equity_transfer(symbol, reservation_id)
+            .await
+        {
+            Ok(true) => {
+                self.pending_pre_enqueue_reservation_releases
+                    .write()
+                    .await
+                    .remove(&reservation_id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    %reservation_id,
+                    %error,
+                    "Failed to release pre-enqueue equity transfer reservation; \
+                     retaining it for the periodic retry sweep"
+                );
+            }
+        }
+    }
+
+    async fn retry_terminal_reservation_release_after_reactor(
+        store: Arc<Store<Position>>,
+        symbol: Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> bool {
+        for attempt in 1..=TERMINAL_RESERVATION_RELEASE_ATTEMPTS {
+            tokio::time::sleep(TERMINAL_RESERVATION_RELEASE_RETRY_DELAY * attempt).await;
+            match store
+                .send(
+                    &symbol,
+                    PositionCommand::ReleaseEquityTransfer { reservation_id },
+                )
+                .await
+            {
+                Ok(()) => return true,
+                Err(error) if attempt == TERMINAL_RESERVATION_RELEASE_ATTEMPTS => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        %reservation_id,
+                        %error,
+                        "Failed to release terminal equity transfer reservation \
+                         after the lifecycle transaction committed; retaining it \
+                         for the periodic retry sweep"
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        false
+    }
+
+    async fn cancel_pending_equity_transfer_reservation_restore(
+        &self,
+        reservation_id: EquityTransferReservationId,
+    ) {
+        self.pending_equity_transfer_reservation_restores
+            .write()
+            .await
+            .remove(&reservation_id);
+    }
+
+    async fn queue_terminal_mint_reservation_release(&self, id: &IssuerRequestId, symbol: &Symbol) {
+        self.pending_timed_out_mint_reservation_releases
+            .write()
+            .await
+            .insert(id.clone(), symbol.clone());
+
+        let store = self.position_store.read().await.as_ref().map(Arc::clone);
+        let pending = Arc::clone(&self.pending_timed_out_mint_reservation_releases);
+        let pending_restores = Arc::clone(&self.pending_equity_transfer_reservation_restores);
+        let id = id.clone();
+        let symbol = symbol.clone();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        drop(tokio::spawn(async move {
+            pending_restores.write().await.remove(&reservation_id);
+            let Some(store) = store else {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %symbol,
+                    "Position authority is not wired; retaining terminal mint \
+                     reservation for the periodic retry sweep"
+                );
+                return;
+            };
+            if Self::retry_terminal_reservation_release_after_reactor(store, symbol, reservation_id)
+                .await
+            {
+                pending.write().await.remove(&id);
+            }
+        }));
+    }
+
+    async fn queue_terminal_redemption_reservation_release(
+        &self,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+    ) {
+        self.pending_timed_out_redemption_reservation_releases
+            .write()
+            .await
+            .insert(id.clone(), symbol.clone());
+
+        let store = self.position_store.read().await.as_ref().map(Arc::clone);
+        let pending = Arc::clone(&self.pending_timed_out_redemption_reservation_releases);
+        let pending_restores = Arc::clone(&self.pending_equity_transfer_reservation_restores);
+        let id = id.clone();
+        let symbol = symbol.clone();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        drop(tokio::spawn(async move {
+            pending_restores.write().await.remove(&reservation_id);
+            let Some(store) = store else {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %symbol,
+                    "Position authority is not wired; retaining terminal redemption \
+                     reservation for the periodic retry sweep"
+                );
+                return;
+            };
+            if Self::retry_terminal_reservation_release_after_reactor(store, symbol, reservation_id)
+                .await
+            {
+                pending.write().await.remove(&id);
+            }
+        }));
+    }
+
+    async fn release_timed_out_mint_reservation(&self, id: &IssuerRequestId, symbol: &Symbol) {
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        self.cancel_pending_equity_transfer_reservation_restore(reservation_id)
+            .await;
+        self.pending_timed_out_mint_reservation_releases
+            .write()
+            .await
+            .insert(id.clone(), symbol.clone());
+        match self
+            .release_terminal_equity_transfer(symbol, reservation_id)
+            .await
+        {
+            Ok(true) => {
+                self.pending_timed_out_mint_reservation_releases
+                    .write()
+                    .await
+                    .remove(id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %symbol,
+                    %error,
+                    "Failed to release timed-out mint reservation; retaining it for retry"
+                );
+            }
+        }
+    }
+
+    async fn release_timed_out_redemption_reservation(
+        &self,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+    ) {
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        self.cancel_pending_equity_transfer_reservation_restore(reservation_id)
+            .await;
+        self.pending_timed_out_redemption_reservation_releases
+            .write()
+            .await
+            .insert(id.clone(), symbol.clone());
+        match self
+            .release_terminal_equity_transfer(symbol, reservation_id)
+            .await
+        {
+            Ok(true) => {
+                self.pending_timed_out_redemption_reservation_releases
+                    .write()
+                    .await
+                    .remove(id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %symbol,
+                    %error,
+                    "Failed to release timed-out redemption reservation; retaining it for retry"
+                );
+            }
+        }
+    }
+
+    async fn retry_pending_reservation_releases(&self) {
+        let pending_pre_enqueue = self
+            .pending_pre_enqueue_reservation_releases
+            .read()
+            .await
+            .clone();
+        for (reservation_id, symbol) in pending_pre_enqueue {
+            match self
+                .release_terminal_equity_transfer(&symbol, reservation_id)
+                .await
+            {
+                Ok(true) => {
+                    self.pending_pre_enqueue_reservation_releases
+                        .write()
+                        .await
+                        .remove(&reservation_id);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol,
+                        %reservation_id,
+                        %error,
+                        "Failed to retry pre-enqueue equity transfer reservation release"
+                    );
+                }
+            }
+        }
+
+        let pending_mints = self
+            .pending_timed_out_mint_reservation_releases
+            .read()
+            .await
+            .clone();
+        for (id, symbol) in pending_mints {
+            self.release_timed_out_mint_reservation(&id, &symbol).await;
+        }
+
+        let pending_redemptions = self
+            .pending_timed_out_redemption_reservation_releases
+            .read()
+            .await
+            .clone();
+        for (id, symbol) in pending_redemptions {
+            self.release_timed_out_redemption_reservation(&id, &symbol)
+                .await;
         }
     }
 
@@ -5889,6 +6935,8 @@ impl RebalancingService {
                  inflight suppression so snapshot polls resume recording the \
                  symbol; balances heal on the next poll"
             );
+            self.queue_terminal_mint_reservation_release(&id, &tombstone.symbol)
+                .await;
             drop(event_sync_guard);
             self.equity_scheduler.enqueue_check(tombstone.symbol).await;
             return Ok(());
@@ -5957,6 +7005,8 @@ impl RebalancingService {
 
         let is_terminal = if Self::is_terminal_mint_event(&event) {
             self.mint_tracking.write().await.remove(&id);
+            self.queue_terminal_mint_reservation_release(&id, &symbol)
+                .await;
             self.clear_equity_in_progress(&symbol);
             debug!(target: "rebalance", %symbol, "Cleared equity in-progress flag after mint terminal event");
             true
@@ -6028,6 +7078,8 @@ impl RebalancingService {
                  inflight suppression so snapshot polls resume recording the \
                  symbol; balances heal on the next poll"
             );
+            self.queue_terminal_redemption_reservation_release(&id, &tombstone.symbol)
+                .await;
             drop(event_sync_guard);
             self.equity_scheduler.enqueue_check(tombstone.symbol).await;
             return Ok(());
@@ -6127,6 +7179,8 @@ impl RebalancingService {
                 drop(inventory);
                 drop(suppressed);
             }
+            self.queue_terminal_redemption_reservation_release(&id, &symbol)
+                .await;
             self.clear_equity_in_progress(&symbol);
             debug!(
                 target: "rebalance",
@@ -10111,7 +11165,11 @@ mod tests {
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        Arc::new(RebalancingService::new(
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let trigger = Arc::new(RebalancingService::new(
             config,
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             BTreeMap::from([(
@@ -10129,7 +11187,15 @@ mod tests {
             )]),
             RebalancingSchedulers::new(&apalis_pool),
             notifier,
-        ))
+        ));
+        trigger
+            .set_position_authority(
+                position,
+                position_projection,
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        trigger
     }
 
     async fn make_trigger_with_inventory_and_registry(
@@ -10308,6 +11374,24 @@ mod tests {
         jobs
     }
 
+    async fn wait_for_redemption_reservation_release(
+        service: &RebalancingService,
+        id: &RedemptionAggregateId,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service
+                .pending_timed_out_redemption_reservation_releases
+                .read()
+                .await
+                .contains_key(id)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal redemption reservation release timed out");
+    }
+
     /// Drains every pending USDC transfer row (both directions) from the
     /// service's Jobs table and returns them parsed as
     /// [`UsdcRebalanceOperation`]. Marking rows `Done` lets repeated trigger
@@ -10374,15 +11458,45 @@ mod tests {
         wrapper: Arc<MockWrapper>,
         config: RebalancingServiceConfig,
     ) -> Arc<RebalancingService> {
+        make_trigger_with_inventory_registry_wrapper_and_pool(inventory, symbol, wrapper, config)
+            .await
+            .0
+    }
+
+    async fn make_trigger_with_inventory_registry_wrapper_and_pool(
+        inventory: InventoryView,
+        symbol: &Symbol,
+        wrapper: Arc<MockWrapper>,
+        config: RebalancingServiceConfig,
+    ) -> (Arc<RebalancingService>, SqlitePool) {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         seed_vault_registry(&pool, symbol, Chain::Base).await;
 
-        Arc::new(RebalancingService::new(
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let position_threshold = ExecutionThreshold::whole_share();
+        position
+            .send(
+                symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: FractionalShares::ZERO,
+                    reason: "initialize neutral rebalancing fixture".to_string(),
+                    threshold: position_threshold,
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: None,
+                },
+            )
+            .await
+            .unwrap();
+        let trigger = Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             BTreeMap::from([(
                 Chain::Base,
                 VaultRegistryId {
@@ -10395,7 +11509,548 @@ mod tests {
             BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
-        ))
+        ));
+        trigger
+            .set_position_authority(position, position_projection, position_threshold)
+            .await;
+        (trigger, pool)
+    }
+    #[tokio::test]
+    async fn incident_order_transfer_reservation_prevents_redemption() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(80), shares(20)),
+            &symbol,
+        )
+        .await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(1),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        let position = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn equity_transfer_reservation_survives_queue_handoff() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let wrapper = Arc::new(MockWrapper::new());
+        let trigger = make_trigger_with_inventory_registry_and_wrapper(
+            InventoryView::default().with_equity(symbol.clone(), shares(80), shares(20)),
+            &symbol,
+            Arc::clone(&wrapper),
+            test_config(),
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            wrapper.ratio_calls(),
+            2,
+            "an actionable check must size before and after taking the reservation"
+        );
+
+        let jobs = take_pending_equity_redemption_jobs(&trigger).await;
+        assert_eq!(jobs.len(), 1);
+        let position = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        let reservation = position
+            .equity_transfer_reservation
+            .expect("queued transfer must retain its Position reservation");
+        assert_eq!(
+            reservation.status,
+            EquityTransferReservationStatus::Confirmed
+        );
+        assert_eq!(reservation.id.into_uuid(), jobs[0].aggregate_id.0);
+    }
+
+    #[tokio::test]
+    async fn balanced_equity_checks_do_not_append_position_events() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, pool) = make_trigger_with_inventory_registry_wrapper_and_pool(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+            Arc::new(MockWrapper::new()),
+            test_config(),
+        )
+        .await;
+
+        for _ in 0..2 {
+            trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        }
+
+        let reservation_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = 'Position' \
+               AND event_type LIKE 'PositionEvent::EquityTransfer%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            reservation_events, 0,
+            "balanced checks must not append Position reservation events"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retains_active_and_releases_orphan_reservations() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::generate();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+
+        let restored_symbol = Symbol::new("MSFT").unwrap();
+        let restored_reservation_id = EquityTransferReservationId::generate();
+
+        trigger
+            .recover_equity_transfer_reservations(&HashSet::from([
+                (symbol.clone(), reservation_id),
+                (restored_symbol.clone(), restored_reservation_id),
+            ]))
+            .await
+            .unwrap();
+        let projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                id: reservation_id,
+                status: EquityTransferReservationStatus::Confirmed,
+            })
+        );
+        assert_eq!(
+            projection
+                .load(&restored_symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                id: restored_reservation_id,
+                status: EquityTransferReservationStatus::Confirmed,
+            })
+        );
+
+        trigger
+            .recover_equity_transfer_reservations(&HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+        assert_eq!(
+            projection
+                .load(&restored_symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retries_reservation_after_pending_hedge_clears() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let reservation_id = EquityTransferReservationId::generate();
+        trigger
+            .recover_equity_transfer_reservations(&HashSet::from([(
+                symbol.clone(),
+                reservation_id,
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the transfer reservation must remain deferred while the hedge is pending"
+        );
+
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id,
+                    error: "test terminal failure".to_string(),
+                    anchor: AnchorDisposition::Release,
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .retry_pending_equity_transfer_reservation_restores()
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "clearing a failed order must not let the transfer pre-empt hedge-ready exposure"
+        );
+
+        let replacement_order_id = OffchainOrderId::new();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: replacement_order_id,
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::CompleteOffChainOrder {
+                    offchain_order_id: replacement_order_id,
+                    shares_filled: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor_order_id: ExecutorOrderId::new("replacement-hedge"),
+                    price: Usd::new(float!(150)),
+                    broker_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .retry_pending_equity_transfer_reservation_restores()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                id: reservation_id,
+                status: EquityTransferReservationStatus::Confirmed,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_cancels_deferred_reservation_restore() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mint_id = issuer_request_id("terminal-deferred-restore");
+        let reservation_id = EquityTransferReservationId::from_uuid(mint_id.0);
+        trigger
+            .recover_equity_transfer_reservations(&HashSet::from([(
+                symbol.clone(),
+                reservation_id,
+            )]))
+            .await
+            .unwrap();
+        assert!(
+            trigger
+                .pending_equity_transfer_reservation_restores
+                .read()
+                .await
+                .contains_key(&reservation_id),
+            "startup recovery must defer the reservation while the hedge is pending"
+        );
+
+        trigger
+            .release_timed_out_mint_reservation(&mint_id, &symbol)
+            .await;
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id,
+                    error: "test terminal failure".to_string(),
+                    anchor: AnchorDisposition::Release,
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .retry_pending_equity_transfer_reservation_restores()
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger
+                .pending_equity_transfer_reservation_restores
+                .read()
+                .await
+                .contains_key(&reservation_id),
+            "terminal cleanup must remove the deferred restore owner"
+        );
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "a later retry sweep must not resurrect a terminal transfer reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_reactor_cleanup_does_not_wait_for_deferred_restore_map() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let mint_id = issuer_request_id("terminal-post-commit-cleanup");
+        let reservation_id = EquityTransferReservationId::from_uuid(mint_id.0);
+        let mut deferred_restores = trigger
+            .pending_equity_transfer_reservation_restores
+            .write()
+            .await;
+        deferred_restores.insert(
+            reservation_id,
+            PendingEquityTransferReservationRestore::Pending(symbol.clone()),
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            trigger.queue_terminal_mint_reservation_release(&mint_id, &symbol),
+        )
+        .await
+        .expect("the terminal reactor path must not wait for the deferred-restore map");
+        drop(deferred_restores);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let restore_cleared = !trigger
+                    .pending_equity_transfer_reservation_restores
+                    .read()
+                    .await
+                    .contains_key(&reservation_id);
+                let release_finished = !trigger
+                    .pending_timed_out_mint_reservation_releases
+                    .read()
+                    .await
+                    .contains_key(&mint_id);
+                if restore_cleared && release_finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the post-commit cleanup task must cancel and release the reservation");
     }
 
     #[tokio::test]
@@ -10514,50 +12169,48 @@ mod tests {
 
     #[tokio::test]
     async fn position_events_auto_register_symbol_and_trigger_rebalancing() {
-        // Reproduces the production scenario: InventoryView starts empty (no
-        // with_equity call), position events arrive for a symbol that exists
-        // in the vault registry. After accumulating an imbalance, rebalancing
-        // must be triggered.
-        //
-        // In production, InventoryView::default() creates an empty equities
-        // map. Position events arrive as onchain fills are processed. If the
-        // symbol isn't pre-registered, the position event handler must
-        // handle it (either by auto-registering or by decoupling the
-        // inventory update failure from the rebalancing check).
+        // Inventory starts without an equity slot. Authoritative snapshots
+        // register the symbol before position deltas arrive; fills must then
+        // preserve that baseline and trigger from the accumulated imbalance.
         let symbol = Symbol::new("AAPL").unwrap();
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let trigger = make_trigger_with_inventory_and_registry(
             InventoryView::default().with_usdc(usdc(1_000_000), usdc(1_000_000)),
-            event_sender,
-        ));
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-
-        seed_vault_registry(&pool, &symbol, Chain::Base).await;
-
-        let trigger = Arc::new(RebalancingService::new(
-            test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
-            BTreeMap::from([(
-                Chain::Base,
-                VaultRegistryId {
-                    chain: st0x_evm::Chain::Base,
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )]),
-            inventory,
-            BTreeMap::from([(
-                Chain::Base,
-                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
-            )]),
-            RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
-        ));
+            &symbol,
+        )
+        .await;
         let reactor = trigger.clone();
-
         let harness = ReactorHarness::new(reactor.clone());
 
-        // Simulate production: onchain fills arrive on an empty inventory.
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), FractionalShares::ZERO)]),
+                fetched_at: Utc::now(),
+                block_number: None,
+            },
+        )
+        .await
+        .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), FractionalShares::ZERO)]),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        drain_pending_jobs(&trigger).await.unwrap();
+
         // 20 onchain buys, 80 offchain buys -> 20% onchain ratio.
         // Threshold: target 50%, deviation 20%, lower bound 30%.
         // 20% < 30% -> should trigger Mint (too much offchain).
@@ -10567,7 +12220,6 @@ mod tests {
                 .receive::<Position>(symbol.clone(), event)
                 .await
                 .unwrap();
-            drain_pending_jobs(&trigger).await.unwrap();
         }
 
         for _ in 0..80 {
@@ -10576,24 +12228,13 @@ mod tests {
                 .receive::<Position>(symbol.clone(), event)
                 .await
                 .unwrap();
-            drain_pending_jobs(&trigger).await.unwrap();
         }
 
-        // Drain any intermediate triggers (the early onchain-heavy phase
-        // enqueues a redemption, which would otherwise suppress the final
-        // mint via the direction-independent per-symbol dedupe) and do a
-        // final check.
-        take_pending_equity_mint_jobs(&trigger).await;
-        take_pending_equity_redemption_jobs(&trigger).await;
-        trigger.clear_equity_in_progress(&symbol);
-
-        // One more event to trigger the check after the imbalance is built up.
-        let event = make_onchain_fill(shares(1), Direction::Buy);
-        harness
-            .receive::<Position>(symbol.clone(), event)
-            .await
-            .unwrap();
-        drain_pending_jobs(&trigger).await.unwrap();
+        // Collapse the queued checks and evaluate the final 20/80 state once;
+        // intermediate ratios must not create a transfer that obscures the
+        // scenario under test.
+        trigger.equity_scheduler.cancel_pending().await;
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
         let jobs = take_pending_equity_mint_jobs(&trigger).await;
         assert_eq!(
@@ -11851,7 +13492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redemption_rejected_via_reactor_is_terminal() {
+    async fn redemption_rejected_releases_transfer_reservation_via_reactor() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
@@ -11877,6 +13518,32 @@ mod tests {
         }
 
         let id = redemption_aggregate_id("redemption-rejected");
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
 
         harness
             .receive::<EquityRedemption>(
@@ -11890,6 +13557,7 @@ mod tests {
             .receive::<EquityRedemption>(id.clone(), make_redemption_rejected())
             .await
             .unwrap();
+        wait_for_redemption_reservation_release(&trigger, &id).await;
 
         assert!(
             !trigger
@@ -11899,6 +13567,18 @@ mod tests {
                 .contains_key(&symbol),
             "In-progress flag should be cleared after terminal RedemptionRejected"
         );
+        let position = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
     }
 
     #[tokio::test]
@@ -12185,7 +13865,16 @@ mod tests {
         );
         drop(inventory);
 
-        assert!(logs_contain("no onchain snapshot has seeded"));
+        assert!(logs_contain("uninitialized equity slot"));
+        assert!(logs_contain("uninitialized cash slot"));
+        assert!(
+            trigger.divergence_gate().is_engaged(&symbol),
+            "the unsnapshotted equity slot must remain gated until a pinned poll"
+        );
+        assert!(
+            trigger.divergence_gate().is_cash_engaged(),
+            "the unsnapshotted cash slot must remain gated until a pinned poll"
+        );
         assert_eq!(count_pending_equity_check_jobs(&trigger).await, 0);
         assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 0);
     }
@@ -12366,6 +14055,456 @@ mod tests {
             "a fill past the snapshot block must apply its USDC leg"
         );
         drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn onchain_fill_underflow_gates_until_forced_pinned_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), FractionalShares::ZERO, shares(50))
+            .with_usdc(usdc(1000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor);
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), FractionalShares::ZERO)]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(1000),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        // A lifecycle/snapshot update has already reduced tracked equity to
+        // zero when the later durable sell fill arrives. The fill reactor must
+        // not abort and lose its independent cash leg.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(10), Direction::Sell, Some(101)),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "the stale tracked remainder is consumed without going negative"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(2500)),
+            "the independent cash leg still applies while equity waits for a snapshot"
+        );
+        drop(inventory);
+
+        assert!(
+            trigger.divergence_gate().is_engaged(&symbol),
+            "the acknowledged intermediate balance must gate equity rebalancing"
+        );
+        assert!(
+            !trigger.divergence_gate().is_cash_engaged(),
+            "the independent additive cash leg remained exact"
+        );
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            trigger.divergence_gate().is_engaged(&symbol),
+            "an unrelated venue snapshot must not clear the onchain repair gate"
+        );
+
+        let generations = trigger
+            .divergence_gate()
+            .claim_pending_onchain_equity_reconciles(Chain::Base);
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(7))]),
+                fetched_at: Utc::now(),
+                block_number: Some(102),
+                generations,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(7)),
+            "the next pinned snapshot must replace the intermediate balance"
+        );
+        assert!(
+            !trigger.divergence_gate().is_engaged(&symbol),
+            "the gate clears only after authoritative onchain reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn onchain_cash_underflow_gates_until_forced_pinned_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(Usdc::ZERO, usdc(10000));
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor);
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: Usdc::ZERO,
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(10), Direction::Buy, Some(101)),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.divergence_gate().is_cash_engaged(),
+            "the acknowledged intermediate cash balance must gate USDC rebalancing"
+        );
+        assert!(
+            !trigger.divergence_gate().is_engaged(&symbol),
+            "the independent additive equity leg remained exact"
+        );
+
+        let generation = trigger
+            .divergence_gate()
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("cash reconciliation request");
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain: Chain::Base,
+                usdc_balance: usdc(25),
+                fetched_at: Utc::now(),
+                block_number: Some(102),
+                generation,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::MarketMaking),
+            Some(usdc(25))
+        );
+        assert!(
+            !trigger.divergence_gate().is_cash_engaged(),
+            "the cash gate clears only after authoritative onchain reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_cannot_satisfy_or_clear_newer_reconciliation_generation() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(10), shares(50)),
+            &symbol,
+        )
+        .await;
+
+        let stale_fetched_at = Utc::now();
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .update_equity(
+                    &symbol,
+                    Inventory::available(Venue::MarketMaking, Operator::Add, shares(1)),
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+
+        let first_generation = trigger.divergence_gate().request_onchain_equity_reconcile(
+            Chain::Base,
+            &symbol,
+            Some(101),
+        );
+        let first_claim = BTreeMap::from([(symbol.clone(), first_generation)]);
+        trigger
+            .divergence_gate()
+            .request_onchain_equity_reconcile(Chain::Base, &symbol, Some(102));
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquity {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(5))]),
+                fetched_at: stale_fetched_at,
+                block_number: Some(100),
+            })
+            .await
+            .unwrap();
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(6))]),
+                fetched_at: stale_fetched_at,
+                block_number: Some(101),
+                generations: first_claim,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(11)),
+            "ordinary and superseded snapshots must preserve the post-fetch delta"
+        );
+        assert!(
+            trigger.divergence_gate().is_engaged(&symbol),
+            "a superseded generation must not clear the newer request"
+        );
+
+        let current_claim = trigger
+            .divergence_gate()
+            .claim_pending_onchain_equity_reconciles(Chain::Base);
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(symbol.clone(), shares(12))]),
+                fetched_at: Utc::now(),
+                block_number: Some(102),
+                generations: current_claim,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(12))
+        );
+        assert!(!trigger.divergence_gate().is_engaged(&symbol));
+    }
+
+    #[tokio::test]
+    async fn symbol_reconciliation_preserves_other_symbol_inflight_balance() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(aapl.clone(), shares(10), shares(50))
+            .with_equity(tsla.clone(), shares(20), shares(50))
+            .update_equity(
+                &tsla,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(5)),
+                Utc::now(),
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &aapl).await;
+
+        trigger
+            .divergence_gate()
+            .request_onchain_equity_reconcile(Chain::Base, &aapl, Some(101));
+        let generations = trigger
+            .divergence_gate()
+            .claim_pending_onchain_equity_reconciles(Chain::Base);
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::Base,
+                balances: BTreeMap::from([(aapl.clone(), shares(11)), (tsla.clone(), shares(25))]),
+                fetched_at: Utc::now(),
+                block_number: Some(101),
+                generations,
+            })
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&aapl, Venue::MarketMaking),
+            Some(shares(11))
+        );
+        assert_eq!(
+            inventory.equity_available(&tsla, Venue::MarketMaking),
+            Some(shares(15)),
+            "TSLA available remains reserved while its redemption is inflight"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&tsla, Venue::MarketMaking),
+            Some(shares(5)),
+            "AAPL reconciliation must not clear TSLA inflight"
+        );
+        drop(inventory);
+        assert!(!trigger.divergence_gate().is_engaged(&aapl));
+    }
+
+    #[tokio::test]
+    async fn superseded_offchain_reconciliation_cannot_force_or_clear_newer_request() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(136)),
+            &symbol,
+        )
+        .await;
+
+        let first_generation = trigger
+            .divergence_gate()
+            .request_offchain_equity_reconcile(&symbol);
+        let current_generation = trigger
+            .divergence_gate()
+            .request_offchain_equity_reconcile(&symbol);
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(0),
+                fetched_at: Utc::now() + chrono::Duration::seconds(1),
+                ledger_position: Some(shares(136)),
+                consecutive_polls: 0,
+                generation: Some(first_generation),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(136))
+        );
+        assert!(trigger.divergence_gate().is_engaged(&symbol));
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(0),
+                fetched_at: Utc::now() + chrono::Duration::seconds(1),
+                ledger_position: Some(shares(136)),
+                consecutive_polls: 0,
+                generation: Some(current_generation),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO)
+        );
+        assert!(!trigger.divergence_gate().is_engaged(&symbol));
+    }
+
+    #[tokio::test]
+    async fn equity_settlement_underflow_gates_both_authoritative_snapshots() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory(InventoryView::default().with_equity(
+            symbol.clone(),
+            shares(80),
+            shares(20),
+        ))
+        .await;
+
+        let outcome = trigger
+            .apply_equity_update_or_defer(
+                &symbol,
+                Chain::Base,
+                Venue::Hedging,
+                RebalancingService::cancel_equity_transfer_update(Venue::Hedging, shares(10)),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            EquitySettlementOutcome::DeferredToSnapshot
+        ));
+        let gate = trigger.divergence_gate();
+        assert!(gate.is_engaged(&symbol));
+        assert!(gate.has_pending_onchain_equity_reconcile(Chain::Base));
+        assert_eq!(
+            gate.pending_offchain_equity_reconciles(),
+            vec![symbol],
+            "a skipped settlement update must force both venue snapshots"
+        );
     }
 
     #[tokio::test]
@@ -17900,6 +20039,111 @@ mod tests {
             .await;
     }
 
+    async fn attach_live_equity_stores(
+        service: &Arc<RebalancingService>,
+    ) -> (
+        Arc<Store<TokenizedEquityMint>>,
+        Arc<Store<EquityRedemption>>,
+    ) {
+        let pool = crate::test_utils::setup_test_db().await;
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(services)
+            .await
+            .unwrap();
+        service
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool, ())),
+            )
+            .await;
+        (mint_store, redemption_store)
+    }
+
+    async fn seed_confirmed_transfer_reservation(
+        service: &RebalancingService,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) {
+        let position_store = service
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn install_closed_position_store(
+        service: &RebalancingService,
+    ) -> (Arc<Store<Position>>, Arc<Projection<Position>>) {
+        let position_store = service
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let position_projection = service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let pool = crate::test_utils::setup_test_db().await;
+        let closed_store = Arc::new(test_store::<Position>(pool.clone(), ()));
+        pool.close().await;
+        service
+            .set_position_authority(
+                closed_store,
+                position_projection.clone(),
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        (position_store, position_projection)
+    }
+
     /// An operator failure dispatched through the conductor-owned store must
     /// reach this live reactor and release a requested mint's symbol guard.
     /// The timeout sweeper intentionally never expires this stage, so a
@@ -17993,6 +20237,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_timeout_retries_failed_transfer_reservation_release() {
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = issuer_request_id("timed-out-mint-release");
+        let service = make_trigger_with_inventory(InventoryView::default().with_equity(
+            symbol.clone(),
+            shares(100),
+            shares(0),
+        ))
+        .await;
+        let (mint_store, _) = attach_live_equity_stores(&service).await;
+
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service.mint_tracking.read().await.get(&id).unwrap().stage,
+            MintTrackingStage::Accepted
+        );
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+        let (position_store, position_projection) = install_closed_position_store(&service).await;
+
+        service
+            .expire_stuck_mints(Utc::now() + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position.equity_transfer_reservation.unwrap().status,
+            EquityTransferReservationStatus::Confirmed
+        );
+        assert!(
+            service
+                .pending_timed_out_mint_reservation_releases
+                .read()
+                .await
+                .contains_key(&id)
+        );
+        assert!(!service.mint_tracking.read().await.contains_key(&id));
+
+        service
+            .set_position_authority(
+                position_store,
+                position_projection.clone(),
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        service
+            .expire_stuck_operations(Utc::now() + ChronoDuration::hours(25))
+            .await
+            .unwrap();
+
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
+        assert!(
+            !service
+                .pending_timed_out_mint_reservation_releases
+                .read()
+                .await
+                .contains_key(&id)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pre_enqueue_release_is_retained_for_retry() {
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let reservation_id = EquityTransferReservationId::generate();
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+        let guard = service
+            .try_claim_equity_guard_for_transfer(&symbol)
+            .expect("test owns the transfer guard");
+        let (position_store, position_projection) = install_closed_position_store(&service).await;
+
+        service
+            .finish_equity_trigger_attempt(
+                &symbol,
+                reservation_id,
+                guard,
+                Ok::<bool, equity::EquityTriggerError>(false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service
+                .pending_pre_enqueue_reservation_releases
+                .read()
+                .await
+                .get(&reservation_id),
+            Some(&symbol)
+        );
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation
+                .unwrap()
+                .status,
+            EquityTransferReservationStatus::Confirmed
+        );
+
+        service
+            .set_position_authority(
+                position_store,
+                position_projection.clone(),
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        service.retry_pending_reservation_releases().await;
+
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+        assert!(
+            service
+                .pending_pre_enqueue_reservation_releases
+                .read()
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_timeout_retries_failed_transfer_reservation_release() {
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = redemption_aggregate_id("timed-out-redemption-release");
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let service = make_trigger_with_inventory(inventory).await;
+        let (_, redemption_store) = attach_live_equity_stores(&service).await;
+
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    amount: U256::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+        let (position_store, position_projection) = install_closed_position_store(&service).await;
+
+        service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position.equity_transfer_reservation.unwrap().status,
+            EquityTransferReservationStatus::Confirmed
+        );
+        assert!(
+            service
+                .pending_timed_out_redemption_reservation_releases
+                .read()
+                .await
+                .contains_key(&id)
+        );
+        assert!(!service.redemption_tracking.read().await.contains_key(&id));
+
+        service
+            .set_position_authority(
+                position_store,
+                position_projection.clone(),
+                ExecutionThreshold::whole_share(),
+            )
+            .await;
+        service
+            .expire_stuck_operations(Utc::now() + ChronoDuration::hours(25))
+            .await
+            .unwrap();
+
+        let position = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
+        assert!(
+            !service
+                .pending_timed_out_redemption_reservation_releases
+                .read()
+                .await
+                .contains_key(&id)
+        );
+    }
+
+    #[tokio::test]
     async fn equity_failed_exhausted_job_does_not_block_enqueue() {
         // An equity Failed row whose retry budget is exhausted must not block.
         // This is terminal regardless of the aggregate state.
@@ -18008,8 +20478,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18053,8 +20523,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18095,8 +20565,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18162,6 +20632,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18225,8 +20696,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18288,6 +20759,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18347,8 +20819,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18393,8 +20865,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18451,8 +20923,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18516,6 +20988,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18578,8 +21051,8 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: FractionalShares::new(float!(1)),
                     generation: equity::GuardGeneration::default(),
-
                     backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
                 })
                 .await
                 .unwrap();
@@ -18650,8 +21123,8 @@ mod tests {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
-
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -18675,6 +21148,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: equity::GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -23835,6 +26309,26 @@ mod tests {
             event_sender,
         ));
         seed_vault_registry(&pool, &symbol, Chain::Base).await;
+        let position_threshold =
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(1000))).unwrap());
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: FractionalShares::ZERO,
+                    reason: "initialize neutral rebalancing fixture".to_string(),
+                    threshold: position_threshold,
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: None,
+                },
+            )
+            .await
+            .unwrap();
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
@@ -23855,6 +26349,9 @@ mod tests {
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
+        trigger
+            .set_position_authority(position, position_projection, position_threshold)
+            .await;
         let reactor = trigger.clone();
 
         let id = InventorySnapshotId {
@@ -23908,158 +26405,6 @@ mod tests {
             jobs.len(),
             1,
             "expected a redemption job for 100% onchain ratio once both venues have data"
-        );
-    }
-
-    /// Verifies logging shows when imbalance check skips due to partial data.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn logs_show_partial_data_skips_imbalance_check() {
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
-            event_sender,
-        ));
-        seed_vault_registry(&pool, &symbol, Chain::Base).await;
-
-        let trigger = Arc::new(RebalancingService::new(
-            test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
-            BTreeMap::from([(
-                Chain::Base,
-                VaultRegistryId {
-                    chain: st0x_evm::Chain::Base,
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )]),
-            inventory.clone(),
-            BTreeMap::from([(
-                Chain::Base,
-                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
-            )]),
-            RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
-        ));
-        let reactor = trigger.clone();
-
-        let id = InventorySnapshotId {
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        };
-
-        // Apply ONLY onchain data - offchain not yet polled
-        let mut balances = BTreeMap::new();
-        balances.insert(symbol.clone(), shares(100));
-
-        let onchain_event = InventorySnapshotEvent::OnchainEquity {
-            chain: Chain::Base,
-            balances,
-            fetched_at: Utc::now(),
-            block_number: None,
-        };
-
-        apply_and_dispatch_snapshot(reactor.clone(), id.clone(), onchain_event)
-            .await
-            .unwrap();
-        drain_pending_jobs(&trigger).await.unwrap();
-
-        // Verify the logs show:
-        // 1. The snapshot event was applied
-        // 2. Imbalance check was skipped due to partial data
-        assert!(
-            logs_contain("Applied inventory snapshot event"),
-            "Should log when snapshot event is applied"
-        );
-        assert!(
-            logs_contain("No equity imbalance detected"),
-            "Should log that imbalance was not detected (due to partial data)"
-        );
-        assert!(
-            !logs_contain("Triggered equity rebalancing"),
-            "Should NOT trigger rebalancing with partial data"
-        );
-    }
-
-    /// Verifies logging shows trigger fires when both venues have data.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn logs_show_trigger_fires_with_complete_data() {
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
-            event_sender,
-        ));
-        seed_vault_registry(&pool, &symbol, Chain::Base).await;
-
-        let trigger = Arc::new(RebalancingService::new(
-            test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
-            BTreeMap::from([(
-                Chain::Base,
-                VaultRegistryId {
-                    chain: st0x_evm::Chain::Base,
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
-                },
-            )]),
-            inventory.clone(),
-            BTreeMap::from([(
-                Chain::Base,
-                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
-            )]),
-            RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
-        ));
-        let reactor = trigger.clone();
-
-        let id = InventorySnapshotId {
-            orderbook: TEST_ORDERBOOK,
-            owner: TEST_ORDER_OWNER,
-        };
-
-        // Apply onchain data first
-        let mut balances = BTreeMap::new();
-        balances.insert(symbol.clone(), shares(100));
-
-        apply_and_dispatch_snapshot(
-            reactor.clone(),
-            id.clone(),
-            InventorySnapshotEvent::OnchainEquity {
-                chain: Chain::Base,
-                balances,
-                fetched_at: Utc::now(),
-                block_number: None,
-            },
-        )
-        .await
-        .unwrap();
-        drain_pending_jobs(&trigger).await.unwrap();
-
-        // Now apply offchain data - both venues now have data
-        let mut positions = BTreeMap::new();
-        positions.insert(symbol.clone(), shares(0));
-
-        apply_and_dispatch_snapshot(
-            reactor.clone(),
-            id.clone(),
-            InventorySnapshotEvent::OffchainEquity {
-                positions,
-                fetched_at: Utc::now(),
-            },
-        )
-        .await
-        .unwrap();
-        drain_pending_jobs(&trigger).await.unwrap();
-
-        // Verify the trigger fired after both venues have data
-        assert!(
-            logs_contain("Triggered equity rebalancing"),
-            "Should trigger rebalancing once both venues have data"
         );
     }
 
@@ -24161,15 +26506,16 @@ mod tests {
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = redemption_aggregate_id("redemption-transfer-cancel");
-
-        // Verify initial imbalance
+        // Verify initial imbalance and retain the aggregate id that owns the
+        // Position reservation exercised by the lifecycle events below.
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        let initial_jobs = take_pending_equity_redemption_jobs(&trigger).await;
         assert_eq!(
-            take_pending_equity_redemption_jobs(&trigger).await.len(),
+            initial_jobs.len(),
             1,
-            "80% ratio should enqueue a redemption job"
+            "80% ratio should enqueue one redemption job"
         );
+        let id = initial_jobs[0].aggregate_id.clone();
         trigger.clear_equity_in_progress(&symbol);
 
         // WithdrawnFromRaindex: 30 tokens move to inflight
@@ -24199,6 +26545,7 @@ mod tests {
             .receive::<EquityRedemption>(id.clone(), make_transfer_failed())
             .await
             .unwrap();
+        wait_for_redemption_reservation_release(&trigger, &id).await;
 
         // After cancel: back to 80 onchain, 20 offchain -> imbalance should re-trigger
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
@@ -26745,6 +29092,7 @@ mod tests {
                 fetched_at: now + chrono::Duration::seconds(1),
                 ledger_position: Some(shares(136)),
                 consecutive_polls: 3,
+                generation: None,
             },
         )
         .await
@@ -26803,6 +29151,7 @@ mod tests {
                     fetched_at: Utc::now(),
                     ledger_position: Some(shares(136)),
                     consecutive_polls: 3,
+                    generation: None,
                 },
             )
             .await
@@ -27329,41 +29678,6 @@ mod tests {
             count_pending_equity_redemption_jobs(&trigger).await,
             0,
             "In-progress flag should suppress duplicate equity dispatch"
-        );
-    }
-
-    #[tokio::test]
-    async fn equity_check_suppresses_dispatch_when_offchain_order_pending() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(20), shares(80))
-            .with_usdc(usdc(500), usdc(500));
-
-        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let trigger = reactor.clone();
-
-        trigger
-            .inventory
-            .write()
-            .await
-            .mark_offchain_order_pending(symbol.clone(), test_order_id());
-
-        EquityRebalancingCheck {
-            symbol: symbol.clone(),
-        }
-        .perform(&trigger)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            count_pending_equity_mint_jobs(&trigger).await,
-            0,
-            "Pending offchain hedge order should suppress equity rebalancing dispatch"
-        );
-        assert_eq!(
-            count_pending_equity_redemption_jobs(&trigger).await,
-            0,
-            "Pending offchain hedge order should suppress equity rebalancing dispatch"
         );
     }
 

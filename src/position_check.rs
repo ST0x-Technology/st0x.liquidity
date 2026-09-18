@@ -30,7 +30,7 @@ use crate::conductor::job::{
     BackpressureStreak, Job, JobQueue, Label, QueuePushError, find_backpressure, find_permanence,
 };
 use crate::conductor::{clamp_shares_to_reservation, recover_orphaned_pending_offchain_orders};
-use crate::equity_redemption::symbols_with_active_transfers;
+use crate::equity_redemption::{has_active_transfer_for_symbol, symbols_with_active_transfers};
 use crate::offchain::order::{
     CancellationReason, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
     PollOrderStatusJobQueue, TerminalPositionFinalization, position_command_for_finalization,
@@ -42,14 +42,22 @@ use crate::trading::offchain::close_flatten::{
     CloseFlattenCrossRamp, CloseFlattenPolicy, CloseFlattenWindow, preflight_skip_reason_label,
 };
 use crate::trading::offchain::hedge::{
-    HedgeJobQueue, PlaceHedge, ReferencePriceError, TransientFailureStreak,
-    acquire_counter_trade_submission_file_lock, alert_dead_letter, apply_slippage,
-    push_anchor_recovery_job_if_absent, resolve_extended_hours_reference_price,
+    EQUITY_TRANSFER_REDRIVE_DELAY, HedgeJobQueue, PlaceHedge, ReferencePriceError,
+    TransientFailureStreak, acquire_counter_trade_submission_file_lock, alert_dead_letter,
+    apply_slippage, push_anchor_recovery_job_if_absent, resolve_extended_hours_reference_price,
 };
 use crate::trading::onchain::trade_accountant::{DeadLetterReason, SymbolScopedReason};
 
 pub(crate) type CheckPositionsJobQueue = JobQueue<CheckPositions>;
 const MAX_CONCURRENT_EXTENDED_HOURS_CANCELLATIONS: usize = 8;
+const EQUITY_TRANSFER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+pub(crate) fn equity_transfer_retry_delay(attempts: u32) -> Duration {
+    let factor = 2_u32.saturating_pow(attempts);
+    EQUITY_TRANSFER_REDRIVE_DELAY
+        .saturating_mul(factor)
+        .min(EQUITY_TRANSFER_RETRY_MAX_DELAY)
+}
 
 /// Shared dependencies for the [`CheckPositions`] job.
 pub(crate) struct CheckPositionsCtx<E: Executor + Clone + Send + Sync + 'static> {
@@ -286,22 +294,22 @@ fn backstop_sizing_assets<'registry>(
         })
 }
 
-/// A durable, self-rescheduling job that scans every position and enqueues a
-/// [`PlaceHedge`] for any symbol whose net exposure has crossed the execution
-/// threshold.
+/// A durable position scan job.
 ///
-/// The scan reads positions from the projection on each run. A single instance
-/// is enqueued at startup; each run re-enqueues itself with a delay equal to
-/// the configured check interval.
-///
-/// The job is stateless. In particular, the extended-hours cancel-and-replace
-/// pass is level-triggered -- every scan that observes a Regular session sweeps
-/// for still-live extended-hours orders -- so no previously-observed session
-/// needs to be carried between runs. (An earlier edge-triggered design carried
-/// a `last_seen_session` payload field; the empty braces keep old payloads
-/// deserializing cleanly by ignoring it.)
+/// The default payload scans every position and reschedules itself at the
+/// configured interval. [`Self::for_symbol`] creates a one-shot recalculation
+/// used after a queued hedge loses a race with a transfer or becomes stale:
+/// it re-runs readiness plus the complete broker preflight before creating a
+/// replacement [`PlaceHedge`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct CheckPositions {}
+pub(crate) struct CheckPositions {
+    #[serde(default)]
+    symbol: Option<Symbol>,
+    /// Number of transfer-blocked reschedules already attempted by this
+    /// symbol-scoped recalculation. Legacy payloads start at zero.
+    #[serde(default)]
+    equity_transfer_retry_attempts: u32,
+}
 
 #[derive(Debug, Default)]
 enum CloseFlattenWindowCache {
@@ -337,6 +345,16 @@ where
 
     async fn perform(&self, ctx: &CheckPositionsCtx<E>) -> Result<Self::Output, Self::Error> {
         let mut close_flatten_window_cache = CloseFlattenWindowCache::default();
+
+        if let Some(symbol) = &self.symbol {
+            ctx.check_and_enqueue_one(
+                symbol,
+                self.equity_transfer_retry_attempts,
+                &mut close_flatten_window_cache,
+            )
+            .await?;
+            return Ok(());
+        }
 
         // Every tick, independent of the feature flag: clear any position
         // whose pending order has gone terminal (e.g. a cancellation the
@@ -387,10 +405,84 @@ where
     }
 }
 
+impl CheckPositions {
+    pub(crate) fn for_symbol(symbol: Symbol) -> Self {
+        Self {
+            symbol: Some(symbol),
+            equity_transfer_retry_attempts: 0,
+        }
+    }
+}
+
 impl<E> CheckPositionsCtx<E>
 where
     E: Executor + Clone + Send + Sync + 'static,
 {
+    async fn check_and_enqueue_one(
+        &self,
+        symbol: &Symbol,
+        equity_transfer_retry_attempts: u32,
+        close_flatten_window_cache: &mut CloseFlattenWindowCache,
+    ) -> Result<(), CheckPositionsError> {
+        let position_reservation_pending = self
+            .position_projection
+            .load(symbol)
+            .await?
+            .is_some_and(|position| position.equity_transfer_reservation.is_some());
+        if position_reservation_pending {
+            return self
+                .reschedule_after_equity_transfer(symbol, equity_transfer_retry_attempts)
+                .await;
+        }
+
+        if has_active_transfer_for_symbol(&self.pool, symbol).await? {
+            return self
+                .reschedule_after_equity_transfer(symbol, equity_transfer_retry_attempts)
+                .await;
+        }
+
+        record_hedge_floor_gauges(
+            symbol,
+            self.ctx.broker.hedge_floor().for_symbol(symbol),
+            FractionalShares::ZERO,
+            FractionalShares::ZERO,
+        );
+
+        let Some(assets) = backstop_sizing_assets(&self.ctx.chains, symbol) else {
+            debug!(%symbol, "Skipping hedge recalculation: no hedged chain enables the symbol");
+            return Ok(());
+        };
+
+        self.check_and_enqueue_symbol(symbol, assets, close_flatten_window_cache)
+            .await;
+        Ok(())
+    }
+
+    async fn reschedule_after_equity_transfer(
+        &self,
+        symbol: &Symbol,
+        equity_transfer_retry_attempts: u32,
+    ) -> Result<(), CheckPositionsError> {
+        let retry_delay = equity_transfer_retry_delay(equity_transfer_retry_attempts);
+        let next_retry_attempts = equity_transfer_retry_attempts.saturating_add(1);
+        self.check_positions_queue
+            .clone()
+            .push_with_delay(
+                CheckPositions {
+                    symbol: Some(symbol.clone()),
+                    equity_transfer_retry_attempts: next_retry_attempts,
+                },
+                retry_delay,
+            )
+            .await?;
+        debug!(
+            %symbol,
+            equity_transfer_retry_attempts = next_retry_attempts,
+            retry_delay_secs = retry_delay.as_secs(),
+            "Equity transfer still in progress; rescheduled fresh hedge recalculation"
+        );
+        Ok(())
+    }
     async fn scan_and_enqueue(
         &self,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
@@ -488,6 +580,9 @@ where
             .filter(|(symbol, position)| {
                 if position.last_failed_offchain_order_id.is_some() {
                     record_scan_skip(symbol, HedgeScanSkipReason::AnchoredOrder, None);
+                    false
+                } else if position.equity_transfer_reservation.is_some() {
+                    debug!(%symbol, "Skipping hedge: Position transfer reservation in progress");
                     false
                 } else {
                     true
@@ -968,7 +1063,7 @@ where
     async fn reschedule(&self) -> Result<(), CheckPositionsError> {
         let mut queue = self.check_positions_queue.clone();
         queue
-            .push_with_delay(CheckPositions {}, self.check_interval)
+            .push_with_delay(CheckPositions::default(), self.check_interval)
             .await?;
         Ok(())
     }
@@ -1539,7 +1634,9 @@ mod tests {
         CounterTradeOrderKind, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
         OrderPlacementResult, PollOrderStatus, ReconcileOrderFillJobQueue,
     };
-    use crate::position::{AnchorDisposition, PositionCommand, TradeId};
+    use crate::position::{
+        AnchorDisposition, EquityTransferReservationId, PositionCommand, TradeId,
+    };
     use crate::test_utils::{TEST_POLL_INTERVAL, setup_test_pools};
 
     async fn build_ctx(
@@ -1835,6 +1932,19 @@ mod tests {
             .unwrap()
     }
 
+    async fn load_queued_check_positions(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+    ) -> (serde_json::Value, i64) {
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? ORDER BY run_at DESC LIMIT 1",
+        )
+        .bind(check_positions_job_type())
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap();
+        (serde_json::from_slice(&payload).unwrap(), run_at)
+    }
+
     fn hedge_job_type() -> String {
         std::any::type_name::<PlaceHedge>().to_string()
     }
@@ -1845,6 +1955,26 @@ mod tests {
 
     fn check_positions_job_type() -> String {
         std::any::type_name::<CheckPositions>().to_string()
+    }
+
+    #[test]
+    fn equity_transfer_retry_delay_grows_exponentially_and_caps() {
+        assert_eq!(equity_transfer_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(equity_transfer_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(equity_transfer_retry_delay(4), Duration::from_secs(16));
+        assert_eq!(equity_transfer_retry_delay(5), Duration::from_secs(30));
+        assert_eq!(
+            equity_transfer_retry_delay(u32::MAX),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn legacy_targeted_payload_defaults_equity_transfer_retry_attempts() {
+        let job: CheckPositions =
+            serde_json::from_value(serde_json::json!({ "symbol": "AAPL" })).unwrap();
+
+        assert_eq!(job.equity_transfer_retry_attempts, 0);
     }
 
     fn dry_run_ctx(symbols: &[&str], extended_hours: OperationMode) -> Ctx {
@@ -1956,7 +2086,7 @@ mod tests {
             alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
         };
 
-        CheckPositions {}.perform(&ctx).await.unwrap();
+        CheckPositions::default().perform(&ctx).await.unwrap();
 
         assert_eq!(
             count_jobs(&apalis_pool, &hedge_job_type()).await,
@@ -1967,6 +2097,154 @@ mod tests {
             count_jobs(&apalis_pool, &check_positions_job_type()).await,
             1,
             "The scan must reschedule itself despite the outage"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_recheck_stays_live_until_position_reservation_releases() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, position) =
+            build_ctx(pool, apalis_pool.clone(), cfg, Duration::from_secs(60)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(0.5)),
+            Direction::Buy,
+        )
+        .await;
+        let reservation_id = EquityTransferReservationId::generate();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job: CheckPositions = serde_json::from_value(serde_json::json!({
+            "symbol": symbol,
+            "equity_transfer_retry_attempts": 3
+        }))
+        .unwrap();
+        let scheduled_after = chrono::Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+
+        assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
+        assert_eq!(
+            count_jobs(&apalis_pool, &check_positions_job_type()).await,
+            1,
+            "the targeted recalculation must retry while Position owns a transfer reservation"
+        );
+        let (payload, run_at) = load_queued_check_positions(&apalis_pool).await;
+        assert_eq!(payload["equity_transfer_retry_attempts"], 4);
+        assert!(
+            run_at >= scheduled_after + 8,
+            "the fourth blocked attempt must wait at least 8 seconds, got run_at={run_at}"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_recheck_caps_backoff_for_durable_active_transfer() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, _) = build_ctx(pool, apalis_pool.clone(), cfg, Duration::from_secs(60)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('EquityRedemption', 'active-redemption', 0, \
+             'EquityRedemptionEvent::WithdrawnFromRaindex', '1', ?1, '{}')",
+        )
+        .bind(r#"{"WithdrawnFromRaindex":{"symbol":"AAPL"}}"#)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+        let job: CheckPositions = serde_json::from_value(serde_json::json!({
+            "symbol": symbol,
+            "equity_transfer_retry_attempts": 5
+        }))
+        .unwrap();
+
+        let scheduled_after = chrono::Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+
+        let (payload, run_at) = load_queued_check_positions(&apalis_pool).await;
+        assert_eq!(payload["equity_transfer_retry_attempts"], 6);
+        assert!(
+            run_at >= scheduled_after + 30,
+            "the blocked retry delay must cap at 30 seconds, got run_at={run_at}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_scan_skips_position_with_equity_transfer_reservation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, position) =
+            build_ctx(pool, apalis_pool.clone(), cfg, Duration::from_secs(60)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(0.5)),
+            Direction::Buy,
+        )
+        .await;
+        let reservation_id = EquityTransferReservationId::generate();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2)),
+            Direction::Buy,
+        )
+        .await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "the periodic scan must not enqueue a hedge for a reserved Position"
         );
     }
 
@@ -3042,7 +3320,10 @@ mod tests {
         )
         .await;
 
-        CheckPositions::default().perform(&ctx).await.unwrap();
+        CheckPositions::for_symbol(symbol.clone())
+            .perform(&ctx)
+            .await
+            .unwrap();
 
         assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
         let rendered = metrics_handle.render();

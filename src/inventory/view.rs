@@ -36,6 +36,8 @@ pub enum InventoryViewError {
     Float(#[from] FloatError),
     #[error("failed to convert USD balance cents {0} to USDC")]
     UsdBalanceConversion(i64),
+    #[error("inventory delta was deferred pending an authoritative venue snapshot")]
+    DeferredSnapshotReconciliation,
 }
 
 /// A change that aligns one in-memory hedge-order gate with durable Position
@@ -1373,7 +1375,6 @@ impl InventoryView {
     /// The market-making equity available in an explicit chain's slot.
     /// [`Self::equity_available`] resolves the primary chain, so a test
     /// covering a secondary chain reads through here instead.
-    #[cfg(test)]
     pub(crate) fn onchain_equity_available_at(
         &self,
         symbol: &Symbol,
@@ -1399,7 +1400,6 @@ impl InventoryView {
     }
 
     /// The market-making USDC available in an explicit chain's slot.
-    #[cfg(test)]
     pub(crate) fn onchain_usdc_available_at(&self, chain: Chain) -> Option<Usdc> {
         self.usdc
             .get_venue(Venue::MarketMaking, chain)
@@ -2210,6 +2210,70 @@ impl InventoryView {
         block_number: Option<u64>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
+        self.apply_equity_snapshot_with_overrides(
+            venue,
+            chain,
+            balances,
+            fetched_at,
+            block_number,
+            now,
+            (&BTreeSet::new(), &BTreeSet::new()),
+        )
+    }
+
+    pub(crate) fn apply_guarded_equity_snapshot<'a>(
+        self,
+        venue: Venue,
+        chain: Chain,
+        balances: impl IntoIterator<Item = (&'a Symbol, &'a FractionalShares)>,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+        now: DateTime<Utc>,
+        protected_symbols: &BTreeSet<Symbol>,
+    ) -> Result<Self, InventoryViewError> {
+        self.apply_equity_snapshot_with_overrides(
+            venue,
+            chain,
+            balances,
+            fetched_at,
+            block_number,
+            now,
+            (&BTreeSet::new(), protected_symbols),
+        )
+    }
+
+    pub(crate) fn apply_reconciled_onchain_equity_snapshot<'a>(
+        self,
+        chain: Chain,
+        balances: impl IntoIterator<Item = (&'a Symbol, &'a FractionalShares)>,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+        now: DateTime<Utc>,
+        forced_symbols: &BTreeSet<Symbol>,
+        protected_symbols: &BTreeSet<Symbol>,
+    ) -> Result<Self, InventoryViewError> {
+        self.apply_equity_snapshot_with_overrides(
+            Venue::MarketMaking,
+            chain,
+            balances,
+            fetched_at,
+            block_number,
+            now,
+            (forced_symbols, protected_symbols),
+        )
+    }
+
+    fn apply_equity_snapshot_with_overrides<'a>(
+        self,
+        venue: Venue,
+        chain: Chain,
+        balances: impl IntoIterator<Item = (&'a Symbol, &'a FractionalShares)>,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+        now: DateTime<Utc>,
+        overrides: (&BTreeSet<Symbol>, &BTreeSet<Symbol>),
+    ) -> Result<Self, InventoryViewError> {
+        let (forced_symbols, protected_symbols) = overrides;
         let snapshot: Vec<(Symbol, FractionalShares)> = balances
             .into_iter()
             .map(|(symbol, balance)| (symbol.clone(), *balance))
@@ -2236,6 +2300,10 @@ impl InventoryView {
         let (view, applied_symbols) = snapshot.iter().chain(absent_zeroes.iter()).try_fold(
             (self, Vec::new()),
             |(view, mut applied_symbols), (symbol, snapshot_balance)| {
+                if protected_symbols.contains(symbol) {
+                    return Ok((view, applied_symbols));
+                }
+
                 // Block ordering is authoritative for onchain reads (ADR
                 // 0018): a read pinned below the symbol's applied watermark
                 // would set a balance missing fills the watermark already
@@ -2256,6 +2324,28 @@ impl InventoryView {
                         "Rejecting onchain equity snapshot pinned below the \
                          symbol's applied block watermark"
                     );
+                    return Ok((view, applied_symbols));
+                }
+
+                if forced_symbols.contains(symbol) {
+                    if view
+                        .equity_snapshot_watermark(symbol, venue, chain)
+                        .is_some_and(|watermark| fetched_at <= watermark)
+                    {
+                        return Ok((view, applied_symbols));
+                    }
+
+                    let view = view.update_equity_at(
+                        symbol,
+                        chain,
+                        Inventory::force_on_snapshot(
+                            venue,
+                            *snapshot_balance,
+                            Arc::new(InventoryViewError::DeferredSnapshotReconciliation),
+                        ),
+                        now,
+                    )?;
+                    applied_symbols.push(symbol.clone());
                     return Ok((view, applied_symbols));
                 }
 
@@ -2899,6 +2989,12 @@ impl InventoryView {
                 balances,
                 block_number,
                 ..
+            }
+            | OnchainEquityReconciled {
+                chain,
+                balances,
+                block_number,
+                ..
             } => self.apply_equity_snapshot(
                 Venue::MarketMaking,
                 *chain,
@@ -2909,6 +3005,12 @@ impl InventoryView {
             ),
 
             OnchainUsdc {
+                chain,
+                usdc_balance,
+                block_number,
+                ..
+            }
+            | OnchainUsdcReconciled {
                 chain,
                 usdc_balance,
                 block_number,
@@ -3107,6 +3209,36 @@ impl InventoryView {
         }
     }
 
+    /// Force one accepted onchain cash reconciliation without regressing its block watermark.
+    pub(crate) fn apply_reconciled_onchain_usdc_snapshot(
+        self,
+        chain: Chain,
+        usdc_balance: Usdc,
+        block_number: Option<u64>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        if let (Some(block_number), Some(watermark)) = (
+            block_number,
+            self.onchain_usdc_snapshot_block_watermark
+                .get(&chain)
+                .copied(),
+        ) && block_number < watermark
+        {
+            return Ok(self);
+        }
+
+        self.update_usdc_at(
+            chain,
+            Inventory::force_on_snapshot(
+                Venue::MarketMaking,
+                usdc_balance,
+                Arc::new(InventoryViewError::DeferredSnapshotReconciliation),
+            ),
+            now,
+        )
+        .map(|view| view.record_onchain_usdc_block_watermark(chain, block_number))
+    }
+
     /// Recovery path for [`Self::apply_snapshot_event`] failures.
     /// Bypasses the inflight staleness guard via
     /// [`Inventory::force_on_snapshot`] so the view can catch up after
@@ -3158,6 +3290,51 @@ impl InventoryView {
             })
     }
 
+    fn force_apply_reconciled_onchain_equity(
+        self,
+        chain: Chain,
+        balances: &BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+        block_number: Option<u64>,
+        now: DateTime<Utc>,
+        forced_symbols: impl Iterator<Item = Symbol>,
+    ) -> Result<Self, InventoryViewError> {
+        let forced_symbols = forced_symbols.collect::<BTreeSet<_>>();
+        self.apply_reconciled_onchain_equity_snapshot(
+            chain,
+            balances.iter(),
+            fetched_at,
+            block_number,
+            now,
+            &forced_symbols,
+            &BTreeSet::new(),
+        )
+    }
+
+    fn force_apply_onchain_usdc(
+        self,
+        chain: Chain,
+        usdc_balance: Usdc,
+        block_number: Option<u64>,
+        now: DateTime<Utc>,
+        reason: Arc<InventoryViewError>,
+    ) -> Result<Self, InventoryViewError> {
+        self.update_usdc_at(
+            chain,
+            Inventory::force_on_snapshot(Venue::MarketMaking, usdc_balance, reason),
+            now,
+        )
+        // The forced balance is authoritative, so the watermark follows it
+        // exactly rather than keeping the monotonic maximum.
+        .map(|mut view| {
+            if let Some(block_number) = block_number {
+                view.onchain_usdc_snapshot_block_watermark
+                    .insert(chain, block_number);
+            }
+            view
+        })
+    }
+
     pub(crate) fn force_apply_snapshot_event(
         self,
         event: &InventorySnapshotEvent,
@@ -3180,31 +3357,33 @@ impl InventoryView {
                 now,
                 &reason,
             ),
+            OnchainEquityReconciled {
+                chain,
+                balances,
+                fetched_at,
+                block_number,
+                generations,
+            } => self.force_apply_reconciled_onchain_equity(
+                *chain,
+                balances,
+                *fetched_at,
+                *block_number,
+                now,
+                generations.keys().cloned(),
+            ),
 
             OnchainUsdc {
                 chain,
                 usdc_balance,
                 block_number,
                 ..
-            } => {
-                let block_number = *block_number;
-                let chain = *chain;
-                self.update_usdc_at(
-                    chain,
-                    Inventory::force_on_snapshot(Venue::MarketMaking, *usdc_balance, reason),
-                    now,
-                )
-                // Same as the equity arm above: the forced balance is
-                // authoritative, so the watermark follows it exactly rather
-                // than keeping the monotonic maximum.
-                .map(|mut view| {
-                    if let Some(block_number) = block_number {
-                        view.onchain_usdc_snapshot_block_watermark
-                            .insert(chain, block_number);
-                    }
-                    view
-                })
             }
+            | OnchainUsdcReconciled {
+                chain,
+                usdc_balance,
+                block_number,
+                ..
+            } => self.force_apply_onchain_usdc(*chain, *usdc_balance, *block_number, now, reason),
 
             OffchainEquity {
                 positions,
@@ -3255,6 +3434,7 @@ impl InventoryView {
                 ledger_position,
                 consecutive_polls,
                 fetched_at,
+                ..
             } => self.reconcile_offchain_equity(
                 symbol,
                 *position,
@@ -6615,6 +6795,7 @@ mod tests {
             fetched_at,
             ledger_position: ledger,
             consecutive_polls: 3,
+            generation: None,
         }
     }
 

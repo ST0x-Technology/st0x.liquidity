@@ -2586,6 +2586,7 @@ struct Position {
     accumulated_long: FractionalShares,
     accumulated_short: FractionalShares,
     pending_execution_id: Option<ExecutionId>,
+    equity_transfer_reservation: Option<EquityTransferReservation>,
     threshold: ExecutionThreshold,
     last_price_usdc: Option<Float>,  // Last known USDC price per share; drives
                                      // dollar-threshold hedging. None until a
@@ -2618,6 +2619,22 @@ enum PositionCommand {
         direction: Direction,
         price_usdc: Decimal,
         block_timestamp: DateTime<Utc>,
+    },
+    ReserveEquityTransfer {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        reservation_id: EquityTransferReservationId,
+    },
+    ConfirmEquityTransfer {
+        reservation_id: EquityTransferReservationId,
+    },
+    ReleaseEquityTransfer {
+        reservation_id: EquityTransferReservationId,
+    },
+    RestoreEquityTransferReservation {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        reservation_id: EquityTransferReservationId,
     },
     PlaceOffChainOrder {
         execution_id: ExecutionId,
@@ -2660,6 +2677,18 @@ enum PositionEvent {
         price_usdc: Decimal,
         block_timestamp: DateTime<Utc>,
         seen_at: DateTime<Utc>,
+    },
+    EquityTransferReserved {
+        reservation_id: EquityTransferReservationId,
+        reserved_at: DateTime<Utc>,
+    },
+    EquityTransferReservationConfirmed {
+        reservation_id: EquityTransferReservationId,
+        confirmed_at: DateTime<Utc>,
+    },
+    EquityTransferReservationReleased {
+        reservation_id: EquityTransferReservationId,
+        released_at: DateTime<Utc>,
     },
     OffChainOrderPlaced {
         execution_id: ExecutionId,
@@ -2735,7 +2764,55 @@ enum TriggerReason {
     $1.00 minimum trade value)
 - Direction of offchain order must be opposite to accumulated position (positive
   net = sell, negative net = buy)
+- Offchain placement is rejected as stale when the requested direction differs
+  from the live position direction or the requested shares exceed the live
+  absolute net. Callers must re-derive the hedge from the current position and
+  retry.
 - Cannot have multiple pending executions for same symbol
+- Equity transfer admission is serialized on this aggregate. A reservation is
+  accepted only when no offchain order is pending, no transfer reservation
+  exists, and the current net position is below the hedge threshold. A nonzero
+  position whose dollar threshold cannot be valued is rejected fail-closed.
+- `PlaceOffChainOrder` is rejected while any transfer reservation owns the
+  symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
+  confirmation of that exact ID must succeed immediately before the transfer job
+  is durably queued. Confirmed reservations survive queue handoff and restart.
+- A direct operator CLI equity transfer uses the same `Position` admission
+  protocol before invoking the transfer saga: a fresh transfer reserves and
+  confirms its aggregate-derived ID, while a resume restores that exact
+  confirmed owner. The CLI releases ownership only after successful completion
+  or when a failed invocation left no live aggregate; an interrupted live
+  aggregate keeps ownership so hedging cannot race its next resume.
+- A fresh transfer refused by the gas-readiness preflight releases its exact
+  `Position` reservation before enqueueing the delayed redrive, so a low wallet
+  cannot suppress hedging. The replacement job may recreate a missing confirmed
+  reservation only under the same pending-order, hedge-readiness, and price
+  eligibility checks as fresh transfer admission.
+- `ManuallyAdjustPosition` and `UpdateThreshold` are rejected while a confirmed
+  transfer reservation owns the symbol. Transfer ownership must be released
+  before either operator mutation can proceed.
+- An equity check performs side-effect-free sizing before creating a `Position`
+  reservation. A balanced or sub-threshold result returns without appending
+  `Position` events. When preflight sizing yields an operation, the trigger
+  reserves the symbol and sizes again; only that post-reservation result is
+  authoritative for dispatch.
+- Post-reservation no-op sizing, sizing failure, queue failure, terminal
+  transfer events, and terminal job attempts that never created an aggregate
+  release only their exact reservation ID. Startup retains reservations owned by
+  live durable transfer jobs, restores missing legacy ownership, and releases
+  crash-orphaned claims. When a pending or hedge-ready position prevents
+  restoration, transfer execution remains deferred until the hedge clears and
+  the exact reservation is restored. Every mint, redemption, and startup-resume
+  payload persists its deferral count and uses the symbol-scoped hedge retry
+  schedule (1/2/4/8/16 seconds, then 30 seconds capped), avoiding a new
+  completed queue row every second for a long-lived order. Terminal cleanup
+  removes that deferred owner in its post-commit task. The retry sweep marks an
+  attempt in flight, releases the map before writing Position, and compensates
+  with an exact-ID release when terminal cleanup cancelled the in-flight owner,
+  so a completed or failed transfer cannot be resurrected. A legacy generic
+  resume row without a symbol is discarded before it can call the transfer
+  service; startup enqueues the fresh symbol-bearing replacement that must
+  restore ownership first.
 - OnChain fills are always applied (blockchain facts are immutable)
 - Threshold is passed as a parameter to commands that need it
 
@@ -4768,8 +4845,9 @@ the TokenizedEquityMint, EquityRedemption, or UsdcRebalance aggregate.
 
 #### Coordination with Position Aggregate
 
-**Position Aggregate** tracks net exposure from arbitrage trading but does NOT
-know about cross-venue inventory.
+**Position Aggregate** tracks net exposure from arbitrage trading and owns the
+durable per-symbol exclusion between hedge placement and cross-venue equity
+transfer dispatch. It does not calculate cross-venue inventory imbalances.
 
 **InventoryView** listens to:
 
@@ -4827,7 +4905,10 @@ know about cross-venue inventory.
   ordering heals unchanged-value polls and placement events delivered after
   their own terminal event without requiring a restart, while never treating the
   Position store's lead over the inventory reactor as proof that its local side
-  effects have completed
+  effects have completed. This pending-order mirror exists only to suppress
+  ambiguous broker snapshots; it is not transfer-admission authority and the
+  rebalancer does not re-read it before dispatch. Transfer admission uses the
+  atomic Position reservation protocol described above.
 - `TokenizedEquityMintEvent::MintAccepted` - Moves shares to inflight (leaving
   Alpaca)
 - `TokenizedEquityMintEvent::TokensReceived` - Moves from inflight to Raindex
