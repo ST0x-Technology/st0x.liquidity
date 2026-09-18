@@ -48,9 +48,38 @@ pub(crate) enum NotifierError {
 /// `message` field in JSON log output).
 pub(crate) struct LogNotifier;
 
+/// Separator that replaces newlines in an alert message. Chosen because the
+/// downstream `kind` label extractor captures `[A-Za-z ]+` after the target,
+/// so a non-alphabetic separator terminates the class exactly where the first
+/// line used to end.
+const LINE_SEPARATOR: &str = " · ";
+
+/// Flatten an alert message onto a single line.
+///
+/// Delivery runs through Docker's `gcplogs` driver, which emits **one Cloud
+/// Logging entry per line**. A multi-line alert therefore arrived as one entry
+/// carrying the headline and several orphan entries carrying the detail, none
+/// of them matching the `operational_alert` target. The logs-based metric and
+/// the Grafana rule built on it only ever saw the headline, so a page read
+/// "Portfolio snapshot mark missing" with no symbol, no balance and no repair
+/// command — the operator had to go back to the raw logs to learn anything.
+///
+/// Keeping the message on one line keeps the whole alert in the entry that the
+/// pipeline actually reads. Trailing whitespace on a line is trimmed so the
+/// separator does not double up, and empty lines are dropped.
+fn flatten(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(LINE_SEPARATOR)
+}
+
 #[async_trait]
 impl Notifier for LogNotifier {
     async fn notify(&self, message: &str) -> Result<(), NotifierError> {
+        let message = flatten(message);
         error!(target: "operational_alert", alert = true, "{message}");
         Ok(())
     }
@@ -115,6 +144,50 @@ mod tests {
         assert!(
             logs_contain("gas balance low on base"),
             "the alert text must be the event message"
+        );
+    }
+
+    /// Docker's gcplogs driver emits one Cloud Logging entry per line, so an
+    /// embedded newline used to split an alert into a headline entry plus
+    /// orphan detail entries that carried no `operational_alert` target. The
+    /// page then named the alert class and nothing else. The whole message
+    /// must ride in one entry.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn notify_keeps_a_multi_line_alert_in_one_event() {
+        LogNotifier
+            .notify(
+                "🚨 Portfolio snapshot mark missing\nET day: 2026-09-11\nSymbol: FTF\n\nRepair: st0x-cli portfolio-snapshot set --day 2026-09-11 --symbol FTF",
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            logs_contain(
+                "Portfolio snapshot mark missing · ET day: 2026-09-11 · Symbol: FTF · Repair: st0x-cli portfolio-snapshot set --day 2026-09-11 --symbol FTF"
+            ),
+            "every line of the alert must survive on one line, blank lines dropped"
+        );
+    }
+
+    /// The `kind` label extractor downstream captures `[A-Za-z ]+` after the
+    /// target, so the separator has to be non-alphabetic or the class would
+    /// swallow the detail that follows the headline.
+    #[test]
+    fn flatten_separates_lines_with_a_non_alphabetic_marker() {
+        assert_eq!(flatten("headline\ndetail"), "headline · detail");
+        assert!(
+            !LINE_SEPARATOR.chars().any(char::is_alphabetic),
+            "an alphabetic separator would extend the extracted alert kind"
+        );
+    }
+
+    /// A single-line alert, which is most of them, must be untouched.
+    #[test]
+    fn flatten_leaves_a_single_line_alert_alone() {
+        assert_eq!(
+            flatten("gas balance low on base"),
+            "gas balance low on base"
         );
     }
 }
