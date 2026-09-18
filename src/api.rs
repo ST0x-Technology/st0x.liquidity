@@ -3105,7 +3105,6 @@ mod tests {
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef};
 
-    /// Builds a migrated application state without published recovery handles.
     async fn empty_app_state(ctx: Ctx) -> AppState {
         let (sender, _) = broadcast::channel(16);
         // Use the shared-cache test pool so the apalis `Jobs` table (set up by
@@ -7330,7 +7329,6 @@ mod tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
-    /// Releasing a hedge must reject symbols that have no persisted position.
     #[tokio::test]
     async fn release_position_hedge_rejects_an_unknown_position() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
