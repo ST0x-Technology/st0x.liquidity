@@ -66,11 +66,15 @@ pub enum RaindexError {
     RpcTransport(#[from] RpcError<TransportErrorKind>),
     #[error("ABI decode error: {0}")]
     SolType(#[from] alloy::sol_types::Error),
-    /// A withdrawal scan could not confirm presence or absence: the queried node
-    /// is not confirmations-deep past `from_block`, so an empty result may be RPC
-    /// lag rather than a true absence. Retryable -- the caller must NOT re-execute
-    /// the irreversible withdraw on this.
-    #[error("withdrawal scan inconclusive: node not caught up past block {from_block}")]
+    /// A withdrawal scan did not find a matching mined transaction. An empty
+    /// log result cannot prove that no submission exists because the
+    /// transaction may still be pending or hidden by a load-balanced RPC
+    /// backend. Retryable -- the caller must NOT re-execute the irreversible
+    /// withdraw on this.
+    #[error(
+        "withdrawal scan found no matching mined transaction after block {from_block}; \
+         submission remains unresolved"
+    )]
     ScanInconclusive { from_block: u64 },
     /// A log the withdrawal scan matched on address + topic0 was anomalous
     /// (see [`ScanAnomaly`]). Impossible under the current contracts, so it
@@ -198,15 +202,16 @@ pub trait Raindex: Send + Sync {
 
     /// Finds the newest matching withdrawal strictly after `from_block`.
     ///
-    /// Implementations must return `Ok(None)` only after proving the queried
-    /// node is confirmations-deep past the lower bound and repeated scans agree
-    /// the effect is absent.
+    /// An empty mined-log scan is never evidence that the irreversible
+    /// submission did not happen: it may still be pending, or the queried RPC
+    /// backend may not have observed it. Implementations must therefore return
+    /// [`RaindexError::ScanInconclusive`] rather than representing absence.
     async fn find_recent_withdrawal(
         &self,
         token: Address,
         vault_id: RaindexVaultId,
         from_block: u64,
-    ) -> Result<Option<(TxHash, U256)>, RaindexError>;
+    ) -> Result<(TxHash, U256), RaindexError>;
 
     /// Wait for a previously submitted transaction to be confirmed.
     async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {

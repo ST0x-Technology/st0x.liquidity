@@ -3770,14 +3770,13 @@ impl<
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
     }
 
-    /// Resumes a transfer stalled at `WithdrawalSubmitting`: scans the chain for
-    /// an already-submitted withdrawal (adopting it to avoid a double-withdraw)
-    /// and otherwise issues the withdrawal, then records and confirms it.
+    /// Resumes a transfer stalled at `WithdrawalSubmitting` by adopting the
+    /// already-mined withdrawal and recording it.
     ///
-    /// The scan is finality-gated: it returns `Ok(None)` (safe to issue the
-    /// withdrawal) only when the queried node is confirmations-deep past
-    /// `from_block`; otherwise it yields a retryable error and this resume re-runs
-    /// rather than risking a double-withdraw off a stale empty `eth_getLogs`.
+    /// Absence from mined logs is never permission to issue another withdrawal:
+    /// the original transaction may still be pending, or a load-balanced RPC
+    /// backend may not have observed it. [`Raindex::find_recent_withdrawal`]
+    /// therefore fails inconclusively instead of returning absence.
     async fn resume_withdrawal_submitting(
         &self,
         id: &UsdcRebalanceId,
@@ -3785,38 +3784,24 @@ impl<
         amount_u256: U256,
         from_block: u64,
     ) -> Result<(), UsdcTransferError> {
-        if let Some((existing_tx, withdrawn)) = self
+        let (existing_tx, withdrawn) = self
             .raindex
             .find_recent_withdrawal(USDC_BASE, self.vault_id, from_block)
-            .await?
-        {
-            // The withdrawal for this transfer already landed on-chain; adopt it
-            // instead of re-withdrawing. If it realized a different amount than
-            // requested (vault under-funded -> partial fill), fail fast for
-            // operator reconciliation -- never burn more on Base than was actually
-            // withdrawn.
-            if withdrawn != amount_u256 {
-                return self
-                    .fail_adopted_withdrawal_mismatch(
-                        id,
-                        amount,
-                        amount_u256,
-                        existing_tx,
-                        withdrawn,
-                    )
-                    .await;
-            }
+            .await?;
 
-            info!(target: "rebalance", %existing_tx, "Adopting already-submitted vault withdrawal on resume");
-            return self.record_vault_withdrawal(id, amount, existing_tx).await;
+        // The withdrawal for this transfer already landed on-chain; adopt it
+        // instead of re-withdrawing. If it realized a different amount than
+        // requested (vault under-funded -> partial fill), fail fast for
+        // operator reconciliation -- never burn more on Base than was actually
+        // withdrawn.
+        if withdrawn != amount_u256 {
+            return self
+                .fail_adopted_withdrawal_mismatch(id, amount, amount_u256, existing_tx, withdrawn)
+                .await;
         }
 
-        let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
-            Ok(tx) => tx,
-            Err(error) => return Err(classify_vault_withdrawal_error(error)),
-        };
-
-        self.record_vault_withdrawal(id, amount, withdraw_tx).await
+        info!(target: "rebalance", %existing_tx, "Adopting already-submitted vault withdrawal on resume");
+        self.record_vault_withdrawal(id, amount, existing_tx).await
     }
 
     /// Handles an adopted withdrawal that realized a different amount than

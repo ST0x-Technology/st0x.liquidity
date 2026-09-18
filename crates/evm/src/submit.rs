@@ -128,9 +128,11 @@
 //! cannot be treated as license to release an entry.
 
 use alloy::eips::eip1559::Eip1559Estimation;
-use alloy::primitives::{Address, Bytes, TxHash};
+use alloy::eips::eip2718::Encodable2718;
+use alloy::network::Ethereum;
+use alloy::primitives::{Address, Bytes, TxHash, keccak256};
 use alloy::providers::Provider;
-use alloy::providers::fillers::NonceManager;
+use alloy::providers::fillers::{FillProvider, NonceManager, TxFiller};
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use async_trait::async_trait;
 use futures::lock::Mutex;
@@ -193,9 +195,13 @@ fn bump_fee(value: u128, pct: u64) -> Result<u128, EvmError> {
 /// a scripted mock instead of a live RPC and signing fillers.
 #[async_trait]
 pub(crate) trait TxSubmitter: Send + Sync {
-    /// Fill, sign, and broadcast `tx`, returning its hash. Pre-set fields
-    /// (nonce, fees) are respected; absent ones are filled by the
-    /// provider's fillers.
+    /// Fill and sign `tx` before broadcasting it, then return its locally
+    /// computed hash. Pre-set fields (nonce, fees) are respected.
+    ///
+    /// Implementations must normalize an RPC "already known" response to
+    /// success with that local hash: the exact signed envelope is known before
+    /// broadcast, so callers never lose transaction identity or retry the
+    /// business operation at a later nonce.
     async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError>;
 
     /// Assigns the next nonce for `address` via `nonce_manager`, mirroring
@@ -241,10 +247,34 @@ pub(crate) trait TxSubmitter: Send + Sync {
 }
 
 #[async_trait]
-impl<P: Provider> TxSubmitter for P {
+impl<F, P> TxSubmitter for FillProvider<F, P, Ethereum>
+where
+    F: TxFiller<Ethereum>,
+    P: Provider<Ethereum>,
+{
     async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError> {
-        let pending = self.send_transaction(tx).await?;
-        Ok(*pending.tx_hash())
+        // `FillProvider::fill` runs the filler chain until all dependencies are
+        // satisfied (for example, WalletFiller sets `from` before GasFiller
+        // estimates against it), then returns the signed envelope without
+        // broadcasting.
+        let sendable = self.fill(tx).await?;
+        let envelope = sendable
+            .try_into_envelope()
+            .map_err(|_| EvmError::TransactionPreparation)?;
+        let encoded = envelope.encoded_2718();
+        let tx_hash = keccak256(&encoded);
+
+        match self.inner().send_raw_transaction(&encoded).await {
+            Ok(_) => Ok(tx_hash),
+            Err(error) => {
+                let error = EvmError::from(error);
+                if error.is_already_known() {
+                    Ok(tx_hash)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     async fn assign_nonce(
@@ -322,30 +352,6 @@ where
         }
         Err(error) => error,
     };
-
-    if let Some(tx_hash) = error.already_known_tx_hash() {
-        info!(
-            target: "wallet",
-            %tx_hash,
-            note,
-            nonce,
-            "Transaction already known by RPC; recovered submitted hash"
-        );
-        in_flight.record(address, nonce, tx_hash);
-        return Ok(tx_hash);
-    }
-
-    if error.is_already_known() {
-        warn!(
-            target: "wallet",
-            %contract,
-            note,
-            nonce,
-            "Transaction already known by RPC without a recoverable hash; \
-             preserving nonce cache for chain reconciliation"
-        );
-        return Err(EvmError::SubmissionAlreadyKnown { nonce });
-    }
 
     if error.is_nonce_too_low() {
         return retry_after_nonce_too_low(
@@ -777,31 +783,6 @@ where
                 in_flight.record(address, next_nonce, tx_hash);
                 return Ok(tx_hash);
             }
-            Err(retry_error) if retry_error.is_already_known() => {
-                if let Some(tx_hash) = retry_error.already_known_tx_hash() {
-                    info!(
-                        target: "wallet",
-                        %tx_hash,
-                        note,
-                        attempt,
-                        nonce = next_nonce,
-                        "Nonce-recovery transaction already known by RPC; recovered submitted hash"
-                    );
-                    in_flight.record(address, next_nonce, tx_hash);
-                    return Ok(tx_hash);
-                }
-
-                warn!(
-                    target: "wallet",
-                    %contract,
-                    note,
-                    attempt,
-                    nonce = next_nonce,
-                    "Nonce-recovery transaction already known without a recoverable hash; \
-                     preserving nonce cache for chain reconciliation"
-                );
-                return Err(EvmError::SubmissionAlreadyKnown { nonce: next_nonce });
-            }
             Err(retry_error) if retry_error.is_nonce_too_low() => {
                 nonce_floor = Some(raise_nonce_floor(nonce_floor, next_nonce.saturating_add(1)));
                 error = retry_error;
@@ -957,32 +938,6 @@ where
             Err(error) => error,
         };
 
-        if let Some(tx_hash) = error.already_known_tx_hash() {
-            info!(
-                target: "wallet",
-                %tx_hash,
-                note,
-                attempt,
-                nonce,
-                "Replacement transaction already known by RPC; recovered submitted hash"
-            );
-            in_flight.record(address, nonce, tx_hash);
-            return Ok(tx_hash);
-        }
-
-        if error.is_already_known() {
-            warn!(
-                target: "wallet",
-                %contract,
-                note,
-                attempt,
-                nonce,
-                "Replacement transaction already known without a recoverable hash; \
-                 preserving nonce cache for chain reconciliation"
-            );
-            return Err(EvmError::SubmissionAlreadyKnown { nonce });
-        }
-
         if error.is_replacement_underpriced() {
             warn!(target: "wallet", %contract, note, attempt, "Replacement still \
                 underpriced; escalating fee");
@@ -1068,6 +1023,8 @@ mod tests {
     use std::time::Duration;
 
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
+    #[cfg(feature = "local-signer")]
+    use alloy::network::TransactionBuilder;
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{Bloom, Bytes, TxHash, U256, address};
     use alloy::providers::ProviderBuilder;
@@ -1079,6 +1036,8 @@ mod tests {
     use tokio::time::Instant;
 
     use super::*;
+    #[cfg(feature = "local-signer")]
+    use crate::Wallet;
 
     const CONTRACT: Address = address!("00000000000000000000000000000000000000c1");
     const WALLET: Address = address!("00000000000000000000000000000000000000a9");
@@ -1138,6 +1097,9 @@ mod tests {
 
     fn reverted() -> EvmError {
         rpc_error("execution reverted")
+    }
+    fn prepared_tx_hash() -> TxHash {
+        TxHash::repeat_byte(0xa5)
     }
 
     fn base_fees() -> Eip1559Estimation {
@@ -1331,7 +1293,10 @@ mod tests {
                 .expect("unexpected submit call: no scripted result left");
 
             self.active.fetch_sub(1, Ordering::SeqCst);
-            result
+            match result {
+                Err(error) if error.is_already_known() => Ok(prepared_tx_hash()),
+                other => other,
+            }
         }
 
         async fn assign_nonce(
@@ -1552,14 +1517,41 @@ mod tests {
             "base send must not set a fee"
         );
     }
+    #[cfg(feature = "local-signer")]
     #[tokio::test]
-    async fn already_known_with_hash_is_accepted_without_resubmit_or_cache_invalidation() {
-        let hash = TxHash::repeat_byte(0x13);
-        let mock = MockSubmitter::new(vec![Err(already_known_with_data(&hash.to_string()))]);
+    async fn signing_provider_recovers_local_hash_when_rpc_omits_it() {
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("already known"),
+            data: None,
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key = alloy::primitives::B256::repeat_byte(1);
+        let wallet = crate::local::RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let tx = TransactionRequest::default()
+            .from(wallet.address())
+            .to(CONTRACT)
+            .nonce(0)
+            .gas_limit(21_000)
+            .with_chain_id(1)
+            .max_fee_per_gas(1_000_000_000)
+            .max_priority_fee_per_gas(100_000_000);
+
+        let tx_hash = TxSubmitter::submit(wallet.signing_provider(), tx)
+            .await
+            .unwrap();
+
+        assert_ne!(tx_hash, TxHash::ZERO);
+    }
+    #[tokio::test]
+    async fn already_known_uses_locally_computed_hash_without_resubmit() {
+        let rpc_hash = TxHash::repeat_byte(0x13);
+        let mock = MockSubmitter::new(vec![Err(already_known_with_data(&rpc_hash.to_string()))]);
 
         let (result, nonce_manager, in_flight) = run_with_manager_and_tracker(&mock).await;
 
-        assert_eq!(result.unwrap(), hash);
+        assert_eq!(result.unwrap(), prepared_tx_hash());
         assert_eq!(mock.sent().len(), 1, "already-known must not resubmit");
         assert_eq!(
             nonce_manager.peek_next_nonce(WALLET).await,
@@ -1569,50 +1561,36 @@ mod tests {
         assert_eq!(
             in_flight.ownership(WALLET, 0),
             NonceOwnership::Ours,
-            "a recovered hash proves the already-known transaction belongs to this wallet"
+            "the locally computed hash preserves in-flight ownership"
         );
     }
 
     #[tokio::test]
-    async fn already_known_without_hash_is_indeterminate_without_resubmit_or_cache_invalidation() {
+    async fn already_known_without_rpc_hash_returns_local_hash_and_records_identity() {
         let mock = MockSubmitter::new(vec![Err(rpc_error("already known"))]);
 
         let (result, nonce_manager, in_flight) = run_with_manager_and_tracker(&mock).await;
 
-        assert!(matches!(
-            result,
-            Err(EvmError::SubmissionAlreadyKnown { nonce: 0 })
-        ));
+        assert_eq!(result.unwrap(), prepared_tx_hash());
         assert_eq!(mock.sent().len(), 1, "already-known must not resubmit");
-        assert_eq!(
-            nonce_manager.peek_next_nonce(WALLET).await,
-            Some(1),
-            "an indeterminate accepted broadcast must preserve the advanced nonce cache"
-        );
-        assert_eq!(
-            in_flight.ownership(WALLET, 0),
-            NonceOwnership::Unknown,
-            "without a hash the wallet cannot invent in-flight ownership evidence"
-        );
+        assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, Some(1));
+        assert_eq!(in_flight.ownership(WALLET, 0), NonceOwnership::Ours);
     }
+
     #[tokio::test]
-    async fn already_known_during_fee_replacement_stops_without_another_resubmit() {
-        let hash = TxHash::repeat_byte(0x14);
-        let mock = MockSubmitter::new(vec![
-            Err(underpriced()),
-            Err(already_known_with_data(&hash.to_string())),
-        ]);
+    async fn already_known_during_fee_replacement_returns_local_hash() {
+        let mock = MockSubmitter::new(vec![Err(underpriced()), Err(rpc_error("already known"))]);
 
         let (result, nonce_manager, in_flight) = run_with_manager_and_tracker(&mock).await;
 
-        assert_eq!(result.unwrap(), hash);
+        assert_eq!(result.unwrap(), prepared_tx_hash());
         assert_eq!(mock.sent().len(), 2);
         assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, Some(1));
         assert_eq!(in_flight.ownership(WALLET, 0), NonceOwnership::Ours);
     }
 
     #[tokio::test]
-    async fn already_known_during_nonce_recovery_is_indeterminate_without_another_resubmit() {
+    async fn already_known_during_nonce_recovery_returns_local_hash() {
         let mock = MockSubmitter::new(vec![
             Err(nonce_too_low_with_hint()),
             Err(rpc_error("already known")),
@@ -1620,12 +1598,7 @@ mod tests {
 
         let (result, nonce_manager) = run_with_manager(&mock).await;
 
-        assert!(matches!(
-            result,
-            Err(EvmError::SubmissionAlreadyKnown {
-                nonce: HINTED_NONCE
-            })
-        ));
+        assert_eq!(result.unwrap(), prepared_tx_hash());
         assert_eq!(mock.sent().len(), 2);
         assert_eq!(
             nonce_manager.peek_next_nonce(WALLET).await,

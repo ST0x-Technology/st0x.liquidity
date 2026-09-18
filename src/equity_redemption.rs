@@ -658,235 +658,273 @@ fn actual_withdrawn_amount_from_receipt(
 
 /// Required by `cqrs_es::DomainEvent`.
 impl PartialEq for EquityRedemptionEvent {
-    #[allow(clippy::too_many_lines)]
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::VaultWithdrawPending {
-                    symbol: s1,
-                    chain: c1,
-                    quantity: q1,
-                    token: t1,
-                    wrapped_amount: w1,
-                    pending_at: pa1,
-                },
-                Self::VaultWithdrawPending {
-                    symbol: s2,
-                    chain: c2,
-                    quantity: q2,
-                    token: t2,
-                    wrapped_amount: w2,
-                    pending_at: pa2,
-                },
-            ) => (s1, c1, t1, w1, pa1) == (s2, c2, t2, w2, pa2) && q1.eq(*q2).unwrap_or(false),
-            (
-                Self::VaultWithdrawSubmitting {
-                    symbol: s1,
-                    chain: c1,
-                    quantity: q1,
-                    token: t1,
-                    vault_id: v1,
-                    wrapped_amount: w1,
-                    from_block: b1,
-                    submitting_at: sa1,
-                },
-                Self::VaultWithdrawSubmitting {
-                    symbol: s2,
-                    chain: c2,
-                    quantity: q2,
-                    token: t2,
-                    vault_id: v2,
-                    wrapped_amount: w2,
-                    from_block: b2,
-                    submitting_at: sa2,
-                },
-            ) => {
-                s1 == s2
-                    && c1 == c2
-                    && q1.eq(*q2).unwrap_or(false)
-                    && t1 == t2
-                    && v1 == v2
-                    && w1 == w2
-                    && b1 == b2
-                    && sa1 == sa2
-            }
-            (
-                Self::VaultWithdrawSubmitted {
-                    symbol: s1,
-                    quantity: q1,
-                    token: t1,
-                    wrapped_amount: w1,
-                    tx_hash: h1,
-                    submitted_at: sa1,
-                },
-                Self::VaultWithdrawSubmitted {
-                    symbol: s2,
-                    quantity: q2,
-                    token: t2,
-                    wrapped_amount: w2,
-                    tx_hash: h2,
-                    submitted_at: sa2,
-                },
-            ) => {
-                s1 == s2
-                    && q1.eq(*q2).unwrap_or(false)
-                    && t1 == t2
-                    && w1 == w2
-                    && h1 == h2
-                    && sa1 == sa2
-            }
-            (
-                Self::UnwrapSubmitted {
-                    unwrap_tx_hash: h1,
-                    submitted_at: sa1,
-                },
-                Self::UnwrapSubmitted {
-                    unwrap_tx_hash: h2,
-                    submitted_at: sa2,
-                },
-            ) => h1 == h2 && sa1 == sa2,
-            (Self::UnwrapPending { pending_at: pa1 }, Self::UnwrapPending { pending_at: pa2 })
-            | (Self::SendPending { pending_at: pa1 }, Self::SendPending { pending_at: pa2 }) => {
-                pa1 == pa2
-            }
-            (
-                Self::WithdrawnFromRaindex {
-                    symbol: s1,
-                    quantity: q1,
-                    token: t1,
-                    wrapped_amount: w1,
-                    actual_wrapped_amount: aw1,
-                    raindex_withdraw_tx: r1,
-                    raindex_withdraw_block: rb1,
-                    withdrawn_at: wa1,
-                },
-                Self::WithdrawnFromRaindex {
-                    symbol: s2,
-                    quantity: q2,
-                    token: t2,
-                    wrapped_amount: w2,
-                    actual_wrapped_amount: aw2,
-                    raindex_withdraw_tx: r2,
-                    raindex_withdraw_block: rb2,
-                    withdrawn_at: wa2,
-                },
-            ) => {
-                s1 == s2
-                    && q1.eq(*q2).unwrap_or(false)
-                    && t1 == t2
-                    && w1 == w2
-                    && aw1 == aw2
-                    && r1 == r2
-                    && rb1 == rb2
-                    && wa1 == wa2
-            }
-            (
-                Self::TokensUnwrapped {
-                    quantity: q1,
-                    underlying_token: u1,
-                    unwrap_tx_hash: h1,
-                    unwrapped_amount: a1,
-                    unwrap_block: b1,
-                    unwrapped_at: t1,
-                },
-                Self::TokensUnwrapped {
-                    quantity: q2,
-                    underlying_token: u2,
-                    unwrap_tx_hash: h2,
-                    unwrapped_amount: a2,
-                    unwrap_block: b2,
-                    unwrapped_at: t2,
-                },
-            ) => {
-                q1.is_some() == q2.is_some()
-                    && q1
-                        .zip(*q2)
-                        .is_none_or(|(q1, q2)| q1.eq(q2).unwrap_or(false))
-                    && u1 == u2
-                    && h1 == h2
-                    && b1 == b2
-                    && a1 == a2
-                    && t1 == t2
-            }
-            (
-                Self::TransferFailed {
-                    tx_hash: h1,
-                    reason: r1,
-                    failed_at: f1,
-                },
-                Self::TransferFailed {
-                    tx_hash: h2,
-                    reason: r2,
-                    failed_at: f2,
-                },
-            ) => h1 == h2 && r1 == r2 && f1 == f2,
-            (
-                Self::TokensSent {
-                    redemption_wallet: w1,
-                    redemption_tx: t1,
-                    sent_at: s1,
-                },
-                Self::TokensSent {
-                    redemption_wallet: w2,
-                    redemption_tx: t2,
-                    sent_at: s2,
-                },
-            ) => w1 == w2 && t1 == t2 && s1 == s2,
-            (
-                Self::DetectionFailed {
-                    failure: f1,
-                    failed_at: fa1,
-                },
-                Self::DetectionFailed {
-                    failure: f2,
-                    failed_at: fa2,
-                },
-            ) => f1 == f2 && fa1 == fa2,
-            (
-                Self::Detected {
-                    tokenization_request_id: t1,
-                    detected_at: d1,
-                },
-                Self::Detected {
-                    tokenization_request_id: t2,
-                    detected_at: d2,
-                },
-            ) => t1 == t2 && d1 == d2,
-            (
-                Self::RedemptionRejected {
-                    reason: r1,
-                    rejected_at: ra1,
-                },
-                Self::RedemptionRejected {
-                    reason: r2,
-                    rejected_at: ra2,
-                },
-            ) => r1 == r2 && ra1 == ra2,
-            (Self::Completed { completed_at: c1 }, Self::Completed { completed_at: c2 }) => {
-                c1 == c2
-            }
-            (
-                Self::ProviderCompletionRecovered {
-                    tokenization_request_id: id1,
-                    recovered_at: t1,
-                },
-                Self::ProviderCompletionRecovered {
-                    tokenization_request_id: id2,
-                    recovered_at: t2,
-                },
-            ) => id1 == id2 && t1 == t2,
-            (
-                Self::OperatorReconciled {
-                    reason: r1,
-                    reconciled_at: t1,
-                },
-                Self::OperatorReconciled {
-                    reason: r2,
-                    reconciled_at: t2,
-                },
-            ) => r1 == r2 && t1 == t2,
-            _ => false,
-        }
+        eq_vault_events(self, other)
+            .or_else(|| eq_processing_events(self, other))
+            .or_else(|| eq_delivery_events(self, other))
+            .or_else(|| eq_terminal_events(self, other))
+            .unwrap_or(false)
+    }
+}
+
+fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) -> Option<bool> {
+    use EquityRedemptionEvent::{
+        VaultWithdrawPending, VaultWithdrawSubmitted, VaultWithdrawSubmitting,
+    };
+
+    match (left, right) {
+        (
+            VaultWithdrawPending {
+                symbol: s1,
+                chain: c1,
+                quantity: q1,
+                token: t1,
+                wrapped_amount: w1,
+                pending_at: pa1,
+            },
+            VaultWithdrawPending {
+                symbol: s2,
+                chain: c2,
+                quantity: q2,
+                token: t2,
+                wrapped_amount: w2,
+                pending_at: pa2,
+            },
+        ) => Some((s1, c1, t1, w1, pa1) == (s2, c2, t2, w2, pa2) && q1.eq(*q2).unwrap_or(false)),
+        (
+            VaultWithdrawSubmitting {
+                symbol: s1,
+                chain: c1,
+                quantity: q1,
+                token: t1,
+                vault_id: v1,
+                wrapped_amount: w1,
+                from_block: b1,
+                submitting_at: sa1,
+            },
+            VaultWithdrawSubmitting {
+                symbol: s2,
+                chain: c2,
+                quantity: q2,
+                token: t2,
+                vault_id: v2,
+                wrapped_amount: w2,
+                from_block: b2,
+                submitting_at: sa2,
+            },
+        ) => Some(
+            s1 == s2
+                && c1 == c2
+                && q1.eq(*q2).unwrap_or(false)
+                && t1 == t2
+                && v1 == v2
+                && w1 == w2
+                && b1 == b2
+                && sa1 == sa2,
+        ),
+        (
+            VaultWithdrawSubmitted {
+                symbol: s1,
+                quantity: q1,
+                token: t1,
+                wrapped_amount: w1,
+                tx_hash: h1,
+                submitted_at: sa1,
+            },
+            VaultWithdrawSubmitted {
+                symbol: s2,
+                quantity: q2,
+                token: t2,
+                wrapped_amount: w2,
+                tx_hash: h2,
+                submitted_at: sa2,
+            },
+        ) => Some(
+            s1 == s2
+                && q1.eq(*q2).unwrap_or(false)
+                && t1 == t2
+                && w1 == w2
+                && h1 == h2
+                && sa1 == sa2,
+        ),
+        _ => None,
+    }
+}
+
+fn eq_processing_events(
+    left: &EquityRedemptionEvent,
+    right: &EquityRedemptionEvent,
+) -> Option<bool> {
+    use EquityRedemptionEvent::{
+        SendPending, TokensUnwrapped, UnwrapPending, UnwrapSubmitted, WithdrawnFromRaindex,
+    };
+
+    match (left, right) {
+        (
+            UnwrapSubmitted {
+                unwrap_tx_hash: h1,
+                submitted_at: sa1,
+            },
+            UnwrapSubmitted {
+                unwrap_tx_hash: h2,
+                submitted_at: sa2,
+            },
+        ) => Some(h1 == h2 && sa1 == sa2),
+        (UnwrapPending { pending_at: pa1 }, UnwrapPending { pending_at: pa2 })
+        | (SendPending { pending_at: pa1 }, SendPending { pending_at: pa2 }) => Some(pa1 == pa2),
+        (
+            WithdrawnFromRaindex {
+                symbol: s1,
+                quantity: q1,
+                token: t1,
+                wrapped_amount: w1,
+                actual_wrapped_amount: aw1,
+                raindex_withdraw_tx: r1,
+                raindex_withdraw_block: rb1,
+                withdrawn_at: wa1,
+            },
+            WithdrawnFromRaindex {
+                symbol: s2,
+                quantity: q2,
+                token: t2,
+                wrapped_amount: w2,
+                actual_wrapped_amount: aw2,
+                raindex_withdraw_tx: r2,
+                raindex_withdraw_block: rb2,
+                withdrawn_at: wa2,
+            },
+        ) => Some(
+            s1 == s2
+                && q1.eq(*q2).unwrap_or(false)
+                && t1 == t2
+                && w1 == w2
+                && aw1 == aw2
+                && r1 == r2
+                && rb1 == rb2
+                && wa1 == wa2,
+        ),
+        (
+            TokensUnwrapped {
+                quantity: q1,
+                underlying_token: u1,
+                unwrap_tx_hash: h1,
+                unwrapped_amount: a1,
+                unwrap_block: b1,
+                unwrapped_at: t1,
+            },
+            TokensUnwrapped {
+                quantity: q2,
+                underlying_token: u2,
+                unwrap_tx_hash: h2,
+                unwrapped_amount: a2,
+                unwrap_block: b2,
+                unwrapped_at: t2,
+            },
+        ) => Some(
+            q1.is_some() == q2.is_some()
+                && q1
+                    .zip(*q2)
+                    .is_none_or(|(q1, q2)| q1.eq(q2).unwrap_or(false))
+                && u1 == u2
+                && h1 == h2
+                && b1 == b2
+                && a1 == a2
+                && t1 == t2,
+        ),
+        _ => None,
+    }
+}
+
+fn eq_delivery_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) -> Option<bool> {
+    use EquityRedemptionEvent::{
+        Detected, DetectionFailed, RedemptionRejected, TokensSent, TransferFailed,
+    };
+
+    match (left, right) {
+        (
+            TransferFailed {
+                tx_hash: h1,
+                reason: r1,
+                failed_at: f1,
+            },
+            TransferFailed {
+                tx_hash: h2,
+                reason: r2,
+                failed_at: f2,
+            },
+        ) => Some(h1 == h2 && r1 == r2 && f1 == f2),
+        (
+            TokensSent {
+                redemption_wallet: w1,
+                redemption_tx: t1,
+                sent_at: s1,
+            },
+            TokensSent {
+                redemption_wallet: w2,
+                redemption_tx: t2,
+                sent_at: s2,
+            },
+        ) => Some(w1 == w2 && t1 == t2 && s1 == s2),
+        (
+            DetectionFailed {
+                failure: f1,
+                failed_at: fa1,
+            },
+            DetectionFailed {
+                failure: f2,
+                failed_at: fa2,
+            },
+        ) => Some(f1 == f2 && fa1 == fa2),
+        (
+            Detected {
+                tokenization_request_id: t1,
+                detected_at: d1,
+            },
+            Detected {
+                tokenization_request_id: t2,
+                detected_at: d2,
+            },
+        ) => Some(t1 == t2 && d1 == d2),
+        (
+            RedemptionRejected {
+                reason: r1,
+                rejected_at: ra1,
+            },
+            RedemptionRejected {
+                reason: r2,
+                rejected_at: ra2,
+            },
+        ) => Some(r1 == r2 && ra1 == ra2),
+        _ => None,
+    }
+}
+
+fn eq_terminal_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) -> Option<bool> {
+    use EquityRedemptionEvent::{Completed, OperatorReconciled, ProviderCompletionRecovered};
+
+    match (left, right) {
+        (Completed { completed_at: c1 }, Completed { completed_at: c2 }) => Some(c1 == c2),
+        (
+            ProviderCompletionRecovered {
+                tokenization_request_id: id1,
+                recovered_at: t1,
+            },
+            ProviderCompletionRecovered {
+                tokenization_request_id: id2,
+                recovered_at: t2,
+            },
+        ) => Some(id1 == id2 && t1 == t2),
+        (
+            OperatorReconciled {
+                reason: r1,
+                reconciled_at: t1,
+            },
+            OperatorReconciled {
+                reason: r2,
+                reconciled_at: t2,
+            },
+        ) => Some(r1 == r2 && t1 == t2),
+        _ => None,
     }
 }
 

@@ -856,16 +856,20 @@ impl Raindex for FixtureRaindex {
         &self,
         _token: Address,
         _vault_id: RaindexVaultId,
-        _from_block: u64,
-    ) -> Result<Option<(TxHash, U256)>, RaindexError> {
-        Ok(self.pending_withdraw.lock().await.map(|(_, amount)| {
-            (
-                TxHash::left_padding_from(
-                    simulated_transfer_uuid("redeem-withdraw-tx", self.day).as_bytes(),
-                ),
-                amount,
-            )
-        }))
+        from_block: u64,
+    ) -> Result<(TxHash, U256), RaindexError> {
+        self.pending_withdraw
+            .lock()
+            .await
+            .map(|(_, amount)| {
+                (
+                    TxHash::left_padding_from(
+                        simulated_transfer_uuid("redeem-withdraw-tx", self.day).as_bytes(),
+                    ),
+                    amount,
+                )
+            })
+            .ok_or(RaindexError::ScanInconclusive { from_block })
     }
 
     async fn confirm_tx_receipt(
