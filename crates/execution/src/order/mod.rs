@@ -88,7 +88,7 @@ pub enum ClientOrderIdError {
     InvalidUuid(#[from] uuid::Error),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OrderPlacement<OrderId> {
     pub order_id: OrderId,
     pub symbol: Symbol,

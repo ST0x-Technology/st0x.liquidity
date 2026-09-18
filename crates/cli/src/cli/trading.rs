@@ -69,6 +69,7 @@ impl OrderPlacer for CliOrderPlacer {
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
+            placed_at: placement.placed_at,
             is_extended_hours: placement.extended_hours,
             limit_price: placement.limit_price,
         })
@@ -1851,6 +1852,7 @@ mod tests {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
                 placed_shares: order.shares,
+                placed_at: Utc::now(),
                 is_extended_hours: false,
                 limit_price: None,
             })
@@ -1863,6 +1865,7 @@ mod tests {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
                 placed_shares: order.shares,
+                placed_at: Utc::now(),
                 is_extended_hours: order.extended_hours,
                 limit_price: Some(order.limit_price),
             })
@@ -2465,6 +2468,7 @@ mod tests {
                     "qty": quantity,
                     "side": side,
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2524,6 +2528,7 @@ mod tests {
                     "qty": "10",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2583,6 +2588,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2649,6 +2655,7 @@ mod tests {
                     "status": "new",
                     "extended_hours": true,
                     "limit_price": "24.20",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });

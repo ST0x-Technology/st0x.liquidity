@@ -61,12 +61,8 @@ fn write_market_session_details<W: Write>(
 ) -> anyhow::Result<()> {
     writeln!(stdout, "   Session: {:?}", status.session())?;
 
-    if let MarketSessionStatus::Extended {
-        closes_at,
-        post_close_gap,
-    } = status
-    {
-        match closes_at {
+    if status.session == st0x_execution::MarketSession::Extended {
+        match status.extended_session_closes_at {
             Some(closes_at) => writeln!(
                 stdout,
                 "   Extended session closes at: {} ({} ET)",
@@ -76,7 +72,7 @@ fn write_market_session_details<W: Write>(
             None => writeln!(stdout, "   Extended session closes at: n/a")?,
         }
 
-        writeln!(stdout, "   Post-close gap: {post_close_gap:?}")?;
+        writeln!(stdout, "   Post-close gap: {:?}", status.post_close_gap)?;
     } else {
         writeln!(stdout, "   Extended session closes at: n/a")?;
     }
@@ -364,8 +360,11 @@ mod tests {
 
         write_market_session_details(
             &mut stdout,
-            MarketSessionStatus::Extended {
-                closes_at: Some(closes_at),
+            MarketSessionStatus {
+                session: st0x_execution::MarketSession::Extended,
+                session_opens_at: None,
+                regular_session_closes_at: None,
+                extended_session_closes_at: Some(closes_at),
                 post_close_gap: st0x_execution::PostCloseGap::MultiDayClosure,
             },
         )
@@ -386,9 +385,9 @@ mod tests {
     #[test]
     fn market_session_details_omit_metadata_for_non_extended_variants() {
         for status in [
-            MarketSessionStatus::Regular,
-            MarketSessionStatus::Overnight,
-            MarketSessionStatus::Closed,
+            MarketSessionStatus::without_close_metadata(st0x_execution::MarketSession::Regular),
+            MarketSessionStatus::without_close_metadata(st0x_execution::MarketSession::Overnight),
+            MarketSessionStatus::without_close_metadata(st0x_execution::MarketSession::Closed),
         ] {
             let mut stdout = Vec::new();
 

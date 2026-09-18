@@ -56,11 +56,14 @@ pub struct MockExecutor {
     health: Health,
     inventory_result: InventoryResult,
     order_status_override: Option<OrderState>,
+    recovered_order: Option<OrderPlacement<String>>,
     market_open: bool,
     market_session_override: Option<MarketSession>,
     market_session_status_calls: Arc<AtomicU64>,
     market_session_status_failure: Option<String>,
-    extended_session_close_metadata_override: Option<(DateTime<Utc>, PostCloseGap)>,
+    regular_session_closes_at_override: Option<DateTime<Utc>>,
+    extended_session_closes_at_override: Option<DateTime<Utc>>,
+    post_close_gap_override: PostCloseGap,
     primary_limit_quote_override: Option<LatestQuote>,
     latest_quote_override: Option<LatestQuote>,
     position_mark_override: Option<Positive<Usd>>,
@@ -75,11 +78,14 @@ impl MockExecutor {
             health: Health::Healthy,
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
+            recovered_order: None,
             market_open: true,
             market_session_override: None,
             market_session_status_calls: Arc::new(AtomicU64::new(0)),
             market_session_status_failure: None,
-            extended_session_close_metadata_override: None,
+            regular_session_closes_at_override: None,
+            extended_session_closes_at_override: None,
+            post_close_gap_override: PostCloseGap::Unknown,
             primary_limit_quote_override: None,
             latest_quote_override: None,
             position_mark_override: None,
@@ -126,6 +132,12 @@ impl MockExecutor {
         self
     }
 
+    #[must_use]
+    pub fn with_recovered_order(mut self, order: OrderPlacement<String>) -> Self {
+        self.recovered_order = Some(order);
+        self
+    }
+
     /// Configures the executor to report the market as closed (open is
     /// the default).
     #[must_use]
@@ -165,7 +177,26 @@ impl MockExecutor {
         closes_at: DateTime<Utc>,
         post_close_gap: PostCloseGap,
     ) -> Self {
-        self.extended_session_close_metadata_override = Some((closes_at, post_close_gap));
+        self.extended_session_closes_at_override = Some(closes_at);
+        self.post_close_gap_override = post_close_gap;
+        self
+    }
+
+    #[must_use]
+    pub fn with_regular_session_closes_at(mut self, closes_at: DateTime<Utc>) -> Self {
+        self.regular_session_closes_at_override = Some(closes_at);
+        self
+    }
+
+    #[must_use]
+    pub fn with_extended_session_closes_at(mut self, closes_at: DateTime<Utc>) -> Self {
+        self.extended_session_closes_at_override = Some(closes_at);
+        self
+    }
+
+    #[must_use]
+    pub fn with_post_close_gap(mut self, post_close_gap: PostCloseGap) -> Self {
+        self.post_close_gap_override = post_close_gap;
         self
     }
 
@@ -295,6 +326,12 @@ impl Default for MockExecutor {
 
 #[async_trait]
 impl Executor for MockExecutor {
+    async fn recover_order_by_client_id(
+        &self,
+        _order: &MarketOrder,
+    ) -> Result<Option<OrderPlacement<Self::OrderId>>, Self::Error> {
+        Ok(self.recovered_order.clone())
+    }
     type Error = ExecutionError;
     type OrderId = String;
     type Ctx = MockExecutorCtx;
@@ -461,17 +498,23 @@ impl Executor for MockExecutor {
         }
 
         let session = self.market_session().await?;
-        let status = match (session, self.extended_session_close_metadata_override) {
-            (MarketSession::Extended, Some((closes_at, post_close_gap))) => {
-                MarketSessionStatus::Extended {
-                    closes_at: Some(closes_at),
-                    post_close_gap,
-                }
-            }
-            (session, _) => MarketSessionStatus::without_close_metadata(session),
-        };
-
-        Ok(status)
+        Ok(MarketSessionStatus {
+            session,
+            session_opens_at: None,
+            regular_session_closes_at: match session {
+                MarketSession::Regular => self.regular_session_closes_at_override,
+                _ => None,
+            },
+            extended_session_closes_at: match session {
+                MarketSession::Extended => self.extended_session_closes_at_override,
+                _ => None,
+            },
+            post_close_gap: if session == MarketSession::Extended {
+                self.post_close_gap_override
+            } else {
+                PostCloseGap::Unavailable
+            },
+        })
     }
 
     async fn fetch_position_mark(
@@ -788,13 +831,22 @@ mod tests {
             .with_market_session(MarketSession::Extended)
             .with_extended_session_close_metadata(closes_at, PostCloseGap::MultiDayClosure);
 
-        assert_eq!(
-            executor.market_session_status().await.unwrap(),
-            MarketSessionStatus::Extended {
-                closes_at: Some(closes_at),
-                post_close_gap: PostCloseGap::MultiDayClosure,
-            }
-        );
+        let status = executor.market_session_status().await.unwrap();
+        assert_eq!(status.session(), MarketSession::Extended);
+        assert_eq!(status.extended_session_closes_at, Some(closes_at));
+        assert_eq!(status.post_close_gap, PostCloseGap::MultiDayClosure);
+    }
+
+    #[tokio::test]
+    async fn market_session_status_omits_regular_close_on_non_regular_sessions() {
+        let closes_at = Utc::now();
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Closed)
+            .with_regular_session_closes_at(closes_at);
+
+        let status = executor.market_session_status().await.unwrap();
+        assert_eq!(status.session(), MarketSession::Closed);
+        assert_eq!(status.regular_session_closes_at, None);
     }
 
     #[tokio::test]
@@ -804,7 +856,7 @@ mod tests {
 
         assert_eq!(
             executor.market_session_status().await.unwrap(),
-            MarketSessionStatus::Regular
+            MarketSessionStatus::without_close_metadata(MarketSession::Regular)
         );
     }
 

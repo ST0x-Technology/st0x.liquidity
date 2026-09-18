@@ -246,10 +246,10 @@ rule is SPEC.md's overnight pricing failure policy).
 The calendar-derived interval between the current extended-session close and the
 next trading session. `PostCloseGap` distinguishes an ordinary overnight (next
 session is the following calendar day), a multi-day closure (weekend or exchange
-holiday), and unknown next-session metadata. The distinction drives close
-flattening without hardcoding weekdays or holiday dates. An ordinary overnight
-gap leads into a valid overnight session; a multi-day closure means the
-overnight session does not run that evening.
+holiday), and unknown next-session metadata. The distinction drives legacy close
+flattening in observation mode. Enabled pricing-schedule coordination instead
+flattens before every actual eligible closure, including ordinary overnight
+gaps, without hardcoding weekdays or holiday dates.
 
 ### Position
 

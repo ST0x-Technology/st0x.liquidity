@@ -927,8 +927,8 @@ fn default_assets() -> ChainAssets {
 
 /// Constructs the CQRS frameworks needed by the integration tests.
 ///
-/// Uses `ExecutorOrderPlacer(MockExecutor::new())` so that the `PlaceOrder`
-/// command atomically calls the mock executor and emits `Placed` + `Submitted`.
+/// Uses the mock executor without a close-flatten policy so that `PlaceOrder`
+/// atomically calls the mock executor and emits `Placed` + `Submitted`.
 ///
 /// Creates a `Projection` wired to the `StoreBuilder` so it receives event
 /// dispatches, while the same projection is returned for type-safe loading.
@@ -950,7 +950,10 @@ async fn create_test_cqrs(
         .unwrap();
 
     let order_placer: Arc<dyn crate::offchain::order::OrderPlacer> =
-        Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+        Arc::new(ExecutorOrderPlacer {
+            executor: MockExecutor::new(),
+            close_flatten_policy: None,
+        });
 
     let (offchain_order, offchain_order_projection) =
         StoreBuilder::<OffchainOrder>::new(pool.clone())

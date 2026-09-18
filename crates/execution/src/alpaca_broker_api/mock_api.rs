@@ -1432,6 +1432,8 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     "side": side.to_string(),
                     "status": "new",
                     "filled_avg_price": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "submitted_at": "2025-01-01T00:00:01Z",
                     "client_order_id": client_order_id,
                 }),
             )

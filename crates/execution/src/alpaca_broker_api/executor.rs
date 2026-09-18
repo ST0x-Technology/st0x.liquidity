@@ -362,6 +362,13 @@ impl Executor for AlpacaBrokerApi {
         }))
     }
 
+    async fn recover_order_by_client_id(
+        &self,
+        order: &MarketOrder,
+    ) -> Result<Option<OrderPlacement<Self::OrderId>>, Self::Error> {
+        super::order::recover_order_by_client_id(&self.client, order).await
+    }
+
     fn to_supported_executor(&self) -> SupportedExecutor {
         SupportedExecutor::AlpacaBrokerApi
     }
@@ -1802,6 +1809,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         })
@@ -1829,6 +1837,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         })
@@ -2132,6 +2141,7 @@ mod tests {
                     "qty": "1951",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2439,6 +2449,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2520,6 +2531,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2664,6 +2676,7 @@ mod tests {
                     "qty": "1951",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });
@@ -2749,6 +2762,7 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "status": "new",
+                                        "created_at": "2026-09-17T10:15:29Z",
                     "filled_avg_price": null
                 }));
         });

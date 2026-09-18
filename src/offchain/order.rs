@@ -39,7 +39,7 @@ use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
@@ -100,6 +100,13 @@ pub enum JobError {
 /// the idempotent placement with the same broker `client_order_id`.
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceOffchainOrderError {
+    #[error("Broker placement deferred; pending intent is retained")]
+    Deferred,
+    #[error("Broker placement admission failed; pending intent is retained")]
+    Admission {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("Offchain order command failed: {0}")]
     Command(#[from] SendError<OffchainOrder>),
     #[error("Broker placement was rate-limited")]
@@ -231,6 +238,17 @@ pub async fn place_offchain_order_at_broker(
         placed_at,
     } = placement;
 
+    // Admission gates this attempt's request (a Market recovery attempt must
+    // never re-drive a stored extended-hours limit), while the broker call
+    // below replays the durable terms. Keep the requested kind for the
+    // admission check; `kind` is shadowed by the durable terms after load.
+    let admission_kind = kind.clone();
+
+    // Record intent before any admission or broker call so every outcome
+    // below -- Deferred, admission error, broker failure -- retains a
+    // recoverable Pending order instead of stranding a live broker order
+    // with no local record. Re-sends are replay-validated (same
+    // symbol/direction/executor is a no-op), so retries are safe.
     store
         .send(
             offchain_order_id,
@@ -251,6 +269,11 @@ pub async fn place_offchain_order_at_broker(
     // outcome already landed (Submitted, or a terminal state) must not place a
     // second time. An exhaustive match forces a conscious decision for any
     // future state rather than letting it silently skip placement.
+    //
+    // The broker call replays the DURABLE Pending terms, not this attempt's
+    // request: a retry may carry a different kind (e.g. a Market recovery
+    // attempt for a stored extended-hours limit), and the recorded intent is
+    // authoritative.
     let placed = store.load(offchain_order_id).await?;
     let (symbol, shares, direction, client_order_id, kind) = match placed {
         Some(OffchainOrder::Pending {
@@ -306,27 +329,47 @@ pub async fn place_offchain_order_at_broker(
         Direction::Sell => "sell",
     };
 
-    let placement = match kind {
-        CounterTradeOrderKind::Market => {
-            let market_order = MarketOrder {
-                symbol,
+    // Admission sees the requested kind: a schedule-aware Market recovery
+    // must defer in the Extended session instead of re-driving the stored
+    // extended-hours limit. The broker call below still replays the durable
+    // terms once admission passes.
+    let admission = order_placer
+        .prepare_placement(
+            &MarketOrder {
+                symbol: symbol.clone(),
                 shares,
                 direction,
-                client_order_id,
-            };
-            order_placer.place_market_order(market_order).await
-        }
-        CounterTradeOrderKind::ExtendedHoursLimit { limit_price, .. } => {
-            let limit_order = LimitOrder {
-                symbol,
-                shares,
-                direction,
-                limit_price,
-                extended_hours: true,
-                client_order_id,
-            };
-            order_placer.place_limit_order(limit_order).await
-        }
+                client_order_id: client_order_id.clone(),
+            },
+            &admission_kind,
+        )
+        .await
+        .map_err(|source| PlaceOffchainOrderError::Admission { source })?;
+    let placement = match admission {
+        PlacementAdmission::Deferred => return Err(PlaceOffchainOrderError::Deferred),
+        PlacementAdmission::Recovered(placement) => Ok(placement),
+        PlacementAdmission::New => match kind {
+            CounterTradeOrderKind::Market => {
+                let market_order = MarketOrder {
+                    symbol,
+                    shares,
+                    direction,
+                    client_order_id,
+                };
+                order_placer.place_market_order(market_order).await
+            }
+            CounterTradeOrderKind::ExtendedHoursLimit { limit_price, .. } => {
+                let limit_order = LimitOrder {
+                    symbol,
+                    shares,
+                    direction,
+                    limit_price,
+                    extended_hours: true,
+                    client_order_id,
+                };
+                order_placer.place_limit_order(limit_order).await
+            }
+        },
     };
     let outcome = match placement {
         Ok(result) => {
@@ -2715,6 +2758,8 @@ fn reconcile_terminal_fill(
 pub struct OrderPlacementResult {
     pub executor_order_id: ExecutorOrderId,
     pub placed_shares: Positive<FractionalShares>,
+    /// Broker-side placement time used by reprice/cancel sweeps.
+    pub placed_at: DateTime<Utc>,
     /// Whether the broker holds the order as extended-hours. Usually echoes
     /// the requested kind, but a duplicate-`client_order_id` placement adopts
     /// the order a prior attempt already created -- possibly with different
@@ -2754,6 +2799,13 @@ pub struct BrokerOrderPlacement {
 /// implementations to be used via `Arc<dyn OrderPlacer>`.
 #[async_trait]
 pub trait OrderPlacer: Send + Sync {
+    async fn prepare_placement(
+        &self,
+        _order: &MarketOrder,
+        _kind: &CounterTradeOrderKind,
+    ) -> Result<PlacementAdmission, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(PlacementAdmission::New)
+    }
     async fn place_market_order(
         &self,
         order: MarketOrder,
@@ -2885,18 +2937,103 @@ pub trait OrderPlacer: Send + Sync {
 
 /// Bridges `Executor` (which has associated types and is not object-safe)
 /// to `OrderPlacer` (object-safe).
-pub(crate) struct ExecutorOrderPlacer<E>(pub E);
+pub(crate) struct ExecutorOrderPlacer<E> {
+    pub(crate) executor: E,
+    pub(crate) close_flatten_policy:
+        Option<crate::trading::offchain::close_flatten::CloseFlattenPolicy>,
+}
+
+pub enum PlacementAdmission {
+    New,
+    Recovered(OrderPlacementResult),
+    Deferred,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Recovered broker order does not match the pending symbol and direction")]
+struct RecoveredOrderMismatch;
+
+#[derive(Debug, Clone, Copy)]
+enum PlacementDeferralReason {
+    Session,
+    BrokerBoundary,
+    ScheduleClosed,
+}
+
+impl PlacementDeferralReason {
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Session => "broker_session",
+            Self::BrokerBoundary => "broker_boundary",
+            Self::ScheduleClosed => "schedule_closed",
+        }
+    }
+}
 
 #[async_trait]
 impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
+    async fn prepare_placement(
+        &self,
+        order: &MarketOrder,
+        kind: &CounterTradeOrderKind,
+    ) -> Result<PlacementAdmission, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(policy) = &self.close_flatten_policy else {
+            return Ok(PlacementAdmission::New);
+        };
+        if !policy.schedule_enabled() {
+            return Ok(PlacementAdmission::New);
+        }
+        if let Some(existing) = self.executor.recover_order_by_client_id(order).await? {
+            if existing.symbol != order.symbol || existing.direction != order.direction {
+                return Err(Box::new(RecoveredOrderMismatch));
+            }
+            return Ok(PlacementAdmission::Recovered(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new(&existing.order_id),
+                placed_shares: existing.shares,
+                placed_at: existing.placed_at,
+                is_extended_hours: existing.extended_hours,
+                limit_price: existing.limit_price,
+            }));
+        }
+        let status = self.executor.market_session_status().await?;
+        let eligible = match (status.session, kind) {
+            (MarketSession::Regular, CounterTradeOrderKind::Market)
+            | (MarketSession::Extended, CounterTradeOrderKind::ExtendedHoursLimit { .. }) => true,
+            (MarketSession::Regular, CounterTradeOrderKind::ExtendedHoursLimit { .. })
+            | (MarketSession::Extended, CounterTradeOrderKind::Market)
+            | (
+                MarketSession::Overnight,
+                CounterTradeOrderKind::Market | CounterTradeOrderKind::ExtendedHoursLimit { .. },
+            )
+            | (
+                MarketSession::Closed,
+                CounterTradeOrderKind::Market | CounterTradeOrderKind::ExtendedHoursLimit { .. },
+            ) => false,
+        };
+        let observed = policy.observe_broker(&order.symbol, status).await;
+        let reason = if !eligible {
+            PlacementDeferralReason::Session
+        } else if !observed {
+            PlacementDeferralReason::BrokerBoundary
+        } else if !policy.allows_new_order(&order.symbol, Utc::now()) {
+            PlacementDeferralReason::ScheduleClosed
+        } else {
+            return Ok(PlacementAdmission::New);
+        };
+        counter!("hedge_placement_deferred_total", "reason" => reason.metric_label()).increment(1);
+        info!(symbol = %order.symbol, client_order_id = %order.client_order_id,
+            reason = reason.metric_label(), "Retaining hedge intent until broker admission permits placement");
+        Ok(PlacementAdmission::Deferred)
+    }
     async fn place_market_order(
         &self,
         order: MarketOrder,
     ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        let placement = self.0.place_market_order(order).await?;
+        let placement = self.executor.place_market_order(order).await?;
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
+            placed_at: placement.placed_at,
             is_extended_hours: placement.extended_hours,
             limit_price: placement.limit_price,
         })
@@ -2906,10 +3043,11 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         &self,
         order: LimitOrder,
     ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
-        let placement = self.0.place_limit_order(order).await?;
+        let placement = self.executor.place_limit_order(order).await?;
         Ok(OrderPlacementResult {
             executor_order_id: ExecutorOrderId::new(&placement.order_id),
             placed_shares: placement.shares,
+            placed_at: placement.placed_at,
             is_extended_hours: placement.extended_hours,
             limit_price: placement.limit_price,
         })
@@ -2919,8 +3057,8 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         &self,
         executor_order_id: &ExecutorOrderId,
     ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        let order_id = self.0.parse_order_id(executor_order_id.as_ref())?;
-        Ok(self.0.cancel_order(&order_id).await?)
+        let order_id = self.executor.parse_order_id(executor_order_id.as_ref())?;
+        Ok(self.executor.cancel_order(&order_id).await?)
     }
 
     async fn get_order_by_client_order_id(
@@ -2928,7 +3066,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         client_order_id: &ClientOrderId,
     ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self
-            .0
+            .executor
             .get_order_by_client_order_id(client_order_id)
             .await?
             .map(|placement| BrokerOrderPlacement {
@@ -2948,7 +3086,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         reserved: BuyingPowerReservationCents,
     ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self
-            .0
+            .executor
             .preflight_counter_trade_with_reserved_buying_power(order, reserved)
             .await?)
     }
@@ -2958,21 +3096,21 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         symbol: &Symbol,
     ) -> Result<Option<st0x_execution::Positive<Usd>>, Box<dyn std::error::Error + Send + Sync>>
     {
-        Ok(self.0.fetch_position_mark(symbol).await?)
+        Ok(self.executor.fetch_position_mark(symbol).await?)
     }
 
     async fn fetch_primary_limit_quote(
         &self,
         symbol: &Symbol,
     ) -> Result<Option<LatestQuote>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.fetch_primary_limit_quote(symbol).await?)
+        Ok(self.executor.fetch_primary_limit_quote(symbol).await?)
     }
 
     async fn fetch_latest_quote(
         &self,
         symbol: &Symbol,
     ) -> Result<Option<LatestQuote>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.fetch_latest_quote(symbol).await?)
+        Ok(self.executor.fetch_latest_quote(symbol).await?)
     }
 
     async fn preflight_counter_trade_at_price(
@@ -2981,7 +3119,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         reference_price: Positive<Usd>,
     ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self
-            .0
+            .executor
             .preflight_counter_trade_at_price(order, reference_price)
             .await?)
     }
@@ -2993,7 +3131,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         reserved: BuyingPowerReservationCents,
     ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self
-            .0
+            .executor
             .preflight_counter_trade_at_price_with_reserved_buying_power(
                 order,
                 reference_price,
@@ -3005,21 +3143,21 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
     async fn market_session(
         &self,
     ) -> Result<st0x_execution::MarketSession, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.market_session().await?)
+        Ok(self.executor.market_session().await?)
     }
 
     async fn market_session_status(
         &self,
     ) -> Result<MarketSessionStatus, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.market_session_status().await?)
+        Ok(self.executor.market_session_status().await?)
     }
 
     async fn get_order_status(
         &self,
         executor_order_id: &ExecutorOrderId,
     ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>> {
-        let order_id = self.0.parse_order_id(executor_order_id.as_ref())?;
-        Ok(self.0.get_order_status(&order_id).await?)
+        let order_id = self.executor.parse_order_id(executor_order_id.as_ref())?;
+        Ok(self.executor.get_order_status(&order_id).await?)
     }
 }
 
@@ -3036,6 +3174,7 @@ pub fn noop_order_placer() -> Arc<dyn OrderPlacer> {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("noop"),
                 placed_shares: noop_placed_shares(order.shares),
+                placed_at: Utc::now(),
                 is_extended_hours: false,
                 limit_price: None,
             })
@@ -3048,6 +3187,7 @@ pub fn noop_order_placer() -> Arc<dyn OrderPlacer> {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("noop-limit"),
                 placed_shares: noop_placed_shares(order.shares),
+                placed_at: Utc::now(),
                 is_extended_hours: order.extended_hours,
                 limit_price: Some(order.limit_price),
             })
@@ -3491,7 +3631,10 @@ mod tests {
             Positive::new(Usd::new(float!(101))).unwrap(),
         )
         .unwrap();
-        let placer = ExecutorOrderPlacer(MockExecutor::new().with_primary_limit_quote(quote));
+        let placer = ExecutorOrderPlacer {
+            executor: MockExecutor::new().with_primary_limit_quote(quote),
+            close_flatten_policy: None,
+        };
 
         assert_eq!(
             placer
@@ -4691,6 +4834,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("OVERFILL"),
                     placed_shares: Positive::new(FractionalShares::new(overfilled)).unwrap(),
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -4801,6 +4945,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("REPLAYED"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: true,
                     limit_price: Some(order.limit_price),
                 })
@@ -4962,6 +5107,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ADOPTED_EXT_LIMIT"),
                         placed_shares: order.shares,
+                        placed_at: Utc::now(),
                         is_extended_hours: true,
                         limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
                     })
@@ -6021,6 +6167,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("ORD-OK"),
                     placed_shares: noop_placed_shares(order.shares),
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -6366,6 +6513,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-CANCELLED"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -6440,6 +6588,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-CANCELLED-PRICED"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -6529,6 +6678,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -6617,6 +6767,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-GONE"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -6939,6 +7090,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7033,6 +7185,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7113,6 +7266,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7206,6 +7360,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7297,6 +7452,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7389,6 +7545,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7476,6 +7633,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7579,6 +7737,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7661,6 +7820,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-OK"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7887,6 +8047,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-NEG-FILL"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -7967,6 +8128,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-NEG-UNPRICED"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })
@@ -8044,6 +8206,7 @@ mod tests {
                     Ok(OrderPlacementResult {
                         executor_order_id: ExecutorOrderId::new("ORD-NEG-PARTIAL"),
                         placed_shares: noop_placed_shares(order.shares),
+                        placed_at: Utc::now(),
                         is_extended_hours: false,
                         limit_price: None,
                     })

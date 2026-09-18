@@ -66,10 +66,12 @@ mod performance;
 mod portfolio_snapshot;
 mod position;
 mod position_check;
+mod pricing_identity;
 mod rebalancing;
 mod startup;
 mod telemetry;
 mod trading;
+mod trading_schedule;
 #[cfg(feature = "mock")]
 pub use st0x_tokenization::mock_api;
 mod tokenized_equity_mint;
@@ -348,6 +350,7 @@ async fn run_bot_session_inner(
                 ethereum_gas_monitor: startup_barrier.token(),
                 hyperevm_gas_monitor: startup_barrier.token(),
                 robinhood_gas_monitor: startup_barrier.token(),
+                trading_schedule_monitor: startup_barrier.token(),
             },
         },
         #[cfg(any(test, feature = "test-support"))]
@@ -873,6 +876,7 @@ mod tests {
                 ethereum_gas_monitor: barrier.token(),
                 hyperevm_gas_monitor: barrier.token(),
                 robinhood_gas_monitor: barrier.token(),
+                trading_schedule_monitor: barrier.token(),
             },
         }
     }
