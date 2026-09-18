@@ -218,15 +218,12 @@ pub enum EvmError {
     )]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     ReplacementUnderpriced { attempts: u32 },
-    /// The RPC reported that the exact signed transaction is already in its
-    /// mempool, but did not include enough information to recover its hash.
-    /// The broadcast may have succeeded; callers must reconcile chain state
-    /// instead of resubmitting or invalidating the nonce cache.
-    #[error(
-        "transaction at nonce {nonce} is already known by the RPC, but its hash was not returned"
-    )]
+    /// The configured filler chain returned without producing a signed
+    /// transaction envelope. Broadcasting is impossible, and no transaction
+    /// reached the RPC.
+    #[error("transaction fillers did not produce a signed envelope")]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    SubmissionAlreadyKnown { nonce: u64 },
+    TransactionPreparation,
     /// Bumping the EIP-1559 fee for a replacement transaction overflowed
     /// `u128`. Only reachable if the RPC returns an absurd fee estimate;
     /// surfaced as a hard error rather than silently wrapping a financial
@@ -295,7 +292,7 @@ impl EvmError {
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::SubmissionAlreadyKnown { .. } => false,
+            Self::TransactionPreparation => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
             #[cfg(feature = "local-signer")]
@@ -327,7 +324,7 @@ impl EvmError {
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::SubmissionAlreadyKnown { .. } => false,
+            Self::TransactionPreparation => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
             #[cfg(feature = "local-signer")]
@@ -373,7 +370,7 @@ impl EvmError {
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::SubmissionAlreadyKnown { .. } => None,
+            Self::TransactionPreparation => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => None,
             #[cfg(feature = "local-signer")]
@@ -462,24 +459,6 @@ impl EvmError {
 
         token.parse().ok().map(NextNonceHint)
     }
-    /// The transaction hash embedded in an "already known" RPC response, if
-    /// the node or proxy included one in its message or JSON error data.
-    ///
-    /// Providers disagree on response shape, so this deliberately accepts a
-    /// hash from either field but only when it is an exact `0x`-prefixed
-    /// 32-byte value. A response without a hash remains indeterminate and
-    /// must be reconciled against chain state by the caller.
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    pub(crate) fn already_known_tx_hash(&self) -> Option<TxHash> {
-        let payload = self.already_known_payload()?;
-
-        tx_hash_in_text(&payload.message).or_else(|| {
-            payload
-                .data
-                .as_ref()
-                .and_then(|data| tx_hash_in_text(data.get()))
-        })
-    }
 
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     pub(crate) fn is_already_known(&self) -> bool {
@@ -522,26 +501,6 @@ impl EvmError {
             _ => false,
         }
     }
-}
-
-#[cfg(any(feature = "turnkey", feature = "local-signer"))]
-fn tx_hash_in_text(text: &str) -> Option<TxHash> {
-    text.match_indices("0x").find_map(|(start, _)| {
-        let end = start.checked_add(66)?;
-        let candidate = text.get(start..end)?;
-        let hex = candidate.strip_prefix("0x")?;
-
-        if hex.chars().all(|character| character.is_ascii_hexdigit())
-            && text
-                .get(end..)
-                .and_then(|suffix| suffix.chars().next())
-                .is_none_or(|character| !character.is_ascii_hexdigit())
-        {
-            candidate.parse().ok()
-        } else {
-            None
-        }
-    })
 }
 
 impl From<std::convert::Infallible> for EvmError {

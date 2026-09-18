@@ -3768,10 +3768,13 @@ action that already succeeded. Each phase records its intent (and the relevant
 chain head) before the action, so resume can scan the chain to adopt an
 already-submitted action instead of re-issuing it:
 
-- `WithdrawalSubmitting` / `BridgingSubmitting`: scan the source chain for an
-  already-submitted withdrawal / burn (`find_recent_withdrawal` /
-  `find_recent_burn`) from the captured head and adopt it rather than
-  withdrawing / burning twice.
+- `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
+  (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
+  log scan is not proof of absence because the submission may still be pending
+  or hidden by a load-balanced RPC backend; it remains unresolved and must never
+  trigger another withdrawal.
+- `BridgingSubmitting`: scan for an already-submitted burn (`find_recent_burn`)
+  and adopt it rather than burning twice.
 - `Attested`: the CCTP mint is irreversible -- re-calling `receiveMessage`
   reverts on the already-used nonce, which would otherwise turn a successfully
   minted transfer into a terminal `BridgingFailed`. Resume must scan the

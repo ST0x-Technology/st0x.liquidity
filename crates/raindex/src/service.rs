@@ -46,17 +46,14 @@ sol!(
 
 const USDC_DECIMALS: u8 = 6;
 
-/// Number of `eth_getLogs` scans that must agree the effect is absent before a
-/// resume re-executes an irreversible withdraw. Defends against a single
-/// load-balanced RPC node lagging and returning a false-empty result.
+/// Number of `eth_getLogs` attempts made before an unresolved withdrawal
+/// submission is surfaced. Repeated scans improve recovery when one
+/// load-balanced backend is briefly stale, but an empty result never authorizes
+/// another irreversible withdrawal.
 const SCAN_ATTEMPTS: u32 = 5;
 
 /// Backoff between scan retries; different load-balanced nodes may answer each.
 const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
-
-/// Blocks the chain head must be past `from_block` before an empty scan is
-/// trusted as a true absence (the on-chain effect lands at/after `from_block`).
-const SCAN_FINALITY_MARGIN: u64 = 2;
 
 /// Service for managing Rain OrderBook vault operations.
 ///
@@ -384,9 +381,8 @@ impl<E: Evm> RaindexService<E> {
     ///   settles atomically -- it reverts `InsufficientVaultLiquidity` rather
     ///   than forward a short fill -- so on this path `event.amount` always
     ///   equals the requested amount; there is no partial-fill case to
-    ///   reconcile (an under-funded withdraw reverts and emits no event, which
-    ///   this scan correctly reports as absent). Only the backwards-compat
-    ///   `WithdrawV2` branch below can surface a partial fill.
+    ///   reconcile. Only the backwards-compat `WithdrawV2` branch below can
+    ///   surface a partial fill.
     /// * **Backwards-compat path (orderbook):** `IRaindexV6.WithdrawV2`
     ///   filtered by `sender == self.owner`. Matches only pre-migration
     ///   withdrawals the bot submitted directly against the orderbook -- once
@@ -394,25 +390,23 @@ impl<E: Evm> RaindexService<E> {
     ///   this branch becomes dead code.
     ///
     /// Crash-safe withdrawal recovery: a transfer records the chain head before
-    /// the on-chain withdraw, so on resume this detects an already-submitted
-    /// withdrawal and the caller adopts it instead of re-issuing (which would
-    /// double-spend the vault). The head is captured before submitting, so this
-    /// transfer's withdraw lands strictly after `from_block`; the scan excludes
-    /// the `from_block` block itself so an earlier withdrawal from the same
-    /// vault is never adopted.
+    /// the on-chain withdraw, so on resume this detects an already-mined
+    /// withdrawal and the caller adopts it instead of re-issuing. The head is
+    /// captured before submitting, so this transfer's withdraw lands strictly
+    /// after `from_block`; the scan excludes the `from_block` block itself so an
+    /// earlier withdrawal from the same vault is never adopted.
     ///
-    /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
-    /// `from_block` and repeated scans agree the effect is absent. A node that
-    /// may be lagging (the dRPC load-balancing hazard AGENTS.md warns about)
-    /// yields a retryable [`RaindexError::ScanInconclusive`] instead, so the
-    /// caller never re-executes the irreversible withdraw off a single stale
-    /// empty `eth_getLogs`.
+    /// Empty mined logs never prove absence: the original transaction may still
+    /// be pending, and a separate head query may be served by a different
+    /// load-balanced backend. After repeated empty scans this returns
+    /// [`RaindexError::ScanInconclusive`], so no caller can use inconsistent RPC
+    /// views to authorize another irreversible withdrawal.
     pub async fn find_recent_withdrawal(
         &self,
         token: Address,
         vault_id: RaindexVaultId,
         from_block: u64,
-    ) -> Result<Option<(TxHash, U256)>, RaindexError> {
+    ) -> Result<(TxHash, U256), RaindexError> {
         let RaindexVaultId(vault_id) = vault_id;
         // Union filter: two contracts, two event signatures. `get_logs`
         // returns matches from either address that match either topic0.
@@ -473,8 +467,7 @@ impl<E: Evm> RaindexService<E> {
                         && event.token == token
                         && event.vaultId == vault_id
                     {
-                        debug!(target: "inventory", %tx_hash, from_block, "Found existing OperatorWithdraw during resume");
-                        return Ok(Some((tx_hash, event.amount)));
+                        return Ok((tx_hash, event.amount));
                     }
                 } else if topic == IRaindexV6::WithdrawV2::SIGNATURE_HASH {
                     let decoded = log
@@ -490,8 +483,7 @@ impl<E: Evm> RaindexService<E> {
                         && event.token == token
                         && event.vaultId == vault_id
                     {
-                        debug!(target: "orderbook", %tx_hash, from_block, "Found existing pre-migration WithdrawV2 during resume");
-                        return Ok(Some((tx_hash, event.withdrawAmountUint256)));
+                        return Ok((tx_hash, event.withdrawAmountUint256));
                     }
                 } else {
                     warn!(target: "inventory", %tx_hash, %topic, "Withdrawal-scan log with unrecognized topic0; failing closed");
@@ -501,19 +493,12 @@ impl<E: Evm> RaindexService<E> {
                 }
             }
 
-            // No match on this query. A single empty eth_getLogs from a
-            // load-balanced node is not authoritative (the dRPC lag hazard, see
-            // src/onchain/clear.rs). Only conclude a true absence once the head is
-            // confirmations-deep past from_block AND repeated scans agree; else
-            // retry, and if still inconclusive return a retryable error so the
-            // caller never re-withdraws off a stale empty result.
-            let head = self.evm.provider().get_block_number().await?;
-            let caught_up = head >= from_block.saturating_add(SCAN_FINALITY_MARGIN);
-
-            if caught_up && attempt == SCAN_ATTEMPTS {
-                return Ok(None);
-            }
-
+            // An empty `eth_getLogs` result is never authoritative for a
+            // submission whose response may have been lost. A pending
+            // transaction has no log yet, and a separately queried chain head
+            // could come from a different load-balanced backend. Retry only to
+            // recover from a briefly stale backend; never convert absence into
+            // permission to resubmit.
             if attempt < SCAN_ATTEMPTS {
                 tokio::time::sleep(SCAN_RETRY_BACKOFF).await;
             }
@@ -731,7 +716,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         token: Address,
         vault_id: RaindexVaultId,
         from_block: u64,
-    ) -> Result<Option<(TxHash, U256)>, RaindexError> {
+    ) -> Result<(TxHash, U256), RaindexError> {
         Self::find_recent_withdrawal(self, token, vault_id, from_block).await
     }
 
@@ -978,16 +963,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_recent_withdrawal_is_inconclusive_when_node_lags() {
+    async fn find_recent_withdrawal_is_inconclusive_when_mined_logs_are_empty() {
         let asserter = Asserter::new();
         let from_block = 100u64;
-        // Every scan attempt sees an empty get_logs and a head BELOW from_block --
-        // a lagging load-balanced node. The scan must NOT report absence (which
-        // would let the caller re-withdraw and double-spend); it must surface a
-        // retryable error so the resume re-runs instead.
+        // Only eth_getLogs responses are scripted. This proves the scan never
+        // combines an empty result from one load-balanced backend with a chain
+        // head from another to authorize an irreversible replay.
         for _ in 0..SCAN_ATTEMPTS {
             asserter.push_success(&json!([]));
-            asserter.push_success(&json!("0x32")); // head = 50 < from_block
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1007,37 +990,8 @@ mod tests {
 
         assert!(
             matches!(error, RaindexError::ScanInconclusive { from_block: fb } if fb == from_block),
-            "lagging node must yield retryable ScanInconclusive, got: {error:?}",
+            "empty mined-log scans must remain unresolved, got: {error:?}",
         );
-    }
-
-    #[tokio::test]
-    async fn find_recent_withdrawal_is_none_when_caught_up_and_absent() {
-        let asserter = Asserter::new();
-        let from_block = 100u64;
-        // Empty get_logs corroborated across every attempt, with a head well past
-        // from_block: the withdrawal is genuinely absent, so re-issuing is safe.
-        for _ in 0..SCAN_ATTEMPTS {
-            asserter.push_success(&json!([]));
-            asserter.push_success(&json!("0x200")); // head = 512 >> from_block
-        }
-
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let service = RaindexService::new(
-            ReadOnlyEvm::new(provider),
-            RaindexContracts {
-                inventory: Address::ZERO,
-                orderbook: Address::ZERO,
-            },
-            Address::ZERO,
-        );
-
-        let result = service
-            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
-            .await
-            .unwrap();
-
-        assert_eq!(result, None);
     }
 
     /// A `WithdrawV2` from this owner's vault, mined at `block_number`, that
@@ -1156,7 +1110,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, Some((expected_tx, amount)));
+        assert_eq!(result, (expected_tx, amount));
     }
 
     #[tokio::test]
@@ -1177,7 +1131,6 @@ mod tests {
         );
         for _ in 0..SCAN_ATTEMPTS {
             asserter.push_success(&json!([log.clone()]));
-            asserter.push_success(&json!("0x200")); // head well past from_block
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1191,14 +1144,14 @@ mod tests {
             Address::ZERO,
         );
 
-        let result = service
+        let error = service
             .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(
-            result, None,
-            "another operator's OperatorWithdraw must not be adopted as ours",
+        assert!(
+            matches!(error, RaindexError::ScanInconclusive { from_block: fb } if fb == from_block),
+            "another operator's withdrawal must not resolve our submission: {error:?}",
         );
     }
 
@@ -1245,7 +1198,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, Some((expected_tx, op_amount)));
+        assert_eq!(result, (expected_tx, op_amount));
     }
 
     #[tokio::test]
@@ -1280,7 +1233,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, Some((expected_tx, withdraw_amount)));
+        assert_eq!(result, (expected_tx, withdraw_amount));
     }
 
     #[tokio::test]
@@ -1616,7 +1569,6 @@ mod tests {
         let stale = json!([withdraw_log(from_block, U256::from(7u64))]);
         for _ in 0..SCAN_ATTEMPTS {
             asserter.push_success(&stale);
-            asserter.push_success(&json!("0x200")); // head = 512 >> from_block
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1629,14 +1581,14 @@ mod tests {
             Address::ZERO,
         );
 
-        let result = service
+        let error = service
             .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(
-            result, None,
-            "a withdrawal mined at from_block must be excluded (strictly-after semantics)",
+        assert!(
+            matches!(error, RaindexError::ScanInconclusive { from_block: fb } if fb == from_block),
+            "a withdrawal mined at from_block must be excluded and leave the submission unresolved",
         );
     }
 
@@ -1665,7 +1617,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, Some((expected_tx, amount)));
+        assert_eq!(result, (expected_tx, amount));
     }
 
     #[tokio::test]
@@ -1857,20 +1809,16 @@ mod tests {
 
         assert_eq!(
             found,
-            Some((withdraw_tx, withdraw_amount)),
+            (withdraw_tx, withdraw_amount),
             "scan must return the real withdrawal's tx and actual on-chain withdrawn amount",
         );
     }
 
     #[tokio::test]
-    async fn find_recent_withdrawal_returns_none_for_non_matching_vault_or_token() {
+    async fn find_recent_withdrawal_is_inconclusive_for_non_matching_vault_or_token() {
         let local_evm = LocalEvm::new().await.unwrap();
         let service = create_test_raindex_service(&local_evm);
 
-        // Capture from_block BEFORE the approve/deposit/withdraw txs so those three
-        // blocks advance the head past from_block + SCAN_FINALITY_MARGIN, letting
-        // the non-matching scans below conclude a true absence (None) rather than
-        // ScanInconclusive.
         let from_block = service.current_block().await.unwrap();
 
         let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
@@ -1906,22 +1854,23 @@ mod tests {
         let other_vault = RaindexVaultId(b256!(
             "0x0000000000000000000000000000000000000000000000000000000000000002"
         ));
-        assert_eq!(
-            service
-                .find_recent_withdrawal(local_evm.token_address, other_vault, from_block)
-                .await
-                .unwrap(),
-            None,
-            "a withdrawal on a different vault must not be adopted",
-        );
-        assert_eq!(
-            service
-                .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
-                .await
-                .unwrap(),
-            None,
-            "a withdrawal of a different token must not be adopted",
-        );
+        let other_vault_error = service
+            .find_recent_withdrawal(local_evm.token_address, other_vault, from_block)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            other_vault_error,
+            RaindexError::ScanInconclusive { from_block: block } if block == from_block
+        ));
+
+        let other_token_error = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            other_token_error,
+            RaindexError::ScanInconclusive { from_block: block } if block == from_block
+        ));
     }
 
     #[tokio::test]

@@ -353,7 +353,7 @@ impl Raindex for PanickingRaindex {
         _: Address,
         _: RaindexVaultId,
         _: u64,
-    ) -> Result<Option<(TxHash, U256)>, RaindexError> {
+    ) -> Result<(TxHash, U256), RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
@@ -1572,28 +1572,18 @@ impl CrossVenueEquityTransfer {
         from_block: u64,
     ) -> Result<(), RedemptionError> {
         let raindex = &self.services.for_chain(chain)?.raindex;
-        let tx_hash = match raindex
+        let (tx_hash, actual) = raindex
             .find_recent_withdrawal(token, vault_id, from_block)
-            .await?
-        {
-            Some((tx_hash, actual)) if actual == amount => {
-                info!(target: "rebalance", %aggregate_id, %tx_hash, %amount, "Adopting already-submitted vault withdrawal");
-                tx_hash
-            }
-            Some((tx_hash, actual)) => {
-                return Err(RedemptionError::AdoptedWithdrawalAmountMismatch {
-                    tx_hash,
-                    expected: amount,
-                    actual,
-                });
-            }
-            None => {
-                info!(target: "rebalance", %aggregate_id, ?vault_id, %amount, "Finalized scan found no vault withdrawal; submitting once");
-                raindex
-                    .submit_withdraw(token, vault_id, amount, TOKENIZED_EQUITY_DECIMALS)
-                    .await?
-            }
-        };
+            .await?;
+        if actual != amount {
+            return Err(RedemptionError::AdoptedWithdrawalAmountMismatch {
+                tx_hash,
+                expected: amount,
+                actual,
+            });
+        }
+
+        info!(target: "rebalance", %aggregate_id, %tx_hash, %amount, "Adopting already-submitted vault withdrawal");
 
         self.record_vault_withdrawal_submission(aggregate_id, tx_hash)
             .await
@@ -4091,7 +4081,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conclusive_empty_withdrawal_scan_submits_exactly_once() {
+    async fn empty_withdrawal_scan_keeps_intent_and_does_not_submit() {
         let raindex = Arc::new(MockRaindex::new());
         let (transfer, _pool) = create_equity_transfer_with_pool(
             Arc::new(MockTokenizer::new()),
@@ -4102,7 +4092,7 @@ mod tests {
         let id = redemption_aggregate_id("withdraw-empty-scan");
         seed_withdrawal_intent(&transfer, &id, 202).await;
 
-        transfer
+        let error = transfer
             .reconcile_vault_withdrawal_submission(
                 &id,
                 Chain::Base,
@@ -4112,42 +4102,11 @@ mod tests {
                 202,
             )
             .await
-            .unwrap();
-
-        assert_eq!(raindex.withdraw_submissions(), 1);
-        assert!(matches!(
-            transfer.redemption_store.load(&id).await.unwrap(),
-            Some(EquityRedemption::VaultWithdrawSubmitted { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn inconclusive_withdrawal_scan_keeps_intent_and_does_not_submit() {
-        let raindex = Arc::new(MockRaindex::new().with_inconclusive_withdrawal_scan());
-        let (transfer, _pool) = create_equity_transfer_with_pool(
-            Arc::new(MockTokenizer::new()),
-            raindex.clone(),
-            Arc::new(MockWrapper::new()),
-        )
-        .await;
-        let id = redemption_aggregate_id("withdraw-inconclusive-scan");
-        seed_withdrawal_intent(&transfer, &id, 303).await;
-
-        let error = transfer
-            .reconcile_vault_withdrawal_submission(
-                &id,
-                Chain::Base,
-                Address::ZERO,
-                RaindexVaultId(B256::ZERO),
-                withdrawal_amount(),
-                303,
-            )
-            .await
             .unwrap_err();
 
         assert!(matches!(
             error,
-            RedemptionError::Raindex(RaindexError::ScanInconclusive { from_block: 303 })
+            RedemptionError::Raindex(RaindexError::ScanInconclusive { from_block: 202 })
         ));
         assert_eq!(raindex.withdraw_submissions(), 0);
         assert!(matches!(

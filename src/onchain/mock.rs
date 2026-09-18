@@ -85,7 +85,6 @@ pub struct MockRaindex {
     withdraw_actual_amount: Option<U256>,
     current_block: u64,
     recent_withdrawal: Mutex<Option<(TxHash, U256)>>,
-    withdrawal_scan_inconclusive: bool,
     remember_submitted_withdrawal: bool,
     withdraw_submissions: AtomicUsize,
 }
@@ -152,7 +151,6 @@ impl MockRaindex {
             withdraw_actual_amount: None,
             current_block: 0,
             recent_withdrawal: Mutex::new(None),
-            withdrawal_scan_inconclusive: false,
             remember_submitted_withdrawal: false,
             withdraw_submissions: AtomicUsize::new(0),
         }
@@ -233,12 +231,6 @@ impl MockRaindex {
             };
             *recent_withdrawal = Some((tx_hash, amount));
         }
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_inconclusive_withdrawal_scan(mut self) -> Self {
-        self.withdrawal_scan_inconclusive = true;
         self
     }
 
@@ -377,15 +369,14 @@ impl Raindex for MockRaindex {
         _token: Address,
         _vault_id: RaindexVaultId,
         from_block: u64,
-    ) -> Result<Option<(TxHash, U256)>, RaindexError> {
-        if self.withdrawal_scan_inconclusive {
-            return Err(RaindexError::ScanInconclusive { from_block });
-        }
-
+    ) -> Result<(TxHash, U256), RaindexError> {
         let Ok(recent_withdrawal) = self.recent_withdrawal.lock() else {
             panic!("mock recent-withdrawal mutex poisoned");
         };
-        Ok(*recent_withdrawal)
+        recent_withdrawal
+            .as_ref()
+            .copied()
+            .ok_or(RaindexError::ScanInconclusive { from_block })
     }
 
     async fn confirm_tx_receipt(
