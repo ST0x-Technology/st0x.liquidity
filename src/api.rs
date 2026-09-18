@@ -2654,6 +2654,12 @@ impl From<ProcessTxReport> for ProcessTxResponse {
     }
 }
 
+fn spawn_process_tx_task(
+    task: impl Future<Output = Result<ProcessTxReport, OperatorError>> + Send + 'static,
+) -> tokio::task::JoinHandle<Result<ProcessTxReport, OperatorError>> {
+    tokio::spawn(task)
+}
+
 /// Accounts a missed on-chain fill and places the opposite hedge inside the
 /// bot, serialized against the trading loop by the shared submission lock.
 /// Mirrors the CLI `process-tx` verb.
@@ -2716,17 +2722,38 @@ async fn process_transaction(
     let provider = ProviderBuilder::new().connect_client(rpc_client);
     let cache = SymbolCache::default();
 
-    let report = process_tx::process_tx(
-        tx_hash,
-        &state.ctx,
-        &state.pool,
-        &provider,
-        &cache,
-        &handle.stores,
-        handle.order_placer.clone(),
-        Some(&handle.counter_trade_submission_lock),
-    )
+    // Keep the state-changing workflow alive if the client disconnects. Tokio
+    // detaches a spawned task when its JoinHandle is dropped, so cancellation
+    // of this request cannot strand a live broker order before its Submitted
+    // event is persisted.
+    let ctx = state.ctx.clone();
+    let pool = state.pool.clone();
+    let stores = handle.stores.clone();
+    let order_placer = Arc::clone(&handle.order_placer);
+    let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
+    let report = spawn_process_tx_task(async move {
+        process_tx::process_tx(
+            tx_hash,
+            &ctx,
+            &pool,
+            &provider,
+            &cache,
+            &stores,
+            order_placer,
+            Some(&counter_trade_submission_lock),
+        )
+        .await
+    })
     .await
+    .map_err(|error| {
+        error!(%error, "process-tx worker task failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "process-tx worker task failed".to_owned(),
+            }),
+        )
+    })?
     .map_err(ops_operator_error)?;
 
     Ok(Json(ProcessTxResponse::from(report)))
@@ -3032,7 +3059,7 @@ mod tests {
     use chrono_tz::America::New_York;
     use httpmock::Method::GET;
     use sqlx::SqlitePool;
-    use tokio::sync::broadcast;
+    use tokio::sync::{Notify, broadcast};
     use tower::ServiceExt;
     use uuid::uuid;
 
@@ -7456,6 +7483,40 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    /// Dropping the HTTP request waiter must detach, not cancel, the process-tx
+    /// worker that may already have submitted a live broker order.
+    #[tokio::test]
+    async fn process_tx_task_survives_request_cancellation() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+
+        let worker_started = Arc::clone(&started);
+        let worker_release = Arc::clone(&release);
+        let worker_finished = Arc::clone(&finished);
+        let request = tokio::spawn(async move {
+            spawn_process_tx_task(async move {
+                worker_started.notify_one();
+                worker_release.notified().await;
+                worker_finished.notify_one();
+                Ok(ProcessTxReport {
+                    fill: None,
+                    outcome: ProcessTxOutcome::NoTradeableEvents,
+                })
+            })
+            .await
+        });
+
+        started.notified().await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), finished.notified())
+            .await
+            .expect("detached process-tx worker must finish after request cancellation");
     }
 
     /// Invalid transaction hashes must be rejected before any recovery work starts.
