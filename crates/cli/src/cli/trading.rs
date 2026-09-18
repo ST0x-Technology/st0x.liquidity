@@ -20,7 +20,7 @@ use st0x_execution::{
 };
 use st0x_float_serde::format_float_with_fallback;
 use st0x_hedge::operator::offchain::order::{OrderPlacementResult, OrderPlacer};
-use st0x_hedge::operator::process_tx::{HedgeDisposition, ProcessTxOutcome};
+use st0x_hedge::operator::process_tx::{HedgeDisposition, ProcessTxOutcome, ProcessTxReport};
 use st0x_registry::SymbolCache;
 
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
@@ -637,7 +637,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     let stores =
         st0x_hedge::operator::process_tx::ProcessTxStores::standalone(pool, order_placer.clone())
             .await?;
-    let outcome = st0x_hedge::operator::process_tx::process_tx(
+    let report = st0x_hedge::operator::process_tx::process_tx(
         tx_hash,
         ctx,
         pool,
@@ -648,7 +648,30 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         None,
     )
     .await?;
-    render_process_tx_outcome(tx_hash, &outcome, stdout)
+    render_process_tx_report(tx_hash, &report, stdout)
+}
+
+/// Renders the decoded fill identity before its process-tx outcome.
+fn render_process_tx_report<W: Write>(
+    tx_hash: TxHash,
+    report: &ProcessTxReport,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    if let Some(fill) = &report.fill {
+        writeln!(stdout, "✅ Found opposite-side trade opportunity:")?;
+        writeln!(stdout, "   Transaction: {}", fill.tx_hash)?;
+        writeln!(stdout, "   Log Index: {}", fill.log_index)?;
+        writeln!(stdout, "   Symbol: {}", fill.symbol)?;
+        writeln!(stdout, "   Direction: {:?}", fill.direction)?;
+        writeln!(stdout, "   Quantity: {}", fill.quantity)?;
+        writeln!(
+            stdout,
+            "   Price per Share: ${}",
+            format_float_with_fallback(&fill.price)
+        )?;
+    }
+
+    render_process_tx_outcome(tx_hash, &report.outcome, stdout)
 }
 
 /// Renders a process-tx outcome as operator-facing CLI guidance.
@@ -929,6 +952,7 @@ mod tests {
         SupportedExecutor, Usd,
     };
     use st0x_hedge::operator::offchain::order::OffchainOrderId;
+    use st0x_hedge::operator::process_tx::ProcessTxFill;
     use st0x_hedge::operator::test_utils::{
         mock_alpaca_broker_ctx, try_positive_shares, try_setup_test_db,
     };
@@ -2748,41 +2772,96 @@ mod tests {
         );
     }
 
-    /// Every process-tx outcome must render actionable operator guidance.
+    /// Every process-tx outcome must render the decoded fill, when present,
+    /// followed by actionable operator guidance.
     #[test]
-    fn render_process_tx_outcome_covers_every_arm() {
+    fn render_process_tx_report_covers_every_arm() {
         let tx_hash = TxHash::repeat_byte(0x11);
         let not_found = TxHash::repeat_byte(0x22);
         let symbol = || Symbol::new("MSTR").expect("test symbol must be valid");
+        let fill = || ProcessTxFill {
+            tx_hash,
+            log_index: 7,
+            symbol: symbol(),
+            direction: Direction::Sell,
+            quantity: FractionalShares::new(
+                Float::parse("1.5".to_owned()).expect("test quantity must be valid"),
+            ),
+            price: Float::parse("123.45".to_owned()).expect("test price must be valid"),
+        };
+        let fill_summary = format!(
+            "✅ Found opposite-side trade opportunity:\n\
+             \x20  Transaction: {tx_hash}\n\
+             \x20  Log Index: 7\n\
+             \x20  Symbol: MSTR\n\
+             \x20  Direction: Sell\n\
+             \x20  Quantity: 1.5\n\
+             \x20  Price per Share: $123.45\n"
+        );
 
-        let mut cases: Vec<(ProcessTxOutcome, String)> = vec![
+        let mut cases: Vec<(ProcessTxReport, String)> = vec![
             (
-                ProcessTxOutcome::NoTradeableEvents,
-                format!("No tradeable events found in transaction {tx_hash}\nThis transaction may not contain orderbook events matching the configured order hash.\n"),
+                ProcessTxReport {
+                    fill: None,
+                    outcome: ProcessTxOutcome::NoTradeableEvents,
+                },
+                format!(
+                    "No tradeable events found in transaction {tx_hash}\nThis transaction may not contain orderbook events matching the configured order hash.\n"
+                ),
             ),
             (
-                ProcessTxOutcome::TransactionNotFound { tx_hash: not_found },
+                ProcessTxReport {
+                    fill: None,
+                    outcome: ProcessTxOutcome::TransactionNotFound { tx_hash: not_found },
+                },
                 format!("Transaction not found: {not_found}\n"),
             ),
             (
-                ProcessTxOutcome::AlreadyAccounted,
-                "Fill is already fully accounted. Nothing to do; the normal pipeline will hedge any unhedged position exposure.\n".to_string(),
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::AlreadyAccounted,
+                },
+                format!(
+                    "{fill_summary}Fill is already fully accounted. Nothing to do; the normal pipeline will hedge any unhedged position exposure.\n"
+                ),
             ),
             (
-                ProcessTxOutcome::PendingHedgeInFlight,
-                "An existing pending hedge is in flight; settled the fill without placing a new hedge.\n".to_string(),
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::PendingHedgeInFlight,
+                },
+                format!(
+                    "{fill_summary}An existing pending hedge is in flight; settled the fill without placing a new hedge.\n"
+                ),
             ),
             (
-                ProcessTxOutcome::BelowExecutionThreshold,
-                "Trade accumulated but did not trigger execution yet (waiting to accumulate enough shares for a whole share execution).\n".to_string(),
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::BelowExecutionThreshold,
+                },
+                format!(
+                    "{fill_summary}Trade accumulated but did not trigger execution yet (waiting to accumulate enough shares for a whole share execution).\n"
+                ),
             ),
             (
-                ProcessTxOutcome::TradingDisabled { symbol: symbol() },
-                format!("Trading disabled by configuration for {}\n", symbol()),
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::TradingDisabled { symbol: symbol() },
+                },
+                format!(
+                    "{fill_summary}Trading disabled by configuration for {}\n",
+                    symbol()
+                ),
             ),
             (
-                ProcessTxOutcome::PlacementRejected { symbol: symbol() },
-                format!("Placement for {} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill.\n", symbol()),
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::PlacementRejected { symbol: symbol() },
+                },
+                format!(
+                    "{fill_summary}Placement for {} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill.\n",
+                    symbol()
+                ),
             ),
         ];
 
@@ -2803,29 +2882,32 @@ mod tests {
             let order_id = OffchainOrderId::new();
             let shares = positive_shares("1.5");
             let expected = format!(
-                "Placed {:?} hedge for {shares} {} (order {order_id})\n{disposition_line}\n",
+                "{fill_summary}Placed {:?} hedge for {shares} {} (order {order_id})\n{disposition_line}\n",
                 Direction::Buy,
                 symbol()
             );
             cases.push((
-                ProcessTxOutcome::HedgePlaced {
-                    symbol: symbol(),
-                    offchain_order_id: order_id,
-                    shares,
-                    direction: Direction::Buy,
-                    disposition,
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::HedgePlaced {
+                        symbol: symbol(),
+                        offchain_order_id: order_id,
+                        shares,
+                        direction: Direction::Buy,
+                        disposition,
+                    },
                 },
                 expected,
             ));
         }
 
-        for (outcome, expected) in cases {
+        for (report, expected) in cases {
             let mut buf = Vec::new();
-            render_process_tx_outcome(tx_hash, &outcome, &mut buf).expect("render must succeed");
+            render_process_tx_report(tx_hash, &report, &mut buf).expect("render must succeed");
             assert_eq!(
                 String::from_utf8(buf).expect("output must be valid UTF-8"),
                 expected,
-                "unexpected output for {outcome:?}"
+                "unexpected output for {report:?}"
             );
         }
     }

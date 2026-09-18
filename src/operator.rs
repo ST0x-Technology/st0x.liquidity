@@ -1485,6 +1485,7 @@ pub mod process_tx {
     use alloy::primitives::TxHash;
     use alloy::providers::Provider;
     use anyhow::Context;
+    use rain_math_float::Float;
     use sqlx::SqlitePool;
     use tokio::sync::Mutex;
     use tracing::{error, info};
@@ -1528,6 +1529,30 @@ pub mod process_tx {
         Finalized,
     }
 
+    /// Decoded on-chain fill identity and economics reported to operators.
+    #[derive(Debug, Clone)]
+    pub struct ProcessTxFill {
+        pub tx_hash: TxHash,
+        pub log_index: u64,
+        pub symbol: Symbol,
+        pub direction: Direction,
+        pub quantity: FractionalShares,
+        pub price: Float,
+    }
+
+    impl From<&OnchainTrade> for ProcessTxFill {
+        fn from(trade: &OnchainTrade) -> Self {
+            Self {
+                tx_hash: trade.tx_hash,
+                log_index: trade.log_index,
+                symbol: trade.symbol().clone(),
+                direction: trade.direction,
+                quantity: trade.amount,
+                price: trade.price(),
+            }
+        }
+    }
+
     /// What processing a transaction's fill resolved to.
     #[derive(Debug)]
     pub enum ProcessTxOutcome {
@@ -1557,6 +1582,13 @@ pub mod process_tx {
             direction: Direction,
             disposition: HedgeDisposition,
         },
+    }
+
+    /// The decoded fill, when one was found, and its processing outcome.
+    #[derive(Debug)]
+    pub struct ProcessTxReport {
+        pub fill: Option<ProcessTxFill>,
+        pub outcome: ProcessTxOutcome,
     }
 
     /// The three stores a process-tx writes through.
@@ -1622,7 +1654,7 @@ pub mod process_tx {
         stores: &ProcessTxStores,
         order_placer: Arc<dyn OrderPlacer>,
         submission_lock: Option<&Mutex<()>>,
-    ) -> Result<ProcessTxOutcome, OperatorError> {
+    ) -> Result<ProcessTxReport, OperatorError> {
         let trading_chain = ctx.chains.primary();
         let actors = RecoveryActors {
             order_owner: ctx.vault_owner(),
@@ -1633,7 +1665,8 @@ pub mod process_tx {
         match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await
         {
             Ok(Some(onchain_trade)) => {
-                process_found_trade(
+                let fill = ProcessTxFill::from(&onchain_trade);
+                let outcome = process_found_trade(
                     onchain_trade,
                     ctx,
                     pool,
@@ -1641,11 +1674,21 @@ pub mod process_tx {
                     order_placer,
                     submission_lock,
                 )
-                .await
+                .await?;
+                Ok(ProcessTxReport {
+                    fill: Some(fill),
+                    outcome,
+                })
             }
-            Ok(None) => Ok(ProcessTxOutcome::NoTradeableEvents),
+            Ok(None) => Ok(ProcessTxReport {
+                fill: None,
+                outcome: ProcessTxOutcome::NoTradeableEvents,
+            }),
             Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(_))) => {
-                Ok(ProcessTxOutcome::TransactionNotFound { tx_hash })
+                Ok(ProcessTxReport {
+                    fill: None,
+                    outcome: ProcessTxOutcome::TransactionNotFound { tx_hash },
+                })
             }
             Err(error) => Err(OperatorError::Operational(anyhow::Error::new(error))),
         }
@@ -2121,8 +2164,8 @@ pub mod process_tx {
         use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
         use super::{
-            HedgeDisposition, OperatorError, PlacementContext, ProcessTxOutcome, ProcessTxStores,
-            RejectionReason, process_found_trade, reconcile_offchain_order_state,
+            HedgeDisposition, OperatorError, PlacementContext, ProcessTxFill, ProcessTxOutcome,
+            ProcessTxStores, RejectionReason, process_found_trade, reconcile_offchain_order_state,
             reconcile_post_place_state,
         };
 
@@ -2141,6 +2184,20 @@ pub mod process_tx {
         /// Returns the valid baseline onchain trade fixture used throughout this module.
         fn onchain_trade_builder() -> OnchainTradeBuilder {
             OnchainTradeBuilder::try_new().expect("default onchain trade fixture must be valid")
+        }
+
+        #[test]
+        fn process_tx_fill_preserves_the_decoded_trade_summary() {
+            let trade = onchain_trade_builder().with_log_index(7).build();
+
+            let fill = ProcessTxFill::from(&trade);
+
+            assert_eq!(fill.tx_hash, trade.tx_hash);
+            assert_eq!(fill.log_index, 7);
+            assert_eq!(&fill.symbol, trade.symbol());
+            assert_eq!(fill.direction, trade.direction);
+            assert_eq!(fill.quantity, trade.amount);
+            assert_eq!(fill.price.get_inner(), trade.price().get_inner());
         }
 
         /// Builds the minimal application context required by process-tx tests.
