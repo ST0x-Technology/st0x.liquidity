@@ -1405,11 +1405,11 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    use st0x_evm::AbiDecodedErrorType;
-    use st0x_evm::Evm;
-    use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{Chain, USDC_BASE, USDC_ETHEREUM};
+    use st0x_evm::{
+        AbiDecodedErrorType, Chain, Evm, NoOpErrorRegistry, PreparedTransaction, USDC_BASE,
+        USDC_ETHEREUM,
+    };
 
     use super::evm::MintRecoveryConfig;
     use super::*;
@@ -1853,6 +1853,27 @@ mod tests {
             self.inner
                 .sign_typed_data(payload_json, expected_digest)
                 .await
+        }
+
+        async fn prepare_pending(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            self.inner.prepare_pending(contract, calldata, note).await
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            prepared: &PreparedTransaction,
+            note: &str,
+        ) -> Result<TxHash, EvmError> {
+            self.inner.broadcast_prepared(prepared, note).await
+        }
+
+        fn discard_prepared(&self, prepared: &PreparedTransaction) {
+            self.inner.discard_prepared(prepared);
         }
 
         async fn send_pending(

@@ -598,7 +598,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use st0x_event_sorcery::{Store, StoreBuilder};
-    use st0x_evm::{Evm, EvmError};
+    use st0x_evm::{Evm, EvmError, PreparedTransaction};
     use st0x_finance::Symbol;
     use st0x_float_macro::float;
 
@@ -645,6 +645,27 @@ mod tests {
             _expected_digest: alloy::primitives::B256,
         ) -> Result<alloy::primitives::Signature, EvmError> {
             panic!("MockWallet::sign_typed_data should not be called in job tests")
+        }
+
+        async fn prepare_pending(
+            &self,
+            _contract: Address,
+            _calldata: alloy::primitives::Bytes,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!("MockWallet::prepare_pending should not be called in job tests")
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            _prepared: &PreparedTransaction,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            panic!("MockWallet::broadcast_prepared should not be called in job tests")
+        }
+
+        fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!("MockWallet::discard_prepared should not be called in job tests");
         }
 
         async fn send_pending(

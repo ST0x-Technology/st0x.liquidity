@@ -81,6 +81,18 @@ impl ResettableNonceManager {
         let slot = self.slot(address);
         *slot.lock().await = Some(nonce);
     }
+    /// Raises the cached next nonce to at least `nonce` without ever lowering
+    /// an already-higher allocation.
+    ///
+    /// Prepared-transaction rebroadcast uses this while holding the wallet
+    /// send lock so a restarted wallet reserves every nonce through the
+    /// persisted transaction before another send can allocate one.
+    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    pub(crate) async fn raise_next_nonce(&self, address: Address, nonce: u64) {
+        let slot = self.slot(address);
+        let mut cached = slot.lock().await;
+        *cached = Some(cached.map_or(nonce, |current| current.max(nonce)));
+    }
 
     /// The per-address cache slot, created empty on first access.
     fn slot(&self, address: Address) -> Arc<Mutex<Option<u64>>> {
@@ -229,6 +241,31 @@ mod tests {
         manager.set_next_nonce(address, 9).await;
 
         assert_eq!(manager.get_next_nonce(&provider, address).await.unwrap(), 9);
+    }
+    #[tokio::test]
+    async fn raise_next_nonce_seeds_empty_cache() {
+        let manager = ResettableNonceManager::default();
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+
+        manager.raise_next_nonce(address, 9).await;
+
+        assert_eq!(manager.get_next_nonce(&provider, address).await.unwrap(), 9);
+    }
+
+    #[tokio::test]
+    async fn raise_next_nonce_never_lowers_existing_cache() {
+        let manager = ResettableNonceManager::default();
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+
+        manager.set_next_nonce(address, 12).await;
+        manager.raise_next_nonce(address, 9).await;
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            12
+        );
     }
 
     #[tokio::test]

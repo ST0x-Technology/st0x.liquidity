@@ -127,6 +127,7 @@
 //! by age, not by wait outcome: see its module doc for why a timed-out wait
 //! cannot be treated as license to release an entry.
 
+use alloy::consensus::Transaction;
 use alloy::eips::eip1559::Eip1559Estimation;
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::Ethereum;
@@ -143,7 +144,7 @@ use tracing::{error, info, warn};
 
 use crate::inflight_nonces::{InFlightNonces, NonceOwnership};
 use crate::nonce::ResettableNonceManager;
-use crate::{EvmError, NextNonceHint};
+use crate::{EvmError, NextNonceHint, PreparedTransaction};
 
 /// Number of escalating-fee resubmit attempts after the first
 /// "replacement transaction underpriced" rejection. Each attempt bumps
@@ -296,6 +297,128 @@ where
     async fn estimate_fees(&self) -> Result<Eip1559Estimation, EvmError> {
         Ok(self.estimate_eip1559_fees().await?)
     }
+}
+/// Fill and sign a transaction without broadcasting it.
+///
+/// The per-wallet send lock covers nonce assignment and signing. The returned
+/// envelope can then be persisted before [`broadcast_prepared`] crosses the
+/// irreversible network boundary.
+pub(crate) async fn prepare_with_nonce<F, P>(
+    submitter: &FillProvider<F, P, Ethereum>,
+    nonce_manager: &ResettableNonceManager,
+    send_lock: &Mutex<()>,
+    address: Address,
+    contract: Address,
+    calldata: Bytes,
+) -> Result<PreparedTransaction, EvmError>
+where
+    F: TxFiller<Ethereum>,
+    P: Provider<Ethereum>,
+{
+    let _guard = send_lock.lock().await;
+    let nonce = nonce_manager.get_next_nonce(submitter, address).await?;
+    let tx = TransactionRequest::default()
+        .to(contract)
+        .input(calldata.into())
+        .nonce(nonce);
+    let envelope_result: Result<_, EvmError> = async {
+        let sendable = submitter.fill(tx).await?;
+        sendable
+            .try_into_envelope()
+            .map_err(|_| EvmError::TransactionPreparation)
+    }
+    .await;
+    let envelope = match envelope_result {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            // `get_next_nonce` already advanced the cache. Since no signed
+            // transaction exists to occupy that nonce, leave no gap for the
+            // next attempt.
+            nonce_manager.invalidate();
+            return Err(error);
+        }
+    };
+    let raw = Bytes::from(envelope.encoded_2718());
+    debug_assert_eq!(envelope.nonce(), nonce);
+    Ok(PreparedTransaction::from_raw(nonce, raw))
+}
+
+/// Broadcast an exact signed envelope prepared earlier.
+///
+/// Repeated broadcasts are idempotent. "Already known" means this exact hash
+/// reached the serving node and is normalized to success. The wallet send lock
+/// also covers rebroadcast: after restart the nonce cache is raised through
+/// this prepared transaction before another operation can allocate a nonce.
+///
+/// A nonce-too-low response can mean the exact transaction already mined and
+/// left the serving node's txpool. The locally known hash is therefore checked
+/// before classifying the response. Visibility by receipt or transaction
+/// adopts the hash; absence remains inconclusive and requires durable redrive.
+pub(crate) async fn broadcast_prepared<P>(
+    provider: &P,
+    nonce_manager: &ResettableNonceManager,
+    in_flight: &InFlightNonces,
+    send_lock: &Mutex<()>,
+    address: Address,
+    prepared: &PreparedTransaction,
+    note: &str,
+) -> Result<TxHash, EvmError>
+where
+    P: Provider,
+{
+    let _guard = send_lock.lock().await;
+    let tx_hash = prepared.tx_hash();
+    nonce_manager
+        .raise_next_nonce(address, prepared.nonce().saturating_add(1))
+        .await;
+
+    match provider.send_raw_transaction(prepared.raw()).await {
+        Ok(_) => {}
+        Err(error) => {
+            let error = EvmError::from(error);
+            if error.is_already_known() {
+                // The exact signed envelope is already in this node's pool.
+            } else if error.is_nonce_too_low() {
+                let receipt_visible = match provider.get_transaction_receipt(tx_hash).await {
+                    Ok(receipt) => receipt.is_some(),
+                    Err(lookup_error) => {
+                        warn!(
+                            target: "wallet",
+                            %tx_hash,
+                            %lookup_error,
+                            "Prepared transaction receipt lookup failed after nonce-too-low"
+                        );
+                        false
+                    }
+                };
+                let transaction_visible = if receipt_visible {
+                    false
+                } else {
+                    match provider.get_transaction_by_hash(tx_hash).await {
+                        Ok(transaction) => transaction.is_some(),
+                        Err(lookup_error) => {
+                            warn!(
+                                target: "wallet",
+                                %tx_hash,
+                                %lookup_error,
+                                "Prepared transaction lookup failed after nonce-too-low"
+                            );
+                            false
+                        }
+                    }
+                };
+                if !receipt_visible && !transaction_visible {
+                    return Err(EvmError::PreparedTransactionReconciliationPending { tx_hash });
+                }
+            } else {
+                return Err(error);
+            }
+        }
+    }
+
+    in_flight.record(address, prepared.nonce(), tx_hash);
+    info!(target: "wallet", %tx_hash, note, nonce = prepared.nonce(), "Prepared transaction broadcast");
+    Ok(tx_hash)
 }
 
 /// Submit `calldata` to `contract`, recovering from nonce races and a
@@ -1544,6 +1667,86 @@ mod tests {
 
         assert_ne!(tx_hash, TxHash::ZERO);
     }
+    #[tokio::test]
+    async fn nonce_too_low_adopts_visible_prepared_transaction_hash() {
+        let tx_hash = prepared_tx_hash();
+        let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("nonce too low"),
+            data: None,
+        });
+        asserter.push_success(&mined_receipt(tx_hash));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::default();
+        let send_lock = Mutex::new(());
+
+        let result = broadcast_prepared(
+            &provider,
+            &nonce_manager,
+            &in_flight,
+            &send_lock,
+            WALLET,
+            &prepared,
+            "visible prepared transaction",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, tx_hash);
+        assert_eq!(
+            nonce_manager.peek_next_nonce(WALLET).await,
+            Some(STUCK_NONCE + 1)
+        );
+        assert_eq!(
+            in_flight.ownership(WALLET, STUCK_NONCE),
+            NonceOwnership::Ours
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_too_low_without_hash_visibility_remains_reconciliation_pending() {
+        let tx_hash = prepared_tx_hash();
+        let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("nonce too low"),
+            data: None,
+        });
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::default();
+        let send_lock = Mutex::new(());
+
+        let error = broadcast_prepared(
+            &provider,
+            &nonce_manager,
+            &in_flight,
+            &send_lock,
+            WALLET,
+            &prepared,
+            "inconclusive prepared transaction",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            EvmError::PreparedTransactionReconciliationPending { tx_hash: hash }
+                if *hash == tx_hash
+        ));
+        assert!(error.is_confirmation_pending());
+        assert_eq!(
+            in_flight.ownership(WALLET, STUCK_NONCE),
+            NonceOwnership::Unknown
+        );
+    }
+
     #[tokio::test]
     async fn already_known_uses_locally_computed_hash_without_resubmit() {
         let rpc_hash = TxHash::repeat_byte(0x13);

@@ -21,8 +21,10 @@ use tracing::info;
 
 use crate::inflight_nonces::InFlightNonces;
 use crate::nonce::ResettableNonceManager;
-use crate::submit::{release_in_flight_after_wait, send_with_recovery};
-use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
+use crate::submit::{
+    broadcast_prepared, prepare_with_nonce, release_in_flight_after_wait, send_with_recovery,
+};
+use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
 
 /// Secrets needed to construct a [`RawPrivateKeyWallet`].
 #[derive(Deserialize)]
@@ -187,6 +189,49 @@ where
         )
         .await
     }
+    async fn prepare_pending(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        info!(target: "wallet", %contract, note, "Preparing local contract call");
+        prepare_with_nonce(
+            &self.signing_provider,
+            &self.nonce_manager,
+            &self.send_lock,
+            self.address(),
+            contract,
+            calldata,
+        )
+        .await
+    }
+
+    async fn broadcast_prepared(
+        &self,
+        prepared: &PreparedTransaction,
+        note: &str,
+    ) -> Result<TxHash, EvmError> {
+        broadcast_prepared(
+            &self.provider,
+            &self.nonce_manager,
+            &self.in_flight,
+            &self.send_lock,
+            self.address(),
+            prepared,
+            note,
+        )
+        .await
+    }
+    fn discard_prepared(&self, prepared: &PreparedTransaction) {
+        self.nonce_manager.invalidate();
+        tracing::warn!(
+            target: "wallet",
+            tx_hash = %prepared.tx_hash(),
+            nonce = prepared.nonce(),
+            "Discarding unpersisted prepared transaction and invalidating nonce cache"
+        );
+    }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
         let result =
@@ -234,7 +279,9 @@ mod tests {
     use alloy::consensus::Transaction as _;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::U256;
+    use alloy::providers::ext::AnvilApi as _;
     use alloy::sol;
+    use alloy::sol_types::SolCall as _;
 
     use crate::NoOpErrorRegistry;
     use crate::inflight_nonces::NonceOwnership;
@@ -407,6 +454,71 @@ mod tests {
             receipt_a.transaction_hash, receipt_b.transaction_hash,
             "transactions must have different hashes (distinct nonces)"
         );
+    }
+    #[tokio::test]
+    async fn prepared_rebroadcast_reserves_its_nonce_before_another_send() {
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        wallet.provider.anvil_set_auto_mine(false).await.unwrap();
+
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "prepared before restart")
+            .await
+            .unwrap();
+        wallet.nonce_manager.invalidate();
+
+        wallet
+            .broadcast_prepared(&prepared, "rebroadcast after restart")
+            .await
+            .unwrap();
+        let following = wallet
+            .prepare_pending(signer_address, Bytes::new(), "send after rebroadcast")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            following.nonce(),
+            prepared.nonce().saturating_add(1),
+            "a cold nonce cache must advance past the persisted transaction before another send"
+        );
+        wallet.discard_prepared(&following);
+    }
+
+    #[tokio::test]
+    async fn failed_preparation_does_not_consume_an_unbroadcast_nonce() {
+        let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let expected_nonce = wallet
+            .provider
+            .get_transaction_count(signer_address)
+            .await
+            .unwrap();
+        let excessive_amount = U256::from(999_999_999) * U256::from(10).pow(U256::from(18));
+        let calldata = Bytes::from(
+            IERC20::transferCall {
+                to: Address::random(),
+                amount: excessive_amount,
+            }
+            .abi_encode(),
+        );
+
+        wallet
+            .prepare_pending(token_address, calldata, "preparation should fail")
+            .await
+            .expect_err("gas estimation must reject an excessive transfer");
+        let prepared = wallet
+            .prepare_pending(
+                signer_address,
+                Bytes::new(),
+                "retry after preparation failure",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prepared.nonce(),
+            expected_nonce,
+            "the failed preparation never broadcast, so its nonce must be reusable"
+        );
+        wallet.discard_prepared(&prepared);
     }
 
     /// Regression test threading the `in_flight` wiring through the

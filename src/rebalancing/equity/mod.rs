@@ -42,7 +42,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use st0x_config::ChainEquities;
 use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
-use st0x_evm::{Chain, EvmError};
+use st0x_evm::{Chain, EvmError, PreparedTransaction};
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 use st0x_issuance_dto::VaultModeTag;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
@@ -74,6 +74,12 @@ use crate::tokenized_equity_mint::{
     TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
 use crate::vault_lookup::{VaultLookup, VaultLookupError};
+/// Delay before retrying an accepted or potentially accepted withdrawal whose
+/// receipt/log state is not yet conclusive. Replacement rows are durable and
+/// intentionally uncapped: transaction finality must not consume the queue's
+/// finite retry budget.
+const WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Data extracted from the TokensReceived aggregate state for
 /// onchain verification and subsequent wrapping.
@@ -331,6 +337,27 @@ impl Raindex for PanickingRaindex {
         _: U256,
         _: u8,
     ) -> Result<TxHash, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn prepare_withdraw(
+        &self,
+        _: Address,
+        _: RaindexVaultId,
+        _: U256,
+        _: u8,
+    ) -> Result<PreparedTransaction, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn broadcast_prepared_withdraw(
+        &self,
+        _: &PreparedTransaction,
+    ) -> Result<TxHash, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    fn discard_prepared_withdraw(&self, _: &PreparedTransaction) {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
@@ -745,15 +772,6 @@ pub enum RedemptionError {
     #[error("Redemption was rejected by Alpaca")]
     Rejected,
     #[error(
-        "adopted vault withdrawal {tx_hash} moved {actual}, expected {expected}; \
-         refusing to continue or submit another withdrawal"
-    )]
-    AdoptedWithdrawalAmountMismatch {
-        tx_hash: TxHash,
-        expected: U256,
-        actual: U256,
-    },
-    #[error(
         "redemption {aggregate_id} is in legacy VaultWithdrawPending without a \
          trustworthy chain-scan lower bound; operator reconciliation is required"
     )]
@@ -766,6 +784,16 @@ impl RedemptionError {
             Self::GasReadiness(failure) => failure.retry_interval(),
             _ => None,
         }
+    }
+
+    pub(crate) fn is_reconciliation_pending(&self) -> bool {
+        matches!(self, Self::Raindex(error) if error.is_reconciliation_pending())
+            || matches!(
+                self,
+                Self::Send(AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::RaindexWithdrawReconciliationPending { .. },
+                )))
+            )
     }
 }
 
@@ -789,7 +817,6 @@ impl BotGasFailureClassifier for RedemptionError {
             | Self::UnexpectedEntity { .. }
             | Self::UnexpectedPendingStatus
             | Self::Rejected
-            | Self::AdoptedWithdrawalAmountMismatch { .. }
             | Self::LegacyVaultWithdrawPending { .. } => false,
         }
     }
@@ -1485,8 +1512,8 @@ impl CrossVenueEquityTransfer {
         }
     }
 
-    /// Persists the vault-withdrawal intent, submits once, records the returned
-    /// transaction hash, then confirms it.
+    /// Signs the exact vault withdrawal, persists that identity, broadcasts its
+    /// bytes, records the hash, then confirms it.
     async fn withdraw_from_raindex(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -1501,9 +1528,13 @@ impl CrossVenueEquityTransfer {
             .vault_lookup
             .vault_id_for_token(token)
             .await?;
-        let from_block = chain_services.raindex.current_block().await?;
+        let prepared = chain_services
+            .raindex
+            .prepare_withdraw(token, vault_id, amount, TOKENIZED_EQUITY_DECIMALS)
+            .await?;
 
-        self.redemption_store
+        let persist_result = self
+            .redemption_store
             .send(
                 aggregate_id,
                 EquityRedemptionCommand::Redeem {
@@ -1513,12 +1544,23 @@ impl CrossVenueEquityTransfer {
                     token,
                     vault_id,
                     amount,
-                    from_block,
+                    from_block: 0,
+                    prepared: prepared.clone(),
                 },
             )
-            .await?;
+            .await;
+        if let Err(error) = persist_result {
+            // A reactor error may be returned after the event committed. Reload
+            // before touching nonce state: only a definitely absent aggregate
+            // proves these signed bytes were not persisted and will never be
+            // broadcast by recovery.
+            if matches!(self.redemption_store.load(aggregate_id).await, Ok(None)) {
+                chain_services.raindex.discard_prepared_withdraw(&prepared);
+            }
+            return Err(error.into());
+        }
 
-        self.submit_and_record_vault_withdrawal(aggregate_id, chain, token, vault_id, amount)
+        self.broadcast_and_record_vault_withdrawal(aggregate_id, chain, &prepared)
             .await?;
 
         self.redemption_store
@@ -1528,21 +1570,21 @@ impl CrossVenueEquityTransfer {
         Ok(())
     }
 
-    async fn submit_and_record_vault_withdrawal(
+    async fn broadcast_and_record_vault_withdrawal(
         &self,
         aggregate_id: &RedemptionAggregateId,
         chain: Chain,
-        token: Address,
-        vault_id: RaindexVaultId,
-        amount: U256,
+        prepared: &PreparedTransaction,
     ) -> Result<(), RedemptionError> {
-        info!(target: "rebalance", ?vault_id, %token, %amount, "Submitting Raindex vault withdrawal");
+        let expected_hash = prepared.tx_hash();
+        info!(target: "rebalance", %expected_hash, "Broadcasting prepared Raindex vault withdrawal");
         let tx_hash = self
             .services
             .for_chain(chain)?
             .raindex
-            .submit_withdraw(token, vault_id, amount, TOKENIZED_EQUITY_DECIMALS)
+            .broadcast_prepared_withdraw(prepared)
             .await?;
+        debug_assert_eq!(tx_hash, expected_hash);
 
         self.record_vault_withdrawal_submission(aggregate_id, tx_hash)
             .await
@@ -1560,33 +1602,6 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
         Ok(())
-    }
-
-    async fn reconcile_vault_withdrawal_submission(
-        &self,
-        aggregate_id: &RedemptionAggregateId,
-        chain: Chain,
-        token: Address,
-        vault_id: RaindexVaultId,
-        amount: U256,
-        from_block: u64,
-    ) -> Result<(), RedemptionError> {
-        let raindex = &self.services.for_chain(chain)?.raindex;
-        let (tx_hash, actual) = raindex
-            .find_recent_withdrawal(token, vault_id, from_block)
-            .await?;
-        if actual != amount {
-            return Err(RedemptionError::AdoptedWithdrawalAmountMismatch {
-                tx_hash,
-                expected: amount,
-                actual,
-            });
-        }
-
-        info!(target: "rebalance", %aggregate_id, %tx_hash, %amount, "Adopting already-submitted vault withdrawal");
-
-        self.record_vault_withdrawal_submission(aggregate_id, tx_hash)
-            .await
     }
 
     /// Unwraps ERC-4626 tokens and sends to Alpaca, returning the
@@ -1801,23 +1816,15 @@ impl CrossVenueEquityTransfer {
                     });
                 }
                 EquityRedemption::VaultWithdrawSubmitting {
-                    chain,
-                    token,
-                    vault_id,
-                    wrapped_amount,
-                    from_block,
-                    ..
+                    chain, prepared, ..
                 } => {
-                    info!(%aggregate_id, "Reconciling persisted vault withdrawal intent");
-                    self.reconcile_vault_withdrawal_submission(
-                        aggregate_id,
-                        chain,
-                        token,
-                        vault_id,
-                        wrapped_amount,
-                        from_block,
-                    )
-                    .await?;
+                    info!(
+                        %aggregate_id,
+                        tx_hash = %prepared.tx_hash(),
+                        "Broadcasting persisted vault withdrawal"
+                    );
+                    self.broadcast_and_record_vault_withdrawal(aggregate_id, chain, &prepared)
+                        .await?;
                 }
                 EquityRedemption::VaultWithdrawSubmitted { .. } => {
                     info!(%aggregate_id, "Resuming submitted vault withdrawal");
@@ -2495,7 +2502,6 @@ mod tests {
     use futures_util::poll;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
-    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
     use std::collections::{BTreeMap, HashMap};
     use std::pin::pin;
     use std::sync::{Arc, Mutex};
@@ -4027,6 +4033,7 @@ mod tests {
                     vault_id: RaindexVaultId(B256::ZERO),
                     amount: withdrawal_amount(),
                     from_block,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -4044,128 +4051,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_adopts_matching_withdrawal_after_restart_without_resubmitting() {
-        let tx_hash = TxHash::repeat_byte(0x61);
-        let raindex = Arc::new(
-            MockRaindex::new()
-                .with_recent_withdrawal(tx_hash, withdrawal_amount())
-                .with_confirm_behavior(ConfirmTxBehavior::Retryable),
-        );
+    async fn resume_broadcasts_prepared_withdrawal_persisted_before_first_attempt() {
+        let raindex =
+            Arc::new(MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Retryable));
         let (transfer, pool) = create_equity_transfer_with_pool(
             Arc::new(MockTokenizer::new()),
             raindex.clone(),
             Arc::new(MockWrapper::new()),
         )
         .await;
-        let id = redemption_aggregate_id("withdraw-adopt-after-restart");
+        let id = redemption_aggregate_id("withdraw-prepared-before-broadcast");
         seed_withdrawal_intent(&transfer, &id, 101).await;
 
+        assert_eq!(raindex.withdraw_submissions(), 0);
         let restarted = restarted_transfer(&transfer, pool);
         let error = restarted.resume_redemption(&id).await.unwrap_err();
 
         assert!(
-            matches!(
-                error,
-                RedemptionError::Send(_) | RedemptionError::Raindex(_)
-            ),
-            "confirmation failure after adoption must propagate, got: {error:?}"
+            error.is_reconciliation_pending(),
+            "receipt reconciliation should remain retryable, got: {error:?}"
         );
-        assert_eq!(raindex.withdraw_submissions(), 0);
+        assert_eq!(
+            raindex.withdraw_submissions(),
+            1,
+            "restart must broadcast the exact prepared transaction"
+        );
         assert!(matches!(
             restarted.redemption_store.load(&id).await.unwrap(),
             Some(EquityRedemption::VaultWithdrawSubmitted {
-                tx_hash: recorded,
+                tx_hash: TxHash::ZERO,
                 ..
-            }) if recorded == tx_hash
+            })
         ));
     }
 
     #[tokio::test]
-    async fn empty_withdrawal_scan_keeps_intent_and_does_not_submit() {
-        let raindex = Arc::new(MockRaindex::new());
-        let (transfer, _pool) = create_equity_transfer_with_pool(
-            Arc::new(MockTokenizer::new()),
-            raindex.clone(),
-            Arc::new(MockWrapper::new()),
-        )
-        .await;
-        let id = redemption_aggregate_id("withdraw-empty-scan");
-        seed_withdrawal_intent(&transfer, &id, 202).await;
-
-        let error = transfer
-            .reconcile_vault_withdrawal_submission(
-                &id,
-                Chain::Base,
-                Address::ZERO,
-                RaindexVaultId(B256::ZERO),
-                withdrawal_amount(),
-                202,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            RedemptionError::Raindex(RaindexError::ScanInconclusive { from_block: 202 })
-        ));
-        assert_eq!(raindex.withdraw_submissions(), 0);
-        assert!(matches!(
-            transfer.redemption_store.load(&id).await.unwrap(),
-            Some(EquityRedemption::VaultWithdrawSubmitting { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn mismatched_withdrawal_amount_fails_closed_without_resubmitting() {
-        let tx_hash = TxHash::repeat_byte(0x62);
-        let actual = withdrawal_amount() - U256::from(1);
-        let raindex = Arc::new(MockRaindex::new().with_recent_withdrawal(tx_hash, actual));
-        let (transfer, _pool) = create_equity_transfer_with_pool(
-            Arc::new(MockTokenizer::new()),
-            raindex.clone(),
-            Arc::new(MockWrapper::new()),
-        )
-        .await;
-        let id = redemption_aggregate_id("withdraw-amount-mismatch");
-        seed_withdrawal_intent(&transfer, &id, 404).await;
-
-        let error = transfer
-            .reconcile_vault_withdrawal_submission(
-                &id,
-                Chain::Base,
-                Address::ZERO,
-                RaindexVaultId(B256::ZERO),
-                withdrawal_amount(),
-                404,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            RedemptionError::AdoptedWithdrawalAmountMismatch {
-                tx_hash: error_hash,
-                expected,
-                actual: error_actual,
-            } if error_hash == tx_hash
-                && expected == withdrawal_amount()
-                && error_actual == actual
-        ));
-        assert_eq!(raindex.withdraw_submissions(), 0);
-        assert!(matches!(
-            transfer.redemption_store.load(&id).await.unwrap(),
-            Some(EquityRedemption::VaultWithdrawSubmitting { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn accepted_withdrawal_broadcast_with_missing_response_is_adopted_after_restart() {
-        let raindex = Arc::new(
-            MockRaindex::new()
-                .with_current_block(505)
-                .accepting_withdraw_then_losing_response()
-                .with_confirm_behavior(ConfirmTxBehavior::Retryable),
-        );
+    async fn lost_broadcast_response_rebroadcasts_persisted_transaction_after_restart() {
+        let raindex = Arc::new(MockRaindex::new().accepting_withdraw_then_losing_response());
         let (transfer, pool) = create_equity_transfer_with_pool(
             Arc::new(MockTokenizer::new()),
             raindex.clone(),
@@ -4174,7 +4096,7 @@ mod tests {
         .await;
         let id = redemption_aggregate_id("withdraw-response-lost");
 
-        let error = transfer
+        let first_error = transfer
             .withdraw_from_raindex(
                 &id,
                 &Symbol::new("TEST").unwrap(),
@@ -4185,111 +4107,21 @@ mod tests {
             )
             .await
             .unwrap_err();
-
-        assert!(matches!(error, RedemptionError::Raindex(_)));
-        assert_eq!(raindex.withdraw_submissions(), 1);
-        assert!(matches!(
-            transfer.redemption_store.load(&id).await.unwrap(),
-            Some(EquityRedemption::VaultWithdrawSubmitting {
-                from_block: 505,
-                ..
-            })
-        ));
+        assert!(matches!(first_error, RedemptionError::Raindex(_)));
+        let prepared_hash = match transfer.redemption_store.load(&id).await.unwrap() {
+            Some(EquityRedemption::VaultWithdrawSubmitting { prepared, .. }) => prepared.tx_hash(),
+            state => panic!("prepared transaction must remain durable, got {state:?}"),
+        };
 
         let restarted = restarted_transfer(&transfer, pool);
-        restarted.resume_redemption(&id).await.unwrap_err();
+        let second_error = restarted.resume_redemption(&id).await.unwrap_err();
 
-        assert_eq!(
-            raindex.withdraw_submissions(),
-            1,
-            "resume must adopt the accepted transaction, not submit a second withdrawal"
-        );
+        assert!(matches!(second_error, RedemptionError::Raindex(_)));
+        assert_eq!(raindex.withdraw_submissions(), 2);
         assert!(matches!(
             restarted.redemption_store.load(&id).await.unwrap(),
-            Some(EquityRedemption::VaultWithdrawSubmitted { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn persistence_failure_after_submit_is_adopted_without_duplicate_withdrawal() {
-        let raindex = Arc::new(
-            MockRaindex::new()
-                .remembering_submitted_withdrawal()
-                .with_confirm_behavior(ConfirmTxBehavior::Retryable),
-        );
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
-        let raindex_service: Arc<dyn Raindex> = raindex.clone();
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let services = mock_services_with(&tokenizer, &raindex_service, &wrapper);
-        let directory = tempfile::tempdir().unwrap();
-        let database_path = directory.path().join("withdraw-persist.sqlite");
-        let writable = SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(&database_path)
-                .create_if_missing(true)
-                .journal_mode(SqliteJournalMode::Delete),
-        )
-        .await
-        .unwrap();
-        sqlx::migrate!().run(&writable).await.unwrap();
-        let id = redemption_aggregate_id("withdraw-persist-failure");
-        let staging = CrossVenueEquityTransfer::new(
-            services.clone(),
-            Arc::new(test_store(writable.clone(), services.clone())),
-            Arc::new(test_store(writable.clone(), services.clone())),
-        );
-        seed_withdrawal_intent(&staging, &id, 606).await;
-        writable.close().await;
-
-        let read_only = SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(&database_path)
-                .read_only(true),
-        )
-        .await
-        .unwrap();
-        let read_only_transfer = CrossVenueEquityTransfer::new(
-            services.clone(),
-            Arc::new(test_store(read_only.clone(), services.clone())),
-            Arc::new(test_store(read_only.clone(), services.clone())),
-        );
-
-        let error = read_only_transfer
-            .submit_and_record_vault_withdrawal(
-                &id,
-                Chain::Base,
-                Address::ZERO,
-                RaindexVaultId(B256::ZERO),
-                withdrawal_amount(),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(error, RedemptionError::Send(_)));
-        assert_eq!(raindex.withdraw_submissions(), 1);
-        read_only.close().await;
-
-        let reopened = SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(&database_path)
-                .journal_mode(SqliteJournalMode::Delete),
-        )
-        .await
-        .unwrap();
-        let restarted = CrossVenueEquityTransfer::new(
-            services.clone(),
-            Arc::new(test_store(reopened.clone(), services.clone())),
-            Arc::new(test_store(reopened, services)),
-        );
-        restarted.resume_redemption(&id).await.unwrap_err();
-
-        assert_eq!(
-            raindex.withdraw_submissions(),
-            1,
-            "the persisted intent scan must adopt the first transaction"
-        );
-        assert!(matches!(
-            restarted.redemption_store.load(&id).await.unwrap(),
-            Some(EquityRedemption::VaultWithdrawSubmitted { .. })
+            Some(EquityRedemption::VaultWithdrawSubmitting { prepared, .. })
+                if prepared.tx_hash() == prepared_hash
         ));
     }
 
@@ -5455,6 +5287,7 @@ mod tests {
                     vault_id: RaindexVaultId(B256::ZERO),
                     amount,
                     from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await

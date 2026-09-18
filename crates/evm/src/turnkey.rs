@@ -43,8 +43,10 @@ use turnkey_client::{RetryConfig, TurnkeyClientError};
 use crate::gcp_kms_stamper::{GcpKmsStamper, GcpKmsStamperError};
 use crate::inflight_nonces::InFlightNonces;
 use crate::nonce::ResettableNonceManager;
-use crate::submit::{release_in_flight_after_wait, send_with_recovery};
-use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
+use crate::submit::{
+    broadcast_prepared, prepare_with_nonce, release_in_flight_after_wait, send_with_recovery,
+};
+use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
 
 /// Turnkey organization identifier (non-secret, lives in plaintext
 /// config).
@@ -1144,6 +1146,49 @@ where
             note,
         )
         .await
+    }
+    async fn prepare_pending(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        info!(target: "wallet", %contract, note, "Preparing Turnkey contract call");
+        prepare_with_nonce(
+            &self.signing_provider,
+            &self.nonce_manager,
+            &self.send_lock,
+            self.address,
+            contract,
+            calldata,
+        )
+        .await
+    }
+
+    async fn broadcast_prepared(
+        &self,
+        prepared: &PreparedTransaction,
+        note: &str,
+    ) -> Result<TxHash, EvmError> {
+        broadcast_prepared(
+            &self.provider,
+            &self.nonce_manager,
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            prepared,
+            note,
+        )
+        .await
+    }
+    fn discard_prepared(&self, prepared: &PreparedTransaction) {
+        self.nonce_manager.invalidate();
+        tracing::warn!(
+            target: "wallet",
+            tx_hash = %prepared.tx_hash(),
+            nonce = prepared.nonce(),
+            "Discarding unpersisted prepared transaction and invalidating nonce cache"
+        );
     }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {

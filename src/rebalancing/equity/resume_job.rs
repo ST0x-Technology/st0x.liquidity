@@ -9,11 +9,11 @@
 //! [`crate::conductor::monitor::order_fills::OrderFillMonitor`] or
 //! [`crate::conductor::monitor::inventory::InventoryMonitor`] from starting.
 //!
-//! Transient errors propagate as `Err` so apalis retries up to three times.
-//! If all retries are exhausted the terminal failure is logged at `error!` but
-//! does NOT trip the conductor-wide fail-stop, so hedging and fill detection
-//! continue running. Aggregates already in a terminal state return `Ok(())`
-//! (idempotent).
+//! Ordinary transient errors propagate so Apalis retries up to three times.
+//! Inconclusive withdrawal broadcast/receipt outcomes instead enqueue an
+//! uncapped durable replacement before returning success, because chain
+//! finality cannot safely consume a finite worker retry budget. Terminal
+//! failures are logged without tripping the conductor-wide fail-stop.
 
 use std::fmt;
 use std::sync::Arc;
@@ -30,7 +30,9 @@ use st0x_tokenization::IssuerRequestId;
 use super::job::{
     PositionReservationAuthority, has_live_sibling_equity_transfer, restore_position_reservation,
 };
-use super::{CrossVenueEquityTransfer, MintError, RedemptionError};
+use super::{
+    CrossVenueEquityTransfer, MintError, RedemptionError, WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -127,6 +129,12 @@ pub(crate) enum ResumeTokenizationJobError {
     PositionReservation(#[from] SendError<Position>),
     #[error(transparent)]
     Enqueue(#[from] QueuePushError),
+}
+
+impl ResumeTokenizationJobError {
+    fn is_reconciliation_pending(&self) -> bool {
+        matches!(self, Self::Redemption(error) if error.is_reconciliation_pending())
+    }
 }
 
 impl BotGasFailureClassifier for ResumeTokenizationJobError {
@@ -234,6 +242,19 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
             return Ok(());
         };
 
+        if error.is_reconciliation_pending() {
+            warn!(
+                target: "tokenization",
+                resume_target = %self.target,
+                "Withdrawal reconciliation remains inconclusive; scheduling a durable resume"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue
+                .push_with_delay(self.clone(), WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY)
+                .await?;
+            return Ok(());
+        }
+
         // Bot-gas cost recording is best-effort (see `BotGasReceiptCostEnqueuer`'s
         // doc, ADR 0017 SS4): redrive through the shared mechanism rather than
         // consuming the apalis retry budget. See `ResumeTokenizationCtx::job_queue`'s
@@ -333,7 +354,7 @@ mod tests {
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::native_gas::ConfiguredGasReadiness;
     use crate::offchain::order::OffchainOrderId;
-    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::mock::{ConfirmTxBehavior, MockRaindex};
     use crate::position::TradeId;
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
@@ -377,11 +398,23 @@ mod tests {
         Arc<st0x_event_sorcery::Store<EquityRedemption>>,
         Arc<MockTokenizer>,
     ) {
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let raindex: Arc<dyn Raindex> = Arc::new(
             MockRaindex::new()
                 .with_withdraw_transfer(Address::ZERO, U256::from(1_000_000_000_000_000_000_u128)),
         );
+        build_ctx_with(tokenizer, raindex).await
+    }
+
+    async fn build_ctx_with(
+        tokenizer: Arc<MockTokenizer>,
+        raindex: Arc<dyn Raindex>,
+    ) -> (
+        ResumeTokenizationCtx,
+        Arc<st0x_event_sorcery::Store<crate::tokenized_equity_mint::TokenizedEquityMint>>,
+        Arc<st0x_event_sorcery::Store<EquityRedemption>>,
+        Arc<MockTokenizer>,
+    ) {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let vault_lookup =
             Arc::new(MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)));
@@ -391,10 +424,10 @@ mod tests {
                 Chain::Base,
                 ChainEquityServices {
                     wallet: Address::ZERO,
-                    raindex: raindex.clone(),
+                    raindex,
                     vault_lookup,
                     tokenizer: tokenizer.clone(),
-                    wrapper: wrapper.clone(),
+                    wrapper,
                     mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                     gas_readiness: ConfiguredGasReadiness::Unwired,
                     equities: ChainEquities::default(),
@@ -597,6 +630,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -721,6 +755,119 @@ mod tests {
             "resume must drive the MintAccepted aggregate to DepositedIntoRaindex, \
              got {resumed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn inconclusive_withdrawal_confirmation_durably_reschedules_resume() {
+        let raindex =
+            Arc::new(MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Retryable));
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (ctx, _, redemption_store, _) = build_ctx_with(tokenizer, raindex.clone()).await;
+        let id = redemption_aggregate_id("resume-withdrawal-reconciliation");
+        let symbol = Symbol::new("AAPL").unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    vault_id: RaindexVaultId(B256::ZERO),
+                    amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Redemption(id.clone()),
+            symbol: Some(symbol),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("inconclusive reconciliation must use a durable replacement row");
+
+        assert_eq!(raindex.withdraw_submissions(), 1);
+        assert!(matches!(
+            redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted {
+                tx_hash: TxHash::ZERO,
+                ..
+            })
+        ));
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_one(ctx.job_queue.pool())
+        .await
+        .unwrap();
+        let replacement: ResumeTokenizationAggregate = serde_json::from_slice(&payload).unwrap();
+        assert!(matches!(
+            replacement.target,
+            ResumeTokenizationTarget::Redemption(replacement_id) if replacement_id == id
+        ));
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            run_at
+                >= now + i64::try_from(WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY.as_secs()).unwrap()
+                    - 5
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_withdrawal_broadcast_response_durably_reschedules_resume() {
+        let raindex = Arc::new(MockRaindex::new().accepting_withdraw_then_losing_response());
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (ctx, _, redemption_store, _) = build_ctx_with(tokenizer, raindex.clone()).await;
+        let id = redemption_aggregate_id("resume-lost-withdrawal-response");
+        let symbol = Symbol::new("AAPL").unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    vault_id: RaindexVaultId(B256::ZERO),
+                    amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Redemption(id.clone()),
+            symbol: Some(symbol),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("unknown broadcast outcome must use a durable replacement row");
+
+        assert_eq!(raindex.withdraw_submissions(), 1);
+        assert!(matches!(
+            redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitting { prepared, .. })
+                if prepared.tx_hash() == TxHash::ZERO
+        ));
+        let pending_jobs: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_one(ctx.job_queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(pending_jobs, 1);
     }
 
     /// `ResumeTokenizationAggregate` is the startup crash-recovery job,
@@ -903,6 +1050,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -1401,6 +1549,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
                     from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
