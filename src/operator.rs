@@ -1635,28 +1635,48 @@ pub mod process_tx {
         }
     }
 
+    /// Selected hedged-chain configuration and its matching RPC provider.
+    pub struct ProcessTxChainContext<'a, P> {
+        trading_chain: &'a HedgedChain,
+        provider: &'a P,
+    }
+
+    impl<'a, P> ProcessTxChainContext<'a, P> {
+        /// Couples the chain decoder configuration to the provider selected by
+        /// the caller for that chain.
+        pub const fn new(trading_chain: &'a HedgedChain, provider: &'a P) -> Self {
+            Self {
+                trading_chain,
+                provider,
+            }
+        }
+    }
+
     /// Accounts a missed on-chain fill from `tx_hash` and, when the resulting
     /// net exposure warrants it, places the opposite hedge.
     ///
-    /// Run inside the bot process, pass the selected hedged-chain config and a
-    /// provider connected to that chain, the conductor's wired `stores` (so the
-    /// fill reaches the running reactors), and the live `submission_lock` so
-    /// the pending-hedge inspection and the broker placement serialize against
-    /// the trading loop (ADR 0014). Under the lock, the shared `Position`
-    /// aggregate's pending-order gate prevents a racing tick from double-placing
-    /// the hedge. The CLI runs in a separate process with standalone stores, no
-    /// shared lock, and passes `None`.
+    /// Run inside the bot process, pass a [`ProcessTxChainContext`] containing
+    /// the selected hedged-chain config and its provider, the conductor's wired
+    /// `stores` (so the fill reaches the running reactors), and the live
+    /// `submission_lock` so the pending-hedge inspection and the broker
+    /// placement serialize against the trading loop (ADR 0014). Under the lock,
+    /// the shared `Position` aggregate's pending-order gate prevents a racing
+    /// tick from double-placing the hedge. The CLI runs in a separate process
+    /// with standalone stores, no shared lock, and passes `None`.
     pub async fn process_tx<P: Provider + Clone + 'static>(
         tx_hash: TxHash,
         ctx: &Ctx,
-        trading_chain: &HedgedChain,
         pool: &SqlitePool,
-        provider: &P,
+        chain: ProcessTxChainContext<'_, P>,
         cache: &SymbolCache,
         stores: &ProcessTxStores,
         order_placer: Arc<dyn OrderPlacer>,
         submission_lock: Option<&Mutex<()>>,
     ) -> Result<ProcessTxReport, OperatorError> {
+        let ProcessTxChainContext {
+            trading_chain,
+            provider,
+        } = chain;
         let actors = RecoveryActors {
             order_owner: trading_chain.vault_owner,
             bot_operator: BotOperator(ctx.order_owner()),
@@ -2180,9 +2200,9 @@ pub mod process_tx {
         use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
         use super::{
-            HedgeDisposition, OperatorError, PlacementContext, ProcessTxFill, ProcessTxOutcome,
-            ProcessTxStores, RejectionReason, process_found_trade, process_tx,
-            reconcile_offchain_order_state, reconcile_post_place_state,
+            HedgeDisposition, OperatorError, PlacementContext, ProcessTxChainContext,
+            ProcessTxFill, ProcessTxOutcome, ProcessTxStores, RejectionReason, process_found_trade,
+            process_tx, reconcile_offchain_order_state, reconcile_post_place_state,
         };
 
         /// Parses a positive share quantity for process-tx fixtures.
@@ -2232,9 +2252,8 @@ pub mod process_tx {
             let report = process_tx(
                 tx_hash,
                 &ctx,
-                &trading_chain,
                 &pool,
-                &provider,
+                ProcessTxChainContext::new(&trading_chain, &provider),
                 &SymbolCache::default(),
                 &stores,
                 order_placer,

@@ -2111,7 +2111,7 @@ async fn run_provider_command<W: Write + Send>(
 ) -> anyhow::Result<()> {
     match command {
         ProviderCommand::ProcessTx { tx_hash, chain } => {
-            let chain = chain.unwrap_or(ctx.chains.primary().chain);
+            let chain = chain.unwrap_or_else(|| ctx.chains.primary().chain);
             let trading_chain = ctx.chains.hedged_chain(chain).ok_or_else(|| {
                 anyhow::anyhow!("process-tx chain {chain} is not configured as a hedged chain")
             })?;

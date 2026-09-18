@@ -20,7 +20,9 @@ use st0x_execution::{
 };
 use st0x_float_serde::format_float_with_fallback;
 use st0x_hedge::operator::offchain::order::{OrderPlacementResult, OrderPlacer};
-use st0x_hedge::operator::process_tx::{HedgeDisposition, ProcessTxOutcome, ProcessTxReport};
+use st0x_hedge::operator::process_tx::{
+    HedgeDisposition, ProcessTxChainContext, ProcessTxOutcome, ProcessTxReport,
+};
 use st0x_registry::SymbolCache;
 
 use super::backpressure_retry::{BACKPRESSURE_RETRY_MAX_ATTEMPTS, retry_on_backpressure};
@@ -640,9 +642,8 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     let report = st0x_hedge::operator::process_tx::process_tx(
         tx_hash,
         ctx,
-        trading_chain,
         pool,
-        provider,
+        ProcessTxChainContext::new(trading_chain, provider),
         cache,
         &stores,
         order_placer,
