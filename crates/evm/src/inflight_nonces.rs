@@ -5,18 +5,17 @@
 //! allocator's coherent set of prepared and broadcast-but-unconfirmed nonces.
 //! [`InFlightNonces`] adds transaction hashes to that ownership: a record is
 //! created when a submission is accepted or restored from durable state, and
-//! `await_receipt` releases it only when the wait resolves definitively. A
-//! mined transaction clears every competing hash recorded at its nonce, while
-//! a transaction proven dropped from both the receipt lookup and the mempool
-//! clears only that hash. This both protects allocation and lets later
-//! "replacement transaction underpriced" rejections use direct ownership
-//! evidence instead of an inferred heuristic.
+//! `await_receipt` resolves it. A mined transaction clears every competing
+//! hash recorded at its nonce. A proven-dropped generic transaction clears
+//! only that hash and rewinds allocation when it was the final hash. Durable
+//! prepared transactions instead remain occupied after a drop because their
+//! persisted exact bytes will be rebroadcast.
 //!
-//! A `HashSet<TxHash>` is kept per nonce, not a single hash, because a
-//! fee-bumped replacement resubmits the *same* nonce under a *new* hash. Only
-//! one can mine, but both must remain recognized as ours until confirmation or
-//! a definitive drop resolves them. Entries are never released by age:
-//! elapsed time does not prove a transaction can no longer mine.
+//! A `HashMap<TxHash, DropPolicy>` is kept per nonce, not a single hash,
+//! because a fee-bumped replacement resubmits the *same* nonce under a *new*
+//! hash. Only one can mine, but every live or durably retryable hash must
+//! remain recognized as ours. Entries are never released by age: elapsed time
+//! does not prove a transaction can no longer mine.
 //!
 //! ## What this tracker can and cannot prove
 //!
@@ -34,7 +33,7 @@
 
 use alloy::primitives::{Address, TxHash};
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::trace;
 
@@ -64,13 +63,19 @@ pub(crate) enum NonceOwnership {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropPolicy {
+    Release,
+    RetainForRebroadcast,
+}
+
 /// One address's in-flight bookkeeping: the nonces this process has
 /// recorded for it.
 #[derive(Debug, Default)]
 struct AddressRecord {
     /// Nonces this process has recorded as its own, each with every
-    /// still-outstanding transaction hash broadcast at it.
-    per_nonce: HashMap<u64, HashSet<TxHash>>,
+    /// still-outstanding transaction hash and its definitive-drop policy.
+    per_nonce: HashMap<u64, HashMap<TxHash, DropPolicy>>,
 }
 
 /// Clone-able handle around the wallet's own record of in-flight nonces.
@@ -97,11 +102,25 @@ impl InFlightNonces {
         }
     }
 
-    /// Records that `tx_hash` occupies `nonce` for `address`.
-    ///
-    /// Fresh submissions call this only after acceptance. Durable recovery may
-    /// also restore an exact persisted transaction before workers begin.
+    /// Records an accepted generic transaction that may release its nonce once
+    /// its final hash is definitively dropped.
     pub(crate) fn record(&self, address: Address, nonce: u64, tx_hash: TxHash) {
+        self.record_with_policy(address, nonce, tx_hash, DropPolicy::Release);
+    }
+
+    /// Records a durable exact transaction whose nonce remains reserved after
+    /// a drop so recovery can rebroadcast the same bytes.
+    pub(crate) fn record_durable(&self, address: Address, nonce: u64, tx_hash: TxHash) {
+        self.record_with_policy(address, nonce, tx_hash, DropPolicy::RetainForRebroadcast);
+    }
+
+    fn record_with_policy(
+        &self,
+        address: Address,
+        nonce: u64,
+        tx_hash: TxHash,
+        policy: DropPolicy,
+    ) {
         self.nonce_manager.occupy_nonce(address, nonce);
         self.nonces
             .entry(address)
@@ -109,40 +128,60 @@ impl InFlightNonces {
             .per_nonce
             .entry(nonce)
             .or_default()
-            .insert(tx_hash);
+            .entry(tx_hash)
+            .and_modify(|existing| {
+                if policy == DropPolicy::RetainForRebroadcast {
+                    *existing = policy;
+                }
+            })
+            .or_insert(policy);
     }
 
-    /// Removes a proven-dropped `tx_hash` from whichever nonce's entry
-    /// contains it. If that leaves the nonce's set empty, the nonce entry
-    /// itself is dropped. Other hashes at the same nonce remain in flight
-    /// because one of them may still confirm.
+    /// Resolves a proven-dropped `tx_hash`.
     ///
-    /// A no-op if `tx_hash` was never recorded, or if `address` has no
-    /// entries at all.
-    pub(crate) fn release_hash(&self, address: Address, tx_hash: TxHash) {
-        let Some(mut record) = self.nonces.get_mut(&address) else {
-            trace!(
-                %address, %tx_hash,
-                "In-flight release for an address with no recorded entries -- \
-                 expected if this process never recorded this hash (e.g. a \
-                 transfer submitted by another party); would also be the \
-                 observable symptom of record() and release() disagreeing on \
-                 address"
-            );
-            return;
+    /// Generic hashes are removed. If the hash was the nonce's final entry,
+    /// occupancy and the cached allocation are atomically rewound while the
+    /// caller holds the wallet send lock. Durable prepared hashes remain
+    /// occupied because their exact persisted bytes are still retryable.
+    pub(crate) async fn release_hash(&self, address: Address, tx_hash: TxHash) {
+        let released_nonce = {
+            let Some(mut record) = self.nonces.get_mut(&address) else {
+                trace!(
+                    %address, %tx_hash,
+                    "In-flight release for an address with no recorded entries -- \
+                     expected if this process never recorded this hash"
+                );
+                return;
+            };
+
+            let Some((nonce, policy)) = record.per_nonce.iter().find_map(|(nonce, tx_hashes)| {
+                tx_hashes
+                    .get(&tx_hash)
+                    .copied()
+                    .map(|policy| (*nonce, policy))
+            }) else {
+                return;
+            };
+            if policy == DropPolicy::RetainForRebroadcast {
+                return;
+            }
+
+            let Some(tx_hashes) = record.per_nonce.get_mut(&nonce) else {
+                return;
+            };
+            tx_hashes.remove(&tx_hash);
+            if tx_hashes.is_empty() {
+                record.per_nonce.remove(&nonce);
+                Some(nonce)
+            } else {
+                None
+            }
         };
 
-        let mut released_nonce = None;
-        record.per_nonce.retain(|nonce, tx_hashes| {
-            tx_hashes.remove(&tx_hash);
-            let retained = !tx_hashes.is_empty();
-            if !retained {
-                released_nonce = Some(*nonce);
-            }
-            retained
-        });
         if let Some(nonce) = released_nonce {
-            self.nonce_manager.release_occupied_nonce(address, nonce);
+            self.nonce_manager
+                .release_nonce_and_rewind(address, nonce)
+                .await;
         }
     }
 
@@ -165,7 +204,7 @@ impl InFlightNonces {
         let confirmed_nonce = record
             .per_nonce
             .iter()
-            .find_map(|(nonce, tx_hashes)| tx_hashes.contains(&tx_hash).then_some(*nonce));
+            .find_map(|(nonce, tx_hashes)| tx_hashes.contains_key(&tx_hash).then_some(*nonce));
         if let Some(nonce) = confirmed_nonce {
             record.per_nonce.remove(&nonce);
             self.nonce_manager.release_occupied_nonce(address, nonce);
@@ -230,13 +269,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn releasing_the_only_tx_hash_for_a_nonce_leaves_it_queryable_again() {
+    #[tokio::test]
+    async fn releasing_the_only_tx_hash_for_a_nonce_leaves_it_queryable_again() {
         let in_flight = InFlightNonces::default();
         let tx_hash = TxHash::repeat_byte(0x33);
 
         in_flight.record(ADDRESS, NONCE, tx_hash);
-        in_flight.release_hash(ADDRESS, tx_hash);
+        in_flight.release_hash(ADDRESS, tx_hash).await;
 
         assert_eq!(
             in_flight.ownership(ADDRESS, NONCE),
@@ -246,8 +285,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn two_tx_hashes_recorded_under_the_same_nonce_stay_ours_until_both_are_released() {
+    #[tokio::test]
+    async fn two_tx_hashes_recorded_under_the_same_nonce_stay_ours_until_both_are_released() {
         let in_flight = InFlightNonces::default();
         let original_hash = TxHash::repeat_byte(0x44);
         let fee_bumped_hash = TxHash::repeat_byte(0x55);
@@ -255,7 +294,7 @@ mod tests {
         in_flight.record(ADDRESS, NONCE, original_hash);
         in_flight.record(ADDRESS, NONCE, fee_bumped_hash);
 
-        in_flight.release_hash(ADDRESS, original_hash);
+        in_flight.release_hash(ADDRESS, original_hash).await;
         assert_eq!(
             in_flight.ownership(ADDRESS, NONCE),
             NonceOwnership::Ours,
@@ -263,7 +302,7 @@ mod tests {
              has not been released yet"
         );
 
-        in_flight.release_hash(ADDRESS, fee_bumped_hash);
+        in_flight.release_hash(ADDRESS, fee_bumped_hash).await;
         assert_eq!(
             in_flight.ownership(ADDRESS, NONCE),
             NonceOwnership::Unknown,
@@ -272,14 +311,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn releasing_a_never_recorded_tx_hash_is_a_no_op() {
+    #[tokio::test]
+    async fn releasing_a_never_recorded_tx_hash_is_a_no_op() {
         let in_flight = InFlightNonces::default();
         let recorded_hash = TxHash::repeat_byte(0x66);
         let never_recorded_hash = TxHash::repeat_byte(0x77);
 
         in_flight.record(ADDRESS, NONCE, recorded_hash);
-        in_flight.release_hash(ADDRESS, never_recorded_hash);
+        in_flight.release_hash(ADDRESS, never_recorded_hash).await;
 
         assert_eq!(
             in_flight.ownership(ADDRESS, NONCE),
@@ -288,7 +327,9 @@ mod tests {
              unrelated recorded entry"
         );
 
-        in_flight.release_hash(OTHER_ADDRESS, never_recorded_hash);
+        in_flight
+            .release_hash(OTHER_ADDRESS, never_recorded_hash)
+            .await;
         assert_eq!(
             in_flight.ownership(OTHER_ADDRESS, NONCE),
             NonceOwnership::Unknown,
@@ -297,8 +338,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cloned_handles_share_the_same_underlying_map() {
+    #[tokio::test]
+    async fn cloned_handles_share_the_same_underlying_map() {
         let in_flight_a = InFlightNonces::default();
         let in_flight_b = in_flight_a.clone();
         let tx_hash = TxHash::repeat_byte(0x88);
@@ -311,12 +352,28 @@ mod tests {
             "a clone must see entries recorded through a different handle"
         );
 
-        in_flight_b.release_hash(ADDRESS, tx_hash);
+        in_flight_b.release_hash(ADDRESS, tx_hash).await;
 
         assert_eq!(
             in_flight_a.ownership(ADDRESS, NONCE),
             NonceOwnership::Unknown,
             "a release through one clone must be visible through another"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_hash_remains_owned_after_a_definitive_drop() {
+        let in_flight = InFlightNonces::default();
+        let tx_hash = TxHash::repeat_byte(0x87);
+
+        in_flight.record_durable(ADDRESS, NONCE, tx_hash);
+        in_flight.release_hash(ADDRESS, tx_hash).await;
+
+        assert_eq!(
+            in_flight.ownership(ADDRESS, NONCE),
+            NonceOwnership::Ours,
+            "persisted exact bytes remain retryable and must keep their nonce \
+             occupied after a definitive drop"
         );
     }
 

@@ -2543,6 +2543,7 @@ impl EquityRedemption {
                 token,
                 wrapped_amount,
                 tx_hash,
+                prepared,
                 ..
             } => {
                 let chain_services = services.for_chain(self.chain())?;
@@ -2552,7 +2553,9 @@ impl EquityRedemption {
                     .await
                     .map_err(|error| {
                         let error_message = error.to_string();
-                        if error.is_reconciliation_pending() {
+                        if error.is_reconciliation_pending()
+                            || (prepared.is_some() && error.is_transaction_dropped())
+                        {
                             EquityRedemptionError::RaindexWithdrawReconciliationPending {
                                 token: *token,
                                 amount: *wrapped_amount,

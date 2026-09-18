@@ -425,8 +425,9 @@ where
         }
     }
 
-    // Keep the nonce occupied until receipt confirmation or a definitive drop.
-    in_flight.record(address, prepared.nonce(), tx_hash);
+    // Persisted exact bytes retain their nonce through a definitive drop so
+    // durable recovery can rebroadcast them.
+    in_flight.record_durable(address, prepared.nonce(), tx_hash);
     info!(target: "wallet", %tx_hash, note, nonce = prepared.nonce(), "Prepared transaction broadcast");
     Ok(tx_hash)
 }
@@ -1116,12 +1117,10 @@ where
 /// the send side.
 ///
 /// - `Ok(_)` (mined) is definitive for the whole nonce: every competing hash
-///   recorded at that nonce is obsolete, so the nonce entry is removed.
-/// - A dropped-transaction error (proven gone from both the receipt lookup
-///   and the mempool past the grace period --
-///   [`EvmError::is_transaction_dropped`]) is definitive only for that
-///   attempt: its hash is removed, while any replacement hash recorded at
-///   the same nonce remains in flight.
+///   recorded at that nonce is obsolete and its occupancy is released.
+/// - A dropped-transaction error is definitive only for that attempt.
+///   Generic hashes are removed and a final hash rewinds the allocator to fill
+///   the gap. Durable prepared hashes remain occupied for exact rebroadcast.
 /// - Every other outcome -- most importantly `Err(EvmError::ReceiptTimeout
 ///   { .. })` -- proves nothing: the transaction may still mine after the
 ///   wait gives up. Releasing here would let a later "replacement
@@ -1136,17 +1135,18 @@ where
 /// exhaustively matches every `EvmError` variant, so a future variant that
 /// should also be treated as decisive is a single, compiler-checked place to
 /// update, instead of a second copy of the classification that could
-/// silently drift from it.
-pub(crate) fn release_in_flight_after_wait(
+pub(crate) async fn release_in_flight_after_wait(
     in_flight: &InFlightNonces,
+    send_lock: &Mutex<()>,
     address: Address,
     tx_hash: TxHash,
     result: &Result<TransactionReceipt, EvmError>,
 ) {
+    let _guard = send_lock.lock().await;
     match result {
         Ok(_) => in_flight.release_nonce_for_hash(address, tx_hash),
         Err(error) if error.is_transaction_dropped() => {
-            in_flight.release_hash(address, tx_hash);
+            in_flight.release_hash(address, tx_hash).await;
         }
         Err(_) => {}
     }
@@ -3349,9 +3349,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn release_in_flight_after_wait_releases_whole_nonce_on_confirm() {
+    #[tokio::test]
+    async fn release_in_flight_after_wait_releases_whole_nonce_on_confirm() {
         let in_flight = InFlightNonces::default();
+        let send_lock = Mutex::new(());
         let original_hash = TxHash::repeat_byte(0xa1);
         let confirmed_replacement_hash = TxHash::repeat_byte(0xa2);
         in_flight.record(WALLET, STUCK_NONCE, original_hash);
@@ -3359,7 +3360,14 @@ mod tests {
 
         let result: Result<TransactionReceipt, EvmError> =
             Ok(mined_receipt(confirmed_replacement_hash));
-        release_in_flight_after_wait(&in_flight, WALLET, confirmed_replacement_hash, &result);
+        release_in_flight_after_wait(
+            &in_flight,
+            &send_lock,
+            WALLET,
+            confirmed_replacement_hash,
+            &result,
+        )
+        .await;
 
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),
@@ -3369,9 +3377,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn release_in_flight_after_wait_releases_only_dropped_hash() {
+    #[tokio::test]
+    async fn release_in_flight_after_wait_releases_only_dropped_hash() {
         let in_flight = InFlightNonces::default();
+        let send_lock = Mutex::new(());
         let dropped_hash = TxHash::repeat_byte(0xa3);
         let replacement_hash = TxHash::repeat_byte(0xa4);
         in_flight.record(WALLET, STUCK_NONCE, dropped_hash);
@@ -3381,7 +3390,7 @@ mod tests {
             tx_hash: dropped_hash,
             elapsed_secs: 42,
         });
-        release_in_flight_after_wait(&in_flight, WALLET, dropped_hash, &result);
+        release_in_flight_after_wait(&in_flight, &send_lock, WALLET, dropped_hash, &result).await;
 
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),
@@ -3391,9 +3400,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn release_in_flight_after_wait_does_not_release_on_timeout() {
+    #[tokio::test]
+    async fn release_in_flight_after_wait_does_not_release_on_timeout() {
         let in_flight = InFlightNonces::default();
+        let send_lock = Mutex::new(());
         let tx_hash = TxHash::repeat_byte(0xa5);
         in_flight.record(WALLET, STUCK_NONCE, tx_hash);
 
@@ -3401,7 +3411,7 @@ mod tests {
             tx_hash,
             timeout_secs: 120,
         });
-        release_in_flight_after_wait(&in_flight, WALLET, tx_hash, &result);
+        release_in_flight_after_wait(&in_flight, &send_lock, WALLET, tx_hash, &result).await;
 
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),
@@ -3413,14 +3423,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn release_in_flight_after_wait_does_not_release_on_other_errors() {
+    #[tokio::test]
+    async fn release_in_flight_after_wait_does_not_release_on_other_errors() {
         let in_flight = InFlightNonces::default();
+        let send_lock = Mutex::new(());
         let tx_hash = TxHash::repeat_byte(0xa6);
         in_flight.record(WALLET, STUCK_NONCE, tx_hash);
 
         let result: Result<TransactionReceipt, EvmError> = Err(reverted());
-        release_in_flight_after_wait(&in_flight, WALLET, tx_hash, &result);
+        release_in_flight_after_wait(&in_flight, &send_lock, WALLET, tx_hash, &result).await;
 
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),

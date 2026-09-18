@@ -19,8 +19,10 @@
 //!   onto the retry transaction.
 //! - The occupancy set protects both prepared transactions and accepted
 //!   in-flight transactions. Allocation skips occupied values after every
-//!   cache seed or invalidation, and ownership is released only after a
-//!   definitive receipt, drop, or discard-before-broadcast decision.
+//!   cache seed or invalidation. Generic ownership is released after a
+//!   definitive receipt or drop; durable prepared ownership survives drops
+//!   for exact rebroadcast and is released only by confirmation or an
+//!   explicit discard-before-broadcast decision.
 //!
 //! The cold-cache fetch intentionally uses `latest`, not `pending`.
 //! `submit.rs`'s stuck-transaction recovery depends on landing back on a stuck
@@ -100,6 +102,15 @@ impl ResettableNonceManager {
     /// nonce remains protected and is skipped by `get_next_nonce`.
     #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
     pub(crate) async fn release_prepared_nonce(&self, address: Address, nonce: u64) {
+        self.release_nonce_and_rewind(address, nonce).await;
+    }
+
+    /// Releases a nonce that is definitively free and rewinds the allocation
+    /// cache so the resulting gap is filled before any higher nonce is used.
+    ///
+    /// Callers must hold the wallet send lock across this operation.
+    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    pub(crate) async fn release_nonce_and_rewind(&self, address: Address, nonce: u64) {
         let slot = self.slot(address);
         let mut cached = slot.lock().await;
         if self.release_occupied_nonce(address, nonce) {
@@ -108,8 +119,8 @@ impl ResettableNonceManager {
     }
 
     /// Marks a nonce occupied by a prepared or broadcast-but-unconfirmed
-    /// transaction. Ownership is released only after a definitive receipt or
-    /// drop decision.
+    /// transaction. The corresponding in-flight policy decides whether a
+    /// definitive drop releases or retains that ownership.
     #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
     pub(crate) fn occupy_nonce(&self, address: Address, nonce: u64) {
         self.occupied.entry(address).or_default().insert(nonce);
@@ -364,6 +375,46 @@ mod tests {
             in_flight_nonce + 1,
             "after filling the released gap, allocation must skip the higher \
              broadcast-but-unconfirmed nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_generic_drop_rewinds_cached_allocation_to_the_released_nonce() {
+        let manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(manager.clone());
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+        let tx_hash = alloy::primitives::TxHash::repeat_byte(0x43);
+
+        let submitted_nonce = manager.get_next_nonce(&provider, address).await.unwrap();
+        in_flight.record(address, submitted_nonce, tx_hash);
+        in_flight.release_hash(address, tx_hash).await;
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            submitted_nonce,
+            "the final generic dropped hash must make its nonce the next \
+             allocation instead of leaving a permanent gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_drop_retains_ownership_and_skips_the_prepared_nonce() {
+        let manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(manager.clone());
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+        let tx_hash = alloy::primitives::TxHash::repeat_byte(0x44);
+
+        let submitted_nonce = manager.get_next_nonce(&provider, address).await.unwrap();
+        in_flight.record_durable(address, submitted_nonce, tx_hash);
+        in_flight.release_hash(address, tx_hash).await;
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            submitted_nonce + 1,
+            "a dropped durable transaction must keep its nonce occupied until \
+             its exact persisted bytes are rebroadcast and confirmed"
         );
     }
 

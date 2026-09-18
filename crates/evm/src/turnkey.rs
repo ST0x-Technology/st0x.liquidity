@@ -1204,7 +1204,7 @@ where
             .reserve_prepared_nonce(self.address, prepared.nonce())
             .await;
         self.in_flight
-            .record(self.address, prepared.nonce(), prepared.tx_hash());
+            .record_durable(self.address, prepared.nonce(), prepared.tx_hash());
     }
 
     async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
@@ -1218,7 +1218,7 @@ where
         self.nonce_manager
             .reserve_prepared_nonce(self.address, nonce)
             .await;
-        self.in_flight.record(self.address, nonce, tx_hash);
+        self.in_flight.record_durable(self.address, nonce, tx_hash);
         Ok(())
     }
 
@@ -1226,7 +1226,14 @@ where
         let result =
             crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await;
 
-        release_in_flight_after_wait(&self.in_flight, self.address, tx_hash, &result);
+        release_in_flight_after_wait(
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            tx_hash,
+            &result,
+        )
+        .await;
 
         let receipt = result?;
 

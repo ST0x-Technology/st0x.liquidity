@@ -784,6 +784,10 @@ pub enum RedemptionError {
          trustworthy chain-scan lower bound; operator reconciliation is required"
     )]
     LegacyVaultWithdrawPending { aggregate_id: RedemptionAggregateId },
+    #[error(
+        "prepared vault withdrawal hash mismatch: expected {expected}, broadcast returned {actual}"
+    )]
+    PreparedWithdrawalHashMismatch { expected: TxHash, actual: TxHash },
 }
 
 impl RedemptionError {
@@ -825,7 +829,8 @@ impl BotGasFailureClassifier for RedemptionError {
             | Self::UnexpectedEntity { .. }
             | Self::UnexpectedPendingStatus
             | Self::Rejected
-            | Self::LegacyVaultWithdrawPending { .. } => false,
+            | Self::LegacyVaultWithdrawPending { .. }
+            | Self::PreparedWithdrawalHashMismatch { .. } => false,
         }
     }
 }
@@ -1587,18 +1592,28 @@ impl CrossVenueEquityTransfer {
         chain: Chain,
         prepared: &PreparedTransaction,
     ) -> Result<(), RedemptionError> {
-        let expected_hash = prepared.tx_hash();
-        info!(target: "rebalance", %expected_hash, "Broadcasting prepared Raindex vault withdrawal");
-        let tx_hash = self
+        let tx_hash = self.broadcast_vault_withdrawal(chain, prepared).await?;
+        self.record_vault_withdrawal_submission(aggregate_id, tx_hash)
+            .await
+    }
+
+    async fn broadcast_vault_withdrawal(
+        &self,
+        chain: Chain,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, RedemptionError> {
+        let expected = prepared.tx_hash();
+        info!(target: "rebalance", %expected, "Broadcasting prepared Raindex vault withdrawal");
+        let actual = self
             .services
             .for_chain(chain)?
             .raindex
             .broadcast_prepared_withdraw(prepared)
             .await?;
-        debug_assert_eq!(tx_hash, expected_hash);
-
-        self.record_vault_withdrawal_submission(aggregate_id, tx_hash)
-            .await
+        if actual != expected {
+            return Err(RedemptionError::PreparedWithdrawalHashMismatch { expected, actual });
+        }
+        Ok(actual)
     }
 
     async fn record_vault_withdrawal_submission(
@@ -1836,6 +1851,9 @@ impl CrossVenueEquityTransfer {
                     );
                     self.broadcast_and_record_vault_withdrawal(aggregate_id, chain, &prepared)
                         .await?;
+                    self.redemption_store
+                        .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
+                        .await?;
                 }
                 EquityRedemption::VaultWithdrawSubmitted {
                     chain,
@@ -1848,6 +1866,14 @@ impl CrossVenueEquityTransfer {
                         .raindex
                         .restore_submitted_withdrawal(tx_hash, prepared.as_ref())
                         .await?;
+                    if let Some(prepared) = prepared.as_ref() {
+                        info!(
+                            %aggregate_id,
+                            %tx_hash,
+                            "Rebroadcasting persisted submitted vault withdrawal"
+                        );
+                        self.broadcast_vault_withdrawal(chain, prepared).await?;
+                    }
                     info!(%aggregate_id, "Resuming submitted vault withdrawal");
                     self.redemption_store
                         .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
@@ -4107,8 +4133,58 @@ mod tests {
         ));
         assert_eq!(
             raindex.restored_prepared_withdrawals(),
-            1,
-            "submitted-state recovery must restore nonce ownership before confirmation"
+            0,
+            "the submitting-state path records ownership while broadcasting \
+             and must not redundantly restore before its first confirmation"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_submitted_withdrawal_rebroadcasts_persisted_bytes_on_every_resume() {
+        let raindex = Arc::new(MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Fail));
+        let (transfer, pool) = create_equity_transfer_with_pool(
+            Arc::new(MockTokenizer::new()),
+            raindex.clone(),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = redemption_aggregate_id("withdraw-submitted-dropped");
+        seed_withdrawal_intent(&transfer, &id, 102).await;
+        let prepared_hash = match transfer.redemption_store.load(&id).await.unwrap() {
+            Some(EquityRedemption::VaultWithdrawSubmitting { prepared, .. }) => prepared.tx_hash(),
+            state => panic!("expected durable prepared withdrawal, got {state:?}"),
+        };
+        transfer
+            .record_vault_withdrawal_submission(&id, prepared_hash)
+            .await
+            .unwrap();
+
+        let restarted = restarted_transfer(&transfer, pool);
+        for expected_submissions in 1..=2 {
+            let error = restarted.resume_redemption(&id).await.unwrap_err();
+            assert!(
+                error.is_reconciliation_pending(),
+                "a dropped durable withdrawal must remain retryable, got {error:?}"
+            );
+            assert_eq!(
+                raindex.withdraw_submissions(),
+                expected_submissions,
+                "each resume must rebroadcast the exact persisted transaction \
+                 before checking its receipt again"
+            );
+            assert!(matches!(
+                restarted.redemption_store.load(&id).await.unwrap(),
+                Some(EquityRedemption::VaultWithdrawSubmitted {
+                    tx_hash,
+                    prepared: Some(prepared),
+                    ..
+                }) if tx_hash == prepared_hash && prepared.tx_hash() == prepared_hash
+            ));
+        }
+        assert_eq!(
+            raindex.restored_prepared_withdrawals(),
+            2,
+            "each resume must restore durable nonce ownership before rebroadcast"
         );
     }
 
