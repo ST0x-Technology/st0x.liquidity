@@ -2671,7 +2671,7 @@ fn resolve_process_tx_chain(
     state: &AppState,
     requested: Option<Chain>,
 ) -> Result<HedgedChain, (StatusCode, Json<ErrorResponse>)> {
-    let chain = requested.unwrap_or(state.ctx.chains.primary().chain);
+    let chain = requested.unwrap_or_else(|| state.ctx.chains.primary().chain);
     state
         .ctx
         .chains
@@ -2770,9 +2770,8 @@ async fn process_transaction(
         process_tx::process_tx(
             tx_hash,
             &ctx,
-            &trading_chain,
             &pool,
-            &provider,
+            process_tx::ProcessTxChainContext::new(&trading_chain, &provider),
             &cache,
             &stores,
             order_placer,
