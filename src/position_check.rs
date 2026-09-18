@@ -50,6 +50,14 @@ use crate::trading::onchain::trade_accountant::{DeadLetterReason, SymbolScopedRe
 
 pub(crate) type CheckPositionsJobQueue = JobQueue<CheckPositions>;
 const MAX_CONCURRENT_EXTENDED_HOURS_CANCELLATIONS: usize = 8;
+const EQUITY_TRANSFER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+fn equity_transfer_retry_delay(attempts: u32) -> Duration {
+    let factor = 2_u32.saturating_pow(attempts);
+    EQUITY_TRANSFER_REDRIVE_DELAY
+        .saturating_mul(factor)
+        .min(EQUITY_TRANSFER_RETRY_MAX_DELAY)
+}
 
 /// Shared dependencies for the [`CheckPositions`] job.
 pub(crate) struct CheckPositionsCtx<E: Executor + Clone + Send + Sync + 'static> {
@@ -297,6 +305,10 @@ fn backstop_sizing_assets<'registry>(
 pub(crate) struct CheckPositions {
     #[serde(default)]
     symbol: Option<Symbol>,
+    /// Number of transfer-blocked reschedules already attempted by this
+    /// symbol-scoped recalculation. Legacy payloads start at zero.
+    #[serde(default)]
+    equity_transfer_retry_attempts: u32,
 }
 
 #[derive(Debug, Default)]
@@ -335,8 +347,12 @@ where
         let mut close_flatten_window_cache = CloseFlattenWindowCache::default();
 
         if let Some(symbol) = &self.symbol {
-            ctx.check_and_enqueue_one(symbol, &mut close_flatten_window_cache)
-                .await?;
+            ctx.check_and_enqueue_one(
+                symbol,
+                self.equity_transfer_retry_attempts,
+                &mut close_flatten_window_cache,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -393,6 +409,7 @@ impl CheckPositions {
     pub(crate) fn for_symbol(symbol: Symbol) -> Self {
         Self {
             symbol: Some(symbol),
+            equity_transfer_retry_attempts: 0,
         }
     }
 }
@@ -404,6 +421,7 @@ where
     async fn check_and_enqueue_one(
         &self,
         symbol: &Symbol,
+        equity_transfer_retry_attempts: u32,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
     ) -> Result<(), CheckPositionsError> {
         let position_reservation_pending = self
@@ -412,11 +430,15 @@ where
             .await?
             .is_some_and(|position| position.equity_transfer_reservation.is_some());
         if position_reservation_pending {
-            return self.reschedule_after_equity_transfer(symbol).await;
+            return self
+                .reschedule_after_equity_transfer(symbol, equity_transfer_retry_attempts)
+                .await;
         }
 
         if has_active_transfer_for_symbol(&self.pool, symbol).await? {
-            return self.reschedule_after_equity_transfer(symbol).await;
+            return self
+                .reschedule_after_equity_transfer(symbol, equity_transfer_retry_attempts)
+                .await;
         }
 
         record_hedge_floor_gauges(
@@ -439,17 +461,24 @@ where
     async fn reschedule_after_equity_transfer(
         &self,
         symbol: &Symbol,
+        equity_transfer_retry_attempts: u32,
     ) -> Result<(), CheckPositionsError> {
+        let retry_delay = equity_transfer_retry_delay(equity_transfer_retry_attempts);
+        let next_retry_attempts = equity_transfer_retry_attempts.saturating_add(1);
         self.check_positions_queue
             .clone()
             .push_with_delay(
-                CheckPositions::for_symbol(symbol.clone()),
-                EQUITY_TRANSFER_REDRIVE_DELAY,
+                CheckPositions {
+                    symbol: Some(symbol.clone()),
+                    equity_transfer_retry_attempts: next_retry_attempts,
+                },
+                retry_delay,
             )
             .await?;
         debug!(
             %symbol,
-            retry_delay_secs = EQUITY_TRANSFER_REDRIVE_DELAY.as_secs(),
+            equity_transfer_retry_attempts = next_retry_attempts,
+            retry_delay_secs = retry_delay.as_secs(),
             "Equity transfer still in progress; rescheduled fresh hedge recalculation"
         );
         Ok(())
@@ -1903,6 +1932,19 @@ mod tests {
             .unwrap()
     }
 
+    async fn load_queued_check_positions(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+    ) -> (serde_json::Value, i64) {
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? ORDER BY run_at DESC LIMIT 1",
+        )
+        .bind(check_positions_job_type())
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap();
+        (serde_json::from_slice(&payload).unwrap(), run_at)
+    }
+
     fn hedge_job_type() -> String {
         std::any::type_name::<PlaceHedge>().to_string()
     }
@@ -1913,6 +1955,26 @@ mod tests {
 
     fn check_positions_job_type() -> String {
         std::any::type_name::<CheckPositions>().to_string()
+    }
+
+    #[test]
+    fn equity_transfer_retry_delay_grows_exponentially_and_caps() {
+        assert_eq!(equity_transfer_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(equity_transfer_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(equity_transfer_retry_delay(4), Duration::from_secs(16));
+        assert_eq!(equity_transfer_retry_delay(5), Duration::from_secs(30));
+        assert_eq!(
+            equity_transfer_retry_delay(u32::MAX),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn legacy_targeted_payload_defaults_equity_transfer_retry_attempts() {
+        let job: CheckPositions =
+            serde_json::from_value(serde_json::json!({ "symbol": "AAPL" })).unwrap();
+
+        assert_eq!(job.equity_transfer_retry_attempts, 0);
     }
 
     fn dry_run_ctx(symbols: &[&str], extended_hours: OperationMode) -> Ctx {
@@ -2080,16 +2142,58 @@ mod tests {
         )
         .await;
 
-        CheckPositions::for_symbol(symbol)
-            .perform(&ctx)
-            .await
-            .unwrap();
+        let job: CheckPositions = serde_json::from_value(serde_json::json!({
+            "symbol": symbol,
+            "equity_transfer_retry_attempts": 3
+        }))
+        .unwrap();
+        let scheduled_after = chrono::Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
 
         assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
         assert_eq!(
             count_jobs(&apalis_pool, &check_positions_job_type()).await,
             1,
             "the targeted recalculation must retry while Position owns a transfer reservation"
+        );
+        let (payload, run_at) = load_queued_check_positions(&apalis_pool).await;
+        assert_eq!(payload["equity_transfer_retry_attempts"], 4);
+        assert!(
+            run_at >= scheduled_after + 8,
+            "the fourth blocked attempt must wait at least 8 seconds, got run_at={run_at}"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_recheck_caps_backoff_for_durable_active_transfer() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, _) = build_ctx(pool, apalis_pool.clone(), cfg, Duration::from_secs(60)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('EquityRedemption', 'active-redemption', 0, \
+             'EquityRedemptionEvent::WithdrawnFromRaindex', '1', ?1, '{}')",
+        )
+        .bind(r#"{"WithdrawnFromRaindex":{"symbol":"AAPL"}}"#)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+        let job: CheckPositions = serde_json::from_value(serde_json::json!({
+            "symbol": symbol,
+            "equity_transfer_retry_attempts": 5
+        }))
+        .unwrap();
+
+        let scheduled_after = chrono::Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+
+        let (payload, run_at) = load_queued_check_positions(&apalis_pool).await;
+        assert_eq!(payload["equity_transfer_retry_attempts"], 6);
+        assert!(
+            run_at >= scheduled_after + 30,
+            "the blocked retry delay must cap at 30 seconds, got run_at={run_at}"
         );
     }
 

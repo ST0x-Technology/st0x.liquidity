@@ -2847,6 +2847,20 @@ pub(crate) enum StuckRedemptionRecoveryError {
     InvalidRequestedQuantity { aggregate_id: RedemptionAggregateId },
 }
 
+/// Static event names interpolated into audited SQL statements below. All
+/// caller-supplied values remain bind parameters.
+const ACTIVE_REDEMPTION_EVENT_TYPES_SQL: &str = "
+    'EquityRedemptionEvent::VaultWithdrawPending',
+    'EquityRedemptionEvent::VaultWithdrawSubmitted',
+    'EquityRedemptionEvent::WithdrawnFromRaindex',
+    'EquityRedemptionEvent::UnwrapPending',
+    'EquityRedemptionEvent::UnwrapSubmitted',
+    'EquityRedemptionEvent::TokensUnwrapped',
+    'EquityRedemptionEvent::SendPending',
+    'EquityRedemptionEvent::TokensSent',
+    'EquityRedemptionEvent::Detected'
+";
+
 /// Returns whether `symbol` has an in-progress equity redemption.
 ///
 /// This is the targeted counterpart to [`symbols_with_active_transfers`].
@@ -2856,51 +2870,44 @@ pub(crate) async fn has_active_transfer_for_symbol(
     pool: &SqlitePool,
     symbol: &Symbol,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
-        "
-        WITH matching AS (
-            SELECT aggregate_id
-            FROM events
-            WHERE aggregate_type = 'EquityRedemption'
-              AND sequence = 0
-              AND COALESCE(
-                  json_extract(payload, '$.VaultWithdrawPending.symbol'),
-                  json_extract(payload, '$.VaultWithdrawSubmitted.symbol'),
-                  json_extract(payload, '$.WithdrawnFromRaindex.symbol')
-              ) = ?
-        ),
-        latest AS (
-            SELECT event.aggregate_id, MAX(event.sequence) AS max_seq
-            FROM events event
-            INNER JOIN matching
-                ON matching.aggregate_id = event.aggregate_id
-            WHERE event.aggregate_type = 'EquityRedemption'
-            GROUP BY event.aggregate_id
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "
+            WITH matching AS (
+                SELECT aggregate_id
+                FROM events
+                WHERE aggregate_type = 'EquityRedemption'
+                  AND sequence = 0
+                  AND COALESCE(
+                      json_extract(payload, '$.VaultWithdrawPending.symbol'),
+                      json_extract(payload, '$.VaultWithdrawSubmitted.symbol'),
+                      json_extract(payload, '$.WithdrawnFromRaindex.symbol')
+                  ) = ?
+            ),
+            latest AS (
+                SELECT event.aggregate_id, MAX(event.sequence) AS max_seq
+                FROM events event
+                INNER JOIN matching
+                    ON matching.aggregate_id = event.aggregate_id
+                WHERE event.aggregate_type = 'EquityRedemption'
+                GROUP BY event.aggregate_id
+            )
+            SELECT EXISTS (
+                SELECT 1
+                FROM events last_ev
+                INNER JOIN latest
+                    ON last_ev.aggregate_id = latest.aggregate_id
+                   AND last_ev.sequence = latest.max_seq
+                WHERE last_ev.aggregate_type = 'EquityRedemption'
+                  AND last_ev.event_type IN ({ACTIVE_REDEMPTION_EVENT_TYPES_SQL})
+            )
+            "
         )
-        SELECT EXISTS (
-            SELECT 1
-            FROM events last_ev
-            INNER JOIN latest
-                ON last_ev.aggregate_id = latest.aggregate_id
-               AND last_ev.sequence = latest.max_seq
-            WHERE last_ev.aggregate_type = 'EquityRedemption'
-              AND last_ev.event_type IN (
-                  'EquityRedemptionEvent::VaultWithdrawPending',
-                  'EquityRedemptionEvent::VaultWithdrawSubmitted',
-                  'EquityRedemptionEvent::WithdrawnFromRaindex',
-                  'EquityRedemptionEvent::UnwrapPending',
-                  'EquityRedemptionEvent::UnwrapSubmitted',
-                  'EquityRedemptionEvent::TokensUnwrapped',
-                  'EquityRedemptionEvent::SendPending',
-                  'EquityRedemptionEvent::TokensSent',
-                  'EquityRedemptionEvent::Detected'
-              )
-        )
-        ",
-    )
-    .bind(symbol.to_string())
-    .fetch_one(pool)
-    .await
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(symbol.to_string())
+        .fetch_one(pool)
+        .await
 }
 /// Returns the set of symbols that have at least one in-progress
 /// EquityRedemption aggregate (i.e. an equity transfer is in progress).
@@ -2919,43 +2926,36 @@ pub(crate) async fn has_active_transfer_for_symbol(
 pub(crate) async fn symbols_with_active_transfers(
     pool: &SqlitePool,
 ) -> Result<HashSet<Symbol>, sqlx::Error> {
-    let rows: Vec<(Option<String>,)> = sqlx::query_as(
-        "
-        WITH latest AS (
-            SELECT aggregate_id, MAX(sequence) AS max_seq
-            FROM events
-            WHERE aggregate_type = 'EquityRedemption'
-            GROUP BY aggregate_id
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "
+            WITH latest AS (
+                SELECT aggregate_id, MAX(sequence) AS max_seq
+                FROM events
+                WHERE aggregate_type = 'EquityRedemption'
+                GROUP BY aggregate_id
+            )
+            SELECT DISTINCT COALESCE(
+                   json_extract(first_ev.payload, '$.VaultWithdrawPending.symbol'),
+                   json_extract(first_ev.payload, '$.VaultWithdrawSubmitted.symbol'),
+                   json_extract(first_ev.payload, '$.WithdrawnFromRaindex.symbol')
+            )
+            FROM events last_ev
+            INNER JOIN latest
+                ON last_ev.aggregate_id = latest.aggregate_id
+               AND last_ev.sequence = latest.max_seq
+            INNER JOIN events first_ev
+                ON first_ev.aggregate_type = 'EquityRedemption'
+               AND first_ev.aggregate_id = latest.aggregate_id
+               AND first_ev.sequence = 0
+            WHERE last_ev.aggregate_type = 'EquityRedemption'
+              AND last_ev.event_type IN ({ACTIVE_REDEMPTION_EVENT_TYPES_SQL})
+            "
         )
-        SELECT DISTINCT COALESCE(
-               json_extract(first_ev.payload, '$.VaultWithdrawPending.symbol'),
-               json_extract(first_ev.payload, '$.VaultWithdrawSubmitted.symbol'),
-               json_extract(first_ev.payload, '$.WithdrawnFromRaindex.symbol')
-        )
-        FROM events last_ev
-        INNER JOIN latest
-            ON last_ev.aggregate_id = latest.aggregate_id
-           AND last_ev.sequence = latest.max_seq
-        INNER JOIN events first_ev
-            ON first_ev.aggregate_type = 'EquityRedemption'
-           AND first_ev.aggregate_id = latest.aggregate_id
-           AND first_ev.sequence = 0
-        WHERE last_ev.aggregate_type = 'EquityRedemption'
-          AND last_ev.event_type IN (
-              'EquityRedemptionEvent::VaultWithdrawPending',
-              'EquityRedemptionEvent::VaultWithdrawSubmitted',
-              'EquityRedemptionEvent::WithdrawnFromRaindex',
-              'EquityRedemptionEvent::UnwrapPending',
-              'EquityRedemptionEvent::UnwrapSubmitted',
-              'EquityRedemptionEvent::TokensUnwrapped',
-              'EquityRedemptionEvent::SendPending',
-              'EquityRedemptionEvent::TokensSent',
-              'EquityRedemptionEvent::Detected'
-          )
-        ",
-    )
-    .fetch_all(pool)
-    .await?;
+    });
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows
         .into_iter()
@@ -2979,34 +2979,29 @@ pub(crate) async fn symbols_with_active_transfers(
 pub(crate) async fn interrupted_redemption_ids(
     pool: &SqlitePool,
 ) -> Result<Vec<RedemptionAggregateId>, sqlx::Error> {
-    let rows: Vec<String> = sqlx::query_scalar(
-        "WITH latest AS ( \
-             SELECT aggregate_id, MAX(sequence) AS max_seq \
-             FROM events \
-             WHERE aggregate_type = 'EquityRedemption' \
-             GROUP BY aggregate_id \
-         ) \
-         SELECT latest.aggregate_id \
-         FROM events last_ev \
-         INNER JOIN latest \
-             ON last_ev.aggregate_id = latest.aggregate_id \
-            AND last_ev.sequence = latest.max_seq \
-         WHERE last_ev.aggregate_type = 'EquityRedemption' \
-           AND last_ev.event_type IN ( \
-               'EquityRedemptionEvent::VaultWithdrawPending', \
-               'EquityRedemptionEvent::VaultWithdrawSubmitted', \
-               'EquityRedemptionEvent::WithdrawnFromRaindex', \
-               'EquityRedemptionEvent::UnwrapPending', \
-               'EquityRedemptionEvent::UnwrapSubmitted', \
-               'EquityRedemptionEvent::TokensUnwrapped', \
-               'EquityRedemptionEvent::SendPending', \
-               'EquityRedemptionEvent::TokensSent', \
-               'EquityRedemptionEvent::Detected' \
-           ) \
-         ORDER BY latest.aggregate_id",
-    )
-    .fetch_all(pool)
-    .await?;
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "
+            WITH latest AS (
+                SELECT aggregate_id, MAX(sequence) AS max_seq
+                FROM events
+                WHERE aggregate_type = 'EquityRedemption'
+                GROUP BY aggregate_id
+            )
+            SELECT latest.aggregate_id
+            FROM events last_ev
+            INNER JOIN latest
+                ON last_ev.aggregate_id = latest.aggregate_id
+               AND last_ev.sequence = latest.max_seq
+            WHERE last_ev.aggregate_type = 'EquityRedemption'
+              AND last_ev.event_type IN ({ACTIVE_REDEMPTION_EVENT_TYPES_SQL})
+            ORDER BY latest.aggregate_id
+            "
+        )
+    });
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows
         .into_iter()
