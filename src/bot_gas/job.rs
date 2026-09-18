@@ -668,6 +668,14 @@ mod tests {
             panic!("MockWallet::discard_prepared should not be called in job tests");
         }
 
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!("MockWallet::restore_prepared should not be called in job tests");
+        }
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            panic!("MockWallet::restore_transaction should not be called in job tests");
+        }
+
         async fn send_pending(
             &self,
             _contract: Address,

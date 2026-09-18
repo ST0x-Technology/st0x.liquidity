@@ -87,6 +87,7 @@ pub struct MockRaindex {
     recent_withdrawal: Mutex<Option<(TxHash, U256)>>,
     remember_submitted_withdrawal: bool,
     withdraw_submissions: AtomicUsize,
+    restored_prepared_withdrawals: AtomicUsize,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -153,6 +154,7 @@ impl MockRaindex {
             recent_withdrawal: Mutex::new(None),
             remember_submitted_withdrawal: false,
             withdraw_submissions: AtomicUsize::new(0),
+            restored_prepared_withdrawals: AtomicUsize::new(0),
         }
     }
 
@@ -227,6 +229,11 @@ impl MockRaindex {
     #[cfg(test)]
     pub(crate) fn withdraw_submissions(&self) -> usize {
         self.withdraw_submissions.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restored_prepared_withdrawals(&self) -> usize {
+        self.restored_prepared_withdrawals.load(Ordering::SeqCst)
     }
 }
 
@@ -345,6 +352,16 @@ impl Raindex for MockRaindex {
     }
 
     async fn discard_prepared_withdraw(&self, _prepared: &PreparedTransaction) {}
+
+    async fn restore_submitted_withdrawal(
+        &self,
+        _tx_hash: TxHash,
+        _prepared: Option<&PreparedTransaction>,
+    ) -> Result<(), RaindexError> {
+        self.restored_prepared_withdrawals
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 
     async fn submit_withdraw(
         &self,

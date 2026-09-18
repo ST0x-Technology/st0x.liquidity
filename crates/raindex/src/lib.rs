@@ -155,6 +155,7 @@ impl RaindexError {
             | Self::MissingOperatorRole { .. } => false,
         }
     }
+
     /// `true` when reconciliation may succeed after the transaction or RPC
     /// backend becomes visible. These errors require durable redrive rather than
     /// a finite worker retry budget.
@@ -218,6 +219,15 @@ pub trait Raindex: Send + Sync {
     /// Releases the wallet-local reservation when a prepared withdrawal could
     /// not be persisted and will never be broadcast.
     async fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction);
+
+    /// Restores wallet-local ownership for a durably submitted withdrawal
+    /// before any other wallet operation can allocate its nonce. Legacy
+    /// records recover the nonce by exact transaction hash.
+    async fn restore_submitted_withdrawal(
+        &self,
+        tx_hash: TxHash,
+        prepared: Option<&PreparedTransaction>,
+    ) -> Result<(), RaindexError>;
 
     /// Submit a vault withdrawal without waiting for confirmation.
     ///

@@ -3546,6 +3546,17 @@ async fn recover_interrupted_tokenization_aggregates(
             .into());
         }
 
+        if let EquityRedemption::VaultWithdrawSubmitted {
+            tx_hash, prepared, ..
+        } = &redemption
+        {
+            equity_services
+                .for_chain(redemption.chain())?
+                .raindex
+                .restore_submitted_withdrawal(*tx_hash, prepared.as_ref())
+                .await?;
+        }
+
         rebalancing_service
             .recover_redemption_state(redemption_id, &redemption)
             .await?;

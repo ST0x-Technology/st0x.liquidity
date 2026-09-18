@@ -860,6 +860,14 @@ impl Raindex for FixtureRaindex {
 
     async fn discard_prepared_withdraw(&self, _prepared: &PreparedTransaction) {}
 
+    async fn restore_submitted_withdrawal(
+        &self,
+        _tx_hash: TxHash,
+        _prepared: Option<&PreparedTransaction>,
+    ) -> Result<(), RaindexError> {
+        Ok(())
+    }
+
     async fn submit_withdraw(
         &self,
         token: Address,

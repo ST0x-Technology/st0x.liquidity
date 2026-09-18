@@ -123,9 +123,9 @@
 //! deliberate trade-off: releasing the lock mid-recovery would reopen the
 //! concurrent-nonce-assignment race the lock exists to close.
 //!
-//! [`crate::inflight_nonces::InFlightNonces`] bounds its own memory growth
-//! by age, not by wait outcome: see its module doc for why a timed-out wait
-//! cannot be treated as license to release an entry.
+//! [`crate::inflight_nonces::InFlightNonces`] retains ownership until a
+//! definitive receipt or drop decision; elapsed time alone never releases a
+//! nonce that may still mine.
 
 use alloy::consensus::Transaction;
 use alloy::eips::eip1559::Eip1559Estimation;
@@ -418,19 +418,14 @@ where
                     return Err(EvmError::PreparedTransactionReconciliationPending { tx_hash });
                 }
             } else {
-                if !error.is_confirmation_pending() {
-                    nonce_manager
-                        .release_prepared_nonce(address, prepared.nonce())
-                        .await;
-                }
+                // The exact prepared bytes remain durable and will be retried.
+                // A single RPC rejection is not proof that their nonce is free.
                 return Err(error);
             }
         }
     }
 
-    nonce_manager
-        .complete_prepared_nonce(address, prepared.nonce())
-        .await;
+    // Keep the nonce occupied until receipt confirmation or a definitive drop.
     in_flight.record(address, prepared.nonce(), tx_hash);
     info!(target: "wallet", %tx_hash, note, nonce = prepared.nonce(), "Prepared transaction broadcast");
     Ok(tx_hash)
@@ -910,26 +905,31 @@ where
         };
 
         nonce_manager.set_next_nonce(address, next_nonce).await;
+        let retry_nonce = submitter.assign_nonce(nonce_manager, address).await?;
 
         let retry_tx = TransactionRequest::default()
             .to(contract)
-            .input(calldata.clone().into());
+            .input(calldata.clone().into())
+            .nonce(retry_nonce);
 
         match submitter.submit(retry_tx).await {
             Ok(tx_hash) => {
-                info!(target: "wallet", %tx_hash, note, attempt, "Transaction submitted");
-                in_flight.record(address, next_nonce, tx_hash);
+                info!(target: "wallet", %tx_hash, note, attempt, nonce = retry_nonce, "Transaction submitted");
+                in_flight.record(address, retry_nonce, tx_hash);
                 return Ok(tx_hash);
             }
             Err(retry_error) if retry_error.is_nonce_too_low() => {
-                nonce_floor = Some(raise_nonce_floor(nonce_floor, next_nonce.saturating_add(1)));
+                nonce_floor = Some(raise_nonce_floor(
+                    nonce_floor,
+                    retry_nonce.saturating_add(1),
+                ));
                 error = retry_error;
             }
             Err(retry_error) if retry_error.is_replacement_underpriced() => {
-                match in_flight.ownership(address, next_nonce) {
+                match in_flight.ownership(address, retry_nonce) {
                     NonceOwnership::Ours => {
                         warn!(
-                            target: "wallet", %contract, note, attempt, next_nonce, %retry_error,
+                            target: "wallet", %contract, note, attempt, retry_nonce, %retry_error,
                             "Nonce-too-low retry rejected as underpriced at a nonce this \
                              wallet's own bookkeeping proves is one of its own unconfirmed \
                              sends -- stopping here rather than opening a permanent gap past \
@@ -945,7 +945,7 @@ where
                             contract,
                             note,
                             attempt,
-                            next_nonce,
+                            retry_nonce,
                             &retry_error,
                         )
                         .await
@@ -1188,6 +1188,7 @@ mod tests {
             data: None,
         }))
     }
+
     fn already_known_with_data(data: &str) -> EvmError {
         EvmError::Transport(RpcError::ErrorResp(ErrorPayload {
             code: -32000,
@@ -1236,6 +1237,7 @@ mod tests {
     fn reverted() -> EvmError {
         rpc_error("execution reverted")
     }
+
     fn prepared_tx_hash() -> TxHash {
         TxHash::repeat_byte(0xa5)
     }
@@ -1655,6 +1657,7 @@ mod tests {
             "base send must not set a fee"
         );
     }
+
     #[cfg(feature = "local-signer")]
     #[tokio::test]
     async fn signing_provider_recovers_local_hash_when_rpc_omits_it() {
@@ -1682,6 +1685,7 @@ mod tests {
 
         assert_ne!(tx_hash, TxHash::ZERO);
     }
+
     #[tokio::test]
     async fn nonce_too_low_adopts_visible_prepared_transaction_hash() {
         let tx_hash = prepared_tx_hash();
@@ -1695,7 +1699,7 @@ mod tests {
         asserter.push_success(&mined_receipt(tx_hash));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let nonce_manager = ResettableNonceManager::default();
-        let in_flight = InFlightNonces::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
         let send_lock = Mutex::new(());
 
         let result = broadcast_prepared(
@@ -1719,6 +1723,16 @@ mod tests {
             in_flight.ownership(WALLET, STUCK_NONCE),
             NonceOwnership::Ours
         );
+        nonce_manager.set_next_nonce(WALLET, STUCK_NONCE).await;
+        let unused_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        assert_eq!(
+            nonce_manager
+                .get_next_nonce(&unused_provider, WALLET)
+                .await
+                .unwrap(),
+            STUCK_NONCE + 1,
+            "a visible but unconfirmed transaction must continue owning its nonce"
+        );
     }
 
     #[tokio::test]
@@ -1735,7 +1749,7 @@ mod tests {
         asserter.push_success(&serde_json::Value::Null);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let nonce_manager = ResettableNonceManager::default();
-        let in_flight = InFlightNonces::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
         let send_lock = Mutex::new(());
 
         let error = broadcast_prepared(
@@ -1760,7 +1774,57 @@ mod tests {
             in_flight.ownership(WALLET, STUCK_NONCE),
             NonceOwnership::Unknown
         );
+        nonce_manager.set_next_nonce(WALLET, STUCK_NONCE).await;
+        let unused_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        assert_eq!(
+            nonce_manager
+                .get_next_nonce(&unused_provider, WALLET)
+                .await
+                .unwrap(),
+            STUCK_NONCE + 1,
+            "an inconclusive rejection must retain the persisted transaction's nonce"
+        );
     }
+
+    #[tokio::test]
+    async fn terminal_prepared_broadcast_error_retains_persisted_nonce() {
+        let tx_hash = prepared_tx_hash();
+        let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("insufficient funds for gas * price + value"),
+            data: None,
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        let send_lock = Mutex::new(());
+
+        broadcast_prepared(
+            &provider,
+            &nonce_manager,
+            &in_flight,
+            &send_lock,
+            WALLET,
+            &prepared,
+            "terminal prepared rejection",
+        )
+        .await
+        .unwrap_err();
+
+        nonce_manager.set_next_nonce(WALLET, STUCK_NONCE).await;
+        let unused_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        assert_eq!(
+            nonce_manager
+                .get_next_nonce(&unused_provider, WALLET)
+                .await
+                .unwrap(),
+            STUCK_NONCE + 1,
+            "a single terminal RPC rejection cannot release a persisted transaction's nonce"
+        );
+    }
+
     #[tokio::test]
     async fn replacement_underpriced_adopts_visible_prepared_transaction_hash() {
         let tx_hash = prepared_tx_hash();
@@ -1774,7 +1838,7 @@ mod tests {
         asserter.push_success(&mined_receipt(tx_hash));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let nonce_manager = ResettableNonceManager::default();
-        let in_flight = InFlightNonces::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
         let send_lock = Mutex::new(());
 
         let result = broadcast_prepared(
@@ -1810,7 +1874,7 @@ mod tests {
         asserter.push_success(&serde_json::Value::Null);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let nonce_manager = ResettableNonceManager::default();
-        let in_flight = InFlightNonces::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
         let send_lock = Mutex::new(());
 
         let error = broadcast_prepared(
@@ -2228,6 +2292,46 @@ mod tests {
             sent[1].nonce,
             Some(DEFAULT_PENDING_NONCE),
             "an unparsable rejection must still seed the cache from a pending-nonce read"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nonce_too_low_retry_pins_and_records_the_reservation_aware_nonce() {
+        let submitted_hash = TxHash::repeat_byte(0x35);
+        let mock = MockSubmitter::new(vec![Ok(submitted_hash)]);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
+        nonce_manager
+            .reserve_prepared_nonce(WALLET, HINTED_NONCE)
+            .await;
+        nonce_manager.set_next_nonce(WALLET, HINTED_NONCE).await;
+
+        let result = retry_after_nonce_too_low(
+            &mock,
+            &nonce_manager,
+            &in_flight,
+            WALLET,
+            CONTRACT,
+            Bytes::from_static(b"calldata"),
+            "test",
+            nonce_too_low_with_hint(),
+        )
+        .await
+        .unwrap();
+
+        let retry_nonce = HINTED_NONCE + 1;
+        assert_eq!(result, submitted_hash);
+        assert_eq!(mock.sent()[0].nonce, Some(retry_nonce));
+        assert_eq!(
+            in_flight.ownership(WALLET, retry_nonce),
+            NonceOwnership::Ours,
+            "ownership must be recorded against the exact pinned nonce, not \
+             the lower pre-allocation target"
+        );
+        assert_eq!(
+            in_flight.ownership(WALLET, HINTED_NONCE),
+            NonceOwnership::Unknown,
+            "the rejected retry never broadcast at the prepared-reserved nonce"
         );
     }
 
