@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_config::{BrokerCtx, OpsApiConfig};
+use st0x_config::{BrokerCtx, HedgedChain, OpsApiConfig};
 use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, Trade,
     TradingVenue,
@@ -31,6 +31,7 @@ use st0x_dto::{
 use st0x_event_sorcery::{
     AggregateError, EventSourced, SendError, StoreBuilder, load_entity, send_command,
 };
+use st0x_evm::Chain;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::{FractionalShares, Positive};
@@ -2591,7 +2592,10 @@ impl From<ProcessTxFill> for ProcessTxFillResponse {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum ProcessTxOutcomeResponse {
     NoTradeableEvents,
-    TransactionNotFound,
+    TransactionNotFound {
+        tx_hash: String,
+        chain: String,
+    },
     AlreadyAccounted,
     PendingHedgeInFlight,
     BelowExecutionThreshold,
@@ -2614,7 +2618,10 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
     fn from(outcome: ProcessTxOutcome) -> Self {
         match outcome {
             ProcessTxOutcome::NoTradeableEvents => Self::NoTradeableEvents,
-            ProcessTxOutcome::TransactionNotFound { .. } => Self::TransactionNotFound,
+            ProcessTxOutcome::TransactionNotFound { tx_hash, chain } => Self::TransactionNotFound {
+                tx_hash: tx_hash.to_string(),
+                chain: chain.to_string(),
+            },
             ProcessTxOutcome::AlreadyAccounted => Self::AlreadyAccounted,
             ProcessTxOutcome::PendingHedgeInFlight => Self::PendingHedgeInFlight,
             ProcessTxOutcome::BelowExecutionThreshold => Self::BelowExecutionThreshold,
@@ -2654,6 +2661,32 @@ impl From<ProcessTxReport> for ProcessTxResponse {
     }
 }
 
+#[derive(Default, Deserialize)]
+struct ProcessTransactionQuery {
+    /// Hedged chain to query; omitted means the configured primary chain.
+    chain: Option<Chain>,
+}
+
+fn resolve_process_tx_chain(
+    state: &AppState,
+    requested: Option<Chain>,
+) -> Result<HedgedChain, (StatusCode, Json<ErrorResponse>)> {
+    let chain = requested.unwrap_or(state.ctx.chains.primary().chain);
+    state
+        .ctx
+        .chains
+        .hedged_chain(chain)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("process-tx chain {chain} is not configured as a hedged chain"),
+                }),
+            )
+        })
+}
+
 fn spawn_process_tx_task(
     task: impl Future<Output = Result<ProcessTxReport, OperatorError>> + Send + 'static,
 ) -> tokio::task::JoinHandle<Result<ProcessTxReport, OperatorError>> {
@@ -2666,6 +2699,7 @@ fn spawn_process_tx_task(
 async fn process_transaction(
     State(state): State<AppState>,
     Path(tx_hash): Path<String>,
+    Query(query): Query<ProcessTransactionQuery>,
 ) -> Result<Json<ProcessTxResponse>, (StatusCode, Json<ErrorResponse>)> {
     let tx_hash = TxHash::from_str(&tx_hash).map_err(|error| {
         (
@@ -2675,6 +2709,7 @@ async fn process_transaction(
             }),
         )
     })?;
+    let trading_chain = resolve_process_tx_chain(&state, query.chain)?;
 
     // process-tx places a live broker hedge, so require FULL startup readiness,
     // not just the published handle: the handle is set when the conductor's own
@@ -2703,7 +2738,7 @@ async fn process_transaction(
     // A hung RPC endpoint that accepts the connection but never responds would
     // otherwise park this request forever (RAI-2218), so bound the transport
     // with the same connect and request timeouts the conductor's providers use.
-    let rpc_url = state.ctx.chains.primary().rpc_url.clone();
+    let rpc_url = trading_chain.rpc_url.clone();
     let http_client = reqwest::Client::builder()
         .connect_timeout(crate::conductor::RPC_CONNECT_TIMEOUT)
         .timeout(crate::conductor::RPC_REQUEST_TIMEOUT)
@@ -2735,6 +2770,7 @@ async fn process_transaction(
         process_tx::process_tx(
             tx_hash,
             &ctx,
+            &trading_chain,
             &pool,
             &provider,
             &cache,
@@ -7380,11 +7416,14 @@ mod tests {
                     fill: None,
                     outcome: ProcessTxOutcome::TransactionNotFound {
                         tx_hash: TxHash::repeat_byte(0x22),
+                        chain: Chain::Ethereum,
                     },
                 },
                 serde_json::json!({
                     "fill": null,
                     "outcome": "transaction_not_found",
+                    "tx_hash": TxHash::repeat_byte(0x22).to_string(),
+                    "chain": "ethereum",
                 }),
             ),
             (
@@ -7517,15 +7556,45 @@ mod tests {
             .expect("detached process-tx worker must finish after request cancellation");
     }
 
+    #[tokio::test]
+    async fn process_transaction_resolves_only_configured_hedged_chains() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let secondary_rpc: url::Url = "http://ethereum.test:8545".parse().unwrap();
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::Ethereum)
+                .rpc_url(secondary_rpc.clone())
+                .call(),
+        );
+        let state = empty_app_state(ctx).await;
+
+        let default_chain = resolve_process_tx_chain(&state, None).unwrap();
+        assert_eq!(default_chain.chain, Chain::Base);
+
+        let selected_chain = resolve_process_tx_chain(&state, Some(Chain::Ethereum)).unwrap();
+        assert_eq!(selected_chain.chain, Chain::Ethereum);
+        assert_eq!(selected_chain.rpc_url, secondary_rpc);
+
+        let Err((status, Json(body))) = resolve_process_tx_chain(&state, Some(Chain::Robinhood))
+        else {
+            panic!("unconfigured chain must be rejected");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("robinhood"));
+    }
+
     /// Invalid transaction hashes must be rejected before any recovery work starts.
     #[tokio::test]
     async fn process_transaction_rejects_an_invalid_tx_hash() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
 
-        let (status, Json(body)) =
-            process_transaction(State(state), Path("not-a-hash".to_string()))
-                .await
-                .unwrap_err();
+        let (status, Json(body)) = process_transaction(
+            State(state),
+            Path("not-a-hash".to_string()),
+            Query(ProcessTransactionQuery::default()),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
@@ -7544,9 +7613,13 @@ mod tests {
         // empty_app_state leaves un-ready.
         let tx_hash = TxHash::repeat_byte(0x11).to_string();
 
-        let (status, Json(body)) = process_transaction(State(state), Path(tx_hash))
-            .await
-            .unwrap_err();
+        let (status, Json(body)) = process_transaction(
+            State(state),
+            Path(tx_hash),
+            Query(ProcessTransactionQuery::default()),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
@@ -7565,9 +7638,13 @@ mod tests {
         state.health.set_ready();
         let tx_hash = TxHash::repeat_byte(0x11).to_string();
 
-        let (status, Json(body)) = process_transaction(State(state), Path(tx_hash))
-            .await
-            .unwrap_err();
+        let (status, Json(body)) = process_transaction(
+            State(state),
+            Path(tx_hash),
+            Query(ProcessTransactionQuery::default()),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
