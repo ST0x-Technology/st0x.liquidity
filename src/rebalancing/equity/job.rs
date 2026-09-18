@@ -220,7 +220,7 @@ pub(super) async fn restore_position_reservation(
     }
 }
 
-async fn has_live_sibling_equity_transfer<JobPayload>(
+pub(super) async fn has_live_sibling_equity_transfer<JobPayload>(
     pool: &apalis_sqlite::SqlitePool,
     task_identity: &TaskIdentity,
     same_owner: impl Fn(&JobPayload) -> bool,

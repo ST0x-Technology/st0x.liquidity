@@ -27,12 +27,16 @@ use st0x_event_sorcery::SendError;
 use st0x_execution::Symbol;
 use st0x_tokenization::IssuerRequestId;
 
-use super::job::{PositionReservationAuthority, restore_position_reservation};
+use super::job::{
+    PositionReservationAuthority, has_live_sibling_equity_transfer, restore_position_reservation,
+};
 use super::{CrossVenueEquityTransfer, MintError, RedemptionError};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
-use crate::conductor::job::{BackpressureStreak, Job, JobQueue, Label, QueuePushError};
+use crate::conductor::job::{
+    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
+};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::position::{EquityTransferReservationId, Position, PositionCommand};
 use crate::trading::offchain::hedge::EQUITY_TRANSFER_REDRIVE_DELAY;
@@ -221,6 +225,75 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
         // consuming the apalis retry budget. See `ResumeTokenizationCtx::job_queue`'s
         // doc for why this matters especially for this startup crash-recovery job.
         redrive_on_bot_gas_failure(self, &ctx.job_queue, BOT_GAS_ENQUEUE_REDRIVE_DELAY, error).await
+    }
+
+    async fn on_terminal_attempt(
+        &self,
+        ctx: &ResumeTokenizationCtx,
+        task_identity: &TaskIdentity,
+    ) -> Result<(), apalis_core::error::BoxDynError> {
+        let Some(symbol) = &self.symbol else {
+            return Ok(());
+        };
+        let target_is_live = match &self.target {
+            ResumeTokenizationTarget::Mint(id) => ctx
+                .transfer
+                .mint_store
+                .load(id)
+                .await?
+                .is_some_and(|aggregate| !aggregate.is_terminal()),
+            ResumeTokenizationTarget::Redemption(id) => ctx
+                .transfer
+                .redemption_store
+                .load(id)
+                .await?
+                .is_some_and(|aggregate| !aggregate.is_terminal()),
+        };
+        if target_is_live {
+            warn!(
+                target: "tokenization",
+                resume_target = %self.target,
+                %task_identity,
+                "Terminal resume attempt retained its reservation because the target aggregate is live"
+            );
+            return Ok(());
+        }
+        if has_live_sibling_equity_transfer::<Self>(
+            ctx.job_queue.pool(),
+            task_identity,
+            |sibling| sibling.target == self.target,
+        )
+        .await?
+        {
+            warn!(
+                target: "tokenization",
+                resume_target = %self.target,
+                %task_identity,
+                "Terminal resume attempt retained its reservation because a sibling job row is live"
+            );
+            return Ok(());
+        }
+
+        let reservation_id = match &self.target {
+            ResumeTokenizationTarget::Mint(id) => EquityTransferReservationId::from_uuid(id.0),
+            ResumeTokenizationTarget::Redemption(id) => {
+                EquityTransferReservationId::from_uuid(id.0)
+            }
+        };
+        ctx.position_authority
+            .0
+            .send(
+                symbol,
+                PositionCommand::ReleaseEquityTransfer { reservation_id },
+            )
+            .await?;
+        warn!(
+            target: "tokenization",
+            resume_target = %self.target,
+            %task_identity,
+            "Terminal resume attempt checked its exact Position reservation"
+        );
+        Ok(())
     }
 }
 
@@ -913,6 +986,187 @@ mod tests {
             "missing redemption aggregate must propagate EntityNotFound so apalis retries, \
              got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_releases_orphaned_reservation_idempotently() {
+        let (ctx, _, _, _) = build_ctx().await;
+        let id = issuer_request_id("orphaned-terminal-resume");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id),
+            symbol: Some(symbol.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        let task_identity =
+            crate::conductor::job::TaskIdentity::for_test("orphaned-terminal-resume");
+
+        Job::on_terminal_attempt(&job, &ctx, &task_identity)
+            .await
+            .unwrap();
+        Job::on_terminal_attempt(&job, &ctx, &task_identity)
+            .await
+            .unwrap();
+
+        let position = ctx
+            .position_authority
+            .0
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            position.equity_transfer_reservation.is_none(),
+            "a terminal resume with no live aggregate or sibling must release its reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_preserves_reservation_for_live_target() {
+        let (ctx, mint_store, _, _) = build_ctx().await;
+        let id = issuer_request_id("live-target-terminal-resume");
+        let symbol = Symbol::new("AAPL").unwrap();
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    chain: Chain::Base,
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id),
+            symbol: Some(symbol.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &crate::conductor::job::TaskIdentity::for_test("live-target-terminal-resume"),
+        )
+        .await
+        .unwrap();
+
+        let position = ctx
+            .position_authority
+            .0
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            position.equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                status: crate::position::EquityTransferReservationStatus::Confirmed,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_preserves_reservation_for_live_sibling() {
+        let (ctx, _, _, _) = build_ctx().await;
+        let id = issuer_request_id("live-sibling-terminal-resume");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id),
+            symbol: Some(symbol.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        let mut queue = ctx.job_queue.clone();
+        queue.push(job.clone()).await.unwrap();
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &crate::conductor::job::TaskIdentity::for_test("current-terminal-resume"),
+        )
+        .await
+        .unwrap();
+
+        let position = ctx
+            .position_authority
+            .0
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            position.equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                status: crate::position::EquityTransferReservationStatus::Confirmed,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
