@@ -3612,7 +3612,7 @@ mod tests {
             ),
         );
 
-        assert!(hedge.is_ok(), "hedge-ready exposure must retain priority");
+        hedge.unwrap();
         assert!(matches!(
             reservation,
             Err(AggregateError::UserError(LifecycleError::Apply(
