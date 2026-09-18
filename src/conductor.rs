@@ -3578,15 +3578,24 @@ async fn recover_interrupted_tokenization_aggregates(
             .into());
         }
 
-        if let EquityRedemption::VaultWithdrawSubmitted {
-            tx_hash, prepared, ..
-        } = &redemption
-        {
-            equity_services
-                .for_chain(redemption.chain())?
-                .raindex
-                .restore_submitted_withdrawal(*tx_hash, prepared.as_ref())
-                .await?;
+        match &redemption {
+            EquityRedemption::VaultWithdrawSubmitting { prepared, .. } => {
+                equity_services
+                    .for_chain(redemption.chain())?
+                    .raindex
+                    .restore_submitted_withdrawal(prepared.tx_hash(), Some(prepared))
+                    .await?;
+            }
+            EquityRedemption::VaultWithdrawSubmitted {
+                tx_hash, prepared, ..
+            } => {
+                equity_services
+                    .for_chain(redemption.chain())?
+                    .raindex
+                    .restore_submitted_withdrawal(*tx_hash, prepared.as_ref())
+                    .await?;
+            }
+            _ => {}
         }
 
         rebalancing_service
@@ -7447,6 +7456,7 @@ mod tests {
         mint_id: st0x_tokenization::IssuerRequestId,
         redemption_id: crate::equity_redemption::RedemptionAggregateId,
         tokenizer: Arc<st0x_tokenization::mock::MockTokenizer>,
+        raindex: Arc<MockRaindex>,
         rebalancing_service: RebalancingService,
         inventory: Arc<BroadcastingInventory>,
         resume_queue: crate::rebalancing::equity::ResumeTokenizationJobQueue,
@@ -7467,7 +7477,7 @@ mod tests {
         let mint_id = issuer_request_id(mint_label);
         let redemption_id = redemption_aggregate_id(redemption_label);
 
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let raindex = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let tokenizer = Arc::new(MockTokenizer::new());
 
@@ -7574,6 +7584,7 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer,
+            raindex,
             rebalancing_service,
             inventory,
             resume_queue,
@@ -7659,6 +7670,7 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer,
+            raindex,
             rebalancing_service,
             inventory,
             mut resume_queue,
@@ -7705,6 +7717,12 @@ mod tests {
             tokenizer.call_count(),
             calls_before,
             "recover_interrupted_tokenization_aggregates must not call the issuer"
+        );
+        assert_eq!(
+            raindex.restored_prepared_withdrawals(),
+            1,
+            "startup must synchronously restore nonce ownership for the \
+             persisted VaultWithdrawSubmitting transaction before workers run"
         );
 
         // Both interrupted aggregates must be enqueued -- assert the payloads
@@ -7786,6 +7804,7 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
@@ -7856,6 +7875,7 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
@@ -7958,6 +7978,7 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
@@ -8044,6 +8065,7 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
@@ -8130,6 +8152,7 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service: _,
             inventory: _,
             resume_queue: _,
@@ -8205,6 +8228,7 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service: _,
             inventory: _,
             resume_queue: _,
@@ -8304,6 +8328,7 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service: _,
             inventory: _,
             resume_queue: _,
@@ -8373,6 +8398,7 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
@@ -8460,6 +8486,7 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
@@ -8714,6 +8741,7 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
