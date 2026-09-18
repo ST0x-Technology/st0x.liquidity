@@ -306,19 +306,33 @@ pub enum UsdcTransferError {
         id: crate::usdc_rebalance::UsdcRebalanceId,
     },
     #[error(
-        "USDC rebalance {id}: market-maker Ethereum wallet holds zero USDC; \
-         any non-zero balance will unblock the CCTP burn \
+        "USDC rebalance {id}: market-maker Ethereum wallet balance {current} \
+         has not increased above preflight baseline {baseline} \
          (nominal amount: {nominal}); waiting for withdrawal to settle on-chain"
     )]
-    WalletUsdcInsufficient { id: UsdcRebalanceId, nominal: Usdc },
-    /// The wallet holds more than the nominal amount plus the tolerated 0.01
-    /// USDC dust ceiling for this rebalance. Ambient or residual USDC beyond
-    /// that ceiling cannot be distinguished from this withdrawal's funds. The
+    WalletUsdcInsufficient {
+        id: UsdcRebalanceId,
+        nominal: Usdc,
+        current: U256,
+        baseline: U256,
+    },
+    /// A legacy AlpacaToBase aggregate reached settlement without the exact
+    /// preflight Ethereum wallet balance. Any current balance may include
+    /// tolerated ambient dust, so no amount can be safely attributed to the
+    /// withdrawal. The manager moves the aggregate to `BridgingFailed`.
+    #[error(
+        "USDC rebalance {id}: persisted preflight wallet balance is missing; \
+         cannot attribute Ethereum USDC to the Alpaca withdrawal"
+    )]
+    MissingPreflightBalance { id: UsdcRebalanceId },
+    /// The Ethereum wallet balance increased by more than the nominal
+    /// withdrawal after the persisted preflight baseline. USDC arriving after
+    /// preflight cannot be distinguished from this withdrawal's funds. The
     /// aggregate is moved to `BridgingFailed` for operator reconciliation; no
     /// burn is attempted.
     #[error(
-        "USDC rebalance {id}: market-maker wallet holds {balance} USDC, \
-         which exceeds the nominal {nominal} plus the 0.01 USDC dust ceiling; \
+        "USDC rebalance {id}: market-maker wallet holds {balance} USDC and its \
+         increase from the preflight baseline exceeds nominal {nominal}; \
          ambient/residual USDC detected; failed for operator reconciliation"
     )]
     WalletUsdcAmbientBalance {
@@ -327,19 +341,18 @@ pub enum UsdcTransferError {
         nominal: Usdc,
     },
     /// The market-maker wallet holds more than the tolerated 0.01 USDC dust
-    /// ceiling before the Alpaca leg starts. Settlement could not safely
-    /// attribute that excess, so the transfer refuses up front before the
+    /// ceiling before the Alpaca leg starts, so the transfer refuses before
     /// conversion. No cash leaves Alpaca and no aggregate event is emitted.
     /// Unlike [`Self::WalletUsdcAmbientBalance`] (settlement time, aggregate
     /// moved to `BridgingFailed`, guard cleared by the terminal event), this
     /// refusal has no aggregate, so the job layer must release the in-progress
     /// guard itself and alert the operator to sweep the wallet.
     ///
-    /// A balance at or below 0.01 USDC is tolerated so a third party cannot
-    /// wedge the public wallet with a fraction-of-a-cent transfer. The later
-    /// settlement burn is capped at the nominal withdrawal; tolerated dust
-    /// remains bounded in the wallet and cannot make the destination settlement
-    /// exceed the initiated amount.
+    /// A balance at or below 0.01 USDC is accepted and persisted as the exact
+    /// settlement baseline. Settlement burns only the later wallet increase,
+    /// leaving the baseline untouched. The threshold raises the cost of
+    /// pre-flight nuisance dusting; it does not prevent hostile transfers after
+    /// the baseline read.
     #[error(
         "cannot start Alpaca->Base rebalance {id}: market-maker wallet \
          already holds {balance} USDC before the withdrawal (nominal \
@@ -549,6 +562,7 @@ impl UsdcTransferError {
             | Self::AdoptedWithdrawalAmountMismatch { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
             | Self::WalletUsdcInsufficient { .. }
+            | Self::MissingPreflightBalance { .. }
             | Self::WalletUsdcAmbientBalance { .. }
             | Self::WalletUsdcAmbientPreflight { .. }
             | Self::WalletUsdcAmbientPreflightUnrepresentable { .. }
@@ -605,6 +619,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::AdoptedWithdrawalAmountMismatch { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
             | Self::WalletUsdcInsufficient { .. }
+            | Self::MissingPreflightBalance { .. }
             | Self::WalletUsdcAmbientBalance { .. }
             | Self::WalletUsdcAmbientPreflight { .. }
             | Self::WalletUsdcAmbientPreflightUnrepresentable { .. }

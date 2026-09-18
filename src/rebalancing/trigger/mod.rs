@@ -13625,6 +13625,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: U256::ZERO,
                 },
             )
             .await
@@ -15931,6 +15932,7 @@ mod tests {
             direction,
             amount,
             order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            preflight_balance: None,
             initiated_at: Utc::now(),
         }
     }
@@ -20795,6 +20797,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: U256::ZERO,
                 },
             )
             .await
@@ -20840,6 +20843,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: U256::ZERO,
                 },
             )
             .await
@@ -21337,6 +21341,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: U256::ZERO,
                 },
             )
             .await
@@ -22581,6 +22586,7 @@ mod tests {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: None,
                     initiated_at: refreshed_at,
                 },
             )
@@ -22638,6 +22644,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: None,
                     initiated_at,
                 },
             )
@@ -22707,6 +22714,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: U256::ZERO,
                 },
             )
             .await
@@ -23477,6 +23485,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100)),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: U256::ZERO,
                 },
             )
             .await
@@ -26071,6 +26080,7 @@ mod tests {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(700),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: None,
                     initiated_at: now,
                 },
             )
@@ -26161,6 +26171,7 @@ mod tests {
                         direction: RebalanceDirection::BaseToAlpaca,
                         amount: usdc(700),
                         order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                        preflight_balance: None,
                         initiated_at: Utc::now(),
                     },
                 )

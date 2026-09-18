@@ -889,6 +889,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(500)),
                 order_id: ClientOrderId::from_uuid(usdc_id),
+                preflight_balance: None,
                 initiated_at: one_hour_ago,
             })
             .unwrap(),
@@ -1211,6 +1212,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100)),
             order_id: ClientOrderId::from_uuid(usdc_id),
+            preflight_balance: None,
             initiated_at: now,
         };
         sqlx::query(

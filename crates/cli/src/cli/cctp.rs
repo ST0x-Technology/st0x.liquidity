@@ -24,6 +24,13 @@ impl CctpChain {
     }
 }
 
+fn full_balance_bridge_amount(balance: U256) -> anyhow::Result<U256> {
+    if balance.is_zero() {
+        anyhow::bail!("Balance is zero");
+    }
+    Ok(balance)
+}
+
 pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Write>(
     stdout: &mut Writer,
     amount: Option<Usdc>,
@@ -63,17 +70,10 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
                     .await?
             }
         };
-        if balance.is_zero() {
-            anyhow::bail!("Balance is zero");
-        }
-        // Burn the entire balance so the source wallet is swept to exactly zero.
-        // The CCTP fast-transfer fee is collected from the minted amount on the
-        // destination (the mint event reports fee_collected), not added to the
-        // burn debit, so passing the full balance drains the wallet to 0 and the
-        // recipient receives balance minus fee. The old `balance * 10000 / 10001`
-        // fee reservation left a 1-unit remainder that re-tripped the wallet-empty
-        // preflight (RAI-2495).
-        balance
+        // The fast-transfer fee is collected from the destination mint, not
+        // added to the burn debit. `--all` therefore passes the source balance
+        // unchanged and leaves no fee-reservation remainder.
+        full_balance_bridge_amount(balance)?
     } else {
         let usdc_amount = amount.ok_or_else(|| anyhow::anyhow!("specify --amount or --all"))?;
         usdc_amount.to_u256_6_decimals()?
@@ -307,6 +307,22 @@ mod tests {
             bot_gas_valuation: None,
             orchestrator: None,
         }
+    }
+
+    #[test]
+    fn all_bridge_amount_uses_the_entire_balance() {
+        let balance = U256::from(1_000_001u64);
+        assert_eq!(full_balance_bridge_amount(balance).unwrap(), balance);
+    }
+
+    #[test]
+    fn all_bridge_amount_refuses_zero() {
+        assert_eq!(
+            full_balance_bridge_amount(U256::ZERO)
+                .unwrap_err()
+                .to_string(),
+            "Balance is zero"
+        );
     }
 
     #[tokio::test]

@@ -1505,24 +1505,7 @@ impl TransferUsdcToMarketMaking {
         ctx: &TransferUsdcToMarketMakingCtx,
         result: Result<(), UsdcTransferError>,
     ) -> Result<(), TransferUsdcToMarketMakingJobError> {
-        // Any non-pre-flight outcome proves the pre-flight passed, so the
-        // alert gates reset and the next refusal pages as a fresh incident.
-        // The ambient refusals sit in between: the balance READ succeeded, so
-        // the read-failure streak resets (it counts consecutive failed reads,
-        // and an interleaved successful read must not let a later failure
-        // inherit the count), while the ambient page dedup keeps its balance
-        // key so consecutive refusals still page once. Only a failed read
-        // leaves the streak counting. A wildcard is safe here: a future
-        // variant wrongly resetting the gate can only cause an extra page,
-        // never a missed one.
-        match &result {
-            Err(UsdcTransferError::PreflightBalanceUnavailable { .. }) => {}
-            Err(
-                UsdcTransferError::WalletUsdcAmbientPreflight { .. }
-                | UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable { .. },
-            ) => ctx.preflight_alerts.reset_unavailable_streak(),
-            _ => ctx.preflight_alerts.reset().await,
-        }
+        Self::reset_preflight_alerts_after_outcome(ctx, &result).await;
 
         match result {
             Ok(()) => {}
@@ -1637,10 +1620,9 @@ impl TransferUsdcToMarketMaking {
                      nothing to redrive, leaving for operator reconciliation"
                 );
             }
-            // Ambient USDC in the market-maker wallet: the wallet-empty invariant
-            // is broken and no burn can safely proceed. The aggregate has already
-            // been moved to BridgingFailed via FailBridging; surface for operator
-            // reconciliation (same pattern as AttestationRetryDeadlineElapsed).
+            // USDC arriving after the persisted preflight baseline made the
+            // attributable increase exceed the nominal withdrawal. The aggregate
+            // has already moved to BridgingFailed via FailBridging.
             Err(UsdcTransferError::WalletUsdcAmbientBalance {
                 id,
                 balance,
@@ -1651,14 +1633,30 @@ impl TransferUsdcToMarketMaking {
                     %id,
                     %balance,
                     %nominal,
-                    "Alpaca->Base USDC transfer failed: ambient USDC in market-maker wallet; \
+                    "Alpaca->Base USDC transfer failed: wallet increase exceeded nominal; \
                      bridge marked failed for operator reconciliation"
                 );
                 let message = format!(
-                    "USDC transfer {id} failed: ambient USDC ({balance}) exceeds nominal ({nominal}). \
-                     Wallet-empty invariant broken; bridge marked failed, manual operator reconciliation required."
+                    "USDC transfer {id} failed: wallet balance {balance} increased by more \
+                     than nominal {nominal} after preflight. Bridge marked failed; manual \
+                     operator reconciliation required."
                 );
                 deliver_market_making_alert(&ctx.notifier, &message, "ambient-balance").await;
+            }
+            Err(UsdcTransferError::MissingPreflightBalance { id }) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    "Alpaca->Base USDC transfer failed: persisted preflight wallet \
+                     balance missing; bridge marked failed for operator reconciliation"
+                );
+                let message = format!(
+                    "USDC transfer {id} has no persisted preflight wallet balance, so the \
+                     Alpaca withdrawal cannot be distinguished from ambient dust. Bridge \
+                     marked failed; manual operator reconciliation required."
+                );
+                deliver_market_making_alert(&ctx.notifier, &message, "missing-preflight-baseline")
+                    .await;
             }
             // Pre-flight refusals (see the variants' docs): no aggregate
             // exists, so each settles worker-side -- log, page through its
@@ -1772,6 +1770,25 @@ impl TransferUsdcToMarketMaking {
         }
 
         Ok(())
+    }
+
+    /// Resets pre-flight alert pacing once an outcome proves the pre-flight
+    /// balance read succeeded or the transfer advanced beyond pre-flight.
+    async fn reset_preflight_alerts_after_outcome(
+        ctx: &TransferUsdcToMarketMakingCtx,
+        result: &Result<(), UsdcTransferError>,
+    ) {
+        // Ambient refusals reset only the read-failure streak while retaining
+        // the last paged balance for deduplication. A failed read retains its
+        // streak. Every other outcome proves pre-flight passed and resets both.
+        match result {
+            Err(UsdcTransferError::PreflightBalanceUnavailable { .. }) => {}
+            Err(
+                UsdcTransferError::WalletUsdcAmbientPreflight { .. }
+                | UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable { .. },
+            ) => ctx.preflight_alerts.reset_unavailable_streak(),
+            _ => ctx.preflight_alerts.reset().await,
+        }
     }
 
     /// Ends the attempt without a retry for the two conversion outcomes that
@@ -5159,6 +5176,8 @@ mod tests {
             Err(UsdcTransferError::WalletUsdcInsufficient {
                 id: id.clone(),
                 nominal: Usdc::new(float!(1)),
+                current: U256::ZERO,
+                baseline: U256::ZERO,
             })
         }
     }

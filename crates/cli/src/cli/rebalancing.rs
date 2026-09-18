@@ -498,6 +498,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::PostDepositConversionShortFill { .. }
         | UsdcTransferError::WithdrawalRefMustBeAlpacaId { .. }
         | UsdcTransferError::WalletUsdcAmbientBalance { .. }
+        | UsdcTransferError::MissingPreflightBalance { .. }
         | UsdcTransferError::WalletUsdcAmbientPreflight { .. }
         | UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable { .. }
         | UsdcTransferError::PreflightBalanceUnavailable { .. }
@@ -1989,6 +1990,8 @@ mod tests {
             UsdcTransferError::WalletUsdcInsufficient {
                 id: id.clone(),
                 nominal: Usdc::new(float!(100)),
+                current: U256::ZERO,
+                baseline: U256::ZERO,
             },
             UsdcTransferError::SettlementCheckTransient {
                 id: id.clone(),
@@ -2722,6 +2725,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xB0B1)),
+                preflight_balance: U256::ZERO,
             },
             UsdcRebalanceCommand::ConfirmConversion {
                 conversion: ConversionAmounts::new(amount, amount),
@@ -3685,6 +3689,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: U256::ZERO,
                 },
             )
             .await
@@ -4431,6 +4436,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xC01D_0001)),
+                    preflight_balance: U256::ZERO,
                 },
             )
             .await
