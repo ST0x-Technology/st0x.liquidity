@@ -304,7 +304,7 @@ impl BotGasReceiptCost {
             return Err(BotGasReceiptCostError::ZeroEffectiveGasPrice.into());
         }
         validate_positive_comparison(
-            &eth_usd_price.price.gt(&Usd::ZERO),
+            &eth_usd_price.price.inner().gt(Usd::ZERO.inner()),
             BotGasReceiptCostError::NonPositiveEthUsdPrice,
             BotGasReceiptCostError::EthUsdPriceComparisonFailed,
         )?;
@@ -417,7 +417,7 @@ impl BotGasReceiptCost {
             return Err(BotGasReceiptCostError::ZeroNativeCost);
         }
         validate_positive_comparison(
-            &self.eth_usd_price.gt(&Usd::ZERO),
+            &self.eth_usd_price.inner().gt(Usd::ZERO.inner()),
             BotGasReceiptCostError::NonPositiveEthUsdPrice,
             BotGasReceiptCostError::EthUsdPriceComparisonFailed,
         )?;
@@ -427,7 +427,7 @@ impl BotGasReceiptCost {
         // zero there, and this rejects it rather than writing an unusable
         // zero cost.
         validate_positive_comparison(
-            &self.usd_cost.gt(&Usd::ZERO),
+            &self.usd_cost.inner().gt(Usd::ZERO.inner()),
             BotGasReceiptCostError::NonPositiveUsdCost,
             BotGasReceiptCostError::UsdCostComparisonFailed,
         )?;
