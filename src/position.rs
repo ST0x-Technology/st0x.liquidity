@@ -1292,16 +1292,14 @@ impl Position {
                 expected: existing.id,
                 actual: reservation_id,
             }),
-            None => Ok(vec![
-                PositionEvent::EquityTransferReserved {
-                    reservation_id,
-                    reserved_at: now,
-                },
-                PositionEvent::EquityTransferReservationConfirmed {
+            None => {
+                let mut events = self.reserve_equity_transfer_events(reservation_id, now)?;
+                events.push(PositionEvent::EquityTransferReservationConfirmed {
                     reservation_id,
                     confirmed_at: now,
-                },
-            ]),
+                });
+                Ok(events)
+            }
         }
     }
 
@@ -3548,6 +3546,45 @@ mod tests {
                 },
             ])
             .when(PositionCommand::ReserveEquityTransfer {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                reservation_id,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::EquityTransferBlockedByHedge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn hedge_ready_position_rejects_missing_transfer_reservation_restore() {
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                    seen_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::RestoreEquityTransferReservation {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
                 reservation_id,

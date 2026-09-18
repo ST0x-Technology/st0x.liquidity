@@ -218,7 +218,9 @@ pub(super) async fn restore_position_reservation(
     {
         Ok(()) => Ok(true),
         Err(AggregateError::UserError(LifecycleError::Apply(
-            PositionError::PendingExecution { .. },
+            PositionError::PendingExecution { .. }
+            | PositionError::EquityTransferBlockedByHedge { .. }
+            | PositionError::EquityTransferHedgeEligibilityUnknown { .. },
         ))) => Ok(false),
         Err(error) => Err(error),
     }
@@ -294,7 +296,7 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                 issuer_request_id = %self.issuer_request_id,
                 position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
                 retry_delay_secs = retry_delay.as_secs(),
-                "Pending hedge deferred equity mint reservation restoration; rescheduling"
+                "Hedge admission deferred equity mint reservation restoration; rescheduling"
             );
             let mut job_queue = ctx.job_queue.clone();
             job_queue.push_with_delay(retry, retry_delay).await?;
@@ -333,6 +335,18 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
         };
 
         if let Some(delay) = transfer_error.gas_readiness_retry_interval() {
+            if let Some((position_store, _)) = &ctx.position_authority {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.issuer_request_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
@@ -781,7 +795,7 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                 aggregate_id = %self.aggregate_id,
                 position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
                 retry_delay_secs = retry_delay.as_secs(),
-                "Pending hedge deferred equity redemption reservation restoration; rescheduling"
+                "Hedge admission deferred equity redemption reservation restoration; rescheduling"
             );
             let mut job_queue = ctx.job_queue.clone();
             job_queue.push_with_delay(retry, retry_delay).await?;
@@ -810,6 +824,18 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         };
 
         if let Some(delay) = error.gas_readiness_retry_interval() {
+            if let Some((position_store, _)) = &ctx.position_authority {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.aggregate_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
@@ -1059,6 +1085,35 @@ mod tests {
         (position_store, symbol)
     }
 
+    async fn confirmed_position_reservation(
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> Arc<Store<Position>> {
+        let position_store = Arc::new(test_store::<Position>(
+            crate::test_utils::setup_test_db().await,
+            (),
+        ));
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        position_store
+    }
+
     /// Records the resume call and returns a configurable outcome, so the
     /// job's `perform` can be tested without broker/onchain setup.
     struct RecordingResume {
@@ -1148,12 +1203,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gas_readiness_failure_delayed_redrives_without_releasing_guard() {
+    async fn gas_readiness_failure_releases_reservation_before_delayed_redrive() {
         let symbol = Symbol::new("AAPL").unwrap();
         let retry_interval = Duration::from_secs(17);
+        let issuer_request_id = issuer_request_id("low-gas");
+        let position_store = confirmed_position_reservation(
+            &symbol,
+            EquityTransferReservationId::from_uuid(issuer_request_id.0),
+        )
+        .await;
         let mut ctx = test_ctx(Arc::new(GasReadinessFailureMintResume(retry_interval))).await;
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         ctx.job_queue = TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+        ctx.position_authority = Some((
+            Arc::clone(&position_store),
+            ExecutionThreshold::whole_share(),
+        ));
         ctx.equity_in_progress.write().unwrap().insert(
             symbol.clone(),
             GuardState::ActiveTransfer {
@@ -1162,7 +1227,7 @@ mod tests {
         );
         let job = TransferEquityToMarketMaking {
             chain: Chain::Base,
-            issuer_request_id: issuer_request_id("low-gas"),
+            issuer_request_id: issuer_request_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
@@ -1181,6 +1246,16 @@ mod tests {
             Some(&GuardState::ActiveTransfer {
                 generation: GuardGeneration::default()
             })
+        );
+        assert_eq!(
+            position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the gas redrive must release its exact Position reservation"
         );
         let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
             "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
@@ -2380,18 +2455,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redemption_gas_readiness_failure_delayed_redrives_without_consuming_budget() {
+    async fn redemption_gas_readiness_failure_releases_reservation_before_delayed_redrive() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let retry_interval = Duration::from_secs(23);
-        let ctx = redemption_test_ctx(
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aggregate_id = redemption_aggregate_id("low-gas");
+        let position_store = confirmed_position_reservation(
+            &symbol,
+            EquityTransferReservationId::from_uuid(aggregate_id.0),
+        )
+        .await;
+        let mut ctx = redemption_test_ctx(
             Arc::new(GasReadinessFailureRedemptionResume(retry_interval)),
             TransferEquityToHedgingJobQueue::new(&apalis_pool),
         )
         .await;
+        ctx.position_authority = Some((
+            Arc::clone(&position_store),
+            ExecutionThreshold::whole_share(),
+        ));
         let job = TransferEquityToHedging {
             chain: Chain::Base,
-            aggregate_id: redemption_aggregate_id("low-gas"),
-            symbol: Symbol::new("AAPL").unwrap(),
+            aggregate_id: aggregate_id.clone(),
+            symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak(4),
@@ -2403,6 +2489,16 @@ mod tests {
             .await
             .expect("low gas must delayed-redrive without consuming the apalis retry budget");
         let after = chrono::Utc::now().timestamp();
+        assert_eq!(
+            position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the gas redrive must release its exact Position reservation"
+        );
 
         let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
             "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
