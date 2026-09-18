@@ -1490,9 +1490,9 @@ pub mod process_tx {
     use tokio::sync::Mutex;
     use tracing::{error, info};
 
-    use st0x_config::Ctx;
+    use st0x_config::{Ctx, HedgedChain};
     use st0x_event_sorcery::{Projection, Store, StoreBuilder};
-    use st0x_evm::ReadOnlyEvm;
+    use st0x_evm::{Chain, ReadOnlyEvm};
     use st0x_execution::{Direction, FractionalShares, MockExecutor, Positive, Symbol};
     use st0x_registry::SymbolCache;
 
@@ -1558,8 +1558,8 @@ pub mod process_tx {
     pub enum ProcessTxOutcome {
         /// No orderbook events in the transaction matched the configured order.
         NoTradeableEvents,
-        /// The RPC endpoint did not find the transaction.
-        TransactionNotFound { tx_hash: TxHash },
+        /// The selected chain's RPC endpoint did not find the transaction.
+        TransactionNotFound { tx_hash: TxHash, chain: Chain },
         /// The fill was already fully accounted; nothing to do.
         AlreadyAccounted,
         /// An existing pending hedge is in flight, so the fill was settled
@@ -1638,16 +1638,18 @@ pub mod process_tx {
     /// Accounts a missed on-chain fill from `tx_hash` and, when the resulting
     /// net exposure warrants it, places the opposite hedge.
     ///
-    /// Run inside the bot process, pass the conductor's wired `stores` (so the
-    /// fill reaches the running reactors) and the live `submission_lock` so the
-    /// pending-hedge inspection and the broker placement serialize against the
-    /// trading loop (ADR 0014); under the lock, the shared `Position`
+    /// Run inside the bot process, pass the selected hedged-chain config and a
+    /// provider connected to that chain, the conductor's wired `stores` (so the
+    /// fill reaches the running reactors), and the live `submission_lock` so
+    /// the pending-hedge inspection and the broker placement serialize against
+    /// the trading loop (ADR 0014). Under the lock, the shared `Position`
     /// aggregate's pending-order gate prevents a racing tick from double-placing
     /// the hedge. The CLI runs in a separate process with standalone stores, no
     /// shared lock, and passes `None`.
     pub async fn process_tx<P: Provider + Clone + 'static>(
         tx_hash: TxHash,
         ctx: &Ctx,
+        trading_chain: &HedgedChain,
         pool: &SqlitePool,
         provider: &P,
         cache: &SymbolCache,
@@ -1655,9 +1657,8 @@ pub mod process_tx {
         order_placer: Arc<dyn OrderPlacer>,
         submission_lock: Option<&Mutex<()>>,
     ) -> Result<ProcessTxReport, OperatorError> {
-        let trading_chain = ctx.chains.primary();
         let actors = RecoveryActors {
-            order_owner: ctx.vault_owner(),
+            order_owner: trading_chain.vault_owner,
             bot_operator: BotOperator(ctx.order_owner()),
         };
         let read_evm = ReadOnlyEvm::new(provider.clone());
@@ -1687,7 +1688,10 @@ pub mod process_tx {
             Err(OnChainError::Validation(TradeValidationError::TransactionNotFound(_))) => {
                 Ok(ProcessTxReport {
                     fill: None,
-                    outcome: ProcessTxOutcome::TransactionNotFound { tx_hash },
+                    outcome: ProcessTxOutcome::TransactionNotFound {
+                        tx_hash,
+                        chain: trading_chain.chain,
+                    },
                 })
             }
             Err(error) => Err(OperatorError::Operational(anyhow::Error::new(error))),
@@ -1708,6 +1712,15 @@ pub mod process_tx {
             onchain_trade.tx_hash,
             onchain_trade.log_index,
         );
+        let trading_chain = ctx
+            .chains
+            .hedged_chain(onchain_trade.chain)
+            .with_context(|| {
+                format!(
+                    "process-tx decoded a fill on {}, which is not configured as a hedged chain",
+                    onchain_trade.chain
+                )
+            })?;
 
         let ProcessTxStores {
             onchain_trade: onchain_trade_store,
@@ -1764,7 +1777,7 @@ pub mod process_tx {
             }
         }
 
-        let trading_enabled = ctx.chains.primary().assets.is_trading_enabled(base_symbol);
+        let trading_enabled = trading_chain.assets.is_trading_enabled(base_symbol);
 
         if !trading_enabled {
             mark_and_settle_fill(
@@ -1789,7 +1802,7 @@ pub mod process_tx {
             position_projection,
             base_symbol,
             executor_type,
-            &ctx.chains.primary().assets,
+            &trading_chain.assets,
             &ctx.assets,
             trading_enabled,
         )
@@ -2125,13 +2138,15 @@ pub mod process_tx {
     mod tests {
         use std::sync::Arc;
 
-        use alloy::primitives::{Address, B256, U256};
+        use alloy::primitives::{Address, B256, TxHash, U256};
+        use alloy::providers::{ProviderBuilder, mock::Asserter};
         use async_trait::async_trait;
         use chrono::Utc;
         use tokio::sync::Mutex;
 
         use st0x_config::{
-            ChainAssets, ChainEquityAsset, Ctx, ExecutionThreshold, HedgingAssets, OperationMode,
+            ChainAssets, ChainEquityAsset, Ctx, ExecutionThreshold, HedgedChain, HedgingAssets,
+            OperationMode,
         };
         use st0x_event_sorcery::StoreBuilder;
         use st0x_evm::Chain;
@@ -2139,6 +2154,7 @@ pub mod process_tx {
             CancellationOutcome, Direction, ExecutorOrderId, FractionalShares, LimitOrder,
             MarketOrder, MockExecutor, Positive, SupportedExecutor, Symbol,
         };
+        use st0x_registry::SymbolCache;
 
         use crate::bindings::IRaindexV6::{ClearConfigV2, ClearV3};
         use crate::conductor::{
@@ -2165,8 +2181,8 @@ pub mod process_tx {
 
         use super::{
             HedgeDisposition, OperatorError, PlacementContext, ProcessTxFill, ProcessTxOutcome,
-            ProcessTxStores, RejectionReason, process_found_trade, reconcile_offchain_order_state,
-            reconcile_post_place_state,
+            ProcessTxStores, RejectionReason, process_found_trade, process_tx,
+            reconcile_offchain_order_state, reconcile_post_place_state,
         };
 
         /// Parses a positive share quantity for process-tx fixtures.
@@ -2198,6 +2214,43 @@ pub mod process_tx {
             assert_eq!(fill.direction, trade.direction);
             assert_eq!(fill.quantity, trade.amount);
             assert_eq!(fill.price.get_inner(), trade.price().get_inner());
+        }
+
+        #[tokio::test]
+        async fn process_tx_names_selected_chain_when_transaction_is_missing() {
+            let pool = setup_test_db().await;
+            let mut ctx = create_base_test_ctx();
+            let trading_chain = HedgedChain::test().chain(Chain::Ethereum).call();
+            ctx.chains.insert_secondary(trading_chain.clone());
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            let asserter = Asserter::new();
+            asserter.push_success(&serde_json::Value::Null);
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let tx_hash = TxHash::repeat_byte(0x44);
+
+            let report = process_tx(
+                tx_hash,
+                &ctx,
+                &trading_chain,
+                &pool,
+                &provider,
+                &SymbolCache::default(),
+                &stores,
+                order_placer,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(report.fill.is_none());
+            assert!(matches!(
+                report.outcome,
+                ProcessTxOutcome::TransactionNotFound {
+                    tx_hash: missing,
+                    chain: Chain::Ethereum,
+                } if missing == tx_hash
+            ));
         }
 
         /// Builds the minimal application context required by process-tx tests.

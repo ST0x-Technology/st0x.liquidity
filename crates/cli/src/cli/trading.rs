@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
 
-use st0x_config::{BrokerCtx, Ctx};
+use st0x_config::{BrokerCtx, Ctx, HedgedChain};
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
     ALPACA_MAX_DECIMAL_PLACES, AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, Direction,
@@ -626,6 +626,7 @@ fn write_order_success<W: Write>(
 pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'static>(
     tx_hash: TxHash,
     ctx: &Ctx,
+    trading_chain: &HedgedChain,
     pool: &SqlitePool,
     stdout: &mut W,
     provider: &P,
@@ -639,6 +640,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     let report = st0x_hedge::operator::process_tx::process_tx(
         tx_hash,
         ctx,
+        trading_chain,
         pool,
         provider,
         cache,
@@ -687,8 +689,8 @@ fn render_process_tx_outcome<W: Write>(
                 "This transaction may not contain orderbook events matching the configured order hash."
             )?;
         }
-        ProcessTxOutcome::TransactionNotFound { tx_hash } => {
-            writeln!(stdout, "Transaction not found: {tx_hash}")?;
+        ProcessTxOutcome::TransactionNotFound { tx_hash, chain } => {
+            writeln!(stdout, "Transaction {tx_hash} not found on {chain}")?;
         }
         ProcessTxOutcome::AlreadyAccounted => {
             writeln!(
@@ -2811,9 +2813,12 @@ mod tests {
             (
                 ProcessTxReport {
                     fill: None,
-                    outcome: ProcessTxOutcome::TransactionNotFound { tx_hash: not_found },
+                    outcome: ProcessTxOutcome::TransactionNotFound {
+                        tx_hash: not_found,
+                        chain: st0x_evm::Chain::Ethereum,
+                    },
                 },
-                format!("Transaction not found: {not_found}\n"),
+                format!("Transaction {not_found} not found on ethereum\n"),
             ),
             (
                 ProcessTxReport {

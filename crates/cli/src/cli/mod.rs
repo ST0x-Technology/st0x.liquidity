@@ -404,6 +404,9 @@ pub enum Commands {
         /// Transaction hash (0x prefixed, 64 hex characters)
         #[arg(long = "tx-hash")]
         tx_hash: TxHash,
+        /// Hedged chain to query; defaults to the configured primary chain.
+        #[arg(long = "chain")]
+        chain: Option<Chain>,
     },
     /// Transfer tokenized equity between trading venues (Raindex <-> Alpaca)
     ///
@@ -1230,6 +1233,7 @@ fn parse_usdc_reconcile_reason(reason: &str) -> anyhow::Result<ReconcileReasonAr
 enum ProviderCommand {
     ProcessTx {
         tx_hash: TxHash,
+        chain: Option<Chain>,
     },
     TransferUsdc {
         direction: TransferDirection,
@@ -1456,8 +1460,8 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
         Commands::AlpacaTokenizationRequests => {
             CommandRoute::Provider(ProviderCommand::AlpacaTokenizationRequests)
         }
-        Commands::ProcessTx { tx_hash } => {
-            CommandRoute::Provider(ProviderCommand::ProcessTx { tx_hash })
+        Commands::ProcessTx { tx_hash, chain } => {
+            CommandRoute::Provider(ProviderCommand::ProcessTx { tx_hash, chain })
         }
         Commands::TransferUsdc { direction, amount } => {
             CommandRoute::Provider(ProviderCommand::TransferUsdc { direction, amount })
@@ -2105,15 +2109,19 @@ async fn run_provider_command<W: Write + Send>(
     stdout: &mut W,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
-    let provider = ProviderBuilder::new().connect_http(ctx.chains.primary().rpc_url.clone());
-
     match command {
-        ProviderCommand::ProcessTx { tx_hash } => {
-            info!("Processing transaction: tx_hash={tx_hash}");
+        ProviderCommand::ProcessTx { tx_hash, chain } => {
+            let chain = chain.unwrap_or(ctx.chains.primary().chain);
+            let trading_chain = ctx.chains.hedged_chain(chain).ok_or_else(|| {
+                anyhow::anyhow!("process-tx chain {chain} is not configured as a hedged chain")
+            })?;
+            let provider = ProviderBuilder::new().connect_http(trading_chain.rpc_url.clone());
+            info!("Processing transaction: tx_hash={tx_hash}, chain={chain}");
             let cache = SymbolCache::default();
             trading::process_tx_with_provider(
                 tx_hash,
                 ctx,
+                trading_chain,
                 pool,
                 stdout,
                 &provider,
@@ -2826,10 +2834,13 @@ mod tests {
     fn classify_process_tx_command_as_provider() {
         let command = Commands::ProcessTx {
             tx_hash: TxHash::ZERO,
+            chain: Some(Chain::Ethereum),
         };
 
         match classified_route(command) {
-            Err(ProviderCommand::ProcessTx { .. }) => {}
+            Err(ProviderCommand::ProcessTx { chain, .. }) => {
+                assert_eq!(chain, Some(Chain::Ethereum));
+            }
             Err(
                 ProviderCommand::TransferUsdc { .. }
                 | ProviderCommand::ResumeUsdcTransfer { .. }
@@ -2843,6 +2854,29 @@ mod tests {
             ) => panic!("expected process-tx provider command"),
             Ok(_) => panic!("expected provider command classification"),
         }
+    }
+    #[test]
+    fn process_tx_command_parses_optional_chain() {
+        let tx_hash = TxHash::repeat_byte(0x11);
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "process-tx",
+            "--tx-hash",
+            &tx_hash.to_string(),
+            "--chain",
+            "ethereum",
+        ])
+        .unwrap();
+
+        let Commands::ProcessTx {
+            tx_hash: parsed_hash,
+            chain,
+        } = cli.command
+        else {
+            panic!("expected process-tx command");
+        };
+        assert_eq!(parsed_hash, tx_hash);
+        assert_eq!(chain, Some(Chain::Ethereum));
     }
 
     #[test]
