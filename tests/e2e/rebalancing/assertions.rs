@@ -219,7 +219,7 @@ impl Wallet for TestWallet {
         }
     }
 
-    fn discard_prepared(&self, _prepared: &PreparedTransaction) {}
+    async fn discard_prepared(&self, _prepared: &PreparedTransaction) {}
 
     async fn send_pending(
         &self,

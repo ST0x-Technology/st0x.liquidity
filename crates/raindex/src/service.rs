@@ -715,8 +715,8 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .broadcast_prepared(prepared, "withdraw4 from vault")
             .await?)
     }
-    fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction) {
-        self.evm.discard_prepared(prepared);
+    async fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction) {
+        self.evm.discard_prepared(prepared).await;
     }
 
     async fn submit_withdraw(

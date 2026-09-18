@@ -317,6 +317,7 @@ where
 {
     let _guard = send_lock.lock().await;
     let nonce = nonce_manager.get_next_nonce(submitter, address).await?;
+    nonce_manager.reserve_prepared_nonce(address, nonce).await;
     let tx = TransactionRequest::default()
         .to(contract)
         .input(calldata.into())
@@ -331,16 +332,50 @@ where
     let envelope = match envelope_result {
         Ok(envelope) => envelope,
         Err(error) => {
-            // `get_next_nonce` already advanced the cache. Since no signed
-            // transaction exists to occupy that nonce, leave no gap for the
-            // next attempt.
-            nonce_manager.invalidate();
+            // `get_next_nonce` already advanced the cache. Roll back only
+            // this failed preparation; earlier persisted preparations remain
+            // reserved across the retry.
+            nonce_manager.release_prepared_nonce(address, nonce).await;
             return Err(error);
         }
     };
     let raw = Bytes::from(envelope.encoded_2718());
     debug_assert_eq!(envelope.nonce(), nonce);
     Ok(PreparedTransaction::from_raw(nonce, raw))
+}
+
+async fn prepared_transaction_visible<P>(provider: &P, tx_hash: TxHash) -> bool
+where
+    P: Provider,
+{
+    let receipt_visible = match provider.get_transaction_receipt(tx_hash).await {
+        Ok(receipt) => receipt.is_some(),
+        Err(lookup_error) => {
+            warn!(
+                target: "wallet",
+                %tx_hash,
+                %lookup_error,
+                "Prepared transaction receipt lookup failed after rebroadcast rejection"
+            );
+            false
+        }
+    };
+    if receipt_visible {
+        return true;
+    }
+
+    match provider.get_transaction_by_hash(tx_hash).await {
+        Ok(transaction) => transaction.is_some(),
+        Err(lookup_error) => {
+            warn!(
+                target: "wallet",
+                %tx_hash,
+                %lookup_error,
+                "Prepared transaction lookup failed after rebroadcast rejection"
+            );
+            false
+        }
+    }
 }
 
 /// Broadcast an exact signed envelope prepared earlier.
@@ -350,9 +385,9 @@ where
 /// also covers rebroadcast: after restart the nonce cache is raised through
 /// this prepared transaction before another operation can allocate a nonce.
 ///
-/// A nonce-too-low response can mean the exact transaction already mined and
-/// left the serving node's txpool. The locally known hash is therefore checked
-/// before classifying the response. Visibility by receipt or transaction
+/// A nonce-too-low or replacement-underpriced response can mean the exact
+/// transaction reached another backend or already mined. The locally known
+/// hash is therefore checked before classifying either rejection. Visibility
 /// adopts the hash; absence remains inconclusive and requires durable redrive.
 pub(crate) async fn broadcast_prepared<P>(
     provider: &P,
@@ -369,7 +404,7 @@ where
     let _guard = send_lock.lock().await;
     let tx_hash = prepared.tx_hash();
     nonce_manager
-        .raise_next_nonce(address, prepared.nonce().saturating_add(1))
+        .reserve_prepared_nonce(address, prepared.nonce())
         .await;
 
     match provider.send_raw_transaction(prepared.raw()).await {
@@ -378,44 +413,24 @@ where
             let error = EvmError::from(error);
             if error.is_already_known() {
                 // The exact signed envelope is already in this node's pool.
-            } else if error.is_nonce_too_low() {
-                let receipt_visible = match provider.get_transaction_receipt(tx_hash).await {
-                    Ok(receipt) => receipt.is_some(),
-                    Err(lookup_error) => {
-                        warn!(
-                            target: "wallet",
-                            %tx_hash,
-                            %lookup_error,
-                            "Prepared transaction receipt lookup failed after nonce-too-low"
-                        );
-                        false
-                    }
-                };
-                let transaction_visible = if receipt_visible {
-                    false
-                } else {
-                    match provider.get_transaction_by_hash(tx_hash).await {
-                        Ok(transaction) => transaction.is_some(),
-                        Err(lookup_error) => {
-                            warn!(
-                                target: "wallet",
-                                %tx_hash,
-                                %lookup_error,
-                                "Prepared transaction lookup failed after nonce-too-low"
-                            );
-                            false
-                        }
-                    }
-                };
-                if !receipt_visible && !transaction_visible {
+            } else if error.is_nonce_too_low() || error.is_replacement_underpriced() {
+                if !prepared_transaction_visible(provider, tx_hash).await {
                     return Err(EvmError::PreparedTransactionReconciliationPending { tx_hash });
                 }
             } else {
+                if !error.is_confirmation_pending() {
+                    nonce_manager
+                        .release_prepared_nonce(address, prepared.nonce())
+                        .await;
+                }
                 return Err(error);
             }
         }
     }
 
+    nonce_manager
+        .complete_prepared_nonce(address, prepared.nonce())
+        .await;
     in_flight.record(address, prepared.nonce(), tx_hash);
     info!(target: "wallet", %tx_hash, note, nonce = prepared.nonce(), "Prepared transaction broadcast");
     Ok(tx_hash)
@@ -1731,6 +1746,81 @@ mod tests {
             WALLET,
             &prepared,
             "inconclusive prepared transaction",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            EvmError::PreparedTransactionReconciliationPending { tx_hash: hash }
+                if *hash == tx_hash
+        ));
+        assert!(error.is_confirmation_pending());
+        assert_eq!(
+            in_flight.ownership(WALLET, STUCK_NONCE),
+            NonceOwnership::Unknown
+        );
+    }
+    #[tokio::test]
+    async fn replacement_underpriced_adopts_visible_prepared_transaction_hash() {
+        let tx_hash = prepared_tx_hash();
+        let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("replacement transaction underpriced"),
+            data: None,
+        });
+        asserter.push_success(&mined_receipt(tx_hash));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::default();
+        let send_lock = Mutex::new(());
+
+        let result = broadcast_prepared(
+            &provider,
+            &nonce_manager,
+            &in_flight,
+            &send_lock,
+            WALLET,
+            &prepared,
+            "visible underpriced prepared transaction",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, tx_hash);
+        assert_eq!(
+            in_flight.ownership(WALLET, STUCK_NONCE),
+            NonceOwnership::Ours
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_underpriced_without_hash_visibility_remains_reconciliation_pending() {
+        let tx_hash = prepared_tx_hash();
+        let prepared = PreparedTransaction::for_test(tx_hash, STUCK_NONCE);
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("replacement transaction underpriced"),
+            data: None,
+        });
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::default();
+        let send_lock = Mutex::new(());
+
+        let error = broadcast_prepared(
+            &provider,
+            &nonce_manager,
+            &in_flight,
+            &send_lock,
+            WALLET,
+            &prepared,
+            "inconclusive underpriced prepared transaction",
         )
         .await
         .unwrap_err();

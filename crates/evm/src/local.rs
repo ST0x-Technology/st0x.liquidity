@@ -223,13 +223,16 @@ where
         )
         .await
     }
-    fn discard_prepared(&self, prepared: &PreparedTransaction) {
-        self.nonce_manager.invalidate();
+    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
+        let _guard = self.send_lock.lock().await;
+        self.nonce_manager
+            .release_prepared_nonce(self.address(), prepared.nonce())
+            .await;
         tracing::warn!(
             target: "wallet",
             tx_hash = %prepared.tx_hash(),
             nonce = prepared.nonce(),
-            "Discarding unpersisted prepared transaction and invalidating nonce cache"
+            "Discarding unpersisted prepared transaction and releasing its nonce reservation"
         );
     }
 
@@ -457,20 +460,22 @@ mod tests {
     }
     #[tokio::test]
     async fn prepared_rebroadcast_reserves_its_nonce_before_another_send() {
-        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
         wallet.provider.anvil_set_auto_mine(false).await.unwrap();
 
         let prepared = wallet
             .prepare_pending(signer_address, Bytes::new(), "prepared before restart")
             .await
             .unwrap();
-        wallet.nonce_manager.invalidate();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let restarted_wallet =
+            RawPrivateKeyWallet::new(&private_key, wallet.provider.clone(), 1).unwrap();
 
-        wallet
+        restarted_wallet
             .broadcast_prepared(&prepared, "rebroadcast after restart")
             .await
             .unwrap();
-        let following = wallet
+        let following = restarted_wallet
             .prepare_pending(signer_address, Bytes::new(), "send after rebroadcast")
             .await
             .unwrap();
@@ -480,17 +485,21 @@ mod tests {
             prepared.nonce().saturating_add(1),
             "a cold nonce cache must advance past the persisted transaction before another send"
         );
-        wallet.discard_prepared(&following);
+        restarted_wallet.discard_prepared(&following).await;
     }
 
     #[tokio::test]
     async fn failed_preparation_does_not_consume_an_unbroadcast_nonce() {
         let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
-        let expected_nonce = wallet
-            .provider
-            .get_transaction_count(signer_address)
+        let earlier = wallet
+            .prepare_pending(
+                signer_address,
+                Bytes::new(),
+                "earlier outstanding preparation",
+            )
             .await
             .unwrap();
+        let expected_retry_nonce = earlier.nonce().saturating_add(1);
         let excessive_amount = U256::from(999_999_999) * U256::from(10).pow(U256::from(18));
         let calldata = Bytes::from(
             IERC20::transferCall {
@@ -504,21 +513,22 @@ mod tests {
             .prepare_pending(token_address, calldata, "preparation should fail")
             .await
             .expect_err("gas estimation must reject an excessive transfer");
-        let prepared = wallet
+        let retry = wallet
             .prepare_pending(
                 signer_address,
                 Bytes::new(),
-                "retry after preparation failure",
+                "retry after later preparation failure",
             )
             .await
             .unwrap();
 
         assert_eq!(
-            prepared.nonce(),
-            expected_nonce,
-            "the failed preparation never broadcast, so its nonce must be reusable"
+            retry.nonce(),
+            expected_retry_nonce,
+            "rolling back the failed later preparation must preserve the earlier reservation"
         );
-        wallet.discard_prepared(&prepared);
+        wallet.discard_prepared(&retry).await;
+        wallet.discard_prepared(&earlier).await;
     }
 
     /// Regression test threading the `in_flight` wiring through the

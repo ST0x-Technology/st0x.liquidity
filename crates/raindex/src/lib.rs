@@ -215,9 +215,9 @@ pub trait Raindex: Send + Sync {
         &self,
         prepared: &PreparedTransaction,
     ) -> Result<TxHash, RaindexError>;
-    /// Releases wallet-local nonce state when a prepared withdrawal could not
-    /// be persisted and will never be broadcast.
-    fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction);
+    /// Releases the wallet-local reservation when a prepared withdrawal could
+    /// not be persisted and will never be broadcast.
+    async fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction);
 
     /// Submit a vault withdrawal without waiting for confirmation.
     ///

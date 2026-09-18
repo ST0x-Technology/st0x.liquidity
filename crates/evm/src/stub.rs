@@ -86,7 +86,7 @@ impl Wallet for StubWallet {
             "StubWallet::broadcast_prepared called - use a real wallet in tests that need transactions"
         )
     }
-    fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+    async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
         panic!(
             "StubWallet::discard_prepared called - use a real wallet in tests that need transactions"
         );
