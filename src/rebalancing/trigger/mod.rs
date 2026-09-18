@@ -17407,6 +17407,7 @@ mod tests {
                     token: Address::random(),
                     wrapped_amount: U256::from(10_000_000_000_000_000_000_u128),
                     tx_hash: TxHash::random(),
+                    prepared: None,
                     submitted_at: Utc::now(),
                 },
             )

@@ -361,6 +361,14 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
+    async fn restore_submitted_withdrawal(
+        &self,
+        _: TxHash,
+        _: Option<&PreparedTransaction>,
+    ) -> Result<(), RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
     async fn submit_withdraw(
         &self,
         _: Address,
@@ -1829,7 +1837,17 @@ impl CrossVenueEquityTransfer {
                     self.broadcast_and_record_vault_withdrawal(aggregate_id, chain, &prepared)
                         .await?;
                 }
-                EquityRedemption::VaultWithdrawSubmitted { .. } => {
+                EquityRedemption::VaultWithdrawSubmitted {
+                    chain,
+                    tx_hash,
+                    prepared,
+                    ..
+                } => {
+                    self.services
+                        .for_chain(chain)?
+                        .raindex
+                        .restore_submitted_withdrawal(tx_hash, prepared.as_ref())
+                        .await?;
                     info!(%aggregate_id, "Resuming submitted vault withdrawal");
                     self.redemption_store
                         .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
@@ -4015,6 +4033,7 @@ mod tests {
 
         (transfer, pool)
     }
+
     fn withdrawal_amount() -> U256 {
         U256::from(50_000_000_000_000_000_000_u128)
     }
@@ -4086,6 +4105,11 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(
+            raindex.restored_prepared_withdrawals(),
+            1,
+            "submitted-state recovery must restore nonce ownership before confirmation"
+        );
     }
 
     #[tokio::test]

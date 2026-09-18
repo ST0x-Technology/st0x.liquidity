@@ -221,6 +221,15 @@ impl Wallet for TestWallet {
 
     async fn discard_prepared(&self, _prepared: &PreparedTransaction) {}
 
+    async fn restore_prepared(&self, _prepared: &PreparedTransaction) {}
+
+    async fn restore_transaction(
+        &self,
+        _tx_hash: alloy::primitives::TxHash,
+    ) -> Result<(), EvmError> {
+        Ok(())
+    }
+
     async fn send_pending(
         &self,
         contract: Address,

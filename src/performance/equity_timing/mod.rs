@@ -1095,6 +1095,7 @@ mod tests {
                 token: Address::repeat_byte(0x22),
                 wrapped_amount: U256::from(5_000_000_000_000_000_000_u128),
                 tx_hash: TxHash::random(),
+                prepared: None,
                 submitted_at: timestamp(5),
             },
             EquityRedemptionEvent::WithdrawnFromRaindex {
@@ -1590,6 +1591,7 @@ mod tests {
                 token: Address::repeat_byte(0x22),
                 wrapped_amount: U256::from(5_000_000_000_000_000_000_u128),
                 tx_hash: TxHash::random(),
+                prepared: None,
                 submitted_at: timestamp(5),
             })
             .unwrap(),

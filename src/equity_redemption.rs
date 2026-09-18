@@ -527,6 +527,10 @@ pub enum EquityRedemptionEvent {
         token: Address,
         wrapped_amount: U256,
         tx_hash: TxHash,
+        /// Exact signed transaction retained until confirmation so restart can
+        /// restore nonce ownership before any wallet send.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
     },
     /// Tokens withdrawn from Raindex vault to wallet.
@@ -760,6 +764,7 @@ fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) 
                 token: t1,
                 wrapped_amount: w1,
                 tx_hash: h1,
+                prepared: p1,
                 submitted_at: sa1,
             },
             VaultWithdrawSubmitted {
@@ -768,6 +773,7 @@ fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) 
                 token: t2,
                 wrapped_amount: w2,
                 tx_hash: h2,
+                prepared: p2,
                 submitted_at: sa2,
             },
         ) => Some(
@@ -776,6 +782,7 @@ fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) 
                 && t1 == t2
                 && w1 == w2
                 && h1 == h2
+                && p1 == p2
                 && sa1 == sa2,
         ),
         _ => None,
@@ -1054,6 +1061,10 @@ pub enum EquityRedemption {
         token: Address,
         wrapped_amount: U256,
         tx_hash: TxHash,
+        /// Exact signed transaction retained until confirmation so restart can
+        /// restore nonce ownership before any wallet send.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
     },
 
@@ -1586,7 +1597,9 @@ impl EventSourced for EquityRedemption {
     // v8: `VaultWithdrawSubmitting` now persists `PreparedTransaction`, making
     // every first and repeated broadcast byte-identical. Version-7 events
     // without this field replay into the legacy fail-closed state.
-    const SCHEMA_VERSION: u64 = 8;
+    // v9: `VaultWithdrawSubmitted` retains the prepared transaction through
+    // confirmation so startup restores its nonce ownership before workers run.
+    const SCHEMA_VERSION: u64 = 9;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
@@ -1648,6 +1661,7 @@ impl EventSourced for EquityRedemption {
                 token,
                 wrapped_amount,
                 tx_hash,
+                prepared,
                 submitted_at,
             } => Some(Self::VaultWithdrawSubmitted {
                 symbol: symbol.clone(),
@@ -1656,6 +1670,7 @@ impl EventSourced for EquityRedemption {
                 token: *token,
                 wrapped_amount: *wrapped_amount,
                 tx_hash: *tx_hash,
+                prepared: prepared.clone(),
                 submitted_at: *submitted_at,
             }),
             // Legacy: old aggregates start with WithdrawnFromRaindex
@@ -1701,6 +1716,7 @@ impl EventSourced for EquityRedemption {
                 token,
                 wrapped_amount,
                 tx_hash,
+                prepared,
                 submitted_at,
             } => match entity {
                 Self::VaultWithdrawPending { .. } | Self::VaultWithdrawSubmitting { .. } => {
@@ -1711,6 +1727,7 @@ impl EventSourced for EquityRedemption {
                         token: *token,
                         wrapped_amount: *wrapped_amount,
                         tx_hash: *tx_hash,
+                        prepared: prepared.clone(),
                         submitted_at: *submitted_at,
                     })
                 }
@@ -2493,6 +2510,7 @@ impl EquityRedemption {
                 quantity,
                 token,
                 wrapped_amount,
+                prepared,
                 ..
             } => Ok(vec![VaultWithdrawSubmitted {
                 symbol: symbol.clone(),
@@ -2500,6 +2518,7 @@ impl EquityRedemption {
                 token: *token,
                 wrapped_amount: *wrapped_amount,
                 tx_hash,
+                prepared: Some(prepared.clone()),
                 submitted_at,
             }]),
             Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
@@ -3419,6 +3438,7 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
     }
+
     fn redemption_test_store(
         services: EquityTransferServices,
     ) -> (TestStore<EquityRedemption>, Arc<dyn Raindex>) {
@@ -3625,6 +3645,7 @@ mod tests {
                 && *wrapped_amount == amount
         ));
     }
+
     #[tokio::test]
     async fn detect_after_tokens_sent_produces_detected() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
@@ -3639,6 +3660,7 @@ mod tests {
 
         assert!(matches!(events[0], EquityRedemptionEvent::Detected { .. }));
     }
+
     #[tokio::test]
     async fn unresolved_withdrawal_intent_cannot_be_failed_away() {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
@@ -3765,12 +3787,14 @@ mod tests {
         assert_eq!(events.len(), 1);
         let EquityRedemptionEvent::VaultWithdrawSubmitted {
             submitted_at: event_submitted_at,
+            prepared: Some(event_prepared),
             ..
         } = &events[0]
         else {
-            panic!("Expected VaultWithdrawSubmitted, got: {:?}", events[0]);
+            panic!("Expected VaultWithdrawSubmitted with prepared transaction");
         };
         assert_eq!(*event_submitted_at, submitted_at);
+        assert_eq!(*event_prepared, prepared_withdrawal_for_test());
         assert!(matches!(
             events[0],
             EquityRedemptionEvent::VaultWithdrawSubmitted {
@@ -7059,6 +7083,7 @@ mod tests {
                 token: Address::ZERO,
                 wrapped_amount: U256::ZERO,
                 tx_hash: TxHash::default(),
+                prepared: None,
                 submitted_at: now,
             }
             .is_terminal(),

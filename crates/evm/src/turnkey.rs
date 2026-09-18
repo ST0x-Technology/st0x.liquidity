@@ -7,7 +7,7 @@
 //! the signer: `TurnkeySigner` (remote signing via Turnkey API) instead
 //! of `PrivateKeySigner` (local key).
 
-use alloy::consensus::{SignableTransaction, TxEnvelope};
+use alloy::consensus::{SignableTransaction, Transaction, TxEnvelope};
 use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
 use alloy::network::{Ethereum, EthereumWallet, TxSigner};
 use alloy::primitives::{
@@ -472,6 +472,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
 
         let base_provider = ctx.provider.clone();
         let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
 
         let signing_provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -490,7 +491,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
-            in_flight: InFlightNonces::default(),
+            in_flight,
             send_lock: Arc::new(Mutex::new(())),
             typed_data_signer,
             address,
@@ -519,6 +520,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
 
         let base_provider = provider.clone();
         let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
 
         let signing_provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -533,7 +535,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
-            in_flight: InFlightNonces::default(),
+            in_flight,
             send_lock: Arc::new(Mutex::new(())),
             typed_data_signer,
             address,
@@ -1147,6 +1149,7 @@ where
         )
         .await
     }
+
     async fn prepare_pending(
         &self,
         contract: Address,
@@ -1181,6 +1184,7 @@ where
         )
         .await
     }
+
     async fn discard_prepared(&self, prepared: &PreparedTransaction) {
         let _guard = self.send_lock.lock().await;
         self.nonce_manager
@@ -1192,6 +1196,30 @@ where
             nonce = prepared.nonce(),
             "Discarding unpersisted prepared transaction and releasing its nonce reservation"
         );
+    }
+
+    async fn restore_prepared(&self, prepared: &PreparedTransaction) {
+        let _guard = self.send_lock.lock().await;
+        self.nonce_manager
+            .reserve_prepared_nonce(self.address, prepared.nonce())
+            .await;
+        self.in_flight
+            .record(self.address, prepared.nonce(), prepared.tx_hash());
+    }
+
+    async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
+        let _guard = self.send_lock.lock().await;
+        let transaction = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or(EvmError::PreparedTransactionReconciliationPending { tx_hash })?;
+        let nonce = transaction.nonce();
+        self.nonce_manager
+            .reserve_prepared_nonce(self.address, nonce)
+            .await;
+        self.in_flight.record(self.address, nonce, tx_hash);
+        Ok(())
     }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {

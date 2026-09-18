@@ -551,6 +551,18 @@ mod tests {
             );
         }
 
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!(
+                "StubWallet::restore_prepared called - use a real wallet in tests that need transactions"
+            );
+        }
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            panic!(
+                "StubWallet::restore_transaction called - use a real wallet in tests that need transactions"
+            );
+        }
+
         async fn send_pending(
             &self,
             _contract: Address,
@@ -809,6 +821,12 @@ mod tests {
         }
 
         async fn discard_prepared(&self, _prepared: &PreparedTransaction) {}
+
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {}
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            Ok(())
+        }
 
         async fn send_pending(
             &self,

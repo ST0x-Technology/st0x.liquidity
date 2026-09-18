@@ -195,13 +195,14 @@ pub enum EvmError {
         tx_hash: alloy::primitives::TxHash,
         timeout_secs: u64,
     },
-    /// A persisted transaction was rejected as nonce-too-low after restart,
-    /// but the serving RPC could not yet find its locally known hash. The
-    /// transaction may already be mined or visible on another backend, so the
-    /// caller must durably redrive reconciliation rather than prepare a new
-    /// transaction.
+    /// A persisted transaction was rejected as nonce-too-low or replacement-
+    /// underpriced after restart, but the serving RPC could not yet find its
+    /// locally known hash. The transaction may already be mined or visible on
+    /// another backend, so the caller must durably redrive reconciliation
+    /// rather than prepare a new transaction.
     #[error(
-        "prepared transaction {tx_hash} was rejected as nonce too low but is not yet visible by hash"
+        "prepared transaction {tx_hash} was rejected by nonce reconciliation \
+         but is not yet visible by hash"
     )]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     PreparedTransactionReconciliationPending { tx_hash: alloy::primitives::TxHash },
@@ -348,6 +349,7 @@ impl EvmError {
             Self::NodeBehindRequiredBlock { .. } => false,
         }
     }
+
     /// `true` when a prepared or known transaction may still have reached the
     /// network, or may confirm once RPC visibility catches up. Callers should
     /// durably reschedule reconciliation rather than exhaust a finite generic
@@ -490,6 +492,7 @@ impl EvmError {
 
         token.parse().ok().map(NextNonceHint)
     }
+
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     pub fn is_already_known(&self) -> bool {
         self.already_known_payload().is_some()
@@ -627,6 +630,7 @@ impl PreparedTransaction {
             raw,
         }
     }
+
     /// Constructs a prepared identity for test doubles that do not broadcast
     /// real signed envelopes.
     #[cfg(any(test, feature = "test-support"))]
@@ -715,6 +719,14 @@ pub trait Wallet: Evm {
     /// Releases this prepared transaction's nonce reservation after persistence
     /// failed and the transaction will never be broadcast.
     async fn discard_prepared(&self, prepared: &PreparedTransaction);
+
+    /// Restores allocator and ownership state for an exact transaction loaded
+    /// from durable storage before any new transaction can allocate its nonce.
+    async fn restore_prepared(&self, prepared: &PreparedTransaction);
+
+    /// Restores ownership for a legacy durable submission that retained only
+    /// its transaction hash. Absence is inconclusive and must fail closed.
+    async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError>;
 
     /// Submit a signed transaction and return the tx hash immediately,
     /// without waiting for confirmation.
@@ -954,12 +966,21 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
     ) -> Result<TxHash, EvmError> {
         (**self).broadcast_prepared(prepared, note).await
     }
+
     async fn discard_prepared(&self, prepared: &PreparedTransaction) {
         (**self).discard_prepared(prepared).await;
     }
 
+    async fn restore_prepared(&self, prepared: &PreparedTransaction) {
+        (**self).restore_prepared(prepared).await;
+    }
+
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
         (**self).await_receipt(tx_hash).await
+    }
+
+    async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
+        (**self).restore_transaction(tx_hash).await
     }
 
     async fn send(

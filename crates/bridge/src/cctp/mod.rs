@@ -1876,6 +1876,14 @@ mod tests {
             self.inner.discard_prepared(prepared).await;
         }
 
+        async fn restore_prepared(&self, prepared: &PreparedTransaction) {
+            self.inner.restore_prepared(prepared).await;
+        }
+
+        async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
+            self.inner.restore_transaction(tx_hash).await
+        }
+
         async fn send_pending(
             &self,
             contract: Address,

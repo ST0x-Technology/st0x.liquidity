@@ -715,8 +715,22 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .broadcast_prepared(prepared, "withdraw4 from vault")
             .await?)
     }
+
     async fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction) {
         self.evm.discard_prepared(prepared).await;
+    }
+
+    async fn restore_submitted_withdrawal(
+        &self,
+        tx_hash: TxHash,
+        prepared: Option<&PreparedTransaction>,
+    ) -> Result<(), RaindexError> {
+        if let Some(prepared) = prepared {
+            self.evm.restore_prepared(prepared).await;
+        } else {
+            self.evm.restore_transaction(tx_hash).await?;
+        }
+        Ok(())
     }
 
     async fn submit_withdraw(

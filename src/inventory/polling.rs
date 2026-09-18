@@ -2183,6 +2183,14 @@ mod tests {
             panic!("MockEthereumWallet::discard_prepared should not be called in polling tests");
         }
 
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!("MockEthereumWallet::restore_prepared should not be called in polling tests");
+        }
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            panic!("MockEthereumWallet::restore_transaction should not be called in polling tests");
+        }
+
         async fn send_pending(
             &self,
             _contract: Address,
@@ -2248,6 +2256,14 @@ mod tests {
 
         async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
             panic!("MockBaseWallet::discard_prepared should not be called in polling tests");
+        }
+
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!("MockBaseWallet::restore_prepared should not be called in polling tests");
+        }
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            panic!("MockBaseWallet::restore_transaction should not be called in polling tests");
         }
 
         async fn send_pending(

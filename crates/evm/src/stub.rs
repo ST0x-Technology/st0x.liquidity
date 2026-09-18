@@ -92,6 +92,18 @@ impl Wallet for StubWallet {
         );
     }
 
+    async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+        panic!(
+            "StubWallet::restore_prepared called - use a real wallet in tests that need transactions"
+        );
+    }
+
+    async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+        panic!(
+            "StubWallet::restore_transaction called - use a real wallet in tests that need transactions"
+        );
+    }
+
     async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
         panic!(
             "StubWallet::await_receipt called - use a real wallet in tests that need transactions"

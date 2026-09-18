@@ -4,6 +4,7 @@
 //! provider with a [`WalletFiller`] internally, and submits transactions
 //! directly.
 
+use alloy::consensus::Transaction;
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
 use alloy::providers::fillers::{
@@ -106,6 +107,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
 
         let base_provider = provider.clone();
         let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
 
         let signing_provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -125,7 +127,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
             signer,
             signing_provider,
             nonce_manager,
-            in_flight: InFlightNonces::default(),
+            in_flight,
             send_lock: Arc::new(Mutex::new(())),
             required_confirmations,
         })
@@ -189,6 +191,7 @@ where
         )
         .await
     }
+
     async fn prepare_pending(
         &self,
         contract: Address,
@@ -223,6 +226,7 @@ where
         )
         .await
     }
+
     async fn discard_prepared(&self, prepared: &PreparedTransaction) {
         let _guard = self.send_lock.lock().await;
         self.nonce_manager
@@ -234,6 +238,30 @@ where
             nonce = prepared.nonce(),
             "Discarding unpersisted prepared transaction and releasing its nonce reservation"
         );
+    }
+
+    async fn restore_prepared(&self, prepared: &PreparedTransaction) {
+        let _guard = self.send_lock.lock().await;
+        self.nonce_manager
+            .reserve_prepared_nonce(self.address(), prepared.nonce())
+            .await;
+        self.in_flight
+            .record(self.address(), prepared.nonce(), prepared.tx_hash());
+    }
+
+    async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
+        let _guard = self.send_lock.lock().await;
+        let transaction = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or(EvmError::PreparedTransactionReconciliationPending { tx_hash })?;
+        let nonce = transaction.nonce();
+        self.nonce_manager
+            .reserve_prepared_nonce(self.address(), nonce)
+            .await;
+        self.in_flight.record(self.address(), nonce, tx_hash);
+        Ok(())
     }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
@@ -458,6 +486,7 @@ mod tests {
             "transactions must have different hashes (distinct nonces)"
         );
     }
+
     #[tokio::test]
     async fn prepared_rebroadcast_reserves_its_nonce_before_another_send() {
         let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
@@ -484,6 +513,41 @@ mod tests {
             following.nonce(),
             prepared.nonce().saturating_add(1),
             "a cold nonce cache must advance past the persisted transaction before another send"
+        );
+        restarted_wallet.discard_prepared(&following).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_hash_only_restart_restores_pending_nonce_ownership() {
+        let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        wallet.provider.anvil_set_auto_mine(false).await.unwrap();
+
+        let tx_hash = wallet
+            .send_pending(signer_address, Bytes::new(), "submitted before restart")
+            .await
+            .unwrap();
+        let submitted_nonce = wallet
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .expect("submitted transaction must remain visible")
+            .nonce();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let restarted_wallet =
+            RawPrivateKeyWallet::new(&private_key, wallet.provider.clone(), 1).unwrap();
+
+        restarted_wallet.restore_transaction(tx_hash).await.unwrap();
+        restarted_wallet.nonce_manager.invalidate();
+        let following = restarted_wallet
+            .prepare_pending(signer_address, Bytes::new(), "send after ownership restore")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            following.nonce(),
+            submitted_nonce.saturating_add(1),
+            "hash-only recovery must restore pending nonce ownership before cache refill"
         );
         restarted_wallet.discard_prepared(&following).await;
     }
