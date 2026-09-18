@@ -20,7 +20,7 @@ mod service;
 pub use service::RaindexService;
 
 /// Vault identifier for Rain OrderBook vaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RaindexVaultId(pub B256);
 
 /// The two Raindex contract addresses a [`RaindexService`] talks to.
@@ -192,6 +192,21 @@ pub trait Raindex: Send + Sync {
         target_amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError>;
+
+    /// Returns the current chain head for an irreversible-action intent.
+    async fn current_block(&self) -> Result<u64, RaindexError>;
+
+    /// Finds the newest matching withdrawal strictly after `from_block`.
+    ///
+    /// Implementations must return `Ok(None)` only after proving the queried
+    /// node is confirmations-deep past the lower bound and repeated scans agree
+    /// the effect is absent.
+    async fn find_recent_withdrawal(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        from_block: u64,
+    ) -> Result<Option<(TxHash, U256)>, RaindexError>;
 
     /// Wait for a previously submitted transaction to be confirmed.
     async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {

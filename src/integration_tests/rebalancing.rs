@@ -2735,7 +2735,9 @@ async fn transfer_failed_cancels_redemption_inflight() {
                 symbol: symbol.clone(),
                 quantity: float!("10"),
                 token: token_address,
+                vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                 amount: U256::from(10_000_000_000_000_000_000_u128),
+                from_block: 0,
             },
         )
         .await
@@ -2753,7 +2755,12 @@ async fn transfer_failed_cancels_redemption_inflight() {
     );
 
     redemption_store
-        .send(&redemption_id, EquityRedemptionCommand::SubmitWithdraw)
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+            },
+        )
         .await
         .unwrap();
 

@@ -8,6 +8,7 @@ use alloy::sol_types::SolEvent;
 use alloy::transports::RpcError;
 use async_trait::async_trait;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
 use st0x_evm::EvmError;
@@ -47,6 +48,13 @@ pub(crate) enum ConfirmTxBehavior {
     #[cfg(test)]
     SucceedWithoutBlockNumber,
 }
+#[derive(Default)]
+enum WithdrawBehavior {
+    #[default]
+    Succeed,
+    #[cfg(test)]
+    AcceptThenLoseResponse,
+}
 
 /// Arguments captured from the last `submit_deposit` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,11 +77,17 @@ pub struct MockRaindex {
     deposit_tx: TxHash,
     deposit_behavior: DepositBehavior,
     confirm_behavior: ConfirmTxBehavior,
+    withdraw_behavior: WithdrawBehavior,
     deposited_token: Mutex<Option<Address>>,
     deposit_call: Mutex<Option<DepositCall>>,
     confirmed_tx: Mutex<Option<TxHash>>,
     withdraw_transfer: Mutex<Option<WithdrawCall>>,
     withdraw_actual_amount: Option<U256>,
+    current_block: u64,
+    recent_withdrawal: Mutex<Option<(TxHash, U256)>>,
+    withdrawal_scan_inconclusive: bool,
+    remember_submitted_withdrawal: bool,
+    withdraw_submissions: AtomicUsize,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -130,11 +144,17 @@ impl MockRaindex {
             deposit_tx: TxHash::random(),
             deposit_behavior: DepositBehavior::Succeed,
             confirm_behavior: ConfirmTxBehavior::Succeed,
+            withdraw_behavior: WithdrawBehavior::Succeed,
             deposited_token: Mutex::new(None),
             deposit_call: Mutex::new(None),
             confirmed_tx: Mutex::new(None),
             withdraw_transfer: Mutex::new(None),
             withdraw_actual_amount: None,
+            current_block: 0,
+            recent_withdrawal: Mutex::new(None),
+            withdrawal_scan_inconclusive: false,
+            remember_submitted_withdrawal: false,
+            withdraw_submissions: AtomicUsize::new(0),
         }
     }
 
@@ -184,6 +204,46 @@ impl MockRaindex {
     pub(crate) fn with_withdraw_actual_amount(mut self, amount: U256) -> Self {
         self.withdraw_actual_amount = Some(amount);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_current_block(mut self, current_block: u64) -> Self {
+        self.current_block = current_block;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_recent_withdrawal(self, tx_hash: TxHash, amount: U256) -> Self {
+        {
+            let Ok(mut recent_withdrawal) = self.recent_withdrawal.lock() else {
+                panic!("mock recent-withdrawal mutex poisoned");
+            };
+            *recent_withdrawal = Some((tx_hash, amount));
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_inconclusive_withdrawal_scan(mut self) -> Self {
+        self.withdrawal_scan_inconclusive = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remembering_submitted_withdrawal(mut self) -> Self {
+        self.remember_submitted_withdrawal = true;
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn accepting_withdraw_then_losing_response(mut self) -> Self {
+        self.remember_submitted_withdrawal = true;
+        self.withdraw_behavior = WithdrawBehavior::AcceptThenLoseResponse;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn withdraw_submissions(&self) -> usize {
+        self.withdraw_submissions.load(Ordering::SeqCst)
     }
 }
 
@@ -264,14 +324,55 @@ impl Raindex for MockRaindex {
         target_amount: U256,
         _decimals: u8,
     ) -> Result<TxHash, RaindexError> {
-        let Ok(mut withdraw_transfer) = self.withdraw_transfer.lock() else {
-            panic!("mock withdrawal-transfer mutex poisoned");
+        self.withdraw_submissions.fetch_add(1, Ordering::SeqCst);
+        {
+            let Ok(mut withdraw_transfer) = self.withdraw_transfer.lock() else {
+                panic!("mock withdrawal-transfer mutex poisoned");
+            };
+            *withdraw_transfer = Some(WithdrawCall {
+                token,
+                amount: target_amount,
+            });
+        }
+
+        if self.remember_submitted_withdrawal {
+            let Ok(mut recent_withdrawal) = self.recent_withdrawal.lock() else {
+                panic!("mock recent-withdrawal mutex poisoned");
+            };
+            *recent_withdrawal = Some((self.withdraw_tx, target_amount));
+        }
+
+        match self.withdraw_behavior {
+            WithdrawBehavior::Succeed => Ok(self.withdraw_tx),
+            #[cfg(test)]
+            WithdrawBehavior::AcceptThenLoseResponse => Err(RaindexError::Evm(
+                EvmError::Transport(RpcError::ErrorResp(alloy::rpc::json_rpc::ErrorPayload {
+                    code: -32000,
+                    message: "connection reset after transaction broadcast".into(),
+                    data: None,
+                })),
+            )),
+        }
+    }
+
+    async fn current_block(&self) -> Result<u64, RaindexError> {
+        Ok(self.current_block)
+    }
+
+    async fn find_recent_withdrawal(
+        &self,
+        _token: Address,
+        _vault_id: RaindexVaultId,
+        from_block: u64,
+    ) -> Result<Option<(TxHash, U256)>, RaindexError> {
+        if self.withdrawal_scan_inconclusive {
+            return Err(RaindexError::ScanInconclusive { from_block });
+        }
+
+        let Ok(recent_withdrawal) = self.recent_withdrawal.lock() else {
+            panic!("mock recent-withdrawal mutex poisoned");
         };
-        *withdraw_transfer = Some(WithdrawCall {
-            token,
-            amount: target_amount,
-        });
-        Ok(self.withdraw_tx)
+        Ok(*recent_withdrawal)
     }
 
     async fn confirm_tx_receipt(

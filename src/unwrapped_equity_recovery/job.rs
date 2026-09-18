@@ -1849,9 +1849,11 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: float!(5),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: FractionalShares::new(float!(5))
                         .to_u256_18_decimals()
                         .unwrap(),
+                    from_block: 0,
                 },
             )
             .await

@@ -33,16 +33,20 @@ impl StoredOperation {
             VaultWithdrawPending {
                 symbol,
                 quantity,
-                pending_at,
+                pending_at: started_at,
+                ..
+            }
+            | VaultWithdrawSubmitting {
+                symbol,
+                quantity,
+                submitting_at: started_at,
                 ..
             } => {
                 self.symbol.get_or_insert_with(|| symbol.clone());
                 self.quantity
                     .get_or_insert_with(|| FractionalShares::new(*quantity));
-                // `VaultWithdrawPending` is always the genuine genesis event
-                // (the aggregate's own `initialize()` command).
-                self.started_at.get_or_insert(*pending_at);
-                self.open_once(RedemptionWithdraw, *pending_at);
+                self.started_at.get_or_insert(*started_at);
+                self.open_once(RedemptionWithdraw, *started_at);
             }
             // Also carries symbol/quantity: hydrate them so an operation
             // first observed mid-stream (deploy/restart backfill) is not
@@ -292,6 +296,9 @@ pub(super) fn redemption_observed_at(event: &EquityRedemptionEvent) -> DateTime<
     // Same combined-arm rationale as `mint_observed_at`.
     match event {
         VaultWithdrawPending { pending_at: at, .. }
+        | VaultWithdrawSubmitting {
+            submitting_at: at, ..
+        }
         | VaultWithdrawSubmitted {
             submitted_at: at, ..
         }

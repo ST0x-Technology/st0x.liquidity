@@ -432,6 +432,7 @@ impl MintTracking {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedemptionTrackingStage {
     VaultWithdrawPending,
+    VaultWithdrawSubmitting,
     VaultWithdrawSubmitted,
     WithdrawnFromRaindex,
     UnwrapPending,
@@ -446,6 +447,7 @@ impl std::fmt::Display for RedemptionTrackingStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::VaultWithdrawPending => write!(formatter, "VaultWithdrawPending"),
+            Self::VaultWithdrawSubmitting => write!(formatter, "VaultWithdrawSubmitting"),
             Self::VaultWithdrawSubmitted => write!(formatter, "VaultWithdrawSubmitted"),
             Self::WithdrawnFromRaindex => write!(formatter, "WithdrawnFromRaindex"),
             Self::UnwrapPending => write!(formatter, "UnwrapPending"),
@@ -489,6 +491,21 @@ impl RedemptionTracking {
                 stage: RedemptionTrackingStage::VaultWithdrawPending,
                 last_progress_at: *pending_at,
             }),
+            EquityRedemptionEvent::VaultWithdrawSubmitting {
+                symbol,
+                chain,
+                quantity,
+                submitting_at,
+                ..
+            } => Some(Self {
+                symbol: symbol.clone(),
+                chain: *chain,
+                quantity: FractionalShares::new(*quantity),
+                tokenization_request_id: None,
+                redemption_tx: None,
+                stage: RedemptionTrackingStage::VaultWithdrawSubmitting,
+                last_progress_at: *submitting_at,
+            }),
             EquityRedemptionEvent::VaultWithdrawSubmitted {
                 symbol,
                 quantity,
@@ -529,10 +546,9 @@ impl RedemptionTracking {
         }
     }
 
-    /// Only `VaultWithdrawPending` records the chain. Tracking built from a
-    /// later event is right for a pre-multichain stream, but a live redemption
-    /// on another chain whose tracking went missing would land on the legacy
-    /// chain with no other signal, so the default is logged loudly.
+    /// Withdrawal genesis events record the chain. Tracking rebuilt from a
+    /// later, chainless legacy event defaults loudly because a live redemption
+    /// on another chain would otherwise debit the wrong inventory slot.
     fn default_chain_for_chainless_genesis(
         symbol: &Symbol,
         stage: RedemptionTrackingStage,
@@ -606,6 +622,7 @@ impl RedemptionTracking {
                 self.last_progress_at = *detected_at;
             }
             EquityRedemptionEvent::VaultWithdrawPending { .. }
+            | EquityRedemptionEvent::VaultWithdrawSubmitting { .. }
             | EquityRedemptionEvent::TransferFailed { .. }
             | EquityRedemptionEvent::DetectionFailed { .. }
             | EquityRedemptionEvent::RedemptionRejected { .. }
@@ -1486,14 +1503,18 @@ impl RebalancingService {
             tracking
                 .iter()
                 .filter_map(|(id, tracking)| {
+                    if matches!(
+                        tracking.stage,
+                        RedemptionTrackingStage::VaultWithdrawPending
+                            | RedemptionTrackingStage::VaultWithdrawSubmitting
+                    ) {
+                        return None;
+                    }
+
                     let elapsed =
                         Self::elapsed_since_timeout_start(tracking.last_progress_at, now)?;
 
-                    if elapsed >= self.config.transfer_timeout {
-                        Some(id.clone())
-                    } else {
-                        None
-                    }
+                    (elapsed >= self.config.transfer_timeout).then(|| id.clone())
                 })
                 .collect::<Vec<_>>()
         };
@@ -1525,7 +1546,8 @@ impl RebalancingService {
 
                 let command = match tracking.stage {
                     RedemptionTrackingStage::VaultWithdrawPending
-                    | RedemptionTrackingStage::VaultWithdrawSubmitted
+                    | RedemptionTrackingStage::VaultWithdrawSubmitting => None,
+                    RedemptionTrackingStage::VaultWithdrawSubmitted
                     | RedemptionTrackingStage::WithdrawnFromRaindex
                     | RedemptionTrackingStage::UnwrapPending
                     | RedemptionTrackingStage::UnwrapSubmitted
@@ -3877,10 +3899,9 @@ impl RebalancingService {
         use EquityRedemptionEvent::*;
 
         match event {
-            VaultWithdrawPending { .. } => Some(Self::start_equity_transfer_update(
-                Venue::MarketMaking,
-                quantity,
-            )),
+            VaultWithdrawPending { .. } | VaultWithdrawSubmitting { .. } => Some(
+                Self::start_equity_transfer_update(Venue::MarketMaking, quantity),
+            ),
             Completed { .. } | ProviderCompletionRecovered { .. } => Some(
                 Self::complete_equity_transfer_update(Venue::MarketMaking, quantity),
             ),
@@ -3927,6 +3948,7 @@ impl RebalancingService {
 
         match entity {
             VaultWithdrawPending { quantity, .. }
+            | VaultWithdrawSubmitting { quantity, .. }
             | VaultWithdrawSubmitted { quantity, .. }
             | WithdrawnFromRaindex { quantity, .. }
             | UnwrapPending { quantity, .. }
@@ -6792,6 +6814,7 @@ impl RebalancingService {
 
         match entity {
             VaultWithdrawPending { symbol, .. }
+            | VaultWithdrawSubmitting { symbol, .. }
             | VaultWithdrawSubmitted { symbol, .. }
             | WithdrawnFromRaindex { symbol, .. }
             | UnwrapPending { symbol, .. }
@@ -6806,6 +6829,12 @@ impl RebalancingService {
                     VaultWithdrawPending { pending_at, .. } => (
                         RedemptionTrackingStage::VaultWithdrawPending,
                         *pending_at,
+                        None,
+                        None,
+                    ),
+                    VaultWithdrawSubmitting { submitting_at, .. } => (
+                        RedemptionTrackingStage::VaultWithdrawSubmitting,
+                        *submitting_at,
                         None,
                         None,
                     ),
@@ -7268,6 +7297,7 @@ impl RebalancingService {
             | OperatorReconciled { .. } => true,
 
             VaultWithdrawPending { .. }
+            | VaultWithdrawSubmitting { .. }
             | VaultWithdrawSubmitted { .. }
             | WithdrawnFromRaindex { .. }
             | UnwrapPending { .. }
@@ -19983,7 +20013,9 @@ mod tests {
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::ZERO,
+                    from_block: 0,
                 },
             )
             .await
@@ -20015,7 +20047,9 @@ mod tests {
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::ZERO,
+                    from_block: 0,
                 },
             )
             .await
@@ -20389,6 +20423,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unresolved_withdrawal_intent_does_not_time_out_or_release_reservation() {
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = redemption_aggregate_id("unresolved-withdrawal-intent");
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let service = make_trigger_with_inventory(inventory).await;
+        let (_, redemption_store) = attach_live_equity_stores(&service).await;
+
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::ZERO,
+                    from_block: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+
+        service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+        let position_projection = service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation
+                .unwrap()
+                .status,
+            EquityTransferReservationStatus::Confirmed
+        );
+
+        assert!(service.redemption_tracking.read().await.contains_key(&id));
+        assert!(
+            service
+                .pending_timed_out_redemption_reservation_releases
+                .read()
+                .await
+                .is_empty()
+        );
+        assert!(matches!(
+            redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitting { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn redemption_timeout_retries_failed_transfer_reservation_release() {
         let symbol = Symbol::new("tAAPL").unwrap();
         let id = redemption_aggregate_id("timed-out-redemption-release");
@@ -20411,7 +20515,18 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: float!(1),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::ZERO,
+                    from_block: 0,
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: TxHash::repeat_byte(0x44),
                 },
             )
             .await

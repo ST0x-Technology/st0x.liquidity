@@ -218,6 +218,15 @@ pub enum EvmError {
     )]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     ReplacementUnderpriced { attempts: u32 },
+    /// The RPC reported that the exact signed transaction is already in its
+    /// mempool, but did not include enough information to recover its hash.
+    /// The broadcast may have succeeded; callers must reconcile chain state
+    /// instead of resubmitting or invalidating the nonce cache.
+    #[error(
+        "transaction at nonce {nonce} is already known by the RPC, but its hash was not returned"
+    )]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    SubmissionAlreadyKnown { nonce: u64 },
     /// Bumping the EIP-1559 fee for a replacement transaction overflowed
     /// `u128`. Only reachable if the RPC returns an absurd fee estimate;
     /// surfaced as a hard error rather than silently wrapping a financial
@@ -286,6 +295,8 @@ impl EvmError {
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::SubmissionAlreadyKnown { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
@@ -315,6 +326,8 @@ impl EvmError {
             Self::ReceiptTimeout { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::SubmissionAlreadyKnown { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
             #[cfg(feature = "local-signer")]
@@ -359,6 +372,8 @@ impl EvmError {
             Self::TransactionDropped { .. } => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => None,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::SubmissionAlreadyKnown { .. } => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => None,
             #[cfg(feature = "local-signer")]
@@ -447,6 +462,43 @@ impl EvmError {
 
         token.parse().ok().map(NextNonceHint)
     }
+    /// The transaction hash embedded in an "already known" RPC response, if
+    /// the node or proxy included one in its message or JSON error data.
+    ///
+    /// Providers disagree on response shape, so this deliberately accepts a
+    /// hash from either field but only when it is an exact `0x`-prefixed
+    /// 32-byte value. A response without a hash remains indeterminate and
+    /// must be reconciled against chain state by the caller.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) fn already_known_tx_hash(&self) -> Option<TxHash> {
+        let payload = self.already_known_payload()?;
+
+        tx_hash_in_text(&payload.message).or_else(|| {
+            payload
+                .data
+                .as_ref()
+                .and_then(|data| tx_hash_in_text(data.get()))
+        })
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) fn is_already_known(&self) -> bool {
+        self.already_known_payload().is_some()
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    fn already_known_payload(&self) -> Option<&alloy::rpc::json_rpc::ErrorPayload> {
+        let Self::Transport(rpc_error) = self else {
+            return None;
+        };
+
+        let payload = rpc_error.as_error_resp()?;
+        payload
+            .message
+            .to_ascii_lowercase()
+            .contains("already known")
+            .then_some(payload)
+    }
 
     /// Returns `true` if this is a "replacement transaction underpriced"
     /// RPC error. It occurs when a different transaction already sits in
@@ -470,6 +522,26 @@ impl EvmError {
             _ => false,
         }
     }
+}
+
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+fn tx_hash_in_text(text: &str) -> Option<TxHash> {
+    text.match_indices("0x").find_map(|(start, _)| {
+        let end = start.checked_add(66)?;
+        let candidate = text.get(start..end)?;
+        let hex = candidate.strip_prefix("0x")?;
+
+        if hex.chars().all(|character| character.is_ascii_hexdigit())
+            && text
+                .get(end..)
+                .and_then(|suffix| suffix.chars().next())
+                .is_none_or(|character| !character.is_ascii_hexdigit())
+        {
+            candidate.parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 impl From<std::convert::Infallible> for EvmError {
