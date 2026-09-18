@@ -260,8 +260,7 @@ where
         self.nonce_manager
             .reserve_prepared_nonce(self.address(), nonce)
             .await;
-        self.in_flight
-            .record_durable(self.address(), nonce, tx_hash);
+        self.in_flight.record(self.address(), nonce, tx_hash);
         Ok(())
     }
 
@@ -319,11 +318,13 @@ mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::U256;
     use alloy::providers::ext::AnvilApi as _;
+    use alloy::providers::fillers::NonceManager as _;
     use alloy::sol;
     use alloy::sol_types::SolCall as _;
 
-    use crate::NoOpErrorRegistry;
     use crate::inflight_nonces::NonceOwnership;
+    use crate::submit::release_in_flight_after_wait;
+    use crate::{NoOpErrorRegistry, ReceiptWaitConfig, wait_for_receipt_with_config};
 
     use super::*;
 
@@ -558,6 +559,140 @@ mod tests {
             "hash-only recovery must restore pending nonce ownership before cache refill"
         );
         restarted_wallet.discard_prepared(&following).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_hash_only_drop_releases_nonce_for_reuse() {
+        let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let snapshot_id = wallet.provider.anvil_snapshot().await.unwrap();
+        let tx_hash = wallet
+            .send_pending(signer_address, Bytes::new(), "submitted before restart")
+            .await
+            .unwrap();
+        let submitted_nonce = wallet
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .expect("submitted transaction must remain visible")
+            .nonce();
+        wallet.await_receipt(tx_hash).await.unwrap();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let restarted_wallet =
+            RawPrivateKeyWallet::new(&private_key, wallet.provider.clone(), 1).unwrap();
+        restarted_wallet.restore_transaction(tx_hash).await.unwrap();
+        restarted_wallet
+            .provider
+            .anvil_revert(snapshot_id)
+            .await
+            .unwrap();
+
+        let result = wait_for_receipt_with_config(
+            restarted_wallet.provider(),
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_millis(100),
+                confirmation_timeout: std::time::Duration::from_millis(100),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            &result,
+            Err(EvmError::TransactionDropped {
+                tx_hash: dropped_hash,
+                ..
+            }) if *dropped_hash == tx_hash
+        ));
+        release_in_flight_after_wait(
+            &restarted_wallet.in_flight,
+            &restarted_wallet.send_lock,
+            signer_address,
+            tx_hash,
+            &result,
+        )
+        .await;
+
+        let next_nonce = restarted_wallet
+            .nonce_manager
+            .get_next_nonce(restarted_wallet.provider(), signer_address)
+            .await
+            .unwrap();
+        assert_eq!(next_nonce, submitted_nonce);
+    }
+
+    #[tokio::test]
+    async fn restored_prepared_drop_retains_nonce_for_exact_rebroadcast() {
+        let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let snapshot_id = wallet.provider.anvil_snapshot().await.unwrap();
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "prepared before restart")
+            .await
+            .unwrap();
+        wallet
+            .broadcast_prepared(&prepared, "broadcast before restart")
+            .await
+            .unwrap();
+        wallet.await_receipt(prepared.tx_hash()).await.unwrap();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let restarted_wallet =
+            RawPrivateKeyWallet::new(&private_key, wallet.provider.clone(), 1).unwrap();
+        restarted_wallet.restore_prepared(&prepared).await;
+        restarted_wallet
+            .provider
+            .anvil_revert(snapshot_id)
+            .await
+            .unwrap();
+
+        let result = wait_for_receipt_with_config(
+            restarted_wallet.provider(),
+            prepared.tx_hash(),
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_millis(100),
+                confirmation_timeout: std::time::Duration::from_millis(100),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            &result,
+            Err(EvmError::TransactionDropped {
+                tx_hash: dropped_hash,
+                ..
+            }) if *dropped_hash == prepared.tx_hash()
+        ));
+        release_in_flight_after_wait(
+            &restarted_wallet.in_flight,
+            &restarted_wallet.send_lock,
+            signer_address,
+            prepared.tx_hash(),
+            &result,
+        )
+        .await;
+
+        assert_eq!(
+            restarted_wallet
+                .in_flight
+                .ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Ours
+        );
+        let next_nonce = restarted_wallet
+            .nonce_manager
+            .get_next_nonce(restarted_wallet.provider(), signer_address)
+            .await
+            .unwrap();
+        assert_eq!(next_nonce, prepared.nonce().saturating_add(1));
+        let rebroadcast_hash = restarted_wallet
+            .broadcast_prepared(&prepared, "rebroadcast after restart")
+            .await
+            .unwrap();
+        assert_eq!(rebroadcast_hash, prepared.tx_hash());
     }
 
     #[tokio::test]

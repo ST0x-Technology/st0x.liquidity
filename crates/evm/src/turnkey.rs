@@ -1218,7 +1218,7 @@ where
         self.nonce_manager
             .reserve_prepared_nonce(self.address, nonce)
             .await;
-        self.in_flight.record_durable(self.address, nonce, tx_hash);
+        self.in_flight.record(self.address, nonce, tx_hash);
         Ok(())
     }
 
@@ -1273,13 +1273,20 @@ mod tests {
     use alloy::consensus::{TxEip1559, TxLegacy};
     use alloy::eips::eip2718::Encodable2718;
     use alloy::eips::eip2930::AccessList;
+    use alloy::network::TransactionBuilder as _;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{TxKind, U256};
     use alloy::providers::ext::AnvilApi;
+    use alloy::providers::fillers::NonceManager as _;
+    use alloy::rpc::types::TransactionRequest;
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolValue;
     use httpmock::MockServer;
+
+    use crate::inflight_nonces::NonceOwnership;
+    use crate::submit::release_in_flight_after_wait;
+    use crate::{ReceiptWaitConfig, wait_for_receipt_with_config};
 
     use super::*;
 
@@ -2516,6 +2523,184 @@ mod tests {
         .unwrap();
 
         assert_eq!(wallet.address(), expected_address);
+    }
+
+    #[tokio::test]
+    async fn legacy_hash_only_drop_releases_nonce_for_reuse() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let address = anvil.addresses()[0];
+        let snapshot_id = provider.anvil_snapshot().await.unwrap();
+        let pending = provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .from(address)
+                    .to(address)
+                    .value(U256::ZERO),
+            )
+            .await
+            .unwrap();
+        let tx_hash = *pending.tx_hash();
+        pending.get_receipt().await.unwrap();
+        let submitted_nonce = provider
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .expect("submitted transaction must remain visible")
+            .nonce();
+        let server = MockServer::start();
+        let wallet = TurnkeyWallet::from_client(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            provider.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+        wallet.restore_transaction(tx_hash).await.unwrap();
+        provider.anvil_revert(snapshot_id).await.unwrap();
+
+        let result = wait_for_receipt_with_config(
+            wallet.provider(),
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: Duration::from_millis(1),
+                inclusion_timeout: Duration::from_millis(100),
+                confirmation_timeout: Duration::from_millis(100),
+                dropped_grace: Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            &result,
+            Err(EvmError::TransactionDropped {
+                tx_hash: dropped_hash,
+                ..
+            }) if *dropped_hash == tx_hash
+        ));
+        release_in_flight_after_wait(
+            &wallet.in_flight,
+            &wallet.send_lock,
+            address,
+            tx_hash,
+            &result,
+        )
+        .await;
+
+        let next_nonce = wallet
+            .nonce_manager
+            .get_next_nonce(wallet.provider(), address)
+            .await
+            .unwrap();
+        assert_eq!(next_nonce, submitted_nonce);
+    }
+
+    #[tokio::test]
+    async fn restored_prepared_drop_retains_nonce_for_exact_rebroadcast() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+        let address = signer.address();
+        let nonce = provider.get_transaction_count(address).await.unwrap();
+        let chain_id = provider.get_chain_id().await.unwrap();
+        let raw = Bytes::from(
+            hex::decode(
+                locally_signed_envelope_hex(
+                    &signer,
+                    TxEip1559 {
+                        chain_id,
+                        nonce,
+                        gas_limit: 21_000,
+                        max_fee_per_gas: 30_000_000_000,
+                        max_priority_fee_per_gas: 1_000_000_000,
+                        to: TxKind::Call(address),
+                        value: U256::ZERO,
+                        access_list: AccessList::default(),
+                        input: Bytes::new(),
+                    },
+                )
+                .await,
+            )
+            .unwrap(),
+        );
+        let prepared = PreparedTransaction::from_raw(nonce, raw);
+        let snapshot_id = provider.anvil_snapshot().await.unwrap();
+        let server = MockServer::start();
+        let wallet = TurnkeyWallet::from_client(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            provider.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+        wallet
+            .broadcast_prepared(&prepared, "broadcast before restart")
+            .await
+            .unwrap();
+        wallet.await_receipt(prepared.tx_hash()).await.unwrap();
+        let restarted_wallet = TurnkeyWallet::from_client(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            provider.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+        restarted_wallet.restore_prepared(&prepared).await;
+        provider.anvil_revert(snapshot_id).await.unwrap();
+
+        let result = wait_for_receipt_with_config(
+            restarted_wallet.provider(),
+            prepared.tx_hash(),
+            1,
+            ReceiptWaitConfig {
+                poll_interval: Duration::from_millis(1),
+                inclusion_timeout: Duration::from_millis(100),
+                confirmation_timeout: Duration::from_millis(100),
+                dropped_grace: Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            &result,
+            Err(EvmError::TransactionDropped {
+                tx_hash: dropped_hash,
+                ..
+            }) if *dropped_hash == prepared.tx_hash()
+        ));
+        release_in_flight_after_wait(
+            &restarted_wallet.in_flight,
+            &restarted_wallet.send_lock,
+            address,
+            prepared.tx_hash(),
+            &result,
+        )
+        .await;
+
+        assert_eq!(
+            restarted_wallet
+                .in_flight
+                .ownership(address, prepared.nonce()),
+            NonceOwnership::Ours
+        );
+        let next_nonce = restarted_wallet
+            .nonce_manager
+            .get_next_nonce(restarted_wallet.provider(), address)
+            .await
+            .unwrap();
+        assert_eq!(next_nonce, prepared.nonce().saturating_add(1));
+        let rebroadcast_hash = restarted_wallet
+            .broadcast_prepared(&prepared, "rebroadcast after restart")
+            .await
+            .unwrap();
+        assert_eq!(rebroadcast_hash, prepared.tx_hash());
     }
 
     // --- Integration tests (real Turnkey API + local Anvil) ---------
