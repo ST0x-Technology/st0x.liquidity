@@ -1206,20 +1206,21 @@ lowers the flag on the way out, so the driver is never left parked without a
 guard. Pausers are serialized behind the guard so one operation's resume cannot
 free the driver under another.
 
-The wait is bounded (`DRIVER_QUIESCE_TIMEOUT`, 30s). An execution can run for
-the whole per-attempt budget, so a pause requested while a transfer is genuinely
+The wait is bounded (`DRIVER_QUIESCE_TIMEOUT`, 5s). An execution can run for the
+whole per-attempt budget, so a pause requested while a transfer is genuinely
 moving funds is refused with `DriverNotQuiesced`, which the routes map to 503,
 and the driver is left running. That is the intended answer: the operations that
 need a pause target a transfer that is stuck or failed, where no execution is
-running and the pause confirms at once. The trigger's rebalancing check and the
-stuck USDC sweep (`expire_stuck_usdc_rebalances`, reached from the check job,
-the equity check, and inline on the snapshot reactor) claim the driver through
-`try_enter`, which never parks: a pause waits for an active check or sweep to
-finish, and a held pause makes them skip, so neither a fresh transfer row nor a
-relatch, clear, or re-arm lands under an operator operation. Current users:
-`transfer resume --kind usdc` and the `UsdcBridge` arm of `transfer recheck`,
-which executes a resume on the request task and therefore spends the wallet
-itself.
+running and the pause confirms at once. The trigger's queued rebalancing check
+also claims the driver through `enter()`: a pause waits for an active check to
+finish, while a check arriving during a held pause parks and runs after the
+guard drops. The stuck USDC sweep (`expire_stuck_usdc_rebalances`, reached from
+the check job, the equity check, and inline on the snapshot reactor) instead
+claims through `try_enter()`, which never parks: a held pause makes the sweep
+skip, so no relatch, clear, or re-arm lands under an operator operation. Current
+users: `transfer resume --kind usdc` and the `UsdcBridge` arm of
+`transfer recheck`, which executes a resume on the request task and therefore
+spends the wallet itself.
 
 ## Error handling in jobs
 
