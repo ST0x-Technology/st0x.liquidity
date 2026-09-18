@@ -6416,7 +6416,7 @@ mod tests {
     }
 
     /// Seeds an `EquityRedemption` into the terminal `Failed` state via
-    /// `Redeem` then `FailTransfer`.
+    /// `Redeem`, `RecordWithdrawSubmission`, then `FailTransfer`.
     async fn seed_redemption_failed(pool: &SqlitePool, id: &RedemptionAggregateId) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
@@ -6440,6 +6440,15 @@ mod tests {
         store
             .send(
                 id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
                 EquityRedemptionCommand::FailTransfer {
                     reason: "seed: transfer failed".to_string(),
                 },
@@ -6448,8 +6457,8 @@ mod tests {
             .unwrap();
     }
 
-    /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawPending`
-    /// state (redeem requested but not failed).
+    /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawSubmitting`
+    /// state (withdrawal intent persisted but not submitted).
     async fn seed_redemption_pending(pool: &SqlitePool, id: &RedemptionAggregateId) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())

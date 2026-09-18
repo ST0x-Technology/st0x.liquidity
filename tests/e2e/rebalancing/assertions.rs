@@ -747,7 +747,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     assert_event_subsequence(
         &redeem_events,
         &[
-            "EquityRedemptionEvent::VaultWithdrawPending",
+            "EquityRedemptionEvent::VaultWithdrawSubmitting",
             "EquityRedemptionEvent::VaultWithdrawSubmitted",
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             "EquityRedemptionEvent::UnwrapPending",
@@ -909,16 +909,16 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
         last_event.event_type,
     );
 
-    // Verify the symbol from the VaultWithdrawPending event (the terminal
+    // Verify the symbol from the VaultWithdrawSubmitting event (the terminal
     // Completed event only has a timestamp). Find by payload key rather
     // than assuming a fixed index.
-    let pending_event = redeem_events
+    let submitting_event = redeem_events
         .iter()
-        .find(|event| event.payload.get("VaultWithdrawPending").is_some())
-        .ok_or_else(|| anyhow::anyhow!("No redemption event contains VaultWithdrawPending"))?;
-    let submitted = pending_event
+        .find(|event| event.payload.get("VaultWithdrawSubmitting").is_some())
+        .ok_or_else(|| anyhow::anyhow!("No redemption event contains VaultWithdrawSubmitting"))?;
+    let submitted = submitting_event
         .payload
-        .get("VaultWithdrawPending")
+        .get("VaultWithdrawSubmitting")
         .expect("checked in find");
     assert_eq!(
         submitted.get("symbol").and_then(|val| val.as_str()),

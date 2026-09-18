@@ -589,10 +589,10 @@ struct StoredOperation {
     /// sort/window key.
     first_seen_at: DateTime<Utc>,
     /// Genuine operation start, seeded ONLY by the operation's genesis event
-    /// (`MintRequested` for mint, `VaultWithdrawPending` for redemption --
-    /// both are the aggregate's own `initialize()` event, so this is always
-    /// the true first phase, unlike USDC's direction-gated seeding). Stays
-    /// `None` when the operation was first observed mid-stream.
+    /// (`MintRequested` for mint; `VaultWithdrawSubmitting` for new redemptions
+    /// and `VaultWithdrawPending` for legacy redemptions). This is always the
+    /// true first phase, unlike USDC's direction-gated seeding. Stays `None`
+    /// when the operation was first observed mid-stream.
     started_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
     status: StoredStatus,

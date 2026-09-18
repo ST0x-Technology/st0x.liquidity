@@ -2784,8 +2784,9 @@ impl InventoryView {
 
     /// Remove a symbol from the previous inflight redemption marker set.
     ///
-    /// Called when a new redemption transfer starts (VaultWithdrawPending
-    /// event) for the same reason as
+    /// Called when a new redemption transfer starts
+    /// (`VaultWithdrawPending` for legacy aggregates or
+    /// `VaultWithdrawSubmitting` for new aggregates) for the same reason as
     /// [`Self::clear_previous_inflight_mint_marker`].
     pub(crate) fn clear_previous_inflight_redemption_marker(mut self, symbol: &Symbol) -> Self {
         self.previous_inflight_redemption_symbols.remove(symbol);
@@ -6009,7 +6010,7 @@ mod tests {
             view.equity_inflight(&symbol, Venue::MarketMaking),
             Some(shares(15)),
             "New redemption inflight must be preserved when previous \
-             poll marker was cleared by VaultWithdrawPending"
+             poll marker was cleared by the redemption genesis event"
         );
     }
 

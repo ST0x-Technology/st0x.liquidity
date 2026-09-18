@@ -206,6 +206,19 @@ impl MockRaindex {
         self
     }
 
+    /// Seeds the transfer log returned by a later withdrawal confirmation.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_withdraw_transfer(self, token: Address, amount: U256) -> Self {
+        {
+            let Ok(mut withdraw_transfer) = self.withdraw_transfer.lock() else {
+                panic!("mock withdrawal-transfer mutex poisoned");
+            };
+            *withdraw_transfer = Some(WithdrawCall { token, amount });
+        }
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_current_block(mut self, current_block: u64) -> Self {
         self.current_block = current_block;

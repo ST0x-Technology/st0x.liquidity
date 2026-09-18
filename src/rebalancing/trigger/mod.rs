@@ -7179,7 +7179,11 @@ impl RebalancingService {
         // When a new redemption transfer starts, clear the previous poll
         // marker so the next inflight poll won't incorrectly zero the new
         // inflight if Alpaca hasn't reflected the request yet.
-        if matches!(event, EquityRedemptionEvent::VaultWithdrawPending { .. }) {
+        if matches!(
+            event,
+            EquityRedemptionEvent::VaultWithdrawPending { .. }
+                | EquityRedemptionEvent::VaultWithdrawSubmitting { .. }
+        ) {
             let mut inventory = self.inventory.write().await;
             *inventory = inventory
                 .clone()
@@ -19999,9 +20003,8 @@ mod tests {
 
     /// Drives an `EquityRedemption` aggregate to `Failed` state (terminal).
     ///
-    /// `Redeem` emits `VaultWithdrawPending` without calling any service.
-    /// `FailTransfer` from `VaultWithdrawPending` also calls no service. Both
-    /// are safe with panicking services.
+    /// `Redeem`, `RecordWithdrawSubmission`, and `FailTransfer` call no
+    /// services, so they are safe with panicking services.
     async fn seed_terminal_redemption_aggregate(
         pool: &SqlitePool,
         redemption_id: &RedemptionAggregateId,
@@ -20026,6 +20029,15 @@ mod tests {
         store
             .send(
                 redemption_id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                redemption_id,
                 EquityRedemptionCommand::FailTransfer {
                     reason: "test: forced redemption failure".to_string(),
                 },
@@ -20034,8 +20046,8 @@ mod tests {
             .unwrap();
     }
 
-    /// Drives an `EquityRedemption` aggregate to `VaultWithdrawPending` state
-    /// (non-terminal). `Redeem` calls no services so panicking services are safe.
+    /// Drives an `EquityRedemption` aggregate to `VaultWithdrawSubmitting`
+    /// (non-terminal). `Redeem` calls no services, so panicking services are safe.
     async fn seed_nonterminal_redemption_aggregate(
         pool: &SqlitePool,
         redemption_id: &RedemptionAggregateId,

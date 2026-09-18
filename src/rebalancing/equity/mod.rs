@@ -3920,15 +3920,16 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         ));
 
+        let services = mock_services();
         let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
-            .build(mock_services())
+            .build(services.clone())
             .await
             .unwrap();
         let (redemption_store, _redemption_projection) =
             StoreBuilder::<EquityRedemption>::new(pool.clone())
                 .with(service.clone())
-                .build(mock_services())
+                .build(services.clone())
                 .await
                 .unwrap();
         service
@@ -3939,7 +3940,7 @@ mod tests {
             )
             .await;
 
-        let transfer = CrossVenueEquityTransfer::new(mock_services(), mint_store, redemption_store);
+        let transfer = CrossVenueEquityTransfer::new(services, mint_store, redemption_store);
 
         (transfer, service, pool)
     }
@@ -5457,12 +5458,20 @@ mod tests {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
         apalis_pool.close().await;
+        let symbol = Symbol::new("TEST").unwrap();
+        let token = mock_vault_lookup()
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = FractionalShares::new(float!(50))
+            .to_u256_18_decimals()
+            .unwrap();
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainEquityServices {
                     wallet: Address::ZERO,
-                    raindex: Arc::new(MockRaindex::new()),
+                    raindex: Arc::new(MockRaindex::new().with_withdraw_transfer(token, amount)),
                     vault_lookup: Arc::new(mock_vault_lookup()),
                     tokenizer: Arc::new(MockTokenizer::new()),
                     wrapper: Arc::new(MockWrapper::new()),
@@ -5475,14 +5484,6 @@ mod tests {
         };
         let redemption_store = Arc::new(test_store::<EquityRedemption>(pool, services.clone()));
 
-        let symbol = Symbol::new("TEST").unwrap();
-        let token = mock_vault_lookup()
-            .vault_token_for_symbol(&symbol)
-            .await
-            .unwrap();
-        let amount = FractionalShares::new(float!(50))
-            .to_u256_18_decimals()
-            .unwrap();
         let id = redemption_aggregate_id("redeem-bot-gas-fail");
         redemption_store
             .send(

@@ -7443,7 +7443,7 @@ mod tests {
 
     /// Shared setup for the three `recover_interrupted_tokenization_aggregates`
     /// tests. Seeds one mint (`MintRequested`) and one redemption
-    /// (VaultWithdrawPending state) into an in-memory database, then builds the
+    /// (`VaultWithdrawSubmitting`) into an in-memory database, then builds the
     /// `RebalancingService` and `ResumeTokenizationJobQueue` that the recovery
     /// function requires.
     async fn seed_interrupted_aggregates_and_build_service(
