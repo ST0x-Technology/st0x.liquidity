@@ -2841,7 +2841,10 @@ mod tests {
             offchain_order_projection,
             ..
         } = create_hedge_ctx_for_executor(
-            Arc::new(ExecutorOrderPlacer(executor)),
+            Arc::new(ExecutorOrderPlacer {
+                executor,
+                close_flatten_policy: None,
+            }),
             SupportedExecutor::AlpacaBrokerApi,
         )
         .await;

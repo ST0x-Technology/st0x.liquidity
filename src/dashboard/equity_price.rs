@@ -799,11 +799,11 @@ mod tests {
     #[tokio::test]
     async fn halt_invalidates_only_requested_assets_until_a_fresh_price_arrives() {
         let assets = assets();
-        let store = EquityPriceStore::new(&assets);
+        let store = EquityPriceStore::new([&assets]);
         let (sender, mut receiver) = broadcast::channel(4);
         let monitor = EquityPriceMonitor::new(
             PricingCtx::new(Url::parse("ws://localhost").unwrap(), "test".into()).unwrap(),
-            &assets,
+            [(TEST_CHAIN_ID, &assets)],
             store.clone(),
             sender,
         );

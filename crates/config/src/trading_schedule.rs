@@ -274,6 +274,7 @@ mod tests {
                     } else {
                         OperationMode::Disabled
                     },
+                    hedge_floor_shares: None,
                 },
             );
             config.scopes.push(TradingScheduleScope {

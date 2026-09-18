@@ -1697,6 +1697,7 @@ mod tests {
                 TradingScheduleMode::Enabled => Some(CloseFlattenWindow {
                     started_at: DateTime::from_timestamp_millis(2000).unwrap(),
                     closes_at: DateTime::from_timestamp_millis(4000).unwrap(),
+                    post_close_gap: PostCloseGap::Unavailable,
                 }),
             };
             assert_eq!(
