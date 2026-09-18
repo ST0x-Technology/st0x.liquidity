@@ -2148,7 +2148,7 @@ pub mod process_tx {
             ChainAssets, ChainEquityAsset, Ctx, ExecutionThreshold, HedgedChain, HedgingAssets,
             OperationMode,
         };
-        use st0x_event_sorcery::StoreBuilder;
+        use st0x_event_sorcery::{AggregateError, SendError, StoreBuilder};
         use st0x_evm::Chain;
         use st0x_execution::{
             CancellationOutcome, Direction, ExecutorOrderId, FractionalShares, LimitOrder,
@@ -4154,8 +4154,37 @@ pub mod process_tx {
 
             // Exactly one path placed a hedge. The loser either observed the
             // pending hedge (PendingHedgeInFlight / PlacementRejected) or lost the
-            // optimistic-concurrency race on the shared Position aggregate
-            // (aggregate conflict, retried upstream); never a second placement.
+            // optimistic-concurrency race on an aggregate. Infrastructure and
+            // accounting failures are not valid losers.
+            let is_aggregate_conflict = |error: &anyhow::Error| {
+                error.chain().any(|source| {
+                    matches!(
+                        source.downcast_ref::<SendError<OnChainTradeCqrs>>(),
+                        Some(AggregateError::AggregateConflict)
+                    ) || matches!(
+                        source.downcast_ref::<SendError<Position>>(),
+                        Some(AggregateError::AggregateConflict)
+                    ) || matches!(
+                        source.downcast_ref::<SendError<OffchainOrder>>(),
+                        Some(AggregateError::AggregateConflict)
+                    )
+                })
+            };
+            let expected_result = |result: &Result<ProcessTxOutcome, OperatorError>| match result {
+                Ok(
+                    ProcessTxOutcome::HedgePlaced { .. }
+                    | ProcessTxOutcome::PendingHedgeInFlight
+                    | ProcessTxOutcome::PlacementRejected { .. },
+                ) => true,
+                Err(OperatorError::Operational(error)) => is_aggregate_conflict(error),
+                Ok(_) | Err(OperatorError::Rejected(_)) => false,
+            };
+            assert!(
+                expected_result(&outcome_a) && expected_result(&outcome_b),
+                "concurrent loser must be an expected domain outcome or aggregate conflict, \
+                 got a={outcome_a:?}, b={outcome_b:?}"
+            );
+
             let placed = |result: &Result<ProcessTxOutcome, OperatorError>| {
                 matches!(result, Ok(ProcessTxOutcome::HedgePlaced { .. }))
             };
