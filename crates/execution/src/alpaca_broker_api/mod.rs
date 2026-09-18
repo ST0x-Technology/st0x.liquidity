@@ -186,6 +186,7 @@ impl CryptoOrderFailureReason {
 pub enum MissingOrderField {
     FilledQty,
     Price,
+    PlacedAt,
     FilledAt,
     CanceledAt,
     FailureTerminality,
@@ -441,6 +442,17 @@ pub enum AlpacaBrokerApiError {
     )]
     UsdcPrecisionExceeded { amount: Float, max_decimals: u8 },
 
+    #[error("buying-power reservation {reserved_cents} cents does not fit in i64")]
+    BuyingPowerReservationOutOfRange { reserved_cents: u64 },
+
+    #[error(
+        "cannot subtract buying-power reservation {reserved_cents} cents from available {available_cents} cents"
+    )]
+    BuyingPowerReservationOverflow {
+        available_cents: i64,
+        reserved_cents: i64,
+    },
+
     #[error(transparent)]
     NotPositive(#[from] st0x_finance::NotPositive<FractionalShares>),
 
@@ -535,6 +547,8 @@ impl AlpacaBrokerApiError {
             | Self::BelowPrecision { .. }
             | Self::UsdcBelowPrecision { .. }
             | Self::UsdcPrecisionExceeded { .. }
+            | Self::BuyingPowerReservationOutOfRange { .. }
+            | Self::BuyingPowerReservationOverflow { .. }
             | Self::NotPositive(_)
             | Self::NotPositiveLimitPrice(_)
             | Self::FloatConversion(_)
@@ -606,6 +620,8 @@ impl AlpacaBrokerApiError {
             | Self::BelowPrecision { .. }
             | Self::UsdcBelowPrecision { .. }
             | Self::UsdcPrecisionExceeded { .. }
+            | Self::BuyingPowerReservationOutOfRange { .. }
+            | Self::BuyingPowerReservationOverflow { .. }
             | Self::NotPositive(_)
             | Self::NotPositiveLimitPrice(_)
             | Self::FloatConversion(_)

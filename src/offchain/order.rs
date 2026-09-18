@@ -45,10 +45,10 @@ use uuid::Uuid;
 use st0x_dto::{Direction, Trade, TradeOutcome, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
 use st0x_execution::{
-    AlpacaBrokerApiError, CancellationOutcome, ClientOrderId, CounterTradePreflight,
-    ExecutionError, Executor, ExecutorOrderId, FractionalShares, LatestQuote, LimitOrder,
-    MarketOrder, MarketSession, MarketSessionStatus, OrderFailureTerminality, OrderState,
-    PersistenceError, Positive, SupportedExecutor, Symbol,
+    AlpacaBrokerApiError, BuyingPowerReservationCents, CancellationOutcome, ClientOrderId,
+    CounterTradePreflight, ExecutionError, Executor, ExecutorOrderId, FractionalShares,
+    LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus,
+    OrderFailureTerminality, OrderState, PersistenceError, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::{NonNegative, NotNonNegative, Usd};
 
@@ -107,6 +107,8 @@ pub enum PlaceOffchainOrderError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    #[error("Pending extended-hours order {order_id} has no durable limit price")]
+    PendingLimitPriceMissing { order_id: OffchainOrderId },
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +119,14 @@ pub struct OffchainOrderPlacement {
     executor: SupportedExecutor,
     client_order_id: ClientOrderId,
     kind: CounterTradeOrderKind,
+    buying_power_reservation: Option<BuyingPowerReservationCents>,
+    placed_at: Option<DateTime<Utc>>,
+}
+
+fn missing_pending_limit_price_failure(order_id: OffchainOrderId) -> OffchainOrderCommand {
+    OffchainOrderCommand::MarkPlacementFailed {
+        error: PlaceOffchainOrderError::PendingLimitPriceMissing { order_id }.to_string(),
+    }
 }
 
 impl OffchainOrderPlacement {
@@ -152,7 +162,24 @@ impl OffchainOrderPlacement {
             executor,
             client_order_id,
             kind,
+            buying_power_reservation: None,
+            placed_at: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_buying_power_reservation(
+        mut self,
+        reservation: Option<BuyingPowerReservationCents>,
+    ) -> Self {
+        self.buying_power_reservation = reservation;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_optional_placed_at(mut self, placed_at: Option<DateTime<Utc>>) -> Self {
+        self.placed_at = placed_at;
+        self
     }
 }
 
@@ -183,10 +210,10 @@ impl OffchainOrderPlacement {
 /// still `Pending`. A stale attempt whose broker call errored after a concurrent
 /// attempt already advanced the order past `Pending` is rejected by the handler
 /// against the aggregate's authoritative state, so it can never strand a live
-/// order. Callers on the live concurrent path (the trade-processing path and
-/// `PlaceHedge`) still hold `counter_trade_submission_lock` to serialise
-/// placement attempts; startup orphan recovery and the CLI `test-trade` command
-/// run without it, which is safe because no concurrent placement runs there.
+/// order. Callers serialize account-wide placement attempts with the shared
+/// submission lock: daemon paths hold both the in-process Tokio mutex and the
+/// cross-process file lock, while the operator CLI participates through the
+/// same file lock.
 pub async fn place_offchain_order_at_broker(
     store: &Store<OffchainOrder>,
     order_placer: &dyn OrderPlacer,
@@ -200,18 +227,22 @@ pub async fn place_offchain_order_at_broker(
         executor,
         client_order_id,
         kind,
+        buying_power_reservation,
+        placed_at,
     } = placement;
 
     store
         .send(
             offchain_order_id,
-            OffchainOrderCommand::Place {
+            OffchainOrderCommand::PlaceReserved {
                 symbol: symbol.clone(),
                 shares,
                 direction,
                 executor,
                 client_order_id: client_order_id.clone(),
                 kind: kind.clone(),
+                buying_power_reservation,
+                placed_at,
             },
         )
         .await?;
@@ -221,8 +252,42 @@ pub async fn place_offchain_order_at_broker(
     // second time. An exhaustive match forces a conscious decision for any
     // future state rather than letting it silently skip placement.
     let placed = store.load(offchain_order_id).await?;
-    match placed {
-        Some(OffchainOrder::Pending { .. }) => {}
+    let (symbol, shares, direction, client_order_id, kind) = match placed {
+        Some(OffchainOrder::Pending {
+            symbol,
+            shares,
+            direction,
+            client_order_id: durable_client_order_id,
+            limit_price,
+            market_session,
+            close_flatten,
+            ..
+        }) => {
+            let kind = if market_session == MarketSession::Extended {
+                let Some(limit_price) = limit_price else {
+                    store
+                        .send(
+                            offchain_order_id,
+                            missing_pending_limit_price_failure(*offchain_order_id),
+                        )
+                        .await?;
+                    return Ok(store.load(offchain_order_id).await?);
+                };
+                CounterTradeOrderKind::ExtendedHoursLimit {
+                    limit_price,
+                    close_flatten,
+                }
+            } else {
+                CounterTradeOrderKind::Market
+            };
+            (
+                symbol,
+                shares,
+                direction,
+                durable_client_order_id.unwrap_or(client_order_id),
+                kind,
+            )
+        }
         settled @ (Some(
             OffchainOrder::Submitted { .. }
             | OffchainOrder::PartiallyFilled { .. }
@@ -232,7 +297,7 @@ pub async fn place_offchain_order_at_broker(
             | OffchainOrder::Cancelled { .. },
         )
         | None) => return Ok(settled),
-    }
+    };
 
     // Capture metric labels before `symbol` is moved into the market order.
     let symbol_label = symbol.to_string();
@@ -404,6 +469,7 @@ fn placed_event(
     executor: SupportedExecutor,
     client_order_id: &ClientOrderId,
     kind: &CounterTradeOrderKind,
+    buying_power_reservation: Option<BuyingPowerReservationCents>,
     placed_at: DateTime<Utc>,
 ) -> OffchainOrderEvent {
     let requested_market_session = kind.market_session();
@@ -425,6 +491,7 @@ fn placed_event(
         limit_price,
         client_order_id: Some(client_order_id.clone()),
         close_flatten,
+        buying_power_reservation,
     }
 }
 
@@ -452,6 +519,10 @@ pub enum OffchainOrder {
         direction: Direction,
         executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
+        #[serde(default)]
+        client_order_id: Option<ClientOrderId>,
+        #[serde(default)]
+        limit_price: Option<Positive<Usd>>,
         #[serde(
             default = "regular_market_session",
             alias = "is_extended_hours",
@@ -460,6 +531,8 @@ pub enum OffchainOrder {
         market_session: MarketSession,
         #[serde(default)]
         close_flatten: bool,
+        #[serde(default)]
+        buying_power_reservation: Option<BuyingPowerReservationCents>,
     },
     /// `shares` carries the broker-accepted quantity for orders placed after the
     /// durable-job extraction (built from `OffchainOrderEvent::Accepted`'s
@@ -559,6 +632,14 @@ pub enum OffchainOrder {
         error: String,
         placed_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
+        #[serde(
+            default = "regular_market_session",
+            alias = "is_extended_hours",
+            deserialize_with = "deserialize_market_session"
+        )]
+        market_session: MarketSession,
+        #[serde(default)]
+        close_flatten: bool,
     },
     /// Terminal state after a successful broker cancellation. Distinct
     /// from `Failed` so analytics and the cancel-and-replace recovery
@@ -597,17 +678,21 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             executor,
             placed_at,
             is_extended_hours,
-            limit_price: _,
-            client_order_id: _,
+            limit_price,
+            client_order_id,
             close_flatten,
+            buying_power_reservation,
         } => Some(OffchainOrder::Pending {
             symbol: symbol.clone(),
             shares: *shares,
             direction: *direction,
             executor: *executor,
             placed_at: *placed_at,
+            client_order_id: client_order_id.clone(),
+            limit_price: *limit_price,
             market_session: market_session_from_extended(*is_extended_hours),
             close_flatten: *close_flatten,
+            buying_power_reservation: *buying_power_reservation,
         }),
         _ => None,
     }
@@ -734,7 +819,7 @@ impl EventSourced for OffchainOrder {
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
     const PROJECTION: Table = Table("offchain_order_view");
-    const SCHEMA_VERSION: u64 = 4;
+    const SCHEMA_VERSION: u64 = 7;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         originate_offchain_order(event)
@@ -757,6 +842,7 @@ impl EventSourced for OffchainOrder {
                     placed_at,
                     market_session,
                     close_flatten,
+                    ..
                 } = entity
                 else {
                     return Ok(None);
@@ -883,7 +969,28 @@ impl EventSourced for OffchainOrder {
                 executor,
                 &client_order_id,
                 &kind,
+                None,
                 Utc::now(),
+            )]),
+
+            PlaceReserved {
+                symbol,
+                shares,
+                direction,
+                executor,
+                client_order_id,
+                kind,
+                buying_power_reservation,
+                placed_at,
+            } => Ok(vec![placed_event(
+                symbol,
+                shares,
+                direction,
+                executor,
+                &client_order_id,
+                &kind,
+                buying_power_reservation,
+                placed_at.unwrap_or_else(Utc::now),
             )]),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -902,6 +1009,7 @@ impl EventSourced for OffchainOrder {
                 executor,
                 &client_order_id,
                 &kind,
+                None,
                 placed_at,
             )]),
 
@@ -929,6 +1037,17 @@ impl EventSourced for OffchainOrder {
                 shares: _,
                 client_order_id: _,
                 kind: _,
+            } => validate_place_replay(self, &symbol, direction, executor),
+
+            OffchainOrderCommand::PlaceReserved {
+                symbol,
+                direction,
+                executor,
+                shares: _,
+                client_order_id: _,
+                kind: _,
+                buying_power_reservation: _,
+                placed_at: _,
             } => validate_place_replay(self, &symbol, direction, executor),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -1472,6 +1591,8 @@ fn evolve_failed(
             direction,
             executor,
             placed_at,
+            market_session,
+            close_flatten,
             ..
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
@@ -1485,6 +1606,8 @@ fn evolve_failed(
             error,
             placed_at: *placed_at,
             failed_at,
+            market_session: *market_session,
+            close_flatten: *close_flatten,
         }),
         OffchainOrder::Submitted {
             symbol,
@@ -1494,6 +1617,8 @@ fn evolve_failed(
             executor,
             executor_order_id,
             placed_at,
+            market_session,
+            close_flatten,
             ..
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
@@ -1507,6 +1632,8 @@ fn evolve_failed(
             error,
             placed_at: *placed_at,
             failed_at,
+            market_session: *market_session,
+            close_flatten: *close_flatten,
         }),
         OffchainOrder::PartiallyFilled {
             symbol,
@@ -1519,6 +1646,8 @@ fn evolve_failed(
             avg_price,
             placed_at,
             partially_filled_at,
+            market_session,
+            close_flatten,
             ..
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
@@ -1539,6 +1668,8 @@ fn evolve_failed(
             error,
             placed_at: *placed_at,
             failed_at,
+            market_session: *market_session,
+            close_flatten: *close_flatten,
         }),
         OffchainOrder::Cancelling {
             symbol,
@@ -1549,6 +1680,8 @@ fn evolve_failed(
             executor,
             executor_order_id,
             placed_at,
+            market_session,
+            close_flatten,
             ..
         } => Some(OffchainOrder::Failed {
             symbol: symbol.clone(),
@@ -1562,6 +1695,8 @@ fn evolve_failed(
             error,
             placed_at: *placed_at,
             failed_at,
+            market_session: *market_session,
+            close_flatten: *close_flatten,
         }),
         OffchainOrder::Filled { .. }
         | OffchainOrder::Failed { .. }
@@ -1918,10 +2053,9 @@ impl OffchainOrder {
 
     /// Whether close-flatten mode priced this order.
     ///
-    /// Only the pre-terminal states carry it, which is enough: a terminal
-    /// transition is always commanded against the state that preceded it, so the
-    /// outcome metric reads the flag before the state collapses. Terminal states
-    /// answer `false` because nothing consults them for attribution.
+    /// Failed orders retain it because broker-anchor recovery must reconstruct
+    /// the original reprice and close-flatten policy. Other terminal states no
+    /// longer need it after their position outcome is finalized.
     pub(crate) const fn close_flatten(&self) -> bool {
         use OffchainOrder::{
             Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
@@ -1930,8 +2064,9 @@ impl OffchainOrder {
             Pending { close_flatten, .. }
             | Submitted { close_flatten, .. }
             | PartiallyFilled { close_flatten, .. }
-            | Cancelling { close_flatten, .. } => *close_flatten,
-            Filled { .. } | Failed { .. } | Cancelled { .. } => false,
+            | Cancelling { close_flatten, .. }
+            | Failed { close_flatten, .. } => *close_flatten,
+            Filled { .. } | Cancelled { .. } => false,
         }
     }
 
@@ -1971,6 +2106,13 @@ impl OffchainOrder {
             | Filled { executor, .. }
             | Failed { executor, .. }
             | Cancelled { executor, .. } => *executor,
+        }
+    }
+
+    pub(crate) fn failed_market_session(&self) -> Option<MarketSession> {
+        match self {
+            Self::Failed { market_session, .. } => Some(*market_session),
+            _ => None,
         }
     }
 
@@ -2586,6 +2728,17 @@ pub struct OrderPlacementResult {
     pub limit_price: Option<Positive<Usd>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BrokerOrderPlacement {
+    pub executor_order_id: ExecutorOrderId,
+    pub symbol: Symbol,
+    pub shares: Positive<FractionalShares>,
+    pub direction: Direction,
+    pub placed_at: DateTime<Utc>,
+    pub is_extended_hours: Option<bool>,
+    pub limit_price: Option<Positive<Usd>>,
+}
+
 /// Type-erased order placement capability.
 ///
 /// Used by the durable placement path
@@ -2615,6 +2768,21 @@ pub trait OrderPlacer: Send + Sync {
         &self,
         executor_order_id: &ExecutorOrderId,
     ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn get_order_by_client_order_id(
+        &self,
+        _client_order_id: &ClientOrderId,
+    ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_order_by_client_order_id not implemented for this OrderPlacer".into())
+    }
+
+    async fn preflight_counter_trade_with_reserved_buying_power(
+        &self,
+        _order: MarketOrder,
+        _reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(CounterTradePreflight::Allowed { reservation: None })
+    }
 
     /// Fetches an optional current bid/ask quote suitable as the primary
     /// extended-hours limit-order reference. The default preserves today's
@@ -2662,6 +2830,16 @@ pub trait OrderPlacer: Send + Sync {
         _reference_price: Positive<Usd>,
     ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
         Ok(CounterTradePreflight::Allowed { reservation: None })
+    }
+
+    async fn preflight_counter_trade_at_price_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reference_price: Positive<Usd>,
+        _reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        self.preflight_counter_trade_at_price(order, reference_price)
+            .await
     }
 
     /// Returns the current market session. Used by hedge jobs to re-check
@@ -2745,6 +2923,36 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         Ok(self.0.cancel_order(&order_id).await?)
     }
 
+    async fn get_order_by_client_order_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .0
+            .get_order_by_client_order_id(client_order_id)
+            .await?
+            .map(|placement| BrokerOrderPlacement {
+                executor_order_id: ExecutorOrderId::new(&placement.order_id),
+                symbol: placement.symbol,
+                shares: placement.shares,
+                direction: placement.direction,
+                placed_at: placement.placed_at,
+                is_extended_hours: placement.extended_hours,
+                limit_price: placement.limit_price,
+            }))
+    }
+
+    async fn preflight_counter_trade_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .0
+            .preflight_counter_trade_with_reserved_buying_power(order, reserved)
+            .await?)
+    }
+
     async fn fetch_position_mark(
         &self,
         symbol: &Symbol,
@@ -2775,6 +2983,22 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         Ok(self
             .0
             .preflight_counter_trade_at_price(order, reference_price)
+            .await?)
+    }
+
+    async fn preflight_counter_trade_at_price_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reference_price: Positive<Usd>,
+        reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .0
+            .preflight_counter_trade_at_price_with_reserved_buying_power(
+                order,
+                reference_price,
+                reserved,
+            )
             .await?)
     }
 
@@ -2903,6 +3127,19 @@ pub enum OffchainOrderCommand {
         client_order_id: ClientOrderId,
         kind: CounterTradeOrderKind,
     },
+    PlaceReserved {
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        executor: SupportedExecutor,
+        client_order_id: ClientOrderId,
+        kind: CounterTradeOrderKind,
+        buying_power_reservation: Option<BuyingPowerReservationCents>,
+        /// Broker-reported creation time when adopting an existing order by
+        /// idempotency key. Fresh placements stamp the command handling time.
+        #[serde(default)]
+        placed_at: Option<DateTime<Utc>>,
+    },
     /// Test/fixture-only: identical to `Place` but takes `placed_at`
     /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
     /// backdate synthetic history.
@@ -3005,13 +3242,14 @@ pub enum OffchainOrderEvent {
         #[serde(default)]
         is_extended_hours: bool,
         /// The limit price submitted to the broker for an extended-hours order
-        /// (`None` for market orders). Audit-only: not applied to entity state,
-        /// recorded so the actual submitted price is reconstructable from the
-        /// event stream. `#[serde(default)]` for events predating this field.
+        /// (`None` for market orders). Seeds the entity's placement terms and
+        /// drives replayed broker placement. `#[serde(default)]` for events
+        /// predating this field.
         #[serde(default)]
         limit_price: Option<Positive<Usd>>,
-        /// The broker idempotency key submitted with this placement. Audit-only.
-        /// `#[serde(default)]` (None) for events predating this field.
+        /// The broker idempotency key submitted with this placement. Seeds the
+        /// entity and drives replayed broker placement. `#[serde(default]`
+        /// (None) for events predating this field.
         #[serde(default)]
         client_order_id: Option<ClientOrderId>,
         /// Whether close-flatten mode priced this order. Seeds the entity flag
@@ -3019,6 +3257,10 @@ pub enum OffchainOrderEvent {
         /// to the flatten window. `false` for events predating this field.
         #[serde(default)]
         close_flatten: bool,
+        /// Buying power reserved when the placement intent was recorded. Seeds
+        /// the entity so replay and recovery preserve the original reservation.
+        #[serde(default)]
+        buying_power_reservation: Option<BuyingPowerReservationCents>,
     },
     /// Legacy broker-acceptance event. Predates the durable-job extraction,
     /// where `Place` did the broker call inline and emitted this alongside
@@ -3234,7 +3476,9 @@ pub enum OffchainOrderError {
 mod tests {
     use serde_json::json;
 
-    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, TestStore, replay};
+    use st0x_event_sorcery::{
+        AggregateError, LifecycleError, StoreBuilder, TestHarness, TestStore, replay,
+    };
     use st0x_execution::MockExecutor;
     use st0x_float_macro::float;
 
@@ -3394,10 +3638,8 @@ mod tests {
             .unwrap();
     }
 
-    /// The flag is only useful if it is still readable at the terminal
-    /// transition, which is where the outcome metric attributes the fill. It has
-    /// to survive Pending -> Submitted, since a broker acceptance rebuilds the
-    /// state from the event rather than carrying the entity forward.
+    /// The flag must survive through `Failed`, because anchor recovery uses the
+    /// terminal state to reconstruct the original close-flatten policy.
     #[tokio::test]
     async fn close_flatten_survives_from_placement_to_the_terminal_transition() {
         let store = TestStore::<OffchainOrder>::new(noop_order_placer());
@@ -3477,6 +3719,23 @@ mod tests {
             store.load(&id).await.unwrap().unwrap().close_flatten(),
             "an in-flight cancellation must retain attribution for its terminal outcome"
         );
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "broker rejected remainder".to_string(),
+                    filled_shares: Some(FractionalShares::new(float!(50))),
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store.load(&id).await.unwrap().unwrap().close_flatten(),
+            "a failed close-flatten order must retain attribution for anchor recovery"
+        );
     }
 
     /// An ordinary extended-hours limit is not a flatten, so it must not be
@@ -3519,6 +3778,7 @@ mod tests {
             limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
             client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
             close_flatten: true,
+            buying_power_reservation: None,
         };
 
         // The submitted terms are recorded on the event for audit.
@@ -3620,6 +3880,8 @@ mod tests {
             error: "broker rejected remainder".to_string(),
             placed_at: fill_time,
             failed_at: failure_time,
+            market_session: MarketSession::Regular,
+            close_flatten: false,
         };
 
         let finalization =
@@ -3653,6 +3915,8 @@ mod tests {
             error: "expired".to_string(),
             placed_at: failure_time,
             failed_at: failure_time,
+            market_session: MarketSession::Regular,
+            close_flatten: false,
         };
 
         let finalization =
@@ -3681,6 +3945,8 @@ mod tests {
             error: "broker unreachable".to_string(),
             placed_at: failure_time,
             failed_at: failure_time,
+            market_session: MarketSession::Regular,
+            close_flatten: false,
         };
 
         let finalization =
@@ -3714,6 +3980,8 @@ mod tests {
             error: "broker rejected remainder".to_string(),
             placed_at: fill_time,
             failed_at: failure_time,
+            market_session: MarketSession::Regular,
+            close_flatten: false,
         };
 
         let trade = order
@@ -3781,6 +4049,8 @@ mod tests {
             error: "broker reported an impossible fill".to_string(),
             placed_at: failed_at,
             failed_at,
+            market_session: MarketSession::Regular,
+            close_flatten: false,
         };
 
         let trade = order
@@ -3960,6 +4230,8 @@ mod tests {
             error: "broker rejected remainder".to_string(),
             placed_at: failed_at,
             failed_at,
+            market_session: MarketSession::Regular,
+            close_flatten: false,
         };
 
         let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
@@ -4063,8 +4335,8 @@ mod tests {
         );
     }
 
-    /// `close_flatten` was added to four persisted pre-terminal variants, and
-    /// snapshots written before it must still replay: a dropped
+    /// `close_flatten` was added to the persisted live states that need it, and
+    /// snapshots written before each addition must still replay: a dropped
     /// `#[serde(default)]` would fail startup rather than CI.
     #[test]
     fn legacy_pre_terminal_states_deserialize_without_close_flatten() {
@@ -4075,8 +4347,11 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::DryRun,
             placed_at,
+            client_order_id: None,
+            limit_price: None,
             market_session: MarketSession::Extended,
             close_flatten: true,
+            buying_power_reservation: None,
         };
         let cancelling = OffchainOrder::Cancelling {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -4108,11 +4383,27 @@ mod tests {
             market_session: MarketSession::Extended,
             close_flatten: true,
         };
+        let failed = OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
+            requested_shares: None,
+            direction: Direction::Buy,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: None,
+            filled_shares: None,
+            executor_order_id: None,
+            error: "broker rejected".to_string(),
+            placed_at,
+            failed_at: placed_at,
+            market_session: MarketSession::Extended,
+            close_flatten: true,
+        };
 
         for (variant, state) in [
             ("Pending", pending),
             ("PartiallyFilled", partially_filled),
             ("Cancelling", cancelling),
+            ("Failed", failed),
         ] {
             let mut legacy_payload = serde_json::to_value(state).unwrap();
             legacy_payload
@@ -4482,6 +4773,142 @@ mod tests {
         assert!(matches!(
             store.load(&id).await.unwrap(),
             Some(OffchainOrder::Pending { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_replay_uses_the_exact_durable_placement_terms() {
+        struct CapturingLimitPlacer {
+            captured: std::sync::Mutex<Option<LimitOrder>>,
+        }
+
+        #[async_trait]
+        impl OrderPlacer for CapturingLimitPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("a durable extended-hours intent must not replay as a market order")
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                *self.captured.lock().unwrap() = Some(order.clone());
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("REPLAYED"),
+                    placed_shares: order.shares,
+                    is_extended_hours: true,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(CancellationOutcome::Requested)
+            }
+        }
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, _) = StoreBuilder::<OffchainOrder>::new(pool)
+            .build(noop_order_placer())
+            .await
+            .unwrap();
+        let id = OffchainOrderId::new();
+        let durable_client_order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+        let durable_shares = Positive::new(FractionalShares::new(float!(2.5))).unwrap();
+        let durable_limit = Positive::new(Usd::new(float!(101.25))).unwrap();
+        let durable_reservation = BuyingPowerReservationCents::new(25_566).unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::PlaceReserved {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: durable_shares,
+                    direction: Direction::Buy,
+                    executor: SupportedExecutor::DryRun,
+                    client_order_id: durable_client_order_id.clone(),
+                    kind: CounterTradeOrderKind::ExtendedHoursLimit {
+                        limit_price: durable_limit,
+                        close_flatten: true,
+                    },
+                    buying_power_reservation: Some(durable_reservation),
+                    placed_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.load(&id).await.unwrap(),
+            Some(OffchainOrder::Pending {
+                client_order_id: Some(ref client_order_id),
+                limit_price: Some(limit_price),
+                buying_power_reservation: Some(reservation),
+                close_flatten: true,
+                ..
+            }) if client_order_id == &durable_client_order_id
+                && limit_price == durable_limit
+                && reservation == durable_reservation
+        ));
+
+        let placer = CapturingLimitPlacer {
+            captured: std::sync::Mutex::new(None),
+        };
+        place_offchain_order_at_broker(
+            &store,
+            &placer,
+            &id,
+            OffchainOrderPlacement::market(
+                Symbol::new("AAPL").unwrap(),
+                Positive::new(FractionalShares::new(float!(9))).unwrap(),
+                Direction::Buy,
+                SupportedExecutor::DryRun,
+                ClientOrderId::from_uuid(Uuid::new_v4()),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let replayed = placer.captured.lock().unwrap().clone().unwrap();
+        assert_eq!(replayed.shares, durable_shares);
+        assert_eq!(replayed.client_order_id, durable_client_order_id);
+        assert_eq!(replayed.limit_price, durable_limit);
+        assert!(replayed.extended_hours);
+    }
+
+    #[tokio::test]
+    async fn missing_pending_limit_price_failure_terminalizes_legacy_pending_order() {
+        let order_id = OffchainOrderId::new();
+        let events = TestHarness::<OffchainOrder>::with(noop_order_placer())
+            .given(vec![OffchainOrderEvent::Placed {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Buy,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+                placed_at: Utc::now(),
+                is_extended_hours: true,
+                limit_price: None,
+                client_order_id: Some(ClientOrderId::from_uuid(Uuid::new_v4())),
+                close_flatten: false,
+                buying_power_reservation: None,
+            }])
+            .when(missing_pending_limit_price_failure(order_id))
+            .await
+            .events();
+
+        assert!(matches!(
+            events.as_slice(),
+            [OffchainOrderEvent::Failed {
+                error,
+                filled_shares: None,
+                ..
+            }] if error.contains(&order_id.to_string())
         ));
     }
 
@@ -6268,8 +6695,11 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::DryRun,
             placed_at: Utc::now(),
+            client_order_id: None,
+            limit_price: None,
             market_session: MarketSession::Regular,
             close_flatten: false,
+            buying_power_reservation: None,
         };
 
         let err = pending
@@ -6346,6 +6776,7 @@ mod tests {
             limit_price: None,
             client_order_id: None,
             close_flatten: false,
+            buying_power_reservation: None,
         };
 
         // Strip the post-upgrade keys to reconstruct the exact payload shape
@@ -6437,6 +6868,7 @@ mod tests {
                 limit_price: None,
                 client_order_id: None,
                 close_flatten: false,
+                buying_power_reservation: None,
             },
             OffchainOrderEvent::Submitted {
                 executor_order_id: ExecutorOrderId::new("broker-cancelled"),

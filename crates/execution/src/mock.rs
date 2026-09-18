@@ -12,11 +12,11 @@ use tracing::{debug, info};
 static MOCK_FILL_PRICE: LazyLock<Float> = LazyLock::new(|| float!(100));
 
 use crate::{
-    CancellationOutcome, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
+    BuyingPowerReservationCents, CancellationOutcome, CounterTradePreflight,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, Executor,
     ExecutorOrderId, HedgeFloor, Inventory, InventoryResult, LatestQuote, LimitOrder, MarketOrder,
     MarketSession, MarketSessionStatus, OrderPlacement, OrderState, Positive, PostCloseGap,
-    SupportedExecutor, Symbol, TryIntoExecutor, Usd, estimate_buffered_cost_cents,
+    SupportedExecutor, Symbol, TryIntoExecutor, Usd, resolve_buy_preflight,
 };
 
 /// Context for MockExecutor (unit struct - no context needed)
@@ -66,6 +66,7 @@ pub struct MockExecutor {
     position_mark_override: Option<Positive<Usd>>,
     preflight_price: Float,
     hedge_floor: HedgeFloor,
+    fractional_orders_supported: bool,
 }
 
 impl MockExecutor {
@@ -84,6 +85,7 @@ impl MockExecutor {
             position_mark_override: None,
             preflight_price: *MOCK_FILL_PRICE,
             hedge_floor: HedgeFloor::default(),
+            fractional_orders_supported: true,
         }
     }
 
@@ -107,6 +109,13 @@ impl MockExecutor {
     #[must_use]
     pub fn with_hedge_floor(mut self, hedge_floor: HedgeFloor) -> Self {
         self.hedge_floor = hedge_floor;
+        self
+    }
+
+    /// Configures whether buy preflight accepts fractional-share quantities.
+    #[must_use]
+    pub fn with_fractional_orders_supported(mut self, supported: bool) -> Self {
+        self.fractional_orders_supported = supported;
         self
     }
 
@@ -247,33 +256,34 @@ impl MockExecutor {
         order: &MarketOrder,
         reference_price: crate::Positive<Usd>,
         slippage_bps: u16,
+        reserved: BuyingPowerReservationCents,
     ) -> Result<CounterTradePreflight, ExecutionError> {
         let InventoryResult::Fetched(inventory) = &self.inventory_result else {
             return Ok(CounterTradePreflight::Allowed { reservation: None });
         };
 
-        let estimated_cost_cents = estimate_buffered_cost_cents(
-            order.shares,
-            reference_price.inner().inner(),
-            slippage_bps,
+        let reserved_cents: i64 = reserved.get().try_into()?;
+        let cash_buying_power_cents = inventory
+            .cash_buying_power_cents
+            .unwrap_or(inventory.usd_balance_cents);
+        let available = cash_buying_power_cents.checked_sub(reserved_cents).ok_or(
+            ExecutionError::BuyingPowerReservationOverflow {
+                current_reserved_cents: reserved_cents,
+                additional_cents: cash_buying_power_cents,
+            },
         )?;
-
-        if inventory.usd_balance_cents >= estimated_cost_cents {
-            Ok(CounterTradePreflight::Allowed {
-                reservation: Some(CounterTradeReservation::BuyingPower {
-                    required: order.shares,
-                    estimated_cost_cents,
-                    available_buying_power_cents: inventory.usd_balance_cents,
-                }),
-            })
+        let quantity_decimals = if self.fractional_orders_supported {
+            crate::ALPACA_MAX_DECIMAL_PLACES
         } else {
-            Ok(CounterTradePreflight::Skipped(
-                CounterTradeSkipReason::InsufficientBuyingPower {
-                    estimated_cost_cents,
-                    available_buying_power_cents: inventory.usd_balance_cents,
-                },
-            ))
-        }
+            0
+        };
+        Ok(resolve_buy_preflight(
+            order,
+            reference_price,
+            slippage_bps,
+            available,
+            quantity_decimals,
+        )?)
     }
 }
 
@@ -367,6 +377,18 @@ impl Executor for MockExecutor {
         &self,
         order: MarketOrder,
     ) -> Result<CounterTradePreflight, Self::Error> {
+        self.preflight_counter_trade_with_reserved_buying_power(
+            order,
+            BuyingPowerReservationCents::ZERO,
+        )
+        .await
+    }
+
+    async fn preflight_counter_trade_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Self::Error> {
         self.fail_if_unhealthy()?;
 
         match order.direction {
@@ -380,6 +402,7 @@ impl Executor for MockExecutor {
                     &order,
                     reference_price,
                     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+                    reserved,
                 )
             }
         }
@@ -390,12 +413,26 @@ impl Executor for MockExecutor {
         order: MarketOrder,
         limit_price: crate::Positive<Usd>,
     ) -> Result<CounterTradePreflight, Self::Error> {
+        self.preflight_counter_trade_at_price_with_reserved_buying_power(
+            order,
+            limit_price,
+            BuyingPowerReservationCents::ZERO,
+        )
+        .await
+    }
+
+    async fn preflight_counter_trade_at_price_with_reserved_buying_power(
+        &self,
+        order: MarketOrder,
+        limit_price: crate::Positive<Usd>,
+        reserved: BuyingPowerReservationCents,
+    ) -> Result<CounterTradePreflight, Self::Error> {
         self.fail_if_unhealthy()?;
 
         match order.direction {
             // Inventory availability doesn't depend on price.
             Direction::Sell => self.preflight_sell(order),
-            Direction::Buy => self.preflight_buy_cash(&order, limit_price, 0),
+            Direction::Buy => self.preflight_buy_cash(&order, limit_price, 0, reserved),
         }
     }
 
@@ -513,7 +550,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{ClientOrderId, Direction, FractionalShares, Positive, Symbol};
+    use crate::{
+        ClientOrderId, CounterTradeReservation, CounterTradeSkipReason, Direction,
+        FractionalShares, Positive, Symbol,
+    };
 
     fn shares(value: &str) -> FractionalShares {
         FractionalShares::new(Float::parse(value.to_string()).unwrap())
@@ -897,11 +937,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_counter_trade_skips_buy_without_cash() {
+    async fn preflight_counter_trade_partially_buys_with_available_cash() {
         let executor = MockExecutor::new()
             .with_inventory(crate::Inventory {
                 positions: vec![],
-                usd_balance_cents: 10_000,
+                usd_balance_cents: 1_000_000,
                 cash_buying_power_cents: Some(10_000),
                 alpaca_usdc: None,
                 cash_withdrawable_cents: None,
@@ -918,12 +958,50 @@ mod tests {
             .await
             .unwrap();
 
+        let CounterTradePreflight::Allowed {
+            reservation:
+                Some(CounterTradeReservation::BuyingPower {
+                    required,
+                    estimated_cost_cents,
+                    available_buying_power_cents,
+                }),
+        } = preflight
+        else {
+            panic!("expected cash-constrained partial buy");
+        };
+        assert!(required.inner().inner().eq(float!(0.990099009)).unwrap());
+        assert_eq!(estimated_cost_cents, 10_000);
+        assert_eq!(available_buying_power_cents, 10_000);
+    }
+
+    #[tokio::test]
+    async fn preflight_counter_trade_floors_buy_when_fractional_orders_are_unsupported() {
+        let executor = MockExecutor::new()
+            .with_inventory(crate::Inventory {
+                positions: vec![],
+                usd_balance_cents: 25_000,
+                cash_buying_power_cents: Some(25_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            })
+            .with_preflight_price(float!(100))
+            .with_fractional_orders_supported(false);
+
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: positive_shares("3.75"),
+                direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap();
+
         assert!(matches!(
             preflight,
-            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
-                estimated_cost_cents,
-                available_buying_power_cents,
-            }) if estimated_cost_cents == 20_200 && available_buying_power_cents == 10_000
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::BuyingPower { required, .. }),
+            } if required == positive_shares("2")
         ));
     }
 

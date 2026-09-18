@@ -91,11 +91,11 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
         corridor,
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
         base_wallet: wallet_ctx.base_wallet().clone(),
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
     })?;
 
@@ -150,11 +150,11 @@ pub(super) async fn cctp_recover_command<Writer: Write>(
         corridor: ctx.rebalancing.cctp_corridor,
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
         base_wallet: wallet_ctx.base_wallet().clone(),
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
     })?;
 

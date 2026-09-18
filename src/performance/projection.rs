@@ -45,7 +45,8 @@ impl HedgeLatencyProjection {
             PositionEvent::Initialized { .. }
             | PositionEvent::ThresholdUpdated { .. }
             | PositionEvent::OnChainFillApplied { .. }
-            | PositionEvent::OnChainFillSettled { .. } => Ok(()),
+            | PositionEvent::OnChainFillSettled { .. }
+            | PositionEvent::FailedOrderAnchorReleased { .. } => Ok(()),
             PositionEvent::OnChainOrderFilled {
                 trade_id,
                 block_timestamp,
