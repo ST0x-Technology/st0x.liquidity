@@ -803,7 +803,13 @@ mod tests {
         view: InventoryView,
         equity_in_progress: HashMap<Symbol, GuardState>,
     ) -> UnwrappedEquityRecoveryCtx {
-        test_ctx_with_tokenizer(view, equity_in_progress, Arc::new(MockTokenizer::new())).await
+        test_ctx_with_tokenizer(
+            view,
+            equity_in_progress,
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+        )
+        .await
     }
 
     /// `test_ctx` with a caller-supplied tokenizer, for tests whose resumed
@@ -813,10 +819,10 @@ mod tests {
         view: InventoryView,
         equity_in_progress: HashMap<Symbol, GuardState>,
         tokenizer: Arc<dyn Tokenizer>,
+        raindex: Arc<dyn Raindex>,
     ) -> UnwrappedEquityRecoveryCtx {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let chain_services = ChainEquityServices {
             wallet: Address::ZERO,
@@ -1829,6 +1835,10 @@ mod tests {
     async fn perform_drives_active_redemption_path_to_dispatched_to_redemption() {
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_id = redemption_aggregate_id("RED001");
+        let token = Address::random();
+        let amount = FractionalShares::new(float!(5))
+            .to_u256_18_decimals()
+            .unwrap();
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
             .set_active_redemption(symbol.clone(), redemption_id.clone());
         let tokenizer = Arc::new(
@@ -1836,11 +1846,12 @@ mod tests {
                 .with_detection_outcome(MockDetectionOutcome::Detected)
                 .with_completion_outcome(MockCompletionOutcome::Completed),
         );
-        let ctx = test_ctx_with_tokenizer(view, HashMap::new(), tokenizer).await;
+        let raindex = Arc::new(MockRaindex::new().with_withdraw_transfer(token, amount));
+        let ctx = test_ctx_with_tokenizer(view, HashMap::new(), tokenizer, raindex).await;
 
-        // Seed the redemption at `VaultWithdrawSubmitted` (Redeem submits the
-        // withdrawal); `resume_redemption` walks it to `Completed` under the
-        // detection/completion-configured mocks.
+        // Seed the redemption at `VaultWithdrawSubmitted`; `Redeem` now records
+        // the pre-submission intent, so record the submitted transaction
+        // explicitly before `resume_redemption` walks it to `Completed`.
         ctx.redemption_store
             .send(
                 &redemption_id,
@@ -1848,12 +1859,19 @@ mod tests {
                     chain: Chain::Base,
                     symbol: symbol.clone(),
                     quantity: float!(5),
-                    token: Address::random(),
+                    token,
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: FractionalShares::new(float!(5))
-                        .to_u256_18_decimals()
-                        .unwrap(),
+                    amount,
                     from_block: 0,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.redemption_store
+            .send(
+                &redemption_id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
