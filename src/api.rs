@@ -34,6 +34,7 @@ use st0x_event_sorcery::{
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::{FractionalShares, Positive};
+use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
 use st0x_tokenization::IssuerRequestId;
 
@@ -59,7 +60,9 @@ use crate::operator::portfolio_snapshot::{EquityMarkCorrection, set_equity_mark}
 use crate::operator::position::{
     OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
 };
-use crate::operator::process_tx::{self, HedgeDisposition, ProcessTxOutcome, ProcessTxStores};
+use crate::operator::process_tx::{
+    self, HedgeDisposition, ProcessTxFill, ProcessTxOutcome, ProcessTxReport, ProcessTxStores,
+};
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
@@ -2550,11 +2553,43 @@ async fn set_position_exposure(
     }))
 }
 
+/// Decoded fill and processing outcome returned by the process-tx route.
+#[derive(Debug, Serialize)]
+struct ProcessTxResponse {
+    fill: Option<ProcessTxFillResponse>,
+    #[serde(flatten)]
+    outcome: ProcessTxOutcomeResponse,
+}
+
+/// Operator-relevant identity and economics of the decoded on-chain fill.
+#[derive(Debug, Serialize)]
+struct ProcessTxFillResponse {
+    tx_hash: String,
+    log_index: u64,
+    symbol: String,
+    direction: String,
+    quantity: String,
+    price: String,
+}
+
+impl From<ProcessTxFill> for ProcessTxFillResponse {
+    fn from(fill: ProcessTxFill) -> Self {
+        Self {
+            tx_hash: fill.tx_hash.to_string(),
+            log_index: fill.log_index,
+            symbol: fill.symbol.to_string(),
+            direction: format!("{:?}", fill.direction),
+            quantity: fill.quantity.to_string(),
+            price: format_float_with_fallback(&fill.price),
+        }
+    }
+}
+
 /// What processing a transaction resolved to, mirrored from
 /// [`ProcessTxOutcome`] for the wire.
 #[derive(Debug, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
-enum ProcessTxResponse {
+enum ProcessTxOutcomeResponse {
     NoTradeableEvents,
     TransactionNotFound,
     AlreadyAccounted,
@@ -2575,7 +2610,7 @@ enum ProcessTxResponse {
     },
 }
 
-impl From<ProcessTxOutcome> for ProcessTxResponse {
+impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
     fn from(outcome: ProcessTxOutcome) -> Self {
         match outcome {
             ProcessTxOutcome::NoTradeableEvents => Self::NoTradeableEvents,
@@ -2606,6 +2641,15 @@ impl From<ProcessTxOutcome> for ProcessTxResponse {
                     HedgeDisposition::Finalized => "finalized",
                 },
             },
+        }
+    }
+}
+
+impl From<ProcessTxReport> for ProcessTxResponse {
+    fn from(report: ProcessTxReport) -> Self {
+        Self {
+            fill: report.fill.map(ProcessTxFillResponse::from),
+            outcome: ProcessTxOutcomeResponse::from(report.outcome),
         }
     }
 }
@@ -2672,7 +2716,7 @@ async fn process_transaction(
     let provider = ProviderBuilder::new().connect_client(rpc_client);
     let cache = SymbolCache::default();
 
-    let outcome = process_tx::process_tx(
+    let report = process_tx::process_tx(
         tx_hash,
         &state.ctx,
         &state.pool,
@@ -2685,7 +2729,7 @@ async fn process_transaction(
     .await
     .map_err(ops_operator_error)?;
 
-    Ok(Json(ProcessTxResponse::from(outcome)))
+    Ok(Json(ProcessTxResponse::from(report)))
 }
 
 /// Wire contract for the portfolio-snapshot mark route.
@@ -7275,43 +7319,104 @@ mod tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
-    /// Every domain outcome must retain its meaning across the API boundary.
+    /// Every domain report must retain its fill identity and outcome across the API boundary.
     #[test]
     fn process_tx_response_serializes_each_mapped_outcome() {
-        let mut cases: Vec<(ProcessTxOutcome, serde_json::Value)> = vec![
+        let tx_hash = TxHash::repeat_byte(0x11);
+        let fill = || ProcessTxFill {
+            tx_hash,
+            log_index: 7,
+            symbol: Symbol::new("AAPL").unwrap(),
+            direction: st0x_execution::Direction::Sell,
+            quantity: FractionalShares::new(Float::parse("1.5".to_owned()).unwrap()),
+            price: Float::parse("123.45".to_owned()).unwrap(),
+        };
+        let fill_json = serde_json::json!({
+            "tx_hash": tx_hash.to_string(),
+            "log_index": 7,
+            "symbol": "AAPL",
+            "direction": "Sell",
+            "quantity": "1.5",
+            "price": "123.45",
+        });
+        let mut cases: Vec<(ProcessTxReport, serde_json::Value)> = vec![
             (
-                ProcessTxOutcome::NoTradeableEvents,
-                serde_json::json!({ "outcome": "no_tradeable_events" }),
-            ),
-            (
-                ProcessTxOutcome::TransactionNotFound {
-                    tx_hash: TxHash::repeat_byte(0x22),
+                ProcessTxReport {
+                    fill: None,
+                    outcome: ProcessTxOutcome::NoTradeableEvents,
                 },
-                serde_json::json!({ "outcome": "transaction_not_found" }),
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "no_tradeable_events",
+                }),
             ),
             (
-                ProcessTxOutcome::AlreadyAccounted,
-                serde_json::json!({ "outcome": "already_accounted" }),
-            ),
-            (
-                ProcessTxOutcome::PendingHedgeInFlight,
-                serde_json::json!({ "outcome": "pending_hedge_in_flight" }),
-            ),
-            (
-                ProcessTxOutcome::BelowExecutionThreshold,
-                serde_json::json!({ "outcome": "below_execution_threshold" }),
-            ),
-            (
-                ProcessTxOutcome::TradingDisabled {
-                    symbol: Symbol::new("AAPL").unwrap(),
+                ProcessTxReport {
+                    fill: None,
+                    outcome: ProcessTxOutcome::TransactionNotFound {
+                        tx_hash: TxHash::repeat_byte(0x22),
+                    },
                 },
-                serde_json::json!({ "outcome": "trading_disabled", "symbol": "AAPL" }),
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "transaction_not_found",
+                }),
             ),
             (
-                ProcessTxOutcome::PlacementRejected {
-                    symbol: Symbol::new("AAPL").unwrap(),
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::AlreadyAccounted,
                 },
-                serde_json::json!({ "outcome": "placement_rejected", "symbol": "AAPL" }),
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "already_accounted",
+                }),
+            ),
+            (
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::PendingHedgeInFlight,
+                },
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "pending_hedge_in_flight",
+                }),
+            ),
+            (
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::BelowExecutionThreshold,
+                },
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "below_execution_threshold",
+                }),
+            ),
+            (
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::TradingDisabled {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                    },
+                },
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "trading_disabled",
+                    "symbol": "AAPL",
+                }),
+            ),
+            (
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::PlacementRejected {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                    },
+                },
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "placement_rejected",
+                    "symbol": "AAPL",
+                }),
             ),
         ];
 
@@ -7321,16 +7426,20 @@ mod tests {
             (HedgeDisposition::Finalized, "finalized"),
         ] {
             cases.push((
-                ProcessTxOutcome::HedgePlaced {
-                    symbol: Symbol::new("AAPL").unwrap(),
-                    offchain_order_id: OffchainOrderId::from_uuid(uuid!(
-                        "11111111-1111-4111-8111-111111111111"
-                    )),
-                    shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
-                    direction: Direction::Buy,
-                    disposition,
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::HedgePlaced {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        offchain_order_id: OffchainOrderId::from_uuid(uuid!(
+                            "11111111-1111-4111-8111-111111111111"
+                        )),
+                        shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
+                        direction: st0x_execution::Direction::Buy,
+                        disposition,
+                    },
                 },
                 serde_json::json!({
+                    "fill": fill_json,
                     "outcome": "hedge_placed",
                     "symbol": "AAPL",
                     "offchain_order_id": "11111111-1111-4111-8111-111111111111",
@@ -7341,9 +7450,9 @@ mod tests {
             ));
         }
 
-        for (outcome, expected) in cases {
+        for (report, expected) in cases {
             assert_eq!(
-                serde_json::to_value(ProcessTxResponse::from(outcome)).unwrap(),
+                serde_json::to_value(ProcessTxResponse::from(report)).unwrap(),
                 expected,
             );
         }
