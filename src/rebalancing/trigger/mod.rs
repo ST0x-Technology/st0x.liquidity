@@ -726,8 +726,8 @@ pub(crate) struct RebalancingService {
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     /// Driver pause gate, attached by the conductor once the USDC workers are
     /// built. Unset in tests that never wire a pause, where the trigger runs
-    /// unpaused. Consulted so a check neither enqueues a transfer nor sweeps
-    /// while an operator operation holds the driver quiesced.
+    /// unpaused. A queued check parks behind a held pause; the inline sweep
+    /// skips and relies on its next caller.
     usdc_driver_gate: std::sync::OnceLock<UsdcDriverGate>,
     notifier: Arc<dyn crate::alerts::Notifier>,
     /// The ERC-4626 wrapper on each hedged chain: a symbol's derivative and
@@ -3491,18 +3491,12 @@ impl RebalancingService {
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
         // Hold a claim on the driver for the whole check so an operator
-        // operation's pause waits for an active check, and a held pause skips
-        // it: neither a fresh transfer row nor a sweep lands under the
-        // operation. The check is enqueued again by the next fill or snapshot.
+        // operation's pause waits for an active check. A check already queued
+        // while the pause is held parks until the operator finishes instead of
+        // dropping the imbalance that caused it; unlike the inline sweep, this
+        // apalis worker has its own execution budget and can safely wait.
         let _in_flight = if let Some(gate) = self.usdc_driver_gate.get() {
-            let Some(in_flight) = gate.try_enter() else {
-                debug!(
-                    target: "rebalance",
-                    "Skipping USDC rebalancing check: driver paused by an operator operation"
-                );
-                return;
-            };
-            Some(in_flight)
+            Some(gate.enter().await)
         } else {
             None
         };
@@ -6365,6 +6359,7 @@ mod tests {
     };
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
+    use crate::rebalancing::usdc::usdc_driver_pause;
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
@@ -12869,6 +12864,41 @@ mod tests {
             count_pending_equity_redemption_jobs(&trigger).await,
             0,
             "Inventory should be balanced after redemption completion (50/50)"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_check_waits_for_operator_pause_then_processes_imbalance() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let (pause, gate) = usdc_driver_pause();
+        trigger.attach_usdc_driver_gate(gate);
+        let pause_guard = pause.pause().await.unwrap();
+
+        let check_trigger = Arc::clone(&trigger);
+        let mut check = tokio::spawn(async move { check_trigger.check_and_trigger_usdc().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut check)
+                .await
+                .is_err(),
+            "a queued USDC check must remain pending while the operator pause is held"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "the paused check must not dispatch a transfer"
+        );
+
+        drop(pause_guard);
+        tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .expect("the USDC check must resume when the operator pause ends")
+            .expect("the resumed USDC check task must complete");
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "the resumed check must process the imbalance without another balance event"
         );
     }
 
