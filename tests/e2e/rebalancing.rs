@@ -1539,10 +1539,10 @@ async fn redemption_rejected_releases_inflight_and_preserves_failed_transfer() -
         .iter()
         .find(|event| {
             event.aggregate_id == first_id
-                && event.event_type == "EquityRedemptionEvent::VaultWithdrawPending"
+                && event.event_type == "EquityRedemptionEvent::VaultWithdrawSubmitting"
         })
         .expect("Rejected redemption must retain its withdrawal intent")
-        .payload["VaultWithdrawPending"]["quantity"]
+        .payload["VaultWithdrawSubmitting"]["quantity"]
         .as_str()
         .expect("Withdrawal intent must retain the quantity")
         .to_owned();

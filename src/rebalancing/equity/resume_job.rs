@@ -370,7 +370,10 @@ mod tests {
         Arc<MockTokenizer>,
     ) {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let raindex: Arc<dyn Raindex> = Arc::new(
+            MockRaindex::new()
+                .with_withdraw_transfer(Address::ZERO, U256::from(1_000_000_000_000_000_000_u128)),
+        );
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let vault_lookup =
             Arc::new(MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)));
@@ -844,7 +847,10 @@ mod tests {
         let bot_gas_queue =
             crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&closed_apalis_pool);
         let bot_gas_enqueuer = BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue);
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let raindex: Arc<dyn Raindex> = Arc::new(
+            MockRaindex::new()
+                .with_withdraw_transfer(Address::ZERO, U256::from(1_000_000_000_000_000_000_u128)),
+        );
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let vault_lookup =
             Arc::new(MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)));

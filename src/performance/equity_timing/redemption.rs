@@ -50,8 +50,8 @@ impl StoredOperation {
             }
             // Also carries symbol/quantity: hydrate them so an operation
             // first observed mid-stream (deploy/restart backfill) is not
-            // left with `symbol: None, quantity: None` when the genesis
-            // `VaultWithdrawPending` was never seen.
+            // left with `symbol: None, quantity: None` when its genesis event
+            // was never seen.
             VaultWithdrawSubmitted {
                 symbol,
                 quantity,

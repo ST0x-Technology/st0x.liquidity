@@ -5285,10 +5285,19 @@ mod tests {
     /// withdrawal is confirmed (`WithdrawnFromRaindex`) -- stuck before the
     /// tokens leave the bot's custody.
     async fn seed_redemption_to_withdrawn(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        let token = Address::random();
+        let amount = U256::from(50_250_000_000_000_000_000_u128);
+        let mut services = redemption_services();
+        services
+            .chains
+            .get_mut(&Chain::Base)
+            .expect("redemption test services must include Base")
+            .raindex = Arc::new(MockRaindex::new().with_withdraw_transfer(token, amount));
+
         use EquityRedemptionCommand::*;
 
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(redemption_services())
+            .build(services)
             .await
             .unwrap();
 
@@ -5299,9 +5308,9 @@ mod tests {
                     chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
-                    token: Address::random(),
+                    token,
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                    amount,
                     from_block: 0,
                 },
             )
