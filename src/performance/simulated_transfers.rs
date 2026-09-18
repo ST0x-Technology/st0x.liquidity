@@ -427,6 +427,7 @@ async fn seed_alpaca_to_base(
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: requested,
                 order_id,
+                preflight_balance: U256::ZERO,
                 initiated_at: t0,
             },
         )

@@ -499,6 +499,16 @@ pub enum CctpError {
     AmountConversion(#[from] alloy::primitives::ruint::FromUintError<u128>),
     #[error("Fast transfer fee not available for {direction:?}")]
     FastTransferFeeNotAvailable { direction: BridgeDirection },
+    #[error(
+        "amount {amount} is at or below the CCTP fast-transfer fee {max_fee} for \
+         {direction:?}; the burn would mint zero and revert. Sweep a balance this \
+         small with a plain ERC-20 transfer instead."
+    )]
+    AmountBelowFastTransferFee {
+        amount: U256,
+        max_fee: U256,
+        direction: BridgeDirection,
+    },
     #[error("Invalid hex encoding: {0}")]
     HexDecode(#[from] alloy::hex::FromHexError),
     #[error("Fee value parse error: {0}")]
@@ -567,6 +577,7 @@ impl CctpError {
             | Self::Float(_)
             | Self::AmountConversion(_)
             | Self::FastTransferFeeNotAvailable { .. }
+            | Self::AmountBelowFastTransferFee { .. }
             | Self::HexDecode(_)
             | Self::FeeValueParse(_) => false,
         }
@@ -767,6 +778,17 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         } else {
             truncated + U256::from(1)
         };
+
+        // A burn whose fee meets or exceeds the amount would mint zero and revert
+        // on-chain (e.g. a single-unit `--all` sweep). Surface it as a clear error
+        // instead of a raw revert so the caller sweeps dust with a plain transfer.
+        if max_fee >= amount {
+            return Err(CctpError::AmountBelowFastTransferFee {
+                amount,
+                max_fee,
+                direction,
+            });
+        }
 
         Ok(max_fee)
     }
@@ -5876,6 +5898,46 @@ mod tests {
             matches!(error, CctpError::MessageSentEventNotFound { .. }),
             "burn must return MessageSentEventNotFound when the receipt has no \
              MessageSent event (post-commit error); got: {error:?}"
+        );
+    }
+
+    /// A burn whose fast-transfer fee meets or exceeds the amount (for example a
+    /// single-unit `cctp-bridge --all` sweep of dust) would mint zero and revert
+    /// on-chain. `query_fast_transfer_fee` surfaces this as
+    /// `AmountBelowFastTransferFee` so the caller sweeps with a plain transfer
+    /// instead of hitting a raw revert (RAI-2495).
+    #[tokio::test]
+    async fn query_fast_transfer_fee_rejects_amount_at_or_below_fee() {
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        // 1 bps fast fee: max_fee = ceil(amount * 1 / 10000). For a 1-unit amount
+        // that ceils to 1, i.e. max_fee == amount, so the burn would mint zero.
+        let fee_server = MockServer::start();
+        fee_server.mock(|when, then| {
+            when.method(GET).path_includes("/v2/burn/USDC/fees/");
+            then.status(200).json_body(serde_json::json!([
+                {"finalityThreshold": 1000, "minimumFee": 1},
+                {"finalityThreshold": 2000, "minimumFee": 0}
+            ]));
+        });
+
+        let bridge = create_bridge(&endpoint, &endpoint, &private_key, USDC_ETHEREUM)
+            .await
+            .unwrap()
+            .with_circle_api_base(fee_server.base_url());
+
+        let error = bridge
+            .query_fast_transfer_fee(U256::from(1u64), BridgeDirection::EthereumToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::AmountBelowFastTransferFee { amount, max_fee, .. }
+                    if amount == U256::from(1u64) && max_fee == U256::from(1u64)
+            ),
+            "a 1-unit burn at a 1-unit fee must be rejected before submission; got: {error:?}"
         );
     }
 

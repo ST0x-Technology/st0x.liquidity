@@ -3464,11 +3464,13 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: Uuid,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     ConversionComplete {
         direction: RebalanceDirection,
         amount: Usdc,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
         converted_at: DateTime<Utc>,
     },
@@ -3486,11 +3488,13 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         withdrawal_ref: TransferRef,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     WithdrawalComplete {
         direction: RebalanceDirection,
         amount: Usdc,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
     },
@@ -3628,6 +3632,7 @@ enum UsdcRebalanceCommand {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: Uuid,
+        preflight_balance: U256,
     },
     ConfirmConversion,
     FailConversion { reason: String },
@@ -3679,6 +3684,7 @@ enum UsdcRebalanceEvent {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: Uuid,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     // direction: Required for incremental dispatch terminal detection
@@ -4125,25 +4131,26 @@ race the same allowance.
 
 Alpaca to Base:
 
-0. **Pre-flight wallet-empty check**: read the market-maker Ethereum wallet USDC
-   balance before any Alpaca call. A non-zero balance shows ambient or residual
-   USDC. The wallet-empty invariant then cannot hold at burn time, so the
-   transfer refuses before the conversion. The check refuses on any non-zero
-   balance, including dust that a third party sends to the wallet. The wallet
-   address is public on-chain, so anyone can create this condition. Only an
-   operator sweep clears the balance and lets rebalancing start again. This is
-   an accepted fail-closed trade-off. No aggregate event is emitted, and no cash
-   leaves Alpaca. The refusal surfaces `WalletUsdcAmbientPreflight`. The worker
-   alerts the operator to sweep the wallet and releases the in-progress guard,
-   because no terminal event exists to clear it. The release checks durable
-   state first: while a persisted rebalance still holds the guard, the latch
-   stays (fail closed). If the balance read itself fails, the transfer stops
-   with `PreflightBalanceUnavailable` — same guard release; a single failure
-   only warns, and a sustained outage pages the operator at a bounded rate
-   (every fifth consecutive failure, with the streak in the message) — and the
-   trigger retries on its next cycle. The transfer is a true no-op with nothing
-   to resume or reconcile. A check that runs only at settlement time strands the
-   already-withdrawn USDC on Ethereum (the 2026-07-10 incident).
+0. **Pre-flight wallet balance check**: read the market-maker Ethereum wallet
+   USDC balance before any Alpaca call. A balance at or below 0.01 USDC is
+   accepted; the exact value is persisted in `ConversionInitiated` and carried
+   through the Alpaca-to-Base conversion and withdrawal states as the settlement
+   baseline. A balance above 0.01 USDC shows ambient or residual USDC that makes
+   attribution too operationally risky, so the transfer refuses before
+   conversion. Only an operator sweep clears that refusal. No aggregate event is
+   emitted and no cash leaves Alpaca. The refusal surfaces
+   `WalletUsdcAmbientPreflight`. The worker alerts the operator to sweep the
+   wallet and releases the in-progress guard, because no terminal event exists
+   to clear it. The release checks durable state first: while a persisted
+   rebalance still holds the guard, the latch stays fail closed. If the balance
+   read itself fails, the transfer stops with `PreflightBalanceUnavailable`
+   using the same guard release. A single failure only warns, and a sustained
+   outage pages the operator at a bounded rate (every fifth consecutive failure,
+   with the streak in the message). The trigger retries on its next cycle. The
+   transfer remains a true no-op with nothing to resume or reconcile. The
+   0.01-USDC threshold raises the cost of pre-flight nuisance dusting; it does
+   not prevent hostile transfers after the baseline read. Settlement subtracts
+   the persisted baseline and burns only the later wallet increase.
 1. **Convert USD to USDC**: Place market sell order on USDC/USD pair (buy USDC)
 2. Poll Alpaca until conversion order is filled
 3. Initiate USDC withdrawal from Alpaca (get transfer_id)
@@ -4182,12 +4189,12 @@ Alpaca to Base:
      RPC nodes; burning against an unconfirmed balance causes an ERC20
      transfer-exceeds-balance revert. This gate is retryable.
    - **Settlement retry deadline:** the retryable settlement wait
-     (under-confirmed tx, or zero wallet balance after a confirmed withdrawal)
-     is bounded. The deadline is `confirmed_at` (the durable
-     `WithdrawalComplete` timestamp) plus the
-     `[rebalancing] settlement_retry_deadline_secs` config value. The value
-     defaults to 24 hours when absent so binaries remain compatible with configs
-     from before this setting existed. The bound also covers persistent
+     (under-confirmed tx, or a wallet balance that has not increased above the
+     persisted pre-flight baseline after a confirmed withdrawal) is bounded. The
+     deadline is `confirmed_at` (the durable `WithdrawalComplete` timestamp)
+     plus the `[rebalancing] settlement_retry_deadline_secs` config value. The
+     value defaults to 24 hours when absent so binaries remain compatible with
+     configs from before this setting existed. The bound also covers persistent
      settlement-check RPC failures (for example a malformed tx hash from
      Alpaca), not only clean not-settled answers. At or after the deadline, the
      redrive emits `FailBridging` instead of re-enqueueing, and the worker pages
@@ -4202,17 +4209,23 @@ Alpaca to Base:
      so the funds are provably off Alpaca. Without this deadline, a withdrawal
      that never settles on-chain redrives every 30 seconds forever, with the
      guard latched and no operator signal.
-   - **Balance read:** after confirmation, read the market-maker Ethereum wallet
-     USDC balance. Three cases:
-     - **balance == 0**: delayed redrive (withdrawal not yet reflected;
-       retried).
-     - **0 < balance <= nominal**: burn the received amount (nominal minus any
-       Alpaca withdrawal fee). Persisted in `BridgingSubmitting.burn_amount` so
-       a crash-resume scan targets the exact burned amount, not the nominal.
-     - **balance > nominal**: wallet-empty invariant broken — ambient/residual
-       USDC from a prior rebalance is present. Emits `FailBridging` (no burn
-       attempted) and surfaces `WalletUsdcAmbientBalance` for operator
-       reconciliation; the job treats this as a clean terminal (no redrive).
+   - **Balance attribution:** after confirmation, read the market-maker Ethereum
+     wallet USDC balance and compare it with the exact persisted pre-flight
+     baseline. Three cases:
+     - **balance <= baseline**: delayed redrive. The tolerated pre-existing dust
+       alone is not evidence that a withdrawal with no transaction hash reached
+       Ethereum. A lower balance likewise cannot prove arrival.
+     - **0 < balance - baseline <= nominal**: burn exactly the increase, leaving
+       the pre-flight balance untouched. This accounts for Alpaca withdrawal
+       fees and persists the actual amount in `BridgingSubmitting.burn_amount`,
+       so a crash-resume scan targets the exact burned amount.
+     - **balance - baseline > nominal**: funds arriving after pre-flight cannot
+       be distinguished from the withdrawal. Emit `FailBridging` without
+       attempting a burn and surface `WalletUsdcAmbientBalance` for operator
+       reconciliation. The job treats this as a clean terminal with no redrive.
+       A legacy aggregate with no persisted baseline also fails closed with
+       `MissingPreflightBalance`; it never assumes zero and never burns an
+       unattributable balance.
 5. Ensure standing allowance to TokenMessenger (see above)
 6. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee (after
    allowance step to keep fee fresh across the cold-path ~30 s node-sync wait)

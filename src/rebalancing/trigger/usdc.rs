@@ -2307,6 +2307,7 @@ mod tests {
             direction,
             amount,
             order_id: ClientOrderId::from_uuid(Uuid::nil()),
+            preflight_balance: None,
             initiated_at: ts(101),
         }
     }
