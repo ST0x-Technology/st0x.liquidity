@@ -2465,6 +2465,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -2500,6 +2501,7 @@ mod tests {
                 quantity: FractionalShares::new(float!(1)),
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -2721,6 +2723,7 @@ mod tests {
                 generation,
 
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
@@ -2770,6 +2773,7 @@ mod tests {
                 generation: GuardGeneration::default(),
 
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             })
             .await
             .unwrap();
