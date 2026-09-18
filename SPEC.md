@@ -2777,6 +2777,12 @@ enum TriggerReason {
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job
   is durably queued. Confirmed reservations survive queue handoff and restart.
+- A direct operator CLI equity transfer uses the same `Position` admission
+  protocol before invoking the transfer saga: a fresh transfer reserves and
+  confirms its aggregate-derived ID, while a resume restores that exact
+  confirmed owner. The CLI releases ownership only after successful completion
+  or when a failed invocation left no live aggregate; an interrupted live
+  aggregate keeps ownership so hedging cannot race its next resume.
 - `ManuallyAdjustPosition` and `UpdateThreshold` are rejected while a confirmed
   transfer reservation owns the symbol. Transfer ownership must be released
   before either operator mutation can proceed.

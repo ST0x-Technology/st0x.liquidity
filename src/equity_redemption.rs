@@ -101,6 +101,9 @@ impl RedemptionAggregateId {
     pub fn generate() -> Self {
         Self(Uuid::new_v4())
     }
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
 }
 
 impl Display for RedemptionAggregateId {
@@ -1197,7 +1200,7 @@ impl EquityRedemption {
     /// An exhaustive `match` is intentional: adding a new variant to the enum
     /// without updating this function causes a compile error, preventing silent
     /// mis-classification of new states.
-    pub(crate) fn is_terminal(&self) -> bool {
+    pub fn is_terminal(&self) -> bool {
         match self {
             Self::Completed { .. } | Self::Failed { .. } | Self::Reconciled { .. } => true,
             Self::VaultWithdrawPending { .. }

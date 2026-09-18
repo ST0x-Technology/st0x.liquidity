@@ -5,14 +5,15 @@ use alloy::providers::RootProvider;
 use anyhow::Context;
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_config::{BrokerCtx, Ctx, HedgedChain, OnchainWalletCtx};
-use st0x_event_sorcery::StoreBuilder;
+use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold, HedgedChain, OnchainWalletCtx};
+use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Executor,
@@ -26,6 +27,7 @@ use st0x_hedge::operator::equity_redemption::{
 };
 use st0x_hedge::operator::mint_authorization::{ConfiguredMintAuthorizer, VaultModeReader};
 use st0x_hedge::operator::native_gas::{ConfiguredGasReadiness, GasReadiness};
+use st0x_hedge::operator::position::{EquityTransferReservationId, Position, PositionCommand};
 use st0x_hedge::operator::rebalancing::equity::{
     ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
 };
@@ -86,8 +88,155 @@ fn mint_resume_command(
 
 struct EquityTransferCliServices {
     transfer: CrossVenueEquityTransfer,
+    mint_store: Arc<Store<TokenizedEquityMint>>,
+    redemption_store: Arc<Store<EquityRedemption>>,
+    position_store: Arc<Store<Position>>,
+    execution_threshold: ExecutionThreshold,
     wallet: Address,
     vault_registry: VaultRegistryId,
+}
+
+#[derive(Clone, Copy)]
+enum OperatorTransferAdmission {
+    Fresh,
+    Resume,
+}
+
+enum OperatorTransferLifecycle<'a> {
+    Mint {
+        store: &'a Store<TokenizedEquityMint>,
+        id: &'a IssuerRequestId,
+    },
+    Redemption {
+        store: &'a Store<EquityRedemption>,
+        id: &'a RedemptionAggregateId,
+    },
+}
+
+impl OperatorTransferLifecycle<'_> {
+    async fn is_live(&self) -> bool {
+        match self {
+            Self::Mint { store, id } => match store.load(id).await {
+                Ok(Some(mint)) => !mint.is_terminal(),
+                Ok(None) => false,
+                Err(_) => true,
+            },
+            Self::Redemption { store, id } => match store.load(id).await {
+                Ok(Some(redemption)) => !redemption.is_terminal(),
+                Ok(None) => false,
+                Err(_) => true,
+            },
+        }
+    }
+}
+
+async fn release_operator_equity_transfer(
+    position_store: &Store<Position>,
+    symbol: &Symbol,
+    reservation_id: EquityTransferReservationId,
+) -> anyhow::Result<()> {
+    position_store
+        .send(
+            symbol,
+            PositionCommand::ReleaseEquityTransfer { reservation_id },
+        )
+        .await
+        .context("failed to release operator equity-transfer reservation")
+}
+
+async fn admit_operator_equity_transfer(
+    position_store: &Store<Position>,
+    symbol: &Symbol,
+    threshold: ExecutionThreshold,
+    reservation_id: EquityTransferReservationId,
+    admission: OperatorTransferAdmission,
+) -> anyhow::Result<()> {
+    match admission {
+        OperatorTransferAdmission::Fresh => {
+            position_store
+                .send(
+                    symbol,
+                    PositionCommand::ReserveEquityTransfer {
+                        symbol: symbol.clone(),
+                        threshold,
+                        reservation_id,
+                    },
+                )
+                .await
+                .context("operator equity transfer rejected by Position admission")?;
+
+            if let Err(error) = position_store
+                .send(
+                    symbol,
+                    PositionCommand::ConfirmEquityTransfer { reservation_id },
+                )
+                .await
+            {
+                if let Err(release_error) =
+                    release_operator_equity_transfer(position_store, symbol, reservation_id).await
+                {
+                    return Err(error).context(format!(
+                        "operator equity-transfer reservation could not be confirmed and its \
+                         invalidated reservation could not be released: {release_error:#}"
+                    ));
+                }
+                return Err(error)
+                    .context("operator equity-transfer reservation could not be confirmed");
+            }
+        }
+        OperatorTransferAdmission::Resume => {
+            position_store
+                .send(
+                    symbol,
+                    PositionCommand::RestoreEquityTransferReservation {
+                        symbol: symbol.clone(),
+                        threshold,
+                        reservation_id,
+                    },
+                )
+                .await
+                .context("operator equity-transfer reservation could not be restored")?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_operator_equity_transfer<F>(
+    services: &EquityTransferCliServices,
+    symbol: &Symbol,
+    reservation_id: EquityTransferReservationId,
+    admission: OperatorTransferAdmission,
+    lifecycle: OperatorTransferLifecycle<'_>,
+    transfer: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    admit_operator_equity_transfer(
+        &services.position_store,
+        symbol,
+        services.execution_threshold,
+        reservation_id,
+        admission,
+    )
+    .await?;
+
+    let result = transfer.await;
+    if (result.is_ok() || !lifecycle.is_live().await)
+        && let Err(release_error) =
+            release_operator_equity_transfer(&services.position_store, symbol, reservation_id).await
+    {
+        return match result {
+            Ok(()) => Err(release_error),
+            Err(error) => Err(error.context(format!(
+                "the transfer also failed to release its Position reservation: \
+                 {release_error:#}"
+            ))),
+        };
+    }
+
+    result
 }
 
 /// Gas readiness for the USDC corridor (Base and Ethereum).
@@ -291,11 +440,22 @@ async fn build_equity_transfer_services(
         StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(services.clone())
             .await?;
+    let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
+        .build(())
+        .await?;
 
-    let transfer = CrossVenueEquityTransfer::new(services, mint_store, redemption_store);
+    let transfer = CrossVenueEquityTransfer::new(
+        services,
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    );
 
     Ok(EquityTransferCliServices {
         transfer,
+        mint_store,
+        redemption_store,
+        position_store,
+        execution_threshold: ctx.execution_threshold,
         wallet,
         vault_registry,
     })
@@ -358,8 +518,9 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         (TransferDirection::ToRaindex, None) | (TransferDirection::ToAlpaca, _) => None,
     };
 
-    match recorded {
-        Some((id, recorded)) if recorded != chain => {
+    let existing_mint = recorded.is_some();
+    match &recorded {
+        Some((id, recorded)) if *recorded != chain => {
             anyhow::bail!(
                 "mint {id} was requested on {recorded}; --network {chain} would resume it \
                  against another chain's orderbook and issuer wallet. Re-run with \
@@ -382,7 +543,6 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     let cli_services =
         build_equity_transfer_services(redemption_wallet, network, ctx, pool).await?;
     writeln!(stdout, "   Vault registry: {}", cli_services.vault_registry)?;
-    let equity_transfer = cli_services.transfer;
 
     match direction {
         TransferDirection::ToRaindex => {
@@ -396,10 +556,9 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
             writeln!(stdout, "   Creating mint request...")?;
             writeln!(stdout, "   Receiving Wallet: {}", cli_services.wallet)?;
 
-            let (issuer_request_id, fresh_mint) = issuer_request_id.map_or_else(
-                || (IssuerRequestId::generate(), true),
-                |uuid| (IssuerRequestId(uuid), false),
-            );
+            let issuer_request_id =
+                issuer_request_id.map_or_else(IssuerRequestId::generate, IssuerRequestId);
+            let fresh_mint = !existing_mint;
 
             if fresh_mint {
                 writeln!(stdout, "Equity mint issuer_request_id: {issuer_request_id}")?;
@@ -411,9 +570,33 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
                 stdout.flush()?;
             }
 
-            equity_transfer
-                .resume_equity_to_market_making(&issuer_request_id, &symbol, chain, quantity)
-                .await?;
+            Box::pin(run_operator_equity_transfer(
+                &cli_services,
+                &symbol,
+                issuer_request_id.0.into(),
+                if fresh_mint {
+                    OperatorTransferAdmission::Fresh
+                } else {
+                    OperatorTransferAdmission::Resume
+                },
+                OperatorTransferLifecycle::Mint {
+                    store: &cli_services.mint_store,
+                    id: &issuer_request_id,
+                },
+                async {
+                    cli_services
+                        .transfer
+                        .resume_equity_to_market_making(
+                            &issuer_request_id,
+                            &symbol,
+                            chain,
+                            quantity,
+                        )
+                        .await
+                        .map_err(Into::into)
+                },
+            ))
+            .await?;
 
             writeln!(stdout, "✅ Mint completed successfully")?;
         }
@@ -422,9 +605,24 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
             let aggregate_id = RedemptionAggregateId::generate();
-            equity_transfer
-                .resume_equity_to_hedging(&aggregate_id, &symbol, chain, quantity)
-                .await?;
+            Box::pin(run_operator_equity_transfer(
+                &cli_services,
+                &symbol,
+                aggregate_id.as_uuid().into(),
+                OperatorTransferAdmission::Fresh,
+                OperatorTransferLifecycle::Redemption {
+                    store: &cli_services.redemption_store,
+                    id: &aggregate_id,
+                },
+                async {
+                    cli_services
+                        .transfer
+                        .resume_equity_to_hedging(&aggregate_id, &symbol, chain, quantity)
+                        .await
+                        .map_err(Into::into)
+                },
+            ))
+            .await?;
 
             writeln!(stdout, "✅ Redemption completed successfully")?;
         }
@@ -1883,6 +2081,7 @@ mod tests {
     use chrono::Utc;
     use rain_math_float::Float;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use uuid::uuid;
 
@@ -1904,7 +2103,7 @@ mod tests {
     use st0x_evm::StubWallet;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTransferId,
-        AlpacaWalletError, ClientOrderId, TimeInForce,
+        AlpacaWalletError, ClientOrderId, Direction, SupportedExecutor, TimeInForce,
     };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
@@ -1913,7 +2112,9 @@ mod tests {
     };
     use st0x_hedge::operator::inventory::ImbalanceThreshold;
     use st0x_hedge::operator::mint_authorization::StubVaultModeReader;
+    use st0x_hedge::operator::offchain::order::OffchainOrderId;
     use st0x_hedge::operator::onchain::mock::MockRaindex;
+    use st0x_hedge::operator::position::TradeId;
     use st0x_hedge::operator::test_utils::try_setup_test_db;
     use st0x_hedge::operator::usdc_rebalance::{
         ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
@@ -1969,6 +2170,192 @@ mod tests {
         try_setup_test_db()
             .await
             .expect("test database setup must succeed")
+    }
+
+    async fn test_equity_transfer_cli_services(pool: &SqlitePool) -> EquityTransferCliServices {
+        let services = chain_keyed_redemption_services();
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let transfer = CrossVenueEquityTransfer::new(
+            services,
+            Arc::clone(&mint_store),
+            Arc::clone(&redemption_store),
+        );
+
+        EquityTransferCliServices {
+            transfer,
+            mint_store,
+            redemption_store,
+            position_store,
+            execution_threshold: ExecutionThreshold::whole_share(),
+            wallet: Address::ZERO,
+            vault_registry: VaultRegistryId::new(Chain::Base, Address::ZERO, Address::ZERO),
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_operator_equity_transfer_does_not_start_while_hedge_is_pending() {
+        let pool = setup_test_db().await;
+        let services = test_equity_transfer_cli_services(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+
+        services
+            .position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: services.execution_threshold,
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: B256::ZERO,
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        services
+            .position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: services.execution_threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        let issuer_request_id = IssuerRequestId::generate();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_by_transfer = Arc::clone(&invoked);
+        let error = run_operator_equity_transfer(
+            &services,
+            &symbol,
+            issuer_request_id.0.into(),
+            OperatorTransferAdmission::Fresh,
+            OperatorTransferLifecycle::Mint {
+                store: &services.mint_store,
+                id: &issuer_request_id,
+            },
+            async move {
+                invoked_by_transfer.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Position admission"),
+            "unexpected refusal: {error:#}"
+        );
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "the transfer saga must not run while a hedge owns the symbol"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_operator_equity_transfer_releases_position_ownership() {
+        let pool = setup_test_db().await;
+        let services = test_equity_transfer_cli_services(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let issuer_request_id = IssuerRequestId::generate();
+
+        run_operator_equity_transfer(
+            &services,
+            &symbol,
+            issuer_request_id.0.into(),
+            OperatorTransferAdmission::Fresh,
+            OperatorTransferLifecycle::Mint {
+                store: &services.mint_store,
+                id: &issuer_request_id,
+            },
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
+
+        let position = services
+            .position_store
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn interrupted_live_operator_equity_transfer_retains_position_ownership() {
+        let pool = setup_test_db().await;
+        let services = test_equity_transfer_cli_services(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let issuer_request_id = IssuerRequestId::generate();
+        services
+            .mint_store
+            .send(
+                &issuer_request_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: issuer_request_id.clone(),
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    quantity: float!(1),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+
+        let reservation_id = EquityTransferReservationId::from(issuer_request_id.0);
+        let error = run_operator_equity_transfer(
+            &services,
+            &symbol,
+            reservation_id,
+            OperatorTransferAdmission::Resume,
+            OperatorTransferLifecycle::Mint {
+                store: &services.mint_store,
+                id: &issuer_request_id,
+            },
+            async { anyhow::bail!("transfer interrupted") },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "transfer interrupted");
+        let position = services
+            .position_store
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            position
+                .equity_transfer_reservation
+                .expect("live transfer must retain ownership")
+                .id,
+            reservation_id
+        );
     }
 
     /// Every wait outcome the apalis worker delayed-redrives must classify as

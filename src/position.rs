@@ -96,6 +96,11 @@ impl EquityTransferReservationId {
         self.0
     }
 }
+impl From<Uuid> for EquityTransferReservationId {
+    fn from(id: Uuid) -> Self {
+        Self(id)
+    }
+}
 
 impl std::fmt::Display for EquityTransferReservationId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

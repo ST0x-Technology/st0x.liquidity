@@ -827,7 +827,9 @@ pub mod position {
     use crate::offchain::order::{OffchainOrder, OffchainOrderId};
     use crate::operator::{OperatorError, RejectionReason};
 
-    pub use crate::position::{AnchorDisposition, Position, PositionCommand};
+    pub use crate::position::{
+        AnchorDisposition, EquityTransferReservationId, Position, PositionCommand,
+    };
 
     #[cfg(feature = "test-support")]
     pub use crate::position::{PositionEvent, TradeId};
