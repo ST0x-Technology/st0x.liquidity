@@ -23,7 +23,7 @@ impl std::fmt::Debug for Usdc {
 
 impl Usdc {
     #[must_use]
-    pub fn new(value: Float) -> Self {
+    pub const fn new(value: Float) -> Self {
         Self(value)
     }
 

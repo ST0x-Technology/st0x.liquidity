@@ -66,9 +66,14 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
         if balance.is_zero() {
             anyhow::bail!("Balance is zero");
         }
-        // Fee is 1 bps (0.01%). To use full balance: amount + fee = balance
-        // amount * 1.0001 = balance => amount = balance * 10000 / 10001
-        balance * U256::from(10000) / U256::from(10001)
+        // Burn the entire balance so the source wallet is swept to exactly zero.
+        // The CCTP fast-transfer fee is collected from the minted amount on the
+        // destination (the mint event reports fee_collected), not added to the
+        // burn debit, so passing the full balance drains the wallet to 0 and the
+        // recipient receives balance minus fee. The old `balance * 10000 / 10001`
+        // fee reservation left a 1-unit remainder that re-tripped the wallet-empty
+        // preflight (RAI-2495).
+        balance
     } else {
         let usdc_amount = amount.ok_or_else(|| anyhow::anyhow!("specify --amount or --all"))?;
         usdc_amount.to_u256_6_decimals()?

@@ -34,8 +34,8 @@ use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
-    ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand,
-    UsdcRebalanceId,
+    AMBIENT_DUST_THRESHOLD, ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance,
+    UsdcRebalanceCommand, UsdcRebalanceId,
 };
 
 /// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
@@ -1646,13 +1646,17 @@ impl<
         // invariant is that the market-maker wallet is flushed to zero by each
         // CCTP burn, so the balance after a withdrawal == the received amount.
         //
-        // Three cases:
-        //   actual == 0            -> delayed-redrive (settlement not yet on-chain)
-        //   0 < actual <= nominal  -> burn actual (valid; fee-reduced received amount)
-        //   actual > nominal       -> explicit reconciliation error (wallet-empty
-        //                            invariant broken; ambient/residual USDC present;
-        //                            cannot distinguish withdrawal from residual)
+        // Cases (dust epsilon: AMBIENT_DUST_THRESHOLD of ambient USDC is
+        // tolerated and rides along with the burn, mirroring the pre-flight check
+        // so that a pre-flight pass never strands withdrawn funds here):
+        //   actual == 0                       -> delayed-redrive (not yet on-chain)
+        //   0 < actual <= nominal + threshold -> burn actual (valid; fee-reduced
+        //                                        receipt and/or tolerated dust)
+        //   actual > nominal + threshold      -> reconciliation error (wallet-empty
+        //                                        invariant broken; genuine ambient/
+        //                                        residual USDC present)
         let nominal_u256 = usdc_to_u256(amount)?;
+        let dust_u256 = usdc_to_u256(AMBIENT_DUST_THRESHOLD)?;
         // Deadline-gated like the confirmation check above: a persistent
         // balance-read failure must not redrive forever unbounded.
         let actual_balance = match self.read_ethereum_usdc_balance(id).await {
@@ -1685,12 +1689,13 @@ impl<
                 id: id.clone(),
                 nominal: amount,
             });
-        } else if actual_balance > nominal_u256 {
-            // Wallet holds MORE than the nominal: the wallet-empty invariant is
-            // broken. Ambient or residual USDC from a prior rebalance is present
-            // and we cannot distinguish those funds from this withdrawal's funds.
-            // Burning any amount here would risk burning funds belonging to a
-            // prior rebalance. Emit FailBridging for operator reconciliation.
+        } else if actual_balance > nominal_u256.saturating_add(dust_u256) {
+            // Wallet holds more than nominal plus the tolerated dust: the
+            // wallet-empty invariant is broken. Genuine ambient or residual USDC
+            // from a prior rebalance is present and we cannot distinguish those
+            // funds from this withdrawal's funds. Burning any amount here would
+            // risk burning funds belonging to a prior rebalance. Emit FailBridging
+            // for operator reconciliation.
             let balance = u256_to_usdc(actual_balance)?;
             error!(
                 target: "rebalance",
@@ -1719,11 +1724,14 @@ impl<
                 nominal: amount,
             });
         } else {
-            // Wallet holds between 0 (exclusive) and nominal (inclusive).
-            // This is the valid range under the wallet-empty invariant:
-            // actual == nominal is the exact-receipt case (no fee), and
-            // actual < nominal is the fee-deducted received amount (prod scenario).
-            // Burn what arrived.
+            // Wallet holds between 0 (exclusive) and nominal + threshold
+            // (inclusive): the valid range. actual == nominal is the exact-receipt
+            // case, actual < nominal the fee-deducted receipt, and
+            // nominal < actual <= nominal + threshold is tolerated dust riding
+            // along (mirrors the pre-flight epsilon). Burn the full balance so the
+            // wallet drains to zero -- the aggregate accepts a burn up to
+            // nominal + threshold, so no dust is left behind to wedge the next
+            // rebalance.
 
             // Log the fee delta when Alpaca deducted a withdrawal fee so operators
             // have an audit trail for P&L reconciliation.
@@ -1748,12 +1756,12 @@ impl<
                 },
                 Ok(_) => {}
                 Err(error) => {
-                    // Defensive: `actual_balance <= nominal_u256` and
-                    // `nominal_u256` was produced by `usdc_to_u256(amount)?`
-                    // (lossless), so this conversion should always succeed for
-                    // valid USDC amounts. If it somehow fails (precision overflow
-                    // in a future type change), the burn still proceeds with the
-                    // raw U256 -- only the fee-delta log is skipped.
+                    // Defensive: `nominal_u256` came from `usdc_to_u256(amount)?`
+                    // (lossless) and actual_balance is within nominal + threshold,
+                    // so this conversion should always succeed for valid USDC
+                    // amounts. If it somehow fails (precision overflow in a future
+                    // type change), the burn still proceeds with the full balance
+                    // -- only the fee-delta log is skipped.
                     warn!(
                         target: "rebalance",
                         %id,
@@ -2002,12 +2010,16 @@ impl<
 
         info!(target: "rebalance", %amount, "Starting Alpaca to Base rebalance");
 
-        // Pre-flight wallet-empty check: any ambient USDC in the market-maker
-        // wallet breaks the wallet-empty invariant at burn time, and enforcing
-        // it only at settlement would pull cash out of Alpaca first and strand
-        // the withdrawn USDC on Ethereum. Refuse BEFORE the conversion (the
-        // first aggregate event), so the transfer is a true no-op: nothing to
-        // resume or reconcile, only a wallet sweep for the operator.
+        // Pre-flight wallet-empty check: ambient USDC above
+        // AMBIENT_DUST_THRESHOLD in the market-maker wallet breaks the
+        // wallet-empty invariant at burn time, and enforcing it only at
+        // settlement would pull cash out of Alpaca first and strand the withdrawn
+        // USDC on Ethereum. Refuse BEFORE the conversion (the first aggregate
+        // event), so the transfer is a true no-op: nothing to resume or
+        // reconcile, only a wallet sweep for the operator. Dust at or below the
+        // threshold is tolerated and rides along with the next burn (settlement
+        // applies the same slack), so a fraction-of-a-cent transfer to the public
+        // wallet address cannot wedge rebalancing.
         //
         // Every failure inside this block maps to a pre-flight variant whose
         // worker arm releases the guard: no aggregate exists yet, so any
@@ -2023,8 +2035,9 @@ impl<
                 id: id.clone(),
                 source: Box::new(UsdcTransferError::Cctp(Box::new(error))),
             })?;
-        if ambient > U256::ZERO {
-            // The non-zero balance is already established, so a failing
+        let dust_u256 = usdc_to_u256(AMBIENT_DUST_THRESHOLD)?;
+        if ambient > dust_u256 {
+            // The above-threshold balance is already established, so a failing
             // display conversion must stay an ambient REFUSAL (page, release,
             // no redrive) -- rerouting to the warn-only "balance could not be
             // determined" would silently loop on a deterministic failure.
@@ -13417,9 +13430,10 @@ mod tests {
     /// order, no withdrawal request, and no aggregate event -- nothing to
     /// resume or reconcile.
     ///
-    /// The ambient balance is deliberately BELOW the nominal: the pre-flight
-    /// rule is "refuse on ANY ambient USDC", unlike the settlement-time rule
-    /// that only trips on balance > nominal.
+    /// The ambient balance (50 USDC) is far above AMBIENT_DUST_THRESHOLD and
+    /// below the nominal: the pre-flight rule refuses on ambient above the dust
+    /// threshold before any Alpaca call, unlike the settlement-time rule that
+    /// only trips above nominal + threshold.
     #[tokio::test]
     async fn execute_alpaca_to_base_refuses_ambient_wallet_balance_before_any_alpaca_call() {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
@@ -13525,6 +13539,174 @@ mod tests {
         );
         conversion_mock.assert();
         whitelist_mock.assert();
+    }
+
+    /// Ambient USDC at exactly AMBIENT_DUST_THRESHOLD is tolerated: the
+    /// pre-flight (`ambient > threshold`) passes and the flow proceeds into the
+    /// conversion and withdrawal legs, proven by the same downstream whitelist
+    /// rejection as the empty-wallet case. A fraction-of-a-cent transfer to the
+    /// public wallet address must not wedge rebalancing (RAI-2495).
+    #[tokio::test]
+    async fn execute_alpaca_to_base_tolerates_dust_at_threshold() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(
+            usdc_to_u256(AMBIENT_DUST_THRESHOLD).unwrap(),
+            market_maker_wallet,
+        )
+        .await;
+
+        let server = MockServer::start();
+        let (manager, _cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let conversion_mock =
+            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
+        let _get_order_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "1000",
+        );
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = manager
+            .execute_alpaca_to_base(&id, usdc("1000"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AlpacaWallet(AlpacaWalletError::AddressNotWhitelisted { .. })
+            ),
+            "dust at the threshold must pass pre-flight (not WalletUsdcAmbientPreflight) \
+             and fail downstream at the whitelist; got: {error:?}"
+        );
+        conversion_mock.assert();
+        whitelist_mock.assert();
+    }
+
+    /// Settlement tolerates the same dust slack as the pre-flight: a wallet
+    /// holding `nominal + AMBIENT_DUST_THRESHOLD` proceeds to the burn and sweeps
+    /// the FULL balance (draining to zero) instead of failing for reconciliation.
+    /// The aggregate accepts a burn up to nominal + threshold, so no dust is left
+    /// behind. Without this matching slack a pre-flight pass would strand the
+    /// withdrawn USDC here (RAI-2495).
+    #[tokio::test]
+    async fn settlement_tolerates_dust_above_nominal_and_burns_full_balance() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let nominal = usdc("1000");
+        let nominal_u256 = usdc_to_u256(nominal).unwrap();
+        let balance = nominal_u256 + usdc_to_u256(AMBIENT_DUST_THRESHOLD).unwrap();
+        let chain = deploy_ethereum_usdc_chain_with_balance(balance, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        // REVERT contract at the token messenger so the burn fails predictably
+        // AFTER BeginBridging; we only assert the balance gate did not wedge and
+        // that the burn consumes the full (drained) balance.
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, revert_bytecode)
+            .await
+            .unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, nominal).await;
+
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                nominal,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "dust within slack must proceed to the burn, not a balance-gate wedge; got: {error:?}"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::BridgingSubmitting {
+            direction,
+            burn_amount,
+            ..
+        } = state
+        else {
+            panic!("Expected BridgingSubmitting (burn attempted); got: {state:?}");
+        };
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(
+            burn_amount,
+            Some(u256_to_usdc(balance).unwrap()),
+            "burn must consume the FULL wallet balance (nominal + dust), draining to zero"
+        );
+    }
+
+    /// One unit above `nominal + AMBIENT_DUST_THRESHOLD` is genuine ambient USDC,
+    /// not tolerated dust: settlement must refuse with WalletUsdcAmbientBalance
+    /// and FailBridging for operator reconciliation (RAI-2495 upper boundary).
+    #[tokio::test]
+    async fn settlement_fails_just_above_dust_threshold() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let nominal = usdc("1000");
+        let nominal_u256 = usdc_to_u256(nominal).unwrap();
+        let balance =
+            nominal_u256 + usdc_to_u256(AMBIENT_DUST_THRESHOLD).unwrap() + U256::from(1u64);
+        let chain = deploy_ethereum_usdc_chain_with_balance(balance, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, nominal).await;
+
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                nominal,
+                None,
+                Utc::now(),
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::WalletUsdcAmbientBalance { .. }),
+            "balance above nominal + dust threshold must fail for reconciliation; got: {error:?}"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: None,
+                    ..
+                }
+            ),
+            "must land at pre-burn BridgingFailed; got: {state:?}"
+        );
     }
 
     /// Hypothesis: when the pre-flight balance read itself fails (RPC down),
