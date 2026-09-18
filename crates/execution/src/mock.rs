@@ -820,13 +820,10 @@ mod tests {
             .with_market_session(MarketSession::Extended)
             .with_extended_session_close_metadata(closes_at, PostCloseGap::MultiDayClosure);
 
-        assert_eq!(
-            executor.market_session_status().await.unwrap(),
-            MarketSessionStatus::Extended {
-                closes_at: Some(closes_at),
-                post_close_gap: PostCloseGap::MultiDayClosure,
-            }
-        );
+        let status = executor.market_session_status().await.unwrap();
+        assert_eq!(status.session(), MarketSession::Extended);
+        assert_eq!(status.extended_session_closes_at, Some(closes_at));
+        assert_eq!(status.post_close_gap, PostCloseGap::MultiDayClosure);
     }
 
     #[tokio::test]
@@ -836,7 +833,7 @@ mod tests {
 
         assert_eq!(
             executor.market_session_status().await.unwrap(),
-            MarketSessionStatus::Regular
+            MarketSessionStatus::without_close_metadata(MarketSession::Regular)
         );
     }
 

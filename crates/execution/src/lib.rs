@@ -1089,43 +1089,35 @@ mod tests {
 
     #[test]
     fn session_status_without_close_metadata_preserves_each_session_variant() {
-        assert_eq!(
-            MarketSessionStatus::without_close_metadata(MarketSession::Regular),
-            MarketSessionStatus::Regular
-        );
-        assert_eq!(
-            MarketSessionStatus::without_close_metadata(MarketSession::Extended),
-            MarketSessionStatus::Extended {
-                closes_at: None,
-                post_close_gap: PostCloseGap::Unavailable,
-            }
-        );
-        assert_eq!(
-            MarketSessionStatus::without_close_metadata(MarketSession::Overnight),
-            MarketSessionStatus::Overnight
-        );
-        assert_eq!(
-            MarketSessionStatus::without_close_metadata(MarketSession::Closed),
-            MarketSessionStatus::Closed
-        );
+        for session in [
+            MarketSession::Regular,
+            MarketSession::Extended,
+            MarketSession::Overnight,
+            MarketSession::Closed,
+        ] {
+            let status = MarketSessionStatus::without_close_metadata(session);
+            assert_eq!(status.session(), session);
+            assert!(status.session_opens_at.is_none());
+            assert!(status.regular_session_closes_at.is_none());
+            assert!(status.extended_session_closes_at.is_none());
+            assert_eq!(status.post_close_gap, PostCloseGap::Unavailable);
+        }
     }
 
     #[test]
     fn extended_status_keeps_close_metadata_on_the_extended_variant() {
         let closes_at = Utc::now();
-        let status = MarketSessionStatus::Extended {
-            closes_at: Some(closes_at),
+        let status = MarketSessionStatus {
+            session: MarketSession::Extended,
+            session_opens_at: None,
+            regular_session_closes_at: None,
+            extended_session_closes_at: Some(closes_at),
             post_close_gap: PostCloseGap::Unknown,
         };
 
         assert_eq!(status.session(), MarketSession::Extended);
-        assert_eq!(
-            status,
-            MarketSessionStatus::Extended {
-                closes_at: Some(closes_at),
-                post_close_gap: PostCloseGap::Unknown,
-            }
-        );
+        assert_eq!(status.extended_session_closes_at, Some(closes_at));
+        assert_eq!(status.post_close_gap, PostCloseGap::Unknown);
         assert_ne!(
             status,
             MarketSessionStatus::without_close_metadata(MarketSession::Extended),

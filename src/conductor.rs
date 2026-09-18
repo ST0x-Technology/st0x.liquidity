@@ -5126,13 +5126,8 @@ async fn place_offchain_order(
         return recover_claimed_offchain_order(execution, cqrs).await;
     }
 
-    if !execute_create_offchain_order(
-        execution,
-        cqrs,
-        offchain_order_id,
-        buying_power_reservation,
-    )
-    .await?
+    if !execute_create_offchain_order(execution, cqrs, offchain_order_id, buying_power_reservation)
+        .await?
     {
         return Ok(None);
     }
@@ -5304,12 +5299,7 @@ async fn recover_claimed_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
-    recover_claimed_offchain_order_for_symbol(
-        &execution.symbol,
-        cqrs,
-        execution.executor,
-    )
-    .await
+    recover_claimed_offchain_order_for_symbol(&execution.symbol, cqrs, execution.executor).await
 }
 
 async fn recover_claimed_offchain_order_for_symbol(

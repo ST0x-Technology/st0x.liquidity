@@ -868,13 +868,12 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(status.session(), MarketSession::Extended);
         assert_eq!(
-            status,
-            MarketSessionStatus::Extended {
-                closes_at: Some(et_time_as_utc("2025-01-06", 20, 0)),
-                post_close_gap: PostCloseGap::Unknown,
-            }
+            status.extended_session_closes_at,
+            Some(et_time_as_utc("2025-01-06", 20, 0))
         );
+        assert_eq!(status.post_close_gap, PostCloseGap::Unknown);
     }
 
     #[tokio::test]
@@ -949,7 +948,7 @@ mod tests {
 
         let status = market_session_status_at(&client, midday).await.unwrap();
 
-        assert_eq!(status, MarketSessionStatus::Regular);
+        assert_eq!(status.session(), MarketSession::Regular);
         lookahead_mock.assert_calls(0);
     }
 
@@ -967,7 +966,8 @@ mod tests {
 
         assert!(matches!(
             status,
-            MarketSessionStatus::Extended {
+            MarketSessionStatus {
+                session: MarketSession::Extended,
                 post_close_gap: PostCloseGap::OrdinaryOvernight,
                 ..
             }
@@ -988,7 +988,8 @@ mod tests {
 
         assert!(matches!(
             status,
-            MarketSessionStatus::Extended {
+            MarketSessionStatus {
+                session: MarketSession::Extended,
                 post_close_gap: PostCloseGap::MultiDayClosure,
                 ..
             }
@@ -1009,7 +1010,8 @@ mod tests {
 
         assert!(matches!(
             status,
-            MarketSessionStatus::Extended {
+            MarketSessionStatus {
+                session: MarketSession::Extended,
                 post_close_gap: PostCloseGap::MultiDayClosure,
                 ..
             }
@@ -1030,7 +1032,8 @@ mod tests {
 
         assert!(matches!(
             status,
-            MarketSessionStatus::Extended {
+            MarketSessionStatus {
+                session: MarketSession::Extended,
                 post_close_gap: PostCloseGap::Unknown,
                 ..
             }
@@ -1062,13 +1065,12 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(status.session(), MarketSession::Extended);
         assert_eq!(
-            status,
-            MarketSessionStatus::Extended {
-                closes_at: Some(et_time_as_utc("2025-07-03", 17, 0)),
-                post_close_gap: PostCloseGap::MultiDayClosure,
-            }
+            status.extended_session_closes_at,
+            Some(et_time_as_utc("2025-07-03", 17, 0))
         );
+        assert_eq!(status.post_close_gap, PostCloseGap::MultiDayClosure);
     }
 
     #[tokio::test]
@@ -1117,7 +1119,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(status, MarketSessionStatus::Overnight);
+        assert_eq!(status.session(), MarketSession::Overnight);
     }
 
     #[tokio::test]
@@ -1450,7 +1452,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(status, MarketSessionStatus::Overnight);
+        assert_eq!(status.session(), MarketSession::Overnight);
         lookahead_mock.assert_calls(0);
     }
 
