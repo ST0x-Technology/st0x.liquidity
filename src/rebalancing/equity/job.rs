@@ -3180,7 +3180,9 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(1),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_u64),
+                    from_block: 0,
                 },
             )
             .await

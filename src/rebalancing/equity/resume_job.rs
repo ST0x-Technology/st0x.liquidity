@@ -578,10 +578,11 @@ mod tests {
         let id = redemption_aggregate_id("resume-redemption-completed");
         let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
 
-        // Drive redemption to Completed: Redeem -> SubmitWithdraw ->
-        // ConfirmWithdraw -> UnwrapTokens -> SubmitUnwrap -> ConfirmUnwrap ->
-        // PrepareSend -> SendTokens -> (TokensSent). Then detect via DetectSend.
-        // MockRaindex and MockWrapper complete synchronously.
+        // Drive redemption to Completed: Redeem ->
+        // RecordWithdrawSubmission -> ConfirmWithdraw -> UnwrapTokens ->
+        // SubmitUnwrap -> ConfirmUnwrap -> PrepareSend -> SendTokens ->
+        // (TokensSent). Then detect via DetectSend. Mock services complete
+        // synchronously.
         redemption_store
             .send(
                 &id,
@@ -590,7 +591,9 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
                 },
             )
             .await
@@ -598,7 +601,9 @@ mod tests {
 
         // Drive through intermediate states to SendPending.
         for cmd in [
-            EquityRedemptionCommand::SubmitWithdraw,
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+            },
             EquityRedemptionCommand::ConfirmWithdraw,
             EquityRedemptionCommand::UnwrapTokens,
             EquityRedemptionCommand::SubmitUnwrap,
@@ -889,13 +894,17 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(1.0),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
                 },
             )
             .await
             .unwrap();
         for command in [
-            EquityRedemptionCommand::SubmitWithdraw,
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+            },
             EquityRedemptionCommand::ConfirmWithdraw,
             EquityRedemptionCommand::UnwrapTokens,
             EquityRedemptionCommand::SubmitUnwrap,
@@ -1383,13 +1392,17 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: float!(1.0),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
                 },
             )
             .await
             .unwrap();
         for cmd in [
-            EquityRedemptionCommand::SubmitWithdraw,
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+            },
             EquityRedemptionCommand::ConfirmWithdraw,
             EquityRedemptionCommand::UnwrapTokens,
             EquityRedemptionCommand::SubmitUnwrap,

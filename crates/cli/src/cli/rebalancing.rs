@@ -3849,13 +3849,20 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(1),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
                 },
             )
             .await
             .unwrap();
         store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
             .await
             .unwrap();
 
@@ -5357,12 +5364,22 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
+                    from_block: 0,
                 },
             )
             .await
             .unwrap();
-        store.send(id, SubmitWithdraw).await.unwrap();
+        store
+            .send(
+                id,
+                RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
         store.send(id, ConfirmWithdraw).await.unwrap();
     }
 

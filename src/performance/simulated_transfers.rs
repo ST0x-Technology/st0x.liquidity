@@ -848,6 +848,26 @@ impl Raindex for FixtureRaindex {
         ))
     }
 
+    async fn current_block(&self) -> Result<u64, RaindexError> {
+        Ok(self.block_number.saturating_sub(1))
+    }
+
+    async fn find_recent_withdrawal(
+        &self,
+        _token: Address,
+        _vault_id: RaindexVaultId,
+        _from_block: u64,
+    ) -> Result<Option<(TxHash, U256)>, RaindexError> {
+        Ok(self.pending_withdraw.lock().await.map(|(_, amount)| {
+            (
+                TxHash::left_padding_from(
+                    simulated_transfer_uuid("redeem-withdraw-tx", self.day).as_bytes(),
+                ),
+                amount,
+            )
+        }))
+    }
+
     async fn confirm_tx_receipt(
         &self,
         tx_hash: TxHash,
@@ -1032,19 +1052,16 @@ impl Wrapper for FixtureWrapper {
 /// simulation.
 ///
 /// Drives the `EquityRedemption` aggregate's happy path (`RedeemAt` ->
-/// `SubmitWithdrawAt` -> `ConfirmWithdrawAt` -> `UnwrapTokensAt` ->
-/// `SubmitUnwrapAt` -> `ConfirmUnwrapAt` -> `PrepareSendAt` ->
-/// `SendTokensAt` -> `DetectAt` -> `CompleteAt`), one redemption per day
-/// alternating between the same dedicated fixture symbols
-/// (`AAPL.SIM`/`TSLA.SIM`) used by [`super::seed_simulated_hedge_latency_history`].
+/// direct Raindex submission -> `RecordWithdrawSubmissionAt` ->
+/// `ConfirmWithdrawAt` -> `UnwrapTokensAt` -> `SubmitUnwrapAt` ->
+/// `ConfirmUnwrapAt` -> `PrepareSendAt` -> `SendTokensAt` -> `DetectAt` ->
+/// `CompleteAt`), one redemption per day alternating between the same
+/// dedicated fixture symbols (`AAPL.SIM`/`TSLA.SIM`) used by
+/// [`super::seed_simulated_hedge_latency_history`].
 ///
-/// Unlike the mint/USDC fixtures, `EquityRedemption`'s service-calling
-/// commands (`SubmitWithdraw`/`ConfirmWithdraw`/`SubmitUnwrap`/
-/// `ConfirmUnwrap`/`SendTokens`) drive the side effect FROM WITHIN
-/// `transition()` itself (mint's analogous commands take the service
-/// result as command input instead), so a fresh, single-cycle-scoped
-/// `FixtureRaindex`/`FixtureVaultLookup`/`FixtureWrapper` triple is
-/// built for every redemption.
+/// A fresh, single-cycle-scoped `FixtureRaindex`/`FixtureVaultLookup`/
+/// `FixtureWrapper` triple is built for every redemption so the explicit
+/// submission can feed the subsequent confirmation step deterministically.
 pub async fn seed_simulated_equity_redemption_history(
     pool: &SqlitePool,
     now: DateTime<Utc>,
@@ -1070,13 +1087,14 @@ pub async fn seed_simulated_equity_redemption_history(
         ));
         let withdraw_block = 4_000_000_u64 + u64::from(day) * 10;
         let unwrap_block = withdraw_block + 5;
+        let raindex = Arc::new(FixtureRaindex::new(owner, withdraw_block, day));
 
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainEquityServices {
                     wallet: Address::ZERO,
-                    raindex: Arc::new(FixtureRaindex::new(owner, withdraw_block, day)),
+                    raindex: raindex.clone(),
                     vault_lookup: Arc::new(FixtureVaultLookup::new(vault_id)),
                     tokenizer: Arc::new(FixtureTokenizer::new(redemption_wallet, day)),
                     wrapper: Arc::new(FixtureWrapper::new(
@@ -1124,16 +1142,24 @@ pub async fn seed_simulated_equity_redemption_history(
                     chain: Chain::Base,
                     quantity,
                     token,
+                    vault_id,
                     amount: wrapped_amount,
-                    pending_at,
+                    from_block: withdraw_block.saturating_sub(1),
+                    submitting_at: pending_at,
                 },
             )
             .await?;
 
+        let withdraw_tx = raindex
+            .submit_withdraw(token, vault_id, wrapped_amount, TOKENIZED_EQUITY_DECIMALS)
+            .await?;
         redemption
             .send(
                 &id,
-                EquityRedemptionCommand::SubmitWithdrawAt { submitted_at },
+                EquityRedemptionCommand::RecordWithdrawSubmissionAt {
+                    tx_hash: withdraw_tx,
+                    submitted_at,
+                },
             )
             .await?;
 

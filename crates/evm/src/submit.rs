@@ -323,6 +323,30 @@ where
         Err(error) => error,
     };
 
+    if let Some(tx_hash) = error.already_known_tx_hash() {
+        info!(
+            target: "wallet",
+            %tx_hash,
+            note,
+            nonce,
+            "Transaction already known by RPC; recovered submitted hash"
+        );
+        in_flight.record(address, nonce, tx_hash);
+        return Ok(tx_hash);
+    }
+
+    if error.is_already_known() {
+        warn!(
+            target: "wallet",
+            %contract,
+            note,
+            nonce,
+            "Transaction already known by RPC without a recoverable hash; \
+             preserving nonce cache for chain reconciliation"
+        );
+        return Err(EvmError::SubmissionAlreadyKnown { nonce });
+    }
+
     if error.is_nonce_too_low() {
         return retry_after_nonce_too_low(
             submitter,
@@ -753,6 +777,31 @@ where
                 in_flight.record(address, next_nonce, tx_hash);
                 return Ok(tx_hash);
             }
+            Err(retry_error) if retry_error.is_already_known() => {
+                if let Some(tx_hash) = retry_error.already_known_tx_hash() {
+                    info!(
+                        target: "wallet",
+                        %tx_hash,
+                        note,
+                        attempt,
+                        nonce = next_nonce,
+                        "Nonce-recovery transaction already known by RPC; recovered submitted hash"
+                    );
+                    in_flight.record(address, next_nonce, tx_hash);
+                    return Ok(tx_hash);
+                }
+
+                warn!(
+                    target: "wallet",
+                    %contract,
+                    note,
+                    attempt,
+                    nonce = next_nonce,
+                    "Nonce-recovery transaction already known without a recoverable hash; \
+                     preserving nonce cache for chain reconciliation"
+                );
+                return Err(EvmError::SubmissionAlreadyKnown { nonce: next_nonce });
+            }
             Err(retry_error) if retry_error.is_nonce_too_low() => {
                 nonce_floor = Some(raise_nonce_floor(nonce_floor, next_nonce.saturating_add(1)));
                 error = retry_error;
@@ -908,6 +957,32 @@ where
             Err(error) => error,
         };
 
+        if let Some(tx_hash) = error.already_known_tx_hash() {
+            info!(
+                target: "wallet",
+                %tx_hash,
+                note,
+                attempt,
+                nonce,
+                "Replacement transaction already known by RPC; recovered submitted hash"
+            );
+            in_flight.record(address, nonce, tx_hash);
+            return Ok(tx_hash);
+        }
+
+        if error.is_already_known() {
+            warn!(
+                target: "wallet",
+                %contract,
+                note,
+                attempt,
+                nonce,
+                "Replacement transaction already known without a recoverable hash; \
+                 preserving nonce cache for chain reconciliation"
+            );
+            return Err(EvmError::SubmissionAlreadyKnown { nonce });
+        }
+
         if error.is_replacement_underpriced() {
             warn!(target: "wallet", %contract, note, attempt, "Replacement still \
                 underpriced; escalating fee");
@@ -1014,6 +1089,13 @@ mod tests {
             code: -32000,
             message: message.into(),
             data: None,
+        }))
+    }
+    fn already_known_with_data(data: &str) -> EvmError {
+        EvmError::Transport(RpcError::ErrorResp(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("already known"),
+            data: Some(serde_json::value::to_raw_value(data).expect("valid JSON")),
         }))
     }
 
@@ -1468,6 +1550,86 @@ mod tests {
         assert_eq!(
             sent[0].max_fee_per_gas, None,
             "base send must not set a fee"
+        );
+    }
+    #[tokio::test]
+    async fn already_known_with_hash_is_accepted_without_resubmit_or_cache_invalidation() {
+        let hash = TxHash::repeat_byte(0x13);
+        let mock = MockSubmitter::new(vec![Err(already_known_with_data(&hash.to_string()))]);
+
+        let (result, nonce_manager, in_flight) = run_with_manager_and_tracker(&mock).await;
+
+        assert_eq!(result.unwrap(), hash);
+        assert_eq!(mock.sent().len(), 1, "already-known must not resubmit");
+        assert_eq!(
+            nonce_manager.peek_next_nonce(WALLET).await,
+            Some(1),
+            "the accepted transaction consumed nonce zero; its cache must remain advanced"
+        );
+        assert_eq!(
+            in_flight.ownership(WALLET, 0),
+            NonceOwnership::Ours,
+            "a recovered hash proves the already-known transaction belongs to this wallet"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_known_without_hash_is_indeterminate_without_resubmit_or_cache_invalidation() {
+        let mock = MockSubmitter::new(vec![Err(rpc_error("already known"))]);
+
+        let (result, nonce_manager, in_flight) = run_with_manager_and_tracker(&mock).await;
+
+        assert!(matches!(
+            result,
+            Err(EvmError::SubmissionAlreadyKnown { nonce: 0 })
+        ));
+        assert_eq!(mock.sent().len(), 1, "already-known must not resubmit");
+        assert_eq!(
+            nonce_manager.peek_next_nonce(WALLET).await,
+            Some(1),
+            "an indeterminate accepted broadcast must preserve the advanced nonce cache"
+        );
+        assert_eq!(
+            in_flight.ownership(WALLET, 0),
+            NonceOwnership::Unknown,
+            "without a hash the wallet cannot invent in-flight ownership evidence"
+        );
+    }
+    #[tokio::test]
+    async fn already_known_during_fee_replacement_stops_without_another_resubmit() {
+        let hash = TxHash::repeat_byte(0x14);
+        let mock = MockSubmitter::new(vec![
+            Err(underpriced()),
+            Err(already_known_with_data(&hash.to_string())),
+        ]);
+
+        let (result, nonce_manager, in_flight) = run_with_manager_and_tracker(&mock).await;
+
+        assert_eq!(result.unwrap(), hash);
+        assert_eq!(mock.sent().len(), 2);
+        assert_eq!(nonce_manager.peek_next_nonce(WALLET).await, Some(1));
+        assert_eq!(in_flight.ownership(WALLET, 0), NonceOwnership::Ours);
+    }
+
+    #[tokio::test]
+    async fn already_known_during_nonce_recovery_is_indeterminate_without_another_resubmit() {
+        let mock = MockSubmitter::new(vec![
+            Err(nonce_too_low_with_hint()),
+            Err(rpc_error("already known")),
+        ]);
+
+        let (result, nonce_manager) = run_with_manager(&mock).await;
+
+        assert!(matches!(
+            result,
+            Err(EvmError::SubmissionAlreadyKnown {
+                nonce: HINTED_NONCE
+            })
+        ));
+        assert_eq!(mock.sent().len(), 2);
+        assert_eq!(
+            nonce_manager.peek_next_nonce(WALLET).await,
+            Some(HINTED_NONCE + 1)
         );
     }
 

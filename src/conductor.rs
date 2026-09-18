@@ -7493,7 +7493,9 @@ mod tests {
                     symbol: st0x_execution::Symbol::new("TSLA").unwrap(),
                     quantity: st0x_float_macro::float!(5.0),
                     token: alloy::primitives::Address::from([wallet_byte; 20]),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: alloy::primitives::U256::from(5_000_000_000_000_000_000_u128),
+                    from_block: 0,
                 },
             )
             .await
@@ -8646,7 +8648,9 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(3),
                     token: Address::from([7; 20]),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(3_000_000_000_000_000_000_u128),
+                    from_block: 0,
                 },
             )
             .await

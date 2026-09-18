@@ -722,6 +722,19 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         Ok(tx_hash)
     }
 
+    async fn current_block(&self) -> Result<u64, RaindexError> {
+        Self::current_block(self).await
+    }
+
+    async fn find_recent_withdrawal(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        from_block: u64,
+    ) -> Result<Option<(TxHash, U256)>, RaindexError> {
+        Self::find_recent_withdrawal(self, token, vault_id, from_block).await
+    }
+
     async fn confirm_tx_receipt(
         &self,
         tx_hash: TxHash,

@@ -3327,7 +3327,9 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WithdrawnFromRaindex: Withdraw
+    [*] --> VaultWithdrawSubmitting: Redeem (persists intent)
+    VaultWithdrawSubmitting --> VaultWithdrawSubmitted: RecordWithdrawSubmission
+    VaultWithdrawSubmitted --> WithdrawnFromRaindex: ConfirmWithdraw
     WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
     WithdrawnFromRaindex --> Failed
     TokensUnwrapped --> TokensSent: Send
@@ -3338,14 +3340,22 @@ stateDiagram-v2
     Pending --> Failed
 ```
 
-- `Withdraw` command withdraws wrapped tokens from Raindex vault to wallet
-- `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but aren't
+- `Redeem` persists `VaultWithdrawSubmitting` with the chain, token, vault ID,
+  target amount, and pre-submission chain head before any withdrawal is
+  broadcast
+- the orchestrator submits the withdrawal outside the aggregate transition and
+  records its hash with `RecordWithdrawSubmission`
+- resume scans from the recorded chain head and adopts the matching
+  `OperatorWithdraw`; it submits only after a finality-gated scan proves absence
+- `VaultWithdrawSubmitted` tracks the known transaction hash until
+  `ConfirmWithdraw` confirms the receipt
+- `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but are not
   yet unwrapped
-- `Unwrap` command converts ERC-4626 wrapped tokens to unwrapped tokens;
-  confirmation records the token the vault reports as its `asset()` at the
-  redeem block as a typed `UnwrappedToken`
+- `Unwrap` converts ERC-4626 wrapped tokens to unwrapped tokens; confirmation
+  records the token the vault reports as its `asset()` at the redeem block as a
+  typed `UnwrappedToken`
 - `TokensUnwrapped` tracks the attested `UnwrappedToken` ready to send
-- `Send` command sends unwrapped tokens to Alpaca and polls until terminal
+- `Send` sends unwrapped tokens to Alpaca and polls until terminal
 - `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
 - `Pending` indicates Alpaca detected the transfer
 - `Completed` and `Failed` are terminal states
@@ -3354,6 +3364,25 @@ stateDiagram-v2
 
 ```rust
 enum EquityRedemption {
+    VaultWithdrawSubmitting {
+        symbol: Symbol,
+        chain: Chain,
+        quantity: Decimal,
+        token: Address,
+        vault_id: RaindexVaultId,
+        wrapped_amount: U256,
+        from_block: u64,
+        submitting_at: DateTime<Utc>,
+    },
+    VaultWithdrawSubmitted {
+        symbol: Symbol,
+        chain: Chain,
+        quantity: Decimal,
+        token: Address,
+        wrapped_amount: U256,
+        tx_hash: TxHash,
+        submitted_at: DateTime<Utc>,
+    },
     WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
@@ -3417,13 +3446,20 @@ enum EquityRedemption {
 
 ```rust
 enum EquityRedemptionCommand {
-    // Withdraws wrapped tokens from Raindex vault to wallet
+    // Initialize: persists the withdrawal intent without an external call.
     Redeem {
         symbol: Symbol,
+        chain: Chain,
         quantity: Decimal,
         token: Address,
+        vault_id: RaindexVaultId,
         amount: U256,
+        from_block: u64,
     },
+    // Records a transaction returned or adopted by the orchestrator.
+    RecordWithdrawSubmission { tx_hash: TxHash },
+    // Confirms the recorded transaction.
+    ConfirmWithdraw,
     // Unwraps ERC-4626 wrapped tokens after Raindex withdrawal
     UnwrapTokens,
     // Sends unwrapped tokens to Alpaca's redemption wallet
@@ -3445,6 +3481,24 @@ enum EquityRedemptionCommand {
 
 ```rust
 enum EquityRedemptionEvent {
+    VaultWithdrawSubmitting {
+        symbol: Symbol,
+        chain: Chain,
+        quantity: Decimal,
+        token: Address,
+        vault_id: RaindexVaultId,
+        wrapped_amount: U256,
+        from_block: u64,
+        submitting_at: DateTime<Utc>,
+    },
+    VaultWithdrawSubmitted {
+        symbol: Symbol,
+        quantity: Decimal,
+        token: Address,
+        wrapped_amount: U256,
+        tx_hash: TxHash,
+        submitted_at: DateTime<Utc>,
+    },
     WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
@@ -3512,6 +3566,29 @@ state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
 the replayed `Failed` state materializes the operator's reason.
 
+Vault withdrawal submission is an irreversible uncertainty boundary. The
+aggregate transition that creates `VaultWithdrawSubmitting` is pure: it performs
+no RPC lookup, signing, or broadcast. The orchestrator then submits exactly once
+in that invocation. If submission or recording the returned hash fails, the
+aggregate remains `VaultWithdrawSubmitting`; no failure event may erase the
+intent.
+
+Every later invocation reconciles before acting. It scans
+`OperatorWithdraw`/legacy `WithdrawV2` events from the recorded `from_block`,
+filtered to this bot's operator, token, and vault. A matching event with the
+requested amount is adopted and its transaction hash recorded. A different
+amount is a typed fail-closed error. An inconclusive or anomalous scan is
+retryable and never broadcasts. Only a confirmations-deep, repeated empty scan
+permits one fresh submission.
+
+An RPC `already known` response is accepted as evidence that the identical
+signed transaction reached a node. The wallet keeps its nonce cache intact and
+returns the transaction hash when the response carries one; otherwise the
+submission remains indeterminate and the persisted intent is reconciled from
+chain logs. Legacy `VaultWithdrawPending` aggregates predate the recorded chain
+head and are never automatically resubmitted; an operator must resolve them
+conservatively.
+
 ##### Aggregate Services
 
 The aggregate uses domain service traits directly as its Services:
@@ -3530,10 +3607,14 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
 
 ##### Business Rules
 
-- `Withdraw` only from uninitialized state; emits `WithdrawnFromRaindex`
-- `Redeem` only from `WithdrawnFromRaindex` state; polls Alpaca until terminal
-- If send fails after withdraw, aggregate stays in `WithdrawnFromRaindex`
-  (tokens in wallet, not stranded)
+- `Redeem` only from uninitialized state; emits only the durable
+  `VaultWithdrawSubmitting` intent and never calls Raindex
+- `RecordWithdrawSubmission` only from `VaultWithdrawSubmitting`
+- `ConfirmWithdraw` only from `VaultWithdrawSubmitted`
+- a resume from `VaultWithdrawSubmitting` always scans before any submission;
+  retries never blindly repeat a possibly accepted withdrawal
+- if a later transfer step fails after withdrawal, the aggregate retains the
+  withdrawal transaction for recovery and audit
 - `ConfirmUnwrap` records the token the vault reports as its `asset()` at the
   redeem block, typed `UnwrappedToken`, and requires the redeem receipt to show
   that token transferred to the withdraw receiver for the withdrawn amount
