@@ -4,30 +4,15 @@
 //! Tracks the workflow from withdrawing tokens from the Raindex vault
 //! through sending to Alpaca's redemption wallet to share delivery.
 //!
-//! # State Flow
+//! # State flow
 //!
-//! The aggregate progresses through the following states:
+//! New redemptions prepare and sign the withdrawal, persist those exact bytes in
+//! `VaultWithdrawSubmitting` before broadcast, then advance through submitted,
+//! withdrawn, unwrapped, sent, provider-pending, and terminal states.
 //!
-//! ```text
-//!     Redeem ------------> Failed
-//!       |
-//!       v
-//!     WithdrawnFromRaindex --> Failed
-//!       |
-//!       v
-//!     TokensUnwrapped ------> Failed
-//!       |
-//!       v
-//!     TokensSent ------------> Failed
-//!       |
-//!       v
-//!     Pending ---------------> Failed
-//!       |
-//!       v
-//!     Completed
-//! ```
-//!
-//! - `Redeem` withdraws wrapped tokens from the Raindex vault
+//! - `Redeem` persists the exact signed vault withdrawal before any broadcast
+//! - `VaultWithdrawSubmitting` retains that identity until the same bytes are
+//!   broadcast and their transaction hash is recorded
 //! - `WithdrawnFromRaindex` tracks tokens withdrawn, awaiting unwrap
 //! - `UnwrapTokens` unwraps ERC-4626 shares into underlying tokens
 //! - `TokensUnwrapped` tracks unwrapped tokens, ready to send
@@ -37,14 +22,12 @@
 //!
 //! # Services
 //!
-//! The aggregate uses cqrs-es Services (`RedemptionServices`) with `Tokenizer` and `Vault`
-//! traits to execute side effects atomically:
-//!
-//! - `vault.withdraw()` - Withdraws tokens from Rain OrderBook vault
-//! - `tokenizer.send_for_redemption()` - Sends tokens to Alpaca's redemption wallet
-//!
-//! This pattern ensures that if Raindex withdraw succeeds but send fails, the aggregate stays
-//! in `WithdrawnFromRaindex` state (tokens in wallet, not stranded).
+//! The aggregate uses `EquityTransferServices` for confirmation, unwrap, and
+//! issuer-transfer side effects. Vault withdrawal preparation and broadcast are
+//! deliberately outside the aggregate transition: the orchestrator signs first,
+//! persists `VaultWithdrawSubmitting`, broadcasts those exact bytes, then records
+//! the transaction hash. A crash or ambiguous RPC response is recovered by
+//! rebroadcasting the persisted transaction, never by creating a new withdrawal.
 //!
 //! # Error Handling
 //!
@@ -71,9 +54,10 @@ use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
-use st0x_evm::{Chain, EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS};
+use st0x_evm::{Chain, EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS, PreparedTransaction};
 use st0x_execution::Symbol;
 use st0x_finance::{FractionalShares, Id};
+use st0x_raindex::RaindexVaultId;
 use st0x_tokenization::TokenizationRequestId;
 use st0x_tokenization::Tokenizer;
 use st0x_wrapper::{UnwrappedToken, WrapperError};
@@ -127,6 +111,12 @@ impl FromStr for RedemptionAggregateId {
 pub fn redemption_aggregate_id(label: &str) -> RedemptionAggregateId {
     RedemptionAggregateId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
 }
+/// Deterministic prepared withdrawal identity for aggregate fixtures that do
+/// not exercise wallet signing.
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepared_withdrawal_for_test() -> PreparedTransaction {
+    PreparedTransaction::for_test(TxHash::ZERO, 0)
+}
 
 /// Errors that can occur during equity redemption operations.
 ///
@@ -148,6 +138,18 @@ pub enum EquityRedemptionError {
          amount {amount}: {error_message}"
     )]
     RaindexWithdrawFailed {
+        token: Address,
+        amount: U256,
+        error_message: String,
+    },
+    /// A prepared/submitted withdrawal has an unresolved network outcome.
+    /// Kept distinct so the durable resume job can bypass its finite retry
+    /// budget without parsing an error string.
+    #[error(
+        "Raindex vault withdrawal reconciliation pending for token {token}, \
+         amount {amount}: {error_message}"
+    )]
+    RaindexWithdrawReconciliationPending {
         token: Address,
         amount: U256,
         error_message: String,
@@ -301,7 +303,9 @@ pub enum EquityRedemptionError {
 
 #[derive(Debug, Clone)]
 pub enum EquityRedemptionCommand {
-    /// Submits vault withdrawal tx and emits VaultWithdrawSubmitted.
+    /// Initializes a redemption by persisting the complete vault-withdrawal
+    /// intent. The orchestrator captures the chain head and resolves the vault
+    /// before sending this pure command.
     Redeem {
         symbol: Symbol,
         /// The chain this redemption runs on. Carried by the genesis command
@@ -310,9 +314,13 @@ pub enum EquityRedemptionCommand {
         chain: Chain,
         quantity: Float,
         token: Address,
+        vault_id: RaindexVaultId,
         amount: U256,
+        /// Version-7 scan lower bound; zero for prepared transactions.
+        from_block: u64,
+        prepared: PreparedTransaction,
     },
-    /// Test/fixture-only: identical to `Redeem` but takes `pending_at`
+    /// Test/fixture-only: identical to `Redeem` but takes `submitting_at`
     /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
     /// backdate synthetic history.
     #[cfg(any(test, feature = "test-support"))]
@@ -321,8 +329,12 @@ pub enum EquityRedemptionCommand {
         chain: Chain,
         quantity: Float,
         token: Address,
+        vault_id: RaindexVaultId,
         amount: U256,
-        pending_at: DateTime<Utc>,
+        /// Version-7 scan lower bound; zero for prepared transactions.
+        from_block: u64,
+        prepared: PreparedTransaction,
+        submitting_at: DateTime<Utc>,
     },
     /// Waits for a previously submitted withdrawal to confirm.
     /// Emits WithdrawnFromRaindex.
@@ -390,14 +402,17 @@ pub enum EquityRedemptionCommand {
     /// Operator or timeout-driven failure from `WithdrawnFromRaindex` or
     /// `TokensUnwrapped` states.
     FailTransfer { reason: String },
-    /// Performs the actual vault withdrawal (side-effectful).
-    /// Valid from `VaultWithdrawPending`.
-    SubmitWithdraw,
-    /// Test/fixture-only: identical to `SubmitWithdraw` but takes
-    /// `submitted_at` explicitly instead of stamping `Utc::now()`, so
-    /// fixture seeding can backdate synthetic history.
+    /// Records the hash of the exact prepared withdrawal after broadcast. Pure:
+    /// the side effect runs in the orchestrator after
+    /// `VaultWithdrawSubmitting` is durable.
+    RecordWithdrawSubmission { tx_hash: TxHash },
+    /// Test/fixture-only: identical to `RecordWithdrawSubmission` but takes
+    /// `submitted_at` explicitly instead of stamping `Utc::now()`.
     #[cfg(any(test, feature = "test-support"))]
-    SubmitWithdrawAt { submitted_at: DateTime<Utc> },
+    RecordWithdrawSubmissionAt {
+        tx_hash: TxHash,
+        submitted_at: DateTime<Utc>,
+    },
     /// Performs the actual ERC-4626 unwrap (side-effectful).
     /// Valid from `UnwrapPending`.
     SubmitUnwrap,
@@ -480,6 +495,27 @@ pub enum EquityRedemptionEvent {
         wrapped_amount: U256,
         pending_at: DateTime<Utc>,
     },
+    /// Exact signed vault withdrawal persisted before its first broadcast.
+    VaultWithdrawSubmitting {
+        symbol: Symbol,
+        chain: Chain,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
+        token: Address,
+        vault_id: RaindexVaultId,
+        wrapped_amount: U256,
+        /// Version-7 scan lower bound; zero for prepared transactions.
+        from_block: u64,
+        /// Exact signed withdrawal persisted before its first broadcast.
+        /// `None` only for version-7 events; replay maps those records to the
+        /// legacy operator-reconciliation state instead of broadcasting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepared: Option<PreparedTransaction>,
+        submitting_at: DateTime<Utc>,
+    },
     /// Vault withdrawal transaction submitted, pending confirmation.
     VaultWithdrawSubmitted {
         symbol: Symbol,
@@ -491,6 +527,10 @@ pub enum EquityRedemptionEvent {
         token: Address,
         wrapped_amount: U256,
         tx_hash: TxHash,
+        /// Exact signed transaction retained until confirmation so restart can
+        /// restore nonce ownership before any wallet send.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
     },
     /// Tokens withdrawn from Raindex vault to wallet.
@@ -651,202 +691,278 @@ fn actual_withdrawn_amount_from_receipt(
 /// Required by `cqrs_es::DomainEvent`.
 impl PartialEq for EquityRedemptionEvent {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::VaultWithdrawPending {
-                    symbol: s1,
-                    chain: c1,
-                    quantity: q1,
-                    token: t1,
-                    wrapped_amount: w1,
-                    pending_at: pa1,
-                },
-                Self::VaultWithdrawPending {
-                    symbol: s2,
-                    chain: c2,
-                    quantity: q2,
-                    token: t2,
-                    wrapped_amount: w2,
-                    pending_at: pa2,
-                },
-            ) => (s1, c1, t1, w1, pa1) == (s2, c2, t2, w2, pa2) && q1.eq(*q2).unwrap_or(false),
-            (
-                Self::VaultWithdrawSubmitted {
-                    symbol: s1,
-                    quantity: q1,
-                    token: t1,
-                    wrapped_amount: w1,
-                    tx_hash: h1,
-                    submitted_at: sa1,
-                },
-                Self::VaultWithdrawSubmitted {
-                    symbol: s2,
-                    quantity: q2,
-                    token: t2,
-                    wrapped_amount: w2,
-                    tx_hash: h2,
-                    submitted_at: sa2,
-                },
-            ) => {
-                s1 == s2
-                    && q1.eq(*q2).unwrap_or(false)
-                    && t1 == t2
-                    && w1 == w2
-                    && h1 == h2
-                    && sa1 == sa2
-            }
-            (
-                Self::UnwrapSubmitted {
-                    unwrap_tx_hash: h1,
-                    submitted_at: sa1,
-                },
-                Self::UnwrapSubmitted {
-                    unwrap_tx_hash: h2,
-                    submitted_at: sa2,
-                },
-            ) => h1 == h2 && sa1 == sa2,
-            (Self::UnwrapPending { pending_at: pa1 }, Self::UnwrapPending { pending_at: pa2 })
-            | (Self::SendPending { pending_at: pa1 }, Self::SendPending { pending_at: pa2 }) => {
-                pa1 == pa2
-            }
-            (
-                Self::WithdrawnFromRaindex {
-                    symbol: s1,
-                    quantity: q1,
-                    token: t1,
-                    wrapped_amount: w1,
-                    actual_wrapped_amount: aw1,
-                    raindex_withdraw_tx: r1,
-                    raindex_withdraw_block: rb1,
-                    withdrawn_at: wa1,
-                },
-                Self::WithdrawnFromRaindex {
-                    symbol: s2,
-                    quantity: q2,
-                    token: t2,
-                    wrapped_amount: w2,
-                    actual_wrapped_amount: aw2,
-                    raindex_withdraw_tx: r2,
-                    raindex_withdraw_block: rb2,
-                    withdrawn_at: wa2,
-                },
-            ) => {
-                s1 == s2
-                    && q1.eq(*q2).unwrap_or(false)
-                    && t1 == t2
-                    && w1 == w2
-                    && aw1 == aw2
-                    && r1 == r2
-                    && rb1 == rb2
-                    && wa1 == wa2
-            }
-            (
-                Self::TokensUnwrapped {
-                    quantity: q1,
-                    underlying_token: u1,
-                    unwrap_tx_hash: h1,
-                    unwrapped_amount: a1,
-                    unwrap_block: b1,
-                    unwrapped_at: t1,
-                },
-                Self::TokensUnwrapped {
-                    quantity: q2,
-                    underlying_token: u2,
-                    unwrap_tx_hash: h2,
-                    unwrapped_amount: a2,
-                    unwrap_block: b2,
-                    unwrapped_at: t2,
-                },
-            ) => {
-                q1.is_some() == q2.is_some()
-                    && q1
-                        .zip(*q2)
-                        .is_none_or(|(q1, q2)| q1.eq(q2).unwrap_or(false))
-                    && u1 == u2
-                    && h1 == h2
-                    && b1 == b2
-                    && a1 == a2
-                    && t1 == t2
-            }
-            (
-                Self::TransferFailed {
-                    tx_hash: h1,
-                    reason: r1,
-                    failed_at: f1,
-                },
-                Self::TransferFailed {
-                    tx_hash: h2,
-                    reason: r2,
-                    failed_at: f2,
-                },
-            ) => h1 == h2 && r1 == r2 && f1 == f2,
-            (
-                Self::TokensSent {
-                    redemption_wallet: w1,
-                    redemption_tx: t1,
-                    sent_at: s1,
-                },
-                Self::TokensSent {
-                    redemption_wallet: w2,
-                    redemption_tx: t2,
-                    sent_at: s2,
-                },
-            ) => w1 == w2 && t1 == t2 && s1 == s2,
-            (
-                Self::DetectionFailed {
-                    failure: f1,
-                    failed_at: fa1,
-                },
-                Self::DetectionFailed {
-                    failure: f2,
-                    failed_at: fa2,
-                },
-            ) => f1 == f2 && fa1 == fa2,
-            (
-                Self::Detected {
-                    tokenization_request_id: t1,
-                    detected_at: d1,
-                },
-                Self::Detected {
-                    tokenization_request_id: t2,
-                    detected_at: d2,
-                },
-            ) => t1 == t2 && d1 == d2,
-            (
-                Self::RedemptionRejected {
-                    reason: r1,
-                    rejected_at: ra1,
-                },
-                Self::RedemptionRejected {
-                    reason: r2,
-                    rejected_at: ra2,
-                },
-            ) => r1 == r2 && ra1 == ra2,
-            (Self::Completed { completed_at: c1 }, Self::Completed { completed_at: c2 }) => {
-                c1 == c2
-            }
-            (
-                Self::ProviderCompletionRecovered {
-                    tokenization_request_id: id1,
-                    recovered_at: t1,
-                },
-                Self::ProviderCompletionRecovered {
-                    tokenization_request_id: id2,
-                    recovered_at: t2,
-                },
-            ) => id1 == id2 && t1 == t2,
-            (
-                Self::OperatorReconciled {
-                    reason: r1,
-                    reconciled_at: t1,
-                },
-                Self::OperatorReconciled {
-                    reason: r2,
-                    reconciled_at: t2,
-                },
-            ) => r1 == r2 && t1 == t2,
-            _ => false,
-        }
+        eq_vault_events(self, other)
+            .or_else(|| eq_processing_events(self, other))
+            .or_else(|| eq_delivery_events(self, other))
+            .or_else(|| eq_terminal_events(self, other))
+            .unwrap_or(false)
+    }
+}
+
+fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) -> Option<bool> {
+    use EquityRedemptionEvent::{
+        VaultWithdrawPending, VaultWithdrawSubmitted, VaultWithdrawSubmitting,
+    };
+
+    match (left, right) {
+        (
+            VaultWithdrawPending {
+                symbol: s1,
+                chain: c1,
+                quantity: q1,
+                token: t1,
+                wrapped_amount: w1,
+                pending_at: pa1,
+            },
+            VaultWithdrawPending {
+                symbol: s2,
+                chain: c2,
+                quantity: q2,
+                token: t2,
+                wrapped_amount: w2,
+                pending_at: pa2,
+            },
+        ) => Some((s1, c1, t1, w1, pa1) == (s2, c2, t2, w2, pa2) && q1.eq(*q2).unwrap_or(false)),
+        (
+            VaultWithdrawSubmitting {
+                symbol: s1,
+                chain: c1,
+                quantity: q1,
+                token: t1,
+                vault_id: v1,
+                wrapped_amount: w1,
+                from_block: b1,
+                prepared: p1,
+                submitting_at: sa1,
+            },
+            VaultWithdrawSubmitting {
+                symbol: s2,
+                chain: c2,
+                quantity: q2,
+                token: t2,
+                vault_id: v2,
+                wrapped_amount: w2,
+                from_block: b2,
+                prepared: p2,
+                submitting_at: sa2,
+            },
+        ) => Some(
+            s1 == s2
+                && c1 == c2
+                && q1.eq(*q2).unwrap_or(false)
+                && t1 == t2
+                && v1 == v2
+                && w1 == w2
+                && b1 == b2
+                && p1 == p2
+                && sa1 == sa2,
+        ),
+        (
+            VaultWithdrawSubmitted {
+                symbol: s1,
+                quantity: q1,
+                token: t1,
+                wrapped_amount: w1,
+                tx_hash: h1,
+                prepared: p1,
+                submitted_at: sa1,
+            },
+            VaultWithdrawSubmitted {
+                symbol: s2,
+                quantity: q2,
+                token: t2,
+                wrapped_amount: w2,
+                tx_hash: h2,
+                prepared: p2,
+                submitted_at: sa2,
+            },
+        ) => Some(
+            s1 == s2
+                && q1.eq(*q2).unwrap_or(false)
+                && t1 == t2
+                && w1 == w2
+                && h1 == h2
+                && p1 == p2
+                && sa1 == sa2,
+        ),
+        _ => None,
+    }
+}
+
+fn eq_processing_events(
+    left: &EquityRedemptionEvent,
+    right: &EquityRedemptionEvent,
+) -> Option<bool> {
+    use EquityRedemptionEvent::{
+        SendPending, TokensUnwrapped, UnwrapPending, UnwrapSubmitted, WithdrawnFromRaindex,
+    };
+
+    match (left, right) {
+        (
+            UnwrapSubmitted {
+                unwrap_tx_hash: h1,
+                submitted_at: sa1,
+            },
+            UnwrapSubmitted {
+                unwrap_tx_hash: h2,
+                submitted_at: sa2,
+            },
+        ) => Some(h1 == h2 && sa1 == sa2),
+        (UnwrapPending { pending_at: pa1 }, UnwrapPending { pending_at: pa2 })
+        | (SendPending { pending_at: pa1 }, SendPending { pending_at: pa2 }) => Some(pa1 == pa2),
+        (
+            WithdrawnFromRaindex {
+                symbol: s1,
+                quantity: q1,
+                token: t1,
+                wrapped_amount: w1,
+                actual_wrapped_amount: aw1,
+                raindex_withdraw_tx: r1,
+                raindex_withdraw_block: rb1,
+                withdrawn_at: wa1,
+            },
+            WithdrawnFromRaindex {
+                symbol: s2,
+                quantity: q2,
+                token: t2,
+                wrapped_amount: w2,
+                actual_wrapped_amount: aw2,
+                raindex_withdraw_tx: r2,
+                raindex_withdraw_block: rb2,
+                withdrawn_at: wa2,
+            },
+        ) => Some(
+            s1 == s2
+                && q1.eq(*q2).unwrap_or(false)
+                && t1 == t2
+                && w1 == w2
+                && aw1 == aw2
+                && r1 == r2
+                && rb1 == rb2
+                && wa1 == wa2,
+        ),
+        (
+            TokensUnwrapped {
+                quantity: q1,
+                underlying_token: u1,
+                unwrap_tx_hash: h1,
+                unwrapped_amount: a1,
+                unwrap_block: b1,
+                unwrapped_at: t1,
+            },
+            TokensUnwrapped {
+                quantity: q2,
+                underlying_token: u2,
+                unwrap_tx_hash: h2,
+                unwrapped_amount: a2,
+                unwrap_block: b2,
+                unwrapped_at: t2,
+            },
+        ) => Some(
+            q1.is_some() == q2.is_some()
+                && q1
+                    .zip(*q2)
+                    .is_none_or(|(q1, q2)| q1.eq(q2).unwrap_or(false))
+                && u1 == u2
+                && h1 == h2
+                && b1 == b2
+                && a1 == a2
+                && t1 == t2,
+        ),
+        _ => None,
+    }
+}
+
+fn eq_delivery_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) -> Option<bool> {
+    use EquityRedemptionEvent::{
+        Detected, DetectionFailed, RedemptionRejected, TokensSent, TransferFailed,
+    };
+
+    match (left, right) {
+        (
+            TransferFailed {
+                tx_hash: h1,
+                reason: r1,
+                failed_at: f1,
+            },
+            TransferFailed {
+                tx_hash: h2,
+                reason: r2,
+                failed_at: f2,
+            },
+        ) => Some(h1 == h2 && r1 == r2 && f1 == f2),
+        (
+            TokensSent {
+                redemption_wallet: w1,
+                redemption_tx: t1,
+                sent_at: s1,
+            },
+            TokensSent {
+                redemption_wallet: w2,
+                redemption_tx: t2,
+                sent_at: s2,
+            },
+        ) => Some(w1 == w2 && t1 == t2 && s1 == s2),
+        (
+            DetectionFailed {
+                failure: f1,
+                failed_at: fa1,
+            },
+            DetectionFailed {
+                failure: f2,
+                failed_at: fa2,
+            },
+        ) => Some(f1 == f2 && fa1 == fa2),
+        (
+            Detected {
+                tokenization_request_id: t1,
+                detected_at: d1,
+            },
+            Detected {
+                tokenization_request_id: t2,
+                detected_at: d2,
+            },
+        ) => Some(t1 == t2 && d1 == d2),
+        (
+            RedemptionRejected {
+                reason: r1,
+                rejected_at: ra1,
+            },
+            RedemptionRejected {
+                reason: r2,
+                rejected_at: ra2,
+            },
+        ) => Some(r1 == r2 && ra1 == ra2),
+        _ => None,
+    }
+}
+
+fn eq_terminal_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) -> Option<bool> {
+    use EquityRedemptionEvent::{Completed, OperatorReconciled, ProviderCompletionRecovered};
+
+    match (left, right) {
+        (Completed { completed_at: c1 }, Completed { completed_at: c2 }) => Some(c1 == c2),
+        (
+            ProviderCompletionRecovered {
+                tokenization_request_id: id1,
+                recovered_at: t1,
+            },
+            ProviderCompletionRecovered {
+                tokenization_request_id: id2,
+                recovered_at: t2,
+            },
+        ) => Some(id1 == id2 && t1 == t2),
+        (
+            OperatorReconciled {
+                reason: r1,
+                reconciled_at: t1,
+            },
+            OperatorReconciled {
+                reason: r2,
+                reconciled_at: t2,
+            },
+        ) => Some(r1 == r2 && t1 == t2),
+        _ => None,
     }
 }
 
@@ -858,6 +974,9 @@ impl DomainEvent for EquityRedemptionEvent {
         match self {
             VaultWithdrawPending { .. } => {
                 "EquityRedemptionEvent::VaultWithdrawPending".to_string()
+            }
+            VaultWithdrawSubmitting { .. } => {
+                "EquityRedemptionEvent::VaultWithdrawSubmitting".to_string()
             }
             VaultWithdrawSubmitted { .. } => {
                 "EquityRedemptionEvent::VaultWithdrawSubmitted".to_string()
@@ -910,6 +1029,24 @@ pub enum EquityRedemption {
         wrapped_amount: U256,
         pending_at: DateTime<Utc>,
     },
+    /// Exact signed vault withdrawal persisted before its first broadcast.
+    VaultWithdrawSubmitting {
+        symbol: Symbol,
+        chain: Chain,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
+        token: Address,
+        vault_id: RaindexVaultId,
+        wrapped_amount: U256,
+        /// Version-7 scan lower bound; zero for prepared transactions.
+        from_block: u64,
+        /// Exact signed withdrawal persisted before its first broadcast.
+        prepared: PreparedTransaction,
+        submitting_at: DateTime<Utc>,
+    },
 
     /// Vault withdrawal submitted, awaiting confirmation
     VaultWithdrawSubmitted {
@@ -924,6 +1061,10 @@ pub enum EquityRedemption {
         token: Address,
         wrapped_amount: U256,
         tx_hash: TxHash,
+        /// Exact signed transaction retained until confirmation so restart can
+        /// restore nonce ownership before any wallet send.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
     },
 
@@ -1140,6 +1281,7 @@ impl EquityRedemption {
     pub(crate) fn symbol(&self) -> &Symbol {
         match self {
             Self::VaultWithdrawPending { symbol, .. }
+            | Self::VaultWithdrawSubmitting { symbol, .. }
             | Self::VaultWithdrawSubmitted { symbol, .. }
             | Self::WithdrawnFromRaindex { symbol, .. }
             | Self::UnwrapPending { symbol, .. }
@@ -1160,6 +1302,7 @@ impl EquityRedemption {
     pub fn chain(&self) -> Chain {
         match self {
             Self::VaultWithdrawPending { chain, .. }
+            | Self::VaultWithdrawSubmitting { chain, .. }
             | Self::VaultWithdrawSubmitted { chain, .. }
             | Self::WithdrawnFromRaindex { chain, .. }
             | Self::UnwrapPending { chain, .. }
@@ -1180,6 +1323,7 @@ impl EquityRedemption {
     pub(crate) fn quantity(&self) -> Float {
         match self {
             Self::VaultWithdrawPending { quantity, .. }
+            | Self::VaultWithdrawSubmitting { quantity, .. }
             | Self::VaultWithdrawSubmitted { quantity, .. }
             | Self::WithdrawnFromRaindex { quantity, .. }
             | Self::UnwrapPending { quantity, .. }
@@ -1204,6 +1348,7 @@ impl EquityRedemption {
         match self {
             Self::Completed { .. } | Self::Failed { .. } | Self::Reconciled { .. } => true,
             Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitting { .. }
             | Self::VaultWithdrawSubmitted { .. }
             | Self::WithdrawnFromRaindex { .. }
             | Self::UnwrapPending { .. }
@@ -1222,6 +1367,7 @@ impl EquityRedemption {
         match self {
             Self::Failed { .. } => true,
             Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitting { .. }
             | Self::VaultWithdrawSubmitted { .. }
             | Self::WithdrawnFromRaindex { .. }
             | Self::UnwrapPending { .. }
@@ -1249,6 +1395,20 @@ impl EquityRedemption {
                 status: EquityRedemptionStatus::Withdrawing,
                 started_at: *pending_at,
                 updated_at: *pending_at,
+            }),
+
+            Self::VaultWithdrawSubmitting {
+                symbol,
+                quantity,
+                submitting_at,
+                ..
+            } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
+                id: Id::new(id.to_string()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: EquityRedemptionStatus::Withdrawing,
+                started_at: *submitting_at,
+                updated_at: *submitting_at,
             }),
 
             Self::VaultWithdrawSubmitted {
@@ -1432,7 +1592,14 @@ impl EventSourced for EquityRedemption {
     // v6: added `chain` to `VaultWithdrawPending` and to every state variant,
     // so a resume resolves the transfer's own chain instead of assuming the
     // primary. Bumped to clear snapshots whose state predates the field.
-    const SCHEMA_VERSION: u64 = 6;
+    // v7: new redemptions originate as `VaultWithdrawSubmitting`, carrying the
+    // durable vault identity and chain-scan lower bound before broadcast.
+    // v8: `VaultWithdrawSubmitting` now persists `PreparedTransaction`, making
+    // every first and repeated broadcast byte-identical. Version-7 events
+    // without this field replay into the legacy fail-closed state.
+    // v9: `VaultWithdrawSubmitted` retains the prepared transaction through
+    // confirmation so startup restores its nonce ownership before workers run.
+    const SCHEMA_VERSION: u64 = 9;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
@@ -1452,6 +1619,41 @@ impl EventSourced for EquityRedemption {
                 wrapped_amount: *wrapped_amount,
                 pending_at: *pending_at,
             }),
+            VaultWithdrawSubmitting {
+                symbol,
+                chain,
+                quantity,
+                token,
+                vault_id,
+                wrapped_amount,
+                from_block,
+                prepared,
+                submitting_at,
+            } => prepared.as_ref().map_or_else(
+                || {
+                    Some(Self::VaultWithdrawPending {
+                        symbol: symbol.clone(),
+                        chain: *chain,
+                        quantity: *quantity,
+                        token: *token,
+                        wrapped_amount: *wrapped_amount,
+                        pending_at: *submitting_at,
+                    })
+                },
+                |prepared| {
+                    Some(Self::VaultWithdrawSubmitting {
+                        symbol: symbol.clone(),
+                        chain: *chain,
+                        quantity: *quantity,
+                        token: *token,
+                        vault_id: *vault_id,
+                        wrapped_amount: *wrapped_amount,
+                        from_block: *from_block,
+                        prepared: prepared.clone(),
+                        submitting_at: *submitting_at,
+                    })
+                },
+            ),
             // Legacy: old aggregates start with VaultWithdrawSubmitted
             VaultWithdrawSubmitted {
                 symbol,
@@ -1459,6 +1661,7 @@ impl EventSourced for EquityRedemption {
                 token,
                 wrapped_amount,
                 tx_hash,
+                prepared,
                 submitted_at,
             } => Some(Self::VaultWithdrawSubmitted {
                 symbol: symbol.clone(),
@@ -1467,6 +1670,7 @@ impl EventSourced for EquityRedemption {
                 token: *token,
                 wrapped_amount: *wrapped_amount,
                 tx_hash: *tx_hash,
+                prepared: prepared.clone(),
                 submitted_at: *submitted_at,
             }),
             // Legacy: old aggregates start with WithdrawnFromRaindex
@@ -1505,24 +1709,28 @@ impl EventSourced for EquityRedemption {
         let chain = entity.chain();
 
         Ok(match event {
-            VaultWithdrawPending { .. } => None,
+            VaultWithdrawPending { .. } | VaultWithdrawSubmitting { .. } => None,
             VaultWithdrawSubmitted {
                 symbol,
                 quantity,
                 token,
                 wrapped_amount,
                 tx_hash,
+                prepared,
                 submitted_at,
             } => match entity {
-                Self::VaultWithdrawPending { .. } => Some(Self::VaultWithdrawSubmitted {
-                    symbol: symbol.clone(),
-                    chain,
-                    quantity: *quantity,
-                    token: *token,
-                    wrapped_amount: *wrapped_amount,
-                    tx_hash: *tx_hash,
-                    submitted_at: *submitted_at,
-                }),
+                Self::VaultWithdrawPending { .. } | Self::VaultWithdrawSubmitting { .. } => {
+                    Some(Self::VaultWithdrawSubmitted {
+                        symbol: symbol.clone(),
+                        chain,
+                        quantity: *quantity,
+                        token: *token,
+                        wrapped_amount: *wrapped_amount,
+                        tx_hash: *tx_hash,
+                        prepared: prepared.clone(),
+                        submitted_at: *submitted_at,
+                    })
+                }
                 // Legacy: VaultWithdrawSubmitted is handled as originate
                 _ => None,
             },
@@ -2010,14 +2218,20 @@ impl EventSourced for EquityRedemption {
                 chain,
                 quantity,
                 token,
+                vault_id,
                 amount,
-            } => Ok(vec![VaultWithdrawPending {
+                from_block,
+                prepared,
+            } => Ok(vec![VaultWithdrawSubmitting {
                 symbol,
                 chain,
                 quantity,
                 token,
+                vault_id,
                 wrapped_amount: amount,
-                pending_at: Utc::now(),
+                from_block,
+                prepared: Some(prepared),
+                submitting_at: Utc::now(),
             }]),
             #[cfg(any(test, feature = "test-support"))]
             RedeemAt {
@@ -2025,17 +2239,23 @@ impl EventSourced for EquityRedemption {
                 chain,
                 quantity,
                 token,
+                vault_id,
                 amount,
-                pending_at,
-            } => Ok(vec![VaultWithdrawPending {
+                from_block,
+                submitting_at,
+                prepared,
+            } => Ok(vec![VaultWithdrawSubmitting {
                 symbol,
                 chain,
                 quantity,
                 token,
+                vault_id,
                 wrapped_amount: amount,
-                pending_at,
+                from_block,
+                prepared: Some(prepared),
+                submitting_at,
             }]),
-            SubmitWithdraw
+            RecordWithdrawSubmission { .. }
             | SubmitUnwrap
             | PrepareSend
             | ConfirmWithdraw
@@ -2051,7 +2271,7 @@ impl EventSourced for EquityRedemption {
             | Reconcile { .. }
             | FailTransfer { .. } => Err(EquityRedemptionError::NotStarted),
             #[cfg(any(test, feature = "test-support"))]
-            SubmitWithdrawAt { .. } => Err(EquityRedemptionError::NotStarted),
+            RecordWithdrawSubmissionAt { .. } => Err(EquityRedemptionError::NotStarted),
             #[cfg(any(test, feature = "test-support"))]
             SubmitUnwrapAt { .. } => Err(EquityRedemptionError::NotStarted),
             #[cfg(any(test, feature = "test-support"))]
@@ -2094,12 +2314,14 @@ impl EventSourced for EquityRedemption {
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
-            SubmitWithdraw => self.transition_submit_withdraw(services, None).await,
-            #[cfg(any(test, feature = "test-support"))]
-            SubmitWithdrawAt { submitted_at } => {
-                self.transition_submit_withdraw(services, Some(submitted_at))
-                    .await
+            RecordWithdrawSubmission { tx_hash } => {
+                self.transition_record_withdraw_submission(tx_hash, Utc::now())
             }
+            #[cfg(any(test, feature = "test-support"))]
+            RecordWithdrawSubmissionAt {
+                tx_hash,
+                submitted_at,
+            } => self.transition_record_withdraw_submission(tx_hash, submitted_at),
 
             ConfirmWithdraw => self.transition_confirm_withdraw(services, None).await,
             #[cfg(any(test, feature = "test-support"))]
@@ -2156,6 +2378,7 @@ impl EventSourced for EquityRedemption {
                     }])
                 }
                 Self::VaultWithdrawPending { .. }
+                | Self::VaultWithdrawSubmitting { .. }
                 | Self::VaultWithdrawSubmitted { .. }
                 | Self::WithdrawnFromRaindex { .. }
                 | Self::UnwrapPending { .. }
@@ -2174,6 +2397,7 @@ impl EventSourced for EquityRedemption {
 
             RejectRedemption { reason } => match self {
                 Self::VaultWithdrawPending { .. }
+                | Self::VaultWithdrawSubmitting { .. }
                 | Self::VaultWithdrawSubmitted { .. }
                 | Self::WithdrawnFromRaindex { .. }
                 | Self::UnwrapPending { .. }
@@ -2271,58 +2495,32 @@ impl EventSourced for EquityRedemption {
 }
 
 impl EquityRedemption {
-    /// Shared body for `SubmitWithdraw`/`SubmitWithdrawAt`.
-    async fn transition_submit_withdraw(
+    /// Records the hash of the exact persisted transaction after broadcast.
+    /// No external call occurs inside the aggregate transition.
+    fn transition_record_withdraw_submission(
         &self,
-        services: &EquityTransferServices,
-        override_at: Option<DateTime<Utc>>,
+        tx_hash: TxHash,
+        submitted_at: DateTime<Utc>,
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
-        use EquityRedemptionEvent::*;
+        use EquityRedemptionEvent::VaultWithdrawSubmitted;
 
         match self {
-            Self::VaultWithdrawPending {
+            Self::VaultWithdrawSubmitting {
                 symbol,
                 quantity,
                 token,
                 wrapped_amount,
+                prepared,
                 ..
-            } => {
-                let chain_services = services.for_chain(self.chain())?;
-                let vault_id = match chain_services.vault_lookup.vault_id_for_token(*token).await {
-                    Ok(id) => id,
-                    Err(error) => {
-                        warn!(target: "rebalance", %error, %token, "Vault lookup failed");
-                        return Err(EquityRedemptionError::RaindexVaultNotFound(*token));
-                    }
-                };
-
-                info!(target: "rebalance", ?vault_id, %token, %wrapped_amount, "Submitting Raindex vault withdrawal");
-
-                let tx_hash = match chain_services
-                    .raindex
-                    .submit_withdraw(*token, vault_id, *wrapped_amount, TOKENIZED_EQUITY_DECIMALS)
-                    .await
-                {
-                    Ok(tx) => tx,
-                    Err(error) => {
-                        warn!(target: "rebalance", %error, %token, %wrapped_amount, "Raindex vault withdrawal submission failed");
-                        return Err(EquityRedemptionError::RaindexWithdrawFailed {
-                            token: *token,
-                            amount: *wrapped_amount,
-                            error_message: error.to_string(),
-                        });
-                    }
-                };
-
-                Ok(vec![VaultWithdrawSubmitted {
-                    symbol: symbol.clone(),
-                    quantity: *quantity,
-                    token: *token,
-                    wrapped_amount: *wrapped_amount,
-                    tx_hash,
-                    submitted_at: override_at.unwrap_or_else(Utc::now),
-                }])
-            }
+            } => Ok(vec![VaultWithdrawSubmitted {
+                symbol: symbol.clone(),
+                quantity: *quantity,
+                token: *token,
+                wrapped_amount: *wrapped_amount,
+                tx_hash,
+                prepared: Some(prepared.clone()),
+                submitted_at,
+            }]),
             Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
             Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
@@ -2345,6 +2543,7 @@ impl EquityRedemption {
                 token,
                 wrapped_amount,
                 tx_hash,
+                prepared,
                 ..
             } => {
                 let chain_services = services.for_chain(self.chain())?;
@@ -2352,10 +2551,23 @@ impl EquityRedemption {
                     .raindex
                     .confirm_tx_receipt(*tx_hash)
                     .await
-                    .map_err(|error| EquityRedemptionError::RaindexWithdrawFailed {
-                        token: *token,
-                        amount: *wrapped_amount,
-                        error_message: error.to_string(),
+                    .map_err(|error| {
+                        let error_message = error.to_string();
+                        if error.is_reconciliation_pending()
+                            || (prepared.is_some() && error.is_transaction_dropped())
+                        {
+                            EquityRedemptionError::RaindexWithdrawReconciliationPending {
+                                token: *token,
+                                amount: *wrapped_amount,
+                                error_message,
+                            }
+                        } else {
+                            EquityRedemptionError::RaindexWithdrawFailed {
+                                token: *token,
+                                amount: *wrapped_amount,
+                                error_message,
+                            }
+                        }
                     })?;
                 let raindex_withdraw_block = receipt
                     .block_number
@@ -2679,6 +2891,7 @@ impl EquityRedemption {
                 detected_at,
             }]),
             Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitting { .. }
             | Self::VaultWithdrawSubmitted { .. }
             | Self::WithdrawnFromRaindex { .. }
             | Self::UnwrapPending { .. }
@@ -2701,6 +2914,7 @@ impl EquityRedemption {
 
         match self {
             Self::VaultWithdrawPending { .. }
+            | Self::VaultWithdrawSubmitting { .. }
             | Self::VaultWithdrawSubmitted { .. }
             | Self::WithdrawnFromRaindex { .. }
             | Self::UnwrapPending { .. }
@@ -2757,6 +2971,7 @@ pub(crate) async fn symbols_with_stuck_redemptions(
          SELECT latest.aggregate_id, \
                 COALESCE( \
                     json_extract(first_ev.payload, '$.VaultWithdrawPending.symbol'), \
+                    json_extract(first_ev.payload, '$.VaultWithdrawSubmitting.symbol'), \
                     json_extract(first_ev.payload, '$.VaultWithdrawSubmitted.symbol'), \
                     json_extract(first_ev.payload, '$.WithdrawnFromRaindex.symbol') \
                 ), \
@@ -2764,6 +2979,7 @@ pub(crate) async fn symbols_with_stuck_redemptions(
                     json_extract(sent_ev.payload, '$.TokensSent.quantity'), \
                     json_extract(unwrapped_ev.payload, '$.TokensUnwrapped.quantity'), \
                     json_extract(first_ev.payload, '$.VaultWithdrawPending.quantity'), \
+                    json_extract(first_ev.payload, '$.VaultWithdrawSubmitting.quantity'), \
                     json_extract(first_ev.payload, '$.VaultWithdrawSubmitted.quantity'), \
                     json_extract(first_ev.payload, '$.WithdrawnFromRaindex.quantity') \
                 ), \
@@ -2854,6 +3070,7 @@ pub(crate) enum StuckRedemptionRecoveryError {
 /// caller-supplied values remain bind parameters.
 const ACTIVE_REDEMPTION_EVENT_TYPES_SQL: &str = "
     'EquityRedemptionEvent::VaultWithdrawPending',
+    'EquityRedemptionEvent::VaultWithdrawSubmitting',
     'EquityRedemptionEvent::VaultWithdrawSubmitted',
     'EquityRedemptionEvent::WithdrawnFromRaindex',
     'EquityRedemptionEvent::UnwrapPending',
@@ -2883,6 +3100,7 @@ pub(crate) async fn has_active_transfer_for_symbol(
                   AND sequence = 0
                   AND COALESCE(
                       json_extract(payload, '$.VaultWithdrawPending.symbol'),
+                      json_extract(payload, '$.VaultWithdrawSubmitting.symbol'),
                       json_extract(payload, '$.VaultWithdrawSubmitted.symbol'),
                       json_extract(payload, '$.WithdrawnFromRaindex.symbol')
                   ) = ?
@@ -2940,6 +3158,7 @@ pub(crate) async fn symbols_with_active_transfers(
             )
             SELECT DISTINCT COALESCE(
                    json_extract(first_ev.payload, '$.VaultWithdrawPending.symbol'),
+                   json_extract(first_ev.payload, '$.VaultWithdrawSubmitting.symbol'),
                    json_extract(first_ev.payload, '$.VaultWithdrawSubmitted.symbol'),
                    json_extract(first_ev.payload, '$.WithdrawnFromRaindex.symbol')
             )
@@ -3188,7 +3407,7 @@ mod tests {
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
     use st0x_evm::NODE_SYNC_MAX_ATTEMPTS;
     use st0x_float_macro::float;
-    use st0x_raindex::RaindexVaultId;
+    use st0x_raindex::{Raindex, RaindexVaultId};
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::tokenization_request_id;
     use st0x_wrapper::MockWrapper;
@@ -3221,6 +3440,45 @@ mod tests {
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
+    }
+
+    fn redemption_test_store(
+        services: EquityTransferServices,
+    ) -> (TestStore<EquityRedemption>, Arc<dyn Raindex>) {
+        let raindex = services
+            .for_chain(Chain::Base)
+            .expect("Base services")
+            .raindex
+            .clone();
+        (TestStore::new(services), raindex)
+    }
+
+    async fn submit_and_record_withdrawal(
+        store: &TestStore<EquityRedemption>,
+        id: &RedemptionAggregateId,
+        raindex: &Arc<dyn Raindex>,
+    ) {
+        let state = store.load(id).await.unwrap().unwrap();
+        let EquityRedemption::VaultWithdrawSubmitting {
+            token,
+            vault_id,
+            wrapped_amount,
+            ..
+        } = state
+        else {
+            panic!("expected VaultWithdrawSubmitting, got {state:?}");
+        };
+        let tx_hash = raindex
+            .submit_withdraw(token, vault_id, wrapped_amount, TOKENIZED_EQUITY_DECIMALS)
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::RecordWithdrawSubmission { tx_hash },
+            )
+            .await
+            .unwrap();
     }
 
     fn receipt_with_logs(logs: Vec<Log>) -> TransactionReceipt {
@@ -3287,14 +3545,17 @@ mod tests {
         }
     }
 
-    fn vault_withdraw_pending_event() -> EquityRedemptionEvent {
-        EquityRedemptionEvent::VaultWithdrawPending {
+    fn vault_withdraw_submitting_event() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::VaultWithdrawSubmitting {
             chain: Chain::Base,
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(50.25),
             token: Address::random(),
+            vault_id: RaindexVaultId(B256::repeat_byte(0x42)),
             wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
-            pending_at: Utc::now(),
+            from_block: 123,
+            prepared: Some(prepared_withdrawal_for_test()),
+            submitting_at: Utc::now(),
         }
     }
 
@@ -3353,23 +3614,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redeem_from_uninitialized_produces_vault_withdraw_pending() {
+    async fn redeem_from_uninitialized_produces_vault_withdraw_submitting() {
+        let token = Address::random();
+        let vault_id = RaindexVaultId(B256::repeat_byte(0x42));
+        let amount = U256::from(50_250_000_000_000_000_000_u128);
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given_no_previous_events()
             .when(EquityRedemptionCommand::Redeem {
                 chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(50.25),
-                token: Address::random(),
-                amount: U256::from(50_250_000_000_000_000_000_u128),
+                token,
+                vault_id,
+                amount,
+                from_block: 123,
+                prepared: prepared_withdrawal_for_test(),
             })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
-            events[0],
-            EquityRedemptionEvent::VaultWithdrawPending { .. }
+            &events[0],
+            EquityRedemptionEvent::VaultWithdrawSubmitting {
+                chain: Chain::Base,
+                token: event_token,
+                vault_id: event_vault_id,
+                wrapped_amount,
+                from_block: 123,
+                ..
+            } if *event_token == token
+                && *event_vault_id == vault_id
+                && *wrapped_amount == amount
         ));
     }
 
@@ -3384,7 +3660,24 @@ mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
+
         assert!(matches!(events[0], EquityRedemptionEvent::Detected { .. }));
+    }
+
+    #[tokio::test]
+    async fn unresolved_withdrawal_intent_cannot_be_failed_away() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![vault_withdraw_submitting_event()])
+            .when(EquityRedemptionCommand::FailTransfer {
+                reason: "submission response was lost".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(EquityRedemptionError::AlreadyStarted)
+        ));
     }
 
     #[tokio::test]
@@ -3405,7 +3698,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_redemption_flow_end_to_end() {
-        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let (store, raindex) = redemption_test_store(mock_services());
         let id = redemption_aggregate_id("end-to-end");
 
         store
@@ -3416,16 +3709,16 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
 
         store
             .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
@@ -3481,31 +3774,44 @@ mod tests {
     /// the caller-supplied timestamp through to the emitted event's field
     /// rather than silently falling back to the current time.
     #[tokio::test]
-    async fn submit_withdraw_at_uses_supplied_timestamp() {
+    async fn record_withdraw_submission_at_uses_supplied_timestamp() {
         let submitted_at = Utc::now() - chrono::Duration::hours(3);
+        let tx_hash = TxHash::repeat_byte(0x43);
 
         let events = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![vault_withdraw_pending_event()])
-            .when(EquityRedemptionCommand::SubmitWithdrawAt { submitted_at })
+            .given(vec![vault_withdraw_submitting_event()])
+            .when(EquityRedemptionCommand::RecordWithdrawSubmissionAt {
+                tx_hash,
+                submitted_at,
+            })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
         let EquityRedemptionEvent::VaultWithdrawSubmitted {
             submitted_at: event_submitted_at,
+            prepared: Some(event_prepared),
             ..
         } = &events[0]
         else {
-            panic!("Expected VaultWithdrawSubmitted, got: {:?}", events[0]);
+            panic!("Expected VaultWithdrawSubmitted with prepared transaction");
         };
         assert_eq!(*event_submitted_at, submitted_at);
+        assert_eq!(*event_prepared, prepared_withdrawal_for_test());
+        assert!(matches!(
+            events[0],
+            EquityRedemptionEvent::VaultWithdrawSubmitted {
+                tx_hash: event_tx_hash,
+                ..
+            } if event_tx_hash == tx_hash
+        ));
     }
 
     #[tokio::test]
     async fn confirm_withdraw_at_uses_supplied_timestamp() {
         let withdrawn_at = Utc::now() - chrono::Duration::hours(2);
 
-        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let (store, raindex) = redemption_test_store(mock_services());
         let id = redemption_aggregate_id("confirm-withdraw-at");
 
         store
@@ -3516,15 +3822,15 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
 
         store
             .send(
@@ -3570,7 +3876,7 @@ mod tests {
     async fn confirm_unwrap_at_uses_supplied_timestamp() {
         let unwrapped_at = Utc::now() - chrono::Duration::minutes(30);
 
-        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let (store, raindex) = redemption_test_store(mock_services());
         let id = redemption_aggregate_id("confirm-unwrap-at");
 
         store
@@ -3581,15 +3887,15 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
         store
             .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
             .await
@@ -3651,7 +3957,7 @@ mod tests {
 
     #[tokio::test]
     async fn redeem_at_uses_supplied_timestamp() {
-        let pending_at = Utc::now() - chrono::Duration::hours(4);
+        let submitting_at = Utc::now() - chrono::Duration::hours(4);
 
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given_no_previous_events()
@@ -3660,21 +3966,24 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: float!(50.25),
                 token: Address::random(),
+                vault_id: RaindexVaultId(B256::ZERO),
                 amount: U256::from(50_250_000_000_000_000_000_u128),
-                pending_at,
+                from_block: 123,
+                submitting_at,
+                prepared: prepared_withdrawal_for_test(),
             })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
-        let EquityRedemptionEvent::VaultWithdrawPending {
-            pending_at: event_pending_at,
+        let EquityRedemptionEvent::VaultWithdrawSubmitting {
+            submitting_at: event_submitting_at,
             ..
         } = &events[0]
         else {
-            panic!("Expected VaultWithdrawPending, got: {:?}", events[0]);
+            panic!("Expected VaultWithdrawSubmitting, got: {:?}", events[0]);
         };
-        assert_eq!(*event_pending_at, pending_at);
+        assert_eq!(*event_submitting_at, submitting_at);
     }
 
     #[tokio::test]
@@ -3791,7 +4100,7 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        let store = TestStore::<EquityRedemption>::new(services);
+        let (store, raindex) = redemption_test_store(services);
         let id = redemption_aggregate_id("underlying-token-fix");
 
         store
@@ -3802,16 +4111,16 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: wrapped_token,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
 
         store
             .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
@@ -4088,7 +4397,7 @@ mod tests {
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
-        let store = TestStore::<EquityRedemption>::new(services);
+        let (store, raindex) = redemption_test_store(services);
         let id = redemption_aggregate_id("partial-withdraw");
 
         store
@@ -4099,16 +4408,16 @@ mod tests {
                     symbol: Symbol::new("COIN").unwrap(),
                     quantity: float!(37.143292455),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: requested_amount,
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
 
         store
             .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
@@ -4149,7 +4458,7 @@ mod tests {
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
-        let store = TestStore::<EquityRedemption>::new(services);
+        let (store, raindex) = redemption_test_store(services);
         let id = redemption_aggregate_id("unwrap-partial-withdraw");
 
         store
@@ -4160,16 +4469,16 @@ mod tests {
                     symbol: Symbol::new("COIN").unwrap(),
                     quantity: float!(37.143292455),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: requested_amount,
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
         store
             .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
             .await
@@ -4230,14 +4539,22 @@ mod tests {
                     symbol: Symbol::new("COIN").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
 
         store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
             .await
             .unwrap();
 
@@ -4296,14 +4613,22 @@ mod tests {
                     symbol: Symbol::new("COIN").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
 
         store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
             .await
             .unwrap();
 
@@ -4774,7 +5099,7 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        let store = TestStore::<EquityRedemption>::new(services);
+        let (store, raindex) = redemption_test_store(services);
         let id = redemption_aggregate_id("send-fail");
 
         store
@@ -4785,16 +5110,16 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
 
         store
             .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
@@ -4852,7 +5177,7 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        let store = TestStore::<EquityRedemption>::new(services);
+        let (store, raindex) = redemption_test_store(services);
         let id = redemption_aggregate_id("no-wallet");
 
         store
@@ -4863,16 +5188,16 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
 
         store
             .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
@@ -4976,7 +5301,7 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        let store = TestStore::<EquityRedemption>::new(services);
+        let (store, raindex) = redemption_test_store(services);
         let id = redemption_aggregate_id("unwrap-delivered-another-token");
 
         store
@@ -4987,15 +5312,15 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
         store
             .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
             .await
@@ -5087,7 +5412,10 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -5101,7 +5429,10 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -5115,7 +5446,7 @@ mod tests {
 
     #[tokio::test]
     async fn redeem_when_pending_returns_already_started() {
-        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let (store, raindex) = redemption_test_store(mock_services());
         let id = redemption_aggregate_id("redemption-1");
 
         store
@@ -5126,16 +5457,16 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
-            .await
-            .unwrap();
+        submit_and_record_withdrawal(&store, &id, &raindex).await;
 
         store
             .send(&id, EquityRedemptionCommand::ConfirmWithdraw)
@@ -5185,7 +5516,10 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(10_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -6752,6 +7086,7 @@ mod tests {
                 token: Address::ZERO,
                 wrapped_amount: U256::ZERO,
                 tx_hash: TxHash::default(),
+                prepared: None,
                 submitted_at: now,
             }
             .is_terminal(),
@@ -6970,6 +7305,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_submitting_event_without_prepared_transaction_fails_closed() {
+        let legacy = serde_json::json!({
+            "VaultWithdrawSubmitting": {
+                "symbol": "AAPL",
+                "chain": "base",
+                "quantity": "10",
+                "token": "0x0000000000000000000000000000000000000001",
+                "vault_id": format!("{:#x}", B256::repeat_byte(0x42)),
+                "wrapped_amount": "10000000000000000000",
+                "from_block": 123,
+                "submitting_at": "2026-01-01T00:00:00Z",
+            }
+        });
+        let event: EquityRedemptionEvent = serde_json::from_value(legacy).unwrap();
+
+        let state = replay::<EquityRedemption>(vec![event]).unwrap().unwrap();
+
+        assert!(matches!(
+            state,
+            EquityRedemption::VaultWithdrawPending { .. }
+        ));
+    }
+
+    #[test]
     fn vault_withdraw_pending_event_roundtrips_its_chain() {
         let event = EquityRedemptionEvent::VaultWithdrawPending {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -6999,7 +7358,10 @@ mod tests {
                 quantity: float!(50.25),
                 token: Address::random(),
                 chain: Chain::Ethereum,
+                vault_id: RaindexVaultId(B256::ZERO),
                 amount: U256::from(50_250_000_000_000_000_000_u128),
+                from_block: 0,
+                prepared: prepared_withdrawal_for_test(),
             })
             .await
             .events();

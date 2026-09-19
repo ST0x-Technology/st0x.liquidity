@@ -7,7 +7,7 @@
 //! the signer: `TurnkeySigner` (remote signing via Turnkey API) instead
 //! of `PrivateKeySigner` (local key).
 
-use alloy::consensus::{SignableTransaction, TxEnvelope};
+use alloy::consensus::{SignableTransaction, Transaction, TxEnvelope};
 use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
 use alloy::network::{Ethereum, EthereumWallet, TxSigner};
 use alloy::primitives::{
@@ -43,8 +43,10 @@ use turnkey_client::{RetryConfig, TurnkeyClientError};
 use crate::gcp_kms_stamper::{GcpKmsStamper, GcpKmsStamperError};
 use crate::inflight_nonces::InFlightNonces;
 use crate::nonce::ResettableNonceManager;
-use crate::submit::{release_in_flight_after_wait, send_with_recovery};
-use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
+use crate::submit::{
+    broadcast_prepared, prepare_with_nonce, release_in_flight_after_wait, send_with_recovery,
+};
+use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
 
 /// Turnkey organization identifier (non-secret, lives in plaintext
 /// config).
@@ -470,6 +472,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
 
         let base_provider = ctx.provider.clone();
         let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
 
         let signing_provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -488,7 +491,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
-            in_flight: InFlightNonces::default(),
+            in_flight,
             send_lock: Arc::new(Mutex::new(())),
             typed_data_signer,
             address,
@@ -517,6 +520,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
 
         let base_provider = provider.clone();
         let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
 
         let signing_provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -531,7 +535,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
-            in_flight: InFlightNonces::default(),
+            in_flight,
             send_lock: Arc::new(Mutex::new(())),
             typed_data_signer,
             address,
@@ -1146,11 +1150,90 @@ where
         .await
     }
 
+    async fn prepare_pending(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        info!(target: "wallet", %contract, note, "Preparing Turnkey contract call");
+        prepare_with_nonce(
+            &self.signing_provider,
+            &self.nonce_manager,
+            &self.send_lock,
+            self.address,
+            contract,
+            calldata,
+        )
+        .await
+    }
+
+    async fn broadcast_prepared(
+        &self,
+        prepared: &PreparedTransaction,
+        note: &str,
+    ) -> Result<TxHash, EvmError> {
+        broadcast_prepared(
+            &self.provider,
+            &self.nonce_manager,
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            prepared,
+            note,
+        )
+        .await
+    }
+
+    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
+        let _guard = self.send_lock.lock().await;
+        self.nonce_manager
+            .release_prepared_nonce(self.address, prepared.nonce())
+            .await;
+        tracing::warn!(
+            target: "wallet",
+            tx_hash = %prepared.tx_hash(),
+            nonce = prepared.nonce(),
+            "Discarding unpersisted prepared transaction and releasing its nonce reservation"
+        );
+    }
+
+    async fn restore_prepared(&self, prepared: &PreparedTransaction) {
+        let _guard = self.send_lock.lock().await;
+        self.nonce_manager
+            .reserve_prepared_nonce(self.address, prepared.nonce())
+            .await;
+        self.in_flight
+            .record_durable(self.address, prepared.nonce(), prepared.tx_hash());
+    }
+
+    async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
+        let _guard = self.send_lock.lock().await;
+        let transaction = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or(EvmError::PreparedTransactionReconciliationPending { tx_hash })?;
+        let nonce = transaction.nonce();
+        self.nonce_manager
+            .reserve_prepared_nonce(self.address, nonce)
+            .await;
+        self.in_flight.record(self.address, nonce, tx_hash);
+        Ok(())
+    }
+
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
         let result =
             crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await;
 
-        release_in_flight_after_wait(&self.in_flight, self.address, tx_hash, &result);
+        release_in_flight_after_wait(
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            tx_hash,
+            &result,
+        )
+        .await;
 
         let receipt = result?;
 
@@ -1193,10 +1276,16 @@ mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{TxKind, U256};
     use alloy::providers::ext::AnvilApi;
+    use alloy::providers::fillers::NonceManager as _;
+    use alloy::rpc::types::TransactionRequest;
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolValue;
     use httpmock::MockServer;
+
+    use crate::inflight_nonces::NonceOwnership;
+    use crate::submit::release_in_flight_after_wait;
+    use crate::{ReceiptWaitConfig, wait_for_receipt_with_config};
 
     use super::*;
 
@@ -2433,6 +2522,184 @@ mod tests {
         .unwrap();
 
         assert_eq!(wallet.address(), expected_address);
+    }
+
+    #[tokio::test]
+    async fn legacy_hash_only_drop_releases_nonce_for_reuse() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let address = anvil.addresses()[0];
+        let snapshot_id = provider.anvil_snapshot().await.unwrap();
+        let pending = provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .from(address)
+                    .to(address)
+                    .value(U256::ZERO),
+            )
+            .await
+            .unwrap();
+        let tx_hash = *pending.tx_hash();
+        pending.get_receipt().await.unwrap();
+        let submitted_nonce = provider
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .expect("submitted transaction must remain visible")
+            .nonce();
+        let server = MockServer::start();
+        let wallet = TurnkeyWallet::from_client(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            provider.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+        wallet.restore_transaction(tx_hash).await.unwrap();
+        provider.anvil_revert(snapshot_id).await.unwrap();
+
+        let result = wait_for_receipt_with_config(
+            wallet.provider(),
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: Duration::from_millis(1),
+                inclusion_timeout: Duration::from_millis(100),
+                confirmation_timeout: Duration::from_millis(100),
+                dropped_grace: Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            &result,
+            Err(EvmError::TransactionDropped {
+                tx_hash: dropped_hash,
+                ..
+            }) if *dropped_hash == tx_hash
+        ));
+        release_in_flight_after_wait(
+            &wallet.in_flight,
+            &wallet.send_lock,
+            address,
+            tx_hash,
+            &result,
+        )
+        .await;
+
+        let next_nonce = wallet
+            .nonce_manager
+            .get_next_nonce(wallet.provider(), address)
+            .await
+            .unwrap();
+        assert_eq!(next_nonce, submitted_nonce);
+    }
+
+    #[tokio::test]
+    async fn restored_prepared_drop_retains_nonce_for_exact_rebroadcast() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+        let address = signer.address();
+        let nonce = provider.get_transaction_count(address).await.unwrap();
+        let chain_id = provider.get_chain_id().await.unwrap();
+        let raw = Bytes::from(
+            hex::decode(
+                locally_signed_envelope_hex(
+                    &signer,
+                    TxEip1559 {
+                        chain_id,
+                        nonce,
+                        gas_limit: 21_000,
+                        max_fee_per_gas: 30_000_000_000,
+                        max_priority_fee_per_gas: 1_000_000_000,
+                        to: TxKind::Call(address),
+                        value: U256::ZERO,
+                        access_list: AccessList::default(),
+                        input: Bytes::new(),
+                    },
+                )
+                .await,
+            )
+            .unwrap(),
+        );
+        let prepared = PreparedTransaction::from_raw(nonce, raw);
+        let snapshot_id = provider.anvil_snapshot().await.unwrap();
+        let server = MockServer::start();
+        let wallet = TurnkeyWallet::from_client(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            provider.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+        wallet
+            .broadcast_prepared(&prepared, "broadcast before restart")
+            .await
+            .unwrap();
+        wallet.await_receipt(prepared.tx_hash()).await.unwrap();
+        let restarted_wallet = TurnkeyWallet::from_client(
+            mock_client(&server),
+            TurnkeyOrganizationId::new("org-test".to_string()),
+            address,
+            provider.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+        restarted_wallet.restore_prepared(&prepared).await;
+        provider.anvil_revert(snapshot_id).await.unwrap();
+
+        let result = wait_for_receipt_with_config(
+            restarted_wallet.provider(),
+            prepared.tx_hash(),
+            1,
+            ReceiptWaitConfig {
+                poll_interval: Duration::from_millis(1),
+                inclusion_timeout: Duration::from_millis(100),
+                confirmation_timeout: Duration::from_millis(100),
+                dropped_grace: Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            &result,
+            Err(EvmError::TransactionDropped {
+                tx_hash: dropped_hash,
+                ..
+            }) if *dropped_hash == prepared.tx_hash()
+        ));
+        release_in_flight_after_wait(
+            &restarted_wallet.in_flight,
+            &restarted_wallet.send_lock,
+            address,
+            prepared.tx_hash(),
+            &result,
+        )
+        .await;
+
+        assert_eq!(
+            restarted_wallet
+                .in_flight
+                .ownership(address, prepared.nonce()),
+            NonceOwnership::Ours
+        );
+        let next_nonce = restarted_wallet
+            .nonce_manager
+            .get_next_nonce(restarted_wallet.provider(), address)
+            .await
+            .unwrap();
+        assert_eq!(next_nonce, prepared.nonce().saturating_add(1));
+        let rebroadcast_hash = restarted_wallet
+            .broadcast_prepared(&prepared, "rebroadcast after restart")
+            .await
+            .unwrap();
+        assert_eq!(rebroadcast_hash, prepared.tx_hash());
     }
 
     // --- Integration tests (real Turnkey API + local Anvil) ---------

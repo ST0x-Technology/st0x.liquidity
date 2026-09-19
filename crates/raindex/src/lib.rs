@@ -12,7 +12,7 @@ use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 
-use st0x_evm::EvmError;
+use st0x_evm::{EvmError, PreparedTransaction};
 
 #[cfg(feature = "rain")]
 mod service;
@@ -20,7 +20,7 @@ mod service;
 pub use service::RaindexService;
 
 /// Vault identifier for Rain OrderBook vaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RaindexVaultId(pub B256);
 
 /// The two Raindex contract addresses a [`RaindexService`] talks to.
@@ -66,11 +66,15 @@ pub enum RaindexError {
     RpcTransport(#[from] RpcError<TransportErrorKind>),
     #[error("ABI decode error: {0}")]
     SolType(#[from] alloy::sol_types::Error),
-    /// A withdrawal scan could not confirm presence or absence: the queried node
-    /// is not confirmations-deep past `from_block`, so an empty result may be RPC
-    /// lag rather than a true absence. Retryable -- the caller must NOT re-execute
-    /// the irreversible withdraw on this.
-    #[error("withdrawal scan inconclusive: node not caught up past block {from_block}")]
+    /// A withdrawal scan did not find a matching mined transaction. An empty
+    /// log result cannot prove that no submission exists because the
+    /// transaction may still be pending or hidden by a load-balanced RPC
+    /// backend. Retryable -- the caller must NOT re-execute the irreversible
+    /// withdraw on this.
+    #[error(
+        "withdrawal scan found no matching mined transaction after block {from_block}; \
+         submission remains unresolved"
+    )]
     ScanInconclusive { from_block: u64 },
     /// A log the withdrawal scan matched on address + topic0 was anomalous
     /// (see [`ScanAnomaly`]). Impossible under the current contracts, so it
@@ -151,6 +155,17 @@ impl RaindexError {
             | Self::MissingOperatorRole { .. } => false,
         }
     }
+
+    /// `true` when reconciliation may succeed after the transaction or RPC
+    /// backend becomes visible. These errors require durable redrive rather than
+    /// a finite worker retry budget.
+    pub fn is_reconciliation_pending(&self) -> bool {
+        match self {
+            Self::ScanInconclusive { .. } | Self::RpcTransport(_) => true,
+            Self::Evm(error) => error.is_confirmation_pending(),
+            _ => false,
+        }
+    }
 }
 
 /// Abstraction for Raindex (Rain OrderBook) operations.
@@ -181,6 +196,39 @@ pub trait Raindex: Send + Sync {
         decimals: u8,
     ) -> Result<TxHash, RaindexError>;
 
+    /// Fill and sign a vault withdrawal without broadcasting it.
+    ///
+    /// Persist the returned identity before calling
+    /// [`broadcast_prepared_withdraw`](Raindex::broadcast_prepared_withdraw).
+    async fn prepare_withdraw(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        target_amount: U256,
+        decimals: u8,
+    ) -> Result<PreparedTransaction, RaindexError>;
+
+    /// Broadcast an exact withdrawal transaction prepared earlier.
+    ///
+    /// Repeated calls submit identical signed bytes and therefore cannot create
+    /// a second withdrawal at another nonce.
+    async fn broadcast_prepared_withdraw(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, RaindexError>;
+    /// Releases the wallet-local reservation when a prepared withdrawal could
+    /// not be persisted and will never be broadcast.
+    async fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction);
+
+    /// Restores wallet-local ownership for a durably submitted withdrawal
+    /// before any other wallet operation can allocate its nonce. Legacy
+    /// records recover the nonce by exact transaction hash.
+    async fn restore_submitted_withdrawal(
+        &self,
+        tx_hash: TxHash,
+        prepared: Option<&PreparedTransaction>,
+    ) -> Result<(), RaindexError>;
+
     /// Submit a vault withdrawal without waiting for confirmation.
     ///
     /// Returns the tx hash immediately. Use
@@ -192,6 +240,22 @@ pub trait Raindex: Send + Sync {
         target_amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError>;
+
+    /// Returns the current chain head for an irreversible-action intent.
+    async fn current_block(&self) -> Result<u64, RaindexError>;
+
+    /// Finds the newest matching withdrawal strictly after `from_block`.
+    ///
+    /// An empty mined-log scan is never evidence that the irreversible
+    /// submission did not happen: it may still be pending, or the queried RPC
+    /// backend may not have observed it. Implementations must therefore return
+    /// [`RaindexError::ScanInconclusive`] rather than representing absence.
+    async fn find_recent_withdrawal(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        from_block: u64,
+    ) -> Result<(TxHash, U256), RaindexError>;
 
     /// Wait for a previously submitted transaction to be confirmed.
     async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {

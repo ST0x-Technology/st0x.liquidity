@@ -1047,7 +1047,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             ExpectedEvent::new(
                 "EquityRedemption",
                 &redemption_agg_id,
-                "EquityRedemptionEvent::VaultWithdrawPending",
+                "EquityRedemptionEvent::VaultWithdrawSubmitting",
             ),
             ExpectedEvent::new(
                 "EquityRedemption",
@@ -1104,11 +1104,11 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     .await;
 
     assert_eq!(
-        events[7].payload["VaultWithdrawPending"]["symbol"]
+        events[7].payload["VaultWithdrawSubmitting"]["symbol"]
             .as_str()
             .unwrap(),
         "AAPL",
-        "VaultWithdrawPending should target the correct symbol"
+        "VaultWithdrawSubmitting should target the correct symbol"
     );
     assert_eq!(
         events[14].payload["TokensSent"]["redemption_tx"]
@@ -2705,7 +2705,10 @@ async fn transfer_failed_cancels_redemption_inflight() {
             Chain::Base,
             ChainEquityServices {
                 wallet: Address::ZERO,
-                raindex: Arc::new(MockRaindex::new()),
+                raindex: Arc::new(MockRaindex::new().with_withdraw_transfer(
+                    token_address,
+                    U256::from(10_000_000_000_000_000_000_u128),
+                )),
                 vault_lookup: mock_vault_lookup_for_symbol(&symbol, token_address),
                 tokenizer,
                 wrapper: Arc::new(MockWrapper::new()),
@@ -2726,7 +2729,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
 
     let redemption_id = redemption_aggregate_id("redemption-transfer-failed");
 
-    // Redeem: creates VaultWithdrawPending
+    // Redeem: creates VaultWithdrawSubmitting
     redemption_store
         .send(
             &redemption_id,
@@ -2735,13 +2738,16 @@ async fn transfer_failed_cancels_redemption_inflight() {
                 symbol: symbol.clone(),
                 quantity: float!("10"),
                 token: token_address,
+                vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                 amount: U256::from(10_000_000_000_000_000_000_u128),
+                from_block: 0,
+                prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
             },
         )
         .await
         .unwrap();
 
-    // After VaultWithdrawPending, inflight should be set at MarketMaking
+    // After VaultWithdrawSubmitting, inflight should be set at MarketMaking
     let inflight_after_withdraw = inventory
         .read()
         .await
@@ -2749,11 +2755,16 @@ async fn transfer_failed_cancels_redemption_inflight() {
         .unwrap();
     assert!(
         !inflight_after_withdraw.inner().is_zero().unwrap(),
-        "Inflight should be non-zero after VaultWithdrawPending, got {inflight_after_withdraw:?}"
+        "Inflight should be non-zero after VaultWithdrawSubmitting, got {inflight_after_withdraw:?}"
     );
 
     redemption_store
-        .send(&redemption_id, EquityRedemptionCommand::SubmitWithdraw)
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+            },
+        )
         .await
         .unwrap();
 

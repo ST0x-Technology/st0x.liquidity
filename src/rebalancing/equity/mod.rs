@@ -42,7 +42,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use st0x_config::ChainEquities;
 use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
-use st0x_evm::{Chain, EvmError};
+use st0x_evm::{Chain, EvmError, PreparedTransaction};
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 use st0x_issuance_dto::VaultModeTag;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
@@ -74,6 +74,12 @@ use crate::tokenized_equity_mint::{
     TOKENIZED_EQUITY_DECIMALS, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
 use crate::vault_lookup::{VaultLookup, VaultLookupError};
+/// Delay before retrying an accepted or potentially accepted withdrawal whose
+/// receipt/log state is not yet conclusive. Replacement rows are durable and
+/// intentionally uncapped: transaction finality must not consume the queue's
+/// finite retry budget.
+const WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Data extracted from the TokensReceived aggregate state for
 /// onchain verification and subsequent wrapping.
@@ -334,6 +340,35 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
+    async fn prepare_withdraw(
+        &self,
+        _: Address,
+        _: RaindexVaultId,
+        _: U256,
+        _: u8,
+    ) -> Result<PreparedTransaction, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn broadcast_prepared_withdraw(
+        &self,
+        _: &PreparedTransaction,
+    ) -> Result<TxHash, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn discard_prepared_withdraw(&self, _: &PreparedTransaction) {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn restore_submitted_withdrawal(
+        &self,
+        _: TxHash,
+        _: Option<&PreparedTransaction>,
+    ) -> Result<(), RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
     async fn submit_withdraw(
         &self,
         _: Address,
@@ -341,6 +376,19 @@ impl Raindex for PanickingRaindex {
         _: U256,
         _: u8,
     ) -> Result<TxHash, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn current_block(&self) -> Result<u64, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn find_recent_withdrawal(
+        &self,
+        _: Address,
+        _: RaindexVaultId,
+        _: u64,
+    ) -> Result<(TxHash, U256), RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
@@ -731,6 +779,15 @@ pub enum RedemptionError {
     UnexpectedPendingStatus,
     #[error("Redemption was rejected by Alpaca")]
     Rejected,
+    #[error(
+        "redemption {aggregate_id} is in legacy VaultWithdrawPending without a \
+         trustworthy chain-scan lower bound; operator reconciliation is required"
+    )]
+    LegacyVaultWithdrawPending { aggregate_id: RedemptionAggregateId },
+    #[error(
+        "prepared vault withdrawal hash mismatch: expected {expected}, broadcast returned {actual}"
+    )]
+    PreparedWithdrawalHashMismatch { expected: TxHash, actual: TxHash },
 }
 
 impl RedemptionError {
@@ -739,6 +796,16 @@ impl RedemptionError {
             Self::GasReadiness(failure) => failure.retry_interval(),
             _ => None,
         }
+    }
+
+    pub(crate) fn is_reconciliation_pending(&self) -> bool {
+        matches!(self, Self::Raindex(error) if error.is_reconciliation_pending())
+            || matches!(
+                self,
+                Self::Send(AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::RaindexWithdrawReconciliationPending { .. },
+                )))
+            )
     }
 }
 
@@ -761,7 +828,9 @@ impl BotGasFailureClassifier for RedemptionError {
             | Self::SendFailed { .. }
             | Self::UnexpectedEntity { .. }
             | Self::UnexpectedPendingStatus
-            | Self::Rejected => false,
+            | Self::Rejected
+            | Self::LegacyVaultWithdrawPending { .. }
+            | Self::PreparedWithdrawalHashMismatch { .. } => false,
         }
     }
 }
@@ -1456,8 +1525,8 @@ impl CrossVenueEquityTransfer {
         }
     }
 
-    /// Sends the Redeem command to submit vault withdrawal, then
-    /// ConfirmWithdraw to wait for confirmation.
+    /// Signs the exact vault withdrawal, persists that identity, broadcasts its
+    /// bytes, records the hash, then confirms it.
     async fn withdraw_from_raindex(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -1467,7 +1536,18 @@ impl CrossVenueEquityTransfer {
         token: Address,
         amount: U256,
     ) -> Result<(), RedemptionError> {
-        self.redemption_store
+        let chain_services = self.services.for_chain(chain)?;
+        let vault_id = chain_services
+            .vault_lookup
+            .vault_id_for_token(token)
+            .await?;
+        let prepared = chain_services
+            .raindex
+            .prepare_withdraw(token, vault_id, amount, TOKENIZED_EQUITY_DECIMALS)
+            .await?;
+
+        let persist_result = self
+            .redemption_store
             .send(
                 aggregate_id,
                 EquityRedemptionCommand::Redeem {
@@ -1475,19 +1555,78 @@ impl CrossVenueEquityTransfer {
                     chain,
                     quantity: quantity.inner(),
                     token,
+                    vault_id,
                     amount,
+                    from_block: 0,
+                    prepared: prepared.clone(),
                 },
             )
-            .await?;
+            .await;
+        if let Err(error) = persist_result {
+            // A reactor error may be returned after the event committed. Reload
+            // before touching nonce state: only a definitely absent aggregate
+            // proves these signed bytes were not persisted and will never be
+            // broadcast by recovery.
+            if matches!(self.redemption_store.load(aggregate_id).await, Ok(None)) {
+                chain_services
+                    .raindex
+                    .discard_prepared_withdraw(&prepared)
+                    .await;
+            }
+            return Err(error.into());
+        }
 
-        self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::SubmitWithdraw)
+        self.broadcast_and_record_vault_withdrawal(aggregate_id, chain, &prepared)
             .await?;
 
         self.redemption_store
             .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
             .await?;
 
+        Ok(())
+    }
+
+    async fn broadcast_and_record_vault_withdrawal(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        chain: Chain,
+        prepared: &PreparedTransaction,
+    ) -> Result<(), RedemptionError> {
+        let tx_hash = self.broadcast_vault_withdrawal(chain, prepared).await?;
+        self.record_vault_withdrawal_submission(aggregate_id, tx_hash)
+            .await
+    }
+
+    async fn broadcast_vault_withdrawal(
+        &self,
+        chain: Chain,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, RedemptionError> {
+        let expected = prepared.tx_hash();
+        info!(target: "rebalance", %expected, "Broadcasting prepared Raindex vault withdrawal");
+        let actual = self
+            .services
+            .for_chain(chain)?
+            .raindex
+            .broadcast_prepared_withdraw(prepared)
+            .await?;
+        if actual != expected {
+            return Err(RedemptionError::PreparedWithdrawalHashMismatch { expected, actual });
+        }
+        Ok(actual)
+    }
+
+    async fn record_vault_withdrawal_submission(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        self.redemption_store
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::RecordWithdrawSubmission { tx_hash },
+            )
+            .await?;
         Ok(())
     }
 
@@ -1698,12 +1837,43 @@ impl CrossVenueEquityTransfer {
         loop {
             match self.load_redemption_entity(aggregate_id).await? {
                 EquityRedemption::VaultWithdrawPending { .. } => {
-                    info!(%aggregate_id, "Resuming pending vault withdrawal");
+                    return Err(RedemptionError::LegacyVaultWithdrawPending {
+                        aggregate_id: aggregate_id.clone(),
+                    });
+                }
+                EquityRedemption::VaultWithdrawSubmitting {
+                    chain, prepared, ..
+                } => {
+                    info!(
+                        %aggregate_id,
+                        tx_hash = %prepared.tx_hash(),
+                        "Broadcasting persisted vault withdrawal"
+                    );
+                    self.broadcast_and_record_vault_withdrawal(aggregate_id, chain, &prepared)
+                        .await?;
                     self.redemption_store
-                        .send(aggregate_id, EquityRedemptionCommand::SubmitWithdraw)
+                        .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
                         .await?;
                 }
-                EquityRedemption::VaultWithdrawSubmitted { .. } => {
+                EquityRedemption::VaultWithdrawSubmitted {
+                    chain,
+                    tx_hash,
+                    prepared,
+                    ..
+                } => {
+                    self.services
+                        .for_chain(chain)?
+                        .raindex
+                        .restore_submitted_withdrawal(tx_hash, prepared.as_ref())
+                        .await?;
+                    if let Some(prepared) = prepared.as_ref() {
+                        info!(
+                            %aggregate_id,
+                            %tx_hash,
+                            "Rebroadcasting persisted submitted vault withdrawal"
+                        );
+                        self.broadcast_vault_withdrawal(chain, prepared).await?;
+                    }
                     info!(%aggregate_id, "Resuming submitted vault withdrawal");
                     self.redemption_store
                         .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
@@ -2414,7 +2584,7 @@ mod tests {
         StubVaultModeReader,
     };
     use crate::native_gas::GasReadiness;
-    use crate::onchain::mock::{DepositBehavior, DepositCall, MockRaindex};
+    use crate::onchain::mock::{ConfirmTxBehavior, DepositBehavior, DepositCall, MockRaindex};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::UsdcRebalance;
@@ -3793,15 +3963,16 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         ));
 
+        let services = mock_services();
         let (mint_store, _mint_projection) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
-            .build(mock_services())
+            .build(services.clone())
             .await
             .unwrap();
         let (redemption_store, _redemption_projection) =
             StoreBuilder::<EquityRedemption>::new(pool.clone())
                 .with(service.clone())
-                .build(mock_services())
+                .build(services.clone())
                 .await
                 .unwrap();
         service
@@ -3812,7 +3983,7 @@ mod tests {
             )
             .await;
 
-        let transfer = CrossVenueEquityTransfer::new(mock_services(), mint_store, redemption_store);
+        let transfer = CrossVenueEquityTransfer::new(services, mint_store, redemption_store);
 
         (transfer, service, pool)
     }
@@ -3887,6 +4058,224 @@ mod tests {
         let transfer = CrossVenueEquityTransfer::new(services, mint_store, redemption_store);
 
         (transfer, pool)
+    }
+
+    fn withdrawal_amount() -> U256 {
+        U256::from(50_000_000_000_000_000_000_u128)
+    }
+
+    async fn seed_withdrawal_intent(
+        transfer: &CrossVenueEquityTransfer,
+        id: &RedemptionAggregateId,
+        from_block: u64,
+    ) {
+        transfer
+            .redemption_store
+            .send(
+                id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("TEST").unwrap(),
+                    chain: Chain::Base,
+                    quantity: float!(50),
+                    token: Address::ZERO,
+                    vault_id: RaindexVaultId(B256::ZERO),
+                    amount: withdrawal_amount(),
+                    from_block,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    fn restarted_transfer(
+        transfer: &CrossVenueEquityTransfer,
+        pool: SqlitePool,
+    ) -> CrossVenueEquityTransfer {
+        let services = transfer.services.clone();
+        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
+        let redemption_store = Arc::new(test_store(pool, services.clone()));
+        CrossVenueEquityTransfer::new(services, mint_store, redemption_store)
+    }
+
+    #[tokio::test]
+    async fn resume_broadcasts_prepared_withdrawal_persisted_before_first_attempt() {
+        let raindex =
+            Arc::new(MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Retryable));
+        let (transfer, pool) = create_equity_transfer_with_pool(
+            Arc::new(MockTokenizer::new()),
+            raindex.clone(),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = redemption_aggregate_id("withdraw-prepared-before-broadcast");
+        seed_withdrawal_intent(&transfer, &id, 101).await;
+
+        assert_eq!(raindex.withdraw_submissions(), 0);
+        let restarted = restarted_transfer(&transfer, pool);
+        let error = restarted.resume_redemption(&id).await.unwrap_err();
+
+        assert!(
+            error.is_reconciliation_pending(),
+            "receipt reconciliation should remain retryable, got: {error:?}"
+        );
+        assert_eq!(
+            raindex.withdraw_submissions(),
+            1,
+            "restart must broadcast the exact prepared transaction"
+        );
+        assert!(matches!(
+            restarted.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted {
+                tx_hash: TxHash::ZERO,
+                ..
+            })
+        ));
+        assert_eq!(
+            raindex.restored_prepared_withdrawals(),
+            0,
+            "the submitting-state path records ownership while broadcasting \
+             and must not redundantly restore before its first confirmation"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_submitted_withdrawal_rebroadcasts_persisted_bytes_on_every_resume() {
+        let raindex = Arc::new(MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Fail));
+        let (transfer, pool) = create_equity_transfer_with_pool(
+            Arc::new(MockTokenizer::new()),
+            raindex.clone(),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = redemption_aggregate_id("withdraw-submitted-dropped");
+        seed_withdrawal_intent(&transfer, &id, 102).await;
+        let prepared_hash = match transfer.redemption_store.load(&id).await.unwrap() {
+            Some(EquityRedemption::VaultWithdrawSubmitting { prepared, .. }) => prepared.tx_hash(),
+            state => panic!("expected durable prepared withdrawal, got {state:?}"),
+        };
+        transfer
+            .record_vault_withdrawal_submission(&id, prepared_hash)
+            .await
+            .unwrap();
+
+        let restarted = restarted_transfer(&transfer, pool);
+        for expected_submissions in 1..=2 {
+            let error = restarted.resume_redemption(&id).await.unwrap_err();
+            assert!(
+                error.is_reconciliation_pending(),
+                "a dropped durable withdrawal must remain retryable, got {error:?}"
+            );
+            assert_eq!(
+                raindex.withdraw_submissions(),
+                expected_submissions,
+                "each resume must rebroadcast the exact persisted transaction \
+                 before checking its receipt again"
+            );
+            assert!(matches!(
+                restarted.redemption_store.load(&id).await.unwrap(),
+                Some(EquityRedemption::VaultWithdrawSubmitted {
+                    tx_hash,
+                    prepared: Some(prepared),
+                    ..
+                }) if tx_hash == prepared_hash && prepared.tx_hash() == prepared_hash
+            ));
+        }
+        assert_eq!(
+            raindex.restored_prepared_withdrawals(),
+            2,
+            "each resume must restore durable nonce ownership before rebroadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_broadcast_response_rebroadcasts_persisted_transaction_after_restart() {
+        let raindex = Arc::new(MockRaindex::new().accepting_withdraw_then_losing_response());
+        let (transfer, pool) = create_equity_transfer_with_pool(
+            Arc::new(MockTokenizer::new()),
+            raindex.clone(),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = redemption_aggregate_id("withdraw-response-lost");
+
+        let first_error = transfer
+            .withdraw_from_raindex(
+                &id,
+                &Symbol::new("TEST").unwrap(),
+                Chain::Base,
+                FractionalShares::new(float!(50)),
+                Address::ZERO,
+                withdrawal_amount(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(first_error, RedemptionError::Raindex(_)));
+        let prepared_hash = match transfer.redemption_store.load(&id).await.unwrap() {
+            Some(EquityRedemption::VaultWithdrawSubmitting { prepared, .. }) => prepared.tx_hash(),
+            state => panic!("prepared transaction must remain durable, got {state:?}"),
+        };
+
+        let restarted = restarted_transfer(&transfer, pool);
+        let second_error = restarted.resume_redemption(&id).await.unwrap_err();
+
+        assert!(matches!(second_error, RedemptionError::Raindex(_)));
+        assert_eq!(raindex.withdraw_submissions(), 2);
+        assert!(matches!(
+            restarted.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitting { prepared, .. })
+                if prepared.tx_hash() == prepared_hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_pending_withdrawal_requires_operator_reconciliation() {
+        let raindex = Arc::new(MockRaindex::new());
+        let (transfer, pool) = create_equity_transfer_with_pool(
+            Arc::new(MockTokenizer::new()),
+            raindex.clone(),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = redemption_aggregate_id("legacy-withdraw-pending");
+        let payload = r#"{"VaultWithdrawPending":{"symbol":"TEST","chain":"base","quantity":"50","token":"0x0000000000000000000000000000000000000000","wrapped_amount":"50000000000000000000","pending_at":"2026-01-01T00:00:00Z"}}"#;
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('EquityRedemption', ?1, 1, \
+             'EquityRedemptionEvent::VaultWithdrawPending', '1', ?2, '{}')",
+        )
+        .bind(id.to_string())
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let snapshot_payload = format!(r#"{{"Live":{payload}}}"#);
+        sqlx::query(
+            "INSERT INTO snapshots \
+             (aggregate_type, aggregate_id, last_sequence, payload, timestamp, snapshot_version) \
+             VALUES ('EquityRedemption', ?1, 1, ?2, '2026-01-01T00:00:00Z', 7)",
+        )
+        .bind(id.to_string())
+        .bind(snapshot_payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let restarted = restarted_transfer(&transfer, pool);
+
+        let error = restarted.resume_redemption(&id).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RedemptionError::LegacyVaultWithdrawPending {
+                    ref aggregate_id
+                } if aggregate_id == &id
+            ),
+            "legacy pending must produce the typed conservative refusal, got: {error:?}"
+        );
+        assert_eq!(raindex.withdraw_submissions(), 0);
     }
 
     async fn advance_redemption_to_tokens_sent(
@@ -4963,12 +5352,20 @@ mod tests {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let queue = RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
         apalis_pool.close().await;
+        let symbol = Symbol::new("TEST").unwrap();
+        let token = mock_vault_lookup()
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = FractionalShares::new(float!(50))
+            .to_u256_18_decimals()
+            .unwrap();
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainEquityServices {
                     wallet: Address::ZERO,
-                    raindex: Arc::new(MockRaindex::new()),
+                    raindex: Arc::new(MockRaindex::new().with_withdraw_transfer(token, amount)),
                     vault_lookup: Arc::new(mock_vault_lookup()),
                     tokenizer: Arc::new(MockTokenizer::new()),
                     wrapper: Arc::new(MockWrapper::new()),
@@ -4981,14 +5378,6 @@ mod tests {
         };
         let redemption_store = Arc::new(test_store::<EquityRedemption>(pool, services.clone()));
 
-        let symbol = Symbol::new("TEST").unwrap();
-        let token = mock_vault_lookup()
-            .vault_token_for_symbol(&symbol)
-            .await
-            .unwrap();
-        let amount = FractionalShares::new(float!(50))
-            .to_u256_18_decimals()
-            .unwrap();
         let id = redemption_aggregate_id("redeem-bot-gas-fail");
         redemption_store
             .send(
@@ -4998,13 +5387,21 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: float!(50),
                     token,
+                    vault_id: RaindexVaultId(B256::ZERO),
                     amount,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
         redemption_store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
             .await
             .unwrap();
 

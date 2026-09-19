@@ -589,10 +589,10 @@ struct StoredOperation {
     /// sort/window key.
     first_seen_at: DateTime<Utc>,
     /// Genuine operation start, seeded ONLY by the operation's genesis event
-    /// (`MintRequested` for mint, `VaultWithdrawPending` for redemption --
-    /// both are the aggregate's own `initialize()` event, so this is always
-    /// the true first phase, unlike USDC's direction-gated seeding). Stays
-    /// `None` when the operation was first observed mid-stream.
+    /// (`MintRequested` for mint; `VaultWithdrawSubmitting` for new redemptions
+    /// and `VaultWithdrawPending` for legacy redemptions). This is always the
+    /// true first phase, unlike USDC's direction-gated seeding. Stays `None`
+    /// when the operation was first observed mid-stream.
     started_at: Option<DateTime<Utc>>,
     completed_at: Option<DateTime<Utc>>,
     status: StoredStatus,
@@ -1095,6 +1095,7 @@ mod tests {
                 token: Address::repeat_byte(0x22),
                 wrapped_amount: U256::from(5_000_000_000_000_000_000_u128),
                 tx_hash: TxHash::random(),
+                prepared: None,
                 submitted_at: timestamp(5),
             },
             EquityRedemptionEvent::WithdrawnFromRaindex {
@@ -1590,6 +1591,7 @@ mod tests {
                 token: Address::repeat_byte(0x22),
                 wrapped_amount: U256::from(5_000_000_000_000_000_000_u128),
                 tx_hash: TxHash::random(),
+                prepared: None,
                 submitted_at: timestamp(5),
             })
             .unwrap(),

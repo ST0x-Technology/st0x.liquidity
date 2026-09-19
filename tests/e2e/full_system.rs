@@ -67,7 +67,7 @@ use crate::poll::{
     connect_db, count_events, count_events_of_type, free_port_pair, poll_for_broker_fills,
     poll_for_events, poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
 };
-use crate::rebalancing::assertions::{TestWallet, test_alerts};
+use crate::rebalancing::assertions::{test_alerts, test_wallet};
 use crate::test_infra::TestInfra;
 
 /// Builds a `Ctx` with ALL features enabled: hedging, equity rebalancing,
@@ -121,13 +121,10 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let base_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
-        &chain.owner_key,
-        chain.endpoint().parse()?,
-        1,
-    )?);
+    let base_wallet: Arc<dyn Wallet<Provider = RootProvider>> =
+        Arc::new(test_wallet(&chain.owner_key, chain.endpoint().parse()?, 1)?);
 
-    let ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
+    let ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(test_wallet(
         &chain.owner_key,
         ethereum_endpoint.parse()?,
         1,

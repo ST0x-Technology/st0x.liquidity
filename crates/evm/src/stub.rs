@@ -9,7 +9,7 @@ use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 
-use crate::{Evm, EvmError, Wallet};
+use crate::{Evm, EvmError, PreparedTransaction, Wallet};
 
 /// Panicking wallet stub for tests.
 ///
@@ -65,6 +65,43 @@ impl Wallet for StubWallet {
         panic!(
             "StubWallet::send_pending called - use a real wallet in tests that need transactions"
         )
+    }
+    async fn prepare_pending(
+        &self,
+        _contract: Address,
+        _calldata: Bytes,
+        _note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        panic!(
+            "StubWallet::prepare_pending called - use a real wallet in tests that need transactions"
+        )
+    }
+
+    async fn broadcast_prepared(
+        &self,
+        _prepared: &PreparedTransaction,
+        _note: &str,
+    ) -> Result<TxHash, EvmError> {
+        panic!(
+            "StubWallet::broadcast_prepared called - use a real wallet in tests that need transactions"
+        )
+    }
+    async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+        panic!(
+            "StubWallet::discard_prepared called - use a real wallet in tests that need transactions"
+        );
+    }
+
+    async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+        panic!(
+            "StubWallet::restore_prepared called - use a real wallet in tests that need transactions"
+        );
+    }
+
+    async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+        panic!(
+            "StubWallet::restore_transaction called - use a real wallet in tests that need transactions"
+        );
     }
 
     async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {

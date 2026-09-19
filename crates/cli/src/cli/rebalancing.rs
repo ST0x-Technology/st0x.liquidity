@@ -2077,7 +2077,7 @@ pub(crate) async fn resume_interrupted_transfers_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, address, b256};
+    use alloy::primitives::{Address, B256, Bytes, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
     use std::collections::BTreeMap;
@@ -2099,6 +2099,7 @@ mod tests {
     };
     use st0x_config::{HedgedChain, InventoryMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError};
+    use st0x_evm::PreparedTransaction;
     #[cfg(feature = "test-support")]
     use st0x_evm::StubWallet;
     use st0x_execution::{
@@ -3785,13 +3786,21 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(1),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: PreparedTransaction::from_raw(0, Bytes::new()),
                 },
             )
             .await
             .unwrap();
         store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
             .await
             .unwrap();
 
@@ -5278,10 +5287,19 @@ mod tests {
     /// withdrawal is confirmed (`WithdrawnFromRaindex`) -- stuck before the
     /// tokens leave the bot's custody.
     async fn seed_redemption_to_withdrawn(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        let token = Address::random();
+        let amount = U256::from(50_250_000_000_000_000_000_u128);
+        let mut services = redemption_services();
+        services
+            .chains
+            .get_mut(&Chain::Base)
+            .expect("redemption test services must include Base")
+            .raindex = Arc::new(MockRaindex::new().with_withdraw_transfer(token, amount));
+
         use EquityRedemptionCommand::*;
 
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(redemption_services())
+            .build(services)
             .await
             .unwrap();
 
@@ -5292,13 +5310,24 @@ mod tests {
                     chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
-                    token: Address::random(),
-                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                    token,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount,
+                    from_block: 0,
+                    prepared: PreparedTransaction::from_raw(0, Bytes::new()),
                 },
             )
             .await
             .unwrap();
-        store.send(id, SubmitWithdraw).await.unwrap();
+        store
+            .send(
+                id,
+                RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
         store.send(id, ConfirmWithdraw).await.unwrap();
     }
 

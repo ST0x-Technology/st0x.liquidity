@@ -6,26 +6,28 @@
 //! wallet address, the cache becomes stale and every subsequent send
 //! fails with "nonce too low".
 //!
-//! [`ResettableNonceManager`] behaves identically to
-//! `CachedNonceManager` but exposes two recovery hooks:
+//! [`ResettableNonceManager`] extends `CachedNonceManager` semantics with
+//! recovery and ownership hooks:
 //!
-//! - [`invalidate()`] clears the cache, forcing the next send to
-//!   re-fetch the nonce from the chain via the **latest** (mined)
-//!   transaction count, not `pending`. `submit.rs`'s stuck-transaction
-//!   recovery (failure mode 2) depends on the next send landing back on
-//!   the nonce a stuck pending transaction occupies and being rejected
-//!   with "replacement transaction underpriced", which is what re-arms
-//!   the fee-bump loop; a `pending` re-fetch would instead return the
-//!   nonce *after* the stuck one (since `pending` is mempool-aware, see
-//!   `submit::TxSubmitter::pending_nonce`'s doc comment), so the send
-//!   would be accepted and merely queue behind it, and the replacement
-//!   would never happen.
-//! - `set_next_nonce()` (crate-internal) seeds the cache with a
-//!   known-good nonce, skipping the re-fetch entirely. Nonce-too-low
-//!   recovery in `submit::retry_after_nonce_too_low` uses this to seed a
-//!   pending-aware target nonce it computes itself (the higher of the
-//!   node's reported next nonce and its own `pending` read), since the
-//!   cold-cache re-fetch above intentionally stays on `latest`.
+//! - [`invalidate()`] clears only the cache, forcing the next send to re-fetch
+//!   the nonce from the chain via the **latest** (mined) transaction count.
+//!   It deliberately retains every prepared or broadcast-but-unconfirmed
+//!   nonce.
+//! - `set_next_nonce()` (crate-internal) seeds the cache with a known-good
+//!   lower bound, skipping the RPC re-fetch. Nonce-too-low recovery then asks
+//!   the allocator for the exact reservation-aware nonce and pins that value
+//!   onto the retry transaction.
+//! - The occupancy set protects both prepared transactions and accepted
+//!   in-flight transactions. Allocation skips occupied values after every
+//!   cache seed or invalidation. Generic ownership is released after a
+//!   definitive receipt or drop; durable prepared ownership survives drops
+//!   for exact rebroadcast and is released only by confirmation or an
+//!   explicit discard-before-broadcast decision.
+//!
+//! The cold-cache fetch intentionally uses `latest`, not `pending`.
+//! `submit.rs`'s stuck-transaction recovery depends on landing back on a stuck
+//! pending nonce and receiving "replacement transaction underpriced"; a
+//! `pending` fetch would jump past it and leave the replacement unattempted.
 //!
 //! [`CachedNonceManager`]: alloy::providers::fillers::CachedNonceManager
 //! [`invalidate()`]: ResettableNonceManager::invalidate
@@ -38,6 +40,7 @@ use alloy::transports::TransportResult;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::lock::Mutex;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::trace;
 
@@ -45,25 +48,26 @@ use tracing::trace;
 /// invalidation and seeding for resilience against external nonce
 /// changes.
 ///
-/// Each entry holds the nonce the *next* send from that address should
-/// use, or `None` when it must be fetched from the RPC.
+/// Each nonce entry holds the nonce the *next* send from that address should
+/// use, or `None` when it must be fetched from the RPC. Occupied nonces are
+/// tracked separately so cache invalidation can discard stale RPC-derived
+/// state without erasing prepared or broadcast-but-unconfirmed ownership.
 #[derive(Clone, Debug, Default)]
 pub struct ResettableNonceManager {
     nonces: Arc<DashMap<Address, Arc<Mutex<Option<u64>>>>>,
+    occupied: Arc<DashMap<Address, BTreeSet<u64>>>,
 }
 
 impl ResettableNonceManager {
-    /// Clears all cached nonces, forcing the next transaction to
-    /// re-fetch the latest nonce from the RPC provider.
+    /// Clears cached next-nonce values while retaining every occupied nonce.
+    /// The next allocation re-fetches the latest mined nonce, then skips
+    /// prepared and broadcast-but-unconfirmed transactions.
     ///
     /// Race note: if a concurrent `get_next_nonce` has already cloned the
-    /// per-address `Arc<Mutex>` but not yet locked it, it will write to
-    /// an orphaned mutex while a new entry is created for subsequent
-    /// callers. This can cause a one-time nonce collision under concurrent
-    /// sends during invalidation. The wallet send path closes this window
-    /// by serializing all sends from one wallet behind a mutex (see
-    /// `submit::send_with_recovery`), so only one send assigns a nonce at
-    /// a time; this note documents the manager's behavior in isolation.
+    /// per-address `Arc<Mutex>` but not yet locked it, it will write to an
+    /// orphaned mutex while a new entry is created for subsequent callers.
+    /// The wallet send path closes this window by serializing all nonce
+    /// mutations behind its send lock.
     pub fn invalidate(&self) {
         self.nonces.clear();
     }
@@ -82,6 +86,54 @@ impl ResettableNonceManager {
         *slot.lock().await = Some(nonce);
     }
 
+    /// Reserves a prepared transaction's nonce and raises the cache past it
+    /// without lowering an already-higher allocation.
+    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    pub(crate) async fn reserve_prepared_nonce(&self, address: Address, nonce: u64) {
+        let slot = self.slot(address);
+        let mut cached = slot.lock().await;
+        self.occupy_nonce(address, nonce);
+        let next = nonce.saturating_add(1);
+        *cached = Some(cached.map_or(next, |current| current.max(next)));
+    }
+
+    /// Releases a prepared nonce that will never be broadcast. The cache is
+    /// rewound only as far as that nonce; every other prepared or in-flight
+    /// nonce remains protected and is skipped by `get_next_nonce`.
+    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    pub(crate) async fn release_prepared_nonce(&self, address: Address, nonce: u64) {
+        self.release_nonce_and_rewind(address, nonce).await;
+    }
+
+    /// Releases a nonce that is definitively free and rewinds the allocation
+    /// cache so the resulting gap is filled before any higher nonce is used.
+    ///
+    /// Callers must hold the wallet send lock across this operation.
+    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    pub(crate) async fn release_nonce_and_rewind(&self, address: Address, nonce: u64) {
+        let slot = self.slot(address);
+        let mut cached = slot.lock().await;
+        if self.release_occupied_nonce(address, nonce) {
+            *cached = Some(cached.map_or(nonce, |current| current.min(nonce)));
+        }
+    }
+
+    /// Marks a nonce occupied by a prepared or broadcast-but-unconfirmed
+    /// transaction. The corresponding in-flight policy decides whether a
+    /// definitive drop releases or retains that ownership.
+    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    pub(crate) fn occupy_nonce(&self, address: Address, nonce: u64) {
+        self.occupied.entry(address).or_default().insert(nonce);
+    }
+
+    /// Releases one definitively resolved nonce.
+    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    pub(crate) fn release_occupied_nonce(&self, address: Address, nonce: u64) -> bool {
+        self.occupied
+            .get_mut(&address)
+            .is_some_and(|mut occupied| occupied.remove(&nonce))
+    }
+
     /// The per-address cache slot, created empty on first access.
     fn slot(&self, address: Address) -> Arc<Mutex<Option<u64>>> {
         let entry = self
@@ -90,6 +142,14 @@ impl ResettableNonceManager {
             .or_insert_with(|| Arc::new(Mutex::new(None)));
 
         Arc::clone(entry.value())
+    }
+
+    /// Whether a prepared or broadcast-but-unconfirmed transaction currently
+    /// owns `nonce`.
+    fn is_occupied(&self, address: Address, nonce: u64) -> bool {
+        self.occupied
+            .get(&address)
+            .is_some_and(|occupied| occupied.contains(&nonce))
     }
 
     /// The nonce the next send from `address` would use, without assigning
@@ -127,28 +187,26 @@ impl NonceManager for ResettableNonceManager {
         let slot = self.slot(address);
         let mut cached = slot.lock().await;
 
-        let next_nonce = if let Some(next_nonce) = *cached {
+        let mut next_nonce = if let Some(next_nonce) = *cached {
             trace!(%address, next_nonce, "using cached nonce");
             next_nonce
         } else {
             trace!(%address, "fetching latest nonce from RPC");
             // Explicit rather than relying on alloy's default block tag: the
             // module doc above depends on this re-fetch returning the
-            // `latest` (mined) count, not `pending`, so that a stuck
-            // pending transaction's nonce is what gets re-targeted. Pinning
-            // it here keeps that dependency visible in code rather than
-            // resting on an upstream default that a future alloy release
-            // could silently change.
+            // `latest` (mined) count, not `pending`.
             provider.get_transaction_count(address).latest().await?
         };
+        while self.is_occupied(address, next_nonce) {
+            let advanced = next_nonce.saturating_add(1);
+            if advanced == next_nonce {
+                break;
+            }
+            next_nonce = advanced;
+        }
 
-        // Saturate rather than wrap: reaching `u64::MAX` here means the
-        // account's nonce space is exhausted, an unreachable condition in
-        // practice (it would take more transactions than any EOA could
-        // ever send). Wrapping to 0 would silently target an
-        // already-used nonce on the next send; saturating instead leaves
-        // every later send targeting `u64::MAX`, which the node will
-        // reject loudly rather than corrupting the cache in silence.
+        // Saturate rather than wrap: reaching `u64::MAX` is unreachable in
+        // practice, and loudly reusing MAX is safer than wrapping to zero.
         *cached = Some(next_nonce.saturating_add(1));
         drop(cached);
 
@@ -161,8 +219,10 @@ mod tests {
     use alloy::providers::ProviderBuilder;
 
     use super::*;
+    use crate::inflight_nonces::InFlightNonces;
 
     #[tokio::test]
+
     async fn increments_locally_after_first_fetch() {
         let manager = ResettableNonceManager::default();
         let provider = ProviderBuilder::new().connect_anvil();
@@ -229,6 +289,133 @@ mod tests {
         manager.set_next_nonce(address, 9).await;
 
         assert_eq!(manager.get_next_nonce(&provider, address).await.unwrap(), 9);
+    }
+
+    #[tokio::test]
+    async fn invalidation_preserves_prepared_nonce_reservations() {
+        let manager = ResettableNonceManager::default();
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+
+        let prepared = manager.get_next_nonce(&provider, address).await.unwrap();
+        manager.reserve_prepared_nonce(address, prepared).await;
+        manager.invalidate();
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            prepared + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_later_preparation_preserves_earlier_reservation() {
+        let manager = ResettableNonceManager::default();
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+
+        let earlier = manager.get_next_nonce(&provider, address).await.unwrap();
+        manager.reserve_prepared_nonce(address, earlier).await;
+        let later = manager.get_next_nonce(&provider, address).await.unwrap();
+        manager.reserve_prepared_nonce(address, later).await;
+        manager.release_prepared_nonce(address, later).await;
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            later,
+            "rolling back the later preparation must not expose the earlier reserved nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_earlier_preparation_skips_later_reservation_after_gap_is_filled() {
+        let manager = ResettableNonceManager::default();
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+
+        let earlier = manager.get_next_nonce(&provider, address).await.unwrap();
+        manager.reserve_prepared_nonce(address, earlier).await;
+        let later = manager.get_next_nonce(&provider, address).await.unwrap();
+        manager.reserve_prepared_nonce(address, later).await;
+        manager.release_prepared_nonce(address, earlier).await;
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            earlier
+        );
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            later + 1,
+            "the allocator must skip the still-reserved later nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn filling_released_gap_skips_higher_in_flight_nonce() {
+        let manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(manager.clone());
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+
+        let prepared = manager.get_next_nonce(&provider, address).await.unwrap();
+        manager.reserve_prepared_nonce(address, prepared).await;
+        let in_flight_nonce = manager.get_next_nonce(&provider, address).await.unwrap();
+        in_flight.record(
+            address,
+            in_flight_nonce,
+            alloy::primitives::TxHash::repeat_byte(0x42),
+        );
+        manager.release_prepared_nonce(address, prepared).await;
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            prepared
+        );
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            in_flight_nonce + 1,
+            "after filling the released gap, allocation must skip the higher \
+             broadcast-but-unconfirmed nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_generic_drop_rewinds_cached_allocation_to_the_released_nonce() {
+        let manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(manager.clone());
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+        let tx_hash = alloy::primitives::TxHash::repeat_byte(0x43);
+
+        let submitted_nonce = manager.get_next_nonce(&provider, address).await.unwrap();
+        in_flight.record(address, submitted_nonce, tx_hash);
+        in_flight.release_hash(address, tx_hash).await;
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            submitted_nonce,
+            "the final generic dropped hash must make its nonce the next \
+             allocation instead of leaving a permanent gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_drop_retains_ownership_and_skips_the_prepared_nonce() {
+        let manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(manager.clone());
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+        let tx_hash = alloy::primitives::TxHash::repeat_byte(0x44);
+
+        let submitted_nonce = manager.get_next_nonce(&provider, address).await.unwrap();
+        in_flight.record_durable(address, submitted_nonce, tx_hash);
+        in_flight.release_hash(address, tx_hash).await;
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            submitted_nonce + 1,
+            "a dropped durable transaction must keep its nonce occupied until \
+             its exact persisted bytes are rebroadcast and confirmed"
+        );
     }
 
     #[tokio::test]

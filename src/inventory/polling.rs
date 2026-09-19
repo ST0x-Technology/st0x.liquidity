@@ -2034,7 +2034,7 @@ mod tests {
     use st0x_config::ExecutionThreshold;
     use st0x_dto::Statement;
     use st0x_event_sorcery::{StoreBuilder, test_store};
-    use st0x_evm::{Chain, ReadOnlyEvm};
+    use st0x_evm::{Chain, PreparedTransaction, ReadOnlyEvm};
     use st0x_execution::{
         Direction, EquityPosition, FractionalShares, Inventory, MockExecutor, Network, Positive,
         SupportedExecutor, Symbol,
@@ -2162,6 +2162,35 @@ mod tests {
             panic!("MockEthereumWallet::sign_typed_data should not be called in polling tests")
         }
 
+        async fn prepare_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!("MockEthereumWallet::prepare_pending should not be called in polling tests")
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            _prepared: &PreparedTransaction,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            panic!("MockEthereumWallet::broadcast_prepared should not be called in polling tests")
+        }
+
+        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!("MockEthereumWallet::discard_prepared should not be called in polling tests");
+        }
+
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!("MockEthereumWallet::restore_prepared should not be called in polling tests");
+        }
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            panic!("MockEthereumWallet::restore_transaction should not be called in polling tests");
+        }
+
         async fn send_pending(
             &self,
             _contract: Address,
@@ -2206,6 +2235,35 @@ mod tests {
             _expected_digest: alloy::primitives::B256,
         ) -> Result<alloy::primitives::Signature, EvmError> {
             panic!("MockBaseWallet::sign_typed_data should not be called in polling tests")
+        }
+
+        async fn prepare_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!("MockBaseWallet::prepare_pending should not be called in polling tests")
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            _prepared: &PreparedTransaction,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            panic!("MockBaseWallet::broadcast_prepared should not be called in polling tests")
+        }
+
+        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!("MockBaseWallet::discard_prepared should not be called in polling tests");
+        }
+
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!("MockBaseWallet::restore_prepared should not be called in polling tests");
+        }
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            panic!("MockBaseWallet::restore_transaction should not be called in polling tests");
         }
 
         async fn send_pending(

@@ -3266,7 +3266,9 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WithdrawnFromRaindex: Withdraw
+    [*] --> VaultWithdrawSubmitting: Redeem (persists signed transaction)
+    VaultWithdrawSubmitting --> VaultWithdrawSubmitted: RecordWithdrawSubmission
+    VaultWithdrawSubmitted --> WithdrawnFromRaindex: ConfirmWithdraw
     WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
     WithdrawnFromRaindex --> Failed
     TokensUnwrapped --> TokensSent: Send
@@ -3277,14 +3279,22 @@ stateDiagram-v2
     Pending --> Failed
 ```
 
-- `Withdraw` command withdraws wrapped tokens from Raindex vault to wallet
-- `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but aren't
+- the orchestrator prepares and signs the withdrawal before `Redeem`, which
+  persists `VaultWithdrawSubmitting` with the chain, token, vault ID, target
+  amount, and exact transaction bytes before any broadcast
+- the orchestrator broadcasts that persisted transaction outside the aggregate
+  transition and records its hash with `RecordWithdrawSubmission`
+- resume rebroadcasts the same signed bytes; it never creates a second
+  withdrawal transaction
+- `VaultWithdrawSubmitted` tracks the known transaction hash until
+  `ConfirmWithdraw` confirms the receipt
+- `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but are not
   yet unwrapped
-- `Unwrap` command converts ERC-4626 wrapped tokens to unwrapped tokens;
-  confirmation records the token the vault reports as its `asset()` at the
-  redeem block as a typed `UnwrappedToken`
+- `Unwrap` converts ERC-4626 wrapped tokens to unwrapped tokens; confirmation
+  records the token the vault reports as its `asset()` at the redeem block as a
+  typed `UnwrappedToken`
 - `TokensUnwrapped` tracks the attested `UnwrappedToken` ready to send
-- `Send` command sends unwrapped tokens to Alpaca and polls until terminal
+- `Send` sends unwrapped tokens to Alpaca and polls until terminal
 - `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
 - `Pending` indicates Alpaca detected the transfer
 - `Completed` and `Failed` are terminal states
@@ -3293,6 +3303,31 @@ stateDiagram-v2
 
 ```rust
 enum EquityRedemption {
+    VaultWithdrawSubmitting {
+        symbol: Symbol,
+        chain: Chain,
+        quantity: Decimal,
+        token: Address,
+        vault_id: RaindexVaultId,
+        wrapped_amount: U256,
+        // Version-7 scan lower bound; zero for prepared transactions.
+        from_block: u64,
+        prepared: PreparedTransaction,
+        submitting_at: DateTime<Utc>,
+    },
+    VaultWithdrawSubmitted {
+        symbol: Symbol,
+        chain: Chain,
+        quantity: Decimal,
+        token: Address,
+        wrapped_amount: U256,
+        tx_hash: TxHash,
+        // Retained so restart can restore nonce ownership before any wallet send.
+        // None only when replaying an event from before version 9; the nonce
+        // restores by transaction hash, but the exact bytes cannot be rebroadcast.
+        prepared: Option<PreparedTransaction>,
+        submitted_at: DateTime<Utc>,
+    },
     WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
@@ -3356,13 +3391,22 @@ enum EquityRedemption {
 
 ```rust
 enum EquityRedemptionCommand {
-    // Withdraws wrapped tokens from Raindex vault to wallet
+    // Initialize: persists the exact signed withdrawal without broadcasting it.
     Redeem {
         symbol: Symbol,
+        chain: Chain,
         quantity: Decimal,
         token: Address,
+        vault_id: RaindexVaultId,
         amount: U256,
+        // Version-7 compatibility field; zero for new commands.
+        from_block: u64,
+        prepared: PreparedTransaction,
     },
+    // Records the persisted transaction's hash after broadcast.
+    RecordWithdrawSubmission { tx_hash: TxHash },
+    // Confirms the recorded transaction.
+    ConfirmWithdraw,
     // Unwraps ERC-4626 wrapped tokens after Raindex withdrawal
     UnwrapTokens,
     // Sends unwrapped tokens to Alpaca's redemption wallet
@@ -3384,6 +3428,32 @@ enum EquityRedemptionCommand {
 
 ```rust
 enum EquityRedemptionEvent {
+    VaultWithdrawSubmitting {
+        symbol: Symbol,
+        chain: Chain,
+        quantity: Decimal,
+        token: Address,
+        vault_id: RaindexVaultId,
+        wrapped_amount: U256,
+        // Version-7 scan lower bound; zero for prepared transactions.
+        from_block: u64,
+        // None only when replaying a version-7 event; such an aggregate
+        // fails closed into the legacy operator-reconciliation state.
+        prepared: Option<PreparedTransaction>,
+        submitting_at: DateTime<Utc>,
+    },
+    VaultWithdrawSubmitted {
+        symbol: Symbol,
+        quantity: Decimal,
+        token: Address,
+        wrapped_amount: U256,
+        tx_hash: TxHash,
+        // Retained so restart can restore nonce ownership before any wallet send.
+        // None only when replaying an event from before version 9; the nonce
+        // restores by transaction hash, but the exact bytes cannot be rebroadcast.
+        prepared: Option<PreparedTransaction>,
+        submitted_at: DateTime<Utc>,
+    },
     WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
@@ -3451,6 +3521,31 @@ state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
 the replayed `Failed` state materializes the operator's reason.
 
+Vault withdrawal submission is an irreversible uncertainty boundary. The
+orchestrator prepares and signs the transaction, then the pure aggregate
+transition creates `VaultWithdrawSubmitting` with its exact hash, nonce, and raw
+bytes before any broadcast. The orchestrator broadcasts only those persisted
+bytes. If broadcast or recording the returned hash fails, the aggregate remains
+`VaultWithdrawSubmitting`; no failure event may erase the prepared transaction.
+
+Every later invocation rebroadcasts the same raw transaction. A crash before the
+first broadcast and an RPC response lost after acceptance therefore enter the
+same idempotent recovery path: neither can allocate a new nonce or create a
+second withdrawal. An RPC `already known` response is accepted as evidence that
+the identical signed transaction reached a node and returns the locally computed
+transaction hash.
+
+Receipt timeout, a node lagging the required block, or otherwise inconclusive
+withdrawal reconciliation is not bounded by Apalis's ordinary retry budget. The
+resume job returns success only after durably enqueueing a delayed replacement
+with no attempt cap, and retains the position reservation while the transaction
+remains unresolved.
+
+Legacy `VaultWithdrawPending` aggregates and version-7 `VaultWithdrawSubmitting`
+events without prepared transaction bytes are never automatically submitted;
+replay places them in the operator-reconciliation state so an operator must
+resolve them conservatively.
+
 ##### Aggregate Services
 
 The aggregate uses domain service traits directly as its Services:
@@ -3469,10 +3564,14 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
 
 ##### Business Rules
 
-- `Withdraw` only from uninitialized state; emits `WithdrawnFromRaindex`
-- `Redeem` only from `WithdrawnFromRaindex` state; polls Alpaca until terminal
-- If send fails after withdraw, aggregate stays in `WithdrawnFromRaindex`
-  (tokens in wallet, not stranded)
+- `Redeem` only from uninitialized state; emits only the durable
+  `VaultWithdrawSubmitting` transaction and never broadcasts it
+- `RecordWithdrawSubmission` only from `VaultWithdrawSubmitting`
+- `ConfirmWithdraw` only from `VaultWithdrawSubmitted`
+- a resume from `VaultWithdrawSubmitting` always rebroadcasts the exact
+  persisted bytes; retries never sign or submit a different withdrawal
+- if a later transfer step fails after withdrawal, the aggregate retains the
+  withdrawal transaction for recovery and audit
 - `ConfirmUnwrap` records the token the vault reports as its `asset()` at the
   redeem block, typed `UnwrappedToken`, and requires the redeem receipt to show
   that token transferred to the withdraw receiver for the withdrawn amount
@@ -3687,10 +3786,13 @@ action that already succeeded. Each phase records its intent (and the relevant
 chain head) before the action, so resume can scan the chain to adopt an
 already-submitted action instead of re-issuing it:
 
-- `WithdrawalSubmitting` / `BridgingSubmitting`: scan the source chain for an
-  already-submitted withdrawal / burn (`find_recent_withdrawal` /
-  `find_recent_burn`) from the captured head and adopt it rather than
-  withdrawing / burning twice.
+- `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
+  (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
+  log scan is not proof of absence because the submission may still be pending
+  or hidden by a load-balanced RPC backend; it remains unresolved and must never
+  trigger another withdrawal.
+- `BridgingSubmitting`: scan for an already-submitted burn (`find_recent_burn`)
+  and adopt it rather than burning twice.
 - `Attested`: the CCTP mint is irreversible -- re-calling `receiveMessage`
   reverts on the already-used nonce, which would otherwise turn a successfully
   minted transfer into a terminal `BridgingFailed`. Resume must scan the

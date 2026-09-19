@@ -473,7 +473,7 @@ mod tests {
     use alloy::sol_types::SolCall;
     use alloy::transports::{TransportError, TransportFut};
     use serde_json::value::RawValue;
-    use st0x_evm::{Evm, EvmError};
+    use st0x_evm::{Evm, EvmError, PreparedTransaction};
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use tower::Service;
@@ -522,6 +522,45 @@ mod tests {
             panic!(
                 "StubWallet::sign_typed_data called - use a real wallet in tests that need signing"
             )
+        }
+
+        async fn prepare_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!(
+                "StubWallet::prepare_pending called - use a real wallet in tests that need transactions"
+            )
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            _prepared: &PreparedTransaction,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            panic!(
+                "StubWallet::broadcast_prepared called - use a real wallet in tests that need transactions"
+            )
+        }
+
+        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!(
+                "StubWallet::discard_prepared called - use a real wallet in tests that need transactions"
+            );
+        }
+
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+            panic!(
+                "StubWallet::restore_prepared called - use a real wallet in tests that need transactions"
+            );
+        }
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            panic!(
+                "StubWallet::restore_transaction called - use a real wallet in tests that need transactions"
+            );
         }
 
         async fn send_pending(
@@ -762,6 +801,31 @@ mod tests {
             _expected_digest: alloy::primitives::B256,
         ) -> Result<alloy::primitives::Signature, EvmError> {
             panic!("MockedWallet::sign_typed_data should not be called in wrapper tests")
+        }
+
+        async fn prepare_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            Ok(PreparedTransaction::from_raw(0, Bytes::new()))
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            prepared: &PreparedTransaction,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            Ok(prepared.tx_hash())
+        }
+
+        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {}
+
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {}
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            Ok(())
         }
 
         async fn send_pending(

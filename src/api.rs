@@ -1056,7 +1056,9 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
         };
 
         match event {
-            VaultWithdrawPending { quantity, .. } | VaultWithdrawSubmitted { quantity, .. } => {
+            VaultWithdrawPending { quantity, .. }
+            | VaultWithdrawSubmitting { quantity, .. }
+            | VaultWithdrawSubmitted { quantity, .. } => {
                 requested_quantity = requested_quantity
                     .or_else(|| Some(FractionalShares::new(quantity).to_string()));
             }
@@ -1550,6 +1552,7 @@ fn fail_transfer_error_response(error: &FailTransferError) -> (StatusCode, Strin
         InvalidMintId, InvalidReason, InvalidRedemptionId, MintAlreadyCompleted, MintAlreadyFailed,
         MintAlreadyReconciled, MintNotFound, MintStore, RedemptionAlreadyCompleted,
         RedemptionAlreadyFailed, RedemptionAlreadyReconciled, RedemptionNotFound, RedemptionStore,
+        RedemptionSubmissionUnresolved,
     };
 
     match error {
@@ -1562,7 +1565,10 @@ fn fail_transfer_error_response(error: &FailTransferError) -> (StatusCode, Strin
         | MintAlreadyReconciled(_)
         | RedemptionAlreadyCompleted(_)
         | RedemptionAlreadyFailed(_)
-        | RedemptionAlreadyReconciled(_) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        | RedemptionAlreadyReconciled(_)
+        | RedemptionSubmissionUnresolved(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
         MintStore(source) if is_failure_command_refusal(source) => {
             (StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
         }
@@ -6410,7 +6416,7 @@ mod tests {
     }
 
     /// Seeds an `EquityRedemption` into the terminal `Failed` state via
-    /// `Redeem` then `FailTransfer`.
+    /// `Redeem`, `RecordWithdrawSubmission`, then `FailTransfer`.
     async fn seed_redemption_failed(pool: &SqlitePool, id: &RedemptionAggregateId) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
@@ -6424,7 +6430,19 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(10),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1000u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
@@ -6440,8 +6458,8 @@ mod tests {
             .unwrap();
     }
 
-    /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawPending`
-    /// state (redeem requested but not failed).
+    /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawSubmitting`
+    /// state (withdrawal intent persisted but not submitted).
     async fn seed_redemption_pending(pool: &SqlitePool, id: &RedemptionAggregateId) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
@@ -6455,7 +6473,10 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(10),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1000u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await

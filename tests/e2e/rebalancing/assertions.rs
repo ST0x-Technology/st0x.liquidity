@@ -8,19 +8,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 pub(crate) use std::time::Duration;
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
 pub(crate) use alloy::primitives::{U256, utils::parse_units};
 pub(crate) use alloy::providers::Provider;
-use alloy::providers::fillers::{
-    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
-};
-use alloy::providers::{Identity, ProviderBuilder, RootProvider};
+use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
-use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
-use alloy::signers::Signer;
-use alloy::signers::local::PrivateKeySigner;
-use async_trait::async_trait;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
@@ -28,7 +20,8 @@ use tokio::task::JoinHandle;
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_config::{BrokerCtx, Ctx};
 use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
-use st0x_evm::{Chain, Evm, EvmError, Wallet};
+use st0x_evm::Chain;
+use st0x_evm::local::RawPrivateKeyWallet;
 use st0x_execution::alpaca_broker_api::{
     AlpacaBrokerMock, OrderSide, OrderStatus, TEST_API_KEY, TEST_API_SECRET, TransferDirection,
     TransferStatus,
@@ -97,154 +90,18 @@ fn hedging_with_reserve(
     }
 }
 
-/// Local signing wallet for rebalancing e2e tests that exposes
-/// `Provider = RootProvider`.
-type SigningProvider = FillProvider<
-    JoinFill<
-        JoinFill<
-            Identity,
-            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-        >,
-        WalletFiller<EthereumWallet>,
-    >,
-    RootProvider,
-    alloy::network::Ethereum,
->;
-
-pub(crate) struct TestWallet {
-    address: Address,
-    read_provider: RootProvider,
-    signing_provider: SigningProvider,
-    signer: PrivateKeySigner,
+pub(crate) fn test_wallet(
+    private_key: &B256,
+    rpc_url: url::Url,
     required_confirmations: u64,
-}
+) -> anyhow::Result<RawPrivateKeyWallet<RootProvider>> {
+    let provider = RootProvider::new(RpcClient::builder().http(rpc_url));
 
-impl TestWallet {
-    pub(crate) fn new(
-        private_key: &B256,
-        rpc_url: url::Url,
-        required_confirmations: u64,
-    ) -> anyhow::Result<Self> {
-        let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let address = signer.address();
-        let eth_wallet = EthereumWallet::from(signer.clone());
-
-        let read_provider = RootProvider::new(RpcClient::builder().http(rpc_url.clone()));
-        let signing_provider = ProviderBuilder::new()
-            .wallet(eth_wallet)
-            .connect_http(rpc_url);
-
-        Ok(Self {
-            address,
-            read_provider,
-            signing_provider,
-            signer,
-            required_confirmations,
-        })
-    }
-}
-
-#[async_trait]
-impl Evm for TestWallet {
-    type Provider = RootProvider;
-
-    fn provider(&self) -> &RootProvider {
-        &self.read_provider
-    }
-}
-
-#[async_trait]
-impl Wallet for TestWallet {
-    fn address(&self) -> Address {
-        self.address
-    }
-
-    async fn sign_typed_data(
-        &self,
-        _payload_json: String,
-        expected_digest: B256,
-    ) -> Result<alloy::primitives::Signature, EvmError> {
-        // Mirrors the local-signer backend: nothing hashes the payload
-        // here, so the caller-computed digest is signed directly.
-        Ok(self.signer.sign_hash(&expected_digest).await?)
-    }
-
-    async fn send_pending(
-        &self,
-        contract: Address,
-        calldata: alloy::primitives::Bytes,
-        note: &str,
-    ) -> Result<alloy::primitives::TxHash, EvmError> {
-        tracing::info!(%contract, note, "Submitting local test wallet call");
-
-        let tx = TransactionRequest::default()
-            .to(contract)
-            .input(calldata.into());
-
-        let pending = self.signing_provider.send_transaction(tx).await?;
-        Ok(*pending.tx_hash())
-    }
-
-    async fn await_receipt(
-        &self,
-        tx_hash: alloy::primitives::TxHash,
-    ) -> Result<TransactionReceipt, EvmError> {
-        let timeout = Duration::from_secs(60);
-        let poll_interval = Duration::from_secs(1);
-        let start = tokio::time::Instant::now();
-
-        let mut poll = tokio::time::interval(poll_interval);
-
-        let (receipt, receipt_block) = loop {
-            poll.tick().await;
-
-            if start.elapsed() > timeout {
-                return Err(EvmError::ReceiptTimeout {
-                    tx_hash,
-                    timeout_secs: 60,
-                });
-            }
-
-            let Some(receipt) = self.read_provider.get_transaction_receipt(tx_hash).await? else {
-                continue;
-            };
-
-            let Some(block) = receipt.block_number else {
-                continue;
-            };
-
-            break (receipt, block);
-        };
-
-        // Wait for required confirmation depth.
-        loop {
-            let current_block = self.read_provider.get_block_number().await?;
-            if current_block >= receipt_block + self.required_confirmations - 1 {
-                break;
-            }
-
-            poll.tick().await;
-
-            if start.elapsed() > timeout {
-                return Err(EvmError::ReceiptTimeout {
-                    tx_hash,
-                    timeout_secs: 60,
-                });
-            }
-        }
-
-        Ok(receipt)
-    }
-
-    async fn send(
-        &self,
-        contract: Address,
-        calldata: alloy::primitives::Bytes,
-        note: &str,
-    ) -> Result<TransactionReceipt, EvmError> {
-        let tx_hash = self.send_pending(contract, calldata, note).await?;
-        self.await_receipt(tx_hash).await
-    }
+    Ok(RawPrivateKeyWallet::new(
+        private_key,
+        provider,
+        required_confirmations,
+    )?)
 }
 
 /// Builds a `Ctx` with rebalancing enabled.
@@ -307,9 +164,8 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(
-        TestWallet::new(&chain.owner_key, chain.endpoint().parse()?, 1)?,
-    );
+    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> =
+        Arc::new(test_wallet(&chain.owner_key, chain.endpoint().parse()?, 1)?);
 
     let equity_threshold = match equity_imbalance {
         Some(threshold) => threshold,
@@ -410,12 +266,14 @@ where
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(
-        TestWallet::new(&base_chain.owner_key, base_chain.endpoint().parse()?, 1)?,
-    );
+    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(test_wallet(
+        &base_chain.owner_key,
+        base_chain.endpoint().parse()?,
+        1,
+    )?);
 
     let ethereum_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(
-        TestWallet::new(&base_chain.owner_key, ethereum_endpoint.parse()?, 1)?,
+        test_wallet(&base_chain.owner_key, ethereum_endpoint.parse()?, 1)?,
     );
 
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
@@ -747,7 +605,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     assert_event_subsequence(
         &redeem_events,
         &[
-            "EquityRedemptionEvent::VaultWithdrawPending",
+            "EquityRedemptionEvent::VaultWithdrawSubmitting",
             "EquityRedemptionEvent::VaultWithdrawSubmitted",
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             "EquityRedemptionEvent::UnwrapPending",
@@ -909,16 +767,16 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
         last_event.event_type,
     );
 
-    // Verify the symbol from the VaultWithdrawPending event (the terminal
+    // Verify the symbol from the VaultWithdrawSubmitting event (the terminal
     // Completed event only has a timestamp). Find by payload key rather
     // than assuming a fixed index.
-    let pending_event = redeem_events
+    let submitting_event = redeem_events
         .iter()
-        .find(|event| event.payload.get("VaultWithdrawPending").is_some())
-        .ok_or_else(|| anyhow::anyhow!("No redemption event contains VaultWithdrawPending"))?;
-    let submitted = pending_event
+        .find(|event| event.payload.get("VaultWithdrawSubmitting").is_some())
+        .ok_or_else(|| anyhow::anyhow!("No redemption event contains VaultWithdrawSubmitting"))?;
+    let submitted = submitting_event
         .payload
-        .get("VaultWithdrawPending")
+        .get("VaultWithdrawSubmitting")
         .expect("checked in find");
     assert_eq!(
         submitted.get("symbol").and_then(|val| val.as_str()),

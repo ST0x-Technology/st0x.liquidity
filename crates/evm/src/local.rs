@@ -4,6 +4,7 @@
 //! provider with a [`WalletFiller`] internally, and submits transactions
 //! directly.
 
+use alloy::consensus::Transaction;
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
 use alloy::providers::fillers::{
@@ -21,8 +22,10 @@ use tracing::info;
 
 use crate::inflight_nonces::InFlightNonces;
 use crate::nonce::ResettableNonceManager;
-use crate::submit::{release_in_flight_after_wait, send_with_recovery};
-use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
+use crate::submit::{
+    broadcast_prepared, prepare_with_nonce, release_in_flight_after_wait, send_with_recovery,
+};
+use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
 
 /// Secrets needed to construct a [`RawPrivateKeyWallet`].
 #[derive(Deserialize)]
@@ -104,6 +107,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
 
         let base_provider = provider.clone();
         let nonce_manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(nonce_manager.clone());
 
         let signing_provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -123,7 +127,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
             signer,
             signing_provider,
             nonce_manager,
-            in_flight: InFlightNonces::default(),
+            in_flight,
             send_lock: Arc::new(Mutex::new(())),
             required_confirmations,
         })
@@ -188,11 +192,90 @@ where
         .await
     }
 
+    async fn prepare_pending(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        info!(target: "wallet", %contract, note, "Preparing local contract call");
+        prepare_with_nonce(
+            &self.signing_provider,
+            &self.nonce_manager,
+            &self.send_lock,
+            self.address(),
+            contract,
+            calldata,
+        )
+        .await
+    }
+
+    async fn broadcast_prepared(
+        &self,
+        prepared: &PreparedTransaction,
+        note: &str,
+    ) -> Result<TxHash, EvmError> {
+        broadcast_prepared(
+            &self.provider,
+            &self.nonce_manager,
+            &self.in_flight,
+            &self.send_lock,
+            self.address(),
+            prepared,
+            note,
+        )
+        .await
+    }
+
+    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
+        let _guard = self.send_lock.lock().await;
+        self.nonce_manager
+            .release_prepared_nonce(self.address(), prepared.nonce())
+            .await;
+        tracing::warn!(
+            target: "wallet",
+            tx_hash = %prepared.tx_hash(),
+            nonce = prepared.nonce(),
+            "Discarding unpersisted prepared transaction and releasing its nonce reservation"
+        );
+    }
+
+    async fn restore_prepared(&self, prepared: &PreparedTransaction) {
+        let _guard = self.send_lock.lock().await;
+        self.nonce_manager
+            .reserve_prepared_nonce(self.address(), prepared.nonce())
+            .await;
+        self.in_flight
+            .record_durable(self.address(), prepared.nonce(), prepared.tx_hash());
+    }
+
+    async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
+        let _guard = self.send_lock.lock().await;
+        let transaction = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or(EvmError::PreparedTransactionReconciliationPending { tx_hash })?;
+        let nonce = transaction.nonce();
+        self.nonce_manager
+            .reserve_prepared_nonce(self.address(), nonce)
+            .await;
+        self.in_flight.record(self.address(), nonce, tx_hash);
+        Ok(())
+    }
+
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
         let result =
             crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await;
 
-        release_in_flight_after_wait(&self.in_flight, self.address(), tx_hash, &result);
+        release_in_flight_after_wait(
+            &self.in_flight,
+            &self.send_lock,
+            self.address(),
+            tx_hash,
+            &result,
+        )
+        .await;
 
         let receipt = result?;
 
@@ -234,10 +317,14 @@ mod tests {
     use alloy::consensus::Transaction as _;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::U256;
+    use alloy::providers::ext::AnvilApi as _;
+    use alloy::providers::fillers::NonceManager as _;
     use alloy::sol;
+    use alloy::sol_types::SolCall as _;
 
-    use crate::NoOpErrorRegistry;
     use crate::inflight_nonces::NonceOwnership;
+    use crate::submit::release_in_flight_after_wait;
+    use crate::{NoOpErrorRegistry, ReceiptWaitConfig, wait_for_receipt_with_config};
 
     use super::*;
 
@@ -407,6 +494,248 @@ mod tests {
             receipt_a.transaction_hash, receipt_b.transaction_hash,
             "transactions must have different hashes (distinct nonces)"
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_rebroadcast_reserves_its_nonce_before_another_send() {
+        let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        wallet.provider.anvil_set_auto_mine(false).await.unwrap();
+
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "prepared before restart")
+            .await
+            .unwrap();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let restarted_wallet =
+            RawPrivateKeyWallet::new(&private_key, wallet.provider.clone(), 1).unwrap();
+
+        restarted_wallet
+            .broadcast_prepared(&prepared, "rebroadcast after restart")
+            .await
+            .unwrap();
+        let following = restarted_wallet
+            .prepare_pending(signer_address, Bytes::new(), "send after rebroadcast")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            following.nonce(),
+            prepared.nonce().saturating_add(1),
+            "a cold nonce cache must advance past the persisted transaction before another send"
+        );
+        restarted_wallet.discard_prepared(&following).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_hash_only_restart_restores_pending_nonce_ownership() {
+        let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        wallet.provider.anvil_set_auto_mine(false).await.unwrap();
+
+        let tx_hash = wallet
+            .send_pending(signer_address, Bytes::new(), "submitted before restart")
+            .await
+            .unwrap();
+        let submitted_nonce = wallet
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .expect("submitted transaction must remain visible")
+            .nonce();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let restarted_wallet =
+            RawPrivateKeyWallet::new(&private_key, wallet.provider.clone(), 1).unwrap();
+
+        restarted_wallet.restore_transaction(tx_hash).await.unwrap();
+        restarted_wallet.nonce_manager.invalidate();
+        let following = restarted_wallet
+            .prepare_pending(signer_address, Bytes::new(), "send after ownership restore")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            following.nonce(),
+            submitted_nonce.saturating_add(1),
+            "hash-only recovery must restore pending nonce ownership before cache refill"
+        );
+        restarted_wallet.discard_prepared(&following).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_hash_only_drop_releases_nonce_for_reuse() {
+        let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let snapshot_id = wallet.provider.anvil_snapshot().await.unwrap();
+        let tx_hash = wallet
+            .send_pending(signer_address, Bytes::new(), "submitted before restart")
+            .await
+            .unwrap();
+        let submitted_nonce = wallet
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .expect("submitted transaction must remain visible")
+            .nonce();
+        wallet.await_receipt(tx_hash).await.unwrap();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let restarted_wallet =
+            RawPrivateKeyWallet::new(&private_key, wallet.provider.clone(), 1).unwrap();
+        restarted_wallet.restore_transaction(tx_hash).await.unwrap();
+        restarted_wallet
+            .provider
+            .anvil_revert(snapshot_id)
+            .await
+            .unwrap();
+
+        let result = wait_for_receipt_with_config(
+            restarted_wallet.provider(),
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_millis(100),
+                confirmation_timeout: std::time::Duration::from_millis(100),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            &result,
+            Err(EvmError::TransactionDropped {
+                tx_hash: dropped_hash,
+                ..
+            }) if *dropped_hash == tx_hash
+        ));
+        release_in_flight_after_wait(
+            &restarted_wallet.in_flight,
+            &restarted_wallet.send_lock,
+            signer_address,
+            tx_hash,
+            &result,
+        )
+        .await;
+
+        let next_nonce = restarted_wallet
+            .nonce_manager
+            .get_next_nonce(restarted_wallet.provider(), signer_address)
+            .await
+            .unwrap();
+        assert_eq!(next_nonce, submitted_nonce);
+    }
+
+    #[tokio::test]
+    async fn restored_prepared_drop_retains_nonce_for_exact_rebroadcast() {
+        let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let snapshot_id = wallet.provider.anvil_snapshot().await.unwrap();
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "prepared before restart")
+            .await
+            .unwrap();
+        wallet
+            .broadcast_prepared(&prepared, "broadcast before restart")
+            .await
+            .unwrap();
+        wallet.await_receipt(prepared.tx_hash()).await.unwrap();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let restarted_wallet =
+            RawPrivateKeyWallet::new(&private_key, wallet.provider.clone(), 1).unwrap();
+        restarted_wallet.restore_prepared(&prepared).await;
+        restarted_wallet
+            .provider
+            .anvil_revert(snapshot_id)
+            .await
+            .unwrap();
+
+        let result = wait_for_receipt_with_config(
+            restarted_wallet.provider(),
+            prepared.tx_hash(),
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(1),
+                inclusion_timeout: std::time::Duration::from_millis(100),
+                confirmation_timeout: std::time::Duration::from_millis(100),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            &result,
+            Err(EvmError::TransactionDropped {
+                tx_hash: dropped_hash,
+                ..
+            }) if *dropped_hash == prepared.tx_hash()
+        ));
+        release_in_flight_after_wait(
+            &restarted_wallet.in_flight,
+            &restarted_wallet.send_lock,
+            signer_address,
+            prepared.tx_hash(),
+            &result,
+        )
+        .await;
+
+        assert_eq!(
+            restarted_wallet
+                .in_flight
+                .ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Ours
+        );
+        let next_nonce = restarted_wallet
+            .nonce_manager
+            .get_next_nonce(restarted_wallet.provider(), signer_address)
+            .await
+            .unwrap();
+        assert_eq!(next_nonce, prepared.nonce().saturating_add(1));
+        let rebroadcast_hash = restarted_wallet
+            .broadcast_prepared(&prepared, "rebroadcast after restart")
+            .await
+            .unwrap();
+        assert_eq!(rebroadcast_hash, prepared.tx_hash());
+    }
+
+    #[tokio::test]
+    async fn failed_preparation_does_not_consume_an_unbroadcast_nonce() {
+        let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let earlier = wallet
+            .prepare_pending(
+                signer_address,
+                Bytes::new(),
+                "earlier outstanding preparation",
+            )
+            .await
+            .unwrap();
+        let expected_retry_nonce = earlier.nonce().saturating_add(1);
+        let excessive_amount = U256::from(999_999_999) * U256::from(10).pow(U256::from(18));
+        let calldata = Bytes::from(
+            IERC20::transferCall {
+                to: Address::random(),
+                amount: excessive_amount,
+            }
+            .abi_encode(),
+        );
+
+        wallet
+            .prepare_pending(token_address, calldata, "preparation should fail")
+            .await
+            .expect_err("gas estimation must reject an excessive transfer");
+        let retry = wallet
+            .prepare_pending(
+                signer_address,
+                Bytes::new(),
+                "retry after later preparation failure",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            retry.nonce(),
+            expected_retry_nonce,
+            "rolling back the failed later preparation must preserve the earlier reservation"
+        );
+        wallet.discard_prepared(&retry).await;
+        wallet.discard_prepared(&earlier).await;
     }
 
     /// Regression test threading the `in_flight` wiring through the

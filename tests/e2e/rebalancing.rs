@@ -26,7 +26,9 @@
 
 pub(crate) mod assertions;
 
-use alloy::primitives::{Address, B256, FixedBytes, Signature, TxHash, U256, keccak256};
+use alloy::consensus::Transaction;
+use alloy::node_bindings::Anvil;
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, Signature, TxHash, U256, keccak256};
 use alloy::providers::ext::AnvilApi as _;
 use alloy::sol_types::{SolCall, SolValue};
 use rain_math_float::Float;
@@ -34,6 +36,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_finance::{FractionalShares, Positive, Symbol, Usd};
 use st0x_float_macro::float;
 use st0x_hedge::ImbalanceThreshold;
@@ -1539,10 +1542,10 @@ async fn redemption_rejected_releases_inflight_and_preserves_failed_transfer() -
         .iter()
         .find(|event| {
             event.aggregate_id == first_id
-                && event.event_type == "EquityRedemptionEvent::VaultWithdrawPending"
+                && event.event_type == "EquityRedemptionEvent::VaultWithdrawSubmitting"
         })
         .expect("Rejected redemption must retain its withdrawal intent")
-        .payload["VaultWithdrawPending"]["quantity"]
+        .payload["VaultWithdrawSubmitting"]["quantity"]
         .as_str()
         .expect("Withdrawal intent must retain the quantity")
         .to_owned();
@@ -2367,6 +2370,89 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
         .await?;
 
     bot2.abort();
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn durable_withdrawal_recovery_reserves_nonce_before_later_preparation() -> anyhow::Result<()>
+{
+    let anvil = Anvil::new().spawn();
+    let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+    let wallet = test_wallet(&private_key, anvil.endpoint_url(), 1)?;
+    wallet.provider().anvil_set_auto_mine(false).await?;
+    let prepared = wallet
+        .prepare_pending(wallet.address(), Bytes::new(), "withdraw before restart")
+        .await?;
+    wallet
+        .broadcast_prepared(&prepared, "withdraw before restart")
+        .await?;
+    let restarted = test_wallet(&private_key, anvil.endpoint_url(), 1)?;
+
+    restarted.restore_prepared(&prepared).await;
+    let following = restarted
+        .prepare_pending(
+            restarted.address(),
+            Bytes::new(),
+            "transaction after recovery",
+        )
+        .await?;
+
+    assert_eq!(
+        following.nonce(),
+        prepared.nonce().saturating_add(1),
+        "a later prepared transaction must not reuse the durable withdrawal nonce"
+    );
+    restarted.discard_prepared(&following).await;
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn legacy_withdrawal_recovery_reserves_nonce_before_later_submission() -> anyhow::Result<()> {
+    let anvil = Anvil::new().spawn();
+    let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+    let wallet = test_wallet(&private_key, anvil.endpoint_url(), 1)?;
+    wallet.provider().anvil_set_auto_mine(false).await?;
+    let tx_hash = wallet
+        .send_pending(wallet.address(), Bytes::new(), "withdraw before restart")
+        .await?;
+    let submitted_nonce = wallet
+        .provider()
+        .get_transaction_by_hash(tx_hash)
+        .await?
+        .expect("submitted transaction must remain visible")
+        .nonce();
+    let restarted = test_wallet(&private_key, anvil.endpoint_url(), 1)?;
+    let missing_hash = TxHash::repeat_byte(0xff);
+
+    let error = restarted
+        .restore_transaction(missing_hash)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        EvmError::PreparedTransactionReconciliationPending { tx_hash }
+            if tx_hash == missing_hash
+    ));
+    restarted.restore_transaction(tx_hash).await?;
+    let following_hash = restarted
+        .send_pending(
+            restarted.address(),
+            Bytes::new(),
+            "transaction after recovery",
+        )
+        .await?;
+    let following_nonce = restarted
+        .provider()
+        .get_transaction_by_hash(following_hash)
+        .await?
+        .expect("following transaction must remain visible")
+        .nonce();
+
+    assert_eq!(
+        following_nonce,
+        submitted_nonce.saturating_add(1),
+        "a later submitted transaction must not reuse the legacy withdrawal nonce"
+    );
     Ok(())
 }
 
