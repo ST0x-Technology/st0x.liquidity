@@ -955,8 +955,13 @@ timestamp compared to the wall clock at evaluation time. The maximum acceptable
 age is an operational parameter with no implicit default —
 `overnight_max_quote_age_secs` is required whenever any asset enables overnight
 counter-trading — and every overnight placement path resolves quotes through the
-same resolver, so a single configured bound drives every defer decision. An
-entitlement failure (401/403) on the feed is classified distinctly from
+same resolver, so a single configured bound drives every defer decision. The
+bound is inclusive: a quote whose age equals the maximum is still usable, and
+only an older one defers. A timestamp ahead of the wall clock is clock skew and
+counts as age zero, but only within a small fixed allowance that is separate
+from the configured age bound; a timestamp further ahead is refused, because an
+unbounded future stamp would otherwise stay fresh until local time reaches it.
+An entitlement failure (401/403) on the feed is classified distinctly from
 transient data failures and pages the operator. Deferred exposure stays visible
 through the standing scan-skip metrics and is retried on the next scan.
 

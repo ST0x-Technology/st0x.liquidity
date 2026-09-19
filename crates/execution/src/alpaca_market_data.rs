@@ -162,7 +162,8 @@ impl AlpacaMarketDataError {
 
             // Transport failures can clear, and syntactically valid latest
             // quotes are dynamic snapshots: a later request can carry a
-            // complete, positive, uncrossed book even when this one did not.
+            // complete, positive, uncrossed book even when this one did
+            // not, and a stale quote can be superseded by a fresh one.
             Self::Auth(_)
             | Self::Http(_)
             | Self::LatestQuoteSymbolMismatch { .. }
@@ -322,6 +323,71 @@ pub(crate) async fn fetch_latest_overnight_quote(
     })?;
 
     Ok(IndicativeQuote { quote, at })
+}
+
+/// Why an indicative quote is unusable for pricing at evaluation time.
+///
+/// Executor-independent, like the quote it validates: the overnight
+/// resolver runs over any executor's [`IndicativeQuote`], so this must not
+/// be an Alpaca error. Concrete Alpaca callers wrap it at their own
+/// boundary, mirroring `OvernightEligibilityError`.
+#[derive(Debug, thiserror::Error)]
+pub enum OvernightQuoteAgeError {
+    #[error(
+        "overnight quote is {:.3}s old, exceeding the configured maximum of {}s; \
+         refusing to price from a stale indicative quote",
+        age.as_secs_f64(),
+        max_age.as_secs()
+    )]
+    Stale { age: Duration, max_age: Duration },
+    #[error(
+        "overnight quote timestamp is {:.3}s ahead of local time, beyond the allowed clock \
+         skew of {}s; refusing to price from an untrustworthy timestamp",
+        ahead.as_secs_f64(),
+        max_skew.as_secs()
+    )]
+    FromFuture { ahead: Duration, max_skew: Duration },
+}
+
+/// How far ahead of local time a broker timestamp may sit and still count
+/// as clock skew rather than an untrustworthy clock.
+///
+/// Deliberately not `max_age`: quote lifetime and clock trust are separate
+/// policies. Reusing the configured age bound here would let a quote
+/// stamped a full `max_age` ahead stay usable for twice that span, because
+/// it only reaches the staleness test once local time has caught up.
+const MAX_QUOTE_CLOCK_SKEW: Duration = Duration::from_secs(5);
+
+/// Rejects an indicative quote older than `max_age` at `now`.
+///
+/// Separate from the fetch on purpose: the CLI's inspection surface must
+/// keep showing stale quotes with their age, while the pricing path
+/// composes fetch + this check so it can never price from one. The bound
+/// is exclusive -- `age == max_age` is the last usable instant, matching
+/// the eligibility window's inclusive-boundary convention. A broker
+/// timestamp slightly ahead of `now` counts as age zero within
+/// [`MAX_QUOTE_CLOCK_SKEW`]; a stamp further ahead is refused (fail
+/// closed) instead of staying "fresh" until local time catches up.
+pub fn validate_overnight_quote_age(
+    quote: &IndicativeQuote,
+    now: DateTime<Utc>,
+    max_age: Duration,
+) -> Result<(), OvernightQuoteAgeError> {
+    if let Ok(ahead) = (quote.at - now).to_std()
+        && ahead > MAX_QUOTE_CLOCK_SKEW
+    {
+        return Err(OvernightQuoteAgeError::FromFuture {
+            ahead,
+            max_skew: MAX_QUOTE_CLOCK_SKEW,
+        });
+    }
+
+    let age = (now - quote.at).to_std().unwrap_or(Duration::ZERO);
+    if age > max_age {
+        return Err(OvernightQuoteAgeError::Stale { age, max_age });
+    }
+
+    Ok(())
 }
 
 async fn fetch_quote_and_timestamp(
@@ -732,6 +798,125 @@ mod tests {
         assert_eq!(error.backpressure(), None);
     }
 
+    /// An indicative quote stamped `age_secs` before the fixed test
+    /// instant, for exercising the staleness bound.
+    fn indicative_quote_aged(now: DateTime<Utc>, age_secs: i64) -> IndicativeQuote {
+        let bid = Positive::new(Usd::new(Float::parse("24.10".to_string()).unwrap())).unwrap();
+        let ask = Positive::new(Usd::new(Float::parse("24.30".to_string()).unwrap())).unwrap();
+        IndicativeQuote {
+            quote: LatestQuote::new(bid, ask).unwrap(),
+            at: now - chrono::Duration::seconds(age_secs),
+        }
+    }
+
+    fn validation_now() -> DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 29, 1, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn quote_younger_than_the_max_age_passes() {
+        let now = validation_now();
+        validate_overnight_quote_age(
+            &indicative_quote_aged(now, 10),
+            now,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn quote_exactly_at_the_max_age_still_passes() {
+        // The bound is exclusive: age == max_age is the last usable
+        // instant, so an off-by-one cannot reject a quote at the limit.
+        let now = validation_now();
+        validate_overnight_quote_age(
+            &indicative_quote_aged(now, 30),
+            now,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn quote_older_than_the_max_age_is_rejected_with_its_exact_age() {
+        let now = validation_now();
+        let error = validate_overnight_quote_age(
+            &indicative_quote_aged(now, 120),
+            now,
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                OvernightQuoteAgeError::Stale { age, max_age }
+                    if age == Duration::from_secs(120) && max_age == Duration::from_secs(30)
+            ),
+            "expected Stale with exact age, got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "overnight quote is 120.000s old, exceeding the configured maximum of 30s; refusing \
+             to price from a stale indicative quote"
+        );
+    }
+
+    #[test]
+    fn quote_stamped_ahead_of_now_passes_as_age_zero() {
+        // Broker clock skew can stamp a quote slightly in the future; a
+        // from-the-future quote within the skew allowance is fresh.
+        let now = validation_now();
+        validate_overnight_quote_age(
+            &indicative_quote_aged(now, -5),
+            now,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn quote_stamped_beyond_the_clock_skew_allowance_is_rejected() {
+        // Beyond the skew allowance the timestamp is untrustworthy: left
+        // unchecked it would keep the quote "fresh" until local time
+        // catches up, so it must refuse to price (fail closed).
+        let now = validation_now();
+        let error = validate_overnight_quote_age(
+            &indicative_quote_aged(now, -120),
+            now,
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                OvernightQuoteAgeError::FromFuture { ahead, max_skew }
+                    if ahead == Duration::from_secs(120) && max_skew == MAX_QUOTE_CLOCK_SKEW
+            ),
+            "expected FromFuture, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_quote_ahead_of_the_skew_allowance_is_refused_even_under_a_larger_max_age() {
+        // The skew allowance is its own policy: a generous quote lifetime
+        // must not widen how far ahead a broker clock may sit, or a quote
+        // stamped one max_age ahead would stay usable for twice that span.
+        let now = validation_now();
+        let error = validate_overnight_quote_age(
+            &indicative_quote_aged(now, -30),
+            now,
+            Duration::from_secs(300),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, OvernightQuoteAgeError::FromFuture { .. }),
+            "expected FromFuture, got {error:?}"
+        );
+    }
+
     async fn overnight_quote_result(
         quote: serde_json::Value,
     ) -> Result<IndicativeQuote, AlpacaMarketDataError> {
@@ -792,6 +977,135 @@ mod tests {
                 if *symbol == Symbol::new("AAPL").unwrap()
         ));
         assert_eq!(error.permanence(), Permanence::Transient);
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_deserializes_a_real_sandbox_payload() {
+        // The exact response shape the sandbox served on 2026-08-26
+        // (feed=overnight, RKLB demo run): numeric prices, exchange and
+        // condition fields the model must tolerate, millisecond
+        // timestamp precision.
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "quote": {
+                        "ap": 309.23,
+                        "as": 3,
+                        "ax": "L",
+                        "bp": 308.06,
+                        "bs": 1,
+                        "bx": "L",
+                        "c": ["R"],
+                        "t": "2026-08-26T08:00:00.67Z",
+                        "z": "C"
+                    }
+                }));
+        });
+
+        let indicative = fetch_latest_overnight_quote(&client, &symbol)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            indicative.quote.bid().inner(),
+            Usd::new(Float::parse("308.06".to_string()).unwrap())
+        );
+        assert_eq!(
+            indicative.quote.ask().inner(),
+            Usd::new(Float::parse("309.23".to_string()).unwrap())
+        );
+        assert_eq!(
+            indicative.at,
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 26, 8, 0, 0).unwrap()
+                + chrono::Duration::milliseconds(670)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_429_keeps_its_backpressure_hint() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(429)
+                .header("Retry-After", "17")
+                .json_body(json!({ "message": "too many requests" }));
+        });
+
+        let error = fetch_latest_overnight_quote(&client, &symbol)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(17)),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_5xx_classifies_transient() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(503).body("upstream unavailable");
+        });
+
+        let error = fetch_latest_overnight_quote(&client, &symbol)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AlpacaMarketDataError::ApiError { status, .. }
+                if *status == StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert_eq!(error.permanence(), Permanence::Transient);
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_overnight_quote_malformed_body_classifies_permanent() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/stocks/AAPL/quotes/latest")
+                .query_param("feed", "overnight");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("not json at all");
+        });
+
+        let error = fetch_latest_overnight_quote(&client, &symbol)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AlpacaMarketDataError::LatestQuoteJsonParse(_)
+        ));
+        assert_eq!(error.permanence(), Permanence::Permanent);
     }
 
     #[tokio::test]

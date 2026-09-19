@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use st0x_execution::{
-    CancellationOutcome, CounterTradePreflight, Executor, InventoryResult, LatestQuote, LimitOrder,
-    MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement, OrderState, Positive,
-    SupportedExecutor, Symbol, Usd,
+    CancellationOutcome, CounterTradePreflight, Executor, IndicativeQuote, InventoryResult,
+    LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus, OrderPlacement,
+    OrderState, Positive, SupportedExecutor, Symbol, Usd,
 };
 
 use super::{Dependency, DependencyCallSample, TelemetrySender, scrub_secrets};
@@ -200,6 +200,16 @@ impl<Inner: Executor + Clone> Executor for InstrumentedExecutor<Inner> {
         result
     }
 
+    async fn fetch_latest_overnight_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<IndicativeQuote, Self::Error> {
+        let started = Instant::now();
+        let result = self.inner.fetch_latest_overnight_quote(symbol).await;
+        self.record("fetch_latest_overnight_quote", started, &result);
+        result
+    }
+
     async fn place_limit_order(
         &self,
         order: LimitOrder,
@@ -256,10 +266,19 @@ mod tests {
             Positive::new(Usd::new(float!(123.50))).unwrap(),
         )
         .unwrap();
+        let overnight_quote = st0x_execution::IndicativeQuote {
+            quote: LatestQuote::new(
+                Positive::new(Usd::new(float!(123.30))).unwrap(),
+                Positive::new(Usd::new(float!(123.60))).unwrap(),
+            )
+            .unwrap(),
+            at: chrono::Utc::now(),
+        };
         let executor = InstrumentedExecutor::new(
             MockExecutor::new()
                 .with_position_mark(mark)
-                .with_primary_limit_quote(primary_quote),
+                .with_primary_limit_quote(primary_quote)
+                .with_overnight_quote(overnight_quote),
             sender.clone(),
         );
 
@@ -307,6 +326,14 @@ mod tests {
             "the wrapper must forward the inner executor's mark unchanged, not the \
              trait's Ok(None) default"
         );
+        let forwarded_overnight_quote = executor
+            .fetch_latest_overnight_quote(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            forwarded_overnight_quote, overnight_quote,
+            "the wrapper must forward the inner executor's indicative quote unchanged"
+        );
 
         drop(executor);
         drop(sender);
@@ -321,8 +348,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             rows.len(),
-            11,
-            "all eleven exercised methods must emit samples"
+            12,
+            "all twelve exercised methods must emit samples"
         );
         let operations: Vec<&str> = rows.iter().map(|(_, op, _)| op.as_str()).collect();
         assert!(
@@ -364,6 +391,10 @@ mod tests {
         assert!(
             operations.contains(&"fetch_position_mark"),
             "fetch_position_mark must be recorded"
+        );
+        assert!(
+            operations.contains(&"fetch_latest_overnight_quote"),
+            "fetch_latest_overnight_quote must be recorded"
         );
         assert!(
             operations.contains(&"fetch_primary_limit_quote"),
