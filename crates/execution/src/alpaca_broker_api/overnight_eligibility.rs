@@ -59,11 +59,22 @@ impl EligibilitySnapshots {
             .copied()
     }
 
+    /// Records a snapshot. Private on purpose: the only production writer
+    /// is [`sync_eligibility`], and a public mutation path would let a
+    /// consumer report an arbitrary snapshot as broker state.
     fn record(&self, symbol: Symbol, snapshot: EligibilitySnapshot) {
         self.inner
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(symbol, snapshot);
+    }
+
+    /// Seeds a snapshot without reaching the broker, for consuming
+    /// crates' tests. Feature-gated so the production build keeps the
+    /// mutation path private (the crate's test-only-constructor seam).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn seed_for_test(&self, symbol: Symbol, snapshot: EligibilitySnapshot) {
+        self.record(symbol, snapshot);
     }
 }
 
