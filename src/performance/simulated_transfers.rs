@@ -784,11 +784,11 @@ fn transfer_log(token: Address, to: Address, amount: U256) -> Log {
 
 /// Minimal [`Raindex`] for one [`seed_simulated_equity_redemption_history`]
 /// cycle. Scoped to a single redemption (a fresh instance per day, not
-/// shared across the seeding loop), so `submit_withdraw`'s single-slot
+/// shared across the seeding loop), so `prepare_withdraw`'s single-slot
 /// `pending_withdraw` is always populated by the time `confirm_tx_receipt`
 /// reads it -- the redemption fixture always calls them in that order.
 /// `withdraw`/`submit_deposit` are unreachable from `EquityRedemption`'s
-/// happy path (it only ever calls `submit_withdraw`/`confirm_tx_receipt`).
+/// happy path.
 struct FixtureRaindex {
     /// Recipient the synthetic withdrawal's `Transfer` log credits -- must
     /// match `FixtureWrapper::owner()`, since `ConfirmWithdraw`'s handler
@@ -796,7 +796,7 @@ struct FixtureRaindex {
     recipient: Address,
     block_number: u64,
     pending_withdraw: Mutex<Option<(Address, U256)>>,
-    /// Feeds `submit_withdraw`'s synthetic tx hash through
+    /// Feeds `prepare_withdraw`'s synthetic tx hash through
     /// `simulated_transfer_uuid`, keeping it deterministic across runs like
     /// every other id in this module.
     day: u32,
@@ -855,6 +855,10 @@ impl Raindex for FixtureRaindex {
         &self,
         prepared: &PreparedTransaction,
     ) -> Result<TxHash, RaindexError> {
+        assert_ne!(
+            prepared,
+            &crate::equity_redemption::prepared_withdrawal_for_test()
+        );
         Ok(prepared.tx_hash())
     }
 
@@ -1159,6 +1163,9 @@ pub async fn seed_simulated_equity_redemption_history(
         let id = RedemptionAggregateId(simulated_transfer_uuid("redemption", day));
         let quantity = Float::parse("5".to_string())?;
         let wrapped_amount = quantity.to_fixed_decimal(TOKENIZED_EQUITY_DECIMALS)?;
+        let prepared = raindex
+            .prepare_withdraw(token, vault_id, wrapped_amount, TOKENIZED_EQUITY_DECIMALS)
+            .await?;
 
         let pending_at = range_start + Duration::days(i64::from(day)) + Duration::hours(11);
         let submitted_at = pending_at + Duration::seconds(20);
@@ -1183,14 +1190,12 @@ pub async fn seed_simulated_equity_redemption_history(
                     amount: wrapped_amount,
                     from_block: withdraw_block.saturating_sub(1),
                     submitting_at: pending_at,
-                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                    prepared: prepared.clone(),
                 },
             )
             .await?;
 
-        let withdraw_tx = raindex
-            .submit_withdraw(token, vault_id, wrapped_amount, TOKENIZED_EQUITY_DECIMALS)
-            .await?;
+        let withdraw_tx = raindex.broadcast_prepared_withdraw(&prepared).await?;
         redemption
             .send(
                 &id,

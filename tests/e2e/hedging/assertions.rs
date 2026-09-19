@@ -34,7 +34,7 @@ pub(crate) use crate::poll::{
     poll_for_aggregate_events_containing, poll_for_events, sleep_or_crash, spawn_bot,
     wait_for_processing,
 };
-use crate::rebalancing::assertions::TestWallet;
+use crate::rebalancing::assertions::test_wallet;
 pub(crate) use crate::test_infra::TestInfra;
 
 /// Builds a `Ctx` pointing at the given chain, broker, and database path.
@@ -96,7 +96,7 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     // triggers disabled, nothing exercises the Ethereum side, so one shared
     // instance serves both chain slots and all bot transactions flow through
     // a single nonce manager.
-    let wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
+    let wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(test_wallet(
         &chain.bot_wallet_key,
         chain.endpoint().parse()?,
         1,

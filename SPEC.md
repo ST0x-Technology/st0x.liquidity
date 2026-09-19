@@ -3383,6 +3383,10 @@ enum EquityRedemption {
         token: Address,
         wrapped_amount: U256,
         tx_hash: TxHash,
+        // Retained so restart can restore nonce ownership before any wallet send.
+        // None only when replaying an event from before version 9; the nonce
+        // restores by transaction hash, but the exact bytes cannot be rebroadcast.
+        prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
     },
     WithdrawnFromRaindex {
@@ -3505,6 +3509,10 @@ enum EquityRedemptionEvent {
         token: Address,
         wrapped_amount: U256,
         tx_hash: TxHash,
+        // Retained so restart can restore nonce ownership before any wallet send.
+        // None only when replaying an event from before version 9; the nonce
+        // restores by transaction hash, but the exact bytes cannot be rebroadcast.
+        prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
     },
     WithdrawnFromRaindex {
