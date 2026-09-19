@@ -78,7 +78,7 @@ pub use journal::{JournalResponse, JournalStatus};
 pub use kms_jwt::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
 pub use order::{
     AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, ConversionOrder, CryptoOrderOutcome,
-    CryptoOrderResponse, ParseAlpacaLimitPriceError,
+    CryptoOrderResponse, OvernightLimitOrder, OvernightOrderError, ParseAlpacaLimitPriceError,
 };
 pub use overnight_eligibility::{
     EligibilitySnapshot, EligibilitySnapshots, EligibilitySyncError, OvernightEligibilityError,
@@ -261,6 +261,12 @@ pub enum AlpacaBrokerApiError {
          from another symbol"
     )]
     PositionSymbolMismatch { requested: Symbol, returned: Symbol },
+
+    #[error(
+        "asset endpoint returned {returned} when {requested} was requested; refusing to decide \
+         eligibility from another asset's attributes"
+    )]
+    AssetSymbolMismatch { requested: Symbol, returned: Symbol },
 
     #[error("Invalid header value: {0}")]
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
@@ -517,6 +523,7 @@ impl AlpacaBrokerApiError {
             | Self::JsonParse(_)
             | Self::AlpacaAmount(_)
             | Self::PositionSymbolMismatch { .. }
+            | Self::AssetSymbolMismatch { .. }
             | Self::InvalidHeader(_)
             | Self::InvalidOrderId(_)
             | Self::IncompleteOrder { .. }
@@ -581,9 +588,10 @@ impl AlpacaBrokerApiError {
             // Basic-auth 401/403; everything else about a mint is
             // network-shaped and retryable.
             Self::KmsJwt(error) if error.is_deterministic() => Permanence::Permanent,
-            Self::HttpClient(_) | Self::KmsJwt(_) | Self::PositionSymbolMismatch { .. } => {
-                Permanence::Transient
-            }
+            Self::HttpClient(_)
+            | Self::KmsJwt(_)
+            | Self::PositionSymbolMismatch { .. }
+            | Self::AssetSymbolMismatch { .. } => Permanence::Transient,
 
             // Everything else is decided locally -- from a response that
             // already arrived, from configuration, or from arithmetic on

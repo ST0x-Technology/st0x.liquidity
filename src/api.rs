@@ -293,14 +293,20 @@ fn overnight_eligibility_entries(
                 whole_share_verdict: verdict(OvernightOrderShape::WholeShares),
                 fractional_verdict: verdict(OvernightOrderShape::Fractional),
                 symbol: symbol.to_string(),
-                synced_at: snapshot.map(|snapshot| snapshot.synced_at),
-                status: snapshot.map(|snapshot| snapshot.details.status),
-                tradable: snapshot.map(|snapshot| snapshot.details.tradable),
+                synced_at: snapshot.as_ref().map(|snapshot| snapshot.synced_at),
+                status: snapshot.as_ref().map(|snapshot| snapshot.details.status),
+                tradable: snapshot.as_ref().map(|snapshot| snapshot.details.tradable),
                 overnight_tradable: snapshot
+                    .as_ref()
                     .and_then(|snapshot| snapshot.details.overnight_tradable),
-                overnight_halted: snapshot.and_then(|snapshot| snapshot.details.overnight_halted),
-                fractionable: snapshot.and_then(|snapshot| snapshot.details.fractionable),
+                overnight_halted: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.details.overnight_halted),
+                fractionable: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.details.fractionable),
                 fractional_eh_enabled: snapshot
+                    .as_ref()
                     .and_then(|snapshot| snapshot.details.fractional_eh_enabled),
             }
         })
@@ -3068,6 +3074,7 @@ mod tests {
         let snapshots = vec![(
             Symbol::new("RKLB").unwrap(),
             Some(EligibilitySnapshot {
+                symbol: Symbol::new("RKLB").unwrap(),
                 synced_at,
                 details: AssetDetails {
                     status: AssetStatus::Active,
@@ -3105,9 +3112,10 @@ mod tests {
         // Three days old: unambiguously before any session's 19:45 ET
         // sync window regardless of when the test runs.
         let synced_at = Utc::now() - chrono::Duration::days(3);
-        state.overnight_eligibility.seed_for_test(
-            Symbol::new("RKLB").unwrap(),
-            EligibilitySnapshot {
+        state
+            .overnight_eligibility
+            .seed_for_test(EligibilitySnapshot {
+                symbol: Symbol::new("RKLB").unwrap(),
                 synced_at,
                 details: AssetDetails {
                     status: AssetStatus::Active,
@@ -3117,8 +3125,7 @@ mod tests {
                     overnight_tradable: Some(true),
                     overnight_halted: Some(false),
                 },
-            },
-        );
+            });
 
         let body = get_overnight_eligibility(state).await;
 

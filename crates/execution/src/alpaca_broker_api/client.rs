@@ -243,7 +243,19 @@ impl AlpacaBrokerApiClient {
     ) -> Result<AssetResponse, AlpacaBrokerApiError> {
         let url = format!("{}/v1/assets/{symbol}", self.base_url);
         debug!("Fetching asset info for {symbol}");
-        self.get(&url).await
+        let asset: AssetResponse = self.get(&url).await?;
+
+        // The attributes decide overnight eligibility for the symbol the
+        // caller asked about, so another asset's payload must refuse rather
+        // than be cached or snapshotted under this symbol.
+        if asset.symbol != *symbol {
+            return Err(AlpacaBrokerApiError::AssetSymbolMismatch {
+                requested: symbol.clone(),
+                returned: asset.symbol,
+            });
+        }
+
+        Ok(asset)
     }
 
     /// Place a crypto order (e.g., USDC/USD conversion)
@@ -799,6 +811,43 @@ mod tests {
         mock.assert();
         assert_eq!(asset.status, AssetStatus::Active);
         assert!(asset.tradable);
+    }
+
+    #[tokio::test]
+    async fn get_asset_refuses_another_symbols_payload() {
+        // The caller caches these attributes under the REQUESTED symbol, so
+        // a payload for a different asset must refuse instead of deciding
+        // that symbol's eligibility from the wrong attributes.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "RKLB",
+                    "status": "active",
+                    "tradable": true
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let error = client.get_asset(&symbol).await.unwrap_err();
+
+        mock.assert();
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::AssetSymbolMismatch {
+                    ref requested,
+                    ref returned,
+                } if *requested == symbol && *returned == Symbol::new("RKLB").unwrap()
+            ),
+            "expected AssetSymbolMismatch, got {error:?}"
+        );
     }
 
     #[tokio::test]
