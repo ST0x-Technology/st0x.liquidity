@@ -6355,7 +6355,8 @@ mod tests {
         );
     }
 
-    /// One hedged equity with the overnight flag as given.
+    /// One hedged equity with the overnight flag as given and extended
+    /// hours disabled.
     fn overnight_assets(symbol: &str, enabled: bool) -> HedgingAssets {
         let overnight_counter_trading = if enabled {
             OperationMode::Enabled
