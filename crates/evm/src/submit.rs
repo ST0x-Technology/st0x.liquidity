@@ -1678,12 +1678,15 @@ mod tests {
             .with_chain_id(1)
             .max_fee_per_gas(1_000_000_000)
             .max_priority_fee_per_gas(100_000_000);
+        let sendable = wallet.signing_provider().fill(tx.clone()).await.unwrap();
+        let envelope = sendable.try_into_envelope().unwrap();
+        let expected_hash = keccak256(envelope.encoded_2718());
 
         let tx_hash = TxSubmitter::submit(wallet.signing_provider(), tx)
             .await
             .unwrap();
 
-        assert_ne!(tx_hash, TxHash::ZERO);
+        assert_eq!(tx_hash, expected_hash);
     }
 
     #[tokio::test]
