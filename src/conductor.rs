@@ -4781,6 +4781,7 @@ async fn resolve_extended_hours_preflight(
         Err(error) => {
             record_scan_skip(
                 &execution.symbol,
+                MarketSession::Extended,
                 HedgeScanSkipReason::MarketSessionCheck,
                 None,
             );
@@ -4807,6 +4808,7 @@ async fn resolve_extended_hours_preflight(
         Err(error) => {
             record_scan_skip(
                 &execution.symbol,
+                MarketSession::Extended,
                 HedgeScanSkipReason::from(&error),
                 close_flatten_window,
             );
@@ -4827,6 +4829,7 @@ async fn resolve_extended_hours_preflight(
             Err(error) => {
                 record_scan_skip(
                     &execution.symbol,
+                    MarketSession::Extended,
                     HedgeScanSkipReason::SlippageCalculation,
                     close_flatten_window,
                 );
@@ -4869,6 +4872,7 @@ async fn resolve_overnight_preflight(
     else {
         record_scan_skip(
             &execution.symbol,
+            MarketSession::Overnight,
             HedgeScanSkipReason::OvernightIneligible,
             None,
         );
@@ -4894,6 +4898,7 @@ async fn resolve_overnight_preflight(
         Err(error) => {
             record_scan_skip(
                 &execution.symbol,
+                MarketSession::Overnight,
                 HedgeScanSkipReason::OvernightUnpriceable,
                 None,
             );
@@ -4914,6 +4919,7 @@ async fn resolve_overnight_preflight(
             Err(error) => {
                 record_scan_skip(
                     &execution.symbol,
+                    MarketSession::Overnight,
                     HedgeScanSkipReason::SlippageCalculation,
                     None,
                 );
