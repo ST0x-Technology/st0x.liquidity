@@ -9535,6 +9535,7 @@ mod tests {
                             symbol.clone(),
                             st0x_config::EquityHedgePolicy {
                                 extended_hours_counter_trading: extended_hours,
+                                overnight_counter_trading: OperationMode::Disabled,
                             },
                         )
                     })
@@ -11205,6 +11206,7 @@ mod tests {
                         Symbol::new("AAPL").unwrap(),
                         st0x_config::EquityHedgePolicy {
                             extended_hours_counter_trading: OperationMode::Enabled,
+                            overnight_counter_trading: OperationMode::Disabled,
                         },
                     )]),
                 },
