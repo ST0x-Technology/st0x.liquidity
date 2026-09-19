@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import * as Card from '$lib/components/ui/card'
+  import SessionFilterChips from '$lib/components/session-filter-chips.svelte'
+  import { matchesSessionFilter, type SessionFilter } from '$lib/session-filter'
   import { reactive } from '$lib/frp.svelte'
   import { getApiBaseUrl } from '$lib/env'
   import { formatUtc, FETCH_TIMEOUT_MS } from '$lib/time'
@@ -23,6 +25,13 @@
 
   const orders = reactive<PendingOrder[]>([])
   const error = reactive<string | null>(null)
+  const selectedSession = reactive<SessionFilter>('all')
+
+  const visibleOrders = $derived(
+    orders.current.filter((order) =>
+      matchesSessionFilter(order.marketSession, selectedSession.current)
+    )
+  )
 
   const fetchOrders = async () => {
     try {
@@ -89,15 +98,28 @@
         {orders.current.length} in-flight
       </span>
     </Card.Title>
+
+    <div class="pt-1.5">
+      <SessionFilterChips
+        selected={selectedSession.current}
+        onchange={(filter: SessionFilter) => {
+          selectedSession.update(() => filter)
+        }}
+      />
+    </div>
   </Card.Header>
   <Card.Content class="min-h-0 flex-1 overflow-auto px-6 pt-0">
     {#if error.current}
       <div class="text-xs text-destructive">{error.current}</div>
     {:else if orders.current.length === 0}
       <div class="text-xs text-muted-foreground">No pending orders</div>
+    {:else if visibleOrders.length === 0}
+      <div class="text-xs text-muted-foreground">
+        No {selectedSession.current} orders in flight
+      </div>
     {:else}
       <div class="space-y-1">
-        {#each orders.current as order, idx (order.viewId)}
+        {#each visibleOrders as order, idx (order.viewId)}
           <div class="flex items-center gap-3 rounded px-2 py-1 text-xs {idx % 2 === 0 ? 'bg-muted/40' : ''}">
             <span class="inline-flex items-center gap-1.5 {statusColor(order.status)}">
               <span class="inline-block h-1.5 w-1.5 rounded-full {dotColor(order.status)}"></span>
