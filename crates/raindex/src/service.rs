@@ -703,7 +703,8 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         Ok(self
             .evm
             .prepare_pending(self.inventory_address, calldata, "withdraw4 from vault")
-            .await?)
+            .await
+            .map_err(map_withdraw_revert)?)
     }
 
     async fn broadcast_prepared_withdraw(
@@ -804,13 +805,14 @@ mod tests {
     use alloy::network::{Ethereum, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::Log as PrimitiveLog;
-    use alloy::primitives::{B256, address, b256};
+    use alloy::primitives::{B256, Signature, address, b256};
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
     use alloy::providers::mock::Asserter;
     use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
+    use alloy::rpc::client::RpcClient;
     use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::rpc::types::{Log, TransactionRequest};
     use alloy::sol;
@@ -1377,6 +1379,123 @@ mod tests {
             message: "execution reverted".into(),
             data: Some(raw),
         }
+    }
+
+    struct PreparationFailingWallet {
+        provider: RootProvider,
+        revert_data: Bytes,
+    }
+
+    impl PreparationFailingWallet {
+        fn new(revert_data: Bytes) -> Self {
+            let url = "http://stub.invalid"
+                .parse()
+                .unwrap_or_else(|_| unreachable!("hardcoded URL must parse"));
+            Self {
+                provider: RootProvider::new(RpcClient::builder().http(url)),
+                revert_data,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Evm for PreparationFailingWallet {
+        type Provider = RootProvider;
+
+        fn provider(&self) -> &RootProvider {
+            &self.provider
+        }
+    }
+
+    #[async_trait]
+    impl Wallet for PreparationFailingWallet {
+        fn address(&self) -> Address {
+            Address::ZERO
+        }
+
+        async fn sign_typed_data(
+            &self,
+            _payload_json: String,
+            _expected_digest: B256,
+        ) -> Result<Signature, EvmError> {
+            unreachable!("prepare_withdraw must not sign typed data")
+        }
+
+        async fn prepare_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            Err(EvmError::Transport(TransportError::ErrorResp(
+                revert_error_payload(&self.revert_data),
+            )))
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            _prepared: &PreparedTransaction,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            unreachable!("prepare_withdraw must not broadcast")
+        }
+
+        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+            unreachable!("prepare_withdraw must not discard")
+        }
+
+        async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
+            unreachable!("prepare_withdraw must not restore")
+        }
+
+        async fn restore_transaction(&self, _tx_hash: TxHash) -> Result<(), EvmError> {
+            unreachable!("prepare_withdraw must not restore")
+        }
+
+        async fn send_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            unreachable!("prepare_withdraw must not submit")
+        }
+
+        async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            unreachable!("prepare_withdraw must not await a receipt")
+        }
+
+        async fn send(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            unreachable!("prepare_withdraw must not send")
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_withdraw_maps_insufficient_vault_liquidity() {
+        let requested = U256::from(1_000u64);
+        let received = U256::from(400u64);
+        let wallet =
+            PreparationFailingWallet::new(insufficient_liquidity_revert_bytes(requested, received));
+        let service = RaindexService::new(
+            wallet,
+            RaindexContracts {
+                inventory: Address::ZERO,
+                orderbook: Address::ZERO,
+            },
+            Address::ZERO,
+        );
+
+        let error = service
+            .prepare_withdraw(USDC_BASE, TEST_VAULT_ID, requested, 6)
+            .await
+            .unwrap_err();
+
+        assert_maps_to_insufficient_liquidity(error, requested, received);
     }
 
     fn assert_maps_to_insufficient_liquidity(
