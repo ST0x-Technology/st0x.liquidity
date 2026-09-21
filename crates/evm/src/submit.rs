@@ -431,6 +431,72 @@ where
     Ok(tx_hash)
 }
 
+/// Release the nonce reservation for a prepared transaction whose caller
+/// decided not to persist it, so a later send can reuse the nonce.
+///
+/// Takes the wallet send lock so this cannot race a concurrent nonce
+/// assignment (see [`prepare_with_nonce`]).
+pub(crate) async fn discard_prepared(
+    nonce_manager: &ResettableNonceManager,
+    send_lock: &Mutex<()>,
+    address: Address,
+    prepared: &PreparedTransaction,
+) {
+    let _guard = send_lock.lock().await;
+    nonce_manager
+        .release_prepared_nonce(address, prepared.nonce())
+        .await;
+    warn!(
+        target: "wallet",
+        tx_hash = %prepared.tx_hash(),
+        nonce = prepared.nonce(),
+        "Discarding unpersisted prepared transaction and releasing its nonce reservation"
+    );
+}
+
+/// Re-reserve the nonce of a persisted prepared transaction after restart and
+/// record it as this wallet's own durable in-flight entry, so recovery can
+/// rebroadcast it without a competing send stealing the nonce.
+pub(crate) async fn restore_prepared(
+    nonce_manager: &ResettableNonceManager,
+    in_flight: &InFlightNonces,
+    send_lock: &Mutex<()>,
+    address: Address,
+    prepared: &PreparedTransaction,
+) {
+    let _guard = send_lock.lock().await;
+    nonce_manager
+        .reserve_prepared_nonce(address, prepared.nonce())
+        .await;
+    in_flight.record_durable(address, prepared.nonce(), prepared.tx_hash());
+}
+
+/// Re-adopt a broadcast transaction known only by hash after restart: look up
+/// its nonce on-chain, re-reserve it, and record the hash as in-flight. A hash
+/// the node cannot yet see is inconclusive and surfaces as
+/// [`EvmError::PreparedTransactionReconciliationPending`] for durable redrive.
+pub(crate) async fn restore_transaction<P>(
+    provider: &P,
+    nonce_manager: &ResettableNonceManager,
+    in_flight: &InFlightNonces,
+    send_lock: &Mutex<()>,
+    address: Address,
+    tx_hash: TxHash,
+) -> Result<(), EvmError>
+where
+    P: Provider,
+{
+    let _guard = send_lock.lock().await;
+    let transaction = provider
+        .get_transaction_by_hash(tx_hash)
+        .await?
+        .ok_or(EvmError::PreparedTransactionReconciliationPending { tx_hash })?;
+    let nonce = transaction.nonce();
+    nonce_manager.reserve_prepared_nonce(address, nonce).await;
+    in_flight.record(address, nonce, tx_hash);
+    Ok(())
+}
+
 /// Submit `calldata` to `contract`, recovering from nonce races and a
 /// stuck pending transaction at the target nonce.
 ///

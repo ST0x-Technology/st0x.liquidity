@@ -166,7 +166,22 @@ impl RaindexError {
             Self::ScanInconclusive { .. } => true,
             Self::RpcTransport(error) => error.as_error_resp().is_none(),
             Self::Evm(error) => error.is_confirmation_pending(),
-            _ => false,
+            // A contract-layer error can carry the same transient transport
+            // failure as `RpcTransport` (connection reset/timeout with no formal
+            // JSON-RPC error response); classify it identically so a call routed
+            // through the contract layer is not silently treated as terminal.
+            // Any other contract error shape (revert, unknown function) is
+            // terminal.
+            Self::Contract(alloy::contract::Error::TransportError(error)) => {
+                error.as_error_resp().is_none()
+            }
+            Self::Contract(_)
+            | Self::Float(_)
+            | Self::ZeroAmount
+            | Self::SolType(_)
+            | Self::ScanAnomalousLog { .. }
+            | Self::InsufficientVaultLiquidity { .. }
+            | Self::MissingOperatorRole { .. } => false,
         }
     }
 }
@@ -299,6 +314,36 @@ mod tests {
             error.is_reconciliation_pending(),
             "a transport failure provides no formal rejection and may recover \
              when another backend becomes visible"
+        );
+    }
+
+    #[test]
+    fn contract_layer_formal_rpc_rejection_is_not_reconciliation_pending() {
+        let error = RaindexError::Contract(alloy::contract::Error::TransportError(
+            RpcError::ErrorResp(ErrorPayload {
+                code: -32602,
+                message: "invalid params".into(),
+                data: None,
+            }),
+        ));
+
+        assert!(
+            !error.is_reconciliation_pending(),
+            "a formal rejection routed through the contract layer is as terminal \
+             as the identical RpcTransport rejection"
+        );
+    }
+
+    #[test]
+    fn contract_layer_transient_transport_failure_is_reconciliation_pending() {
+        let error = RaindexError::Contract(alloy::contract::Error::TransportError(
+            TransportErrorKind::backend_gone(),
+        ));
+
+        assert!(
+            error.is_reconciliation_pending(),
+            "a transient transport failure reaching the caller through the \
+             contract layer is retryable, matching the RpcTransport path"
         );
     }
 }

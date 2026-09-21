@@ -357,13 +357,35 @@ impl EvmError {
     /// retry budget.
     pub fn is_confirmation_pending(&self) -> bool {
         match self {
+            // A transport failure carrying no formal JSON-RPC error response
+            // (connection reset, timeout) may still have reached the network or
+            // may confirm once RPC visibility catches up; a formal error
+            // response is the node's terminal rejection.
             Self::Transport(error) => error.as_error_resp().is_none(),
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReceiptTimeout { .. } => true,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::PreparedTransactionReconciliationPending { .. } => true,
             Self::NodeBehindRequiredBlock { .. } => true,
-            _ => false,
+            Self::Transaction(_)
+            | Self::Contract(_)
+            | Self::AbiDecode(_)
+            | Self::DecodedRevert(_)
+            | Self::Reverted { .. }
+            | Self::WalletConfigParse(_)
+            | Self::Signer(_) => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::TransactionDropped { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementUnderpriced { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::TransactionPreparation => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementFeeOverflow => false,
+            #[cfg(feature = "local-signer")]
+            Self::InvalidPrivateKey(_) => false,
+            #[cfg(feature = "turnkey")]
+            Self::Turnkey(_) => false,
         }
     }
 

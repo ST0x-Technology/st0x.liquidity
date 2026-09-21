@@ -7,7 +7,7 @@
 //! the signer: `TurnkeySigner` (remote signing via Turnkey API) instead
 //! of `PrivateKeySigner` (local key).
 
-use alloy::consensus::{SignableTransaction, Transaction, TxEnvelope};
+use alloy::consensus::{SignableTransaction, TxEnvelope};
 use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
 use alloy::network::{Ethereum, EthereumWallet, TxSigner};
 use alloy::primitives::{
@@ -44,7 +44,8 @@ use crate::gcp_kms_stamper::{GcpKmsStamper, GcpKmsStamperError};
 use crate::inflight_nonces::InFlightNonces;
 use crate::nonce::ResettableNonceManager;
 use crate::submit::{
-    broadcast_prepared, prepare_with_nonce, release_in_flight_after_wait, send_with_recovery,
+    broadcast_prepared, discard_prepared, prepare_with_nonce, release_in_flight_after_wait,
+    restore_prepared, restore_transaction, send_with_recovery,
 };
 use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
 
@@ -1186,40 +1187,30 @@ where
     }
 
     async fn discard_prepared(&self, prepared: &PreparedTransaction) {
-        let _guard = self.send_lock.lock().await;
-        self.nonce_manager
-            .release_prepared_nonce(self.address, prepared.nonce())
-            .await;
-        tracing::warn!(
-            target: "wallet",
-            tx_hash = %prepared.tx_hash(),
-            nonce = prepared.nonce(),
-            "Discarding unpersisted prepared transaction and releasing its nonce reservation"
-        );
+        discard_prepared(&self.nonce_manager, &self.send_lock, self.address, prepared).await;
     }
 
     async fn restore_prepared(&self, prepared: &PreparedTransaction) {
-        let _guard = self.send_lock.lock().await;
-        self.nonce_manager
-            .reserve_prepared_nonce(self.address, prepared.nonce())
-            .await;
-        self.in_flight
-            .record_durable(self.address, prepared.nonce(), prepared.tx_hash());
+        restore_prepared(
+            &self.nonce_manager,
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            prepared,
+        )
+        .await;
     }
 
     async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
-        let _guard = self.send_lock.lock().await;
-        let transaction = self
-            .provider
-            .get_transaction_by_hash(tx_hash)
-            .await?
-            .ok_or(EvmError::PreparedTransactionReconciliationPending { tx_hash })?;
-        let nonce = transaction.nonce();
-        self.nonce_manager
-            .reserve_prepared_nonce(self.address, nonce)
-            .await;
-        self.in_flight.record(self.address, nonce, tx_hash);
-        Ok(())
+        restore_transaction(
+            &self.provider,
+            &self.nonce_manager,
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            tx_hash,
+        )
+        .await
     }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
@@ -1270,6 +1261,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::Transaction as _;
     use alloy::consensus::{TxEip1559, TxLegacy};
     use alloy::eips::eip2718::Encodable2718;
     use alloy::eips::eip2930::AccessList;
