@@ -282,6 +282,54 @@ ratios between onchain and offchain holdings. Two dimensions:
 Rebalancing is only available with Alpaca Broker API (requires account-level
 access for mint/redeem operations).
 
+### Target Share
+
+The fraction of a symbol's total inventory (broker shares plus every chain's
+vault balance in underlying shares) that belongs on one chain, in `[0, 1]`.
+Configured per chain under `[rebalancing.allocation].targets` and overridable
+per equity with `target_share` on its chain entry. The type is `TargetShare`.
+The broker holds whatever the chain targets leave over.
+
+### Alpaca Floor
+
+The share of a symbol's total that stays at the broker: a mint never takes the
+broker's available shares below `alpaca_floor * total`, and a mint that would is
+declined as `FloorCapped` for the whole symbol. Configured as
+`[rebalancing.allocation].alpaca_floor`, also a `TargetShare`. At load time
+every rebalanced symbol's chain targets plus the floor must not exceed 1.
+Distinct from the hedge floor, which is a fixed number of shares.
+
+### Deviation Band
+
+How far a chain's actual share may drift from its target share before the
+planner acts, as a fraction of the total: a chain is a candidate only when
+`|actual - target| > band`. Configured as `[rebalancing.allocation].deviation`.
+The type is `DeviationBand`.
+
+### Minimum Operation Size
+
+The smallest equity transfer worth its gas, in dollars, valued at the last hedge
+price the `Position` recorded for the symbol. A candidate below it is dropped as
+`BelowMinimum` and the next candidate is evaluated; a missing or stale price
+declines the symbol (`PriceMissing`, `PriceStale`). Configured as
+`[rebalancing.allocation].min_operation_usd` with a per-chain
+`min_operation_usd` override on the trading table.
+
+### Reservation
+
+The durable record that one equity operation is in flight for a symbol: the
+transfer job row (symbol, quantity, aggregate id, chain), the transfer's first
+event and the inventory's inflight balance. Startup re-arms the per-symbol lock
+from open transfers, so a restart cannot dispatch a second operation for the
+symbol.
+
+### Cooldown
+
+The pause after an equity operation during which its `(symbol, chain)` pair is
+not re-planned, so a transfer truncated by a limit does not re-fire every tick.
+Configured as `[rebalancing.allocation].cooldown_secs`; a chain inside it is
+skipped as `CoolingDown`.
+
 ### Bridge
 
 Infrastructure for moving assets between chains. Used by USDC rebalancing to
