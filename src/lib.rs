@@ -81,6 +81,12 @@ mod vault_lookup;
 mod vault_registry;
 mod wrapped_equity_recovery;
 
+/// The equity allocation planner, exported ahead of its trigger wiring so
+/// the crate keeps it live until the trigger consumes it.
+pub use rebalancing::trigger::allocation::{
+    ChainSlot, DeclineReason, EquityPlan, EquityPlanError, EquityPlanInput, PlannedDirection,
+    PlannedOperation, plan_equity_operation,
+};
 pub use st0x_config::{
     ExtraLayer, FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing,
 };

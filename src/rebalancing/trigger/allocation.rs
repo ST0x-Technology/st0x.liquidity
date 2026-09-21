@@ -4,6 +4,292 @@
 //! Not wired into the trigger yet: the trigger still sizes against the
 //! single-chain `ImbalanceThreshold`.
 
+use chrono::{DateTime, Utc};
+use rain_math_float::FloatError;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Not;
+use std::time::Duration;
+use tracing::debug;
+
+use st0x_config::{DeviationBand, TargetShare};
+use st0x_evm::Chain;
+use st0x_execution::{FractionalShares, HasZero, NotPositive, Positive, Symbol};
+use st0x_finance::Usdc;
+use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
+
+use super::equity::{cap_shares, truncate_for_alpaca};
+use crate::inventory::VenueBalance;
+use crate::position::PriceObservation;
+
+/// One symbol's inventory and limits across every venue the caller could
+/// vouch for. A chain gets a slot only when it is hedged, polled and fresh;
+/// the planner never guesses a missing venue.
+#[derive(Debug, Clone)]
+pub struct EquityPlanInput {
+    pub symbol: Symbol,
+    /// The broker's shares; `None` until the broker venue has been polled.
+    pub offchain: Option<VenueBalance<FractionalShares>>,
+    pub onchain: BTreeMap<Chain, ChainSlot>,
+    /// Whether any venue, slotted or not, still has a transfer in flight.
+    pub has_inflight: bool,
+    /// The share of the total a mint must leave available at the broker.
+    pub alpaca_floor: TargetShare,
+    /// Chains that ran an operation for this symbol too recently.
+    pub cooldowns: BTreeSet<Chain>,
+    /// The hedging side's last price for the symbol, used to value the
+    /// minimum operation size.
+    pub last_price: Option<PriceObservation>,
+    pub price_staleness_bound: Duration,
+    pub now: DateTime<Utc>,
+}
+
+/// One chain's slot in an [`EquityPlanInput`].
+#[derive(Debug, Clone)]
+pub struct ChainSlot {
+    /// The vault balance in wrapped shares.
+    pub balance: VenueBalance<FractionalShares>,
+    pub ratio: UnderlyingPerWrapped,
+    pub target: TargetShare,
+    pub band: DeviationBand,
+    /// Cap on one operation, in underlying shares.
+    pub operational_limit: Option<Positive<FractionalShares>>,
+    pub min_operation_usd: Positive<Usdc>,
+    pub gas_ready: bool,
+    /// Whether the equity opts into rebalancing on this chain. A disabled
+    /// slot counts in the total but is never chosen.
+    pub enabled: bool,
+}
+
+/// What the planner decided for one symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EquityPlan {
+    Operation(PlannedOperation),
+    Decline(DeclineReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedOperation {
+    pub chain: Chain,
+    pub direction: PlannedDirection,
+    /// Underlying shares, truncated to the tokenization API's precision.
+    pub quantity: Positive<FractionalShares>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannedDirection {
+    Mint,
+    Redemption,
+}
+
+/// Why no operation was planned. A per-chain reason names the best-ranked
+/// candidate that was dropped for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclineReason {
+    OffchainUnpolled,
+    NoPolledChain,
+    Inflight,
+    TotalZero,
+    WithinBand,
+    /// The broker is at or below its floor, so no chain can mint.
+    FloorCapped,
+    BelowMinimum {
+        chain: Chain,
+    },
+    NoGas {
+        chain: Chain,
+    },
+    CoolingDown {
+        chain: Chain,
+    },
+    PriceMissing,
+    PriceStale,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EquityPlanError {
+    #[error(transparent)]
+    Float(#[from] FloatError),
+    #[error(transparent)]
+    Ratio(#[from] RatioError),
+    #[error(transparent)]
+    NotPositive(#[from] NotPositive<FractionalShares>),
+}
+
+/// A chain outside its band, with its signed distance from target in
+/// underlying shares.
+struct Candidate {
+    chain: Chain,
+    deviation: FractionalShares,
+    magnitude: FractionalShares,
+}
+
+impl Candidate {
+    fn direction(&self) -> Result<PlannedDirection, FloatError> {
+        Ok(if self.deviation.is_negative()? {
+            PlannedDirection::Mint
+        } else {
+            PlannedDirection::Redemption
+        })
+    }
+
+    /// Redemptions before mints, then the larger deviation, then chain
+    /// order.
+    fn outranks(&self, other: &Self) -> Result<bool, FloatError> {
+        let (mine, theirs) = (self.direction()?, other.direction()?);
+        if mine != theirs {
+            return Ok(mine == PlannedDirection::Redemption);
+        }
+
+        if self.magnitude.inner().gt(other.magnitude.inner())? {
+            return Ok(true);
+        }
+        if self.magnitude.inner().lt(other.magnitude.inner())? {
+            return Ok(false);
+        }
+
+        Ok(self.chain < other.chain)
+    }
+}
+
+/// Picks at most one operation for the symbol: the guards first, then the
+/// best-ranked candidate that survives the gas, cooldown, floor and minimum
+/// size checks.
+pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, EquityPlanError> {
+    let Some(offchain) = input.offchain else {
+        return Ok(EquityPlan::Decline(DeclineReason::OffchainUnpolled));
+    };
+    if input.onchain.is_empty() {
+        return Ok(EquityPlan::Decline(DeclineReason::NoPolledChain));
+    }
+    if input.has_inflight {
+        return Ok(EquityPlan::Decline(DeclineReason::Inflight));
+    }
+
+    let mut underlying = BTreeMap::new();
+    let mut total = FractionalShares::ZERO;
+    for (chain, slot) in &input.onchain {
+        let shares = slot.ratio.to_underlying_fractional(slot.balance.total()?)?;
+        total = (total + shares)?;
+        underlying.insert(*chain, shares);
+    }
+    let total = (total + offchain.total()?)?;
+    if total.is_zero()? {
+        return Ok(EquityPlan::Decline(DeclineReason::TotalZero));
+    }
+
+    let mut first_drop = None;
+    for candidate in ranked_candidates(input, total, &underlying)? {
+        let slot = &input.onchain[&candidate.chain];
+        let direction = candidate.direction()?;
+
+        if !slot.gas_ready {
+            first_drop.get_or_insert(DeclineReason::NoGas {
+                chain: candidate.chain,
+            });
+            continue;
+        }
+        if input.cooldowns.contains(&candidate.chain) {
+            first_drop.get_or_insert(DeclineReason::CoolingDown {
+                chain: candidate.chain,
+            });
+            continue;
+        }
+
+        let mut quantity = cap_shares(&input.symbol, candidate.magnitude, slot.operational_limit);
+        if direction == PlannedDirection::Mint {
+            let floor = (total * input.alpaca_floor.inner())?;
+            let mintable = (offchain.available() - floor)?;
+            if mintable.is_zero()? || mintable.is_negative()? {
+                return Ok(EquityPlan::Decline(DeclineReason::FloorCapped));
+            }
+            if quantity.inner().gt(mintable.inner())? {
+                debug!(
+                    target: "rebalance",
+                    symbol = %input.symbol,
+                    chain = %candidate.chain,
+                    computed = %quantity,
+                    capped = %mintable,
+                    "Equity mint capped to keep the Alpaca floor"
+                );
+                quantity = mintable;
+            }
+        }
+        let quantity = truncate_for_alpaca(&input.symbol, quantity)?;
+
+        let Some(price) = input.last_price else {
+            return Ok(EquityPlan::Decline(DeclineReason::PriceMissing));
+        };
+        if price_is_stale(&price, input.now, input.price_staleness_bound) {
+            return Ok(EquityPlan::Decline(DeclineReason::PriceStale));
+        }
+        let value = (quantity.inner() * price.price)?;
+        if value.lt(slot.min_operation_usd.inner().inner())? {
+            first_drop.get_or_insert(DeclineReason::BelowMinimum {
+                chain: candidate.chain,
+            });
+            continue;
+        }
+
+        return Ok(EquityPlan::Operation(PlannedOperation {
+            chain: candidate.chain,
+            direction,
+            quantity: Positive::new(quantity)?,
+        }));
+    }
+
+    Ok(EquityPlan::Decline(
+        first_drop.unwrap_or(DeclineReason::WithinBand),
+    ))
+}
+
+/// The enabled chains outside their band, best first.
+fn ranked_candidates(
+    input: &EquityPlanInput,
+    total: FractionalShares,
+    underlying: &BTreeMap<Chain, FractionalShares>,
+) -> Result<Vec<Candidate>, FloatError> {
+    let mut remaining = Vec::new();
+    for (chain, slot) in &input.onchain {
+        if !slot.enabled {
+            continue;
+        }
+
+        let target = (total * slot.target.inner())?;
+        let deviation = (underlying[chain] - target)?;
+        let magnitude = deviation.abs()?;
+        let band = (total * slot.band.inner())?;
+        if magnitude.inner().gt(band.inner())? {
+            remaining.push(Candidate {
+                chain: *chain,
+                deviation,
+                magnitude,
+            });
+        }
+    }
+
+    let mut ranked = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let mut best = 0;
+        for index in 1..remaining.len() {
+            if remaining[index].outranks(&remaining[best])? {
+                best = index;
+            }
+        }
+        ranked.push(remaining.swap_remove(best));
+    }
+
+    Ok(ranked)
+}
+
+/// A price older than the bound, or stamped in the future, cannot value a
+/// minimum.
+fn price_is_stale(price: &PriceObservation, now: DateTime<Utc>, bound: Duration) -> bool {
+    now.signed_duration_since(price.observed_at)
+        .to_std()
+        .is_ok_and(|age| age <= bound)
+        .not()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
