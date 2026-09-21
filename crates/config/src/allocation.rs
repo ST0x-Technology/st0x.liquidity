@@ -207,7 +207,7 @@ pub enum AllocationConfigError {
         format_float_with_fallback(value)
     )]
     NegativeDeviationBand { value: Float },
-    #[error("[rebalancing.allocation] cooldown_secs must be non-zero")]
+    #[error("cooldown_secs must be non-zero")]
     ZeroCooldown,
     #[error(
         "[rebalancing.allocation] targets names {chain}, which has no enabled \
