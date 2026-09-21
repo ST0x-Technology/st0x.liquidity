@@ -298,7 +298,7 @@ symbol is declined as `FloorCapped` only when that leaves no room to mint at
 all. Configured as `[rebalancing.allocation].alpaca_floor`, also a
 `TargetShare`. At load time every rebalanced symbol's chain targets plus the
 floor must not exceed 1. Distinct from the hedge floor, which is a fixed number
-of shares.
+of shares; the planner keeps whichever of the two is larger.
 
 ### Deviation Band
 

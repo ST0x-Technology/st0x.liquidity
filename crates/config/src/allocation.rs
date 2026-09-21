@@ -23,6 +23,10 @@ static EXACT_ONE: LazyLock<Float> = LazyLock::new(|| float!(1));
 pub struct TargetShare(Float);
 
 impl TargetShare {
+    /// No share of the total: the target of a venue that is counted but
+    /// never planned.
+    pub const ZERO: Self = Self(float!(0));
+
     /// # Errors
     ///
     /// Returns [`AllocationConfigError::TargetShareOutOfRange`] outside `[0, 1]`.
@@ -192,6 +196,38 @@ impl AllocationCtx {
             min_operation_usd: config.min_operation_usd,
             cooldown: Duration::from_secs(config.cooldown_secs),
         })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl AllocationCtx {
+    /// Test fixture: one chain at `target` with `band` around it, no broker
+    /// floor, a one-dollar minimum and a one-second cooldown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocationConfigError`] for a share outside `[0, 1]` or a
+    /// negative band.
+    pub fn single_chain_test(
+        chain: Chain,
+        target: Float,
+        band: Float,
+    ) -> Result<Self, AllocationConfigError> {
+        Ok(Self {
+            targets: BTreeMap::from([(chain, TargetShare::new(target)?)]),
+            alpaca_floor: TargetShare::ZERO,
+            deviation: DeviationBand::new(band)?,
+            min_operation_usd: Positive::new(Usdc::new(float!(1)))
+                .unwrap_or_else(|_| unreachable!("one dollar is positive")),
+            cooldown: Duration::from_secs(1),
+        })
+    }
+
+    /// The test builders' default: Base at 50% inside a 20% band.
+    #[must_use]
+    pub fn base_test() -> Self {
+        Self::single_chain_test(Chain::Base, float!(0.5), float!(0.2))
+            .unwrap_or_else(|_| unreachable!("hard-coded shares are valid"))
     }
 }
 

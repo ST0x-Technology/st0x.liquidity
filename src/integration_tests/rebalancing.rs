@@ -305,7 +305,7 @@ async fn build_position_cqrs_with_service(
         .build(())
         .await
         .unwrap();
-    service.set_last_price_reader(projection).await;
+    service.set_last_price_reader(projection.clone()).await;
 
     service
         .set_position_authority(
@@ -1387,7 +1387,9 @@ async fn over_target_chain_redeems_before_the_under_target_chain_mints() {
         30,
     )
     .await;
-    drain_pending_jobs(&service).await.unwrap();
+    // The terminal event re-arms only a USDC check; the next equity tick is
+    // the next snapshot poll's, driven here by hand.
+    service.check_and_trigger_equity(&symbol).await.unwrap();
 
     let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
     assert_eq!(mint.chain, Chain::HyperEvm);
@@ -1490,7 +1492,7 @@ async fn capped_chain_cools_down_before_it_is_replanned() {
         10,
     )
     .await;
-    drain_pending_jobs(&service).await.unwrap();
+    service.check_and_trigger_equity(&symbol).await.unwrap();
 
     assert_eq!(
         pending_equity_redemption_job_count(&apalis_pool).await,
@@ -2295,16 +2297,13 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
-        equity: ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        },
+        allocation: test_trigger_config().allocation,
         usdc: Some(ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
-        assets,
+        chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
     };
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
@@ -2432,16 +2431,13 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
-        equity: ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        },
+        allocation: test_trigger_config().allocation,
         usdc: Some(ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
-        assets,
+        chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
     };
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
@@ -2533,23 +2529,23 @@ async fn threshold_config_controls_trigger_sensitivity() {
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
-            equity: ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.4),
-            },
+            allocation: test_trigger_config().allocation,
             usdc: Some(ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.4),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: ChainAssets {
-                equities: ChainEquities::default(),
-                cash: Some(ChainCashAsset {
-                    vault_ids: Vec::new(),
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: None,
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash: Some(ChainCashAsset {
+                        vault_ids: Vec::new(),
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
                 }),
-            },
+            )]),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
@@ -2601,23 +2597,23 @@ async fn threshold_config_controls_trigger_sensitivity() {
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
-            equity: ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.1),
-            },
+            allocation: test_trigger_config().allocation,
             usdc: Some(ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.1),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: ChainAssets {
-                equities: ChainEquities::default(),
-                cash: Some(ChainCashAsset {
-                    vault_ids: Vec::new(),
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: None,
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash: Some(ChainCashAsset {
+                        vault_ids: Vec::new(),
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
                 }),
-            },
+            )]),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());

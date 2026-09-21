@@ -1,15 +1,12 @@
 //! Pure equity allocation planner: at most one mint or redemption per
 //! symbol, chosen from per-chain target shares.
-//!
-//! Not wired into the trigger yet: the trigger still sizes against the
-//! single-chain `ImbalanceThreshold`.
 
 use chrono::{DateTime, Utc};
-use rain_math_float::FloatError;
+use rain_math_float::{Float, FloatError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Not;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, info};
 
 use st0x_config::{DeviationBand, TargetShare};
 use st0x_evm::Chain;
@@ -17,9 +14,11 @@ use st0x_execution::{FractionalShares, HasZero, NotPositive, Positive, Symbol};
 use st0x_finance::Usdc;
 use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
 
-use super::equity::{cap_shares, truncate_for_alpaca};
 use crate::inventory::VenueBalance;
 use crate::position::PriceObservation;
+
+/// Maximum decimal places for Alpaca tokenization API quantities.
+const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
 
 /// One symbol's inventory and limits across every venue the caller could
 /// vouch for.
@@ -28,60 +27,63 @@ use crate::position::PriceObservation;
 /// the planner never guesses a missing venue, and a listing chain without a
 /// slot declines the symbol rather than sizing it against a partial total.
 #[derive(Debug, Clone)]
-pub struct EquityPlanInput {
-    pub symbol: Symbol,
+pub(crate) struct EquityPlanInput {
+    pub(crate) symbol: Symbol,
     /// The broker's shares; `None` until the broker venue has been polled.
-    pub offchain: Option<VenueBalance<FractionalShares>>,
+    pub(crate) offchain: Option<VenueBalance<FractionalShares>>,
     /// Every chain that lists the symbol; each needs a slot in `onchain`.
-    pub listing_chains: BTreeSet<Chain>,
-    pub onchain: BTreeMap<Chain, ChainSlot>,
+    pub(crate) listing_chains: BTreeSet<Chain>,
+    pub(crate) onchain: BTreeMap<Chain, ChainSlot>,
     /// Whether any venue, slotted or not, still has a transfer in flight.
-    pub has_inflight: bool,
+    pub(crate) has_inflight: bool,
     /// The share of the total a mint must leave available at the broker.
-    pub alpaca_floor: TargetShare,
+    pub(crate) alpaca_floor: TargetShare,
+    /// Shares a mint may never take out of the broker account: the residual
+    /// a sell hedge leaves so pricing never loses the symbol's mark.
+    pub(crate) hedge_floor: FractionalShares,
     /// Chains that ran an operation for this symbol too recently.
-    pub cooldowns: BTreeSet<Chain>,
+    pub(crate) cooldowns: BTreeSet<Chain>,
     /// The symbol's last onchain fill price, block-timestamped, used to
     /// value the minimum operation size.
-    pub last_price: Option<PriceObservation>,
-    pub price_staleness_bound: Duration,
-    pub now: DateTime<Utc>,
+    pub(crate) last_price: Option<PriceObservation>,
+    pub(crate) price_staleness_bound: Duration,
+    pub(crate) now: DateTime<Utc>,
 }
 
 /// One chain's slot in an [`EquityPlanInput`].
 #[derive(Debug, Clone)]
-pub struct ChainSlot {
+pub(crate) struct ChainSlot {
     /// The vault balance in wrapped shares.
-    pub balance: VenueBalance<FractionalShares>,
-    pub ratio: UnderlyingPerWrapped,
-    pub target: TargetShare,
-    pub band: DeviationBand,
+    pub(crate) balance: VenueBalance<FractionalShares>,
+    pub(crate) ratio: UnderlyingPerWrapped,
+    pub(crate) target: TargetShare,
+    pub(crate) band: DeviationBand,
     /// Cap on one operation, in underlying shares.
-    pub operational_limit: Option<Positive<FractionalShares>>,
-    pub min_operation_usd: Positive<Usdc>,
-    pub gas_ready: bool,
+    pub(crate) operational_limit: Option<Positive<FractionalShares>>,
+    pub(crate) min_operation_usd: Positive<Usdc>,
+    pub(crate) gas_ready: bool,
     /// Whether the equity opts into rebalancing on this chain. A disabled
     /// slot counts in the total but is never chosen.
-    pub enabled: bool,
+    pub(crate) enabled: bool,
 }
 
 /// What the planner decided for one symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EquityPlan {
+pub(crate) enum EquityPlan {
     Operation(PlannedOperation),
     Decline(DeclineReason),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedOperation {
-    pub chain: Chain,
-    pub direction: PlannedDirection,
+pub(crate) struct PlannedOperation {
+    pub(crate) chain: Chain,
+    pub(crate) direction: PlannedDirection,
     /// Underlying shares, truncated to the tokenization API's precision.
-    pub quantity: Positive<FractionalShares>,
+    pub(crate) quantity: Positive<FractionalShares>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlannedDirection {
+pub(crate) enum PlannedDirection {
     Mint,
     Redemption,
 }
@@ -90,7 +92,7 @@ pub enum PlannedDirection {
 /// candidate that was dropped for it, and outranks a symbol-wide reason met
 /// on a later candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeclineReason {
+pub(crate) enum DeclineReason {
     OffchainUnpolled,
     NoPolledChain,
     /// A chain that lists the symbol has no slot, so the total is partial.
@@ -115,8 +117,46 @@ pub enum DeclineReason {
     PriceStale,
 }
 
+impl DeclineReason {
+    /// The stable label the decline counter is keyed by.
+    pub(crate) fn metric_label(&self) -> &'static str {
+        match self {
+            Self::OffchainUnpolled => "offchain_unpolled",
+            Self::NoPolledChain => "no_polled_chain",
+            Self::ChainUnpolled { .. } => "chain_unpolled",
+            Self::Inflight => "inflight",
+            Self::TotalZero => "total_zero",
+            Self::WithinBand => "within_band",
+            Self::FloorCapped => "floor_capped",
+            Self::BelowMinimum { .. } => "below_minimum",
+            Self::NoGas { .. } => "no_gas",
+            Self::CoolingDown { .. } => "cooling_down",
+            Self::PriceMissing => "price_missing",
+            Self::PriceStale => "price_stale",
+        }
+    }
+
+    /// The chain a per-chain reason names.
+    pub(crate) fn chain(&self) -> Option<Chain> {
+        match self {
+            Self::ChainUnpolled { chain }
+            | Self::BelowMinimum { chain }
+            | Self::NoGas { chain }
+            | Self::CoolingDown { chain } => Some(*chain),
+            Self::OffchainUnpolled
+            | Self::NoPolledChain
+            | Self::Inflight
+            | Self::TotalZero
+            | Self::WithinBand
+            | Self::FloorCapped
+            | Self::PriceMissing
+            | Self::PriceStale => None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-pub enum EquityPlanError {
+pub(crate) enum EquityPlanError {
     #[error(transparent)]
     Float(#[from] FloatError),
     #[error(transparent)]
@@ -167,7 +207,9 @@ impl Candidate {
 /// gas, cooldown, floor and minimum size checks wins. A missing or stale price declines the symbol before any
 /// candidate is tried; a per-chain drop on a higher-ranked candidate only
 /// outranks a later `FloorCapped`.
-pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, EquityPlanError> {
+pub(crate) fn plan_equity_operation(
+    input: &EquityPlanInput,
+) -> Result<EquityPlan, EquityPlanError> {
     let Some(offchain) = input.offchain else {
         return Ok(EquityPlan::Decline(DeclineReason::OffchainUnpolled));
     };
@@ -199,7 +241,7 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
         return Ok(EquityPlan::Decline(DeclineReason::TotalZero));
     }
 
-    let candidates = ranked_candidates(input, total, &underlying)?;
+    let (candidates, deviations) = ranked_candidates(input, total, &underlying)?;
     if candidates.is_empty() {
         return Ok(EquityPlan::Decline(DeclineReason::WithinBand));
     }
@@ -230,8 +272,7 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
 
         let mut quantity = cap_shares(&input.symbol, candidate.magnitude, slot.operational_limit);
         if direction == PlannedDirection::Mint {
-            let floor = (total * input.alpaca_floor.inner())?;
-            let mintable = (offchain.available() - floor)?;
+            let mintable = mintable_above_floors(input, offchain, total)?;
             if mintable.is_zero()? || mintable.is_negative()? {
                 return Ok(EquityPlan::Decline(
                     first_drop.unwrap_or(DeclineReason::FloorCapped),
@@ -244,7 +285,7 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
                     chain = %candidate.chain,
                     computed = %quantity,
                     capped = %mintable,
-                    "Equity mint capped to keep the Alpaca floor"
+                    "Equity mint capped to keep the broker floors"
                 );
                 quantity = mintable;
             }
@@ -259,6 +300,17 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
             continue;
         }
 
+        info!(
+            target: "rebalance",
+            symbol = %input.symbol,
+            chain = %candidate.chain,
+            ?direction,
+            %quantity,
+            %total,
+            deviations = %format_deviations(&deviations),
+            "Planned equity operation"
+        );
+
         return Ok(EquityPlan::Operation(PlannedOperation {
             chain: candidate.chain,
             direction,
@@ -271,20 +323,41 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
     ))
 }
 
-/// The enabled chains outside their band, best first.
+/// What the broker can mint without dropping below either floor: the share
+/// of the total it keeps, or the fixed residual a sell hedge leaves,
+/// whichever is larger.
+fn mintable_above_floors(
+    input: &EquityPlanInput,
+    offchain: VenueBalance<FractionalShares>,
+    total: FractionalShares,
+) -> Result<FractionalShares, FloatError> {
+    let share_floor = (total * input.alpaca_floor.inner())?;
+    let floor = if input.hedge_floor.inner().gt(share_floor.inner())? {
+        input.hedge_floor
+    } else {
+        share_floor
+    };
+
+    offchain.available() - floor
+}
+
+/// Every slot's signed distance from its target in underlying shares, and
+/// the enabled chains outside their band, best first.
 fn ranked_candidates(
     input: &EquityPlanInput,
     total: FractionalShares,
     underlying: &BTreeMap<Chain, FractionalShares>,
-) -> Result<Vec<Candidate>, FloatError> {
+) -> Result<(Vec<Candidate>, BTreeMap<Chain, FractionalShares>), FloatError> {
+    let mut deviations = BTreeMap::new();
     let mut remaining = Vec::new();
     for (chain, slot) in &input.onchain {
+        let target = (total * slot.target.inner())?;
+        let deviation = (underlying[chain] - target)?;
+        deviations.insert(*chain, deviation);
         if !slot.enabled {
             continue;
         }
 
-        let target = (total * slot.target.inner())?;
-        let deviation = (underlying[chain] - target)?;
         let magnitude = deviation.abs()?;
         let band = (total * slot.band.inner())?;
         if magnitude.inner().gt(band.inner())? {
@@ -307,7 +380,15 @@ fn ranked_candidates(
         ranked.push(remaining.swap_remove(best));
     }
 
-    Ok(ranked)
+    Ok((ranked, deviations))
+}
+
+fn format_deviations(deviations: &BTreeMap<Chain, FractionalShares>) -> String {
+    deviations
+        .iter()
+        .map(|(chain, deviation)| format!("{chain}={deviation}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A price older than the bound, or stamped in the future, cannot value a
@@ -317,6 +398,59 @@ fn price_is_stale(price: &PriceObservation, now: DateTime<Utc>, bound: Duration)
         .to_std()
         .is_ok_and(|age| age <= bound)
         .not()
+}
+
+fn cap_shares(
+    symbol: &Symbol,
+    quantity: FractionalShares,
+    shares_limit: Option<Positive<FractionalShares>>,
+) -> FractionalShares {
+    let Some(cap) = shares_limit else {
+        return quantity;
+    };
+
+    let cap_value = cap.inner();
+
+    if quantity > cap_value {
+        debug!(
+            target: "rebalance",
+            %symbol,
+            computed = %quantity,
+            limit = %cap_value,
+            "Equity rebalancing shares capped by operational limit"
+        );
+        cap_value
+    } else {
+        quantity
+    }
+}
+
+/// Truncates to the Alpaca API decimal limit, logging when sub-nanoshare
+/// digits are dropped.
+fn truncate_for_alpaca(
+    symbol: &Symbol,
+    quantity: FractionalShares,
+) -> Result<FractionalShares, FloatError> {
+    // Truncate by converting to fixed-point with the target scale,
+    // then back. This drops any digits beyond the scale limit.
+    let (fixed, _lossless) = quantity
+        .inner()
+        .to_fixed_decimal_lossy(ALPACA_QUANTITY_MAX_DECIMAL_PLACES)?;
+    let truncated_value = Float::from_fixed_decimal(fixed, ALPACA_QUANTITY_MAX_DECIMAL_PLACES)?;
+    let truncated = FractionalShares::new(truncated_value);
+
+    if truncated != quantity {
+        debug!(
+            target: "rebalance",
+            %symbol,
+            original = %quantity,
+            truncated = %truncated,
+            "Truncated quantity to {} decimal places for Alpaca API",
+            ALPACA_QUANTITY_MAX_DECIMAL_PLACES
+        );
+    }
+
+    Ok(truncated)
 }
 
 #[cfg(test)]
@@ -329,14 +463,15 @@ mod tests {
     use proptest::prelude::*;
     use rain_math_float::Float;
 
-    use st0x_config::{DeviationBand, ImbalanceThreshold, TargetShare};
+    use st0x_config::{DeviationBand, TargetShare};
     use st0x_evm::Chain;
     use st0x_execution::{FractionalShares, Positive, Symbol};
     use st0x_finance::Usdc;
+    use st0x_float_macro::float;
     use st0x_wrapper::{RATIO_ONE, UnderlyingPerWrapped};
 
     use super::*;
-    use crate::inventory::{Imbalance, InventoryView, VenueBalance};
+    use crate::inventory::VenueBalance;
     use crate::position::PriceObservation;
 
     const STALENESS_BOUND: Duration = Duration::from_secs(300);
@@ -404,6 +539,7 @@ mod tests {
             onchain,
             has_inflight: false,
             alpaca_floor: target("0"),
+            hedge_floor: FractionalShares::ZERO,
             cooldowns: BTreeSet::new(),
             last_price: Some(observed("100", now())),
             price_staleness_bound: STALENESS_BOUND,
@@ -581,6 +717,34 @@ mod tests {
         assert_eq!(plan, mint(Chain::Base, "10"));
     }
 
+    /// 80 onchain against a 50% target asks to redeem 30; a 10-share limit
+    /// caps it, and the remaining excess is planned again next round until
+    /// the chain is inside its band.
+    #[test]
+    fn capped_redemption_leaves_the_remaining_excess_plannable() {
+        let capped = |onchain: &str, offchain: &str| {
+            plan_equity_operation(&input(
+                Some(balance(offchain)),
+                BTreeMap::from([(
+                    Chain::Base,
+                    ChainSlot {
+                        operational_limit: Some(positive("10")),
+                        ..slot(onchain, "0.5")
+                    },
+                )]),
+            ))
+            .unwrap()
+        };
+
+        assert_eq!(capped("80", "20"), redemption(Chain::Base, "10"));
+        assert_eq!(capped("75", "25"), redemption(Chain::Base, "10"));
+        assert_eq!(
+            capped("70", "30"),
+            EquityPlan::Decline(DeclineReason::WithinBand),
+            "20 over on a total of 100 sits exactly on the band"
+        );
+    }
+
     /// A 60% floor on a total of 100 keeps 60 shares at the broker, so only
     /// 25 of the 35-share deviation can be minted.
     #[test]
@@ -629,6 +793,125 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan, redemption(Chain::Base, "30"));
+    }
+
+    /// Everything offchain and a target of 95% onchain asks to mint 9.975 of
+    /// 10.5 shares; a one-share hedge floor caps the mint at 9.5.
+    #[test]
+    fn mint_stops_at_the_hedge_floor() {
+        let plan = plan_equity_operation(&EquityPlanInput {
+            hedge_floor: shares("1"),
+            ..input(
+                Some(balance("10.5")),
+                BTreeMap::from([(
+                    Chain::Base,
+                    ChainSlot {
+                        band: band("0.01"),
+                        ..slot("0", "0.95")
+                    },
+                )]),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(plan, mint(Chain::Base, "9.5"));
+    }
+
+    /// The larger of the two floors binds: a 60% share floor keeps 6.3 of
+    /// 10.5 shares, above the one-share hedge floor, so 4.2 can be minted.
+    #[test]
+    fn the_larger_floor_binds() {
+        let plan = plan_equity_operation(&EquityPlanInput {
+            alpaca_floor: target("0.6"),
+            hedge_floor: shares("1"),
+            ..input(
+                Some(balance("10.5")),
+                BTreeMap::from([(
+                    Chain::Base,
+                    ChainSlot {
+                        band: band("0.01"),
+                        ..slot("0", "0.95")
+                    },
+                )]),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(plan, mint(Chain::Base, "4.2"));
+    }
+
+    /// A floored sell leaves the book at exactly the floor, and broker
+    /// positions carry nine-decimal residue, so `floor + dust` is the steady
+    /// state. That must not become a dust mint every cycle: the dust is
+    /// worth less than any minimum.
+    #[test]
+    fn dust_above_the_hedge_floor_is_below_the_minimum() {
+        let plan = plan_equity_operation(&EquityPlanInput {
+            hedge_floor: shares("1"),
+            ..input(
+                Some(balance("1.000000001")),
+                BTreeMap::from([(
+                    Chain::Base,
+                    ChainSlot {
+                        band: band("0.01"),
+                        ..slot("0", "0.95")
+                    },
+                )]),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            EquityPlan::Decline(DeclineReason::BelowMinimum { chain: Chain::Base })
+        );
+    }
+
+    /// An operational limit below the minimum must not turn a legitimate
+    /// excess into a dust mint either.
+    #[test]
+    fn operational_limit_leaving_only_dust_is_below_the_minimum() {
+        let plan = plan_equity_operation(&EquityPlanInput {
+            hedge_floor: shares("1"),
+            ..input(
+                Some(balance("10.5")),
+                BTreeMap::from([(
+                    Chain::Base,
+                    ChainSlot {
+                        band: band("0.01"),
+                        operational_limit: Some(positive("0.001")),
+                        ..slot("0", "0.95")
+                    },
+                )]),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            EquityPlan::Decline(DeclineReason::BelowMinimum { chain: Chain::Base })
+        );
+    }
+
+    /// A book that is nothing but the hedge floor has nothing to mint.
+    #[test]
+    fn book_that_is_only_the_hedge_floor_is_floor_capped() {
+        let plan = plan_equity_operation(&EquityPlanInput {
+            hedge_floor: shares("1"),
+            ..input(
+                Some(balance("1")),
+                BTreeMap::from([(
+                    Chain::Base,
+                    ChainSlot {
+                        band: band("0.01"),
+                        ..slot("0", "0.95")
+                    },
+                )]),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(plan, EquityPlan::Decline(DeclineReason::FloorCapped));
     }
 
     #[test]
@@ -863,6 +1146,26 @@ mod tests {
         assert_eq!(plan, redemption(Chain::Base, "10"));
     }
 
+    /// 50 wrapped at a 1.05 ratio are 52.5 underlying: 51% of the total, a
+    /// small appreciation that stays inside a 20% band.
+    #[test]
+    fn small_ratio_appreciation_stays_within_band() {
+        let ratio = UnderlyingPerWrapped::new(U256::from(1_050_000_000_000_000_000u64)).unwrap();
+        let plan = plan_equity_operation(&input(
+            Some(balance("50")),
+            BTreeMap::from([(
+                Chain::Base,
+                ChainSlot {
+                    ratio,
+                    ..slot("50", "0.5")
+                },
+            )]),
+        ))
+        .unwrap();
+
+        assert_eq!(plan, EquityPlan::Decline(DeclineReason::WithinBand));
+    }
+
     /// A chain whose equity has rebalancing disabled still holds inventory
     /// that counts in the total, but it is never chosen.
     #[test]
@@ -916,6 +1219,150 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan, mint(Chain::Base, "9.528666704"));
+    }
+
+    /// The sub-nanoshare digits a truncated mint leaves behind stay in the
+    /// venue totals: after the truncated quantity moves, the leftover sits
+    /// inside the band rather than vanishing or re-firing.
+    #[test]
+    fn truncated_leftover_stays_in_the_totals() {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let before = input(
+            Some(balance("25.409777878878899058")),
+            BTreeMap::from([(
+                Chain::Base,
+                ChainSlot {
+                    band: band("0.1"),
+                    ..slot("6.352444469719724764", "0.5")
+                },
+            )]),
+        );
+        let EquityPlan::Operation(operation) = plan_equity_operation(&before).unwrap() else {
+            panic!("expected a mint");
+        };
+        let minted = operation.quantity.inner();
+        assert_eq!(minted, shares("9.528666704"));
+
+        let after = input(
+            Some(VenueBalance::new(
+                (before.offchain.unwrap().available() - minted).unwrap(),
+                FractionalShares::ZERO,
+            )),
+            BTreeMap::from([(
+                Chain::Base,
+                ChainSlot {
+                    balance: VenueBalance::new(
+                        (before.onchain[&Chain::Base].balance.available() + minted).unwrap(),
+                        FractionalShares::ZERO,
+                    ),
+                    band: band("0.1"),
+                    ..slot("0", "0.5")
+                },
+            )]),
+        );
+        let plan = plan_equity_operation(&EquityPlanInput { symbol, ..after }).unwrap();
+
+        assert_eq!(plan, EquityPlan::Decline(DeclineReason::WithinBand));
+    }
+
+    /// Two rounds of truncated mints keep every quantity at nine decimals
+    /// while the leftovers accumulate in the totals between them.
+    #[test]
+    fn truncated_leftovers_accumulate_over_multiple_operations() {
+        let nine_decimals = |quantity: FractionalShares| {
+            let (fixed, lossless) = quantity.inner().to_fixed_decimal_lossy(9).unwrap();
+            lossless
+                && quantity
+                    .inner()
+                    .eq(Float::from_fixed_decimal(fixed, 9).unwrap())
+                    .unwrap()
+        };
+        let round = |onchain: FractionalShares, offchain: FractionalShares| {
+            let plan = plan_equity_operation(&input(
+                Some(VenueBalance::new(offchain, FractionalShares::ZERO)),
+                BTreeMap::from([(
+                    Chain::Base,
+                    ChainSlot {
+                        balance: VenueBalance::new(onchain, FractionalShares::ZERO),
+                        band: band("0.1"),
+                        ..slot("0", "0.5")
+                    },
+                )]),
+            ))
+            .unwrap();
+            let EquityPlan::Operation(operation) = plan else {
+                panic!("expected a mint, got {plan:?}");
+            };
+            operation.quantity.inner()
+        };
+
+        let onchain = shares("10.123456789123456789");
+        let offchain = shares("89.876543210876543211");
+        let first = round(onchain, offchain);
+        assert!(
+            nine_decimals(first),
+            "first mint {first} exceeds nine decimals"
+        );
+
+        let onchain = (onchain + first).unwrap();
+        let offchain = ((offchain - first).unwrap() + shares("100.0000000001")).unwrap();
+        let second = round(onchain, offchain);
+        assert!(
+            second.inner().gt(Float::zero().unwrap()).unwrap(),
+            "the new imbalance plus the leftover must mint again"
+        );
+        assert!(
+            nine_decimals(second),
+            "second mint {second} exceeds nine decimals"
+        );
+    }
+
+    #[test]
+    fn truncate_for_alpaca_truncates_excess_precision() {
+        let symbol = Symbol::new("TEST").unwrap();
+        let original = shares("1.12345678901234567890");
+        let truncated = truncate_for_alpaca(&symbol, original).unwrap();
+
+        assert!(truncated.inner().eq(float!(1.123456789)).unwrap());
+    }
+
+    #[test]
+    fn truncate_for_alpaca_preserves_value_within_limit() {
+        let symbol = Symbol::new("TEST").unwrap();
+        let original = shares("1.123");
+        let result = truncate_for_alpaca(&symbol, original).unwrap();
+
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn cap_shares_returns_input_when_no_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let amount = shares("123");
+        assert_eq!(cap_shares(&symbol, amount, None), amount);
+    }
+
+    #[test]
+    fn cap_shares_returns_input_when_below_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let amount = shares("10");
+        assert_eq!(cap_shares(&symbol, amount, Some(positive("50"))), amount);
+    }
+
+    #[test]
+    fn cap_shares_returns_input_when_equal_to_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let amount = shares("50");
+        assert_eq!(cap_shares(&symbol, amount, Some(positive("50"))), amount);
+    }
+
+    #[test]
+    fn cap_shares_returns_limit_when_above_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        assert_eq!(
+            cap_shares(&symbol, shares("100"), Some(positive("50"))),
+            shares("50")
+        );
     }
 
     fn arb_shares() -> impl Strategy<Value = FractionalShares> {
@@ -1004,6 +1451,31 @@ mod tests {
             .collect();
 
         (total, deviations)
+    }
+
+    /// The single-chain rule the planner replaced: the onchain share of the
+    /// total against `target +- band`, sized back to the target.
+    fn threshold_rule(
+        onchain: FractionalShares,
+        offchain: FractionalShares,
+        target_share: Float,
+        band_width: Float,
+    ) -> Option<(PlannedDirection, FractionalShares)> {
+        let total = (onchain + offchain).unwrap();
+        if total.is_zero().unwrap() {
+            return None;
+        }
+
+        let ratio = (onchain.inner() / total.inner()).unwrap();
+        let target = (total * target_share).unwrap();
+        if ratio.lt((target_share - band_width).unwrap()).unwrap() {
+            return Some((PlannedDirection::Mint, (target - onchain).unwrap()));
+        }
+        if ratio.gt((target_share + band_width).unwrap()).unwrap() {
+            return Some((PlannedDirection::Redemption, (onchain - target).unwrap()));
+        }
+
+        None
     }
 
     proptest! {
@@ -1110,12 +1582,7 @@ mod tests {
             target_share in arb_percent(100),
             band_width in arb_percent(30),
         ) {
-            let symbol = Symbol::new("AAPL").unwrap();
-            let threshold = ImbalanceThreshold { target: target_share, deviation: band_width };
-            let expected = InventoryView::default()
-                .with_equity(symbol.clone(), onchain, offchain)
-                .check_equity_imbalance(&symbol, Chain::Base, &threshold, &one_to_one())
-                .unwrap();
+            let expected = threshold_rule(onchain, offchain, target_share, band_width);
 
             let plan = plan_equity_operation(&EquityPlanInput {
                 last_price: Some(observed("1", now())),
@@ -1140,19 +1607,11 @@ mod tests {
                     matches!(plan, EquityPlan::Decline(_)),
                     "threshold rule is balanced but the planner chose {plan:?}"
                 ),
-                Some(Imbalance::TooMuchOffchain { excess }) => prop_assert_eq!(
+                Some((direction, excess)) => prop_assert_eq!(
                     plan,
                     EquityPlan::Operation(PlannedOperation {
                         chain: Chain::Base,
-                        direction: PlannedDirection::Mint,
-                        quantity: Positive::new(excess).unwrap(),
-                    })
-                ),
-                Some(Imbalance::TooMuchOnchain { excess }) => prop_assert_eq!(
-                    plan,
-                    EquityPlan::Operation(PlannedOperation {
-                        chain: Chain::Base,
-                        direction: PlannedDirection::Redemption,
+                        direction,
                         quantity: Positive::new(excess).unwrap(),
                     })
                 ),

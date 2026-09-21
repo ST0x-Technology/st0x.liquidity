@@ -200,14 +200,14 @@ mod tests {
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use uuid::Uuid;
 
-    use st0x_config::{ChainAssets, OperationMode, RebalancingCtx};
+    use st0x_config::{AllocationCtx, OperationMode, RebalancingCtx};
     use st0x_event_sorcery::test_store;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::test_chain::evm_mapping_slot;
-    use st0x_evm::{Evm, USDC_ETHEREUM};
+    use st0x_evm::{Chain, Evm, USDC_ETHEREUM};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
         AlpacaWalletService, Executor, Symbol, TimeInForce,
@@ -273,6 +273,7 @@ mod tests {
                 target: float!(0.5),
                 deviation: float!(0.2),
             })
+            .allocation(AllocationCtx::base_test())
             .usdc(ImbalanceThreshold {
                 target: float!(0.6),
                 deviation: float!(0.15),
@@ -349,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn trigger_config_uses_equity_from_ctx() {
+    fn trigger_config_uses_allocation_from_ctx() {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
@@ -357,14 +358,26 @@ mod tests {
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
-            equity: ctx.equity,
+            allocation: ctx.allocation.clone().unwrap(),
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
-            assets: ChainAssets::default(),
+            chains: BTreeMap::new(),
         };
 
-        assert!(trigger_config.equity.target.eq(float!(0.5)).unwrap());
-        assert!(trigger_config.equity.deviation.eq(float!(0.2)).unwrap());
+        assert!(
+            trigger_config.allocation.targets[&Chain::Base]
+                .inner()
+                .eq(float!(0.5))
+                .unwrap()
+        );
+        assert!(
+            trigger_config
+                .allocation
+                .deviation
+                .inner()
+                .eq(float!(0.2))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -376,10 +389,10 @@ mod tests {
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
-            equity: ctx.equity,
+            allocation: ctx.allocation.clone().unwrap(),
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
-            assets: ChainAssets::default(),
+            chains: BTreeMap::new(),
         };
 
         let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");

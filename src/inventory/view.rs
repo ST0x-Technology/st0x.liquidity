@@ -16,7 +16,6 @@ use st0x_evm::Chain;
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::{Usd, Usdc};
 use st0x_tokenization::IssuerRequestId;
-use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
 
 use super::divergence::{PersistentBrokerCashDivergence, PersistentBrokerDivergence};
 use super::snapshot::InventorySnapshotEvent;
@@ -49,15 +48,25 @@ pub(crate) struct HedgeOrderGateCorrection {
     pub(crate) durable_order_id: Option<OffchainOrderId>,
 }
 
-/// Why an equity imbalance check failed.
+/// Why a symbol's equity venues could not be read for planning.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum EquityImbalanceError {
+pub(crate) enum EquityVenuesError {
     #[error("symbol {0} not tracked in inventory")]
     SymbolNotTracked(Symbol),
     #[error("arithmetic error: {0}")]
     Float(#[from] FloatError),
-    #[error(transparent)]
-    Ratio(#[from] RatioError),
+}
+
+/// One symbol's balances at every polled venue, read together so the
+/// allocation planner sizes off a single snapshot of the view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EquityVenues {
+    /// The broker's shares; `None` until the broker venue has been polled.
+    pub(crate) offchain: Option<VenueBalance<FractionalShares>>,
+    /// One slot per polled chain, in wrapped shares.
+    pub(crate) onchain: BTreeMap<Chain, VenueBalance<FractionalShares>>,
+    /// Whether any venue still has a transfer in flight.
+    pub(crate) has_inflight: bool,
 }
 
 /// Imbalance requiring rebalancing action.
@@ -233,73 +242,6 @@ where
                 offchain: balance,
                 ..self
             },
-        }
-    }
-}
-
-impl<T> Inventory<T>
-where
-    T: Add<Output = Result<T, FloatError>>
-        + Sub<Output = Result<T, FloatError>>
-        + std::ops::Mul<Float, Output = Result<T, FloatError>>
-        + Copy
-        + HasZero
-        + Into<Float>
-        + std::fmt::Display
-        + std::fmt::Debug,
-{
-    /// Detects imbalance using a normalized onchain value.
-    ///
-    /// This is used when onchain balance is in wrapped tokens and needs to be
-    /// converted to unwrapped-equivalent before comparison with offchain balance.
-    ///
-    /// # Arguments
-    ///
-    /// * `threshold` - The imbalance threshold configuration
-    /// * `normalized_onchain` - The onchain balance converted to unwrapped-equivalent
-    ///
-    /// Returns `None` if balanced, has inflight operations, or total is zero.
-    fn detect_imbalance_normalized(
-        &self,
-        threshold: &ImbalanceThreshold,
-        normalized_onchain: T,
-    ) -> Result<Option<Imbalance<T>>, FloatError> {
-        if self.has_inflight()? {
-            return Ok(None);
-        }
-
-        let Some(offchain_venue) = self.offchain.as_ref() else {
-            return Ok(None);
-        };
-
-        let onchain_decimal: Float = normalized_onchain.into();
-        let offchain: Float = offchain_venue.total()?.into();
-        let total = (onchain_decimal + offchain)?;
-
-        if total.is_zero()? {
-            return Ok(None);
-        }
-
-        let ratio = (onchain_decimal / total)?;
-        let lower = (threshold.target - threshold.deviation)?;
-        let upper = (threshold.target + threshold.deviation)?;
-
-        if ratio.lt(lower)? {
-            let offchain_val = offchain_venue.total()?;
-            let total_val = (normalized_onchain + offchain_val)?;
-            let target = (total_val * threshold.target)?;
-            let excess = (target - normalized_onchain)?;
-
-            Ok(Some(Imbalance::TooMuchOffchain { excess }))
-        } else if ratio.gt(upper)? {
-            let offchain_val = offchain_venue.total()?;
-            let total_val = (normalized_onchain + offchain_val)?;
-            let target = (total_val * threshold.target)?;
-            let excess = (normalized_onchain - target)?;
-
-            Ok(Some(Imbalance::TooMuchOnchain { excess }))
-        } else {
-            Ok(None)
         }
     }
 }
@@ -873,14 +815,6 @@ pub(crate) fn alpaca_to_base_usdc_capacity(
 }
 
 impl InventoryView {
-    /// Checks a single equity for imbalance against the threshold.
-    ///
-    /// The onchain balance is converted from wrapped to unwrapped-equivalent using
-    /// the vault ratio before comparison with offchain balance. This ensures correct
-    /// imbalance detection when onchain tokens have accrued value through stock
-    /// splits or dividends.
-    ///
-    /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
     /// The primary chain: the one the bot rebalances automatically, and
     /// the one venue-addressed operations act on. Every hedged chain's
     /// vault inventory is polled.
@@ -888,26 +822,20 @@ impl InventoryView {
         self.primary_chain
     }
 
-    pub(crate) fn check_equity_imbalance(
-        &self,
-        symbol: &Symbol,
-        chain: Chain,
-        threshold: &ImbalanceThreshold,
-        vault_ratio: &UnderlyingPerWrapped,
-    ) -> Result<Option<Imbalance<FractionalShares>>, EquityImbalanceError> {
+    /// Every polled venue of `symbol`, for the allocation planner. Wallet
+    /// readings never enter it: they are a transfer-in-progress signal, not
+    /// inventory.
+    pub(crate) fn equity_venues(&self, symbol: &Symbol) -> Result<EquityVenues, EquityVenuesError> {
         let inventory = self
             .equities
             .get(symbol)
-            .ok_or_else(|| EquityImbalanceError::SymbolNotTracked(symbol.clone()))?;
+            .ok_or_else(|| EquityVenuesError::SymbolNotTracked(symbol.clone()))?;
 
-        let Some(onchain_venue) = inventory.onchain.get(&chain) else {
-            return Ok(None);
-        };
-
-        let onchain_wrapped = onchain_venue.total()?;
-        let onchain_equivalent = vault_ratio.to_underlying_fractional(onchain_wrapped)?;
-
-        Ok(inventory.detect_imbalance_normalized(threshold, onchain_equivalent)?)
+        Ok(EquityVenues {
+            offchain: inventory.offchain,
+            onchain: inventory.onchain.clone(),
+            has_inflight: inventory.has_inflight()?,
+        })
     }
 
     /// Checks USDC imbalance using gross offchain cash when available.
@@ -3577,7 +3505,6 @@ mod tests {
     use st0x_evm::Chain;
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
-    use st0x_wrapper::RATIO_ONE;
 
     use super::*;
     use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotCommand};
@@ -3589,10 +3516,6 @@ mod tests {
 
     fn test_order_id() -> OffchainOrderId {
         OffchainOrderId::from_uuid(Uuid::nil())
-    }
-
-    fn one_to_one_ratio() -> UnderlyingPerWrapped {
-        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
     }
 
     fn venue(available: i64, inflight: i64) -> VenueBalance<FractionalShares> {
@@ -3826,74 +3749,24 @@ mod tests {
         }
     }
 
+    /// The venues read carries one slot per polled chain and nothing for a
+    /// chain that was never polled (SPEC multi-chain: inventory is not
+    /// fungible across chains, so a slot is never borrowed).
     #[test]
-    fn check_equity_imbalance_returns_none_when_balanced() {
-        let aapl = Symbol::new("AAPL").unwrap();
-        let view = make_view(vec![(aapl.clone(), make_inventory(50, 0, 50, 0))]);
-        let thresh = threshold("0.5", "0.2");
-        let ratio = one_to_one_ratio();
-
-        assert!(
-            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn check_equity_imbalance_detects_too_much_onchain() {
+    fn equity_venues_reports_only_polled_chain_slots() {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(aapl.clone(), make_inventory(80, 0, 20, 0))]);
-        let thresh = threshold("0.5", "0.2");
-        let ratio = one_to_one_ratio();
 
-        let imbalance = view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio);
-
-        assert!(matches!(
-            imbalance,
-            Ok(Some(Imbalance::TooMuchOnchain { .. }))
-        ));
-    }
-
-    #[test]
-    fn check_equity_imbalance_detects_too_much_offchain() {
-        let aapl = Symbol::new("AAPL").unwrap();
-        let view = make_view(vec![(aapl.clone(), make_inventory(20, 0, 80, 0))]);
-        let thresh = threshold("0.5", "0.2");
-        let ratio = one_to_one_ratio();
-
-        let imbalance = view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio);
-
-        assert!(matches!(
-            imbalance,
-            Ok(Some(Imbalance::TooMuchOffchain { .. }))
-        ));
-    }
-
-    /// The imbalance evaluation reads only the requested chain's slot: a
-    /// balance on another chain must neither satisfy nor distort it
-    /// (SPEC multi-chain: inventory is not fungible across chains).
-    #[test]
-    fn check_equity_imbalance_reads_only_the_requested_chain() {
-        let aapl = Symbol::new("AAPL").unwrap();
-        // Base slot heavily onchain; evaluated against Ethereum, whose slot
-        // was never polled, the check must return None rather than borrow
-        // Base's balance.
-        let view = make_view(vec![(aapl.clone(), make_inventory(80, 0, 20, 0))]);
-        let thresh = threshold("0.5", "0.2");
-        let ratio = one_to_one_ratio();
+        let venues = view.equity_venues(&aapl).unwrap();
 
         assert_eq!(
-            view.check_equity_imbalance(&aapl, Chain::Ethereum, &thresh, &ratio)
-                .unwrap(),
-            None,
-            "an unpolled chain has no onchain slot to evaluate"
+            venues,
+            EquityVenues {
+                offchain: Some(venue(20, 0)),
+                onchain: BTreeMap::from([(Chain::Base, venue(80, 0))]),
+                has_inflight: false,
+            }
         );
-
-        assert!(matches!(
-            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio),
-            Ok(Some(Imbalance::TooMuchOnchain { .. }))
-        ));
     }
 
     /// A snapshot event from a second chain lands in its own slot and leaves
@@ -3940,142 +3813,30 @@ mod tests {
     }
 
     #[test]
-    fn check_equity_imbalance_errors_for_unknown_symbol() {
+    fn equity_venues_errors_for_unknown_symbol() {
         let aapl = Symbol::new("AAPL").unwrap();
         let msft = Symbol::new("MSFT").unwrap();
         let view = make_view(vec![(aapl, make_inventory(80, 0, 20, 0))]);
-        let thresh = threshold("0.5", "0.2");
-        let ratio = one_to_one_ratio();
 
-        let error = view
-            .check_equity_imbalance(&msft, Chain::Base, &thresh, &ratio)
-            .unwrap_err();
-        assert!(matches!(error, EquityImbalanceError::SymbolNotTracked(symbol) if symbol == msft));
+        let error = view.equity_venues(&msft).unwrap_err();
+
+        assert!(matches!(error, EquityVenuesError::SymbolNotTracked(symbol) if symbol == msft));
     }
 
+    /// A transfer in flight at any venue is reported so the planner declines
+    /// the symbol until it settles.
     #[test]
-    fn check_equity_imbalance_returns_none_when_inflight() {
+    fn equity_venues_reports_inflight_at_any_venue() {
         let aapl = Symbol::new("AAPL").unwrap();
-        let view = make_view(vec![(aapl.clone(), make_inventory(60, 20, 20, 0))]);
-        let thresh = threshold("0.5", "0.2");
-        let ratio = one_to_one_ratio();
 
-        assert!(
-            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio)
-                .unwrap()
-                .is_none()
-        );
-    }
+        let onchain_inflight = make_view(vec![(aapl.clone(), make_inventory(60, 20, 20, 0))]);
+        assert!(onchain_inflight.equity_venues(&aapl).unwrap().has_inflight);
 
-    #[test]
-    fn check_equity_imbalance_with_one_to_one_ratio_detects_imbalance() {
-        let aapl = Symbol::new("AAPL").unwrap();
-        let view = make_view(vec![(aapl.clone(), make_inventory(80, 0, 20, 0))]);
-        let thresh = threshold("0.5", "0.2");
-        let ratio = one_to_one_ratio();
+        let offchain_inflight = make_view(vec![(aapl.clone(), make_inventory(60, 0, 20, 5))]);
+        assert!(offchain_inflight.equity_venues(&aapl).unwrap().has_inflight);
 
-        let imbalance = view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio);
-
-        assert!(matches!(
-            imbalance,
-            Ok(Some(Imbalance::TooMuchOnchain { .. }))
-        ));
-    }
-
-    #[test]
-    fn check_equity_imbalance_with_1_05_ratio_converts_onchain() {
-        let aapl = Symbol::new("AAPL").unwrap();
-        // 50 wrapped onchain, 50 offchain
-        // With 1:1 ratio: 50/100 = 0.5 (balanced)
-        // With 1.05 ratio: 50 wrapped = 52.5 unwrapped-equivalent
-        // Total = 52.5 + 50 = 102.5
-        // Ratio = 52.5 / 102.5 = 0.512 (still within 50% +/- 20% threshold)
-        let view = make_view(vec![(aapl.clone(), make_inventory(50, 0, 50, 0))]);
-        let thresh = threshold("0.5", "0.2");
-
-        // 1:1 ratio - balanced
-        let one_to_one = one_to_one_ratio();
-        assert!(
-            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &one_to_one)
-                .unwrap()
-                .is_none()
-        );
-
-        // 1.05 ratio - still balanced (small appreciation doesn't change outcome)
-        let ratio_1_05 =
-            UnderlyingPerWrapped::new(U256::from(1_050_000_000_000_000_000u64)).unwrap();
-        assert!(
-            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio_1_05)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn check_equity_imbalance_with_high_ratio_changes_detection() {
-        let aapl = Symbol::new("AAPL").unwrap();
-        // 65 wrapped onchain, 35 offchain
-        // With 1:1 ratio: 65/100 = 0.65 (within 50% +/- 20% = 30%-70%)
-        // With 1.5 ratio: 65 wrapped = 97.5 unwrapped-equivalent
-        // Total = 97.5 + 35 = 132.5
-        // Ratio = 97.5 / 132.5 = 0.736 (above 70% upper threshold!)
-        let view = make_view(vec![(aapl.clone(), make_inventory(65, 0, 35, 0))]);
-        let thresh = threshold("0.5", "0.2");
-
-        // 1:1 ratio - balanced (65% within threshold)
-        let one_to_one = one_to_one_ratio();
-        assert!(
-            view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &one_to_one)
-                .unwrap()
-                .is_none()
-        );
-
-        // 1.5 ratio - triggers imbalance (73.6% exceeds 70% upper bound)
-        let ratio_1_5 =
-            UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
-        let imbalance = view.check_equity_imbalance(&aapl, Chain::Base, &thresh, &ratio_1_5);
-        assert!(
-            matches!(imbalance, Ok(Some(Imbalance::TooMuchOnchain { .. }))),
-            "Expected TooMuchOnchain, got: {imbalance:?}"
-        );
-    }
-
-    #[test]
-    fn detect_imbalance_normalized_returns_none_when_balanced() {
-        let inventory = make_inventory(50, 0, 50, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        // Normalized onchain = 50 (same as raw)
-        let normalized = shares(50);
-        let result = inventory.detect_imbalance_normalized(&thresh, normalized);
-
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn detect_imbalance_normalized_detects_too_much_onchain() {
-        let inventory = make_inventory(50, 0, 50, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        // Normalized onchain = 100 (double the raw wrapped amount)
-        // Total = 100 + 50 = 150, ratio = 100/150 ~= 0.67 (within threshold)
-        // But if normalized = 120, ratio = 120/170 ~= 0.71 (above 70%)
-        let normalized = shares(120);
-        let result = inventory.detect_imbalance_normalized(&thresh, normalized);
-
-        assert!(matches!(result, Ok(Some(Imbalance::TooMuchOnchain { .. }))));
-    }
-
-    #[test]
-    fn detect_imbalance_normalized_returns_none_when_inflight() {
-        let inventory = make_inventory(50, 10, 50, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        let normalized = shares(120);
-        let result = inventory.detect_imbalance_normalized(&thresh, normalized);
-
-        // Even with high normalized value, inflight blocks detection
-        assert!(result.unwrap().is_none());
+        let settled = make_view(vec![(aapl.clone(), make_inventory(60, 0, 20, 0))]);
+        assert!(!settled.equity_venues(&aapl).unwrap().has_inflight);
     }
 
     /// Wallet-read events must populate `inflight_cash` rather than the
@@ -4537,31 +4298,24 @@ mod tests {
         );
     }
 
-    /// Wallet equity balances must NOT enter the imbalance math --
-    /// `check_equity_imbalance` operates on venue totals only, so wallet
-    /// readings can never mask or compensate a real venue imbalance.
+    /// Wallet equity balances must NOT enter the planner's venues --
+    /// `equity_venues` reports venue totals only, so wallet readings can
+    /// never mask or compensate a real venue imbalance.
     #[test]
-    fn wallet_equity_balances_do_not_enter_imbalance_math() {
+    fn wallet_equity_balances_do_not_enter_the_planned_venues() {
         let symbol_aapl = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
         let baseline =
             InventoryView::default().with_equity(symbol_aapl.clone(), shares(90), shares(10));
-
-        let imbalance_without_wallet = baseline
-            .check_equity_imbalance(
-                &symbol_aapl,
-                Chain::Base,
-                &threshold("0.5", "0.3"),
-                &one_to_one_ratio(),
-            )
-            .unwrap();
-        assert!(
-            matches!(
-                imbalance_without_wallet,
-                Some(Imbalance::TooMuchOnchain { .. })
-            ),
-            "venue imbalance is detected without wallet noise, got {imbalance_without_wallet:?}",
+        let venues_without_wallet = baseline.equity_venues(&symbol_aapl).unwrap();
+        assert_eq!(
+            venues_without_wallet,
+            EquityVenues {
+                offchain: Some(venue(10, 0)),
+                onchain: BTreeMap::from([(Chain::Base, venue(90, 0))]),
+                has_inflight: false,
+            }
         );
 
         let mut wallet_balances = BTreeMap::new();
@@ -4577,17 +4331,10 @@ mod tests {
             )
             .unwrap();
 
-        let imbalance_with_wallet = with_huge_wallet
-            .check_equity_imbalance(
-                &symbol_aapl,
-                Chain::Base,
-                &threshold("0.5", "0.3"),
-                &one_to_one_ratio(),
-            )
-            .unwrap();
         assert_eq!(
-            imbalance_without_wallet, imbalance_with_wallet,
-            "wallet equity readings must not alter the imbalance answer",
+            with_huge_wallet.equity_venues(&symbol_aapl).unwrap(),
+            venues_without_wallet,
+            "wallet equity readings must not alter the planned venues",
         );
     }
 
