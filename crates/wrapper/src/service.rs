@@ -809,7 +809,10 @@ mod tests {
             _calldata: Bytes,
             _note: &str,
         ) -> Result<PreparedTransaction, EvmError> {
-            Ok(PreparedTransaction::from_raw(0, Bytes::new()))
+            Ok(PreparedTransaction::for_test(
+                alloy::primitives::TxHash::ZERO,
+                0,
+            ))
         }
 
         async fn broadcast_prepared(

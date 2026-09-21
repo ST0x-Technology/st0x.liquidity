@@ -2625,7 +2625,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let prepared = PreparedTransaction::from_raw(nonce, raw);
+        let prepared = PreparedTransaction::from_raw(raw).unwrap();
         let snapshot_id = provider.anvil_snapshot().await.unwrap();
         let server = MockServer::start();
         let wallet = TurnkeyWallet::from_client(

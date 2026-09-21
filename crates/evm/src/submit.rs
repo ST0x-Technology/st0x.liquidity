@@ -339,9 +339,8 @@ where
             return Err(error);
         }
     };
-    let raw = Bytes::from(envelope.encoded_2718());
     debug_assert_eq!(envelope.nonce(), nonce);
-    Ok(PreparedTransaction::from_raw(nonce, raw))
+    Ok(PreparedTransaction::from_envelope(&envelope))
 }
 
 async fn prepared_transaction_visible<P>(provider: &P, tx_hash: TxHash) -> bool

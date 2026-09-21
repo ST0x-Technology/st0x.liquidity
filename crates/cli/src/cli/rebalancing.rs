@@ -2087,7 +2087,7 @@ pub(crate) async fn resume_interrupted_transfers_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, Bytes, address, b256};
+    use alloy::primitives::{Address, B256, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
     use std::collections::BTreeMap;
@@ -3853,7 +3853,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
                     from_block: 0,
-                    prepared: PreparedTransaction::from_raw(0, Bytes::new()),
+                    prepared: PreparedTransaction::for_test(alloy::primitives::TxHash::ZERO, 0),
                 },
             )
             .await
@@ -5378,7 +5378,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount,
                     from_block: 0,
-                    prepared: PreparedTransaction::from_raw(0, Bytes::new()),
+                    prepared: PreparedTransaction::for_test(alloy::primitives::TxHash::ZERO, 0),
                 },
             )
             .await

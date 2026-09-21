@@ -16,14 +16,15 @@
 //! `Wallet::submit` (write transactions), so consumers get
 //! human-readable revert reasons without manual wiring.
 
-use alloy::consensus::Transaction;
+use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::eips::BlockId;
+use alloy::eips::eip2718::{Decodable2718, Eip2718Error, Encodable2718};
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -611,22 +612,41 @@ pub trait Evm: Send + Sync + 'static {
 /// Persisting this value closes the crash window between an irreversible
 /// submission and recording its hash: recovery rebroadcasts these exact bytes,
 /// so every attempt has the same nonce, signature, and transaction hash.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PreparedTransaction {
     tx_hash: TxHash,
     nonce: u64,
     raw: Bytes,
 }
+
+#[derive(Deserialize)]
+struct PersistedPreparedTransaction {
+    tx_hash: TxHash,
+    nonce: u64,
+    raw: Bytes,
+}
+
 impl PreparedTransaction {
-    /// Builds a prepared transaction from a signed EIP-2718 envelope.
+    /// Builds a prepared transaction from exact signed EIP-2718 bytes.
     ///
-    /// The hash is derived locally so persisted identity cannot disagree with
-    /// the bytes later broadcast.
-    pub fn from_raw(nonce: u64, raw: Bytes) -> Self {
-        let tx_hash = alloy::primitives::keccak256(&raw);
+    /// Both identity fields are derived from the decoded envelope. Malformed
+    /// bytes, including trailing data, are rejected.
+    pub fn from_raw(raw: Bytes) -> Result<Self, Eip2718Error> {
+        let envelope = TxEnvelope::decode_2718_exact(raw.as_ref())?;
+        Ok(Self {
+            tx_hash: alloy::primitives::keccak256(&raw),
+            nonce: envelope.nonce(),
+            raw,
+        })
+    }
+
+    /// Builds a prepared transaction from an envelope already decoded by the
+    /// signing path, avoiding a redundant decode.
+    pub(crate) fn from_envelope(envelope: &TxEnvelope) -> Self {
+        let raw = Bytes::from(envelope.encoded_2718());
         Self {
-            tx_hash,
-            nonce,
+            tx_hash: alloy::primitives::keccak256(&raw),
+            nonce: envelope.nonce(),
             raw,
         }
     }
@@ -652,6 +672,45 @@ impl PreparedTransaction {
 
     pub fn raw(&self) -> &Bytes {
         &self.raw
+    }
+}
+
+impl<'de> Deserialize<'de> for PreparedTransaction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = PersistedPreparedTransaction::deserialize(deserializer)?;
+
+        // Test doubles deliberately have no signed envelope. This escape hatch
+        // is unavailable in production builds and accepts only the exact empty
+        // representation created by `for_test`.
+        #[cfg(any(test, feature = "test-support"))]
+        if persisted.raw.is_empty() {
+            return Ok(Self {
+                tx_hash: persisted.tx_hash,
+                nonce: persisted.nonce,
+                raw: persisted.raw,
+            });
+        }
+
+        let prepared = Self::from_raw(persisted.raw).map_err(|error| {
+            serde::de::Error::custom(format!("invalid signed transaction: {error}"))
+        })?;
+        if persisted.tx_hash != prepared.tx_hash {
+            return Err(serde::de::Error::custom(format!(
+                "prepared transaction hash mismatch: persisted {}, signed bytes {}",
+                persisted.tx_hash, prepared.tx_hash
+            )));
+        }
+        if persisted.nonce != prepared.nonce {
+            return Err(serde::de::Error::custom(format!(
+                "prepared transaction nonce mismatch: persisted {}, signed bytes {}",
+                persisted.nonce, prepared.nonce
+            )));
+        }
+
+        Ok(prepared)
     }
 }
 
@@ -1468,11 +1527,14 @@ where
 mod tests {
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
+    use alloy::consensus::{SignableTransaction, TxEip1559};
+    use alloy::eips::eip2718::Encodable2718;
+    use alloy::eips::eip2930::AccessList;
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::primitives::Bloom;
-    use alloy::primitives::{Address, U256};
+    use alloy::primitives::{Address, TxKind, U256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -1482,6 +1544,62 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    const PREPARED_NONCE: u64 = 7;
+
+    fn signed_transaction_bytes() -> Bytes {
+        let transaction = TxEip1559 {
+            chain_id: 1,
+            nonce: PREPARED_NONCE,
+            gas_limit: 21_000,
+            max_fee_per_gas: 30_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        };
+        let signature = Signature::new(U256::from(1), U256::from(2), false);
+        let envelope = TxEnvelope::from(transaction.into_signed(signature));
+        Bytes::from(envelope.encoded_2718())
+    }
+
+    #[test]
+    fn prepared_transaction_derives_identity_from_signed_bytes() {
+        let raw = signed_transaction_bytes();
+        let prepared = PreparedTransaction::from_raw(raw.clone()).unwrap();
+
+        assert_eq!(prepared.nonce(), PREPARED_NONCE);
+        assert_eq!(prepared.tx_hash(), alloy::primitives::keccak256(&raw));
+        assert_eq!(prepared.raw(), &raw);
+    }
+
+    #[test]
+    fn prepared_transaction_rejects_inconsistent_persisted_identity() {
+        let prepared = PreparedTransaction::from_raw(signed_transaction_bytes()).unwrap();
+
+        let mut wrong_nonce = serde_json::to_value(&prepared).unwrap();
+        wrong_nonce["nonce"] = serde_json::json!(PREPARED_NONCE + 1);
+        let nonce_error = serde_json::from_value::<PreparedTransaction>(wrong_nonce).unwrap_err();
+        assert!(nonce_error.to_string().contains("nonce mismatch"));
+
+        let mut wrong_hash = serde_json::to_value(&prepared).unwrap();
+        wrong_hash["tx_hash"] = serde_json::to_value(TxHash::repeat_byte(0xa5)).unwrap();
+        let hash_error = serde_json::from_value::<PreparedTransaction>(wrong_hash).unwrap_err();
+        assert!(hash_error.to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn prepared_transaction_rejects_malformed_signed_bytes() {
+        let malformed = PreparedTransaction {
+            tx_hash: TxHash::repeat_byte(0xb6),
+            nonce: PREPARED_NONCE,
+            raw: Bytes::from_static(&[0xff]),
+        };
+        let persisted = serde_json::to_value(malformed).unwrap();
+
+        let error = serde_json::from_value::<PreparedTransaction>(persisted).unwrap_err();
+        assert!(error.to_string().contains("invalid signed transaction"));
+    }
 
     /// Build a mock provider whose `eth_blockNumber` returns the given sequence
     /// of block numbers in order, one per call.
