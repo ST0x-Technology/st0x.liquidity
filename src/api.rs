@@ -87,7 +87,9 @@ use crate::usdc_rebalance::{
     PreBurnFailEligibility, RebalanceDirection, ReconcileReason, UsdcRebalance,
     UsdcRebalanceCommand, UsdcRebalanceId,
 };
-use crate::view_rebuild::{RebuildScope, RebuildableView, rebuild_view};
+use crate::view_rebuild::{
+    RebuildScope, RebuildableView, execute_rebuild_view, parse_rebuild_scope,
+};
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
@@ -2563,9 +2565,9 @@ struct RebuildViewResponse {
 
 /// Rebuilds a materialized view or read model by deleting its rows and
 /// replaying the event log, the escape hatch for a corrupted view. Available
-/// only after startup completes. The projection-maintenance guard first drains
-/// live apalis jobs, inventory polling, and direct HTTP writers, then excludes
-/// new writers through the full delete/replay window.
+/// only after startup completes. The request is fully validated before the
+/// projection-maintenance guard drains live apalis jobs, inventory polling, and
+/// direct HTTP writers, then excludes new writers through delete and replay.
 ///
 /// Mirrors `stox view rebuild`; the `{view}` segment is the CLI's
 /// `--aggregate` value (`position`, `offchain-order`, `vault-registry`,
@@ -2597,6 +2599,14 @@ async fn rebuild_materialized_view(
             ));
         }
     };
+    let scope = parse_rebuild_scope(view, scope).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+    })?;
     if !state.health.is_ready() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2620,20 +2630,9 @@ async fn rebuild_materialized_view(
             )
         })?;
 
-    let rebuilt = rebuild_view(&state.pool, view, scope)
+    let rebuilt = execute_rebuild_view(&state.pool, scope)
         .await
-        .map_err(|error| {
-            if error.is_caller_error() {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: error.to_string(),
-                    }),
-                )
-            } else {
-                ops_store_error(error)
-            }
-        })?;
+        .map_err(ops_store_error)?;
 
     let id = match rebuilt.scope {
         RebuildScope::Id(id) => Some(id),
@@ -8447,26 +8446,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_view_refuses_a_single_id_for_a_read_model() {
+    async fn rebuild_view_refuses_a_single_read_model_id_before_pausing_writers() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
         state.health.set_ready();
+        let projection_write = state.projection_maintenance.enter().await;
 
-        let resp = rebuild_materialized_view(
-            State(state.clone()),
-            Path("equity-timing".to_string()),
-            Json(RebuildViewRequest {
-                id: Some("x".to_string()),
-                all: false,
-            }),
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            rebuild_materialized_view(
+                State(state.clone()),
+                Path("equity-timing".to_string()),
+                Json(RebuildViewRequest {
+                    id: Some("x".to_string()),
+                    all: false,
+                }),
+            ),
         )
-        .await;
+        .await
+        .expect("an unsupported single-id scope must be rejected before pausing writers");
+        drop(projection_write);
 
-        let Err((status, Json(error))) = resp else {
+        let Err((status, Json(error))) = response else {
             panic!("a read model must refuse a single id");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(error.error.contains("whole read model"), "{}", error.error);
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_refuses_a_malformed_id_before_pausing_writers() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        let projection_write = state.projection_maintenance.enter().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            rebuild_materialized_view(
+                State(state.clone()),
+                Path("position".to_string()),
+                Json(RebuildViewRequest {
+                    id: Some(String::new()),
+                    all: false,
+                }),
+            ),
+        )
+        .await
+        .expect("a malformed id must be rejected before pausing writers");
+        drop(projection_write);
+
+        let Err((status, Json(error))) = response else {
+            panic!("a malformed position id must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error.error.contains("invalid position id"),
+            "{}",
+            error.error
+        );
     }
 
     #[tokio::test]
