@@ -157,11 +157,14 @@ impl RaindexError {
     }
 
     /// `true` when reconciliation may succeed after the transaction or RPC
-    /// backend becomes visible. These errors require durable redrive rather than
-    /// a finite worker retry budget.
+    /// backend becomes visible. These errors require durable redrive rather
+    /// than a finite worker retry budget. Formal JSON-RPC error responses are
+    /// terminal: the node processed and rejected the request, so repeating it
+    /// indefinitely cannot improve visibility.
     pub fn is_reconciliation_pending(&self) -> bool {
         match self {
-            Self::ScanInconclusive { .. } | Self::RpcTransport(_) => true,
+            Self::ScanInconclusive { .. } => true,
+            Self::RpcTransport(error) => error.as_error_resp().is_none(),
             Self::Evm(error) => error.is_confirmation_pending(),
             _ => false,
         }
@@ -265,4 +268,37 @@ pub trait Raindex: Send + Sync {
     /// Wait for a previously submitted transaction to be confirmed and return the receipt.
     async fn confirm_tx_receipt(&self, tx_hash: TxHash)
     -> Result<TransactionReceipt, RaindexError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::rpc::json_rpc::ErrorPayload;
+
+    use super::*;
+
+    #[test]
+    fn formal_rpc_rejection_is_not_reconciliation_pending() {
+        let error = RaindexError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
+            code: -32602,
+            message: "invalid params".into(),
+            data: None,
+        }));
+
+        assert!(
+            !error.is_reconciliation_pending(),
+            "a node that processed and rejected the request will not become \
+             successful through uncapped reconciliation redrive"
+        );
+    }
+
+    #[test]
+    fn transient_rpc_transport_failure_remains_reconciliation_pending() {
+        let error = RaindexError::RpcTransport(TransportErrorKind::backend_gone());
+
+        assert!(
+            error.is_reconciliation_pending(),
+            "a transport failure provides no formal rejection and may recover \
+             when another backend becomes visible"
+        );
+    }
 }
