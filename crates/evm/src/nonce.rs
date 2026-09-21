@@ -222,7 +222,6 @@ mod tests {
     use crate::inflight_nonces::InFlightNonces;
 
     #[tokio::test]
-
     async fn increments_locally_after_first_fetch() {
         let manager = ResettableNonceManager::default();
         let provider = ProviderBuilder::new().connect_anvil();
