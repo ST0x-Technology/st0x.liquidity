@@ -605,6 +605,8 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
             let aggregate_id = RedemptionAggregateId::generate();
+            writeln!(stdout, "Equity redemption aggregate_id: {aggregate_id}")?;
+            stdout.flush()?;
             Box::pin(run_operator_equity_transfer(
                 &cli_services,
                 &symbol,

@@ -196,10 +196,18 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
         {
             let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
             let mut retry = self.clone();
-            retry.position_reservation_retry_attempts =
-                self.position_reservation_retry_attempts.saturating_add(1);
+            let retry_attempts = self.position_reservation_retry_attempts.saturating_add(1);
+            retry.position_reservation_retry_attempts = retry_attempts;
             let mut job_queue = ctx.job_queue.clone();
             job_queue.push_with_delay(retry, retry_delay).await?;
+            warn!(
+                target: "tokenization",
+                %symbol,
+                resume_target = %self.target,
+                position_reservation_retry_attempts = retry_attempts,
+                retry_delay_secs = retry_delay.as_secs(),
+                "Hedge admission deferred tokenization reservation restoration; rescheduling"
+            );
             return Ok(());
         }
 

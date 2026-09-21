@@ -81,7 +81,7 @@ pub(crate) enum GuardState {
 /// a monotonic per-process counter. Zero is reserved for persisted job payloads
 /// created before generations were introduced; only a restored legacy owner
 /// uses it. Startup reserves persisted counters before allocating new claims.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct GuardGeneration(u64);
 
@@ -92,6 +92,16 @@ impl GuardGeneration {
 
     pub(crate) const fn is_legacy(self) -> bool {
         self.0 == 0
+    }
+
+    pub(crate) const fn boot_nonce(self) -> u32 {
+        let bytes = self.0.to_be_bytes();
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    pub(crate) const fn counter(self) -> u32 {
+        let bytes = self.0.to_be_bytes();
+        u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
     }
 }
 

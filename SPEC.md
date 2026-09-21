@@ -2829,9 +2829,11 @@ enum TriggerReason {
   retry.
 - Cannot have multiple pending executions for same symbol
 - Equity transfer admission is serialized on this aggregate. A reservation is
-  accepted only when no offchain order is pending, no transfer reservation
-  exists, and the current net position is below the hedge threshold. A nonzero
-  position whose dollar threshold cannot be valued is rejected fail-closed.
+  accepted only when no offchain order is pending, no failed-order idempotency
+  anchor (`last_failed_offchain_order_id`) still owns the symbol, no transfer
+  reservation exists, and the current net position is below the hedge threshold.
+  A nonzero position whose dollar threshold cannot be valued is rejected
+  fail-closed.
 - `PlaceOffChainOrder` is rejected while any transfer reservation owns the
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job

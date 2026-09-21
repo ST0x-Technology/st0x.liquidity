@@ -3799,7 +3799,20 @@ fn insert_transfer_owner(
             Ok(())
         }
         Entry::Occupied(mut entry) if entry.get().target == owner.target => {
-            if owner.generation > entry.get().generation {
+            let current_generation = entry.get().generation;
+            if current_generation.boot_nonce() != owner.generation.boot_nonce() {
+                return Err(anyhow::anyhow!(
+                    "multiple live equity transfer rows own symbol {symbol} for the same target \
+                     {:?} but have different guard boot generations: {} generation {:?} and {} \
+                     generation {:?}",
+                    owner.target,
+                    entry.get().job_type,
+                    current_generation,
+                    owner.job_type,
+                    owner.generation
+                ));
+            }
+            if owner.generation.counter() > current_generation.counter() {
                 entry.insert(owner);
             }
             Ok(())
@@ -8228,6 +8241,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn duplicate_transfer_owner_from_different_boots_is_rejected() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let target = ResumeTokenizationTarget::Mint(issuer_request_id("cross-boot-duplicate"));
+        let first_generation = GuardGeneration::from_parts(NonZeroU32::new(11).unwrap(), 2);
+        let second_generation = GuardGeneration::from_parts(NonZeroU32::new(12).unwrap(), 1);
+        let mut owners = HashMap::new();
+
+        insert_transfer_owner(
+            &mut owners,
+            &symbol,
+            TransferGuardOwner {
+                generation: first_generation,
+                job_type: "first",
+                target: target.clone(),
+            },
+        )
+        .unwrap();
+        let error = insert_transfer_owner(
+            &mut owners,
+            &symbol,
+            TransferGuardOwner {
+                generation: second_generation,
+                job_type: "second",
+                target,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("different guard boot generations")
+        );
+        assert_eq!(
+            owners.get(&symbol).map(|owner| owner.generation),
+            Some(first_generation),
+            "rejecting a cross-boot duplicate must preserve the existing owner"
+        );
+    }
     #[tokio::test]
     async fn delayed_redrive_rows_for_same_transfer_restore_one_owner() {
         let InterruptedAggregateFixture {
