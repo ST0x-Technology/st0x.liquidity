@@ -1,10 +1,10 @@
-//! Projection-maintenance pause for projection writes issued through the generic
-//! apalis worker path.
+//! Projection-maintenance pause for runtime work that can write projections.
 //!
 //! Event-sorcery folds projections synchronously inside `Store::send`.
-//! [`work`](super::job::work) calls [`enter_projection_gate`] and holds the
-//! returned slot for the whole job, so pausing the gate serializes a rebuild
-//! against projection writes emitted by those workers.
+//! [`work`](super::job::work), the supervised inventory monitor, and detached
+//! burn submission each call [`enter_projection_gate`] and hold the returned
+//! slot for their full write-capable operation. Pausing the gate therefore
+//! serializes a rebuild against projection writes emitted by those paths.
 //!
 //! Operator HTTP write routes are not currently covered. Routes that call
 //! `Store::send` directly do not enter this gate and remain ungated. Publishing
@@ -12,25 +12,25 @@
 //! not gate those direct-send paths.
 //!
 //! This is a thin wrapper over the shared [`Quiesce`](crate::quiesce) primitive.
-//! The worker gate is process-global: `work` is built through the worker macros
-//! with no seam to thread per-worker data, and there is exactly one conductor
-//! per process.
+//! The gate is process-global because `work` is built through worker macros with
+//! no seam to inject per-worker data. Every gated runtime writer shares that
+//! gate, and there is exactly one conductor per process.
 
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::quiesce::{self, NotQuiesced, Quiesce, QuiesceGate, QuiesceGuard};
 
-/// How long a rebuild waits for in-flight worker projection writes to drain
-/// before refusing. Coarse: a write is gated for the whole apalis job that
-/// emits it, so a long-running job holds the gate for its duration. A rebuild
-/// is a rare operator action taken at a quiet moment, so refusing while a long
-/// job runs and asking the operator to retry is acceptable.
+/// How long a rebuild waits for gated projection writers to drain before
+/// refusing. Coarse: a slot is held for the whole write-capable operation, so
+/// long-running work holds the gate for its duration. A rebuild is a rare
+/// operator action taken at a quiet moment, so refusing while work runs and
+/// asking the operator to retry is acceptable.
 const PROJECTION_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Process-global worker gate, read by the generic apalis handler
-/// [`work`](super::job::work). Set once at conductor startup, before any worker
-/// is built, by [`init_projection_maintenance`].
+/// Process-global projection-write gate, read by workers and supervised runtime
+/// tasks. Set once at conductor startup, before any of them are spawned, by
+/// [`init_projection_maintenance`].
 static PROJECTION_GATE: OnceLock<QuiesceGate> = OnceLock::new();
 
 /// Projection writers did not quiesce within [`PROJECTION_QUIESCE_TIMEOUT`], so
@@ -39,9 +39,9 @@ static PROJECTION_GATE: OnceLock<QuiesceGate> = OnceLock::new();
 #[error("projection writers did not quiesce: a job or write is in flight")]
 pub(crate) struct ProjectionBusy;
 
-/// Controller side, held by the rebuild route. Pausing quiesces the gated
-/// worker projection writes for the guard's lifetime; direct-send routes remain
-/// outside this gate.
+/// Controller side, held by the rebuild route. Pausing quiesces gated runtime
+/// projection writes for the guard's lifetime; direct-send routes remain outside
+/// this gate.
 pub(crate) struct ProjectionMaintenance(Quiesce);
 
 impl ProjectionMaintenance {
@@ -50,8 +50,7 @@ impl ProjectionMaintenance {
     /// caller cannot forget to resume on an error or panic path. Returns
     /// [`ProjectionBusy`] when writers are still in flight after
     /// [`PROJECTION_QUIESCE_TIMEOUT`], leaving them running.
-    // Consumed by the `rebuild_materialized_view` route in
-    // `rai-2248-view-cctp-recovery`, restacked on top of this branch (RAI-2436);
+    // Consumed by the materialized-view rebuild route on the dependent branch;
     // remove this allow when that route lands the `pause()` call site.
     #[allow(dead_code)]
     pub(crate) async fn pause(&self) -> Result<ProjectionMaintenanceGuard, ProjectionBusy> {
@@ -69,14 +68,14 @@ pub(crate) struct ProjectionMaintenanceGuard {
     _inner: QuiesceGuard,
 }
 
-/// Builds the projection-maintenance controller and publishes its worker gate to
-/// the process global that [`work`](super::job::work) reads. Called once at
-/// conductor startup. The returned controller lets the rebuild route pause the
-/// generic worker writers; publishing it does not gate direct-send HTTP routes.
+/// Builds the projection-maintenance controller and publishes its gate to the
+/// process global that runtime projection writers read. Called once at conductor
+/// startup, before those writers are spawned. The returned controller lets the
+/// rebuild route pause gated runtime writers; publishing it does not gate
+/// direct-send HTTP routes.
 ///
-/// A second call (a second conductor in one test process) keeps the first gate;
-/// harmless because the production `work` is the sole global reader and there is
-/// one conductor per process.
+/// Production starts one conductor per process. A second call keeps the first
+/// process-global gate and is unsupported outside isolated test setup.
 pub(crate) fn init_projection_maintenance() -> ProjectionMaintenance {
     let (control, gate) = quiesce::quiesce(PROJECTION_QUIESCE_TIMEOUT);
     let _ = PROJECTION_GATE.set(gate);
@@ -108,7 +107,7 @@ pub(crate) async fn enter_projection_gate() -> Option<quiesce::InFlight> {
 impl ProjectionMaintenance {
     /// A controller wired to a fresh, non-global gate, so a test drives the pause
     /// against its own writers without touching the process-global
-    /// [`PROJECTION_GATE`] that `work` reads.
+    /// [`PROJECTION_GATE`] that runtime writers read.
     fn with_gate_for_test() -> (Self, QuiesceGate) {
         let (control, gate) = quiesce::quiesce(PROJECTION_QUIESCE_TIMEOUT);
         (Self(control), gate)
