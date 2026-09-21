@@ -1872,7 +1872,7 @@ mod tests {
             .unwrap()
         };
 
-        assert!(matches!(trading("").min_operation_usd, None));
+        assert!(trading("").min_operation_usd.is_none());
 
         let config = trading("min_operation_usd = 250");
         assert!(

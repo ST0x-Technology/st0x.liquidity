@@ -1026,7 +1026,7 @@ mod tests {
             .unwrap()
         };
 
-        assert!(matches!(equity("").target_share, None));
+        assert!(equity("").target_share.is_none());
         assert!(
             equity("target_share = \"0.4\"")
                 .target_share

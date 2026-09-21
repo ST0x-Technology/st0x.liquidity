@@ -235,13 +235,13 @@ mod tests {
 
     fn allocation(targets: &str, alpaca_floor: &str) -> AllocationConfig {
         toml::from_str(&format!(
-            r#"
+            r"
             targets = {targets}
             alpaca_floor = {alpaca_floor}
             deviation = 0.05
             min_operation_usd = 100
             cooldown_secs = 600
-            "#
+            "
         ))
         .unwrap()
     }
@@ -296,7 +296,7 @@ mod tests {
             (Chain::Ethereum, transport()),
         ]);
 
-        allocation(r#"{ base = 0.6 }"#, "0.4")
+        allocation(r"{ base = 0.6 }", "0.4")
             .validate(&chains)
             .unwrap();
     }
@@ -311,7 +311,7 @@ mod tests {
             ),
         ]);
 
-        let error = allocation(r#"{ base = 0.5, hyperevm = 0.4 }"#, "0.2")
+        let error = allocation(r"{ base = 0.5, hyperevm = 0.4 }", "0.2")
             .validate(&chains)
             .unwrap_err();
 
@@ -328,9 +328,9 @@ mod tests {
     fn per_asset_target_share_replaces_the_chain_target_in_the_sum() {
         let over = BTreeMap::from([(
             Chain::Base,
-            hedged(ChainLifecycle::Active, "enabled", r#"target_share = 0.9"#),
+            hedged(ChainLifecycle::Active, "enabled", r"target_share = 0.9"),
         )]);
-        let error = allocation(r#"{ base = 0.5 }"#, "0.2")
+        let error = allocation(r"{ base = 0.5 }", "0.2")
             .validate(&over)
             .unwrap_err();
         assert!(
@@ -340,9 +340,9 @@ mod tests {
 
         let under = BTreeMap::from([(
             Chain::Base,
-            hedged(ChainLifecycle::Active, "enabled", r#"target_share = 0.7"#),
+            hedged(ChainLifecycle::Active, "enabled", r"target_share = 0.7"),
         )]);
-        allocation(r#"{ base = 0.9 }"#, "0.2")
+        allocation(r"{ base = 0.9 }", "0.2")
             .validate(&under)
             .unwrap();
     }
@@ -354,7 +354,7 @@ mod tests {
             (Chain::Ethereum, transport()),
         ]);
 
-        let error = allocation(r#"{ base = 0.5, ethereum = 0.1 }"#, "0.1")
+        let error = allocation(r"{ base = 0.5, ethereum = 0.1 }", "0.1")
             .validate(&chains)
             .unwrap_err();
 
@@ -379,7 +379,7 @@ mod tests {
             ),
         ]);
 
-        let error = allocation(r#"{ base = 0.5, hyperevm = 0.1 }"#, "0.1")
+        let error = allocation(r"{ base = 0.5, hyperevm = 0.1 }", "0.1")
             .validate(&chains)
             .unwrap_err();
 
@@ -404,7 +404,7 @@ mod tests {
             ),
         ]);
 
-        let error = allocation(r#"{ base = 0.5 }"#, "0.1")
+        let error = allocation(r"{ base = 0.5 }", "0.1")
             .validate(&chains)
             .unwrap_err();
 
@@ -427,10 +427,10 @@ mod tests {
             ),
         ]);
 
-        allocation(r#"{ base = 0.6 }"#, "0.4")
+        allocation(r"{ base = 0.6 }", "0.4")
             .validate(&chains)
             .unwrap();
-        allocation(r#"{ base = 0.6, robinhood = 0.4 }"#, "0.4")
+        allocation(r"{ base = 0.6, robinhood = 0.4 }", "0.4")
             .validate(&chains)
             .unwrap();
     }

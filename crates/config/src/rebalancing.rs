@@ -956,11 +956,8 @@ mod tests {
     fn allocation_section_is_optional() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
-        assert!(matches!(config.allocation, None));
-        assert!(matches!(
-            RebalancingCtx::new(&config).unwrap().allocation,
-            None
-        ));
+        assert!(config.allocation.is_none());
+        assert!(RebalancingCtx::new(&config).unwrap().allocation.is_none());
     }
 
     #[test]
@@ -1025,13 +1022,13 @@ mod tests {
     #[test]
     fn allocation_target_share_above_one_is_refused() {
         let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
-            r#"
+            r"
             targets = { base = 1.5 }
             alpaca_floor = 0.1
             deviation = 0.05
             min_operation_usd = 100
             cooldown_secs = 600
-            "#,
+            ",
         ))
         .unwrap_err();
 
@@ -1044,13 +1041,13 @@ mod tests {
     #[test]
     fn allocation_negative_deviation_is_refused() {
         let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
-            r#"
+            r"
             targets = { base = 0.5 }
             alpaca_floor = 0.1
             deviation = -0.05
             min_operation_usd = 100
             cooldown_secs = 600
-            "#,
+            ",
         ))
         .unwrap_err();
 
@@ -1063,13 +1060,13 @@ mod tests {
     #[test]
     fn allocation_zero_minimum_operation_is_refused() {
         let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
-            r#"
+            r"
             targets = { base = 0.5 }
             alpaca_floor = 0.1
             deviation = 0.05
             min_operation_usd = 0
             cooldown_secs = 600
-            "#,
+            ",
         ))
         .unwrap_err();
 
@@ -1082,14 +1079,14 @@ mod tests {
     #[test]
     fn allocation_unknown_key_is_refused() {
         let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
-            r#"
+            r"
             targets = { base = 0.5 }
             alpaca_floor = 0.1
             deviation = 0.05
             min_operation_usd = 100
             cooldown_secs = 600
             hysteresis = 0.01
-            "#,
+            ",
         ))
         .unwrap_err();
 
@@ -1102,13 +1099,13 @@ mod tests {
     #[test]
     fn zero_allocation_cooldown_fails_validation() {
         let config: RebalancingConfig = toml::from_str(&allocation_toml(
-            r#"
+            r"
             targets = { base = 0.5 }
             alpaca_floor = 0.1
             deviation = 0.05
             min_operation_usd = 100
             cooldown_secs = 0
-            "#,
+            ",
         ))
         .unwrap();
 
