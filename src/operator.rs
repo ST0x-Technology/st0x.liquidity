@@ -1499,7 +1499,11 @@ pub mod process_tx {
     use st0x_config::{Ctx, HedgedChain};
     use st0x_event_sorcery::{Projection, Store, StoreBuilder};
     use st0x_evm::{Chain, ReadOnlyEvm};
-    use st0x_execution::{Direction, FractionalShares, MockExecutor, Positive, Symbol};
+    use st0x_execution::{
+        BuyingPowerReservationCents, ClientOrderId, CounterTradePreflight, CounterTradeReservation,
+        Direction, FractionalShares, MarketOrder, MockExecutor, Positive, SupportedExecutor,
+        Symbol,
+    };
     use st0x_registry::SymbolCache;
 
     use crate::conductor::{
@@ -1517,6 +1521,9 @@ pub mod process_tx {
     use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
     use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
     use crate::position::{AnchorDisposition, Position, PositionCommand};
+    use crate::trading::offchain::hedge::{
+        acquire_counter_trade_submission_file_lock, live_buying_power_reservations,
+    };
 
     use super::{OperatorError, RejectionReason};
 
@@ -1580,6 +1587,10 @@ pub mod process_tx {
         /// A concurrent placement already claimed the position, so the fill was
         /// settled without placing a hedge.
         PlacementRejected { symbol: Symbol },
+        /// The fill was accounted, but the buy preflight deferred the hedge
+        /// because live buying power could not cover it. The fill was settled
+        /// without placing a hedge.
+        BuyPreflightDeferred { symbol: Symbol },
         /// A hedge order was placed at the broker.
         HedgePlaced {
             symbol: Symbol,
@@ -1786,6 +1797,15 @@ pub mod process_tx {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // The in-process mutex only serializes within this process, and the CLI
+        // passes `None`. The pool-scoped file lock is the only guard that crosses
+        // process boundaries; the bot's own `process_queued_trade` and
+        // `PlaceHedge` worker take it in the same mutex-then-file order, so an
+        // operator running process-tx against a live bot cannot submit inside the
+        // window between the bot's preflight and its `Placed` event.
+        let _file_submission_guard = acquire_counter_trade_submission_file_lock(pool)
+            .await
+            .context("failed to acquire the counter-trade submission file lock")?;
 
         match reconcile_existing_pending_order(offchain_order_store, position_store, base_symbol)
             .await?
@@ -1847,30 +1867,67 @@ pub mod process_tx {
 
         let offchain_order_id = OffchainOrderId::new();
 
-        let anchor = position_store
-            .load(&params.symbol)
-            .await
-            .inspect_err(|error| {
-                error!(
-                    %offchain_order_id,
-                    symbol = %params.symbol,
-                    %error,
-                    "Failed to load position for the idempotency anchor; refusing \
-                     placement until it can be read"
-                );
-            })
-            .context("failed to load position for the idempotency anchor")?
-            .and_then(|position| position.last_failed_offchain_order_id);
+        let anchor = match reconcile_failed_anchor(
+            position_store,
+            order_placer.as_ref(),
+            &params.symbol,
+            offchain_order_id,
+            executor_type,
+        )
+        .await
+        {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                mark_and_settle_fill(
+                    onchain_trade_store,
+                    position_store,
+                    &trade_id,
+                    &onchain_trade,
+                )
+                .await?;
+                return Err(OperatorError::Operational(error));
+            }
+        };
 
-        // `_submission_guard` above is still held here, so the aggregate claim
-        // and the broker placement are serialized against the trading loop.
+        let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
+
+        // The submission guards above are still held here, so the buy preflight,
+        // the aggregate claim, and the broker placement all serialize against the
+        // trading loop.
+        let (hedge_shares, buying_power_reservation) = if params.direction == Direction::Buy {
+            match preflight_buy(
+                pool,
+                order_placer.as_ref(),
+                &params.symbol,
+                params.shares,
+                client_order_id.clone(),
+            )
+            .await?
+            {
+                Some(preflight) => preflight,
+                None => {
+                    mark_and_settle_fill(
+                        onchain_trade_store,
+                        position_store,
+                        &trade_id,
+                        &onchain_trade,
+                    )
+                    .await?;
+                    return Ok(ProcessTxOutcome::BuyPreflightDeferred {
+                        symbol: params.symbol.clone(),
+                    });
+                }
+            }
+        } else {
+            (params.shares, None)
+        };
 
         match position_store
             .send(
                 &params.symbol,
                 PositionCommand::PlaceOffChainOrder {
                     offchain_order_id,
-                    shares: params.shares,
+                    shares: hedge_shares,
                     direction: params.direction,
                     executor: params.executor,
                     threshold: ctx.execution_threshold,
@@ -1899,19 +1956,18 @@ pub mod process_tx {
             Err(error) => return Err(OperatorError::Operational(anyhow::Error::new(error))),
         }
 
-        let client_order_id = client_order_id_for_placement(offchain_order_id, anchor);
-
         place_offchain_order_at_broker(
             offchain_order_store,
             order_placer.as_ref(),
             &offchain_order_id,
             OffchainOrderPlacement::market(
                 params.symbol.clone(),
-                params.shares,
+                hedge_shares,
                 params.direction,
                 params.executor,
                 client_order_id,
-            ),
+            )
+            .with_buying_power_reservation(buying_power_reservation),
         )
         .await
         .context("failed to place the offchain order at the broker")?;
@@ -1935,7 +1991,7 @@ pub mod process_tx {
         Ok(ProcessTxOutcome::HedgePlaced {
             symbol: params.symbol.clone(),
             offchain_order_id,
-            shares: params.shares,
+            shares: hedge_shares,
             direction: params.direction,
             disposition,
         })
@@ -1951,6 +2007,112 @@ pub mod process_tx {
         execute_mark_acknowledged(onchain_trade_store, trade_id).await?;
         execute_settle_fill(position_store, onchain_trade).await?;
         Ok(())
+    }
+
+    /// Reconciles a preserved failed-order anchor with the broker before a fresh
+    /// placement reuses it as the client order id. For an Alpaca executor a
+    /// present broker order means the prior attempt did reach the broker, so it
+    /// refuses rather than double-submitting; only a confirmed absence releases
+    /// the anchor. Non-Alpaca executors have no such lookup, so the anchor is
+    /// returned unchanged.
+    async fn reconcile_failed_anchor(
+        position_store: &Store<Position>,
+        order_placer: &dyn OrderPlacer,
+        symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
+        executor: SupportedExecutor,
+    ) -> anyhow::Result<Option<OffchainOrderId>> {
+        let anchor = position_store
+            .load(symbol)
+            .await
+            .inspect_err(|error| {
+                error!(
+                    %offchain_order_id,
+                    %symbol,
+                    %error,
+                    "Failed to load position for the idempotency anchor; refusing \
+                     placement until it can be read"
+                );
+            })?
+            .and_then(|position| position.last_failed_offchain_order_id);
+        if executor != SupportedExecutor::AlpacaBrokerApi {
+            return Ok(anchor);
+        }
+        let Some(anchor) = anchor else {
+            return Ok(None);
+        };
+
+        let client_order_id = client_order_id_for_placement(offchain_order_id, Some(anchor));
+        if let Some(broker_order) = order_placer
+            .get_order_by_client_order_id(&client_order_id)
+            .await
+            .map_err(anyhow::Error::from_boxed)?
+        {
+            anyhow::bail!(
+                "broker order {} already exists for failed anchor {anchor}; let the liquidity \
+                 service reconcile it before processing this fill",
+                broker_order.executor_order_id
+            )
+        }
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ReleaseFailedOrderAnchor {
+                    expected_offchain_order_id: anchor,
+                },
+            )
+            .await?;
+        Ok(None)
+    }
+
+    /// Runs the cash-only buy safety preflight: prices the hedge against live
+    /// buying-power reservations and either defers it (`None`) or returns the
+    /// broker-approved share count and the reservation to attach to the order.
+    async fn preflight_buy(
+        pool: &SqlitePool,
+        order_placer: &dyn OrderPlacer,
+        symbol: &Symbol,
+        shares: Positive<FractionalShares>,
+        client_order_id: ClientOrderId,
+    ) -> anyhow::Result<
+        Option<(
+            Positive<FractionalShares>,
+            Option<BuyingPowerReservationCents>,
+        )>,
+    > {
+        let reserved = live_buying_power_reservations(pool).await?;
+        let preflight = order_placer
+            .preflight_counter_trade_with_reserved_buying_power(
+                MarketOrder {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Buy,
+                    client_order_id,
+                },
+                reserved,
+            )
+            .await
+            .map_err(anyhow::Error::from_boxed)?;
+        match preflight {
+            CounterTradePreflight::Skipped(reason) => {
+                info!(%symbol, "process-tx buy preflight deferred the hedge: {reason}");
+                Ok(None)
+            }
+            CounterTradePreflight::Allowed {
+                reservation:
+                    Some(CounterTradeReservation::BuyingPower {
+                        required,
+                        estimated_cost_cents,
+                        ..
+                    }),
+            } => Ok(Some((
+                required,
+                Some(BuyingPowerReservationCents::new(estimated_cost_cents)?),
+            ))),
+            CounterTradePreflight::Allowed { .. } => {
+                anyhow::bail!("Alpaca buy preflight returned no buying-power reservation")
+            }
+        }
     }
 
     /// Inspects any pending hedge already recorded on the position before
@@ -2177,8 +2339,10 @@ pub mod process_tx {
         use st0x_event_sorcery::{AggregateError, SendError, StoreBuilder};
         use st0x_evm::Chain;
         use st0x_execution::{
-            CancellationOutcome, Direction, ExecutorOrderId, FractionalShares, LimitOrder,
-            MarketOrder, MockExecutor, Positive, SupportedExecutor, Symbol,
+            BuyingPowerReservationCents, CancellationOutcome, ClientOrderId, CounterTradePreflight,
+            CounterTradeReservation, CounterTradeSkipReason, Direction, ExecutorOrderId,
+            FractionalShares, LimitOrder, MarketOrder, MockExecutor, Positive, SupportedExecutor,
+            Symbol,
         };
         use st0x_registry::SymbolCache;
 
@@ -2188,16 +2352,16 @@ pub mod process_tx {
             process_queued_trade,
         };
         use crate::offchain::order::{
-            CancellationReason, ExecutorOrderPlacer, OffchainOrder, OffchainOrderId,
-            OrderPlacementResult, OrderPlacer, PollOrderStatusJobQueue, RetainedFill,
-            noop_order_placer,
+            BrokerOrderPlacement, CancellationReason, ExecutorOrderPlacer, OffchainOrder,
+            OffchainOrderId, OrderPlacementResult, OrderPlacer, PollOrderStatusJobQueue,
+            RetainedFill, noop_order_placer,
         };
         use crate::onchain::trade::RaindexTradeEvent;
         use crate::onchain_trade::{
             InventoryVenue, OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand, OnChainTradeId,
             OnChainTradeSource,
         };
-        use crate::position::{Position, PositionCommand};
+        use crate::position::{AnchorDisposition, Position, PositionCommand};
         use crate::test_utils::{
             OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, try_positive_shares,
             try_setup_test_db, try_setup_test_pools,
@@ -2207,8 +2371,9 @@ pub mod process_tx {
 
         use super::{
             HedgeDisposition, OperatorError, PlacementContext, ProcessTxChainContext,
-            ProcessTxFill, ProcessTxOutcome, ProcessTxStores, RejectionReason, process_found_trade,
-            process_tx, reconcile_offchain_order_state, reconcile_post_place_state,
+            ProcessTxFill, ProcessTxOutcome, ProcessTxStores, RejectionReason, preflight_buy,
+            process_found_trade, process_tx, reconcile_failed_anchor,
+            reconcile_offchain_order_state, reconcile_post_place_state,
         };
 
         /// Parses a positive share quantity for process-tx fixtures.
@@ -2281,6 +2446,256 @@ pub mod process_tx {
         /// Builds the minimal application context required by process-tx tests.
         fn create_base_test_ctx() -> Ctx {
             st0x_config::create_test_ctx_with_order_owner(Address::ZERO)
+        }
+
+        /// `OrderPlacer` that reports whether the broker still holds an order
+        /// for the queried client id, used to drive `reconcile_failed_anchor`.
+        struct AnchorPresencePlacer {
+            present: bool,
+        }
+
+        #[async_trait]
+        impl OrderPlacer for AnchorPresencePlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("anchor reconciliation must not place")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("anchor reconciliation must not place")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                panic!("anchor reconciliation must not cancel")
+            }
+
+            async fn get_order_by_client_order_id(
+                &self,
+                _client_order_id: &ClientOrderId,
+            ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(self.present.then(|| BrokerOrderPlacement {
+                    executor_order_id: ExecutorOrderId::new("existing-anchor-order"),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: positive_shares("1"),
+                    direction: Direction::Sell,
+                    placed_at: Utc::now(),
+                    is_extended_hours: Some(false),
+                    limit_price: None,
+                }))
+            }
+        }
+
+        /// Seeds a `Position` carrying a preserved failed-order anchor for an
+        /// Alpaca executor, the state `reconcile_failed_anchor` reconciles.
+        async fn seeded_failed_anchor(
+            pool: &sqlx::SqlitePool,
+        ) -> (
+            Arc<st0x_event_sorcery::Store<Position>>,
+            Symbol,
+            OffchainOrderId,
+        ) {
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let symbol = Symbol::new("AAPL").unwrap();
+            let trade = onchain_trade_builder().build();
+            execute_acknowledge_fill(
+                &position_store,
+                &trade,
+                ExecutionThreshold::whole_share(),
+                trade.block_timestamp.unwrap(),
+            )
+            .await
+            .unwrap();
+            let anchor = OffchainOrderId::new();
+            position_store
+                .send(
+                    &symbol,
+                    PositionCommand::PlaceOffChainOrder {
+                        offchain_order_id: anchor,
+                        shares: positive_shares("1"),
+                        direction: Direction::Sell,
+                        executor: SupportedExecutor::AlpacaBrokerApi,
+                        threshold: ExecutionThreshold::whole_share(),
+                    },
+                )
+                .await
+                .unwrap();
+            position_store
+                .send(
+                    &symbol,
+                    PositionCommand::FailOffChainOrder {
+                        offchain_order_id: anchor,
+                        error: "lost placement response".to_string(),
+                        anchor: AnchorDisposition::Preserve,
+                    },
+                )
+                .await
+                .unwrap();
+            (position_store, symbol, anchor)
+        }
+
+        /// A broker order still exists for the preserved anchor's client id, so
+        /// process-tx must refuse rather than double-submit, and must leave the
+        /// anchor in place for the liquidity service to reconcile.
+        #[tokio::test]
+        async fn reconcile_failed_anchor_refuses_when_the_broker_still_holds_the_order() {
+            let pool = setup_test_db().await;
+            let (position_store, symbol, anchor) = seeded_failed_anchor(&pool).await;
+
+            let error = reconcile_failed_anchor(
+                &position_store,
+                &AnchorPresencePlacer { present: true },
+                &symbol,
+                OffchainOrderId::new(),
+                SupportedExecutor::AlpacaBrokerApi,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("already exists for failed anchor"),
+                "got: {error}"
+            );
+            let position = position_store.load(&symbol).await.unwrap().unwrap();
+            assert_eq!(
+                position.last_failed_offchain_order_id,
+                Some(anchor),
+                "a broker-present anchor must be preserved, not released"
+            );
+        }
+
+        /// The broker confirms no order for the anchor's client id, so the
+        /// anchor is released and a fresh placement may proceed.
+        #[tokio::test]
+        async fn reconcile_failed_anchor_releases_when_the_broker_confirms_absence() {
+            let pool = setup_test_db().await;
+            let (position_store, symbol, _anchor) = seeded_failed_anchor(&pool).await;
+
+            let released = reconcile_failed_anchor(
+                &position_store,
+                &AnchorPresencePlacer { present: false },
+                &symbol,
+                OffchainOrderId::new(),
+                SupportedExecutor::AlpacaBrokerApi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(released, None);
+            let position = position_store.load(&symbol).await.unwrap().unwrap();
+            assert_eq!(
+                position.last_failed_offchain_order_id, None,
+                "a confirmed-absent anchor must be released"
+            );
+        }
+
+        /// `OrderPlacer` returning a fixed buy preflight verdict.
+        struct PreflightPlacer {
+            allow: bool,
+        }
+
+        #[async_trait]
+        impl OrderPlacer for PreflightPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("preflight test must not place")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("preflight test must not place")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                panic!("preflight test must not cancel")
+            }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                _order: MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(if self.allow {
+                    CounterTradePreflight::Allowed {
+                        reservation: Some(CounterTradeReservation::BuyingPower {
+                            required: positive_shares("0.5"),
+                            estimated_cost_cents: 5_000,
+                            available_buying_power_cents: 100_000,
+                        }),
+                    }
+                } else {
+                    CounterTradePreflight::Skipped(
+                        CounterTradeSkipReason::InsufficientBuyingPower {
+                            estimated_cost_cents: 5_000,
+                            available_buying_power_cents: 100,
+                        },
+                    )
+                })
+            }
+        }
+
+        /// Insufficient buying power must defer the buy hedge (`None`), the
+        /// cash-only safety the shared path restored.
+        #[tokio::test]
+        async fn preflight_buy_defers_when_buying_power_is_insufficient() {
+            let pool = setup_test_db().await;
+            let deferred = preflight_buy(
+                &pool,
+                &PreflightPlacer { allow: false },
+                &Symbol::new("AAPL").unwrap(),
+                positive_shares("1"),
+                ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+            )
+            .await
+            .unwrap();
+            assert!(deferred.is_none(), "insufficient buying power must defer");
+        }
+
+        /// An allowed buy preflight returns the broker-approved (possibly
+        /// reduced) share count and the reservation to attach to the order.
+        #[tokio::test]
+        async fn preflight_buy_returns_the_reduced_shares_and_reservation() {
+            let pool = setup_test_db().await;
+            let (shares, reservation) = preflight_buy(
+                &pool,
+                &PreflightPlacer { allow: true },
+                &Symbol::new("AAPL").unwrap(),
+                positive_shares("1"),
+                ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+            )
+            .await
+            .unwrap()
+            .expect("an allowed preflight must return a placement");
+            assert_eq!(shares, positive_shares("0.5"));
+            assert_eq!(
+                reservation,
+                Some(BuyingPowerReservationCents::new(5_000).unwrap())
+            );
         }
 
         /// Standalone stores for the offline-path tests; the reactor-wired

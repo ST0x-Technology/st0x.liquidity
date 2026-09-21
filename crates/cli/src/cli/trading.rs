@@ -755,6 +755,12 @@ fn render_process_tx_outcome<W: Write>(
                 "Placement for {symbol} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill."
             )?;
         }
+        ProcessTxOutcome::BuyPreflightDeferred { symbol } => {
+            writeln!(
+                stdout,
+                "Trade accumulated but the buy preflight deferred the hedge for {symbol}: live buying power could not cover it. Settled the fill."
+            )?;
+        }
         ProcessTxOutcome::HedgePlaced {
             symbol,
             offchain_order_id,
@@ -2945,6 +2951,17 @@ mod tests {
                 expected,
             ));
         }
+
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::BuyPreflightDeferred { symbol: symbol() },
+            },
+            format!(
+                "{fill_summary}Trade accumulated but the buy preflight deferred the hedge for {}: live buying power could not cover it. Settled the fill.\n",
+                symbol()
+            ),
+        ));
 
         for (report, expected) in cases {
             let mut buf = Vec::new();

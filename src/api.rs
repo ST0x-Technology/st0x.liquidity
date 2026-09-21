@@ -2607,6 +2607,9 @@ enum ProcessTxOutcomeResponse {
     PlacementRejected {
         symbol: String,
     },
+    BuyPreflightDeferred {
+        symbol: String,
+    },
     HedgePlaced {
         symbol: String,
         offchain_order_id: String,
@@ -2631,6 +2634,9 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
                 symbol: symbol.to_string(),
             },
             ProcessTxOutcome::PlacementRejected { symbol } => Self::PlacementRejected {
+                symbol: symbol.to_string(),
+            },
+            ProcessTxOutcome::BuyPreflightDeferred { symbol } => Self::BuyPreflightDeferred {
                 symbol: symbol.to_string(),
             },
             ProcessTxOutcome::HedgePlaced {
@@ -7528,6 +7534,20 @@ mod tests {
                 }),
             ));
         }
+
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::BuyPreflightDeferred {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+            },
+            serde_json::json!({
+                "fill": fill_json,
+                "outcome": "buy_preflight_deferred",
+                "symbol": "AAPL",
+            }),
+        ));
 
         for (report, expected) in cases {
             assert_eq!(
