@@ -4511,6 +4511,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_legacy_submitted_withdrawal_is_terminal() {
+        let token = Address::random();
+        let amount = U256::from(10_000_000_000_000_000_000_u128);
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(
+                        MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Fail),
+                    ),
+                    vault_lookup: Arc::new(mock_vault_lookup()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+
+        let error = TestHarness::<EquityRedemption>::with(services)
+            .given(vec![EquityRedemptionEvent::VaultWithdrawSubmitted {
+                symbol: Symbol::new("COIN").unwrap(),
+                quantity: float!(10),
+                token,
+                wrapped_amount: amount,
+                tx_hash: TxHash::ZERO,
+                prepared: None,
+                submitted_at: Utc::now(),
+            }])
+            .when(EquityRedemptionCommand::ConfirmWithdraw)
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::RaindexWithdrawFailed {
+                    token: failed_token,
+                    amount: failed_amount,
+                    ..
+                }) if failed_token == token && failed_amount == amount
+            ),
+            "a dropped legacy submission without prepared bytes cannot be \
+             rebroadcast and must remain a terminal withdrawal failure: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn confirm_withdraw_fails_without_matching_receipt_transfer() {
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
