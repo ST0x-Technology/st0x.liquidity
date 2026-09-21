@@ -8,10 +8,12 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use st0x_evm::Chain;
-use st0x_execution::Positive;
+use st0x_execution::{Positive, Symbol};
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
+
+use crate::{ChainConfig, ChainLifecycle, OperationMode, TradingConfig};
 
 static EXACT_ONE: LazyLock<Float> = LazyLock::new(|| float!(1));
 
@@ -94,6 +96,75 @@ pub struct AllocationConfig {
     pub cooldown_secs: u64,
 }
 
+impl AllocationConfig {
+    /// Checks the targets against the chain tables: a target may name only a
+    /// hedged chain, every rebalanced listing needs an effective target, and
+    /// per symbol those targets plus the floor must not exceed 1. A listing
+    /// with rebalancing disabled is never planned, so it needs no target and
+    /// does not count.
+    ///
+    /// # Errors
+    ///
+    /// The first violation, in chain and then symbol order.
+    pub fn validate(
+        &self,
+        chains: &BTreeMap<Chain, ChainConfig>,
+    ) -> Result<(), AllocationConfigError> {
+        let hedged: BTreeMap<Chain, &TradingConfig> = chains
+            .iter()
+            .filter(|(_, config)| config.lifecycle != ChainLifecycle::Disabled)
+            .filter_map(|(chain, config)| config.trading.as_ref().map(|trading| (*chain, trading)))
+            .collect();
+
+        if let Some(chain) = self
+            .targets
+            .keys()
+            .find(|chain| !hedged.contains_key(chain))
+        {
+            return Err(AllocationConfigError::TargetOnUnhedgedChain { chain: *chain });
+        }
+
+        let mut sums: BTreeMap<&Symbol, Float> = BTreeMap::new();
+        for (chain, trading) in &hedged {
+            let mut listings: Vec<_> = trading
+                .assets
+                .equities
+                .symbols
+                .iter()
+                .filter(|(_, equity)| equity.rebalancing == OperationMode::Enabled)
+                .collect();
+            listings.sort_by_key(|(symbol, _)| *symbol);
+
+            for (symbol, equity) in listings {
+                let target = equity
+                    .target_share
+                    .or_else(|| self.targets.get(chain).copied())
+                    .ok_or_else(|| AllocationConfigError::MissingTarget {
+                        chain: *chain,
+                        symbol: symbol.clone(),
+                    })?;
+                let running = match sums.get(symbol) {
+                    Some(sum) => (*sum + target.inner())?,
+                    None => target.inner(),
+                };
+                sums.insert(symbol, running);
+            }
+        }
+
+        for (symbol, sum) in sums {
+            let total = (sum + self.alpaca_floor.inner())?;
+            if total.gt(*EXACT_ONE)? {
+                return Err(AllocationConfigError::TargetsExceedOne {
+                    symbol: symbol.clone(),
+                    total,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// [`AllocationConfig`] after validation, with durations resolved.
 #[derive(Debug, Clone)]
 pub struct AllocationCtx {
@@ -138,16 +209,29 @@ pub enum AllocationConfigError {
     NegativeDeviationBand { value: Float },
     #[error("[rebalancing.allocation] cooldown_secs must be non-zero")]
     ZeroCooldown,
+    #[error(
+        "[rebalancing.allocation] targets names {chain}, which has no enabled \
+         [chains.{chain}.trading] table and so is not a hedged chain"
+    )]
+    TargetOnUnhedgedChain { chain: Chain },
+    #[error(
+        "{symbol} rebalances on {chain} but has no target share there: set \
+         [rebalancing.allocation].targets.{chain} or target_share on \
+         [chains.{chain}.trading.assets.equities.{symbol}]"
+    )]
+    MissingTarget { chain: Chain, symbol: Symbol },
+    #[error(
+        "{symbol}: its chain target shares plus alpaca_floor sum to {}, which exceeds 1",
+        format_float_with_fallback(total)
+    )]
+    TargetsExceedOne { symbol: Symbol, total: Float },
     #[error(transparent)]
     Float(#[from] FloatError),
 }
 
 #[cfg(test)]
 mod tests {
-    use st0x_execution::Symbol;
-
     use super::*;
-    use crate::{ChainConfig, ChainLifecycle, TradingConfig};
 
     fn allocation(targets: &str, alpaca_floor: &str) -> AllocationConfig {
         toml::from_str(&format!(

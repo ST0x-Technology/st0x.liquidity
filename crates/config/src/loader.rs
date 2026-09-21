@@ -33,10 +33,11 @@ use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
-    AlertsConfig, AlertsCtx, BotGasValuationConfig, ChainConfig, ChainEquityAsset, ChainRegistry,
-    ChainSecrets, ExecutionThreshold, HedgingAssets, InvalidThresholdError, OperationMode,
-    OrchestratorConfig, PricingConfig, PricingCtx, PricingCtxError, RebalancingConfig,
-    RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
+    AlertsConfig, AlertsCtx, AllocationConfigError, BotGasValuationConfig, ChainConfig,
+    ChainEquityAsset, ChainRegistry, ChainSecrets, ExecutionThreshold, HedgingAssets,
+    InvalidThresholdError, OperationMode, OrchestratorConfig, PricingConfig, PricingCtx,
+    PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig,
+    TelemetryCtx,
 };
 
 /// Alpaca minimum execution threshold: $2.
@@ -1797,6 +1798,9 @@ fn validate_config(
             return Err(CtxError::MissingRebalancing);
         };
         RebalancingCtx::new(rebalancing)?;
+        if let Some(allocation) = &rebalancing.allocation {
+            allocation.validate(&config.chains)?;
+        }
 
         let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
 
@@ -1933,6 +1937,9 @@ fn parse_and_validate(
     };
 
     let rebalancing = Box::new(RebalancingCtx::new(&rebalancing_config)?);
+    if let Some(allocation) = &rebalancing_config.allocation {
+        allocation.validate(&config.chains)?;
+    }
 
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
 
@@ -2508,6 +2515,8 @@ pub enum CtxError {
     TradingSchedule(#[from] crate::TradingScheduleConfigError),
     #[error(transparent)]
     Rebalancing(Box<RebalancingCtxError>),
+    #[error("[rebalancing.allocation]: {0}")]
+    Allocation(#[from] AllocationConfigError),
     #[error(transparent)]
     Pricing(#[from] PricingCtxError),
     #[error("log_query_url_template must contain the {{id}} placeholder")]
@@ -2785,6 +2794,7 @@ impl CtxError {
     fn kind(&self) -> &'static str {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
+            Self::Allocation(_) => "equity allocation configuration error",
             Self::Pricing(_) => "pricing configuration error",
             Self::TradingSchedule(_) => "trading schedule configuration error",
             Self::MissingRebalancing => "missing [rebalancing] config section",
@@ -3068,9 +3078,7 @@ mod tests {
 
     use super::*;
     use crate::chain::IngestionCutoffTag;
-    use crate::{
-        AllocationConfigError, ChainLifecycle, ChainRole, ExecutionThreshold, InventoryModeTag,
-    };
+    use crate::{ChainLifecycle, ChainRole, ExecutionThreshold, InventoryModeTag};
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
