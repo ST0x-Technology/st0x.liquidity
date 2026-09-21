@@ -129,6 +129,9 @@ pub enum ViewRebuildError {
         #[source]
         source: ParseVaultRegistryIdError,
     },
+    /// The requested aggregate id has no event stream to replay.
+    #[error("{view} has no event stream for id {id:?}")]
+    NoEventStream { view: RebuildableView, id: String },
     #[error(transparent)]
     Position(ProjectionError<Position>),
     #[error(transparent)]
@@ -143,6 +146,20 @@ pub enum ViewRebuildError {
     LifecycleFailure(crate::performance::reliability::FailureProjectionError),
     #[error(transparent)]
     PortfolioSnapshot(crate::portfolio_snapshot::projection::ProjectionError),
+}
+
+impl ViewRebuildError {
+    /// Whether the failure is a request error rather than a store failure.
+    pub const fn is_caller_error(&self) -> bool {
+        matches!(
+            self,
+            Self::WholeModelOnly { .. }
+                | Self::InvalidPositionId { .. }
+                | Self::InvalidOffchainOrderId { .. }
+                | Self::InvalidVaultRegistryId { .. }
+                | Self::NoEventStream { .. }
+        )
+    }
 }
 
 /// Local mirror of event-sorcery's private lifecycle state. The serialized
@@ -214,7 +231,7 @@ where
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
         id: &Entity::Id,
-    ) -> Result<(), ProjectionError<Entity>>;
+    ) -> Result<bool, ProjectionError<Entity>>;
 
     async fn rebuild_all_in(
         &self,
@@ -230,7 +247,7 @@ where
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
         id: &Entity::Id,
-    ) -> Result<(), ProjectionError<Entity>> {
+    ) -> Result<bool, ProjectionError<Entity>> {
         let Table(table) = Entity::PROJECTION;
         let view_id = id.to_string();
 
@@ -262,7 +279,11 @@ where
             .await?;
 
         for aggregate_id in aggregate_ids {
-            replay_projection::<Entity>(transaction, table, &aggregate_id).await?;
+            let rebuilt = replay_projection::<Entity>(transaction, table, &aggregate_id).await?;
+            debug_assert!(
+                rebuilt,
+                "an aggregate id selected from events must be replayable"
+            );
         }
 
         Ok(())
@@ -273,7 +294,7 @@ async fn replay_projection<Entity>(
     transaction: &mut Transaction<'_, Sqlite>,
     table: &str,
     aggregate_id: &str,
-) -> Result<(), ProjectionError<Entity>>
+) -> Result<bool, ProjectionError<Entity>>
 where
     Entity: EventSourced<Materialized = Table>,
 {
@@ -288,7 +309,7 @@ where
     .await?;
 
     let Some((max_sequence, _)) = events.last() else {
-        return Ok(());
+        return Ok(false);
     };
     let max_sequence = *max_sequence;
     let mut lifecycle = RebuiltLifecycle::<Entity>::default();
@@ -316,21 +337,25 @@ where
     .execute(&mut **transaction)
     .await?;
 
-    Ok(())
+    Ok(true)
 }
 
 async fn rebuild_projection<Entity>(
     pool: &SqlitePool,
     id: &Entity::Id,
-) -> Result<(), ProjectionError<Entity>>
+) -> Result<bool, ProjectionError<Entity>>
 where
     Entity: EventSourced<Materialized = Table>,
 {
     let projection = Projection::<Entity>::sqlite(pool.clone());
     let mut transaction = pool.begin().await?;
-    projection.rebuild_in(&mut transaction, id).await?;
+    let rebuilt = projection.rebuild_in(&mut transaction, id).await?;
+    if !rebuilt {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
     transaction.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn rebuild_all_projections<Entity>(pool: &SqlitePool) -> Result<(), ProjectionError<Entity>>
@@ -342,6 +367,23 @@ where
     projection.rebuild_all_in(&mut transaction).await?;
     transaction.commit().await?;
     Ok(())
+}
+
+async fn event_stream_exists<Entity>(
+    pool: &SqlitePool,
+    id: &Entity::Id,
+) -> Result<bool, ProjectionError<Entity>>
+where
+    Entity: EventSourced<Materialized = Table>,
+{
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM events \
+         WHERE aggregate_type = ?1 AND aggregate_id = ?2)",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .bind(id.to_string())
+    .fetch_one(pool)
+    .await?)
 }
 
 /// A validated rebuild target. Single-aggregate variants carry their parsed,
@@ -411,6 +453,48 @@ pub fn parse_rebuild_scope(
     }
 }
 
+/// Checks that a parsed single-aggregate target has an event stream to replay.
+/// The live API calls this before pausing projection writers.
+pub async fn validate_rebuild_scope(
+    pool: &SqlitePool,
+    scope: ParsedRebuildScope,
+) -> Result<ParsedRebuildScope, ViewRebuildError> {
+    let exists = match &scope {
+        ParsedRebuildScope::Position { id, .. } => event_stream_exists::<Position>(pool, id)
+            .await
+            .map_err(ViewRebuildError::Position)?,
+        ParsedRebuildScope::OffchainOrder { id, .. } => {
+            event_stream_exists::<OffchainOrder>(pool, id)
+                .await
+                .map_err(ViewRebuildError::OffchainOrder)?
+        }
+        ParsedRebuildScope::VaultRegistry { id, .. } => {
+            event_stream_exists::<VaultRegistry>(pool, id)
+                .await
+                .map_err(ViewRebuildError::VaultRegistry)?
+        }
+        ParsedRebuildScope::All(_) => return Ok(scope),
+    };
+
+    if exists {
+        return Ok(scope);
+    }
+
+    let (view, id) = match scope {
+        ParsedRebuildScope::Position { requested_id, .. } => {
+            (RebuildableView::Position, requested_id)
+        }
+        ParsedRebuildScope::OffchainOrder { requested_id, .. } => {
+            (RebuildableView::OffchainOrder, requested_id)
+        }
+        ParsedRebuildScope::VaultRegistry { requested_id, .. } => {
+            (RebuildableView::VaultRegistry, requested_id)
+        }
+        ParsedRebuildScope::All(_) => unreachable!("whole-view scopes return before validation"),
+    };
+    Err(ViewRebuildError::NoEventStream { view, id })
+}
+
 /// Executes a previously validated rebuild by deleting the affected rows and
 /// replaying the event log. The caller must exclude concurrent projection
 /// writers.
@@ -420,9 +504,15 @@ pub async fn execute_rebuild_view(
 ) -> Result<ViewRebuilt, ViewRebuildError> {
     let (view, scope, replayed) = match scope {
         ParsedRebuildScope::Position { requested_id, id } => {
-            rebuild_projection::<Position>(pool, &id)
+            let rebuilt = rebuild_projection::<Position>(pool, &id)
                 .await
                 .map_err(ViewRebuildError::Position)?;
+            if !rebuilt {
+                return Err(ViewRebuildError::NoEventStream {
+                    view: RebuildableView::Position,
+                    id: requested_id,
+                });
+            }
             (
                 RebuildableView::Position,
                 RebuildScope::Id(requested_id),
@@ -430,9 +520,15 @@ pub async fn execute_rebuild_view(
             )
         }
         ParsedRebuildScope::OffchainOrder { requested_id, id } => {
-            rebuild_projection::<OffchainOrder>(pool, &id)
+            let rebuilt = rebuild_projection::<OffchainOrder>(pool, &id)
                 .await
                 .map_err(ViewRebuildError::OffchainOrder)?;
+            if !rebuilt {
+                return Err(ViewRebuildError::NoEventStream {
+                    view: RebuildableView::OffchainOrder,
+                    id: requested_id,
+                });
+            }
             (
                 RebuildableView::OffchainOrder,
                 RebuildScope::Id(requested_id),
@@ -440,9 +536,15 @@ pub async fn execute_rebuild_view(
             )
         }
         ParsedRebuildScope::VaultRegistry { requested_id, id } => {
-            rebuild_projection::<VaultRegistry>(pool, &id)
+            let rebuilt = rebuild_projection::<VaultRegistry>(pool, &id)
                 .await
                 .map_err(ViewRebuildError::VaultRegistry)?;
+            if !rebuilt {
+                return Err(ViewRebuildError::NoEventStream {
+                    view: RebuildableView::VaultRegistry,
+                    id: requested_id,
+                });
+            }
             (
                 RebuildableView::VaultRegistry,
                 RebuildScope::Id(requested_id),
@@ -513,6 +615,7 @@ pub async fn rebuild_view(
     scope: RebuildScope,
 ) -> Result<ViewRebuilt, ViewRebuildError> {
     let scope = parse_rebuild_scope(view, scope)?;
+    let scope = validate_rebuild_scope(pool, scope).await?;
     execute_rebuild_view(pool, scope).await
 }
 
@@ -558,6 +661,55 @@ mod tests {
             std::error::Error::source(&error).is_some(),
             "the parse error must remain the source",
         );
+    }
+
+    #[tokio::test]
+    async fn missing_event_stream_is_a_caller_error_and_preserves_the_view_row() {
+        let pool = setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO position_view (view_id, version, payload) VALUES ('AAPL', 7, '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let parsed = parse_rebuild_scope(
+            RebuildableView::Position,
+            RebuildScope::Id("AAPL".to_owned()),
+        )
+        .unwrap();
+        let error = validate_rebuild_scope(&pool, parsed).await.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ViewRebuildError::NoEventStream {
+                    view: RebuildableView::Position,
+                    id,
+                } if id == "AAPL"
+            ),
+            "{error}"
+        );
+        assert!(error.is_caller_error());
+
+        // Execution defends the same invariant and rolls its deletion back if a
+        // caller bypasses preflight validation.
+        let parsed = parse_rebuild_scope(
+            RebuildableView::Position,
+            RebuildScope::Id("AAPL".to_owned()),
+        )
+        .unwrap();
+        let error = execute_rebuild_view(&pool, parsed).await.unwrap_err();
+        assert!(
+            matches!(&error, ViewRebuildError::NoEventStream { .. }),
+            "{error}"
+        );
+
+        let row: (i64, String) =
+            sqlx::query_as("SELECT version, payload FROM position_view WHERE view_id = 'AAPL'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, (7, "{}".to_owned()));
     }
 
     #[tokio::test]

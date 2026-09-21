@@ -88,7 +88,8 @@ use crate::usdc_rebalance::{
     UsdcRebalanceCommand, UsdcRebalanceId,
 };
 use crate::view_rebuild::{
-    RebuildScope, RebuildableView, execute_rebuild_view, parse_rebuild_scope,
+    RebuildScope, RebuildableView, ViewRebuildError, execute_rebuild_view, parse_rebuild_scope,
+    validate_rebuild_scope,
 };
 
 /// Comma-separated filter for transfer kinds in query parameters.
@@ -2563,6 +2564,19 @@ struct RebuildViewResponse {
     replayed: Option<u64>,
 }
 
+fn view_rebuild_error_response(error: ViewRebuildError) -> (StatusCode, Json<ErrorResponse>) {
+    if error.is_caller_error() {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+    } else {
+        ops_store_error(error)
+    }
+}
+
 /// Rebuilds a materialized view or read model by deleting its rows and
 /// replaying the event log, the escape hatch for a corrupted view. Available
 /// only after startup completes. The request is fully validated before the
@@ -2599,14 +2613,7 @@ async fn rebuild_materialized_view(
             ));
         }
     };
-    let scope = parse_rebuild_scope(view, scope).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: error.to_string(),
-            }),
-        )
-    })?;
+    let scope = parse_rebuild_scope(view, scope).map_err(view_rebuild_error_response)?;
     if !state.health.is_ready() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2615,6 +2622,10 @@ async fn rebuild_materialized_view(
             }),
         ));
     }
+
+    let scope = validate_rebuild_scope(&state.pool, scope)
+        .await
+        .map_err(view_rebuild_error_response)?;
 
     let _projection_paused = state
         .projection_maintenance
@@ -2632,7 +2643,7 @@ async fn rebuild_materialized_view(
 
     let rebuilt = execute_rebuild_view(&state.pool, scope)
         .await
-        .map_err(ops_store_error)?;
+        .map_err(view_rebuild_error_response)?;
 
     let id = match rebuilt.scope {
         RebuildScope::Id(id) => Some(id),
@@ -8505,6 +8516,44 @@ mod tests {
             "{}",
             error.error
         );
+    }
+
+    #[tokio::test]
+    async fn rebuild_view_refuses_a_missing_event_stream_before_pausing_writers() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        let symbol: Symbol = "AAPL".parse().unwrap();
+        seed_position_pnl_fill(&state.pool, &symbol).await;
+        let projection_write = state.projection_maintenance.enter().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rebuild_materialized_view(
+                State(state.clone()),
+                Path("position".to_string()),
+                Json(RebuildViewRequest {
+                    id: Some("aapl".to_string()),
+                    all: false,
+                }),
+            ),
+        )
+        .await
+        .expect("a missing event stream must be rejected before pausing writers");
+        drop(projection_write);
+
+        let Err((status, Json(error))) = response else {
+            panic!("an id without an event stream must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("no event stream"), "{}", error.error);
+
+        let row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM position_view WHERE view_id = 'AAPL'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(row_count, 1, "a mistyped id must not alter the real row");
     }
 
     #[tokio::test]
