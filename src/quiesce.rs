@@ -276,6 +276,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enter_parks_while_paused_and_claims_after_resume() {
+        let (control, gate) = quiesce(TEST_TIMEOUT);
+        let guard = control.pause().await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let worker = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            gate.enter().await
+        });
+        started_rx.await.unwrap();
+        assert!(
+            !worker.is_finished(),
+            "enter must not claim an in-flight slot while paused"
+        );
+
+        drop(guard);
+        let claim = worker.await.unwrap();
+        drop(claim);
+    }
+
+    #[tokio::test]
     async fn a_refused_pause_leaves_the_workers_running() {
         let (control, gate) = quiesce(Duration::from_millis(50));
         let executing = gate.enter().await;
