@@ -985,26 +985,9 @@ where
 /// holds an equivalent handle.
 fn publish_recovery_handle(
     recovery_cell: &tokio::sync::OnceCell<crate::api::RecoveryHandle>,
-    transfer: Arc<CrossVenueEquityTransfer>,
-    mint_store: Arc<Store<TokenizedEquityMint>>,
-    redemption_store: Arc<Store<EquityRedemption>>,
-    rebalancing_service: Arc<RebalancingService>,
-    usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
-    usdc_driver_pause: Arc<UsdcDriverPause>,
-    usdc_store: Arc<Store<UsdcRebalance>>,
+    handle: crate::api::RecoveryHandle,
 ) {
-    let _ = recovery_cell.set(crate::api::RecoveryHandle {
-        transfer,
-        mint_store,
-        redemption_store,
-        rebalancing_service,
-        usdc_recheck,
-        usdc_driver_pause,
-        usdc_store,
-        projection_maintenance: Arc::new(
-            crate::conductor::projection_pause::init_projection_maintenance(),
-        ),
-    });
+    let _ = recovery_cell.set(handle);
 }
 
 /// Publishes the process-tx handle backing the in-bot process-tx route, set
@@ -1320,6 +1303,11 @@ impl Conductor {
             notifier: notifier.clone(),
         });
 
+        // Publish the process-global projection gate before spawning the apalis
+        // monitor so every worker execution is gated from its first poll.
+        let projection_maintenance =
+            Arc::new(crate::conductor::projection_pause::init_projection_maintenance());
+
         let conductor = builder::spawn()
             .context(conductor_ctx)
             .counter_trade_submission_lock(counter_trade_submission_lock.clone())
@@ -1367,13 +1355,16 @@ impl Conductor {
 
         publish_recovery_handle(
             &recovery_cell,
-            recovery_transfer,
-            recovery_mint_store,
-            recovery_redemption_store,
-            recovery_service,
-            usdc_recheck,
-            usdc_driver_pause,
-            recovery_usdc_store,
+            crate::api::RecoveryHandle {
+                transfer: recovery_transfer,
+                mint_store: recovery_mint_store,
+                redemption_store: recovery_redemption_store,
+                rebalancing_service: recovery_service,
+                usdc_recheck,
+                usdc_driver_pause,
+                usdc_store: recovery_usdc_store,
+                projection_maintenance,
+            },
         );
 
         publish_process_tx_handle(
@@ -18852,18 +18843,23 @@ mod tests {
         let usdc_recheck: Arc<dyn RecheckUsdcDeposit> = Arc::new(NeverCalledUsdcRecheck);
         let usdc_driver_pause = Arc::new(crate::rebalancing::usdc::usdc_driver_pause().0);
         let usdc_store = Arc::new(test_store::<UsdcRebalance>(pool, ()));
+        let projection_maintenance =
+            Arc::new(crate::conductor::projection_pause::init_projection_maintenance());
 
         let recovery_cell = tokio::sync::OnceCell::new();
 
         publish_recovery_handle(
             &recovery_cell,
-            transfer.clone(),
-            mint_store.clone(),
-            redemption_store.clone(),
-            rebalancing_service.clone(),
-            usdc_recheck,
-            usdc_driver_pause.clone(),
-            usdc_store.clone(),
+            crate::api::RecoveryHandle {
+                transfer: transfer.clone(),
+                mint_store: mint_store.clone(),
+                redemption_store: redemption_store.clone(),
+                rebalancing_service: rebalancing_service.clone(),
+                usdc_recheck,
+                usdc_driver_pause: usdc_driver_pause.clone(),
+                usdc_store: usdc_store.clone(),
+                projection_maintenance: projection_maintenance.clone(),
+            },
         );
 
         let handle = recovery_cell
@@ -18886,6 +18882,10 @@ mod tests {
         assert!(
             Arc::ptr_eq(&handle.rebalancing_service, &rebalancing_service),
             "the cell must hold the published rebalancing service"
+        );
+        assert!(
+            Arc::ptr_eq(&handle.projection_maintenance, &projection_maintenance),
+            "the cell must hold the projection maintenance controller created before workers spawn",
         );
     }
 
