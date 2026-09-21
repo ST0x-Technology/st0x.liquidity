@@ -83,17 +83,24 @@ pub(crate) fn init_projection_maintenance() -> ProjectionMaintenance {
     ProjectionMaintenance(control)
 }
 
-/// Claims a projection-write slot for the generic apalis handler
-/// [`work`](super::job::work), parking while a rebuild is paused. `None` before
-/// startup wiring -- a bare test that never calls [`init_projection_maintenance`]
-/// runs ungated -- so the caller holds the slot and drops it when the job
-/// finishes. Production only: the test-support handler does not gate, so a global
-/// gate one test set can never park another test's workers.
-#[cfg(not(feature = "test-support"))]
+/// Claims a projection-write slot for work that can commit through event
+/// sorcery, parking while a rebuild is paused. `None` before startup wiring, so
+/// a bare test or process that never calls [`init_projection_maintenance`] runs
+/// ungated. The caller holds the slot until all of its projection writes finish.
+///
+/// Test-support builds stay ungated so a process-global gate initialized by one
+/// test cannot park another test's workers.
 pub(crate) async fn enter_projection_gate() -> Option<quiesce::InFlight> {
-    match PROJECTION_GATE.get() {
-        Some(gate) => Some(gate.enter().await),
-        None => None,
+    #[cfg(feature = "test-support")]
+    {
+        std::future::ready(None).await
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        match PROJECTION_GATE.get() {
+            Some(gate) => Some(gate.enter().await),
+            None => None,
+        }
     }
 }
 

@@ -4436,10 +4436,13 @@ impl<
     /// Broadcasts the burn and durably records its hash via `RecordPendingBurn`,
     /// on a detached task so a cancelling job timeout cannot drop the future
     /// between the (irreversible) broadcast and the record. The task captures only
-    /// owned values plus the shared `Arc`s, so it outlives a cancelled caller.
-    /// Returns the broadcast tx hash once the hash is committed. The record is
-    /// retried a bounded number of times; if every attempt fails the task returns
-    /// the TERMINAL `BurnRecordFailed` (never a silent hash loss), and a JoinError
+    /// owned values plus the shared `Arc`s, so it outlives a cancelled caller. It
+    /// claims its own projection gate slot before any aggregate write or broadcast
+    /// and holds it through the durable record, so an outer worker timeout cannot
+    /// expose that write to a concurrent materialized-view rebuild. Returns the
+    /// broadcast tx hash once the hash is committed. The record is retried a
+    /// bounded number of times; if every attempt fails the task returns the
+    /// TERMINAL `BurnRecordFailed` (never a silent hash loss), and a JoinError
     /// (panic) surfaces as `BurnRecordTaskFailed`.
     ///
     /// The broadcast itself is bounded by [`BURN_BROADCAST_TIMEOUT`]. A submission
@@ -4463,6 +4466,9 @@ impl<
         let task_id = id.clone();
 
         tokio::spawn(async move {
+            let _projection_slot =
+                crate::conductor::projection_pause::enter_projection_gate().await;
+
             // Clear any stale recorded burn hash BEFORE broadcasting, so that if recording THIS
             // burn's hash fails, the resume path sees `pending_burn_tx: None` and fails closed
             // instead of reburning off the stale hash (double-burn). A no-op (no event) on the
