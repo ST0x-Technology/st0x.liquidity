@@ -1120,6 +1120,7 @@ impl RebalancingService {
                 }
                 Err(AggregateError::UserError(LifecycleError::Apply(
                     error @ (PositionError::PendingExecution { .. }
+                    | PositionError::EquityTransferBlockedByFailedOrderAnchor { .. }
                     | PositionError::EquityTransferBlockedByHedge { .. }
                     | PositionError::EquityTransferHedgeEligibilityUnknown { .. }),
                 ))) => {
@@ -1215,6 +1216,7 @@ impl RebalancingService {
                 }
                 Err(AggregateError::UserError(LifecycleError::Apply(
                     PositionError::PendingExecution { .. }
+                    | PositionError::EquityTransferBlockedByFailedOrderAnchor { .. }
                     | PositionError::EquityTransferBlockedByHedge { .. }
                     | PositionError::EquityTransferHedgeEligibilityUnknown { .. },
                 ))) => {
@@ -3502,6 +3504,7 @@ impl RebalancingService {
                     &error,
                     PositionError::PendingExecution { .. }
                         | PositionError::EquityTransferReservationExists { .. }
+                        | PositionError::EquityTransferBlockedByFailedOrderAnchor { .. }
                         | PositionError::EquityTransferBlockedByHedge { .. }
                         | PositionError::EquityTransferHedgeEligibilityUnknown { .. }
                 ) =>

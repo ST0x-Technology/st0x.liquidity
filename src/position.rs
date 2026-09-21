@@ -960,6 +960,11 @@ impl Position {
                 offchain_order_id: pending,
             });
         }
+        if let Some(reservation) = self.equity_transfer_reservation {
+            return Err(PositionError::EquityTransferPending {
+                reservation_id: reservation.id,
+            });
+        }
 
         info!(
             target: "hedge",
@@ -1186,6 +1191,11 @@ impl Position {
         if let Some(pending) = self.pending_offchain_order_id {
             return Err(PositionError::PendingExecution {
                 offchain_order_id: pending,
+            });
+        }
+        if let Some(offchain_order_id) = self.last_failed_offchain_order_id {
+            return Err(PositionError::EquityTransferBlockedByFailedOrderAnchor {
+                offchain_order_id,
             });
         }
 
@@ -1580,6 +1590,11 @@ pub enum PositionError {
         reservation_id: EquityTransferReservationId,
     },
     #[error(
+        "Cannot reserve equity transfer: failed-order anchor {offchain_order_id:?} may still own \
+         this symbol"
+    )]
+    EquityTransferBlockedByFailedOrderAnchor { offchain_order_id: OffchainOrderId },
+    #[error(
         "Cannot reserve equity transfer: position {net_position:?} requires a hedge under \
          threshold {threshold:?}"
     )]
@@ -1712,9 +1727,10 @@ pub enum PositionCommand {
     SettleOnChainFill {
         trade_id: TradeId,
     },
-    /// Claims this symbol for equity transfer sizing. The command is also
-    /// valid against an uninitialized aggregate: zero exposure is not
-    /// hedge-ready, and the supplied threshold seeds the Position.
+    /// Claims this symbol for equity transfer sizing only when no live or
+    /// ambiguously failed broker order owns it. The command is also valid
+    /// against an uninitialized aggregate: zero exposure is not hedge-ready,
+    /// and the supplied threshold seeds the Position.
     ReserveEquityTransfer {
         symbol: Symbol,
         threshold: ExecutionThreshold,
@@ -1743,9 +1759,10 @@ pub enum PositionCommand {
         threshold: ExecutionThreshold,
     },
     /// Claims the position for a broker order found under a preserved failed
-    /// idempotency anchor. This deliberately bypasses the current hedge
-    /// threshold: the broker side effect may already exist and must be polled
-    /// and accounted even if later onchain fills changed the net exposure.
+    /// idempotency anchor, unless an equity transfer already owns it. This
+    /// deliberately bypasses the current hedge threshold: the broker side
+    /// effect may already exist and must be polled and accounted even if later
+    /// onchain fills changed the net exposure.
     RecoverFailedOffChainOrder {
         expected_failed_offchain_order_id: OffchainOrderId,
         offchain_order_id: OffchainOrderId,
@@ -2802,6 +2819,76 @@ mod tests {
             })
             .await
             .then_expect_error();
+    }
+
+    #[tokio::test]
+    async fn failed_order_anchor_blocks_transfer_reservation_below_hedge_threshold() {
+        let anchor = OffchainOrderId::new();
+        let reservation_id = EquityTransferReservationId::generate();
+        let mut history = failed_anchor_history(anchor);
+        history.push(PositionEvent::OnChainOrderFilled {
+            trade_id: TradeId {
+                chain: Chain::Base,
+                tx_hash: TxHash::random(),
+                log_index: 2,
+            },
+            amount: FractionalShares::new(float!(1)),
+            direction: Direction::Sell,
+            price_usdc: float!(100),
+            block_timestamp: Utc::now(),
+            block_number: None,
+            seen_at: Utc::now(),
+        });
+
+        let error = TestHarness::<Position>::with(())
+            .given(history)
+            .when(PositionCommand::ReserveEquityTransfer {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                reservation_id,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                PositionError::EquityTransferBlockedByFailedOrderAnchor {
+                    offchain_order_id
+                }
+            ) if offchain_order_id == anchor
+        ));
+    }
+
+    #[tokio::test]
+    async fn transfer_reservation_blocks_failed_order_recovery() {
+        let anchor = OffchainOrderId::new();
+        let recovery = OffchainOrderId::new();
+        let reservation_id = EquityTransferReservationId::generate();
+        let mut history = failed_anchor_history(anchor);
+        history.push(PositionEvent::EquityTransferReserved {
+            reservation_id,
+            reserved_at: Utc::now(),
+        });
+
+        let error = TestHarness::<Position>::with(())
+            .given(history)
+            .when(PositionCommand::RecoverFailedOffChainOrder {
+                expected_failed_offchain_order_id: anchor,
+                offchain_order_id: recovery,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::EquityTransferPending {
+                reservation_id: actual
+            }) if actual == reservation_id
+        ));
     }
 
     #[test]

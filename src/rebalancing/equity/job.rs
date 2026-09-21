@@ -219,6 +219,7 @@ pub(super) async fn restore_position_reservation(
         Ok(()) => Ok(true),
         Err(AggregateError::UserError(LifecycleError::Apply(
             PositionError::PendingExecution { .. }
+            | PositionError::EquityTransferBlockedByFailedOrderAnchor { .. }
             | PositionError::EquityTransferBlockedByHedge { .. }
             | PositionError::EquityTransferHedgeEligibilityUnknown { .. },
         ))) => Ok(false),
