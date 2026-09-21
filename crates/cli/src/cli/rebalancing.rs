@@ -228,7 +228,9 @@ where
             release_operator_equity_transfer(&services.position_store, symbol, reservation_id).await
     {
         return match result {
-            Ok(()) => Err(release_error),
+            Ok(()) => Err(release_error.context(
+                "the equity transfer completed but its Position reservation could not be released",
+            )),
             Err(error) => Err(error.context(format!(
                 "the transfer also failed to release its Position reservation: \
                  {release_error:#}"

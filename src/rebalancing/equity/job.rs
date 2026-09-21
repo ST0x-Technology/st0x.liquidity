@@ -513,13 +513,15 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
         ctx: &TransferEquityToMarketMakingCtx,
         task_identity: &TaskIdentity,
     ) -> Result<(), BoxDynError> {
-        if let Some(_aggregate) = ctx.mint_store.load(&self.issuer_request_id).await? {
+        if let Some(aggregate) = ctx.mint_store.load(&self.issuer_request_id).await?
+            && !aggregate.is_terminal()
+        {
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
                 issuer_request_id = %self.issuer_request_id,
                 %task_identity,
-                "Terminal mint attempt retained its guard because a lifecycle aggregate exists"
+                "Terminal mint attempt retained its guard because a live lifecycle aggregate exists"
             );
             return Ok(());
         }
@@ -870,13 +872,15 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         ctx: &TransferEquityToHedgingCtx,
         task_identity: &TaskIdentity,
     ) -> Result<(), BoxDynError> {
-        if let Some(_aggregate) = ctx.redemption_store.load(&self.aggregate_id).await? {
+        if let Some(aggregate) = ctx.redemption_store.load(&self.aggregate_id).await?
+            && !aggregate.is_terminal()
+        {
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
                 aggregate_id = %self.aggregate_id,
                 %task_identity,
-                "Terminal redemption attempt retained its guard because a lifecycle aggregate exists"
+                "Terminal redemption attempt retained its guard because a live lifecycle aggregate exists"
             );
             return Ok(());
         }
@@ -2900,6 +2904,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_mint_cleanup_releases_when_aggregate_is_terminal() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::from_parts(NonZeroU32::new(3).unwrap(), 3);
+        let issuer_request_id = issuer_request_id("terminal-mint-terminal-aggregate");
+        let mut ctx = test_ctx(Arc::new(RecordingResume::success())).await;
+
+        // Drive the mint to a terminal Failed state: a terminal aggregate no
+        // longer owns the reservation, so cleanup must release it.
+        ctx.mint_store
+            .send(
+                &issuer_request_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: issuer_request_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        submit_requested_mint(&ctx, &issuer_request_id).await;
+        ctx.mint_store
+            .send(&issuer_request_id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+        ctx.mint_store
+            .send(
+                &issuer_request_id,
+                TokenizedEquityMintCommand::FailWrapping {
+                    reason: "test: forced terminal state".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let position_pool = crate::test_utils::setup_test_db().await;
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(position_pool)
+            .build(())
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(issuer_request_id.0);
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation });
+
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: issuer_request_id.clone(),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
+            generation,
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &TaskIdentity::for_test("terminal-mint-terminal-aggregate"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.equity_in_progress.read().unwrap().get(&symbol), None);
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_mint_cleanup_preserves_legacy_and_newer_owners() {
         let symbol = Symbol::new("AAPL").unwrap();
         let current_generation = GuardGeneration::from_parts(NonZeroU32::new(4).unwrap(), 2);
@@ -3109,6 +3210,105 @@ mod tests {
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
             Some(&GuardState::ActiveTransfer { generation })
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_redemption_cleanup_releases_when_aggregate_is_terminal() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::from_parts(NonZeroU32::new(5).unwrap(), 3);
+        let aggregate_id = redemption_aggregate_id("terminal-redemption-terminal-aggregate");
+        let mut ctx = redemption_test_ctx(
+            Arc::new(RecordingRedemptionResume {
+                fail: false,
+                captured: Mutex::new(None),
+            }),
+            hedging_test_job_queue().await,
+        )
+        .await;
+
+        // Drive the redemption to a terminal Failed state: a terminal aggregate
+        // no longer owns the reservation, so cleanup must release it.
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    amount: U256::from(1_u64),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "test: forced terminal state".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let position_pool = crate::test_utils::setup_test_db().await;
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(position_pool)
+            .build(())
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(aggregate_id.0);
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation });
+
+        let job = TransferEquityToHedging {
+            aggregate_id,
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
+            generation,
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &TaskIdentity::for_test("terminal-redemption-terminal-aggregate"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.equity_in_progress.read().unwrap().get(&symbol), None);
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
         );
     }
 
