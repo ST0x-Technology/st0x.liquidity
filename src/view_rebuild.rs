@@ -331,7 +331,7 @@ async fn rebuild_projection<Entity>(
 where
     Entity: EventSourced<Materialized = Table>,
 {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let rebuilt = rebuild_projection_in::<Entity>(&mut transaction, id).await?;
     if !rebuilt {
         transaction.rollback().await?;
@@ -345,7 +345,7 @@ async fn rebuild_all_projections<Entity>(pool: &SqlitePool) -> Result<(), Projec
 where
     Entity: EventSourced<Materialized = Table>,
 {
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     rebuild_all_projections_in::<Entity>(&mut transaction).await?;
     transaction.commit().await?;
     Ok(())
