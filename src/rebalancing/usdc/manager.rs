@@ -217,6 +217,20 @@ fn classify_vault_withdrawal_error(error: RaindexError) -> UsdcTransferError {
     }
 }
 
+fn classify_vault_withdrawal_scan_error(
+    id: &UsdcRebalanceId,
+    error: RaindexError,
+) -> UsdcTransferError {
+    if error.is_reconciliation_pending() {
+        UsdcTransferError::WithdrawalScanTransient {
+            id: id.clone(),
+            source: Box::new(error),
+        }
+    } else {
+        UsdcTransferError::Vault(error)
+    }
+}
+
 /// The two durable timestamps carried by `AwaitingAttestation`: when the
 /// attestation retry gives up, and when the transfer originally started.
 /// Both are `DateTime<Utc>`, so passing them as adjacent positional
@@ -3787,7 +3801,8 @@ impl<
         let (existing_tx, withdrawn) = self
             .raindex
             .find_recent_withdrawal(USDC_BASE, self.vault_id, from_block)
-            .await?;
+            .await
+            .map_err(|error| classify_vault_withdrawal_scan_error(id, error))?;
 
         // The withdrawal for this transfer already landed on-chain; adopt it
         // instead of re-withdrawing. If it realized a different amount than
@@ -4907,6 +4922,44 @@ mod tests {
         RebalanceDirection, ReconcileReason, TransferRef, UsdcRebalanceError, UsdcRebalanceEvent,
     };
     use st0x_finance::UsdcConversionError;
+
+    #[test]
+    fn withdrawal_scan_inconclusive_classifies_for_delayed_redrive() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = classify_vault_withdrawal_scan_error(
+            &id,
+            RaindexError::ScanInconclusive { from_block: 42 },
+        );
+
+        assert!(matches!(
+            error,
+            UsdcTransferError::WithdrawalScanTransient {
+                id: error_id,
+                source,
+            } if error_id == id
+                && matches!(*source, RaindexError::ScanInconclusive { from_block: 42 })
+        ));
+    }
+
+    #[test]
+    fn deterministic_withdrawal_scan_failure_preserves_vault_error_path() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = classify_vault_withdrawal_scan_error(
+            &id,
+            RaindexError::ScanAnomalousLog {
+                reason: st0x_raindex::ScanAnomaly::MissingTransactionHash,
+            },
+        );
+
+        assert!(matches!(
+            error,
+            UsdcTransferError::Vault(RaindexError::ScanAnomalousLog {
+                reason: st0x_raindex::ScanAnomaly::MissingTransactionHash,
+            })
+        ));
+    }
 
     /// A minimal bridge double for tests that exercise `burn_recording_pending`.
     ///

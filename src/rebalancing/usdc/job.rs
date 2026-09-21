@@ -726,6 +726,20 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                      nothing to redrive, leaving for operator reconciliation"
                 );
             }
+            Err(UsdcTransferError::WithdrawalScanTransient { id, source }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    delay = ?SETTLEMENT_REDRIVE_DELAY,
+                    ?source,
+                    "Rescheduling Base->Alpaca USDC transfer after transient or \
+                     inconclusive vault-withdrawal scan"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue
+                    .push_with_delay(self.clone(), SETTLEMENT_REDRIVE_DELAY)
+                    .await?;
+            }
             // Settlement-phase transient: the Base burn scan was inconclusive
             // (chain head not yet far enough past the scan lower bound) or another
             // settlement-phase RPC check failed transiently. The aggregate is in a
@@ -5414,6 +5428,67 @@ mod tests {
                 && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
             "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
              run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    struct WithdrawalScanFailureBaseToAlpaca;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for WithdrawalScanFailureBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WithdrawalScanTransient {
+                id: id.clone(),
+                source: Box::new(st0x_raindex::RaindexError::ScanInconclusive { from_block: 42 }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn hedging_job_delayed_redrives_transient_withdrawal_scan() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(WithdrawalScanFailureBaseToAlpaca),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let before = Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            1,
+            "a transient withdrawal scan must enqueue one delayed replacement"
+        );
+        assert!(
+            notifier.messages().is_empty(),
+            "a transient withdrawal scan must not fire a terminal alert"
+        );
+        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(rescheduled.id, job.id);
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, job.revert_redrive_attempts,
+            "withdrawal-scan redrive must not consume the burn-redrive budget"
+        );
+        assert!(
+            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by approximately {SETTLEMENT_REDRIVE_DELAY:?}"
         );
     }
 

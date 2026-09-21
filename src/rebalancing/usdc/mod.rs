@@ -76,6 +76,20 @@ pub enum UsdcTransferError {
     BurnRevert(Box<CctpError>),
     #[error("Vault error: {0}")]
     Vault(#[from] RaindexError),
+    /// A fail-closed lookup for a durably recorded `WithdrawalSubmitting`
+    /// transfer could not determine whether the withdrawal mined. Transient
+    /// transport failures and inconclusive scans delayed-redrive without
+    /// consuming the Apalis retry budget; formal RPC rejections and other
+    /// deterministic failures remain [`Self::Vault`].
+    #[error(
+        "USDC rebalance {id}: vault withdrawal scan inconclusive or failed \
+         transiently; will retry after delay"
+    )]
+    WithdrawalScanTransient {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<RaindexError>,
+    },
     /// The shared inventory reverted a `withdraw4` because the vault could not
     /// cover the requested amount (a concurrent clear drained it). Distinct from
     /// the opaque `Vault` wrap so it is not redriven blindly: retrying the same
@@ -568,6 +582,7 @@ impl UsdcTransferError {
             | Self::WalletUsdcAmbientPreflightUnrepresentable { .. }
             | Self::PreflightBalanceUnavailable { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
+            | Self::WithdrawalScanTransient { .. }
             | Self::SettlementCheckTransient { .. }
             | Self::MintRecoveryInconclusive { .. }
             | Self::BurnRecordTaskFailed { .. }
@@ -626,6 +641,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::PreflightBalanceUnavailable { .. }
             | Self::SettlementRetryDeadlineElapsed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
+            | Self::WithdrawalScanTransient { .. }
             | Self::SettlementCheckTransient { .. }
             | Self::MintRecoveryInconclusive { .. }
             | Self::BurnRecordTaskFailed { .. }
