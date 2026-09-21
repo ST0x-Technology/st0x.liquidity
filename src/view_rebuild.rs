@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{AssertSqlSafe, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 
-use st0x_event_sorcery::{EventSourced, LifecycleError, Projection, ProjectionError, Table};
+use st0x_event_sorcery::{EventSourced, LifecycleError, ProjectionError, Table};
 use st0x_execution::{EmptySymbolError, Symbol};
 
 use crate::offchain::order::{OffchainOrder, OffchainOrderId};
@@ -220,74 +220,58 @@ where
     }
 }
 
-/// Transaction-aware rebuild operations missing from event-sorcery's public
-/// projection API. Keeping the transaction caller-owned makes deletion and
-/// replay one atomic operation.
-trait TransactionalProjection<Entity>
+/// Rebuilds one aggregate projection inside a caller-owned transaction so row
+/// deletion and replay remain atomic. Returns `false` when no event stream
+/// exists.
+async fn rebuild_projection_in<Entity>(
+    transaction: &mut Transaction<'_, Sqlite>,
+    id: &Entity::Id,
+) -> Result<bool, ProjectionError<Entity>>
 where
     Entity: EventSourced<Materialized = Table>,
 {
-    async fn rebuild_in(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        id: &Entity::Id,
-    ) -> Result<bool, ProjectionError<Entity>>;
+    let Table(table) = Entity::PROJECTION;
+    let view_id = id.to_string();
 
-    async fn rebuild_all_in(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-    ) -> Result<(), ProjectionError<Entity>>;
+    sqlx::query(AssertSqlSafe(format!(
+        "DELETE FROM {table} WHERE view_id = ?1"
+    )))
+    .bind(&view_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    replay_projection::<Entity>(transaction, table, &view_id).await
 }
 
-impl<Entity> TransactionalProjection<Entity> for Projection<Entity>
+/// Rebuilds every aggregate projection inside one caller-owned transaction.
+async fn rebuild_all_projections_in<Entity>(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), ProjectionError<Entity>>
 where
     Entity: EventSourced<Materialized = Table>,
 {
-    async fn rebuild_in(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        id: &Entity::Id,
-    ) -> Result<bool, ProjectionError<Entity>> {
-        let Table(table) = Entity::PROJECTION;
-        let view_id = id.to_string();
+    let Table(table) = Entity::PROJECTION;
+    let aggregate_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT aggregate_id FROM events \
+         WHERE aggregate_type = ?1 ORDER BY aggregate_id",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .fetch_all(&mut **transaction)
+    .await?;
 
-        sqlx::query(AssertSqlSafe(format!(
-            "DELETE FROM {table} WHERE view_id = ?1"
-        )))
-        .bind(&view_id)
+    sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
         .execute(&mut **transaction)
         .await?;
 
-        replay_projection::<Entity>(transaction, table, &view_id).await
+    for aggregate_id in aggregate_ids {
+        let rebuilt = replay_projection::<Entity>(transaction, table, &aggregate_id).await?;
+        debug_assert!(
+            rebuilt,
+            "an aggregate id selected from events must be replayable"
+        );
     }
 
-    async fn rebuild_all_in(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-    ) -> Result<(), ProjectionError<Entity>> {
-        let Table(table) = Entity::PROJECTION;
-        let aggregate_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT aggregate_id FROM events \
-             WHERE aggregate_type = ?1 ORDER BY aggregate_id",
-        )
-        .bind(Entity::AGGREGATE_TYPE)
-        .fetch_all(&mut **transaction)
-        .await?;
-
-        sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
-            .execute(&mut **transaction)
-            .await?;
-
-        for aggregate_id in aggregate_ids {
-            let rebuilt = replay_projection::<Entity>(transaction, table, &aggregate_id).await?;
-            debug_assert!(
-                rebuilt,
-                "an aggregate id selected from events must be replayable"
-            );
-        }
-
-        Ok(())
-    }
+    Ok(())
 }
 
 async fn replay_projection<Entity>(
@@ -347,9 +331,8 @@ async fn rebuild_projection<Entity>(
 where
     Entity: EventSourced<Materialized = Table>,
 {
-    let projection = Projection::<Entity>::sqlite(pool.clone());
     let mut transaction = pool.begin().await?;
-    let rebuilt = projection.rebuild_in(&mut transaction, id).await?;
+    let rebuilt = rebuild_projection_in::<Entity>(&mut transaction, id).await?;
     if !rebuilt {
         transaction.rollback().await?;
         return Ok(false);
@@ -362,9 +345,8 @@ async fn rebuild_all_projections<Entity>(pool: &SqlitePool) -> Result<(), Projec
 where
     Entity: EventSourced<Materialized = Table>,
 {
-    let projection = Projection::<Entity>::sqlite(pool.clone());
     let mut transaction = pool.begin().await?;
-    projection.rebuild_all_in(&mut transaction).await?;
+    rebuild_all_projections_in::<Entity>(&mut transaction).await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -623,6 +605,7 @@ pub async fn rebuild_view(
 mod tests {
     use chrono::Utc;
     use st0x_config::ExecutionThreshold;
+    use st0x_event_sorcery::Projection;
 
     use super::*;
     use crate::position::PositionEvent;
