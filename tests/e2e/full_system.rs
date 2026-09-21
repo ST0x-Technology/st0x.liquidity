@@ -116,6 +116,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             ))
         })

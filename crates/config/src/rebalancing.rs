@@ -13,7 +13,9 @@ use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
 
-use crate::{ImbalanceThreshold, OperationMode};
+use crate::{
+    AllocationConfig, AllocationConfigError, AllocationCtx, ImbalanceThreshold, OperationMode,
+};
 
 /// Minimum USDC amount for Alpaca withdrawals.
 ///
@@ -55,6 +57,8 @@ pub enum RebalancingCtxError {
     ZeroMaxBurnRevertRedrives,
     #[error("[rebalancing] cash corridor: {0}")]
     CctpCorridor(#[from] CorridorStableNotUsdc),
+    #[error("[rebalancing.allocation]: {0}")]
+    Allocation(#[from] AllocationConfigError),
     #[error("invalid wallet config: {0}")]
     WalletConfig(#[from] toml::de::Error),
     #[error(transparent)]
@@ -78,6 +82,10 @@ pub enum UsdcRebalancing {
 #[serde(deny_unknown_fields)]
 pub struct RebalancingConfig {
     pub equity: ImbalanceThreshold,
+    /// Per-chain equity allocation for the planner that replaces `equity`.
+    /// Optional while the deployed configs gain it; validated against the
+    /// hedged chains at load.
+    pub allocation: Option<AllocationConfig>,
     pub usdc: UsdcRebalancing,
     pub transfer_timeout_secs: u64,
     /// Per-attempt wall-clock bound for a single Base->Alpaca transfer job
@@ -160,6 +168,8 @@ fn default_settlement_retry_deadline_secs() -> u64 {
 #[derive(Clone)]
 pub struct RebalancingCtx {
     pub equity: ImbalanceThreshold,
+    /// See [`RebalancingConfig::allocation`].
+    pub allocation: Option<AllocationCtx>,
     pub usdc: Option<ImbalanceThreshold>,
     pub transfer_timeout: Duration,
     /// Staleness bound for per-chain inventory snapshots. See
@@ -226,8 +236,15 @@ impl RebalancingCtx {
             return Err(RebalancingCtxError::ZeroMaxBurnRevertRedrives);
         }
 
+        let allocation = config
+            .allocation
+            .as_ref()
+            .map(AllocationCtx::new)
+            .transpose()?;
+
         Ok(Self {
             equity: config.equity,
+            allocation,
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
             inventory_staleness_bound: Duration::from_secs(config.inventory_staleness_bound_secs),
@@ -257,6 +274,7 @@ impl RebalancingCtx {
     #[builder]
     pub fn stub(
         equity: ImbalanceThreshold,
+        allocation: Option<AllocationCtx>,
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
@@ -269,6 +287,7 @@ impl RebalancingCtx {
     ) -> Self {
         Self {
             equity,
+            allocation,
             usdc,
             transfer_timeout,
             inventory_staleness_bound,
@@ -296,6 +315,7 @@ impl RebalancingCtx {
     #[builder]
     pub fn with_wallets(
         equity: ImbalanceThreshold,
+        allocation: Option<AllocationCtx>,
         usdc: UsdcRebalancing,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
@@ -315,6 +335,7 @@ impl RebalancingCtx {
 
         Self {
             equity,
+            allocation,
             usdc,
             transfer_timeout,
             inventory_staleness_bound,
@@ -356,6 +377,7 @@ impl std::fmt::Debug for RebalancingCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebalancingCtx")
             .field("equity", &self.equity)
+            .field("allocation", &self.allocation)
             .field("usdc", &self.usdc)
             .field("inventory_staleness_bound", &self.inventory_staleness_bound)
             .field("freeze_check", &self.freeze_check)

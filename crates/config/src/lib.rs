@@ -5,6 +5,7 @@
 //! shared-metadata, and domain crates must remain config-agnostic.
 
 mod alerts;
+mod allocation;
 mod assets;
 mod bot_gas_valuation;
 mod chain;
@@ -21,6 +22,9 @@ mod trading_schedule;
 mod wallet;
 
 pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, LEGACY_GAS_MONITORED_CHAINS};
+pub use allocation::{
+    AllocationConfig, AllocationConfigError, AllocationCtx, DeviationBand, TargetShare,
+};
 pub use assets::{
     CashHedgePolicy, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset,
     EquityHedgePolicy, HedgedEquities, HedgingAssets, OperationMode,

@@ -13,7 +13,8 @@ use thiserror::Error;
 use url::Url;
 
 use st0x_evm::Chain;
-use st0x_execution::Symbol;
+use st0x_execution::{Positive, Symbol};
+use st0x_finance::Usdc;
 
 use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode};
 use crate::enablement::{ChainEnablementError, ChainLifecycle, check_enablement};
@@ -275,6 +276,9 @@ pub struct TradingConfig {
     /// go here. Per chain because a redemption delivers tokens that exist on
     /// one chain, so sending to another chain's issuer address burns them.
     pub redemption_wallet: Option<Address>,
+    /// Overrides `[rebalancing.allocation].min_operation_usd` here: the
+    /// smallest equity transfer worth this chain's gas.
+    pub min_operation_usd: Option<Positive<Usdc>>,
     /// The equities and cash the bot holds on this chain.
     ///
     /// Defaulted rather than required: an absent table and an empty one mean
@@ -392,6 +396,8 @@ pub struct HedgedChain {
     /// Seconds between fill-watch poll cycles on this chain.
     pub order_fill_poll_interval: std::time::Duration,
     pub redemption_wallet: Option<Address>,
+    /// See [`TradingConfig::min_operation_usd`].
+    pub min_operation_usd: Option<Positive<Usdc>>,
     pub assets: ChainAssets,
 }
 
@@ -421,6 +427,7 @@ impl HedgedChain {
         #[builder(default = std::time::Duration::from_secs(1))]
         order_fill_poll_interval: std::time::Duration,
         redemption_wallet: Option<Address>,
+        min_operation_usd: Option<Positive<Usdc>>,
         #[builder(default)] assets: ChainAssets,
     ) -> Self {
         Self {
@@ -435,6 +442,7 @@ impl HedgedChain {
             ingestion_cutoff,
             order_fill_poll_interval,
             redemption_wallet,
+            min_operation_usd,
             assets,
         }
     }
@@ -454,6 +462,7 @@ impl std::fmt::Debug for HedgedChain {
             .field("ingestion_cutoff", &self.ingestion_cutoff)
             .field("order_fill_poll_interval", &self.order_fill_poll_interval)
             .field("redemption_wallet", &self.redemption_wallet)
+            .field("min_operation_usd", &self.min_operation_usd)
             .field("assets", &self.assets)
             .finish()
     }
@@ -486,6 +495,7 @@ impl HedgedChain {
                 trading.order_fill_poll_interval_secs,
             ),
             redemption_wallet: trading.redemption_wallet,
+            min_operation_usd: trading.min_operation_usd,
             assets: trading.assets.clone(),
         })
     }
@@ -947,6 +957,7 @@ mod tests {
                         rebalancing: OperationMode::Enabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
+                        target_share: None,
                     },
                 )]),
                 operational_limit: None,
@@ -972,6 +983,7 @@ mod tests {
             rebalancing,
             wrapped_equity_recovery: OperationMode::Disabled,
             operational_limit: None,
+            target_share: None,
         };
         let assets = ChainAssets {
             equities: ChainEquities {

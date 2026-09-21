@@ -252,6 +252,7 @@ mod tests {
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
+                        target_share: None,
                     },
                 )]),
             },
@@ -724,6 +725,7 @@ mod tests {
                         operational_limit: Some(
                             Positive::new(FractionalShares::new(float!(3.0))).unwrap(),
                         ),
+                        target_share: None,
                     },
                 )]),
             },

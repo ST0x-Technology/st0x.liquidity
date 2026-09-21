@@ -302,6 +302,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
+                    target_share: None,
                 },
             ))
         })
@@ -405,6 +406,7 @@ where
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
+                    target_share: None,
                 },
             ))
         })

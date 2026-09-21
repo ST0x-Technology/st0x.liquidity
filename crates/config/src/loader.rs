@@ -2954,6 +2954,7 @@ pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
 
     let config = RebalancingConfig {
         equity,
+        allocation: None,
         usdc: crate::UsdcRebalancing::Disabled,
         inventory_staleness_bound_secs: 300,
         transfer_timeout_secs: 1800,

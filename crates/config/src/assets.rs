@@ -21,6 +21,8 @@ use thiserror::Error;
 use st0x_execution::{FractionalShares, Positive, Symbol};
 use st0x_finance::{Usd, Usdc};
 
+use crate::TargetShare;
+
 /// Whether a per-asset operation (trading or rebalancing) is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -110,6 +112,9 @@ pub struct ChainEquityAsset {
     /// Per chain because tokens are deliverable only where they sit: a symbol
     /// that is net flat across chains can still be untradeable on each of them.
     pub operational_limit: Option<Positive<FractionalShares>>,
+    /// Overrides `[rebalancing.allocation].targets` for this equity on this
+    /// chain.
+    pub target_share: Option<TargetShare>,
 }
 
 /// Cash (USDC) as it exists on one chain.
@@ -573,6 +578,7 @@ mod tests {
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
 
@@ -646,6 +652,7 @@ mod tests {
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
 
@@ -684,6 +691,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
 
@@ -725,6 +733,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
 

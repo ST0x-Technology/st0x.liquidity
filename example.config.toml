@@ -183,6 +183,8 @@ primary = true
 # needs none, and no wrapper vault either. Also used by the alpaca-redeem and
 # transfer-equity CLI commands (overridable there with --redemption-wallet).
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+# Overrides [rebalancing.allocation].min_operation_usd on this chain.
+# min_operation_usd = 100
 
 # Ethereum is a cash-corridor endpoint only: the bot holds USDC and signs
 # there, but runs no orderbook and ingests no fills, so it has no [trading]
@@ -334,6 +336,25 @@ freeze_check = "enabled"
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 
+# Optional: the per-chain equity allocation that replaces `equity` once the
+# planner is wired. `targets` gives each hedged chain's share of every
+# equity's total inventory (an equity overrides it with `target_share` on its
+# chain entry); the broker holds the rest and a mint never takes its available
+# shares below `alpaca_floor`. Load fails when, for any rebalanced equity, the
+# chain targets plus the floor exceed 1, when a target names a chain that is
+# not hedged, or when a rebalanced equity has no target on its chain.
+# `deviation` is the band around each target inside which nothing runs;
+# `min_operation_usd` is the smallest transfer worth its gas, valued at the
+# last hedge price (a chain overrides it with `min_operation_usd` on its
+# trading table); `cooldown_secs` pauses re-planning of a (symbol, chain)
+# after an operation.
+# [rebalancing.allocation]
+# targets = { base = 0.5 }
+# alpaca_floor = 0.1
+# deviation = 0.2
+# min_operation_usd = 100
+# cooldown_secs = 600
+
 [chains.base.trading.assets.equities.EXAMPLE]
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -352,6 +373,8 @@ wrapped_equity_recovery = "disabled"
 # Single vault: vault_ids = "0xab12"
 # Multiple vaults: vault_ids = ["0xab12", "0xcd34"]
 # operational_limit = 100.0
+# Overrides [rebalancing.allocation].targets for this equity on this chain.
+# target_share = 0.5
 
 [chains.base.trading.assets.cash]
 rebalancing = "enabled"
