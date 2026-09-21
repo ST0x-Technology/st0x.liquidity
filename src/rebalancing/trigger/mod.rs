@@ -3724,18 +3724,17 @@ impl RebalancingService {
             );
         }
 
-        let last_price = match self.last_prices.read().await.clone() {
-            Some(reader) => reader.last_price(symbol).await?,
-            None => {
-                warn!(
-                    target: "rebalance",
-                    %symbol,
-                    "No last-price reader is wired, so the minimum operation size cannot \
-                     be valued"
-                );
-                None
-            }
+        let reader = self.last_prices.read().await.clone();
+        let Some(reader) = reader else {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "No last-price reader is wired, so the minimum operation size cannot \
+                 be valued"
+            );
+            return Ok(EquityPlan::Decline(DeclineReason::PriceMissing));
         };
+        let last_price = reader.last_price(symbol).await?;
         // Stamped after the price read so an observation made during the
         // reads above is never mistaken for a future one.
         let now = Utc::now();

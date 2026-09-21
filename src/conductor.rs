@@ -2139,6 +2139,34 @@ async fn wire_freeze_guard(
     Ok(())
 }
 
+/// Hands the trigger the handles only the query manifest can produce: the
+/// stores it emits timeout failures through, the Position authority that
+/// arbitrates transfer admission against hedges, and the position projection
+/// it values minimum operation sizes with.
+async fn attach_manifest_handles(
+    rebalancing_service: &RebalancingService,
+    built: &BuiltFrameworks,
+    execution_threshold: ExecutionThreshold,
+) {
+    rebalancing_service
+        .set_stores(
+            built.mint.clone(),
+            built.redemption.clone(),
+            built.usdc.clone(),
+        )
+        .await;
+    rebalancing_service
+        .set_position_authority(
+            built.position.clone(),
+            built.position_projection.clone(),
+            execution_threshold,
+        )
+        .await;
+    rebalancing_service
+        .set_last_price_reader(built.position_projection.clone())
+        .await;
+}
+
 /// Wires the pre-dispatch safety checks used by fresh rebalancing transfers:
 /// the USDC corridor's gas check, one gas check per equity chain, and the
 /// dividend freeze guard.
@@ -3196,23 +3224,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )
         .await?;
 
-        rebalancing_service
-            .set_stores(
-                built.mint.clone(),
-                built.redemption.clone(),
-                built.usdc.clone(),
-            )
-            .await;
-        rebalancing_service
-            .set_position_authority(
-                built.position.clone(),
-                built.position_projection.clone(),
-                deps.ctx.execution_threshold,
-            )
-            .await;
-        rebalancing_service
-            .set_last_price_reader(built.position_projection.clone())
-            .await;
+        attach_manifest_handles(&rebalancing_service, &built, deps.ctx.execution_threshold).await;
 
         let recovery_transfer = Arc::new(
             CrossVenueEquityTransfer::new(
