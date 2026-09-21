@@ -7366,6 +7366,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_usdc_transfer_returns_503_before_conductor_ready() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        // Eligible, so a 503 proves the readiness gate fires before any write.
+        seed_usdc_bridging_failed(&state.pool, &id).await;
+
+        let resp = reconcile_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(ReconcileUsdcRequest {
+                reason: ReconcileReasonWire::FundsMovedManually,
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            matches!(
+                load_usdc_rebalance(&state.pool, &id).await,
+                UsdcRebalance::BridgingFailed { .. }
+            ),
+            "a refused request must not touch the aggregate",
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_usdc_transfer_reconciles_a_post_burn_failure() {
         let pool = crate::test_utils::setup_test_db().await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
