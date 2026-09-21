@@ -405,7 +405,7 @@ mod tests {
             }
             // A non-blank reason with the same shape parses.
             let argv: Vec<&str> = verb.iter().copied().chain(["real reason"]).collect();
-            assert!(debug(&argv).is_ok(), "{argv:?} must parse");
+            debug(&argv).unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
         }
     }
 
