@@ -1,5 +1,6 @@
 //! Rebalancing trigger that reacts to inventory imbalances.
 
+pub(crate) mod allocation;
 mod equity;
 mod freeze;
 mod usdc;
