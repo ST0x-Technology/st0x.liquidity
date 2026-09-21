@@ -126,8 +126,9 @@ pub(crate) fn usdc_driver_pause() -> (UsdcDriverPause, UsdcDriverGate) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     /// The USDC wrapper maps the generic refusal to [`DriverNotQuiesced`] and
     /// applies [`DRIVER_QUIESCE_TIMEOUT`]: an execution that outlasts the window

@@ -219,8 +219,9 @@ pub(crate) fn quiesce(timeout: Duration) -> (Quiesce, QuiesceGate) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
