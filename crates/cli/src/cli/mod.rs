@@ -4520,9 +4520,12 @@ mod tests {
                 max_burn_revert_redrives = 5
                 freeze_check = "disabled"
 
-                [rebalancing.equity]
-                target = "0.5"
-                deviation = "0.2"
+                [rebalancing.allocation]
+                targets = { base = 0.5 }
+                alpaca_floor = 0.1
+                deviation = 0.2
+                min_operation_usd = 10
+                cooldown_secs = 300
 
                 [rebalancing.usdc]
                 mode = "disabled"

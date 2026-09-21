@@ -843,10 +843,6 @@ mod tests {
             assets: HedgingAssets::default(),
             rebalancing: Box::new(
                 RebalancingCtx::stub()
-                    .equity(ImbalanceThreshold {
-                        target: float!(0.5),
-                        deviation: float!(0.1),
-                    })
                     .usdc(ImbalanceThreshold {
                         target: Float::zero().unwrap(),
                         deviation: Float::zero().unwrap(),

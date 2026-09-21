@@ -2932,11 +2932,8 @@ fn build_rebalancing_service(
     deps: &RebalancingDeps,
     registry_ids: BTreeMap<Chain, VaultRegistryId>,
     wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
-) -> anyhow::Result<Arc<RebalancingService>> {
-    let allocation = rebalancing_ctx
-        .allocation
-        .clone()
-        .context("[rebalancing.allocation] is required: the equity trigger plans from it")?;
+) -> Arc<RebalancingService> {
+    let allocation = rebalancing_ctx.allocation.clone();
     let chains = deps
         .ctx
         .chains
@@ -2954,7 +2951,7 @@ fn build_rebalancing_service(
         })
         .collect();
 
-    Ok(Arc::new(RebalancingService::new(
+    Arc::new(RebalancingService::new(
         RebalancingServiceConfig {
             poll_freshness: deps.poll_freshness.clone(),
             inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
@@ -2971,7 +2968,7 @@ fn build_rebalancing_service(
         wrappers,
         deps.schedulers.clone(),
         deps.notifier.clone(),
-    )))
+    ))
 }
 
 /// Every hedged chain's equity transfer services, plus the per-chain vault
@@ -3204,7 +3201,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let primary_equity_services = equity_transfer_services.for_chain(primary_chain)?.clone();
 
         let rebalancing_service =
-            build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone())?;
+            build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
 
         wire_transfer_admission_guards(
             &rebalancing_service,

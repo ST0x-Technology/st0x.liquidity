@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 pub(crate) use st0x_config::InventoryMode;
 use st0x_config::{BrokerCtx, ChainAssets, Ctx, OnchainWalletCtx};
 pub(crate) use st0x_event_sorcery::Projection;
-use st0x_evm::Wallet;
+use st0x_evm::{Chain, Wallet};
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
 pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
@@ -19,7 +19,7 @@ pub(crate) use st0x_hedge::ExecutionThreshold;
 use st0x_hedge::OffchainOrderId;
 use st0x_hedge::bindings::IRaindexV6;
 use st0x_hedge::mock_api::REDEMPTION_WALLET;
-use st0x_hedge::{ImbalanceThreshold, OperationMode, RebalancingCtx, UsdcRebalancing};
+use st0x_hedge::{AllocationCtx, OperationMode, RebalancingCtx, UsdcRebalancing};
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
 pub(crate) use crate::assert::ExpectedPosition;
@@ -106,7 +106,11 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         OnchainWalletCtx::from_wallets(wallet.clone(), wallet.clone(), wallet.clone(), wallet);
 
     let rebalancing_ctx = RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(float!(0.5), float!(0.1))?)
+        .allocation(AllocationCtx::single_chain_test(
+            Chain::Base,
+            float!(0.5),
+            float!(0.1),
+        )?)
         .usdc(UsdcRebalancing::Disabled)
         .freeze_check(OperationMode::Disabled)
         .call();

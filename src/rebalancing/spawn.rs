@@ -269,10 +269,6 @@ mod tests {
 
     fn make_ctx() -> RebalancingCtx {
         RebalancingCtx::stub()
-            .equity(ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
-            })
             .allocation(AllocationCtx::base_test())
             .usdc(ImbalanceThreshold {
                 target: float!(0.6),
@@ -358,7 +354,7 @@ mod tests {
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
-            allocation: ctx.allocation.clone().unwrap(),
+            allocation: ctx.allocation.clone(),
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
             chains: BTreeMap::new(),
@@ -389,7 +385,7 @@ mod tests {
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
-            allocation: ctx.allocation.clone().unwrap(),
+            allocation: ctx.allocation.clone(),
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
             chains: BTreeMap::new(),

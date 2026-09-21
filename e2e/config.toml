@@ -104,9 +104,12 @@ settlement_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
 freeze_check = "disabled"
 
-[rebalancing.equity]
-target = 0.5
+[rebalancing.allocation]
+targets = { base = 0.5 }
+alpaca_floor = 0
 deviation = 0.05
+min_operation_usd = 1
+cooldown_secs = 1
 
 [rebalancing.usdc]
 mode = "disabled"

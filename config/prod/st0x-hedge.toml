@@ -246,9 +246,21 @@ mode = "enabled"
 target = 0.6
 deviation = 0.05
 
-[rebalancing.equity]
-target = 0.5
+# Equity allocation across the hedged chains (st0x.liquidity RAI-2082). Base
+# keeps the 50% target and 5% band the retired [rebalancing.equity] table
+# carried; Robinhood is hedge-only and Ethereum runs no orderbook, so neither
+# gets a target and the broker holds the other 50%. alpaca_floor keeps a
+# tenth of every equity's total at the broker as the hedging reserve (inert
+# beside a 50% target: a mint stops there anyway). min_operation_usd sits two
+# orders of magnitude above a Base mint's gas while still letting the cheapest
+# listings rebalance; cooldown_secs matches the inventory staleness bound, so
+# a limit-truncated transfer re-fires once per poll window, not every tick.
+[rebalancing.allocation]
+targets = { base = 0.5 }
+alpaca_floor = 0.1
 deviation = 0.05
+min_operation_usd = 10
+cooldown_secs = 300
 
 [rest_api]
 url = "https://api.st0x.io"

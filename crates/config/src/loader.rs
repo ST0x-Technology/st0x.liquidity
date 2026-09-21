@@ -1798,9 +1798,7 @@ fn validate_config(
             return Err(CtxError::MissingRebalancing);
         };
         RebalancingCtx::new(rebalancing)?;
-        if let Some(allocation) = &rebalancing.allocation {
-            allocation.validate(&config.chains)?;
-        }
+        rebalancing.allocation.validate(&config.chains)?;
 
         let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
 
@@ -1937,9 +1935,7 @@ fn parse_and_validate(
     };
 
     let rebalancing = Box::new(RebalancingCtx::new(&rebalancing_config)?);
-    if let Some(allocation) = &rebalancing_config.allocation {
-        allocation.validate(&config.chains)?;
-    }
+    rebalancing_config.allocation.validate(&config.chains)?;
 
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
 
@@ -2959,12 +2955,21 @@ pub fn test_issuance_status_ctx(base_url: Url) -> IssuanceStatusCtx {
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
-    let equity = crate::ImbalanceThreshold::new(float!(0.5), float!(0.1))
-        .unwrap_or_else(|_| unreachable!("hardcoded threshold literals are valid"));
-
     let config = RebalancingConfig {
-        equity,
-        allocation: None,
+        equity: None,
+        allocation: crate::AllocationConfig {
+            targets: std::collections::BTreeMap::from([(
+                st0x_evm::Chain::Base,
+                crate::TargetShare::new(float!(0.5))
+                    .unwrap_or_else(|_| unreachable!("hardcoded share literals are valid")),
+            )]),
+            alpaca_floor: crate::TargetShare::ZERO,
+            deviation: crate::DeviationBand::new(float!(0.1))
+                .unwrap_or_else(|_| unreachable!("hardcoded band literals are valid")),
+            min_operation_usd: st0x_execution::Positive::new(st0x_finance::Usdc::new(float!(1)))
+                .unwrap_or_else(|_| unreachable!("one dollar is positive")),
+            cooldown_secs: 1,
+        },
         usdc: crate::UsdcRebalancing::Disabled,
         inventory_staleness_bound_secs: 300,
         transfer_timeout_secs: 1800,
@@ -3197,9 +3202,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "disabled"
@@ -3286,9 +3299,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "disabled"
@@ -3873,9 +3894,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = {{ base = 0.5 }}
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "disabled"
@@ -5380,9 +5409,17 @@ mod tests {
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "enabled"
@@ -5479,9 +5516,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "disabled"
@@ -5656,9 +5701,17 @@ mod tests {
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "enabled"
@@ -6213,9 +6266,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "enabled"
@@ -6325,9 +6386,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "enabled"
@@ -6450,9 +6519,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "enabled"
@@ -6572,9 +6649,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = {{ base = 0.5 }}
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "enabled"
@@ -7934,9 +8019,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "disabled"
@@ -8611,9 +8704,17 @@ mod tests {
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "enabled"
@@ -9057,13 +9158,13 @@ mod tests {
         );
     }
 
+    /// The example's own allocation section is the one the validator reads;
+    /// a per-listing `target_share` override rides beside it.
     #[test]
     fn validate_config_file_accepts_the_allocation_section() {
-        let config_str = format!(
-            "{}\n[rebalancing.allocation]\ntargets = {{ base = 0.5 }}\nalpaca_floor = 0.1\n\
-             deviation = 0.2\nmin_operation_usd = 100\ncooldown_secs = 600\n",
-            std::fs::read_to_string(example_config_toml()).unwrap()
-        );
+        let config_str = std::fs::read_to_string(example_config_toml())
+            .unwrap()
+            .replace("# target_share = 0.5", "target_share = 0.4");
         let config = toml_file(&config_str);
 
         Ctx::validate_config_file(config.path()).unwrap();
@@ -9073,11 +9174,9 @@ mod tests {
     /// secrets-free validator, so the config-drift gate catches them.
     #[test]
     fn validate_config_file_refuses_an_allocation_target_on_an_unhedged_chain() {
-        let config_str = format!(
-            "{}\n[rebalancing.allocation]\ntargets = {{ hyperevm = 0.5 }}\nalpaca_floor = 0.1\n\
-             deviation = 0.2\nmin_operation_usd = 100\ncooldown_secs = 600\n",
-            std::fs::read_to_string(example_config_toml()).unwrap()
-        );
+        let config_str = std::fs::read_to_string(example_config_toml())
+            .unwrap()
+            .replace("targets = { base = 0.5 }", "targets = { hyperevm = 0.5 }");
         let config = toml_file(&config_str);
 
         let error = Ctx::validate_config_file(config.path()).unwrap_err();
@@ -10330,9 +10429,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "disabled"
@@ -10514,9 +10621,17 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
 
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
+            [rebalancing.allocation]
+
+            targets = { base = 0.5 }
+
+            alpaca_floor = 0.1
+
+            deviation = 0.2
+
+            min_operation_usd = 10
+
+            cooldown_secs = 300
 
             [rebalancing.usdc]
             mode = "disabled"
