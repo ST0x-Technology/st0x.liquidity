@@ -141,3 +141,213 @@ pub enum AllocationConfigError {
     #[error(transparent)]
     Float(#[from] FloatError),
 }
+
+#[cfg(test)]
+mod tests {
+    use st0x_execution::Symbol;
+
+    use super::*;
+    use crate::{ChainConfig, ChainLifecycle, TradingConfig};
+
+    fn allocation(targets: &str, alpaca_floor: &str) -> AllocationConfig {
+        toml::from_str(&format!(
+            r#"
+            targets = {targets}
+            alpaca_floor = {alpaca_floor}
+            deviation = 0.05
+            min_operation_usd = 100
+            cooldown_secs = 600
+            "#
+        ))
+        .unwrap()
+    }
+
+    /// A hedged chain listing AAPL with the given flag and optional
+    /// `target_share` override.
+    fn hedged(lifecycle: ChainLifecycle, rebalancing: &str, target_share: &str) -> ChainConfig {
+        let trading: TradingConfig = toml::from_str(&format!(
+            r#"
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "legacy"
+            inventory_adapters = []
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            order_fill_poll_interval_secs = 1
+            ingestion_cutoff = "safe"
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            trading = "enabled"
+            rebalancing = "{rebalancing}"
+            wrapped_equity_recovery = "disabled"
+            {target_share}
+            "#
+        ))
+        .unwrap();
+
+        ChainConfig {
+            lifecycle,
+            required_confirmations: 1,
+            trading: Some(trading),
+        }
+    }
+
+    fn transport() -> ChainConfig {
+        ChainConfig {
+            lifecycle: ChainLifecycle::Active,
+            required_confirmations: 1,
+            trading: None,
+        }
+    }
+
+    fn aapl() -> Symbol {
+        Symbol::new("AAPL").unwrap()
+    }
+
+    #[test]
+    fn targets_that_leave_room_for_the_floor_pass() {
+        let chains = BTreeMap::from([
+            (Chain::Base, hedged(ChainLifecycle::Active, "enabled", "")),
+            (Chain::Ethereum, transport()),
+        ]);
+
+        allocation(r#"{ base = 0.6 }"#, "0.4")
+            .validate(&chains)
+            .unwrap();
+    }
+
+    #[test]
+    fn targets_plus_floor_above_one_are_refused_per_symbol() {
+        let chains = BTreeMap::from([
+            (Chain::Base, hedged(ChainLifecycle::Active, "enabled", "")),
+            (
+                Chain::HyperEvm,
+                hedged(ChainLifecycle::Active, "enabled", ""),
+            ),
+        ]);
+
+        let error = allocation(r#"{ base = 0.5, hyperevm = 0.4 }"#, "0.2")
+            .validate(&chains)
+            .unwrap_err();
+
+        let AllocationConfigError::TargetsExceedOne { symbol, total } = error else {
+            panic!("expected TargetsExceedOne, got {error:?}");
+        };
+        assert_eq!(symbol, aapl());
+        assert!(total.eq(float!(1.1)).unwrap(), "got {total:?}");
+    }
+
+    /// The per-equity override replaces the chain default in the sum, in
+    /// both directions.
+    #[test]
+    fn per_asset_target_share_replaces_the_chain_target_in_the_sum() {
+        let over = BTreeMap::from([(
+            Chain::Base,
+            hedged(ChainLifecycle::Active, "enabled", r#"target_share = 0.9"#),
+        )]);
+        let error = allocation(r#"{ base = 0.5 }"#, "0.2")
+            .validate(&over)
+            .unwrap_err();
+        assert!(
+            matches!(error, AllocationConfigError::TargetsExceedOne { .. }),
+            "got {error:?}"
+        );
+
+        let under = BTreeMap::from([(
+            Chain::Base,
+            hedged(ChainLifecycle::Active, "enabled", r#"target_share = 0.7"#),
+        )]);
+        allocation(r#"{ base = 0.9 }"#, "0.2")
+            .validate(&under)
+            .unwrap();
+    }
+
+    #[test]
+    fn target_on_a_chain_without_a_trading_table_is_refused() {
+        let chains = BTreeMap::from([
+            (Chain::Base, hedged(ChainLifecycle::Active, "enabled", "")),
+            (Chain::Ethereum, transport()),
+        ]);
+
+        let error = allocation(r#"{ base = 0.5, ethereum = 0.1 }"#, "0.1")
+            .validate(&chains)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AllocationConfigError::TargetOnUnhedgedChain {
+                    chain: Chain::Ethereum
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn target_on_a_disabled_chain_is_refused() {
+        let chains = BTreeMap::from([
+            (Chain::Base, hedged(ChainLifecycle::Active, "enabled", "")),
+            (
+                Chain::HyperEvm,
+                hedged(ChainLifecycle::Disabled, "disabled", ""),
+            ),
+        ]);
+
+        let error = allocation(r#"{ base = 0.5, hyperevm = 0.1 }"#, "0.1")
+            .validate(&chains)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AllocationConfigError::TargetOnUnhedgedChain {
+                    chain: Chain::HyperEvm
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn rebalanced_equity_without_a_target_on_its_chain_is_refused() {
+        let chains = BTreeMap::from([
+            (Chain::Base, hedged(ChainLifecycle::Active, "enabled", "")),
+            (
+                Chain::HyperEvm,
+                hedged(ChainLifecycle::Active, "enabled", ""),
+            ),
+        ]);
+
+        let error = allocation(r#"{ base = 0.5 }"#, "0.1")
+            .validate(&chains)
+            .unwrap_err();
+
+        let AllocationConfigError::MissingTarget { chain, symbol } = error else {
+            panic!("expected MissingTarget, got {error:?}");
+        };
+        assert_eq!(chain, Chain::HyperEvm);
+        assert_eq!(symbol, aapl());
+    }
+
+    /// A hedge-only listing is never planned, so it needs no target and
+    /// its chain's default does not count against the symbol.
+    #[test]
+    fn a_listing_with_rebalancing_disabled_needs_no_target() {
+        let chains = BTreeMap::from([
+            (Chain::Base, hedged(ChainLifecycle::Active, "enabled", "")),
+            (
+                Chain::Robinhood,
+                hedged(ChainLifecycle::Prefunded, "disabled", ""),
+            ),
+        ]);
+
+        allocation(r#"{ base = 0.6 }"#, "0.4")
+            .validate(&chains)
+            .unwrap();
+        allocation(r#"{ base = 0.6, robinhood = 0.4 }"#, "0.4")
+            .validate(&chains)
+            .unwrap();
+    }
+}

@@ -3068,7 +3068,9 @@ mod tests {
 
     use super::*;
     use crate::chain::IngestionCutoffTag;
-    use crate::{ChainLifecycle, ChainRole, ExecutionThreshold, InventoryModeTag};
+    use crate::{
+        AllocationConfigError, ChainLifecycle, ChainRole, ExecutionThreshold, InventoryModeTag,
+    };
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -9044,6 +9046,42 @@ mod tests {
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
             "expected ConfigToml, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_file_accepts_the_allocation_section() {
+        let config_str = format!(
+            "{}\n[rebalancing.allocation]\ntargets = {{ base = 0.5 }}\nalpaca_floor = 0.1\n\
+             deviation = 0.2\nmin_operation_usd = 100\ncooldown_secs = 600\n",
+            std::fs::read_to_string(example_config_toml()).unwrap()
+        );
+        let config = toml_file(&config_str);
+
+        Ctx::validate_config_file(config.path()).unwrap();
+    }
+
+    /// The allocation targets are checked against the chain tables by the
+    /// secrets-free validator, so the config-drift gate catches them.
+    #[test]
+    fn validate_config_file_refuses_an_allocation_target_on_an_unhedged_chain() {
+        let config_str = format!(
+            "{}\n[rebalancing.allocation]\ntargets = {{ hyperevm = 0.5 }}\nalpaca_floor = 0.1\n\
+             deviation = 0.2\nmin_operation_usd = 100\ncooldown_secs = 600\n",
+            std::fs::read_to_string(example_config_toml()).unwrap()
+        );
+        let config = toml_file(&config_str);
+
+        let error = Ctx::validate_config_file(config.path()).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::Allocation(AllocationConfigError::TargetOnUnhedgedChain {
+                    chain: Chain::HyperEvm
+                })
+            ),
+            "expected TargetOnUnhedgedChain, got {error:?}"
         );
     }
 
