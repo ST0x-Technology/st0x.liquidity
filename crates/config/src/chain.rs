@@ -919,6 +919,8 @@ mod tests {
     use std::collections::HashMap;
 
     use st0x_execution::Symbol;
+    use st0x_finance::Usdc;
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::assets::ChainEquities;
@@ -1835,6 +1837,49 @@ mod tests {
         assert!(
             error.to_string().contains("ingestion_cutoff"),
             "expected missing-field error for ingestion_cutoff, got: {error}"
+        );
+    }
+
+    /// A per-chain `min_operation_usd` overrides the global allocation
+    /// minimum and travels to the hedged chain. Optional, so a trading table
+    /// without one keeps parsing.
+    #[test]
+    fn trading_min_operation_usd_override_reaches_the_hedged_chain() {
+        let trading = |extra: &str| -> TradingConfig {
+            toml::from_str(&format!(
+                "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+                 inventory_mode = \"legacy\"\n\
+                 inventory_adapters = []\n\
+                 vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+                 deployment_block = 1\n\
+                 order_fill_poll_interval_secs = 1\n\
+                 primary = true\n\
+                 ingestion_cutoff = \"safe\"\n\
+                 {extra}"
+            ))
+            .unwrap()
+        };
+
+        assert!(matches!(trading("").min_operation_usd, None));
+
+        let config = trading("min_operation_usd = 250");
+        assert!(
+            config
+                .min_operation_usd
+                .unwrap()
+                .inner()
+                .eq(&Usdc::new(float!(250)))
+                .unwrap()
+        );
+
+        let ctx =
+            HedgedChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
+        assert!(
+            ctx.min_operation_usd
+                .unwrap()
+                .inner()
+                .eq(&Usdc::new(float!(250)))
+                .unwrap()
         );
     }
 }

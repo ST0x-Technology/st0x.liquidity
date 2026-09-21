@@ -365,10 +365,11 @@ impl std::fmt::Debug for RebalancingCtx {
 
 #[cfg(test)]
 mod tests {
-    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
+    use st0x_evm::{Chain, USDC_BASE, USDC_ETHEREUM};
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::AllocationConfigError;
 
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
@@ -918,5 +919,181 @@ mod tests {
             error.message().contains("max_burn_revert_redrives"),
             "Expected missing max_burn_revert_redrives error, got: {error}"
         );
+    }
+
+    fn allocation_toml(allocation: &str) -> String {
+        format!(
+            "{}\n[allocation]\n{allocation}",
+            valid_rebalancing_config_toml()
+        )
+    }
+
+    /// The allocation table is optional beside the equity threshold, so the
+    /// deployed configs keep parsing until they gain it.
+    #[test]
+    fn allocation_section_is_optional() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+
+        assert!(matches!(config.allocation, None));
+        assert!(matches!(
+            RebalancingCtx::new(&config).unwrap().allocation,
+            None
+        ));
+    }
+
+    #[test]
+    fn allocation_section_parses_beside_the_equity_threshold() {
+        let config: RebalancingConfig = toml::from_str(&allocation_toml(
+            r#"
+            targets = { base = "0.6", ethereum = 0.1 }
+            alpaca_floor = "0.1"
+            deviation = 0.05
+            min_operation_usd = 100
+            cooldown_secs = 600
+            "#,
+        ))
+        .unwrap();
+
+        let allocation = config.allocation.as_ref().unwrap();
+        assert_eq!(allocation.targets.len(), 2);
+        assert!(
+            allocation.targets[&Chain::Base]
+                .inner()
+                .eq(float!(0.6))
+                .unwrap()
+        );
+        assert!(
+            allocation.targets[&Chain::Ethereum]
+                .inner()
+                .eq(float!(0.1))
+                .unwrap()
+        );
+        assert!(allocation.alpaca_floor.inner().eq(float!(0.1)).unwrap());
+        assert!(allocation.deviation.inner().eq(float!(0.05)).unwrap());
+        assert!(
+            allocation
+                .min_operation_usd
+                .inner()
+                .eq(&Usdc::new(float!(100)))
+                .unwrap()
+        );
+        assert_eq!(allocation.cooldown_secs, 600);
+        assert!(config.equity.target.eq(float!(0.5)).unwrap());
+
+        let ctx = RebalancingCtx::new(&config).unwrap();
+        let allocation = ctx.allocation.unwrap();
+        assert_eq!(allocation.cooldown, Duration::from_secs(600));
+        assert!(
+            allocation.targets[&Chain::Base]
+                .inner()
+                .eq(float!(0.6))
+                .unwrap()
+        );
+        assert!(allocation.alpaca_floor.inner().eq(float!(0.1)).unwrap());
+        assert!(allocation.deviation.inner().eq(float!(0.05)).unwrap());
+        assert!(
+            allocation
+                .min_operation_usd
+                .inner()
+                .eq(&Usdc::new(float!(100)))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn allocation_target_share_above_one_is_refused() {
+        let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
+            r#"
+            targets = { base = 1.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 100
+            cooldown_secs = 600
+            "#,
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("target share"),
+            "expected a target share range error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn allocation_negative_deviation_is_refused() {
+        let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
+            r#"
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = -0.05
+            min_operation_usd = 100
+            cooldown_secs = 600
+            "#,
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("deviation band"),
+            "expected a deviation band error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn allocation_zero_minimum_operation_is_refused() {
+        let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
+            r#"
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 0
+            cooldown_secs = 600
+            "#,
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("positive"),
+            "expected a positive minimum error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn allocation_unknown_key_is_refused() {
+        let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
+            r#"
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 100
+            cooldown_secs = 600
+            hysteresis = 0.01
+            "#,
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("hysteresis"),
+            "expected an unknown field error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn zero_allocation_cooldown_fails_validation() {
+        let config: RebalancingConfig = toml::from_str(&allocation_toml(
+            r#"
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 100
+            cooldown_secs = 0
+            "#,
+        ))
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            RebalancingCtxError::Allocation(AllocationConfigError::ZeroCooldown)
+        ));
     }
 }
