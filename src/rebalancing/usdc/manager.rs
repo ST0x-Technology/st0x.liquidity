@@ -5286,10 +5286,6 @@ impl CctpMintRecoveryError {
     /// [`CctpError::MalformedAttestation`]) that retrying cannot fix, as is a
     /// deterministic mint submission failure.
     pub(crate) fn is_retryable(&self) -> bool {
-        // Retryable only for an attestation that is not definitively malformed:
-        // Circle has not attested yet, or a transient transport hiccup. A
-        // malformed complete attestation and a failed mint are hard failures
-        // retrying cannot fix.
         matches!(
             self,
             Self::Attestation { source, .. }
