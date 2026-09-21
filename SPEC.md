@@ -5505,11 +5505,20 @@ effect rather than a generic intent:
   recover, only a missing fill to backfill. It **fails closed on a fill already
   recorded** in the `OnChainTrade` log, whether acknowledged or merely
   witnessed: re-applying it would double-count the position, so only a fill with
-  no record is accounted. It runs in direct-DB mode and **must not run while the
-  bot is concurrently accounting the same symbol** -- the CLI and the bot are
-  separate processes that no in-process lock can serialize, so the persisted
-  pending-acknowledgement set (see ADR 0010), not process isolation, is what
-  makes a cross-process re-drive reject as a duplicate rather than double-count.
+  no record is accounted. It has two execution paths. The **CLI** runs it in
+  direct-DB mode, in a separate process from the bot: because no in-process lock
+  can serialize across processes, the persisted pending-acknowledgement set (see
+  ADR 0010), not process isolation, is what makes a cross-process re-drive
+  reject as a duplicate rather than double-count, so the CLI path **must not run
+  while the bot is concurrently accounting the same symbol**. The **in-bot REST
+  route** (`POST /liquidity-write/transactions/{tx_hash}/process`) instead runs
+  inside the live bot and serializes its position claim and broker placement
+  against the trading loop through the shared counter-trade submission lock (ADR
+  0014), so it does **not** require stopping the bot; it gates on full startup
+  readiness (503 until then), selects the hedged chain from the `chain` query
+  (defaulting to the primary), returns the decoded fill alongside its outcome,
+  and runs the accounting and placement on a detached task so a client
+  disconnect cannot strand a placed order before its Submitted event persists.
 
 **Standing rules:**
 
@@ -5578,11 +5587,16 @@ effect rather than a generic intent:
   (crash- recovery window), and creates the full witness/acknowledge record for
   genuinely missed fills — so every subsequent re-delivery, whether from another
   CLI run or the normal pipeline, hits the dedup guard and skips cleanly.
-  **Operational precondition**: run with exclusive processing for that fill:
-  stop the live bot, drain any apalis accounting job for the fill, and do not
-  run another `process-tx` for the same `(tx_hash, log_index)` concurrently. The
-  durable dedup guard and the CQRS apply are separate transactions, so any
-  concurrent actor processing the same fill can slip through the TOCTOU window.
+  **Operational precondition (CLI direct-DB path)**: run with exclusive
+  processing for that fill: stop the live bot, drain any apalis accounting job
+  for the fill, and do not run another `process-tx` for the same
+  `(tx_hash, log_index)` concurrently. The durable dedup guard and the CQRS
+  apply are separate transactions, so any concurrent actor processing the same
+  fill can slip through the TOCTOU window. The **in-bot REST route lifts this
+  precondition**: it holds the shared submission lock across the position claim
+  and broker placement and gates on full startup readiness, so it runs safely
+  against the live pipeline without stopping the bot; the same durable dedup
+  guard still rejects a re-drive of an already-recorded fill.
 
 ### Event Processing Flow
 

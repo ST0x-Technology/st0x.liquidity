@@ -35,7 +35,7 @@ use st0x_evm::Chain;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::{FractionalShares, Positive};
-use st0x_float_serde::format_float_with_fallback;
+use st0x_float_serde::format_float;
 use st0x_registry::SymbolCache;
 use st0x_tokenization::IssuerRequestId;
 
@@ -2573,16 +2573,18 @@ struct ProcessTxFillResponse {
     price: String,
 }
 
-impl From<ProcessTxFill> for ProcessTxFillResponse {
-    fn from(fill: ProcessTxFill) -> Self {
-        Self {
+impl TryFrom<ProcessTxFill> for ProcessTxFillResponse {
+    type Error = rain_math_float::FloatError;
+
+    fn try_from(fill: ProcessTxFill) -> Result<Self, Self::Error> {
+        Ok(Self {
             tx_hash: fill.tx_hash.to_string(),
             log_index: fill.log_index,
             symbol: fill.symbol.to_string(),
             direction: format!("{:?}", fill.direction),
             quantity: fill.quantity.to_string(),
-            price: format_float_with_fallback(&fill.price),
-        }
+            price: format_float(&fill.price)?,
+        })
     }
 }
 
@@ -2652,12 +2654,17 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
     }
 }
 
-impl From<ProcessTxReport> for ProcessTxResponse {
-    fn from(report: ProcessTxReport) -> Self {
-        Self {
-            fill: report.fill.map(ProcessTxFillResponse::from),
+impl TryFrom<ProcessTxReport> for ProcessTxResponse {
+    type Error = rain_math_float::FloatError;
+
+    fn try_from(report: ProcessTxReport) -> Result<Self, Self::Error> {
+        Ok(Self {
+            fill: report
+                .fill
+                .map(ProcessTxFillResponse::try_from)
+                .transpose()?,
             outcome: ProcessTxOutcomeResponse::from(report.outcome),
-        }
+        })
     }
 }
 
@@ -2791,7 +2798,16 @@ async fn process_transaction(
     })?
     .map_err(ops_operator_error)?;
 
-    Ok(Json(ProcessTxResponse::from(report)))
+    let response = ProcessTxResponse::try_from(report).map_err(|error| {
+        error!(%error, "failed to format the process-tx response");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "failed to format the process-tx response".to_owned(),
+            }),
+        )
+    })?;
+    Ok(Json(response))
 }
 
 /// Wire contract for the portfolio-snapshot mark route.
@@ -7515,7 +7531,7 @@ mod tests {
 
         for (report, expected) in cases {
             assert_eq!(
-                serde_json::to_value(ProcessTxResponse::from(report)).unwrap(),
+                serde_json::to_value(ProcessTxResponse::try_from(report).unwrap()).unwrap(),
                 expected,
             );
         }
