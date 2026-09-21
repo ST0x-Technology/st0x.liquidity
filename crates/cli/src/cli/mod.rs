@@ -2115,7 +2115,19 @@ async fn run_provider_command<W: Write + Send>(
             let trading_chain = ctx.chains.hedged_chain(chain).ok_or_else(|| {
                 anyhow::anyhow!("process-tx chain {chain} is not configured as a hedged chain")
             })?;
-            let provider = ProviderBuilder::new().connect_http(trading_chain.rpc_url.clone());
+            // Bound the RPC transport so a hung endpoint surfaces as an error
+            // instead of parking the process-tx call indefinitely (RAI-2218),
+            // mirroring the ops-API provider in src/api.rs.
+            let rpc_url = trading_chain.rpc_url.clone();
+            let http_client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?;
+            let is_local = alloy::transports::utils::guess_local_url(rpc_url.as_str());
+            let transport = alloy::transports::http::Http::with_client(http_client, rpc_url);
+            let rpc_client =
+                alloy::rpc::client::ClientBuilder::default().transport(transport, is_local);
+            let provider = ProviderBuilder::new().connect_client(rpc_client);
             info!("Processing transaction: tx_hash={tx_hash}, chain={chain}");
             let cache = SymbolCache::default();
             trading::process_tx_with_provider(
