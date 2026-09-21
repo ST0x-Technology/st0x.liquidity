@@ -645,7 +645,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// should drive, not the CLI. The set mirrors the apalis worker's own
 /// delayed-redrive outcomes: `AttestationTimedOut`, the settlement-wait
 /// errors (`WithdrawalTxUnderconfirmed`, `WalletUsdcInsufficient`,
-/// `SettlementCheckTransient`), a non-backpressure
+/// `WithdrawalScanTransient`, `SettlementCheckTransient`), a non-backpressure
 /// `WithdrawalPollInconclusive` (Alpaca unreachable), and
 /// `MintRecoveryInconclusive`. The CLI must NOT keep redriving these itself:
 /// its process would race the bot's worker on the same aggregate (the
@@ -658,6 +658,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         UsdcTransferError::AttestationTimedOut { .. }
         | UsdcTransferError::WithdrawalTxUnderconfirmed { .. }
         | UsdcTransferError::WalletUsdcInsufficient { .. }
+        | UsdcTransferError::WithdrawalScanTransient { .. }
         | UsdcTransferError::SettlementCheckTransient { .. }
         | UsdcTransferError::MintRecoveryInconclusive { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
@@ -2394,6 +2395,10 @@ mod tests {
             UsdcTransferError::SettlementCheckTransient {
                 id: id.clone(),
                 source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
+            },
+            UsdcTransferError::WithdrawalScanTransient {
+                id: id.clone(),
+                source: Box::new(st0x_raindex::RaindexError::ScanInconclusive { from_block: 99 }),
             },
             UsdcTransferError::MintRecoveryInconclusive {
                 id: id.clone(),
