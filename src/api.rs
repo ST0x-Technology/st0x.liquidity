@@ -2374,11 +2374,10 @@ struct FailUsdcTransferResponse {
     transfer_id: String,
     outcome: &'static str,
     /// Whether the rebalancing guard is still held after the failure. False
-    /// for BaseToAlpaca (no funds left the source venue; the guard clears on
-    /// the next stuck-operation sweep past the transfer timeout or on
-    /// restart). True for AlpacaToBase: the withdrawal already moved the funds
-    /// off Alpaca, so the guard stays held until `reconcile-usdc` settles
-    /// them.
+    /// for BaseToAlpaca: no funds left the source venue, and the wired-store
+    /// reactor clears the live guard as the failure event lands. True for
+    /// AlpacaToBase: the withdrawal already moved the funds off Alpaca, so the
+    /// guard stays held until `reconcile-usdc` settles them.
     guard_held: bool,
 }
 
