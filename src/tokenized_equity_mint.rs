@@ -1460,7 +1460,9 @@ impl PartialEq for TokenizedEquityMint {
 impl Eq for TokenizedEquityMint {}
 
 impl TokenizedEquityMint {
-    pub(crate) fn symbol(&self) -> &Symbol {
+    /// The equity symbol this mint is for. `pub` for the operator CLI, which
+    /// refuses a resume whose `--symbol` disagrees with the record.
+    pub fn symbol(&self) -> &Symbol {
         match self {
             Self::MintRequested { symbol, .. }
             | Self::MintAccepted { symbol, .. }

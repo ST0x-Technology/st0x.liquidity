@@ -507,29 +507,35 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     let chain = Chain::from(network);
 
     // A resume continues the transfer the record describes, so the recorded
-    // chain decides: driving it on another network would use the wrong
-    // orderbook, wrapper and issuer wallet. Only a mint resumes by id; a
-    // redemption always starts fresh, so `to-alpaca` never consults the record.
+    // chain and symbol decide: driving it on another network or against another
+    // symbol would use the wrong orderbook, wrapper, issuer wallet or Position.
+    // Only a mint resumes by id; a redemption always starts fresh, so
+    // `to-alpaca` never consults the record.
     let recorded = match (direction, issuer_request_id) {
         (TransferDirection::ToRaindex, Some(uuid)) => {
             let id = IssuerRequestId(uuid);
             st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &id)
                 .await?
-                .map(|entity| (id, entity.chain()))
+                .map(|entity| (id, entity.chain(), entity.symbol().clone()))
         }
         (TransferDirection::ToRaindex, None) | (TransferDirection::ToAlpaca, _) => None,
     };
 
     let existing_mint = recorded.is_some();
-    match &recorded {
-        Some((id, recorded)) if *recorded != chain => {
+    if let Some((id, recorded_chain, recorded_symbol)) = &recorded {
+        if *recorded_chain != chain {
             anyhow::bail!(
-                "mint {id} was requested on {recorded}; --network {chain} would resume it \
+                "mint {id} was requested on {recorded_chain}; --network {chain} would resume it \
                  against another chain's orderbook and issuer wallet. Re-run with \
-                 --network {recorded}"
+                 --network {recorded_chain}"
             );
         }
-        Some(_) | None => {}
+        if *recorded_symbol != symbol {
+            anyhow::bail!(
+                "mint {id} was requested for {recorded_symbol}; --symbol {symbol} would resume it \
+                 against another symbol's Position and vault. Re-run with --symbol {recorded_symbol}"
+            );
+        }
     }
 
     let direction_str = match direction {
@@ -3738,6 +3744,60 @@ mod tests {
         assert!(
             error.ends_with("Re-run with --network ethereum"),
             "expected the refusal to point at the recorded chain, got: {error}"
+        );
+    }
+
+    /// A resume continues the transfer the record describes. Naming another
+    /// symbol would drive it against the wrong Position, vault and orderbook,
+    /// so the recorded symbol decides and a disagreement is refused before
+    /// anything reaches the chain.
+    #[tokio::test]
+    async fn transfer_equity_resume_refuses_a_symbol_the_record_disagrees_with() {
+        let ctx = create_alpaca_ctx_hedging_on_ethereum();
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-mint-resume-symbol-mismatch");
+
+        send_mint_command(
+            &pool,
+            &id,
+            TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: id.clone(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                chain: Chain::Ethereum,
+                quantity: float!(10),
+                wallet: Address::ZERO,
+            },
+        )
+        .await;
+
+        let IssuerRequestId(uuid) = id;
+        let mut stdout = Vec::new();
+        let error = transfer_equity_command(
+            &mut stdout,
+            TransferEquity {
+                direction: TransferDirection::ToRaindex,
+                symbol: Symbol::new("MSFT").unwrap(),
+                quantity: FractionalShares::new(float!(10)),
+                issuer_request_id: Some(uuid),
+                redemption_wallet: None,
+                network: TokenizationNetwork::Ethereum,
+            },
+            &ctx,
+            &pool,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.starts_with(&format!(
+                "mint {uuid} was requested for AAPL; --symbol MSFT would resume it"
+            )),
+            "expected the recorded-symbol mismatch refusal, got: {error}"
+        );
+        assert!(
+            error.ends_with("Re-run with --symbol AAPL"),
+            "expected the refusal to point at the recorded symbol, got: {error}"
         );
     }
 
