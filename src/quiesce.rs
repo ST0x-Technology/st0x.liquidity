@@ -228,10 +228,7 @@ mod tests {
     #[tokio::test]
     async fn pause_quiesces_when_nothing_is_in_flight() {
         let (control, _gate) = quiesce(TEST_TIMEOUT);
-        assert!(
-            control.pause().await.is_ok(),
-            "an idle set must quiesce at once"
-        );
+        control.pause().await.unwrap();
     }
 
     #[tokio::test]
@@ -251,15 +248,12 @@ mod tests {
         let (control, gate) = quiesce(TEST_TIMEOUT);
         let executing = gate.enter().await;
 
-        let pause = tokio::spawn(async move { control.pause().await.is_ok() });
+        let pause = tokio::spawn(async move { control.pause().await });
         // Give the pause a moment to raise the flag and start waiting.
         tokio::time::sleep(Duration::from_millis(20)).await;
         drop(executing);
 
-        assert!(
-            pause.await.unwrap(),
-            "the pause completes once in-flight drains"
-        );
+        pause.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -301,12 +295,12 @@ mod tests {
         let (control, gate) = quiesce(TEST_TIMEOUT);
         let executing = gate.enter().await;
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), control.pause())
-                .await
-                .is_err(),
-            "the outer timeout must cancel a pause waiting for an in-flight execution"
-        );
+        match tokio::time::timeout(Duration::from_millis(10), control.pause()).await {
+            Err(_) => {}
+            Ok(_) => {
+                panic!("the outer timeout must cancel a pause waiting for an in-flight execution")
+            }
+        }
 
         drop(executing);
         drop(
@@ -342,9 +336,6 @@ mod tests {
         );
 
         drop(first);
-        assert!(
-            second.await.unwrap().is_ok(),
-            "the second pause proceeds after the first drops"
-        );
+        second.await.unwrap().unwrap();
     }
 }
