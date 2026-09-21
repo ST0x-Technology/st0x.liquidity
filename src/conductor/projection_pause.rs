@@ -116,8 +116,9 @@ impl ProjectionMaintenance {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     /// The rebuild race: a projection write already in flight must drain before a
     /// pause is granted, and a new writer cannot claim the gate while the pause
