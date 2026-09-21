@@ -1115,4 +1115,67 @@ mod tests {
             RebalancingCtxError::Allocation(AllocationConfigError::ZeroCooldown)
         ));
     }
+
+    /// The threshold `[rebalancing.allocation]` replaced is refused with its
+    /// replacement spelled out, not as an anonymous unknown key.
+    #[test]
+    fn retired_equity_threshold_is_refused_by_name() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [equity]
+            target = 0.5
+            deviation = 0.2
+
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 10
+            cooldown_secs = 300
+
+            [usdc]
+            mode = "disabled"
+            "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+
+        assert!(
+            matches!(error, RebalancingCtxError::RetiredEquityThreshold),
+            "expected the retired key refused by name, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn allocation_section_is_required() {
+        let error = toml::from_str::<RebalancingConfig>(
+            r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [usdc]
+            mode = "disabled"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("allocation"),
+            "expected the missing allocation section named, got: {error}"
+        );
+    }
 }
