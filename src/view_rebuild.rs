@@ -145,20 +145,6 @@ pub enum ViewRebuildError {
     PortfolioSnapshot(crate::portfolio_snapshot::projection::ProjectionError),
 }
 
-impl ViewRebuildError {
-    /// Whether the failure is the caller's (bad scope or id) rather than the
-    /// store's.
-    pub const fn is_caller_error(&self) -> bool {
-        matches!(
-            self,
-            Self::WholeModelOnly { .. }
-                | Self::InvalidPositionId { .. }
-                | Self::InvalidOffchainOrderId { .. }
-                | Self::InvalidVaultRegistryId { .. }
-        )
-    }
-}
-
 /// Local mirror of event-sorcery's private lifecycle state. The serialized
 /// shape must remain identical because the framework deserializes these rows.
 #[derive(Default, Serialize)]
@@ -358,67 +344,61 @@ where
     Ok(())
 }
 
-/// Rebuilds `view` for `scope` by deleting the affected rows and replaying the
-/// event log. The caller must exclude concurrent projection writers.
-pub async fn rebuild_view(
-    pool: &SqlitePool,
+/// A validated rebuild target. Single-aggregate variants carry their parsed,
+/// view-specific id, so executing one cannot discover a caller error after a
+/// projection-maintenance pause has begun.
+#[derive(Debug)]
+pub enum ParsedRebuildScope {
+    /// One position projection.
+    Position { requested_id: String, id: Symbol },
+    /// One offchain-order projection.
+    OffchainOrder {
+        requested_id: String,
+        id: OffchainOrderId,
+    },
+    /// One vault-registry projection.
+    VaultRegistry {
+        requested_id: String,
+        id: VaultRegistryId,
+    },
+    /// Every row of the selected view or read model.
+    All(RebuildableView),
+}
+
+/// Validates a requested scope and parses a single aggregate id into the type
+/// its projection uses. This performs no store access.
+pub fn parse_rebuild_scope(
     view: RebuildableView,
     scope: RebuildScope,
-) -> Result<ViewRebuilt, ViewRebuildError> {
-    let replayed = match (view, &scope) {
-        (RebuildableView::Position, RebuildScope::Id(id)) => {
-            let symbol: Symbol =
-                id.parse()
+) -> Result<ParsedRebuildScope, ViewRebuildError> {
+    match (view, scope) {
+        (RebuildableView::Position, RebuildScope::Id(requested_id)) => {
+            let id =
+                requested_id
+                    .parse()
                     .map_err(|source| ViewRebuildError::InvalidPositionId {
-                        id: id.to_owned(),
+                        id: requested_id.clone(),
                         source,
                     })?;
-            rebuild_projection::<Position>(pool, &symbol)
-                .await
-                .map_err(ViewRebuildError::Position)?;
-            None
+            Ok(ParsedRebuildScope::Position { requested_id, id })
         }
-        (RebuildableView::Position, RebuildScope::All) => {
-            rebuild_all_projections::<Position>(pool)
-                .await
-                .map_err(ViewRebuildError::Position)?;
-            None
+        (RebuildableView::OffchainOrder, RebuildScope::Id(requested_id)) => {
+            let id = requested_id.parse().map_err(|source| {
+                ViewRebuildError::InvalidOffchainOrderId {
+                    id: requested_id.clone(),
+                    source,
+                }
+            })?;
+            Ok(ParsedRebuildScope::OffchainOrder { requested_id, id })
         }
-        (RebuildableView::OffchainOrder, RebuildScope::Id(id)) => {
-            let order_id: OffchainOrderId =
-                id.parse()
-                    .map_err(|source| ViewRebuildError::InvalidOffchainOrderId {
-                        id: id.to_owned(),
-                        source,
-                    })?;
-            rebuild_projection::<OffchainOrder>(pool, &order_id)
-                .await
-                .map_err(ViewRebuildError::OffchainOrder)?;
-            None
-        }
-        (RebuildableView::OffchainOrder, RebuildScope::All) => {
-            rebuild_all_projections::<OffchainOrder>(pool)
-                .await
-                .map_err(ViewRebuildError::OffchainOrder)?;
-            None
-        }
-        (RebuildableView::VaultRegistry, RebuildScope::Id(id)) => {
-            let registry_id: VaultRegistryId =
-                id.parse()
-                    .map_err(|source| ViewRebuildError::InvalidVaultRegistryId {
-                        id: id.to_owned(),
-                        source,
-                    })?;
-            rebuild_projection::<VaultRegistry>(pool, &registry_id)
-                .await
-                .map_err(ViewRebuildError::VaultRegistry)?;
-            None
-        }
-        (RebuildableView::VaultRegistry, RebuildScope::All) => {
-            rebuild_all_projections::<VaultRegistry>(pool)
-                .await
-                .map_err(ViewRebuildError::VaultRegistry)?;
-            None
+        (RebuildableView::VaultRegistry, RebuildScope::Id(requested_id)) => {
+            let id = requested_id.parse().map_err(|source| {
+                ViewRebuildError::InvalidVaultRegistryId {
+                    id: requested_id.clone(),
+                    source,
+                }
+            })?;
+            Ok(ParsedRebuildScope::VaultRegistry { requested_id, id })
         }
         (
             RebuildableView::RebalanceTiming
@@ -426,31 +406,96 @@ pub async fn rebuild_view(
             | RebuildableView::LifecycleFailure
             | RebuildableView::PortfolioSnapshot,
             RebuildScope::Id(_),
-        ) => return Err(ViewRebuildError::WholeModelOnly { view }),
-        (RebuildableView::RebalanceTiming, RebuildScope::All) => Some(
-            RebalanceTimingProjection::new(pool.clone())
-                .rebuild_all()
+        ) => Err(ViewRebuildError::WholeModelOnly { view }),
+        (view, RebuildScope::All) => Ok(ParsedRebuildScope::All(view)),
+    }
+}
+
+/// Executes a previously validated rebuild by deleting the affected rows and
+/// replaying the event log. The caller must exclude concurrent projection
+/// writers.
+pub async fn execute_rebuild_view(
+    pool: &SqlitePool,
+    scope: ParsedRebuildScope,
+) -> Result<ViewRebuilt, ViewRebuildError> {
+    let (view, scope, replayed) = match scope {
+        ParsedRebuildScope::Position { requested_id, id } => {
+            rebuild_projection::<Position>(pool, &id)
                 .await
-                .map_err(ViewRebuildError::RebalanceTiming)?,
-        ),
-        (RebuildableView::EquityTiming, RebuildScope::All) => Some(
-            EquityTimingProjection::new(pool.clone())
-                .rebuild_all()
+                .map_err(ViewRebuildError::Position)?;
+            (
+                RebuildableView::Position,
+                RebuildScope::Id(requested_id),
+                None,
+            )
+        }
+        ParsedRebuildScope::OffchainOrder { requested_id, id } => {
+            rebuild_projection::<OffchainOrder>(pool, &id)
                 .await
-                .map_err(ViewRebuildError::EquityTiming)?,
-        ),
-        (RebuildableView::LifecycleFailure, RebuildScope::All) => Some(
-            LifecycleFailureProjection::new(pool.clone())
-                .rebuild_all()
+                .map_err(ViewRebuildError::OffchainOrder)?;
+            (
+                RebuildableView::OffchainOrder,
+                RebuildScope::Id(requested_id),
+                None,
+            )
+        }
+        ParsedRebuildScope::VaultRegistry { requested_id, id } => {
+            rebuild_projection::<VaultRegistry>(pool, &id)
                 .await
-                .map_err(ViewRebuildError::LifecycleFailure)?,
-        ),
-        (RebuildableView::PortfolioSnapshot, RebuildScope::All) => Some(
-            PortfolioSnapshotProjection::new(pool.clone())
-                .rebuild_all()
-                .await
-                .map_err(ViewRebuildError::PortfolioSnapshot)?,
-        ),
+                .map_err(ViewRebuildError::VaultRegistry)?;
+            (
+                RebuildableView::VaultRegistry,
+                RebuildScope::Id(requested_id),
+                None,
+            )
+        }
+        ParsedRebuildScope::All(view) => {
+            let replayed = match view {
+                RebuildableView::Position => {
+                    rebuild_all_projections::<Position>(pool)
+                        .await
+                        .map_err(ViewRebuildError::Position)?;
+                    None
+                }
+                RebuildableView::OffchainOrder => {
+                    rebuild_all_projections::<OffchainOrder>(pool)
+                        .await
+                        .map_err(ViewRebuildError::OffchainOrder)?;
+                    None
+                }
+                RebuildableView::VaultRegistry => {
+                    rebuild_all_projections::<VaultRegistry>(pool)
+                        .await
+                        .map_err(ViewRebuildError::VaultRegistry)?;
+                    None
+                }
+                RebuildableView::RebalanceTiming => Some(
+                    RebalanceTimingProjection::new(pool.clone())
+                        .rebuild_all()
+                        .await
+                        .map_err(ViewRebuildError::RebalanceTiming)?,
+                ),
+                RebuildableView::EquityTiming => Some(
+                    EquityTimingProjection::new(pool.clone())
+                        .rebuild_all()
+                        .await
+                        .map_err(ViewRebuildError::EquityTiming)?,
+                ),
+                RebuildableView::LifecycleFailure => Some(
+                    LifecycleFailureProjection::new(pool.clone())
+                        .rebuild_all()
+                        .await
+                        .map_err(ViewRebuildError::LifecycleFailure)?,
+                ),
+                RebuildableView::PortfolioSnapshot => Some(
+                    PortfolioSnapshotProjection::new(pool.clone())
+                        .rebuild_all()
+                        .await
+                        .map_err(ViewRebuildError::PortfolioSnapshot)?,
+                ),
+            };
+            (view, RebuildScope::All, replayed)
+        }
     };
 
     Ok(ViewRebuilt {
@@ -458,6 +503,17 @@ pub async fn rebuild_view(
         scope,
         replayed,
     })
+}
+
+/// Validates and executes a rebuild for direct database callers that do not
+/// manage projection maintenance separately.
+pub async fn rebuild_view(
+    pool: &SqlitePool,
+    view: RebuildableView,
+    scope: RebuildScope,
+) -> Result<ViewRebuilt, ViewRebuildError> {
+    let scope = parse_rebuild_scope(view, scope)?;
+    execute_rebuild_view(pool, scope).await
 }
 
 #[cfg(test)]
@@ -469,18 +525,15 @@ mod tests {
     use crate::position::PositionEvent;
     use crate::test_utils::{persist_event, setup_test_db};
 
-    #[tokio::test]
-    async fn read_models_refuse_a_single_id() {
-        let pool = setup_test_db().await;
+    #[test]
+    fn read_models_refuse_a_single_id_during_parsing() {
         for view in [
             RebuildableView::RebalanceTiming,
             RebuildableView::EquityTiming,
             RebuildableView::LifecycleFailure,
             RebuildableView::PortfolioSnapshot,
         ] {
-            let error = rebuild_view(&pool, view, RebuildScope::Id("x".to_owned()))
-                .await
-                .unwrap_err();
+            let error = parse_rebuild_scope(view, RebuildScope::Id("x".to_owned())).unwrap_err();
             assert!(
                 matches!(error, ViewRebuildError::WholeModelOnly { view: refused } if refused == view),
                 "{view}: {error}"
@@ -489,21 +542,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_malformed_id_is_a_caller_error_before_any_store_access() {
-        let pool = setup_test_db().await;
-        let error = rebuild_view(
-            &pool,
+    #[test]
+    fn a_malformed_id_is_a_caller_error_during_parsing() {
+        let error = parse_rebuild_scope(
             RebuildableView::VaultRegistry,
             RebuildScope::Id("no-delimiter".to_owned()),
         )
-        .await
         .unwrap_err();
         assert!(
             matches!(error, ViewRebuildError::InvalidVaultRegistryId { .. }),
             "{error}"
         );
-        assert!(error.is_caller_error());
         // The typed source chain is preserved, not flattened into a string.
         assert!(
             std::error::Error::source(&error).is_some(),
