@@ -11123,7 +11123,8 @@ mod tests {
 
     /// The trigger's own pre-plan skip is a decline too: a listing chain
     /// whose poll aged out counts as `chain_stale`, one never polled since
-    /// boot as `chain_unpolled`.
+    /// boot as `chain_unpolled`, and the line says how stale against which
+    /// bound.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn unvouched_listing_chain_declines_are_counted_by_reason() {
@@ -11152,6 +11153,10 @@ mod tests {
             assert!(
                 logs_contain(reason),
                 "the decline must be recorded as {reason}"
+            );
+            assert!(
+                logs_contain("bound_secs=300"),
+                "the {reason} decline must say which bound the poll missed"
             );
         }
     }
