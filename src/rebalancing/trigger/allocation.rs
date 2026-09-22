@@ -674,44 +674,58 @@ mod tests {
     }
 
     /// Base's redemption ranks first but its wallet has no gas, and the
-    /// fallback mint on HyperEVM is then floor-capped, unpriced or stale.
-    /// The decline names the gas: the blocker on the best-ranked candidate.
+    /// fallback mint on HyperEVM is then floor-capped. The decline names
+    /// the gas: the blocker on the best-ranked candidate.
     #[test]
-    fn symbol_wide_declines_keep_the_higher_ranked_drop() {
-        let onchain = || {
-            BTreeMap::from([
-                (
-                    Chain::Base,
-                    ChainSlot {
-                        gas_ready: false,
-                        ..slot("60", "0.3")
-                    },
-                ),
-                (Chain::HyperEvm, slot("10", "0.4")),
-            ])
-        };
-        let no_gas = EquityPlan::Decline(DeclineReason::NoGas { chain: Chain::Base });
-
+    fn floor_capped_decline_keeps_the_higher_ranked_drop() {
         let floor_capped = plan_equity_operation(&EquityPlanInput {
             alpaca_floor: target("0.9"),
-            ..input(Some(balance("20")), onchain())
+            ..input(Some(balance("20")), gasless_base_and_hyperevm())
         })
         .unwrap();
-        assert_eq!(floor_capped, no_gas, "floor-capped fallback");
 
+        assert_eq!(
+            floor_capped,
+            EquityPlan::Decline(DeclineReason::NoGas { chain: Chain::Base })
+        );
+    }
+
+    /// The same gasless Base over an unpriced or stale symbol: the price
+    /// declines the symbol before any candidate is tried, so the gas drop
+    /// never masks it.
+    #[test]
+    fn price_declines_pre_empt_a_higher_ranked_drop() {
         let price_missing = plan_equity_operation(&EquityPlanInput {
             last_price: None,
-            ..input(Some(balance("20")), onchain())
+            ..input(Some(balance("20")), gasless_base_and_hyperevm())
         })
         .unwrap();
-        assert_eq!(price_missing, no_gas, "unpriced fallback");
+        assert_eq!(
+            price_missing,
+            EquityPlan::Decline(DeclineReason::PriceMissing)
+        );
 
         let price_stale = plan_equity_operation(&EquityPlanInput {
             last_price: Some(observed("100", now() - TimeDelta::seconds(301))),
-            ..input(Some(balance("20")), onchain())
+            ..input(Some(balance("20")), gasless_base_and_hyperevm())
         })
         .unwrap();
-        assert_eq!(price_stale, no_gas, "stale-priced fallback");
+        assert_eq!(price_stale, EquityPlan::Decline(DeclineReason::PriceStale));
+    }
+
+    /// Base's redemption ranks first but its wallet has no gas; HyperEVM's
+    /// mint is the fallback.
+    fn gasless_base_and_hyperevm() -> BTreeMap<Chain, ChainSlot> {
+        BTreeMap::from([
+            (
+                Chain::Base,
+                ChainSlot {
+                    gas_ready: false,
+                    ..slot("60", "0.3")
+                },
+            ),
+            (Chain::HyperEvm, slot("10", "0.4")),
+        ])
     }
 
     #[test]
