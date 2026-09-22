@@ -7624,6 +7624,7 @@ mod tests {
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
+                    target_share: None,
                 },
             ))
             .collect(),
