@@ -226,8 +226,9 @@ pub mod equity_transfer {
         #[error("redemption {0} already reconciled")]
         RedemptionAlreadyReconciled(RedemptionAggregateId),
         #[error(
-            "redemption {0} has an unresolved vault withdrawal submission; \
-             resume/reconcile it before force-failing"
+            "redemption {0} has an unresolved vault withdrawal submission; force-fail is \
+             refused because the withdrawal may already have landed -- verify it on-chain, \
+             then reconcile it (`stox transfer reconcile --kind redemption`) to resolve it"
         )]
         RedemptionSubmissionUnresolved(RedemptionAggregateId),
         #[error("mint store operation failed")]

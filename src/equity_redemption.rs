@@ -284,8 +284,12 @@ pub enum EquityRedemptionError {
     /// an RPC edge case (e.g. pending or uncle-block receipt).
     #[error("Raindex withdrawal receipt for {tx_hash} is missing block number")]
     MissingWithdrawBlock { tx_hash: TxHash },
-    /// Attempted to reconcile a redemption that is not in the `Failed` state
-    #[error("Cannot reconcile: redemption is not in the Failed state")]
+    /// Attempted to reconcile a redemption that is neither `Failed` nor a stuck
+    /// `VaultWithdrawSubmitting` submission -- the only reconcilable states.
+    #[error(
+        "Cannot reconcile: redemption must be Failed or an unresolved vault \
+         withdrawal submission"
+    )]
     NotFailed,
     /// Attempted to act on a redemption already resolved out-of-band (`Reconciled`)
     #[error("Already reconciled")]
@@ -429,10 +433,12 @@ pub enum EquityRedemptionCommand {
     /// backdate synthetic history.
     #[cfg(any(test, feature = "test-support"))]
     PrepareSendAt { pending_at: DateTime<Utc> },
-    /// Reconcile a redemption stranded in the terminal `Failed` state to the
-    /// terminal `Reconciled` state. The residual equity was handled out-of-band
-    /// (e.g. via wrap-equity/vault-deposit), so this is a bookkeeping resolution
-    /// rather than a re-drive. Valid ONLY from `Failed`.
+    /// Reconcile a redemption to the terminal `Reconciled` state once its
+    /// residual was handled out-of-band (e.g. via wrap-equity/vault-deposit), a
+    /// bookkeeping resolution rather than a re-drive. Valid from the `Failed`
+    /// terminal, and from the `VaultWithdrawSubmitting` origin whose broadcast
+    /// fate an operator has verified on-chain -- the one in-flight state with no
+    /// automatic exit (never force-failed, since its withdrawal may have landed).
     Reconcile { reason: String },
 }
 
@@ -631,8 +637,9 @@ pub enum EquityRedemptionEvent {
         tokenization_request_id: TokenizationRequestId,
         recovered_at: DateTime<Utc>,
     },
-    /// An operator reconciled a terminal `Failed` redemption out-of-band. Marks
-    /// the transfer resolved without re-driving the failed leg.
+    /// An operator reconciled a `Failed` redemption -- or a stuck
+    /// `VaultWithdrawSubmitting` one -- out-of-band. Marks the transfer resolved
+    /// without re-driving it.
     OperatorReconciled {
         reason: String,
         reconciled_at: DateTime<Utc>,
@@ -1252,8 +1259,8 @@ pub enum EquityRedemption {
         failed_at: DateTime<Utc>,
     },
 
-    /// An operator reconciled a terminal `Failed` redemption out-of-band
-    /// (terminal state). Retains the identifying fields carried by `Failed` so
+    /// An operator reconciled a `Failed` (or stuck `VaultWithdrawSubmitting`)
+    /// redemption out-of-band (terminal state). Retains the identifying fields so
     /// the projection still reports the real transfer instead of a zero-value
     /// record.
     Reconciled {
@@ -1379,6 +1386,16 @@ impl EquityRedemption {
             | Self::Completed { .. }
             | Self::Reconciled { .. } => false,
         }
+    }
+
+    /// Whether an operator may `Reconcile` this redemption to the terminal
+    /// `Reconciled` state: the `Failed` terminal, or the `VaultWithdrawSubmitting`
+    /// origin whose withdrawal fate the operator has verified on-chain. The
+    /// latter is the only in-flight state with no automatic exit -- it is never
+    /// force-failed (its withdrawal may have landed) and the timeout sweep skips
+    /// it -- so reconcile is its manual escape hatch.
+    pub fn is_operator_reconcilable(&self) -> bool {
+        self.is_failed() || matches!(self, Self::VaultWithdrawSubmitting { .. })
     }
 
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
@@ -2175,8 +2192,8 @@ impl EventSourced for EquityRedemption {
             OperatorReconciled {
                 reason,
                 reconciled_at,
-            } => {
-                let Self::Failed {
+            } => match entity {
+                Self::Failed {
                     symbol,
                     quantity,
                     raindex_withdraw_tx,
@@ -2185,12 +2202,7 @@ impl EventSourced for EquityRedemption {
                     reason: failure_reason,
                     started_at,
                     ..
-                } = entity
-                else {
-                    return Ok(None);
-                };
-
-                Some(Self::Reconciled {
+                } => Some(Self::Reconciled {
                     symbol: symbol.clone(),
                     chain,
                     quantity: *quantity,
@@ -2201,8 +2213,29 @@ impl EventSourced for EquityRedemption {
                     reconcile_reason: reason.clone(),
                     started_at: *started_at,
                     reconciled_at: *reconciled_at,
-                })
-            }
+                }),
+                // Reconciled straight from the submitting origin: nothing was
+                // withdrawn, sent, or failed, so the tx/failure fields are absent
+                // and the durable submit timestamp is the transfer's start.
+                Self::VaultWithdrawSubmitting {
+                    symbol,
+                    quantity,
+                    submitting_at,
+                    ..
+                } => Some(Self::Reconciled {
+                    symbol: symbol.clone(),
+                    chain,
+                    quantity: *quantity,
+                    raindex_withdraw_tx: None,
+                    redemption_tx: None,
+                    tokenization_request_id: None,
+                    failure_reason: None,
+                    reconcile_reason: reason.clone(),
+                    started_at: *submitting_at,
+                    reconciled_at: *reconciled_at,
+                }),
+                _ => return Ok(None),
+            },
         })
     }
 
@@ -2472,7 +2505,7 @@ impl EventSourced for EquityRedemption {
             },
 
             Reconcile { reason } => match self {
-                Self::Failed { symbol, .. } => {
+                Self::Failed { symbol, .. } | Self::VaultWithdrawSubmitting { symbol, .. } => {
                     if reason.trim().is_empty() {
                         return Err(EquityRedemptionError::ReconcileReasonRequired);
                     }
@@ -2480,7 +2513,7 @@ impl EventSourced for EquityRedemption {
                     warn!(
                         target: "rebalance",
                         %symbol, %reason,
-                        "Reconciling stuck failed redemption out-of-band"
+                        "Reconciling stuck redemption out-of-band"
                     );
                     Ok(vec![OperatorReconciled {
                         reason,
@@ -6998,6 +7031,58 @@ mod tests {
             Some("operator forced terminal".to_string()),
             "reconciled state must carry the source failure reason from Failed"
         );
+        assert!(
+            quantity.eq(float!(50.25)).unwrap(),
+            "reconciled state must preserve the requested quantity, got {quantity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_submitting_emits_operator_reconciled_and_replays_to_reconciled() {
+        // A redemption wedged in the VaultWithdrawSubmitting origin (signed but
+        // never confirmably broadcast) is the one in-flight state with no
+        // automatic exit; an operator who verified its on-chain fate reconciles
+        // it out-of-band rather than force-failing an ambiguous submission.
+        let history = vec![vault_withdraw_submitting_event()];
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(history.clone())
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "withdrawal never broadcast; verified on-chain".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::OperatorReconciled { reason, .. } = &events[0] else {
+            panic!("Expected OperatorReconciled, got {:?}", events[0]);
+        };
+        assert_eq!(reason, "withdrawal never broadcast; verified on-chain");
+
+        let state = replay::<EquityRedemption>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let EquityRedemption::Reconciled {
+            reconcile_reason,
+            failure_reason,
+            raindex_withdraw_tx,
+            redemption_tx,
+            quantity,
+            ..
+        } = state
+        else {
+            panic!("a reconciled submitting redemption should be Reconciled, got {state:?}");
+        };
+        assert_eq!(
+            reconcile_reason,
+            "withdrawal never broadcast; verified on-chain"
+        );
+        assert_eq!(
+            failure_reason, None,
+            "a redemption reconciled from the submitting origin never failed"
+        );
+        assert_eq!(raindex_withdraw_tx, None);
+        assert_eq!(redemption_tx, None);
         assert!(
             quantity.eq(float!(50.25)).unwrap(),
             "reconciled state must preserve the requested quantity, got {quantity:?}"

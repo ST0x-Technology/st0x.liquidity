@@ -2354,13 +2354,13 @@ async fn reconcile_equity_transfer(
                         }),
                     )
                 })?;
-            if !entity.is_failed() {
+            if !entity.is_operator_reconcilable() {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
                         error: format!(
-                            "Redemption {id} is not in the Failed state; reconcile only resolves \
-                             a Failed terminal."
+                            "Redemption {id} is not reconcilable; reconcile resolves a \
+                             Failed terminal or an unresolved vault-withdrawal submission."
                         ),
                     }),
                 ));
@@ -6459,8 +6459,8 @@ mod tests {
     }
 
     /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawSubmitting`
-    /// state (withdrawal intent persisted but not submitted).
-    async fn seed_redemption_pending(pool: &SqlitePool, id: &RedemptionAggregateId) {
+    /// origin (exact withdrawal signed and persisted, not yet broadcast).
+    async fn seed_redemption_submitting(pool: &SqlitePool, id: &RedemptionAggregateId) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
             .await
@@ -6477,6 +6477,25 @@ mod tests {
                     amount: U256::from(1000u64),
                     from_block: 0,
                     prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seeds an `EquityRedemption` into the non-terminal, non-reconcilable
+    /// `VaultWithdrawSubmitted` state (withdrawal broadcast, awaiting confirmation).
+    async fn seed_redemption_submitted(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        seed_redemption_submitting(pool, id).await;
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
@@ -6728,11 +6747,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_equity_transfer_rejects_a_non_failed_redemption() {
+    async fn reconcile_equity_transfer_reconciles_a_submitting_redemption() {
+        // The one in-flight state with no automatic exit: an operator who
+        // verified the withdrawal's on-chain fate reconciles it out-of-band.
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
-        let id = redemption_aggregate_id("api-redemption-non-failed");
-        seed_redemption_pending(&state.pool, &id).await;
+        let id = redemption_aggregate_id("api-redemption-submitting");
+        seed_redemption_submitting(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "withdrawal never broadcast; verified on-chain".to_string(),
+            }),
+        )
+        .await;
+
+        let Ok(Json(_)) = resp else {
+            panic!("a stuck submitting redemption must reconcile");
+        };
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "the redemption must land in the Reconciled terminal, got {entity:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_rejects_a_non_reconcilable_redemption() {
+        // VaultWithdrawSubmitted has a broadcast tx and its own force-fail exit,
+        // so reconcile refuses it (only Failed and VaultWithdrawSubmitting qualify).
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = redemption_aggregate_id("api-redemption-non-reconcilable");
+        seed_redemption_submitted(&state.pool, &id).await;
 
         let resp = reconcile_equity_transfer(
             State(state.clone()),

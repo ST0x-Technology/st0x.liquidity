@@ -1277,6 +1277,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vault_withdraw_submitting_redemption_is_listed_with_non_null_started_at() {
+        // Regression: a redemption in the `VaultWithdrawSubmitting` origin state
+        // must project a non-null `started_at`, or the dashboard's
+        // `started_at IS NOT NULL` filter hides every new redemption for the
+        // whole window before its withdrawal is broadcast.
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let redemption_id = redemption_aggregate_id("submitting-started-at");
+        let redemption = EquityRedemption::VaultWithdrawSubmitting {
+            symbol: Symbol::new("AAPL").unwrap(),
+            chain: Chain::Base,
+            quantity: float!(10),
+            token: Address::ZERO,
+            vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+            wrapped_amount: alloy::primitives::U256::from(10),
+            from_block: 0,
+            prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+            submitting_at: Utc::now(),
+        };
+        sqlx::query(
+            "INSERT INTO equity_redemption_view (view_id, version, payload) \
+             VALUES (?1, 1, ?2)",
+        )
+        .bind(redemption_id.to_string())
+        .bind(serde_json::json!({ "Live": redemption }).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let listed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM equity_redemption_view \
+             WHERE view_id = ?1 AND started_at IS NOT NULL",
+        )
+        .bind(redemption_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            listed, 1,
+            "a VaultWithdrawSubmitting redemption must project a non-null started_at \
+             so the dashboard's `started_at IS NOT NULL` listing includes it"
+        );
+    }
+
+    #[tokio::test]
     async fn transfer_history_pages_projection_rows_before_decoding() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();

@@ -1200,6 +1200,7 @@ where
 /// exhaustively matches every `EvmError` variant, so a future variant that
 /// should also be treated as decisive is a single, compiler-checked place to
 /// update, instead of a second copy of the classification that could
+/// silently drift from it.
 pub(crate) async fn release_in_flight_after_wait(
     in_flight: &InFlightNonces,
     send_lock: &Mutex<()>,

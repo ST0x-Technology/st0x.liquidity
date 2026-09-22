@@ -1966,11 +1966,11 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Redemption aggregate not found: {id}"))?;
 
-            if !matches!(entity, EquityRedemption::Failed { .. }) {
+            if !entity.is_operator_reconcilable() {
                 anyhow::bail!(
-                    "transfer reconcile: redemption {id} is not in the Failed state. Refusing to \
-                     act -- reconcile only resolves a transfer stuck in the Failed terminal; \
-                     check its current state on the dashboard."
+                    "transfer reconcile: redemption {id} is not reconcilable (must be Failed \
+                     or an unresolved vault-withdrawal submission). Refusing to act -- check \
+                     its current state on the dashboard."
                 );
             }
 
@@ -5353,6 +5353,31 @@ mod tests {
         }
     }
 
+    /// Seeds a redemption into the `VaultWithdrawSubmitting` origin: the exact
+    /// withdrawal is signed and persisted, but never confirmably broadcast.
+    async fn seed_redemption_to_submitting(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(50.25),
+                    token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: PreparedTransaction::for_test(alloy::primitives::TxHash::ZERO, 0),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     /// Drives a redemption through the real CQRS command flow until the vault
     /// withdrawal is confirmed (`WithdrawnFromRaindex`) -- stuck before the
     /// tokens leave the bot's custody.
@@ -5961,8 +5986,37 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("not in the Failed state"),
+            err_msg.contains("not reconcilable"),
             "reconcile of a non-failed redemption must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_redemption_succeeds_from_submitting() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-from-submitting");
+        seed_redemption_to_submitting(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "withdrawal never broadcast; verified on-chain"
+                .parse()
+                .unwrap(),
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "a stuck submitting redemption must reconcile, got: {entity:?}"
         );
     }
 
@@ -6028,7 +6082,7 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("not in the Failed state"),
+            err_msg.contains("not reconcilable"),
             "a second reconcile of an already-reconciled redemption must refuse; got: {err_msg}"
         );
     }
