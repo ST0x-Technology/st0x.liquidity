@@ -2116,7 +2116,7 @@ async fn run_provider_command<W: Write + Send>(
                 anyhow::anyhow!("process-tx chain {chain} is not configured as a hedged chain")
             })?;
             // Bound the RPC transport so a hung endpoint surfaces as an error
-            // instead of parking the process-tx call indefinitely (RAI-2218),
+            // instead of parking the process-tx call indefinitely,
             // mirroring the ops-API provider in src/api.rs.
             let rpc_url = trading_chain.rpc_url.clone();
             let http_client = reqwest::Client::builder()

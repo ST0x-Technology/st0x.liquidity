@@ -1107,7 +1107,7 @@ impl Conductor {
         // Built from the same `startup_policy` as the conductor's own placer so
         // the in-bot process-tx route runs `recover_order_by_client_id` and the
         // session-eligibility gate before placing, rather than shortcutting to
-        // `New` (RAI-2250).
+        // `New`.
         let process_tx_order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
             executor: executor.clone(),
             close_flatten_policy: Some(startup_policy.clone()),

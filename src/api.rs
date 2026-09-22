@@ -2718,7 +2718,7 @@ fn resolve_process_tx_chain(
 /// future -- a client disconnect or cancellation -- detaches the in-flight
 /// broker placement instead of cancelling it: a hedge that has already reached
 /// the broker must run through to its `Submitted` event even when nobody is
-/// waiting on the response (RAI-2250). Awaiting `process_tx` inline here would
+/// waiting on the response. Awaiting `process_tx` inline here would
 /// reintroduce that cancellation bug.
 async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + Clone + 'static>(
     tx_hash: TxHash,
@@ -2803,7 +2803,7 @@ async fn process_transaction(
     })?;
 
     // A hung RPC endpoint that accepts the connection but never responds would
-    // otherwise park this request forever (RAI-2218), so bound the transport
+    // otherwise park this request forever, so bound the transport
     // with the same connect and request timeouts the conductor's providers use.
     let rpc_url = trading_chain.rpc_url.clone();
     let http_client = reqwest::Client::builder()
@@ -7655,7 +7655,7 @@ mod tests {
     /// Aborting the HTTP request future after the broker placement has begun
     /// must NOT cancel that placement: `process_transaction` runs the process-tx
     /// workload on a detached task, so a live broker order completes even when
-    /// nobody awaits the response (RAI-2250). This drives the real handler path
+    /// nobody awaits the response. This drives the real handler path
     /// -- a mocked provider decodes a tradeable fill, and the published
     /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify` -- aborts
     /// the request once placement has begun, and asserts the placement still

@@ -1539,7 +1539,7 @@ pub mod process_tx {
     /// The state of a hedge order after (attempted) broker placement, or of an
     /// existing pending hedge found before placement.
     #[derive(Debug, Clone, Copy)]
-    pub enum HedgeDisposition {
+    enum HedgeDisposition {
         /// The broker accepted the order; the next order-status recovery sweep
         /// reconciles it to a terminal state.
         InFlight,
@@ -2489,7 +2489,7 @@ pub mod process_tx {
             InventoryVenue, OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand, OnChainTradeId,
             OnChainTradeSource,
         };
-        use crate::position::{AnchorDisposition, Position, PositionCommand};
+        use crate::position::{AnchorDisposition, Position, PositionCommand, TradeId};
         use crate::test_utils::{
             OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, try_positive_shares,
             try_setup_test_db, try_setup_test_pools,
@@ -2734,6 +2734,97 @@ pub mod process_tx {
             assert_eq!(
                 position.last_failed_offchain_order_id, None,
                 "a confirmed-absent anchor must be released"
+            );
+        }
+
+        /// End to end proof that the shared `process_found_trade` settles the
+        /// fill before it surfaces a failed anchor rejection. With a broker
+        /// present anchor the path must acknowledge the fresh fill and drop it
+        /// from the position pending acknowledgement set before returning
+        /// `FailedAnchorStillAtBroker`, so accounting stays durable even when the
+        /// hedge is refused.
+        #[tokio::test]
+        async fn process_found_trade_settles_the_fill_before_rejecting_a_broker_present_anchor() {
+            let pool = setup_test_db().await;
+            let (position_store, symbol, anchor) = seeded_failed_anchor(&pool).await;
+
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+
+            let onchain_trade = onchain_trade_builder()
+                .with_log_index(5)
+                .with_block_number(42)
+                .build();
+            let trade_id =
+                OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+            let position_trade_id = TradeId {
+                chain: onchain_trade.chain,
+                tx_hash: onchain_trade.tx_hash,
+                log_index: onchain_trade.log_index,
+            };
+
+            let order_placer: Arc<dyn OrderPlacer> =
+                Arc::new(AnchorPresencePlacer { present: true });
+            let error = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    &error,
+                    OperatorError::Rejected(RejectionReason::FailedAnchorStillAtBroker {
+                        anchor: refused_anchor,
+                        executor_order_id,
+                    }) if *refused_anchor == anchor
+                        && executor_order_id.as_ref() == "existing-anchor-order"
+                ),
+                "a broker present anchor must reject with FailedAnchorStillAtBroker, got: {error}"
+            );
+
+            let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let onchain_state = onchain_trade_store
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .expect("the fresh fill must be witnessed before the anchor rejection returns");
+            assert!(
+                onchain_state.is_acknowledged(),
+                "the durable onchain marker must be acknowledged before the anchor rejection returns"
+            );
+
+            let position = position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .expect("the position must exist after fill accounting");
+            assert!(
+                !position
+                    .pending_acknowledged_trade_ids
+                    .contains(&position_trade_id),
+                "the accounted fill must be settled out of the pending acknowledgement set \
+                 before the anchor rejection propagates"
             );
         }
 
