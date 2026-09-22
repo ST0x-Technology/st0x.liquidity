@@ -3275,7 +3275,8 @@ mod tests {
     };
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
-    use crate::rebalancing::usdc::{UsdcTransferError, usdc_driver_pause};
+    use crate::rebalancing::usdc::{UsdcDriverGate, UsdcTransferError, usdc_driver_pause};
+    use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::test_utils::{
         TEST_POLL_INTERVAL, get_test_order, reserving_counter_trade_preflight,
         seed_get_test_order_token_symbols, setup_test_pools,
@@ -6507,6 +6508,167 @@ mod tests {
         assert_eq!(
             parsed["error"],
             "unknown direction: sideways (expected alpaca_to_base or base_to_alpaca)"
+        );
+    }
+
+    /// Recovery stub: the 503-cannot-quiesce route tests refuse at the driver
+    /// pause before the recheck runs, so a call here would mean the gate was
+    /// bypassed. It returns a benign outcome (not a panic) so that a test can
+    /// distinguish "quiesced first" (503) from "ran the recheck" (200) if the
+    /// gate call is ever removed.
+    struct LeftUnchangedUsdcRecheck;
+
+    #[async_trait]
+    impl RecheckUsdcDeposit for LeftUnchangedUsdcRecheck {
+        async fn recheck_deposit(
+            &self,
+            _id: &UsdcRebalanceId,
+        ) -> Result<RecheckOutcome, UsdcRecheckError> {
+            Ok(RecheckOutcome::LeftUnchanged)
+        }
+    }
+
+    /// Builds an `AppState` with a published recovery handle whose USDC driver
+    /// pause is returned alongside its gate, so a test can hold an execution
+    /// in flight and drive the two operator routes through their real quiesce
+    /// call. The heavy handle dependencies are never touched on the 503 path
+    /// (the route refuses at the pause), but must exist to construct the handle.
+    async fn recovery_state_with_driver_pause() -> (AppState, UsdcDriverGate) {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let services = EquityTransferServices::panicking();
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(state.pool.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _) =
+            StoreBuilder::<crate::equity_redemption::EquityRedemption>::new(state.pool.clone())
+                .build(services.clone())
+                .await
+                .unwrap();
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            services,
+            mint_store.clone(),
+            redemption_store.clone(),
+        ));
+
+        let (event_sender, _) = broadcast::channel(16);
+        let rebalancing_inventory = Arc::new(BroadcastingInventory::new(
+            inventory::InventoryView::default(),
+            event_sender,
+        ));
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let vault_registry = Arc::new(st0x_event_sorcery::test_store::<
+            crate::vault_registry::VaultRegistry,
+        >(state.pool.clone(), ()));
+        let rebalancing_service = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
+                poll_freshness: crate::inventory::PollFreshness::always_fresh(),
+                inventory_staleness_bound: std::time::Duration::from_secs(300),
+                equity: crate::inventory::ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: std::time::Duration::from_secs(60),
+                assets: st0x_config::ChainAssets {
+                    equities: crate::test_utils::rebalancing_enabled_equities(&["AAPL"]),
+                    cash: None,
+                },
+                cash_reserved: None,
+                hedge_floor: st0x_execution::HedgeFloor::default(),
+            },
+            vault_registry,
+            std::collections::BTreeMap::from([(
+                Chain::Base,
+                crate::vault_registry::VaultRegistryId {
+                    chain: Chain::Base,
+                    orderbook: Address::ZERO,
+                    owner: Address::ZERO,
+                },
+            )]),
+            rebalancing_inventory,
+            std::collections::BTreeMap::from([(
+                Chain::Base,
+                Arc::new(st0x_wrapper::MockWrapper::new()) as Arc<dyn st0x_wrapper::Wrapper>,
+            )]),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::LogNotifier),
+        ));
+
+        let (pause, gate) = usdc_driver_pause();
+
+        state
+            .recovery
+            .set(RecoveryHandle {
+                transfer,
+                mint_store,
+                redemption_store,
+                rebalancing_service,
+                usdc_recheck: Arc::new(LeftUnchangedUsdcRecheck),
+                usdc_driver_pause: Arc::new(pause),
+            })
+            .ok()
+            .expect("recovery cell must start empty");
+
+        (state, gate)
+    }
+
+    /// Production integration for the resume route's driver-pause call: with a
+    /// worker execution in flight the route must refuse with 503 at the pause,
+    /// before its own single-flight gates. Removing `quiesce_usdc_driver` from
+    /// the route lets it fall through to `resume_usdc_transfer`, which 404s an
+    /// unknown id, failing this 503 assertion.
+    #[tokio::test]
+    async fn resume_usdc_route_returns_503_when_driver_cannot_quiesce() {
+        let (state, gate) = recovery_state_with_driver_pause().await;
+        let _executing = gate.enter().await;
+        // Pause the clock only after the DB pools are built, so the quiesce
+        // window's 5-second timer auto-advances without a real wait while the
+        // held execution keeps the driver from quiescing.
+        tokio::time::pause();
+        let id = uuid::Uuid::new_v4();
+
+        let Err((status, Json(body))) = resume_usdc_transfer(
+            State(state),
+            Path(("base_to_alpaca".to_string(), id.to_string())),
+        )
+        .await
+        else {
+            panic!("the resume route must refuse while a transfer is executing");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "A USDC transfer is executing; retry once it is not in flight"
+        );
+    }
+
+    /// Sibling of the resume test for the recheck route. Removing the route's
+    /// `quiesce_usdc_driver` call lets it run the recheck (a 200
+    /// `left_unchanged`), failing this 503 assertion.
+    #[tokio::test]
+    async fn recheck_usdc_route_returns_503_when_driver_cannot_quiesce() {
+        let (state, gate) = recovery_state_with_driver_pause().await;
+        let _executing = gate.enter().await;
+        tokio::time::pause();
+        let id = uuid::Uuid::new_v4();
+
+        let Err((status, Json(body))) = recheck_transfer(
+            State(state),
+            Path(("usdc_bridge".to_string(), id.to_string())),
+        )
+        .await
+        else {
+            panic!("the recheck route must refuse while a transfer is executing");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "A USDC transfer is executing; retry once it is not in flight"
         );
     }
 

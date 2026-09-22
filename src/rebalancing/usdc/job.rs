@@ -2178,6 +2178,7 @@ mod tests {
     use alloy::transports::TransportErrorKind;
     use chrono::{DateTime, Utc};
     use reqwest::StatusCode;
+    use tokio::sync::Notify;
     use uuid::{Uuid, uuid};
 
     use st0x_evm::{Chain, EvmError};
@@ -2189,6 +2190,7 @@ mod tests {
     use super::*;
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::native_gas::GasReadinessFailure;
+    use crate::rebalancing::usdc::{DriverNotQuiesced, usdc_driver_pause};
     use crate::test_utils::setup_test_apalis_pool;
 
     /// Builds a `QueuePushError` without touching a pool. The classification
@@ -3122,6 +3124,207 @@ mod tests {
             usdc_guard: Arc::new(NoopGuardRelease),
             preflight_alerts: Arc::new(PreflightAlertGate::default()),
         }
+    }
+
+    /// Records whether the fund-moving resume was actually invoked, so a test
+    /// can assert the worker moved no funds while the driver was paused.
+    struct RecordingBaseToAlpaca {
+        moved: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for RecordingBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            self.moved.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Alpaca->Base sibling of [`RecordingBaseToAlpaca`].
+    struct RecordingAlpacaToBase {
+        moved: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for RecordingAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            self.moved.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Signals when its resume has entered (holding the in-flight claim) and
+    /// blocks there until released, so a test can observe a live worker
+    /// execution making an operator pause wait.
+    struct BlockingBaseToAlpaca {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for BlockingBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    /// Production integration for the Base->Alpaca worker's driver-gate call:
+    /// while an operator holds the driver paused the worker must park at the
+    /// gate and move no funds, then proceed once the pause releases. Deleting
+    /// or moving the `ctx.driver_gate.enter().await` in `perform` lets the
+    /// worker move funds while paused, failing the paused assertion.
+    #[tokio::test]
+    async fn base_to_alpaca_worker_parks_while_paused_then_moves_funds_after_resume() {
+        let pool = setup_queue_pool().await;
+        let moved = Arc::new(AtomicBool::new(false));
+        let (pause, gate) = usdc_driver_pause();
+        let mut ctx = hedging_ctx(
+            Arc::new(RecordingBaseToAlpaca {
+                moved: moved.clone(),
+            }),
+            &pool,
+        );
+        ctx.driver_gate = gate;
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let pause_guard = pause.pause().await.unwrap();
+
+        let mut worker = tokio::spawn(async move { Job::perform(&job, &ctx).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut worker)
+                .await
+                .is_err(),
+            "the worker must park at the gate while the driver is paused"
+        );
+        assert!(
+            !moved.load(Ordering::SeqCst),
+            "a paused worker must move no funds"
+        );
+
+        drop(pause_guard);
+
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("the worker must resume once the pause releases")
+            .expect("the worker task must not panic")
+            .expect("the resumed worker must complete its transfer");
+        assert!(
+            moved.load(Ordering::SeqCst),
+            "the resumed worker must move funds"
+        );
+    }
+
+    /// Alpaca->Base sibling of the test above, covering the second worker entry
+    /// point (`TransferUsdcToMarketMaking::perform`).
+    #[tokio::test]
+    async fn alpaca_to_base_worker_parks_while_paused_then_moves_funds_after_resume() {
+        let pool = setup_queue_pool().await;
+        let moved = Arc::new(AtomicBool::new(false));
+        let (pause, gate) = usdc_driver_pause();
+        let mut ctx = market_making_ctx(
+            Arc::new(RecordingAlpacaToBase {
+                moved: moved.clone(),
+            }),
+            &pool,
+        );
+        ctx.driver_gate = gate;
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let pause_guard = pause.pause().await.unwrap();
+
+        let mut worker = tokio::spawn(async move { Job::perform(&job, &ctx).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut worker)
+                .await
+                .is_err(),
+            "the worker must park at the gate while the driver is paused"
+        );
+        assert!(
+            !moved.load(Ordering::SeqCst),
+            "a paused worker must move no funds"
+        );
+
+        drop(pause_guard);
+
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("the worker must resume once the pause releases")
+            .expect("the worker task must not panic")
+            .expect("the resumed worker must complete its transfer");
+        assert!(
+            moved.load(Ordering::SeqCst),
+            "the resumed worker must move funds"
+        );
+    }
+
+    /// Production integration for "an active execution makes a pause wait": a
+    /// live worker execution holds the in-flight claim through
+    /// `ctx.driver_gate.enter().await`, so an operator pause requested while it
+    /// runs must refuse (`DriverNotQuiesced`) rather than quiesce over the top
+    /// of moving funds. Removing the worker's gate call lets the pause quiesce
+    /// immediately, failing this assertion.
+    #[tokio::test]
+    async fn operator_pause_waits_for_an_in_flight_worker_execution() {
+        let pool = setup_queue_pool().await;
+        let (pause, gate) = usdc_driver_pause();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut ctx = hedging_ctx(
+            Arc::new(BlockingBaseToAlpaca {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            &pool,
+        );
+        ctx.driver_gate = gate;
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let worker = tokio::spawn(async move { Job::perform(&job, &ctx).await });
+        entered.notified().await;
+        // Pause only after the DB pool is built and the worker holds the
+        // in-flight claim, so the quiesce window's timer auto-advances instead
+        // of waiting five real seconds.
+        tokio::time::pause();
+
+        assert!(
+            matches!(pause.pause().await, Err(DriverNotQuiesced)),
+            "a pause must refuse while a worker execution holds the driver"
+        );
+
+        release.notify_one();
+        worker
+            .await
+            .expect("the worker task must not panic")
+            .expect("the released worker must complete its transfer");
     }
 
     #[tokio::test]

@@ -3125,7 +3125,7 @@ fn build_rebalancing_service(
     deps: &RebalancingDeps,
     registry_ids: BTreeMap<Chain, VaultRegistryId>,
     wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
-) -> (Arc<RebalancingService>, UsdcDriverPause, UsdcDriverGate) {
+) -> anyhow::Result<(Arc<RebalancingService>, UsdcDriverPause, UsdcDriverGate)> {
     let allocation = rebalancing_ctx.allocation.clone();
     let chains = deps
         .ctx
@@ -3164,9 +3164,9 @@ fn build_rebalancing_service(
     ));
 
     let (usdc_driver_pause, usdc_driver_gate) = usdc_driver_pause();
-    service.attach_usdc_driver_gate(usdc_driver_gate.clone());
+    service.attach_usdc_driver_gate(usdc_driver_gate.clone())?;
 
-    (service, usdc_driver_pause, usdc_driver_gate)
+    Ok((service, usdc_driver_pause, usdc_driver_gate))
 }
 
 /// Every hedged chain's equity transfer services, plus the per-chain vault
@@ -3399,7 +3399,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let primary_equity_services = equity_transfer_services.for_chain(primary_chain)?.clone();
 
         let (rebalancing_service, usdc_driver_pause, usdc_driver_gate) =
-            build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
+            build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone())?;
 
         wire_transfer_admission_guards(
             &rebalancing_service,
