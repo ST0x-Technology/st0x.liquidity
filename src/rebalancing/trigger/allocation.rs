@@ -888,7 +888,9 @@ mod tests {
     }
 
     fn arb_percent(max: u32) -> impl Strategy<Value = Float> {
-        (0..=max).prop_map(|percent| Float::parse(format!("0.{percent:02}")).unwrap())
+        (0..=max).prop_map(|percent| {
+            Float::parse(format!("{}.{:02}", percent / 100, percent % 100)).unwrap()
+        })
     }
 
     fn arb_slot() -> impl Strategy<Value = ChainSlot> {
@@ -971,23 +973,26 @@ mod tests {
 
     proptest! {
         /// The chosen quantity never carries a chain past its target, never
-        /// exceeds the operational limit, and a mint never exceeds what the
-        /// broker has available.
+        /// exceeds the operational limit, and a mint never takes the broker
+        /// below its Alpaca floor.
         #[test]
         fn an_operation_never_overshoots(input in arb_input()) {
             let EquityPlan::Operation(operation) = plan_equity_operation(&input).unwrap() else {
                 return Ok(());
             };
 
-            let (_, deviations) = deviations(&input);
+            let (total, deviations) = deviations(&input);
             let deviation = deviations[&operation.chain];
             let quantity = operation.quantity.inner();
 
             match operation.direction {
                 PlannedDirection::Mint => {
                     prop_assert!(deviation.is_negative().unwrap());
+                    let floor = (total * input.alpaca_floor.inner()).unwrap();
+                    let above_floor = (input.offchain.unwrap().available() - floor).unwrap();
                     prop_assert!(
-                        quantity.inner().lte(input.offchain.unwrap().available().inner()).unwrap()
+                        quantity.inner().lte(above_floor.inner()).unwrap(),
+                        "mint {quantity} takes the broker below its floor {floor}"
                     );
                 }
                 PlannedDirection::Redemption => {
