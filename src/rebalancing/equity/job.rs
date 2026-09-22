@@ -782,6 +782,37 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
     }
 
     async fn perform(&self, ctx: &TransferEquityToHedgingCtx) -> Result<Self::Output, Self::Error> {
+        // A terminal redemption (Failed/Completed/Reconciled) has nothing left to
+        // transfer. Terminate instead of deferring on reservation restoration: a
+        // deferring job row stays non-terminal, and `in_flight_equity_transfer`
+        // treats it as an in-flight transfer that suppresses a legitimately needed
+        // new redemption for the same symbol (the reject path reproduces this: the
+        // rejected redemption's aggregate is terminal, but a pending counter-hedge
+        // blocks reservation restoration, so the job would otherwise reschedule
+        // itself forever). Release the reservation defensively (idempotent; the
+        // terminal-event reactor also releases it).
+        if ctx
+            .redemption_store
+            .load(&self.aggregate_id)
+            .await
+            .map_err(|error| Box::new(RedemptionError::from(error)))?
+            .is_some_and(|aggregate| aggregate.is_terminal())
+        {
+            if let Some((position_store, _)) = &ctx.position_authority {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.aggregate_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+
         if let Some((position_store, position_threshold)) = &ctx.position_authority
             && !restore_position_reservation(
                 position_store,
@@ -1550,6 +1581,90 @@ mod tests {
         assert!(
             run_at >= scheduled_after + 8,
             "the fourth reservation retry must use the shared 8-second backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_redemption_transfer_terminates_instead_of_deferring() {
+        // Regression: a rejected (terminal `Failed`) redemption whose reservation
+        // restoration is blocked by a pending hedge must terminate, not reschedule.
+        // A deferred redrive row stays non-terminal, and `in_flight_equity_transfer`
+        // then suppresses the next genuinely-needed redemption for the symbol
+        // forever -- the flaky reject-path e2e.
+        let (position_store, symbol) = pending_hedge_position().await;
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let stub = Arc::new(RecordingRedemptionResume {
+            fail: false,
+            captured: Mutex::new(None),
+        });
+        let mut ctx = redemption_test_ctx(
+            stub.clone(),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        let aggregate_id = redemption_aggregate_id("terminal-redemption-no-defer");
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::from(1_u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "test: forced terminal state".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id,
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 3,
+        };
+
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert!(
+            stub.captured.lock().unwrap().is_none(),
+            "a terminal redemption has nothing to transfer"
+        );
+        let pending: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending, 0,
+            "a terminal redemption must terminate, never enqueue a zombie redrive"
         );
     }
 
