@@ -4292,7 +4292,19 @@ impl RebalancingService {
                         DeclineReason::ChainStale { chain }
                     }
                 };
-                Self::record_equity_decline(symbol, &reason);
+                // Counted like every other decline, but logged here so the
+                // line keeps how stale the poll is and which bound it missed.
+                let label = reason.metric_label();
+                counter!("equity_plan_declined_total", "reason" => label).increment(1);
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    %chain,
+                    %staleness,
+                    bound_secs = self.config.inventory_staleness_bound.as_secs(),
+                    reason = label,
+                    "Declined equity plan"
+                );
                 return Ok(());
             }
         }
