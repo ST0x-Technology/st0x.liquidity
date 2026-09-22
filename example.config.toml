@@ -345,9 +345,9 @@ usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 # not hedged, or when a rebalanced equity has no target on its chain.
 # `deviation` is the band around each target inside which nothing runs;
 # `min_operation_usd` is the smallest transfer worth its gas, valued at the
-# last hedge price (a chain overrides it with `min_operation_usd` on its
-# trading table); `cooldown_secs` pauses re-planning of a (symbol, chain)
-# after an operation.
+# symbol's last onchain fill price (a chain overrides it with
+# `min_operation_usd` on its trading table); `cooldown_secs` pauses
+# re-planning of a (symbol, chain) after an operation.
 # [rebalancing.allocation]
 # targets = { base = 0.5 }
 # alpaca_floor = 0.1

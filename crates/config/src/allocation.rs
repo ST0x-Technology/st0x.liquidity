@@ -89,8 +89,9 @@ pub struct AllocationConfig {
     pub alpaca_floor: TargetShare,
     /// The band around each chain's target inside which no operation runs.
     pub deviation: DeviationBand,
-    /// The smallest transfer worth its gas, valued at the last hedge price. A
-    /// chain's trading table can override it with its own `min_operation_usd`.
+    /// The smallest transfer worth its gas, valued at the symbol's last onchain
+    /// fill price. A chain's trading table can override it with its own
+    /// `min_operation_usd`.
     pub min_operation_usd: Positive<Usdc>,
     /// How long a `(symbol, chain)` pair is not re-planned after an operation.
     pub cooldown_secs: u64,

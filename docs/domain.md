@@ -292,12 +292,13 @@ The broker holds whatever the chain targets leave over.
 
 ### Alpaca Floor
 
-The share of a symbol's total that stays at the broker: a mint never takes the
-broker's available shares below `alpaca_floor * total`, and a mint that would is
-declined as `FloorCapped` for the whole symbol. Configured as
-`[rebalancing.allocation].alpaca_floor`, also a `TargetShare`. At load time
-every rebalanced symbol's chain targets plus the floor must not exceed 1.
-Distinct from the hedge floor, which is a fixed number of shares.
+The share of a symbol's total that stays at the broker: a mint is capped so the
+broker's available shares stay at or above `alpaca_floor * total`, and the
+symbol is declined as `FloorCapped` only when that leaves no room to mint at
+all. Configured as `[rebalancing.allocation].alpaca_floor`, also a
+`TargetShare`. At load time every rebalanced symbol's chain targets plus the
+floor must not exceed 1. Distinct from the hedge floor, which is a fixed number
+of shares.
 
 ### Deviation Band
 
@@ -308,10 +309,13 @@ The type is `DeviationBand`.
 
 ### Minimum Operation Size
 
-The smallest equity transfer worth its gas, in dollars, valued at the last hedge
-price the `Position` recorded for the symbol. A candidate below it is dropped as
-`BelowMinimum` and the next candidate is evaluated; a missing or stale price
-declines the symbol (`PriceMissing`, `PriceStale`). Configured as
+The smallest equity transfer worth its gas, in dollars, valued at the last
+onchain fill price the `Position` recorded for the symbol. A candidate below it
+is dropped as `BelowMinimum` and the next candidate is evaluated; a missing or
+stale price declines the symbol (`PriceMissing`, `PriceStale`). A symbol-wide
+decline (`FloorCapped`, `PriceMissing`, `PriceStale`) reports the per-chain
+reason (`NoGas`, `CoolingDown`, `BelowMinimum`) a higher-ranked candidate was
+dropped for, when there is one. Configured as
 `[rebalancing.allocation].min_operation_usd` with a per-chain
 `min_operation_usd` override on the trading table.
 

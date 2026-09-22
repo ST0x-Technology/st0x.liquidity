@@ -39,8 +39,8 @@ pub struct EquityPlanInput {
     pub alpaca_floor: TargetShare,
     /// Chains that ran an operation for this symbol too recently.
     pub cooldowns: BTreeSet<Chain>,
-    /// The hedging side's last price for the symbol, used to value the
-    /// minimum operation size.
+    /// The symbol's last onchain fill price, block-timestamped, used to
+    /// value the minimum operation size.
     pub last_price: Option<PriceObservation>,
     pub price_staleness_bound: Duration,
     pub now: DateTime<Utc>,
