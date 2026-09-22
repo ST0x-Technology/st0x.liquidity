@@ -1,0 +1,76 @@
+# Observation-mode rollout fragment, not a deployable runtime config.
+# Apply only after a supporting binary release and scope verification.
+[pricing.trading_schedule]
+mode = "observe"
+environment = "staging"
+poll_interval_secs = 5
+request_timeout_secs = 3
+response_freshness_secs = 30
+calendar_max_age_secs = 7200
+evidence_clock_skew_secs = 2
+emergency_buffer_secs = 900
+
+[[pricing.trading_schedule.scopes]]
+id = "alpaca-regular"
+profile_revision = "staging-existing-v1"
+extended_hours = false
+assets = [
+  "SGOV",
+  "SPYM",
+  "TSLA",
+  "AMZN",
+  "NVDA",
+  "MSTR",
+  "IAU",
+  "COIN",
+  "SIVR",
+  "CRCL",
+  "PPLT",
+  "BMNR",
+  "QQQM",
+  "VWO",
+  "ARKK",
+  "SPCX",
+  "CEG",
+  "DRAM",
+  "TSM",
+  "ASML",
+  "SKHY",
+  "MU",
+  "AMD",
+  "AVGO",
+  "AMAT",
+  "LRCX",
+  "TTWO",
+  "GOOGL",
+  "INTC",
+  "AAPL",
+  "MSFT",
+  "LLY",
+  "PTY",
+  "HOOD",
+  "ORCL",
+  "SMCI",
+  "BABA",
+  "TQQQ",
+  "MCD",
+  "NKE",
+  "GRND",
+  "DNUT",
+  "FGI",
+  "PLBY",
+  "TR",
+  "WEN",
+]
+
+[[pricing.trading_schedule.scopes]]
+id = "alpaca-extended"
+profile_revision = "staging-existing-v1"
+extended_hours = true
+assets = ["RKLB"]
+
+[[pricing.trading_schedule.scopes]]
+id = "alpaca-regular-unpriced"
+profile_revision = "staging-existing-v1"
+extended_hours = false
+assets = ["QSEP"]
