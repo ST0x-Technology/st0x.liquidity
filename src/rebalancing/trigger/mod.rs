@@ -3696,9 +3696,8 @@ impl RebalancingService {
             let target = listing
                 .target_share
                 .or_else(|| self.config.allocation.targets.get(&chain).copied());
-            let (enabled, target) = match target {
-                Some(target) => (true, target),
-                None => {
+            let (enabled, target) = target.map_or_else(
+                || {
                     error!(
                         target: "rebalance",
                         %symbol,
@@ -3707,8 +3706,9 @@ impl RebalancingService {
                          disabled -- config validation should have refused this"
                     );
                     (false, TargetShare::ZERO)
-                }
-            };
+                },
+                |target| (true, target),
+            );
             let gas_ready = enabled && self.equity_chain_gas_is_ready(chain).await;
 
             onchain.insert(
