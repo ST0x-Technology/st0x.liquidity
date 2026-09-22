@@ -8323,6 +8323,48 @@ mod tests {
         .await;
     }
 
+    /// The recovery jobs run on the primary chain only, so a secondary-chain
+    /// mint held for recovery would block its symbol forever. It reconstructs
+    /// as `ActiveTransfer` even with recovery enabled on the primary.
+    #[tokio::test]
+    async fn recover_mint_state_holds_only_a_primary_chain_mint_for_recovery() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trigger = make_trigger_with_recovery_enabled(&symbol).await;
+
+        trigger
+            .recover_mint_state(
+                &issuer_request_id("startup-secondary-tokens-received"),
+                &TokenizedEquityMint::TokensReceived {
+                    chain: Chain::HyperEvm,
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                    issuer_request_id: issuer_request_id("startup-secondary-tokens-received"),
+                    tokenization_request_id: tokenization_request_id("TOK-TR-HL"),
+                    tx_hash: TxHash::ZERO,
+                    shares_minted: U256::from(5u64),
+                    fees: None,
+                    requested_at: now,
+                    accepted_at: now,
+                    received_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let guard = trigger
+            .equity_in_progress
+            .read()
+            .unwrap()
+            .get(&symbol)
+            .cloned();
+        assert!(
+            matches!(guard, Some(equity::GuardState::ActiveTransfer { .. })),
+            "a HyperEVM mint must not be held for a primary-chain recovery: {guard:?}"
+        );
+    }
+
     #[tokio::test]
     async fn recover_redemption_state_restores_tracking_and_inflight() {
         let trigger = make_trigger().await;
