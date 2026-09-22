@@ -1401,12 +1401,12 @@ async fn over_target_chain_redeems_before_the_under_target_chain_mints() {
     );
 }
 
-/// With a 60% Alpaca floor and 60 of AAPL's 100 shares at the broker, the
-/// 10-share mint Base's 50% target asks for would breach the floor, so the
-/// planner declines the symbol as floor-capped and says so.
-#[tracing_test::traced_test]
+/// Base holds 20 of AAPL's 100 shares against a 30% target while HyperEVM's
+/// 44 sit inside the 5% band around its 40%, so the planner mints for Base.
+/// Its 10-share shortfall would take the broker's 36 under the 30% Alpaca
+/// floor of 30, so the mint is capped to the 6 shares above the floor.
 #[tokio::test]
-async fn mint_that_would_breach_the_alpaca_floor_is_declined() {
+async fn mint_is_capped_to_keep_the_alpaca_floor() {
     let EquityTriggerFixture {
         pool,
         apalis_pool,
@@ -1416,29 +1416,32 @@ async fn mint_that_would_breach_the_alpaca_floor_is_declined() {
         inventory,
         position_cqrs,
     } = setup_equity_trigger_with_config(RebalancingServiceConfig {
-        allocation: allocation(&[(Chain::Base, "0.5")], "0.6", "0.05"),
-        ..test_trigger_config()
+        allocation: allocation(
+            &[(Chain::Base, "0.3"), (Chain::HyperEvm, "0.4")],
+            "0.3",
+            "0.05",
+        ),
+        ..two_chain_trigger_config()
     })
     .await;
     seed_vault_registry(&pool, Chain::Base, &symbol, Address::random()).await;
+    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(44)).await;
 
     build_imbalanced_inventory(Imbalance::Equity {
         inventory: &inventory,
         position_cqrs: &position_cqrs,
         symbol: &symbol,
-        onchain: float!(40),
-        offchain: float!(60),
+        onchain: float!(20),
+        offchain: float!(36),
     })
     .await;
     seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(44)).await;
     drain_pending_jobs(&service).await.unwrap();
 
-    assert_eq!(pending_equity_mint_job_count(&apalis_pool).await, 0);
+    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(mint.chain, Chain::Base);
+    assert_eq!(mint.quantity, FractionalShares::new(float!(6)));
     assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
-    assert!(
-        logs_contain("floor_capped"),
-        "the decline must name its reason"
-    );
 }
 
 /// Base holds 80 of AAPL's 100 shares against a 50% target but may move
