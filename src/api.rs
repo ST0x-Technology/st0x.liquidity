@@ -2711,12 +2711,6 @@ fn resolve_process_tx_chain(
         })
 }
 
-fn spawn_process_tx_task(
-    task: impl Future<Output = Result<ProcessTxReport, OperatorError>> + Send + 'static,
-) -> tokio::task::JoinHandle<Result<ProcessTxReport, OperatorError>> {
-    tokio::spawn(task)
-}
-
 /// Runs the process-tx workload on a detached `tokio` task and awaits its
 /// result, mapping a task-join failure and the operator error to HTTP
 /// responses.
@@ -2741,7 +2735,7 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
     let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
     let poll_status_queue = handle.poll_status_queue.clone();
     let poll_interval = handle.poll_interval;
-    spawn_process_tx_task(async move {
+    tokio::spawn(async move {
         process_tx::process_tx(
             tx_hash,
             &ctx,
@@ -7667,8 +7661,8 @@ mod tests {
     /// -- a mocked provider decodes a tradeable fill, and the published
     /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify` -- aborts
     /// the request once placement has begun, and asserts the placement still
-    /// finishes. Awaiting the workload inline instead of
-    /// `spawn_process_tx_task(...).await` would cancel the parked placement and
+    /// finishes. Awaiting the workload inline instead of the detached
+    /// `tokio::spawn(...).await` would cancel the parked placement and
     /// hang `finished`, which is the regression this test guards.
     #[tokio::test]
     async fn process_tx_task_survives_request_cancellation() {
