@@ -5,7 +5,7 @@
 //! implementation modules themselves private.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::{ExecutorOrderId, FractionalShares, Symbol};
 
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain_trade::OnChainTradeId;
@@ -128,6 +128,14 @@ pub enum RejectionReason {
         offchain_order_id: OffchainOrderId,
         symbol: Symbol,
         shares_filled: FractionalShares,
+    },
+    #[error(
+        "broker order {executor_order_id} already exists for failed anchor {anchor}; let the \
+         liquidity service reconcile it before processing this fill"
+    )]
+    FailedAnchorStillAtBroker {
+        anchor: OffchainOrderId,
+        executor_order_id: ExecutorOrderId,
     },
 }
 
@@ -1854,6 +1862,9 @@ pub mod process_tx {
         {
             Ok(anchor) => anchor,
             Err(error) => {
+                // Settle the fill before surfacing the failure so accounting is
+                // durable whether this is a typed rejection (a broker order still
+                // holds the anchor) or an operational store/RPC failure.
                 mark_and_settle_fill(
                     onchain_trade_store,
                     position_store,
@@ -1861,7 +1872,7 @@ pub mod process_tx {
                     &onchain_trade,
                 )
                 .await?;
-                return Err(OperatorError::Operational(error));
+                return Err(error);
             }
         };
 
@@ -2118,7 +2129,7 @@ pub mod process_tx {
         symbol: &Symbol,
         offchain_order_id: OffchainOrderId,
         executor: SupportedExecutor,
-    ) -> anyhow::Result<Option<OffchainOrderId>> {
+    ) -> Result<Option<OffchainOrderId>, OperatorError> {
         let anchor = position_store
             .load(symbol)
             .await
@@ -2130,7 +2141,8 @@ pub mod process_tx {
                     "Failed to load position for the idempotency anchor; refusing \
                      placement until it can be read"
                 );
-            })?
+            })
+            .context("failed to load position for the idempotency anchor")?
             .and_then(|position| position.last_failed_offchain_order_id);
         if executor != SupportedExecutor::AlpacaBrokerApi {
             return Ok(anchor);
@@ -2145,11 +2157,11 @@ pub mod process_tx {
             .await
             .map_err(anyhow::Error::from_boxed)?
         {
-            anyhow::bail!(
-                "broker order {} already exists for failed anchor {anchor}; let the liquidity \
-                 service reconcile it before processing this fill",
-                broker_order.executor_order_id
-            )
+            return Err(RejectionReason::FailedAnchorStillAtBroker {
+                anchor,
+                executor_order_id: broker_order.executor_order_id,
+            }
+            .into());
         }
         position_store
             .send(
@@ -2158,7 +2170,8 @@ pub mod process_tx {
                     expected_offchain_order_id: anchor,
                 },
             )
-            .await?;
+            .await
+            .context("failed to release the failed-order anchor")?;
         Ok(None)
     }
 
@@ -2663,10 +2676,15 @@ pub mod process_tx {
             .unwrap_err();
 
             assert!(
-                error
-                    .to_string()
-                    .contains("already exists for failed anchor"),
-                "got: {error}"
+                matches!(
+                    &error,
+                    OperatorError::Rejected(RejectionReason::FailedAnchorStillAtBroker {
+                        anchor: refused_anchor,
+                        executor_order_id,
+                    }) if *refused_anchor == anchor
+                        && executor_order_id.as_ref() == "existing-anchor-order"
+                ),
+                "a broker-present anchor must be a typed rejection, got: {error}"
             );
             let position = position_store.load(&symbol).await.unwrap().unwrap();
             assert_eq!(
