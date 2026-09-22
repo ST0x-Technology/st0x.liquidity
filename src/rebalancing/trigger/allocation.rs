@@ -62,8 +62,9 @@ pub(crate) struct ChainSlot {
     pub(crate) operational_limit: Option<Positive<FractionalShares>>,
     pub(crate) min_operation_usd: Positive<Usdc>,
     pub(crate) gas_ready: bool,
-    /// Whether the equity opts into rebalancing on this chain. A disabled
-    /// slot counts in the total but is never chosen.
+    /// Whether the trigger resolved a target for this listing. A slot without
+    /// one still counts in the total, so the total stays whole, but is never
+    /// chosen. A hedge-only listing never reaches the planner at all.
     pub(crate) enabled: bool,
 }
 
@@ -1180,10 +1181,11 @@ mod tests {
         assert_eq!(plan, EquityPlan::Decline(DeclineReason::WithinBand));
     }
 
-    /// A chain whose equity has rebalancing disabled still holds inventory
-    /// that counts in the total, but it is never chosen.
+    /// A rebalancing listing whose target the trigger could not resolve still
+    /// holds inventory that counts in the total, but it is never chosen. A
+    /// hedge-only listing is neither slotted nor counted.
     #[test]
-    fn disabled_slot_counts_in_the_total_but_is_never_a_candidate() {
+    fn slot_without_a_target_counts_in_the_total_but_is_never_a_candidate() {
         let plan = plan_equity_operation(&input(
             Some(balance("25")),
             BTreeMap::from([

@@ -4916,8 +4916,7 @@ targets.
 - Sizing: `total = broker total + sum of every slot in underlying shares`; zero
   declines. Each chain's deviation is
   `underlying on chain - target share * total`, in shares. A chain is a
-  candidate when its listing is rebalancing-enabled and `|deviation|` exceeds
-  `band * total`.
+  candidate when `|deviation|` exceeds `band * total`.
 - Ranking: redemptions (over target) before mints, larger deviation first, ties
   by chain order. A candidate whose wallet is not gas-ready, or whose chain is
   cooling down, is skipped and the next one evaluated.
