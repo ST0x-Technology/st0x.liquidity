@@ -2612,7 +2612,7 @@ enum ProcessTxOutcomeResponse {
     PlacementRejected {
         symbol: String,
     },
-    BuyPreflightDeferred {
+    PreflightDeferred {
         symbol: String,
     },
     HedgePlaced {
@@ -2623,6 +2623,9 @@ enum ProcessTxOutcomeResponse {
         disposition: &'static str,
     },
     HedgePlacementCleared {
+        symbol: String,
+    },
+    HedgePlacementDeferred {
         symbol: String,
     },
 }
@@ -2644,7 +2647,7 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
             ProcessTxOutcome::PlacementRejected { symbol } => Self::PlacementRejected {
                 symbol: symbol.to_string(),
             },
-            ProcessTxOutcome::BuyPreflightDeferred { symbol } => Self::BuyPreflightDeferred {
+            ProcessTxOutcome::PreflightDeferred { symbol } => Self::PreflightDeferred {
                 symbol: symbol.to_string(),
             },
             ProcessTxOutcome::HedgePlaced {
@@ -2664,6 +2667,9 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
                 },
             },
             ProcessTxOutcome::HedgePlacementCleared { symbol } => Self::HedgePlacementCleared {
+                symbol: symbol.to_string(),
+            },
+            ProcessTxOutcome::HedgePlacementDeferred { symbol } => Self::HedgePlacementDeferred {
                 symbol: symbol.to_string(),
             },
         }
@@ -7575,13 +7581,13 @@ mod tests {
         cases.push((
             ProcessTxReport {
                 fill: Some(fill()),
-                outcome: ProcessTxOutcome::BuyPreflightDeferred {
+                outcome: ProcessTxOutcome::PreflightDeferred {
                     symbol: Symbol::new("AAPL").unwrap(),
                 },
             },
             serde_json::json!({
                 "fill": fill_json,
-                "outcome": "buy_preflight_deferred",
+                "outcome": "preflight_deferred",
                 "symbol": "AAPL",
             }),
         ));
@@ -7596,6 +7602,20 @@ mod tests {
             serde_json::json!({
                 "fill": fill_json,
                 "outcome": "hedge_placement_cleared",
+                "symbol": "AAPL",
+            }),
+        ));
+
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::HedgePlacementDeferred {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+            },
+            serde_json::json!({
+                "fill": fill_json,
+                "outcome": "hedge_placement_deferred",
                 "symbol": "AAPL",
             }),
         ));

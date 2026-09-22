@@ -755,10 +755,10 @@ fn render_process_tx_outcome<W: Write>(
                 "Placement for {symbol} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill."
             )?;
         }
-        ProcessTxOutcome::BuyPreflightDeferred { symbol } => {
+        ProcessTxOutcome::PreflightDeferred { symbol } => {
             writeln!(
                 stdout,
-                "Trade accumulated but the buy preflight deferred the hedge for {symbol}: live buying power could not cover it. Settled the fill."
+                "Trade accumulated but the placement preflight deferred the hedge for {symbol}: buying power could not cover a buy, or the equity reservation blocked a sell. Settled the fill."
             )?;
         }
         ProcessTxOutcome::HedgePlaced {
@@ -787,6 +787,12 @@ fn render_process_tx_outcome<W: Write>(
             writeln!(
                 stdout,
                 "No hedge placed for {symbol}: broker placement failed or the order vanished. The pending order was cleared so the normal pipeline can re-hedge."
+            )?;
+        }
+        ProcessTxOutcome::HedgePlacementDeferred { symbol } => {
+            writeln!(
+                stdout,
+                "Hedge placement for {symbol} was deferred by broker admission; the pending order intent was retained for the normal pipeline to retry once admission permits. Settled the fill."
             )?;
         }
     }
@@ -2953,10 +2959,10 @@ mod tests {
         cases.push((
             ProcessTxReport {
                 fill: Some(fill()),
-                outcome: ProcessTxOutcome::BuyPreflightDeferred { symbol: symbol() },
+                outcome: ProcessTxOutcome::PreflightDeferred { symbol: symbol() },
             },
             format!(
-                "{fill_summary}Trade accumulated but the buy preflight deferred the hedge for {}: live buying power could not cover it. Settled the fill.\n",
+                "{fill_summary}Trade accumulated but the placement preflight deferred the hedge for {}: buying power could not cover a buy, or the equity reservation blocked a sell. Settled the fill.\n",
                 symbol()
             ),
         ));
@@ -2968,6 +2974,17 @@ mod tests {
             },
             format!(
                 "{fill_summary}No hedge placed for {}: broker placement failed or the order vanished. The pending order was cleared so the normal pipeline can re-hedge.\n",
+                symbol()
+            ),
+        ));
+
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::HedgePlacementDeferred { symbol: symbol() },
+            },
+            format!(
+                "{fill_summary}Hedge placement for {} was deferred by broker admission; the pending order intent was retained for the normal pipeline to retry once admission permits. Settled the fill.\n",
                 symbol()
             ),
         ));
