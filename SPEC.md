@@ -5682,24 +5682,23 @@ effect rather than a generic intent:
   quiesces the USDC rebalancing driver (see "Both bot-routed USDC recovery
   routes quiesce the rebalancing driver first" below) and holds it paused for
   the whole operation before it applies the single-flight gates and enqueues a
-  transfer job keyed by the
-  EXISTING id for the apalis worker to drive: any live or retryable USDC job row
-  in either direction refuses with 409 (a terminal `Failed` row does NOT --
-  re-enqueueing it is the recovery case), and a durable guard holder other than
-  the requested id refuses with 409. The worker uses the aggregate's persisted
-  amount. Routing through the bot closes the CLI-vs-server race: the CLI process
-  never drives an aggregate the bot's worker may also drive. The manual
-  `transfer-usdc` command still starts a fresh transfer directly, but hands off
-  to this endpoint at the FIRST bot-resumable wait (attestation timeout,
-  settlement lag, inconclusive poll); when the bot is unreachable, the transfer
-  is durable -- a bot restart re-arms it automatically. Like the whole
-  `server_port` recovery surface (`/transfers/resume`, `/transfers/recheck`,
-  `/transfers/fail`), its bare path is restricted to loopback callers for the
-  in-container CLI. Network operators use the IAP-verified
-  `/liquidity-write/transfers/*` mounts.
-- **Both bot-routed USDC recovery routes quiesce the rebalancing driver
-  first.** `transfer resume --kind usdc` and `transfer recheck --kind usdc`
-  send transactions from the rebalancing wallet or advance the `UsdcRebalance`
+  transfer job keyed by the EXISTING id for the apalis worker to drive: any live
+  or retryable USDC job row in either direction refuses with 409 (a terminal
+  `Failed` row does NOT -- re-enqueueing it is the recovery case), and a durable
+  guard holder other than the requested id refuses with 409. The worker uses the
+  aggregate's persisted amount. Routing through the bot closes the CLI-vs-server
+  race: the CLI process never drives an aggregate the bot's worker may also
+  drive. The manual `transfer-usdc` command still starts a fresh transfer
+  directly, but hands off to this endpoint at the FIRST bot-resumable wait
+  (attestation timeout, settlement lag, inconclusive poll); when the bot is
+  unreachable, the transfer is durable -- a bot restart re-arms it
+  automatically. Like the whole `server_port` recovery surface
+  (`/transfers/resume`, `/transfers/recheck`, `/transfers/fail`), its bare path
+  is restricted to loopback callers for the in-container CLI. Network operators
+  use the IAP-verified `/liquidity-write/transfers/*` mounts.
+- **Both bot-routed USDC recovery routes quiesce the rebalancing driver first.**
+  `transfer resume --kind usdc` and `transfer recheck --kind usdc` send
+  transactions from the rebalancing wallet or advance the `UsdcRebalance`
   aggregate on the request task, so before either mutates, it pauses the USDC
   rebalancing driver -- the two apalis workers (`TransferUsdcToHedging`,
   `TransferUsdcToMarketMaking`) plus the trigger's own queued USDC check and
