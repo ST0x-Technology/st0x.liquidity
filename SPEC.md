@@ -4899,17 +4899,20 @@ emits imbalance detection events.
 ##### Equity Allocation Planner
 
 Every equity check plans one symbol from a pure function over the venues the
-trigger can vouch for: the broker balance, one slot per hedged chain that lists
-the symbol (its wrapped vault balance converted through that chain's ERC-4626
-ratio, its effective target share, the band, its operational limit, its minimum
-operation size, whether its wallet is gas-ready and whether the listing opts
-into rebalancing), the floors, the cooling chains and the symbol's last hedge
-price.
+trigger can vouch for: the broker balance, one slot per hedged chain that
+rebalances the symbol (its wrapped vault balance converted through that chain's
+ERC-4626 ratio, its effective target share, the band, its operational limit, its
+minimum operation size and whether its wallet is gas-ready), the floors, the
+cooling chains and the symbol's last hedge price. A hedge-only listing
+(`rebalancing = "disabled"`) is neither slotted nor counted: its prefunded
+inventory is outside the planner's total, so it never moves the other chains'
+targets.
 
-- Guards, in order: the broker venue unpolled, no chain slot at all, or any
-  transfer in flight for the symbol declines the plan. Before planning, the
-  trigger declines the symbol when any chain that lists it has no polled slot or
-  a stale poll, so a total is never sized from a partial set of chains.
+- Guards, in order: the broker venue unpolled, no chain slot at all, a
+  rebalancing chain without a slot, or any transfer in flight for the symbol
+  declines the plan. Before planning, the trigger declines the symbol when any
+  chain that rebalances it has no polled slot or a stale poll, so a total is
+  never sized from a partial set of chains.
 - Sizing: `total = broker total + sum of every slot in underlying shares`; zero
   declines. Each chain's deviation is
   `underlying on chain - target share * total`, in shares. A chain is a

@@ -272,7 +272,7 @@ pub(crate) struct RebalancingServiceConfig {
     pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) transfer_timeout: Duration,
     /// Every hedged chain's asset table and minimum. The planner slots a
-    /// symbol on each chain that lists it; the USDC trigger reads the
+    /// symbol on each chain that rebalances it; the USDC trigger reads the
     /// primary's cash entry.
     pub(crate) chains: BTreeMap<Chain, ChainRebalancingConfig>,
     /// The per-chain target shares, broker floor, band and cooldown.
@@ -296,8 +296,10 @@ impl RebalancingServiceConfig {
             .any(|chain| chain.assets.is_rebalancing_enabled(symbol))
     }
 
-    /// Every hedged chain that lists `symbol`, with its listing.
-    fn listings<'config>(
+    /// Every hedged chain whose listing of `symbol` rebalances it. A
+    /// hedge-only listing (`rebalancing = "disabled"`) is neither slotted
+    /// nor counted: its prefunded inventory is outside the planner's total.
+    fn rebalancing_listings<'config>(
         &'config self,
         symbol: &'config Symbol,
     ) -> impl Iterator<
@@ -313,6 +315,7 @@ impl RebalancingServiceConfig {
                 .equities
                 .symbols
                 .get(symbol)
+                .filter(|listing| listing.rebalancing == OperationMode::Enabled)
                 .map(|listing| (*chain, config, listing))
         })
     }
@@ -3670,14 +3673,14 @@ impl RebalancingService {
     }
 
     /// Builds the planner's view of `symbol` -- one slot per hedged chain
-    /// that lists it, the broker balance, the floors, the cooldowns and the
-    /// last price -- and plans.
+    /// that rebalances it, the broker balance, the floors, the cooldowns
+    /// and the last price -- and plans.
     async fn plan_equity(&self, symbol: &Symbol) -> Result<EquityPlan, equity::EquityTriggerError> {
         let venues = self.inventory.read().await.equity_venues(symbol)?;
 
         let mut listing_chains = BTreeSet::new();
         let mut onchain = BTreeMap::new();
-        for (chain, config, listing) in self.config.listings(symbol) {
+        for (chain, config, listing) in self.config.rebalancing_listings(symbol) {
             listing_chains.insert(chain);
             // A slot can vanish between the freshness check and this read;
             // the planner then declines the symbol naming the chain.
@@ -3693,9 +3696,9 @@ impl RebalancingService {
             let target = listing
                 .target_share
                 .or_else(|| self.config.allocation.targets.get(&chain).copied());
-            let (enabled, target) = match (listing.rebalancing, target) {
-                (OperationMode::Enabled, Some(target)) => (true, target),
-                (OperationMode::Enabled, None) => {
+            let (enabled, target) = match target {
+                Some(target) => (true, target),
+                None => {
                     error!(
                         target: "rebalance",
                         %symbol,
@@ -3705,7 +3708,6 @@ impl RebalancingService {
                     );
                     (false, TargetShare::ZERO)
                 }
-                (OperationMode::Disabled, target) => (false, target.unwrap_or(TargetShare::ZERO)),
             };
             let gas_ready = enabled && self.equity_chain_gas_is_ready(chain).await;
 
@@ -4251,14 +4253,14 @@ impl RebalancingService {
 
         // Cross-chain staleness rule: never size an operation off a chain
         // whose onchain balance was not recently confirmed by a successful
-        // poll. Every chain listing the symbol counts in the planner's
+        // poll. Every chain rebalancing the symbol counts in the planner's
         // total, so one unpolled or stale listing declines the symbol rather
         // than sizing against a partial total. Freshness comes from
         // PollFreshness, which the poller stamps on every successful fetch,
         // so an unchanged (event-suppressed) book still reads fresh; the
         // snapshot aggregate's own stamps freeze on quiet books (see
         // freshness.rs module doc).
-        for (chain, _, _) in self.config.listings(symbol) {
+        for (chain, _, _) in self.config.rebalancing_listings(symbol) {
             let seeded = self
                 .inventory
                 .read()
