@@ -4779,9 +4779,16 @@ where
     // Acquired once and held to the end of the function (through both the
     // extended-hours enqueue and the inline placement), so the mutex is taken
     // exactly once per trade.
-    let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+    let counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
-    match reconcile_existing_pending_order(base_symbol, cqrs, configured_executor).await? {
+    match reconcile_existing_pending_order(
+        &counter_trade_submission_guard,
+        base_symbol,
+        cqrs,
+        configured_executor,
+    )
+    .await?
+    {
         ExistingPendingOrderOutcome::NoPending | ExistingPendingOrderOutcome::Cleared => {}
         ExistingPendingOrderOutcome::InFlight | ExistingPendingOrderOutcome::Deferred => {
             return Ok(None);
@@ -5456,7 +5463,14 @@ async fn handle_failed_anchor_recovery(
     Ok(true)
 }
 
+/// Reconciles a position's existing pending offchain-order pointer.
+///
+/// Precondition: the caller MUST hold `counter_trade_submission_lock`. The
+/// `_submission_guard` parameter makes the compiler enforce this -- the
+/// schedule-enabled close-flatten branch re-drives the claim recovery without
+/// re-acquiring the non-reentrant mutex and would self-deadlock if it did.
 async fn reconcile_existing_pending_order(
+    _submission_guard: &tokio::sync::MutexGuard<'_, ()>,
     symbol: &Symbol,
     cqrs: &TradeProcessingCqrs,
     configured_executor: SupportedExecutor,
@@ -5492,9 +5506,7 @@ async fn reconcile_existing_pending_order(
     if cqrs.close_flatten_policy.schedule_enabled()
         && matches!(loaded, Some(OffchainOrder::Pending { .. }))
     {
-        // The caller (`process_queued_trade`) already holds
-        // `counter_trade_submission_lock` across this reconciliation (ADR 0014),
-        // so re-acquiring the non-reentrant mutex here would self-deadlock.
+        // Recover under the caller's `_submission_guard` -- no re-acquire (ADR 0014).
         let recovered =
             recover_claimed_offchain_order_for_symbol(symbol, cqrs, configured_executor).await?;
         let retained = cqrs
@@ -16331,6 +16343,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_queued_trade_completes_scheduled_pending_reconciliation_under_the_submission_lock()
+     {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _) = create_cqrs_frameworks(&pool).await;
+        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let config = toml::from_str(
+            r#"
+                mode = "enabled"
+                environment = "staging"
+                poll_interval_secs = 5
+                request_timeout_secs = 3
+                response_freshness_secs = 30
+                calendar_max_age_secs = 7200
+                evidence_clock_skew_secs = 2
+                emergency_buffer_secs = 900
+                [[scopes]]
+                id = "extended"
+                profile_revision = "v1"
+                extended_hours = true
+                assets = ["AAPL"]
+            "#,
+        )
+        .unwrap();
+        let schedule = crate::trading_schedule::TradingScheduleStore::load(config, pool.clone())
+            .await
+            .unwrap();
+        let policy = CloseFlattenPolicy::from_secs(900)
+            .unwrap()
+            .with_schedule(Some(Arc::new(schedule)));
+        assert!(
+            policy.schedule_enabled(),
+            "the reconciliation branch under test only runs for a schedule-enabled policy"
+        );
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let pending_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+        let executor = MockExecutor::new().with_market_session(MarketSession::Extended);
+        cqrs.order_placer = Arc::new(crate::offchain::order::ExecutorOrderPlacer {
+            executor,
+            close_flatten_policy: Some(policy.clone()),
+        });
+        cqrs.close_flatten_policy = policy;
+        cqrs.offchain_order
+            .send(
+                &pending_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(pending_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            process_queued_trade(
+                &MockExecutor::with_failure("readiness must not run for retained claim"),
+                &make_trade_event(90),
+                test_trade_with_amount(float!(1.5), 90),
+                &cqrs,
+                &assets,
+                true,
+            ),
+        )
+        .await
+        .expect(
+            "process_queued_trade must not deadlock reconciling a scheduled pending order under \
+             the submission lock",
+        );
+        assert_eq!(outcome.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn pending_reconciliation_without_schedule_preserves_strict_error_and_claim() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _) = create_cqrs_frameworks(&pool).await;
@@ -16362,8 +16455,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let Err(error) =
-            reconcile_existing_pending_order(&symbol, &cqrs, SupportedExecutor::DryRun).await
+        let submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+        let Err(error) = reconcile_existing_pending_order(
+            &submission_guard,
+            &symbol,
+            &cqrs,
+            SupportedExecutor::DryRun,
+        )
+        .await
         else {
             panic!("pending order without schedule must retain strict reconciliation error");
         };
