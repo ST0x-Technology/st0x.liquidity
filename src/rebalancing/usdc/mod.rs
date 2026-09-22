@@ -81,12 +81,19 @@ pub enum UsdcTransferError {
     /// transport failures and inconclusive scans delayed-redrive without
     /// consuming the Apalis retry budget; formal RPC rejections and other
     /// deterministic failures remain [`Self::Vault`].
+    ///
+    /// `initiated_at` is the durable `WithdrawalSubmitting.initiated_at`
+    /// timestamp, threaded here so the job handler computes a durable deadline:
+    /// before the deadline the redrive is silent; at or after it the operator is
+    /// paged (guard held, redrive continues at a slower cadence) so an
+    /// indefinitely-inconclusive scan cannot redrive forever unnoticed.
     #[error(
         "USDC rebalance {id}: vault withdrawal scan inconclusive or failed \
          transiently; will retry after delay"
     )]
     WithdrawalScanTransient {
         id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
         #[source]
         source: Box<RaindexError>,
     },

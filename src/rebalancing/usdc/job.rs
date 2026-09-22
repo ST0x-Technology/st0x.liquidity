@@ -134,6 +134,22 @@ const MINT_RECOVERY_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 /// idempotent against the same CCTP nonce -- keeps running.
 const MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
 
+/// Duration after which repeated `WithdrawalScanTransient` redrives page the
+/// operator via the notifier. Mirrors `WITHDRAWAL_POLL_ALERT_DEADLINE` /
+/// `MINT_RECOVERY_ALERT_DEADLINE`: the deadline is durable, derived from
+/// `WithdrawalSubmitting.initiated_at`, so the countdown survives restarts. An
+/// inconclusive vault-withdrawal scan self-heals as the chain advances, so
+/// before the deadline the redrive is silent; the deadline only guards against
+/// a scan that stays inconclusive long enough to signal a real problem
+/// (RPC/backend degradation, or a withdrawal that never mined).
+const WITHDRAWAL_SCAN_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Redrive delay used AFTER the withdrawal-scan alert deadline has elapsed.
+/// Mirrors `WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY`: slows the cadence from
+/// `SETTLEMENT_REDRIVE_DELAY` to prevent alert fatigue while the guard stays
+/// held and the idempotent re-scan keeps running.
+const WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
+
 /// Returns the warn-threshold attempt count at which an early operator alert
 /// fires, or `None` when there is no room for a distinct early warning.
 ///
@@ -726,18 +742,12 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                      nothing to redrive, leaving for operator reconciliation"
                 );
             }
-            Err(UsdcTransferError::WithdrawalScanTransient { id, source }) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    delay = ?SETTLEMENT_REDRIVE_DELAY,
-                    ?source,
-                    "Rescheduling Base->Alpaca USDC transfer after transient or \
-                     inconclusive vault-withdrawal scan"
-                );
-                let mut job_queue = ctx.job_queue.clone();
-                job_queue
-                    .push_with_delay(self.clone(), SETTLEMENT_REDRIVE_DELAY)
+            Err(UsdcTransferError::WithdrawalScanTransient {
+                id,
+                initiated_at,
+                source,
+            }) => {
+                self.handle_withdrawal_scan_inconclusive(ctx, id, initiated_at, source)
                     .await?;
             }
             // Settlement-phase transient: the Base burn scan was inconclusive
@@ -1182,6 +1192,60 @@ impl TransferUsdcToHedging {
             source,
         )
         .await?;
+        Ok(())
+    }
+
+    /// Reschedules a `WithdrawalSubmitting` transfer whose vault-withdrawal scan
+    /// stayed inconclusive, paging the operator once the durable
+    /// `WITHDRAWAL_SCAN_ALERT_DEADLINE` (anchored on `initiated_at`) elapses
+    /// while continuing to redrive at the slower post-deadline cadence. Mirrors
+    /// [`Self::handle_mint_recovery_inconclusive`]: the guard stays held and the
+    /// idempotent re-scan keeps running because the withdrawal may still be
+    /// genuinely pending.
+    async fn handle_withdrawal_scan_inconclusive(
+        &self,
+        ctx: &TransferUsdcToHedgingCtx,
+        id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
+        source: Box<st0x_raindex::RaindexError>,
+    ) -> Result<(), TransferUsdcToHedgingJobError> {
+        // Mirror the `.ok()` pattern used for the mint-recovery / withdrawal-poll
+        // deadlines: a future `initiated_at` (clock skew after restart) makes
+        // `to_std()` return `Err`, treated as `None` so no spurious alert fires.
+        let elapsed = Utc::now().signed_duration_since(initiated_at).to_std().ok();
+        let alert_deadline_elapsed = deadline_elapsed(elapsed, WITHDRAWAL_SCAN_ALERT_DEADLINE);
+        let redrive_delay = if alert_deadline_elapsed.is_some() {
+            WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY
+        } else {
+            SETTLEMENT_REDRIVE_DELAY
+        };
+        warn!(
+            target: "rebalance",
+            %id,
+            delay = ?redrive_delay,
+            ?elapsed,
+            ?source,
+            "Rescheduling Base->Alpaca USDC transfer after transient or \
+             inconclusive vault-withdrawal scan (guard held, redrive continues)"
+        );
+        if let Some(elapsed) = alert_deadline_elapsed {
+            let message = format!(
+                "USDC transfer {id}: vault-withdrawal scan has stayed inconclusive for \
+                 {elapsed:?} since the transfer started (>{WITHDRAWAL_SCAN_ALERT_DEADLINE:?}); \
+                 the withdrawal's on-chain fate is still unknown ({source}). Transfer stays \
+                 latched at WithdrawalSubmitting (guard held); automatic redrive continues at a \
+                 slower cadence. Verify the vault withdrawal on-chain; use `stox transfer resume \
+                 --kind usdc --id {id} --direction to-alpaca` if the automatic redrive appears \
+                 stuck."
+            );
+            if let Err(notify_err) = ctx.notifier.notify(&message).await {
+                warn!(target: "rebalance", ?notify_err, "Failed to deliver withdrawal-scan-deadline-elapsed alert");
+            }
+        }
+        ctx.job_queue
+            .clone()
+            .push_with_delay(self.clone(), redrive_delay)
+            .await?;
         Ok(())
     }
 }
@@ -5431,7 +5495,9 @@ mod tests {
         );
     }
 
-    struct WithdrawalScanFailureBaseToAlpaca;
+    struct WithdrawalScanFailureBaseToAlpaca {
+        initiated_at: DateTime<Utc>,
+    }
 
     #[async_trait]
     impl ResumeBaseToAlpaca for WithdrawalScanFailureBaseToAlpaca {
@@ -5442,6 +5508,7 @@ mod tests {
         ) -> Result<(), UsdcTransferError> {
             Err(UsdcTransferError::WithdrawalScanTransient {
                 id: id.clone(),
+                initiated_at: self.initiated_at,
                 source: Box::new(st0x_raindex::RaindexError::ScanInconclusive { from_block: 42 }),
             })
         }
@@ -5452,7 +5519,9 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            transfer: Arc::new(WithdrawalScanFailureBaseToAlpaca),
+            transfer: Arc::new(WithdrawalScanFailureBaseToAlpaca {
+                initiated_at: Utc::now(),
+            }),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
@@ -5489,6 +5558,70 @@ mod tests {
             run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
                 && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
             "redrive must be delayed by approximately {SETTLEMENT_REDRIVE_DELAY:?}"
+        );
+    }
+
+    /// A withdrawal scan that stays inconclusive past
+    /// `WITHDRAWAL_SCAN_ALERT_DEADLINE` must page the operator exactly once while
+    /// STILL redriving (at the slower post-deadline cadence, guard held): the
+    /// withdrawal may still be genuinely pending, so redrive never stops.
+    #[tokio::test]
+    async fn hedging_job_pages_on_withdrawal_scan_deadline_elapsed() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(WithdrawalScanFailureBaseToAlpaca {
+                initiated_at: Utc::now() - chrono::Duration::hours(5),
+            }),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let before = Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "a withdrawal scan inconclusive past the alert deadline must page the \
+             operator exactly once, got: {messages:?}"
+        );
+        assert!(
+            messages[0].contains(&job.id.to_string()),
+            "the deadline alert must include the transfer id; got: {:?}",
+            messages[0]
+        );
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            1,
+            "the guard stays held and redrive continues past the deadline"
+        );
+        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(rescheduled.id, job.id);
+        assert!(
+            run_at
+                >= before
+                    + i64::try_from(WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY.as_secs()).unwrap()
+                    - 5
+                && run_at
+                    <= after
+                        + i64::try_from(WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY.as_secs())
+                            .unwrap()
+                        + 5,
+            "past the deadline the redrive must slow to \
+             ~{WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY:?} -- run_at={run_at} \
+             before={before} after={after}"
         );
     }
 

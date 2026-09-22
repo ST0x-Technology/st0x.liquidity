@@ -88,6 +88,7 @@ pub struct MockRaindex {
     remember_submitted_withdrawal: bool,
     withdraw_submissions: AtomicUsize,
     restored_prepared_withdrawals: AtomicUsize,
+    restore_submitted_withdrawal_calls: Mutex<Vec<(TxHash, bool)>>,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -155,6 +156,7 @@ impl MockRaindex {
             remember_submitted_withdrawal: false,
             withdraw_submissions: AtomicUsize::new(0),
             restored_prepared_withdrawals: AtomicUsize::new(0),
+            restore_submitted_withdrawal_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -234,6 +236,17 @@ impl MockRaindex {
     #[cfg(test)]
     pub(crate) fn restored_prepared_withdrawals(&self) -> usize {
         self.restored_prepared_withdrawals.load(Ordering::SeqCst)
+    }
+
+    /// Every `restore_submitted_withdrawal` call as `(tx_hash, prepared_present)`,
+    /// so a test can assert both the exact adopted hash and whether the retained
+    /// prepared transaction was forwarded.
+    #[cfg(test)]
+    pub(crate) fn restore_submitted_withdrawal_calls(&self) -> Vec<(TxHash, bool)> {
+        let Ok(calls) = self.restore_submitted_withdrawal_calls.lock() else {
+            panic!("mock restore-submitted-withdrawal mutex poisoned");
+        };
+        calls.clone()
     }
 }
 
@@ -355,11 +368,15 @@ impl Raindex for MockRaindex {
 
     async fn restore_submitted_withdrawal(
         &self,
-        _tx_hash: TxHash,
-        _prepared: Option<&PreparedTransaction>,
+        tx_hash: TxHash,
+        prepared: Option<&PreparedTransaction>,
     ) -> Result<(), RaindexError> {
         self.restored_prepared_withdrawals
             .fetch_add(1, Ordering::SeqCst);
+        let Ok(mut calls) = self.restore_submitted_withdrawal_calls.lock() else {
+            panic!("mock restore-submitted-withdrawal mutex poisoned");
+        };
+        calls.push((tx_hash, prepared.is_some()));
         Ok(())
     }
 

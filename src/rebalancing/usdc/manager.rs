@@ -219,11 +219,13 @@ fn classify_vault_withdrawal_error(error: RaindexError) -> UsdcTransferError {
 
 fn classify_vault_withdrawal_scan_error(
     id: &UsdcRebalanceId,
+    initiated_at: DateTime<Utc>,
     error: RaindexError,
 ) -> UsdcTransferError {
     if error.is_reconciliation_pending() {
         UsdcTransferError::WithdrawalScanTransient {
             id: id.clone(),
+            initiated_at,
             source: Box::new(error),
         }
     } else {
@@ -2913,8 +2915,14 @@ impl<
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
                 let amount_u256 = usdc_to_u256(amount)?;
-                self.resume_withdrawal_submitting(id, amount, amount_u256, from_block)
-                    .await?;
+                self.resume_withdrawal_submitting(
+                    id,
+                    amount,
+                    amount_u256,
+                    from_block,
+                    initiated_at,
+                )
+                .await?;
                 self.continue_from_withdrawal_complete(id, amount, initiated_at)
                     .await
             }
@@ -3797,12 +3805,13 @@ impl<
         amount: Usdc,
         amount_u256: U256,
         from_block: u64,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         let (existing_tx, withdrawn) = self
             .raindex
             .find_recent_withdrawal(USDC_BASE, self.vault_id, from_block)
             .await
-            .map_err(|error| classify_vault_withdrawal_scan_error(id, error))?;
+            .map_err(|error| classify_vault_withdrawal_scan_error(id, initiated_at, error))?;
 
         // The withdrawal for this transfer already landed on-chain; adopt it
         // instead of re-withdrawing. If it realized a different amount than
@@ -4929,6 +4938,7 @@ mod tests {
 
         let error = classify_vault_withdrawal_scan_error(
             &id,
+            chrono::Utc::now(),
             RaindexError::ScanInconclusive { from_block: 42 },
         );
 
@@ -4937,6 +4947,7 @@ mod tests {
             UsdcTransferError::WithdrawalScanTransient {
                 id: error_id,
                 source,
+                ..
             } if error_id == id
                 && matches!(*source, RaindexError::ScanInconclusive { from_block: 42 })
         ));
@@ -4948,6 +4959,7 @@ mod tests {
 
         let error = classify_vault_withdrawal_scan_error(
             &id,
+            chrono::Utc::now(),
             RaindexError::ScanAnomalousLog {
                 reason: st0x_raindex::ScanAnomaly::MissingTransactionHash,
             },

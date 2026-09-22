@@ -2398,6 +2398,7 @@ mod tests {
             },
             UsdcTransferError::WithdrawalScanTransient {
                 id: id.clone(),
+                initiated_at: Utc::now(),
                 source: Box::new(st0x_raindex::RaindexError::ScanInconclusive { from_block: 99 }),
             },
             UsdcTransferError::MintRecoveryInconclusive {

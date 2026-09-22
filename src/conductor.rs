@@ -7654,6 +7654,72 @@ mod tests {
         }
     }
 
+    /// Companion to `issuer_down_does_not_block_tokenization_resume` covering the
+    /// second arm of the recovery `match`: a redemption interrupted at
+    /// `VaultWithdrawSubmitted` (the legacy hash-only recovery path) must have
+    /// its nonce ownership restored synchronously with the exact adopted tx hash
+    /// and its retained prepared transaction before workers run.
+    #[tokio::test]
+    async fn startup_restores_submitted_withdrawal_nonce_ownership() {
+        let InterruptedAggregateFixture {
+            pool,
+            services,
+            redemption_id,
+            raindex,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+            ..
+        } = seed_interrupted_aggregates_and_build_service(
+            2,
+            "submitted-mint",
+            "submitted-redemption",
+        )
+        .await;
+
+        // The fixture seeds the redemption at `VaultWithdrawSubmitting`; advance
+        // it to `VaultWithdrawSubmitted` so recovery takes the second match arm.
+        let withdraw_tx = TxHash::from([0x7c; 32]);
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+        redemption_store
+            .send(
+                &redemption_id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: withdraw_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            mint_store,
+            redemption_store,
+            &services,
+            &mut resume_queue,
+        )
+        .await
+        .expect("recover_interrupted_tokenization_aggregates must succeed");
+
+        assert_eq!(
+            raindex.restore_submitted_withdrawal_calls(),
+            vec![(withdraw_tx, true)],
+            "startup must restore the persisted VaultWithdrawSubmitted \
+             transaction's nonce ownership with its exact tx hash and retained \
+             prepared transaction before workers run"
+        );
+    }
+
     /// Regression: `recover_interrupted_tokenization_aggregates` must enqueue
     /// a `ResumeTokenizationAggregate` job for each interrupted aggregate and
     /// return immediately without calling any issuer (tokenizer) method.
