@@ -23,7 +23,7 @@ use st0x_hedge::operator::offchain::order::{
     BrokerOrderPlacement, OrderPlacementResult, OrderPlacer,
 };
 use st0x_hedge::operator::process_tx::{
-    HedgeDisposition, ProcessTxChainContext, ProcessTxOutcome, ProcessTxReport,
+    PlacedHedgeDisposition, ProcessTxChainContext, ProcessTxOutcome, ProcessTxReport,
 };
 use st0x_registry::SymbolCache;
 
@@ -773,15 +773,11 @@ fn render_process_tx_outcome<W: Write>(
                 "Placed {direction:?} hedge for {shares} {symbol} (order {offchain_order_id})"
             )?;
             match disposition {
-                HedgeDisposition::InFlight => writeln!(
+                PlacedHedgeDisposition::InFlight => writeln!(
                     stdout,
                     "Order submitted; it will be reconciled to a terminal state by the order-status recovery sweep on the next bot startup."
                 )?,
-                HedgeDisposition::ClearedForRetry => writeln!(
-                    stdout,
-                    "Hedge placement failed or the order vanished; pending order cleared so the normal pipeline can re-hedge."
-                )?,
-                HedgeDisposition::Finalized => writeln!(
+                PlacedHedgeDisposition::Finalized => writeln!(
                     stdout,
                     "The order reached a terminal broker state and the position was finalized."
                 )?,
@@ -2924,15 +2920,11 @@ mod tests {
 
         for (disposition, disposition_line) in [
             (
-                HedgeDisposition::InFlight,
+                PlacedHedgeDisposition::InFlight,
                 "Order submitted; it will be reconciled to a terminal state by the order-status recovery sweep on the next bot startup.",
             ),
             (
-                HedgeDisposition::ClearedForRetry,
-                "Hedge placement failed or the order vanished; pending order cleared so the normal pipeline can re-hedge.",
-            ),
-            (
-                HedgeDisposition::Finalized,
+                PlacedHedgeDisposition::Finalized,
                 "The order reached a terminal broker state and the position was finalized.",
             ),
         ] {

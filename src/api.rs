@@ -62,7 +62,7 @@ use crate::operator::position::{
     OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
 };
 use crate::operator::process_tx::{
-    self, HedgeDisposition, ProcessTxFill, ProcessTxOutcome, ProcessTxReport, ProcessTxStores,
+    self, PlacedHedgeDisposition, ProcessTxFill, ProcessTxOutcome, ProcessTxReport, ProcessTxStores,
 };
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
@@ -2659,9 +2659,8 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
                 shares: shares.to_string(),
                 direction: format!("{direction:?}"),
                 disposition: match disposition {
-                    HedgeDisposition::InFlight => "in_flight",
-                    HedgeDisposition::ClearedForRetry => "cleared_for_retry",
-                    HedgeDisposition::Finalized => "finalized",
+                    PlacedHedgeDisposition::InFlight => "in_flight",
+                    PlacedHedgeDisposition::Finalized => "finalized",
                 },
             },
             ProcessTxOutcome::HedgePlacementCleared { symbol } => Self::HedgePlacementCleared {
@@ -7545,9 +7544,8 @@ mod tests {
         ];
 
         for (disposition, wire) in [
-            (HedgeDisposition::InFlight, "in_flight"),
-            (HedgeDisposition::ClearedForRetry, "cleared_for_retry"),
-            (HedgeDisposition::Finalized, "finalized"),
+            (PlacedHedgeDisposition::InFlight, "in_flight"),
+            (PlacedHedgeDisposition::Finalized, "finalized"),
         ] {
             cases.push((
                 ProcessTxReport {

@@ -1575,6 +1575,22 @@ pub mod process_tx {
         }
     }
 
+    /// The two dispositions a placed process-tx hedge can carry.
+    ///
+    /// The broker accepted it and it is still in flight, or it reached a
+    /// terminal broker state and the position was finalized. A cleared
+    /// placement is not reachable here -- `finalize_hedge_outcome` routes
+    /// `ClearedForRetry` to `HedgePlacementCleared` instead.
+    #[derive(Debug, Clone, Copy)]
+    pub enum PlacedHedgeDisposition {
+        /// The broker accepted the order; the next order-status recovery sweep
+        /// reconciles it to a terminal state.
+        InFlight,
+        /// The order reached a terminal broker state and the position was
+        /// finalized.
+        Finalized,
+    }
+
     /// What processing a transaction's fill resolved to.
     #[derive(Debug)]
     pub enum ProcessTxOutcome {
@@ -1607,7 +1623,7 @@ pub mod process_tx {
             offchain_order_id: OffchainOrderId,
             shares: Positive<FractionalShares>,
             direction: Direction,
-            disposition: HedgeDisposition,
+            disposition: PlacedHedgeDisposition,
         },
         /// Broker placement failed or the just-placed order vanished, so the
         /// position's pending marker was cleared for the normal pipeline to
@@ -2070,14 +2086,14 @@ pub mod process_tx {
         direction: Direction,
         poll_enrollment: Option<(&PollOrderStatusJobQueue, Duration)>,
     ) -> Result<ProcessTxOutcome, OperatorError> {
-        match disposition {
-            HedgeDisposition::ClearedForRetry => Ok(ProcessTxOutcome::HedgePlacementCleared {
-                symbol: symbol.clone(),
-            }),
-            HedgeDisposition::InFlight | HedgeDisposition::Finalized => {
-                if let (HedgeDisposition::InFlight, Some((poll_status_queue, poll_interval))) =
-                    (disposition, poll_enrollment)
-                {
+        let placed_disposition = match disposition {
+            HedgeDisposition::ClearedForRetry => {
+                return Ok(ProcessTxOutcome::HedgePlacementCleared {
+                    symbol: symbol.clone(),
+                });
+            }
+            HedgeDisposition::InFlight => {
+                if let Some((poll_status_queue, poll_interval)) = poll_enrollment {
                     push_poll_job_if_absent(
                         poll_status_queue.clone(),
                         offchain_order_id,
@@ -2094,15 +2110,17 @@ pub mod process_tx {
                     })
                     .map_err(|error| OperatorError::Operational(anyhow::Error::new(error)))?;
                 }
-                Ok(ProcessTxOutcome::HedgePlaced {
-                    symbol: symbol.clone(),
-                    offchain_order_id,
-                    shares: hedge_shares,
-                    direction,
-                    disposition,
-                })
+                PlacedHedgeDisposition::InFlight
             }
-        }
+            HedgeDisposition::Finalized => PlacedHedgeDisposition::Finalized,
+        };
+        Ok(ProcessTxOutcome::HedgePlaced {
+            symbol: symbol.clone(),
+            offchain_order_id,
+            shares: hedge_shares,
+            direction,
+            disposition: placed_disposition,
+        })
     }
 
     /// Completes fill accounting after the recovery path has resolved its hedge decision.
@@ -2480,10 +2498,10 @@ pub mod process_tx {
         use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
         use super::{
-            HedgeDisposition, OperatorError, PlacementContext, ProcessTxChainContext,
-            ProcessTxFill, ProcessTxOutcome, ProcessTxStores, RejectionReason, preflight_buy,
-            process_found_trade, process_tx, reconcile_failed_anchor,
-            reconcile_offchain_order_state, reconcile_post_place_state,
+            HedgeDisposition, OperatorError, PlacedHedgeDisposition, PlacementContext,
+            ProcessTxChainContext, ProcessTxFill, ProcessTxOutcome, ProcessTxStores,
+            RejectionReason, preflight_buy, process_found_trade, process_tx,
+            reconcile_failed_anchor, reconcile_offchain_order_state, reconcile_post_place_state,
         };
 
         /// Parses a positive share quantity for process-tx fixtures.
@@ -4619,7 +4637,7 @@ pub mod process_tx {
                 matches!(
                     outcome,
                     ProcessTxOutcome::HedgePlaced {
-                        disposition: HedgeDisposition::InFlight,
+                        disposition: PlacedHedgeDisposition::InFlight,
                         ..
                     }
                 ),
@@ -4722,7 +4740,7 @@ pub mod process_tx {
 
             let ProcessTxOutcome::HedgePlaced {
                 offchain_order_id,
-                disposition: HedgeDisposition::InFlight,
+                disposition: PlacedHedgeDisposition::InFlight,
                 ..
             } = outcome
             else {
