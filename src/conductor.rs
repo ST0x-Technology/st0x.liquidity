@@ -5487,7 +5487,9 @@ async fn reconcile_existing_pending_order(
     if cqrs.close_flatten_policy.schedule_enabled()
         && matches!(loaded, Some(OffchainOrder::Pending { .. }))
     {
-        let _submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+        // The caller (`process_queued_trade`) already holds
+        // `counter_trade_submission_lock` across this reconciliation (ADR 0014),
+        // so re-acquiring the non-reentrant mutex here would self-deadlock.
         let recovered =
             recover_claimed_offchain_order_for_symbol(symbol, cqrs, configured_executor).await?;
         let retained = cqrs
