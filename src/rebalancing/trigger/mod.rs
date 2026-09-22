@@ -3215,19 +3215,22 @@ impl RebalancingService {
                     self.divergence_gate
                         .request_onchain_cash_reconcile(trade_id.chain, *block_number);
                 }
-                // Only the primary chain rebalances: a secondary is
-                // prefunded and holds its own inventory, so its fill
-                // must not schedule work against the primary chain's
-                // balances. A clamped leg waits for the next pinned
-                // snapshot instead of sizing a transfer from an
-                // acknowledged intermediate balance.
-                if trade_id.chain == primary_chain {
-                    if equity_reconciled {
-                        self.equity_scheduler.enqueue_check(symbol).await;
-                    }
-                    if usdc_reconciled {
-                        self.usdc_scheduler.enqueue_check().await;
-                    }
+                // Equity rebalancing is per chain: a fill on a chain whose
+                // listing rebalances the symbol moves that chain's slot, so
+                // it schedules the symbol's check. A hedge-only listing is
+                // prefunded and outside the planner's total, and USDC still
+                // rebalances on the primary chain only. A clamped leg waits
+                // for the next pinned snapshot instead of sizing a transfer
+                // from an acknowledged intermediate balance.
+                let rebalances_here = self
+                    .config
+                    .rebalancing_listings(&symbol)
+                    .any(|(chain, _, _)| chain == trade_id.chain);
+                if rebalances_here && equity_reconciled {
+                    self.equity_scheduler.enqueue_check(symbol).await;
+                }
+                if trade_id.chain == primary_chain && usdc_reconciled {
+                    self.usdc_scheduler.enqueue_check().await;
                 }
 
                 Ok(())
@@ -14256,13 +14259,14 @@ mod tests {
     }
 
     /// A fill on a hedged secondary chain belongs to that chain: it moves
-    /// the secondary's own inventory slot, leaves the primary's untouched,
-    /// and asks for no rebalancing (secondaries are prefunded, with
-    /// rebalancing disabled on every asset).
+    /// the secondary's own inventory slot and leaves the primary's untouched.
+    /// It asks for no rebalancing when the chain does not list the symbol
+    /// (Ethereum) or lists it hedge-only (Robinhood, prefunded and outside
+    /// the planner's total); USDC rebalances on the primary chain only.
     #[tokio::test]
     async fn secondary_chain_fill_stays_on_its_own_chain() {
-        for chain in [Chain::Ethereum, Chain::HyperEvm] {
-            let symbol = Symbol::new("AAPL").unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        for chain in [Chain::Ethereum, Chain::Robinhood] {
             let now = Utc::now();
             let inventory = InventoryView::default()
                 .with_equity(symbol.clone(), shares(50), shares(50))
@@ -14287,8 +14291,23 @@ mod tests {
                     now,
                 )
                 .unwrap();
+            let mut hedge_only = rebalancing_enabled_equities(&["AAPL"]);
+            hedge_only
+                .symbols
+                .get_mut(&symbol)
+                .expect("AAPL is configured")
+                .rebalancing = OperationMode::Disabled;
+            let mut config = test_config();
+            config.chains.insert(
+                Chain::Robinhood,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities: hedge_only,
+                    cash: None,
+                }),
+            );
 
-            let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+            let reactor =
+                make_trigger_with_inventory_and_registry_config(inventory, &symbol, config).await;
             let trigger = reactor.clone();
             let harness = ReactorHarness::new(reactor.clone());
 
@@ -14327,7 +14346,8 @@ mod tests {
             assert_eq!(
                 count_pending_equity_check_jobs(&trigger).await,
                 0,
-                "a secondary chain's fill must not schedule the primary's equity rebalancing"
+                "a fill on a chain that does not rebalance the symbol must not schedule \
+                 its equity check"
             );
             assert_eq!(
                 count_pending_usdc_check_jobs(&trigger).await,
