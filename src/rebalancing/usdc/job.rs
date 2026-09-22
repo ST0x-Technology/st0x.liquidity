@@ -1242,9 +1242,17 @@ impl TransferUsdcToHedging {
                 warn!(target: "rebalance", ?notify_err, "Failed to deliver withdrawal-scan-deadline-elapsed alert");
             }
         }
+        // A non-429 self-heal redrive breaks the consecutive-429 streak, so reset
+        // it (mirrors the burn-revert / withdrawal-poll-inconclusive redrives);
+        // carrying a stale streak could otherwise fire a premature backpressure
+        // page on a later genuine 429.
+        let redriven = Self {
+            backpressure_streak: BackpressureStreak::default(),
+            ..self.clone()
+        };
         ctx.job_queue
             .clone()
-            .push_with_delay(self.clone(), redrive_delay)
+            .push_with_delay(redriven, redrive_delay)
             .await?;
         Ok(())
     }
@@ -5531,7 +5539,7 @@ mod tests {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
             revert_redrive_attempts: 3,
-            backpressure_streak: BackpressureStreak::default(),
+            backpressure_streak: BackpressureStreak(4),
         };
 
         let before = Utc::now().timestamp();
@@ -5553,6 +5561,12 @@ mod tests {
         assert_eq!(
             rescheduled.revert_redrive_attempts, job.revert_redrive_attempts,
             "withdrawal-scan redrive must not consume the burn-redrive budget"
+        );
+        assert_eq!(
+            rescheduled.backpressure_streak,
+            BackpressureStreak::default(),
+            "a non-429 inconclusive withdrawal-scan redrive is unrelated to \
+             backpressure and must reset the streak"
         );
         assert!(
             run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
