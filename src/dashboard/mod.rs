@@ -656,6 +656,23 @@ mod tests {
         })
     }
 
+    /// Only per-symbol `target_share` overrides are configured, so the
+    /// primary chain has no chain-level default and the dashboard gets no
+    /// equity target rather than a fabricated 0%.
+    #[test]
+    fn settings_from_ctx_reports_no_equity_target_without_a_primary_chain_default() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        let primary = ctx.chains.primary().chain;
+        ctx.rebalancing.allocation.targets.remove(&primary).unwrap();
+
+        let settings = serde_json::to_value(settings_from_ctx(&ctx)).unwrap();
+
+        assert_eq!(settings["equityTarget"], json!(null));
+        assert_eq!(settings["equityDeviation"], json!(0.1));
+    }
+
     #[test]
     fn settings_from_ctx_includes_asset_operation_flags() {
         let mut ctx = create_test_ctx_with_order_owner(address!(
