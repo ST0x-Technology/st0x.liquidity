@@ -4911,8 +4911,8 @@ targets.
 - Guards, in order: the broker venue unpolled, no chain slot at all, a
   rebalancing chain without a slot, or any transfer in flight for the symbol
   declines the plan. Before planning, the trigger declines the symbol when any
-  chain that rebalances it has no polled slot or a stale poll, so a total is
-  never sized from a partial set of chains.
+  chain that rebalances it has no polled slot or a stale poll (`chain_unpolled`,
+  `chain_stale`), so a total is never sized from a partial set of chains.
 - Sizing: `total = broker total + sum of every slot in underlying shares`; zero
   declines. Each chain's deviation is
   `underlying on chain - target share * total`, in shares. A chain is a
@@ -4929,14 +4929,15 @@ targets.
 - Minimum: with no last price, or one older than the inventory staleness bound,
   the plan declines; a candidate whose quantity times price is below the chain's
   minimum is skipped and the next one evaluated.
-- Dispatch: the chosen chain must know the token in its vault registry; the
-  operation is enqueued as that chain's mint or redemption and the
-  `(symbol, chain)` cooldown starts. One operation per symbol is in flight at a
-  time (the per-symbol lock, the job row and the transfer's first event).
-- Telemetry: every declined plan increments `equity_plan_declined_total` by
-  reason and is logged with the symbol and, where one applies, the chain; a
-  planned operation logs its chain, direction, quantity, the total and every
-  chain's deviation.
+- Dispatch: the chosen chain must know the token in its vault registry (else
+  `not_in_registry`); the operation is enqueued as that chain's mint or
+  redemption and the `(symbol, chain)` cooldown starts. One operation per symbol
+  is in flight at a time (the per-symbol lock, the job row and the transfer's
+  first event).
+- Telemetry: every declined plan, the trigger's own staleness and registry skips
+  included, increments `equity_plan_declined_total` by reason and is logged with
+  the symbol and, where one applies, the chain; a planned operation logs its
+  chain, direction, quantity, the total and every chain's deviation.
 
 ##### Trigger Events
 

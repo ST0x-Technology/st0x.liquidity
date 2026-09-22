@@ -99,6 +99,11 @@ pub(crate) enum DeclineReason {
     ChainUnpolled {
         chain: Chain,
     },
+    /// Raised by the trigger before planning: the chain's inventory poll is
+    /// older than the staleness bound or stamped in the future.
+    ChainStale {
+        chain: Chain,
+    },
     Inflight,
     TotalZero,
     WithinBand,
@@ -115,6 +120,11 @@ pub(crate) enum DeclineReason {
     },
     PriceMissing,
     PriceStale,
+    /// Raised by the trigger after planning: the chosen chain's vault
+    /// registry does not know the token.
+    NotInRegistry {
+        chain: Chain,
+    },
 }
 
 impl DeclineReason {
@@ -124,6 +134,7 @@ impl DeclineReason {
             Self::OffchainUnpolled => "offchain_unpolled",
             Self::NoPolledChain => "no_polled_chain",
             Self::ChainUnpolled { .. } => "chain_unpolled",
+            Self::ChainStale { .. } => "chain_stale",
             Self::Inflight => "inflight",
             Self::TotalZero => "total_zero",
             Self::WithinBand => "within_band",
@@ -133,6 +144,7 @@ impl DeclineReason {
             Self::CoolingDown { .. } => "cooling_down",
             Self::PriceMissing => "price_missing",
             Self::PriceStale => "price_stale",
+            Self::NotInRegistry { .. } => "not_in_registry",
         }
     }
 
@@ -140,9 +152,11 @@ impl DeclineReason {
     pub(crate) fn chain(&self) -> Option<Chain> {
         match self {
             Self::ChainUnpolled { chain }
+            | Self::ChainStale { chain }
             | Self::BelowMinimum { chain }
             | Self::NoGas { chain }
-            | Self::CoolingDown { chain } => Some(*chain),
+            | Self::CoolingDown { chain }
+            | Self::NotInRegistry { chain } => Some(*chain),
             Self::OffchainUnpolled
             | Self::NoPolledChain
             | Self::Inflight

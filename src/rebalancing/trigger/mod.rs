@@ -3775,8 +3775,9 @@ impl RebalancingService {
     }
 
     /// A declined plan is a decision too: the counter keeps the idle planner
-    /// distinguishable from a silent one, and every reason but the steady
-    /// state is worth a line.
+    /// distinguishable from a silent one, every reason but the steady state
+    /// is worth a line, and a venue the trigger cannot vouch for is worth a
+    /// warning.
     fn record_equity_decline(symbol: &Symbol, reason: &DeclineReason) {
         let label = reason.metric_label();
         counter!("equity_plan_declined_total", "reason" => label).increment(1);
@@ -3785,9 +3786,19 @@ impl RebalancingService {
             DeclineReason::WithinBand => {
                 debug!(target: "rebalance", %symbol, reason = label, "Declined equity plan");
             }
+            DeclineReason::ChainUnpolled { .. }
+            | DeclineReason::ChainStale { .. }
+            | DeclineReason::NotInRegistry { .. } => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    chain = ?reason.chain(),
+                    reason = label,
+                    "Declined equity plan"
+                );
+            }
             DeclineReason::OffchainUnpolled
             | DeclineReason::NoPolledChain
-            | DeclineReason::ChainUnpolled { .. }
             | DeclineReason::Inflight
             | DeclineReason::TotalZero
             | DeclineReason::FloorCapped
@@ -3842,11 +3853,11 @@ impl RebalancingService {
             .await?
             .is_none()
         {
-            warn!(
-                target: "rebalance",
-                %symbol,
-                chain = %operation.chain,
-                "Skipped equity trigger: symbol not in the chain's vault registry"
+            Self::record_equity_decline(
+                symbol,
+                &DeclineReason::NotInRegistry {
+                    chain: operation.chain,
+                },
             );
             return Ok(None);
         }
@@ -4275,15 +4286,13 @@ impl RebalancingService {
             if let Some(staleness) =
                 stale_snapshot_age(last_polled.flatten(), self.config.inventory_staleness_bound)
             {
-                warn!(
-                    target: "rebalance",
-                    %symbol,
-                    %chain,
-                    %staleness,
-                    bound_secs = self.config.inventory_staleness_bound.as_secs(),
-                    "Skipped equity trigger: the chain's onchain inventory \
-                     poll is stale"
-                );
+                let reason = match staleness {
+                    StaleSnapshot::NeverPolled => DeclineReason::ChainUnpolled { chain },
+                    StaleSnapshot::AgedOut { .. } | StaleSnapshot::FutureStamp { .. } => {
+                        DeclineReason::ChainStale { chain }
+                    }
+                };
+                Self::record_equity_decline(symbol, &reason);
                 return Ok(());
             }
         }
