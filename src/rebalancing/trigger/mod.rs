@@ -3786,13 +3786,24 @@ impl RebalancingService {
             DeclineReason::WithinBand => {
                 debug!(target: "rebalance", %symbol, reason = label, "Declined equity plan");
             }
-            DeclineReason::ChainUnpolled { .. }
-            | DeclineReason::ChainStale { .. }
-            | DeclineReason::NotInRegistry { .. } => {
+            DeclineReason::ChainUnpolled { chain }
+            | DeclineReason::ChainStale { chain }
+            | DeclineReason::NotInRegistry { chain } => {
                 warn!(
                     target: "rebalance",
                     %symbol,
-                    chain = ?reason.chain(),
+                    %chain,
+                    reason = label,
+                    "Declined equity plan"
+                );
+            }
+            DeclineReason::BelowMinimum { chain }
+            | DeclineReason::NoGas { chain }
+            | DeclineReason::CoolingDown { chain } => {
+                info!(
+                    target: "rebalance",
+                    %symbol,
+                    %chain,
                     reason = label,
                     "Declined equity plan"
                 );
@@ -3802,18 +3813,9 @@ impl RebalancingService {
             | DeclineReason::Inflight
             | DeclineReason::TotalZero
             | DeclineReason::FloorCapped
-            | DeclineReason::BelowMinimum { .. }
-            | DeclineReason::NoGas { .. }
-            | DeclineReason::CoolingDown { .. }
             | DeclineReason::PriceMissing
             | DeclineReason::PriceStale => {
-                info!(
-                    target: "rebalance",
-                    %symbol,
-                    chain = ?reason.chain(),
-                    reason = label,
-                    "Declined equity plan"
-                );
+                info!(target: "rebalance", %symbol, reason = label, "Declined equity plan");
             }
         }
     }

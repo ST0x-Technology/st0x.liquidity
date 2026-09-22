@@ -148,26 +148,6 @@ impl DeclineReason {
             Self::NotInRegistry { .. } => "not_in_registry",
         }
     }
-
-    /// The chain a per-chain reason names.
-    pub(crate) fn chain(&self) -> Option<Chain> {
-        match self {
-            Self::ChainUnpolled { chain }
-            | Self::ChainStale { chain }
-            | Self::BelowMinimum { chain }
-            | Self::NoGas { chain }
-            | Self::CoolingDown { chain }
-            | Self::NotInRegistry { chain } => Some(*chain),
-            Self::OffchainUnpolled
-            | Self::NoPolledChain
-            | Self::Inflight
-            | Self::TotalZero
-            | Self::WithinBand
-            | Self::FloorCapped
-            | Self::PriceMissing
-            | Self::PriceStale => None,
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
