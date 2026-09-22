@@ -262,6 +262,11 @@ pub enum EvmError {
     #[error("replacement fee bump overflowed u128 (network fee estimate too large)")]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     ReplacementFeeOverflow,
+    /// Padding a gas estimate overflowed `u64`. Only reachable if the RPC
+    /// returns an absurd estimate.
+    #[error("gas limit padding overflowed u64 (gas estimate {estimate} too large)")]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    GasLimitOverflow { estimate: u64 },
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
@@ -328,6 +333,8 @@ impl EvmError {
             Self::TransactionPreparation => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::GasLimitOverflow { .. } => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
@@ -362,6 +369,8 @@ impl EvmError {
             Self::TransactionPreparation => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::GasLimitOverflow { .. } => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
@@ -401,6 +410,8 @@ impl EvmError {
             Self::TransactionPreparation => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::GasLimitOverflow { .. } => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
@@ -448,6 +459,8 @@ impl EvmError {
             Self::TransactionPreparation => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => None,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::GasLimitOverflow { .. } => None,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => None,
             #[cfg(feature = "turnkey")]
