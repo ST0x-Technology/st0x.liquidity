@@ -916,37 +916,36 @@ mod tests {
             )
     }
 
+    fn arb_chain() -> impl Strategy<Value = Chain> {
+        prop_oneof![
+            Just(Chain::Base),
+            Just(Chain::Ethereum),
+            Just(Chain::HyperEvm)
+        ]
+    }
+
+    /// The listing set is the slotted chains plus, sometimes, one chain that
+    /// has no slot.
     fn arb_input() -> impl Strategy<Value = EquityPlanInput> {
         (
             arb_shares(),
-            proptest::collection::btree_map(
-                prop_oneof![
-                    Just(Chain::Base),
-                    Just(Chain::Ethereum),
-                    Just(Chain::HyperEvm)
-                ],
-                arb_slot(),
-                1..=3,
-            ),
+            proptest::collection::btree_map(arb_chain(), arb_slot(), 1..=3),
             arb_percent(50),
-            proptest::collection::btree_set(
-                prop_oneof![
-                    Just(Chain::Base),
-                    Just(Chain::Ethereum),
-                    Just(Chain::HyperEvm)
-                ],
-                0..=2,
-            ),
+            proptest::collection::btree_set(arb_chain(), 0..=2),
+            proptest::option::weighted(0.2, arb_chain()),
         )
-            .prop_map(|(offchain, onchain, floor, cooldowns)| EquityPlanInput {
-                alpaca_floor: TargetShare::new(floor).unwrap(),
-                cooldowns,
-                last_price: Some(observed("1", now())),
-                ..input(
-                    Some(VenueBalance::new(offchain, FractionalShares::ZERO)),
-                    onchain,
-                )
-            })
+            .prop_map(
+                |(offchain, onchain, floor, cooldowns, unslotted)| EquityPlanInput {
+                    alpaca_floor: TargetShare::new(floor).unwrap(),
+                    cooldowns,
+                    last_price: Some(observed("1", now())),
+                    listing_chains: onchain.keys().copied().chain(unslotted).collect(),
+                    ..input(
+                        Some(VenueBalance::new(offchain, FractionalShares::ZERO)),
+                        onchain,
+                    )
+                },
+            )
     }
 
     /// Mirrors the planner's arithmetic: the total over every polled venue
@@ -972,12 +971,25 @@ mod tests {
     }
 
     proptest! {
-        /// The chosen quantity never carries a chain past its target, never
+        /// A listing chain with no slot declines the symbol by name. Otherwise
+        /// the chosen quantity never carries a chain past its target, never
         /// exceeds the operational limit, and a mint never takes the broker
         /// below its Alpaca floor.
         #[test]
         fn an_operation_never_overshoots(input in arb_input()) {
-            let EquityPlan::Operation(operation) = plan_equity_operation(&input).unwrap() else {
+            let plan = plan_equity_operation(&input).unwrap();
+            if let Some(chain) = input
+                .listing_chains
+                .iter()
+                .find(|chain| !input.onchain.contains_key(chain))
+            {
+                prop_assert_eq!(
+                    plan,
+                    EquityPlan::Decline(DeclineReason::ChainUnpolled { chain: *chain })
+                );
+                return Ok(());
+            }
+            let EquityPlan::Operation(operation) = plan else {
                 return Ok(());
             };
 
@@ -1041,7 +1053,12 @@ mod tests {
                 EquityPlan::Decline(DeclineReason::NoPolledChain)
             );
 
-            let inflight = EquityPlanInput { has_inflight: true, ..input };
+            // The listing guard runs first, so every listing chain gets its slot.
+            let inflight = EquityPlanInput {
+                has_inflight: true,
+                listing_chains: input.onchain.keys().copied().collect(),
+                ..input
+            };
             prop_assert_eq!(
                 plan_equity_operation(&inflight).unwrap(),
                 EquityPlan::Decline(DeclineReason::Inflight)
