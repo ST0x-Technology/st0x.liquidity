@@ -67,6 +67,10 @@ pub struct ResettableNonceManager {
 /// Why a nonce is currently held, which decides whether allocation may land
 /// back on it after a cache seed or invalidation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Only the wallet features construct these (see the cfg-gated occupy/reserve
+// methods); the always-compiled `occupied` field type and `is_reserved` still
+// need the enum, so a no-feature build sees the variants as never constructed.
+#[allow(dead_code)]
 enum NonceHold {
     /// A prepared (not-yet-broadcast) reservation or a durable prepared
     /// transaction retained for exact rebroadcast. Allocation skips it: a

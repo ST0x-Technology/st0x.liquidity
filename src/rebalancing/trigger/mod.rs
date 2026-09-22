@@ -3908,10 +3908,16 @@ impl RebalancingService {
             Completed { .. } | ProviderCompletionRecovered { .. } => Some(
                 Self::complete_equity_transfer_update(Venue::MarketMaking, quantity),
             ),
-            TransferFailed { .. } => Some(Self::cancel_equity_transfer_update(
-                Venue::MarketMaking,
-                quantity,
-            )),
+            // `TransferFailed` cancels the inflight the withdraw opened, returning
+            // the shares to available. A redemption reconciled directly from
+            // `VaultWithdrawSubmitting` never withdrew from the vault either, so it
+            // cancels identically. `OperatorReconciled` only reaches this fold for
+            // the submitting origin: reconcile from `Failed` has its tracking removed
+            // by `TransferFailed`, so `on_redemption` early-returns before calling
+            // `redemption_inventory_update`.
+            TransferFailed { .. } | OperatorReconciled { .. } => Some(
+                Self::cancel_equity_transfer_update(Venue::MarketMaking, quantity),
+            ),
             VaultWithdrawSubmitted { .. }
             | WithdrawnFromRaindex { .. }
             | UnwrapPending { .. }
@@ -3921,9 +3927,6 @@ impl RebalancingService {
             | TokensSent { .. }
             | DetectionFailed { .. }
             | Detected { .. }
-            // Reconciliation is a pure bookkeeping terminal transition from
-            // `Failed`: the failure already settled inventory, so nothing to do.
-            | OperatorReconciled { .. }
             | RedemptionRejected { .. } => None,
         }
     }
@@ -17248,6 +17251,105 @@ mod tests {
             reason: "test rejection".to_string(),
             rejected_at: Utc::now(),
         }
+    }
+
+    fn make_vault_withdraw_submitting(symbol: &Symbol, quantity: Float) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::VaultWithdrawSubmitting {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            quantity,
+            token: Address::random(),
+            vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+            wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            from_block: 0,
+            prepared: None,
+            submitting_at: Utc::now(),
+        }
+    }
+
+    fn make_operator_reconciled() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::OperatorReconciled {
+            reason: "withdrawal never broadcast; verified on-chain".to_string(),
+            reconciled_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_submitting_cancels_marketmaking_inflight_and_restores_available() {
+        // Regression: reconciling a redemption wedged in `VaultWithdrawSubmitting`
+        // must cancel the MarketMaking inflight its submit opened, returning the
+        // shares to available (the withdrawal never left the vault). The `Failed`
+        // origin's `TransferFailed` already cancelled that inflight; submitting ->
+        // `OperatorReconciled` emits no cancel, so without the fold's cancel arm the
+        // inflight leaks a phantom redemption that skews rebalancing.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = redemption_aggregate_id("redemption-reconcile-from-submitting");
+
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                make_vault_withdraw_submitting(&symbol, float!("10")),
+            )
+            .await
+            .unwrap();
+        let (inflight, available) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_inflight(&symbol, Venue::MarketMaking),
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(
+            inflight,
+            Some(shares(10)),
+            "submit must open the MarketMaking inflight"
+        );
+        assert_eq!(
+            available,
+            Some(shares(70)),
+            "submit reserves the shares from available"
+        );
+
+        harness
+            .receive::<EquityRedemption>(id.clone(), make_operator_reconciled())
+            .await
+            .unwrap();
+
+        let (inflight, available) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_inflight(&symbol, Venue::MarketMaking),
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(
+            inflight,
+            Some(shares(0)),
+            "reconcile-from-submitting must cancel the phantom MarketMaking inflight"
+        );
+        assert_eq!(
+            available,
+            Some(shares(80)),
+            "cancelling returns the never-withdrawn shares to available"
+        );
     }
 
     #[tokio::test]

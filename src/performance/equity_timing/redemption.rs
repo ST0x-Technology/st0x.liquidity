@@ -259,11 +259,14 @@ impl StoredOperation {
                 self.completed_at = Some(*recovered_at);
             }
             OperatorReconciled { reconciled_at, .. } => {
-                // Reconcile is valid only from the terminal `Failed` state
-                // (see `EquityRedemptionCommand::Reconcile`), so the failed
-                // stage is already closed -- no stage manipulation needed
-                // here, matching USDC's `OperatorReconciled` handling
-                // exactly.
+                // Reconcile is valid from the terminal `Failed` state (whose stages
+                // a prior failure already closed, making this a no-op) OR from the
+                // `VaultWithdrawSubmitting` origin, whose genesis opened
+                // `RedemptionWithdraw`. Close any still-open stage `Unmeasured` -- an
+                // out-of-band reconcile measures nothing -- so a submitting-origin
+                // reconcile does not leave a stage `InProgress` on a `Completed`
+                // operation.
+                self.close_open_stages(*reconciled_at, StoredStageOutcome::Unmeasured);
                 self.status = StoredStatus::Completed;
                 self.completed_at = Some(*reconciled_at);
                 self.operator_reconciled = true;
@@ -373,6 +376,40 @@ mod tests {
                 "{name:?} did not succeed"
             );
         }
+    }
+
+    #[test]
+    fn reconcile_from_submitting_completes_and_closes_open_withdraw_stage() {
+        // An operator reconciling a redemption wedged in `VaultWithdrawSubmitting`
+        // (whose genesis opened `RedemptionWithdraw`) must not leave that stage
+        // `InProgress`/`Unmeasured`-missing on a `Completed` operation.
+        let events = vec![
+            EquityRedemptionEvent::VaultWithdrawSubmitting {
+                chain: st0x_evm::Chain::Base,
+                symbol: symbol(),
+                quantity: float!(5),
+                token: Address::repeat_byte(0x22),
+                vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                wrapped_amount: U256::from(5_000_000_000_000_000_000_u128),
+                from_block: 0,
+                prepared: None,
+                submitting_at: timestamp(0),
+            },
+            EquityRedemptionEvent::OperatorReconciled {
+                reason: "withdrawal never broadcast; verified on-chain".to_string(),
+                reconciled_at: timestamp(10),
+            },
+        ];
+        let operation = fold_redemption_from_genesis(&events);
+
+        assert_eq!(operation.status, RebalanceTimingStatus::Completed);
+        let withdraw = stage(&operation, EquityStageName::RedemptionWithdraw);
+        assert_eq!(
+            withdraw.outcome,
+            StageOutcome::Unmeasured,
+            "reconcile-from-submitting must close the open withdraw stage as \
+             Unmeasured, not leave it open on a Completed operation"
+        );
     }
 
     #[test]

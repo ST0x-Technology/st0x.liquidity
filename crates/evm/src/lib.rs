@@ -664,6 +664,9 @@ impl PreparedTransaction {
 
     /// Builds a prepared transaction from an envelope already decoded by the
     /// signing path, avoiding a redundant decode.
+    // Reached only from the feature-gated signing path
+    // (`submit::prepare_with_nonce`), so a no-feature build sees it as unused.
+    #[allow(dead_code)]
     pub(crate) fn from_envelope(envelope: &TxEnvelope) -> Self {
         let raw = Bytes::from(envelope.encoded_2718());
         Self {

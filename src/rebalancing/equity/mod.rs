@@ -150,7 +150,9 @@ pub(crate) async fn withdrawal_reconciliation_redrive_delay(
                  prepared withdrawal signed at a fee the market then outran cannot confirm and \
                  is never fee-bumped, so later sends from this wallet queue behind its nonce. \
                  Automatic redrive continues at a slower cadence (guard held). Verify the \
-                 withdrawal on-chain and reconcile or replace it."
+                 withdrawal on-chain; if it can never confirm, reconcile the redemption \
+                 (`stox transfer reconcile --kind redemption`) to release its reservation, then \
+                 restart the bot to clear the stuck wallet nonce so later sends proceed."
             );
             if let Err(alert_error) = notifier.notify(&message).await {
                 warn!(
