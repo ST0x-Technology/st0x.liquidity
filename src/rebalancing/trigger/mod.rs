@@ -11191,6 +11191,10 @@ mod tests {
             logs_contain("not_in_registry"),
             "the decline must be recorded by reason"
         );
+        assert!(
+            logs_contain("chain=base") && !logs_contain("chain=Some("),
+            "the decline names its chain like every other rebalance line"
+        );
     }
 
     fn base_equity_gas(readiness: Arc<GasReadiness>) -> BTreeMap<Chain, ConfiguredGasReadiness> {
@@ -26874,6 +26878,85 @@ mod tests {
             jobs.len(),
             1,
             "expected a redemption job for 100% onchain ratio once both venues have data"
+        );
+    }
+
+    /// Verifies logging shows when imbalance check skips due to partial data.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn logs_show_partial_data_skips_imbalance_check() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let symbol = Symbol::new("RKLB").unwrap();
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+        seed_vault_registry(&pool, &symbol, Chain::Base).await;
+
+        let trigger = Arc::new(RebalancingService::new(
+            test_config(),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
+            inventory.clone(),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::LogNotifier),
+        ));
+        trigger
+            .set_last_price_reader(Arc::new(StubLastPrice(float!(100))))
+            .await;
+        let reactor = trigger.clone();
+
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Apply ONLY onchain data - offchain not yet polled
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
+            balances,
+            fetched_at: Utc::now(),
+            block_number: None,
+        };
+
+        apply_and_dispatch_snapshot(reactor.clone(), id.clone(), onchain_event)
+            .await
+            .unwrap();
+        drain_pending_jobs(&trigger).await.unwrap();
+
+        // Verify the logs show:
+        // 1. The snapshot event was applied
+        // 2. Imbalance check was skipped due to partial data
+        assert!(
+            logs_contain("Applied inventory snapshot event"),
+            "Should log when snapshot event is applied"
+        );
+        assert!(
+            logs_contain("Declined equity plan") && logs_contain("offchain_unpolled"),
+            "Should log that the plan declined because the broker venue is unpolled"
+        );
+        assert!(
+            !logs_contain("chain=None"),
+            "a symbol-wide decline carries no chain field"
+        );
+        assert!(
+            !logs_contain("Triggered equity rebalancing"),
+            "Should NOT trigger rebalancing with partial data"
         );
     }
 
