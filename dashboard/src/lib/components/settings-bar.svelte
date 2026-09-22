@@ -14,7 +14,7 @@
   const fmtPct = (value: number): string => `${(value * 100).toFixed(0)}%`
 
   const equityBounds = $derived(
-    settings
+    settings?.equityTarget != null
       ? `${fmtPct(settings.equityTarget - settings.equityDeviation)}–${fmtPct(settings.equityTarget + settings.equityDeviation)}`
       : ''
   )
@@ -33,10 +33,12 @@
         <span class="font-mono">{settings.broker}</span>
       </span>
 
-      <span class="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-0.5 text-xs">
-        Equity <span class="font-mono font-semibold">{fmtPct(settings.equityTarget)}</span>
-        <span class="text-muted-foreground">({equityBounds})</span>
-      </span>
+      {#if settings.equityTarget != null}
+        <span class="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-0.5 text-xs">
+          Equity <span class="font-mono font-semibold">{fmtPct(settings.equityTarget)}</span>
+          <span class="text-muted-foreground">({equityBounds})</span>
+        </span>
+      {/if}
 
       {#if settings.usdcTarget != null}
         <span class="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-0.5 text-xs">

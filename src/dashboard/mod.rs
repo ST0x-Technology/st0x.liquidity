@@ -335,12 +335,12 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
                 )
             });
         // The dashboard's equity band is the primary chain's default target
-        // share; a chain that targets nothing shows as 0.
+        // share; with only per-symbol overrides there is no single target.
         let primary_target = rebalancing
             .allocation
             .targets
             .get(&ctx.chains.primary().chain)
-            .map_or(0.0, |target| float_to_f64(target.inner(), 0.5));
+            .map(|target| float_to_f64(target.inner(), 0.5));
 
         (
             primary_target,
@@ -625,7 +625,7 @@ mod tests {
 
     fn empty_settings() -> st0x_dto::Settings {
         st0x_dto::Settings {
-            equity_target: 0.5,
+            equity_target: Some(0.5),
             equity_deviation: 0.2,
             usdc_target: None,
             usdc_deviation: None,

@@ -142,7 +142,7 @@ mod tests {
             positions: Vec::new(),
             equity_prices: Vec::new(),
             settings: Settings {
-                equity_target: 0.5,
+                equity_target: Some(0.5),
                 equity_deviation: 0.2,
                 usdc_target: None,
                 usdc_deviation: None,
