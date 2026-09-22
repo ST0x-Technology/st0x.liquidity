@@ -14337,6 +14337,84 @@ mod tests {
         }
     }
 
+    /// A fill on a secondary chain whose listing rebalances the symbol moves
+    /// that chain's own slot and so its deviation from its target, which the
+    /// planner manages: it asks for the symbol's equity check. USDC still
+    /// rebalances on the primary chain only.
+    #[tokio::test]
+    async fn rebalancing_secondary_chain_fill_schedules_the_equity_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::HyperEvm,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::HyperEvm,
+                    usdc_balance: usdc(5000),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap();
+        let mut config = test_config();
+        config.chains.insert(
+            Chain::HyperEvm,
+            ChainRebalancingConfig::for_test(ChainAssets {
+                equities: rebalancing_enabled_equities(&["AAPL"]),
+                cash: None,
+            }),
+        );
+        let reactor = make_trigger_with_inventory_registry_and_wrappers(
+            inventory,
+            &symbol,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::HyperEvm,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+            config,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::HyperEvm),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            1,
+            "a rebalancing secondary's fill must schedule the symbol's equity check"
+        );
+        assert_eq!(
+            count_pending_usdc_check_jobs(&trigger).await,
+            0,
+            "USDC rebalancing still runs on the primary chain only"
+        );
+    }
+
     /// Before a hedged secondary's first poll, no snapshot has seeded its
     /// slots. Debiting an unseeded slot would fail and crediting one would
     /// invent a balance holding only the delta; the chain's first snapshot
