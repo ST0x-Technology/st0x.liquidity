@@ -10973,8 +10973,8 @@ mod tests {
     }
 
     /// Robinhood lists AAPL hedge-only (`rebalancing = "disabled"`) with a
-    /// prefunded 100 shares and, as in prod, no wrapper. That inventory is
-    /// outside the planner's total: Base is sized against its own 20 and
+    /// prefunded 100 shares and, as in prod, its own wrapper. That inventory
+    /// is outside the planner's total: Base is sized against its own 20 and
     /// the broker's 80 alone, so it mints 30, not the 80 a total of 200
     /// would ask for.
     #[tokio::test]
@@ -11014,8 +11014,22 @@ mod tests {
             ]),
             ..test_config()
         };
-        let trigger =
-            make_trigger_with_inventory_and_registry_config(inventory, &symbol, config).await;
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
+            inventory,
+            &symbol,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Robinhood,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+            config,
+        )
+        .await;
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
@@ -11880,30 +11894,33 @@ mod tests {
         symbol: &Symbol,
         config: RebalancingServiceConfig,
     ) -> Arc<RebalancingService> {
-        make_trigger_with_inventory_registry_and_wrapper(
+        make_trigger_with_inventory_registry_and_wrappers(
             inventory,
             symbol,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             config,
         )
         .await
     }
 
-    async fn make_trigger_with_inventory_registry_and_wrapper(
+    async fn make_trigger_with_inventory_registry_and_wrappers(
         inventory: InventoryView,
         symbol: &Symbol,
-        wrapper: Arc<MockWrapper>,
+        wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
         config: RebalancingServiceConfig,
     ) -> Arc<RebalancingService> {
-        make_trigger_with_inventory_registry_wrapper_and_pool(inventory, symbol, wrapper, config)
+        make_trigger_with_inventory_registry_wrappers_and_pool(inventory, symbol, wrappers, config)
             .await
             .0
     }
 
-    async fn make_trigger_with_inventory_registry_wrapper_and_pool(
+    async fn make_trigger_with_inventory_registry_wrappers_and_pool(
         inventory: InventoryView,
         symbol: &Symbol,
-        wrapper: Arc<MockWrapper>,
+        wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
         config: RebalancingServiceConfig,
     ) -> (Arc<RebalancingService>, SqlitePool) {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -11943,7 +11960,7 @@ mod tests {
                 },
             )]),
             inventory,
-            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
+            wrappers,
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
@@ -12013,10 +12030,10 @@ mod tests {
     async fn equity_transfer_reservation_survives_queue_handoff() {
         let symbol = Symbol::new("AAPL").unwrap();
         let wrapper = Arc::new(MockWrapper::new());
-        let trigger = make_trigger_with_inventory_registry_and_wrapper(
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
             InventoryView::default().with_equity(symbol.clone(), shares(80), shares(20)),
             &symbol,
-            Arc::clone(&wrapper),
+            BTreeMap::from([(Chain::Base, Arc::clone(&wrapper) as Arc<dyn Wrapper>)]),
             test_config(),
         )
         .await;
@@ -12055,10 +12072,13 @@ mod tests {
     #[tokio::test]
     async fn balanced_equity_checks_do_not_append_position_events() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (trigger, pool) = make_trigger_with_inventory_registry_wrapper_and_pool(
+        let (trigger, pool) = make_trigger_with_inventory_registry_wrappers_and_pool(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             test_config(),
         )
         .await;
@@ -13145,10 +13165,10 @@ mod tests {
         let wrapper = Arc::new(MockWrapper::with_ratio(U256::from(
             1_500_000_000_000_000_000u64,
         )));
-        let reactor = make_trigger_with_inventory_registry_and_wrapper(
+        let reactor = make_trigger_with_inventory_registry_and_wrappers(
             inventory,
             &symbol,
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             test_config(),
         )
         .await;
