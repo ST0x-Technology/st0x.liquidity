@@ -161,7 +161,9 @@ impl Candidate {
 
 /// Picks at most one operation for the symbol: the guards first, then the
 /// best-ranked candidate that survives the gas, cooldown, floor and minimum
-/// size checks.
+/// size checks. A missing or stale price declines the symbol before any
+/// candidate is tried; a per-chain drop on a higher-ranked candidate only
+/// outranks a later `FloorCapped`.
 pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, EquityPlanError> {
     let Some(offchain) = input.offchain else {
         return Ok(EquityPlan::Decline(DeclineReason::OffchainUnpolled));
@@ -194,8 +196,19 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
         return Ok(EquityPlan::Decline(DeclineReason::TotalZero));
     }
 
+    let candidates = ranked_candidates(input, total, &underlying)?;
+    if candidates.is_empty() {
+        return Ok(EquityPlan::Decline(DeclineReason::WithinBand));
+    }
+    let Some(price) = input.last_price else {
+        return Ok(EquityPlan::Decline(DeclineReason::PriceMissing));
+    };
+    if price_is_stale(&price, input.now, input.price_staleness_bound) {
+        return Ok(EquityPlan::Decline(DeclineReason::PriceStale));
+    }
+
     let mut first_drop = None;
-    for candidate in ranked_candidates(input, total, &underlying)? {
+    for candidate in candidates {
         let slot = &input.onchain[&candidate.chain];
         let direction = candidate.direction()?;
 
@@ -235,16 +248,6 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
         }
         let quantity = truncate_for_alpaca(&input.symbol, quantity)?;
 
-        let Some(price) = input.last_price else {
-            return Ok(EquityPlan::Decline(
-                first_drop.unwrap_or(DeclineReason::PriceMissing),
-            ));
-        };
-        if price_is_stale(&price, input.now, input.price_staleness_bound) {
-            return Ok(EquityPlan::Decline(
-                first_drop.unwrap_or(DeclineReason::PriceStale),
-            ));
-        }
         let value = (quantity.inner() * price.price)?;
         if value.lt(slot.min_operation_usd.inner().inner())? {
             first_drop.get_or_insert(DeclineReason::BelowMinimum {
