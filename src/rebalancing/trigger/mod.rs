@@ -11112,6 +11112,61 @@ mod tests {
         );
     }
 
+    /// The trigger's own pre-plan skip is a decline too: a listing chain
+    /// whose poll aged out counts as `chain_stale`, one never polled since
+    /// boot as `chain_unpolled`.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn unvouched_listing_chain_declines_are_counted_by_reason() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aged_out = PollFreshness::new();
+        aged_out.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now() - chrono::Duration::seconds(301),
+        );
+
+        for (freshness, reason) in [
+            (aged_out, "chain_stale"),
+            (PollFreshness::new(), "chain_unpolled"),
+        ] {
+            let trigger = make_imbalanced_trigger_with_freshness(
+                &symbol,
+                rebalancing_enabled_equities(&["AAPL"]),
+                freshness,
+            )
+            .await;
+
+            trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+            assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+            assert!(
+                logs_contain(reason),
+                "the decline must be recorded as {reason}"
+            );
+        }
+    }
+
+    /// The post-plan registry gate is a decline too: the chosen chain not
+    /// knowing the token counts as `not_in_registry`.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn symbol_missing_from_the_chosen_chain_registry_is_a_counted_decline() {
+        let known = Symbol::new("AAPL").unwrap();
+        let unknown = Symbol::new("TSLA").unwrap();
+        let inventory =
+            InventoryView::default().with_equity(unknown.clone(), shares(20), shares(80));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &known).await;
+
+        trigger.check_and_trigger_equity(&unknown).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert!(
+            logs_contain("not_in_registry"),
+            "the decline must be recorded by reason"
+        );
+    }
+
     fn base_equity_gas(readiness: Arc<GasReadiness>) -> BTreeMap<Chain, ConfiguredGasReadiness> {
         BTreeMap::from([(Chain::Base, ConfiguredGasReadiness::Wired(readiness))])
     }
