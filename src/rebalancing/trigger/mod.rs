@@ -3215,23 +3215,14 @@ impl RebalancingService {
                     self.divergence_gate
                         .request_onchain_cash_reconcile(trade_id.chain, *block_number);
                 }
-                // Equity rebalancing is per chain: a fill on a chain whose
-                // listing rebalances the symbol moves that chain's slot, so
-                // it schedules the symbol's check. A hedge-only listing is
-                // prefunded and outside the planner's total, and USDC still
-                // rebalances on the primary chain only. A clamped leg waits
-                // for the next pinned snapshot instead of sizing a transfer
-                // from an acknowledged intermediate balance.
-                let rebalances_here = self
-                    .config
-                    .rebalancing_listings(&symbol)
-                    .any(|(chain, _, _)| chain == trade_id.chain);
-                if rebalances_here && equity_reconciled {
-                    self.equity_scheduler.enqueue_check(symbol).await;
-                }
-                if trade_id.chain == primary_chain && usdc_reconciled {
-                    self.usdc_scheduler.enqueue_check().await;
-                }
+                self.schedule_fill_checks(
+                    symbol,
+                    trade_id.chain,
+                    primary_chain,
+                    equity_reconciled,
+                    usdc_reconciled,
+                )
+                .await;
 
                 Ok(())
             }
@@ -3775,6 +3766,34 @@ impl RebalancingService {
             .filter(|(cooled, _)| cooled == symbol)
             .map(|(_, chain)| *chain)
             .collect()
+    }
+
+    /// The rebalancing work a fill asks for. Equity rebalancing is per
+    /// chain: a fill on a chain whose listing rebalances the symbol moves
+    /// that chain's slot, so it schedules the symbol's check, while a
+    /// hedge-only listing is prefunded and outside the planner's total. USDC
+    /// still rebalances on the primary chain only. A clamped leg waits for
+    /// the next pinned snapshot instead of sizing a transfer from an
+    /// acknowledged intermediate balance.
+    async fn schedule_fill_checks(
+        &self,
+        symbol: Symbol,
+        fill_chain: Chain,
+        primary_chain: Chain,
+        equity_reconciled: bool,
+        usdc_reconciled: bool,
+    ) {
+        let rebalances_here = self
+            .config
+            .rebalancing_listings(&symbol)
+            .any(|(chain, _, _)| chain == fill_chain);
+        if rebalances_here && equity_reconciled {
+            self.equity_scheduler.enqueue_check(symbol).await;
+        }
+
+        if fill_chain == primary_chain && usdc_reconciled {
+            self.usdc_scheduler.enqueue_check().await;
+        }
     }
 
     /// A declined plan is a decision too: the counter keeps the idle planner
