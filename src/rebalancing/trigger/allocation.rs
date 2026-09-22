@@ -23,12 +23,15 @@ use crate::position::PriceObservation;
 
 /// One symbol's inventory and limits across every venue the caller could
 /// vouch for. A chain gets a slot only when it is hedged, polled and fresh;
-/// the planner never guesses a missing venue.
+/// the planner never guesses a missing venue, and a listing chain without a
+/// slot declines the symbol rather than sizing it against a partial total.
 #[derive(Debug, Clone)]
 pub struct EquityPlanInput {
     pub symbol: Symbol,
     /// The broker's shares; `None` until the broker venue has been polled.
     pub offchain: Option<VenueBalance<FractionalShares>>,
+    /// Every chain that lists the symbol; each needs a slot in `onchain`.
+    pub listing_chains: BTreeSet<Chain>,
     pub onchain: BTreeMap<Chain, ChainSlot>,
     /// Whether any venue, slotted or not, still has a transfer in flight.
     pub has_inflight: bool,
@@ -87,6 +90,10 @@ pub enum PlannedDirection {
 pub enum DeclineReason {
     OffchainUnpolled,
     NoPolledChain,
+    /// A chain that lists the symbol has no slot, so the total is partial.
+    ChainUnpolled {
+        chain: Chain,
+    },
     Inflight,
     TotalZero,
     WithinBand,
@@ -160,6 +167,15 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
     };
     if input.onchain.is_empty() {
         return Ok(EquityPlan::Decline(DeclineReason::NoPolledChain));
+    }
+    if let Some(chain) = input
+        .listing_chains
+        .iter()
+        .find(|chain| !input.onchain.contains_key(chain))
+    {
+        return Ok(EquityPlan::Decline(DeclineReason::ChainUnpolled {
+            chain: *chain,
+        }));
     }
     if input.has_inflight {
         return Ok(EquityPlan::Decline(DeclineReason::Inflight));
