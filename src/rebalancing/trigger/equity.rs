@@ -41,8 +41,8 @@ pub(crate) enum EquityTriggerError {
     LastPrice(#[from] ProjectionError<Position>),
 }
 
-/// Reads the hedging side's last price for a symbol, so the planner can
-/// value the minimum operation size.
+/// Reads a symbol's last onchain fill price, block-timestamped, so the
+/// planner can value the minimum operation size.
 #[async_trait]
 pub(crate) trait LastPriceReader: Send + Sync {
     async fn last_price(

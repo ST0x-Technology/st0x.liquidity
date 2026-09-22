@@ -4886,8 +4886,8 @@ emits imbalance detection events.
     available at the broker; beside it the hedge floor keeps its fixed number of
     shares
   - Minimum operation size: `min_operation_usd`, valued at the symbol's last
-    hedge price, overridable per chain with the trading table's
-    `min_operation_usd`
+    onchain fill price (the block-timestamped `Position.last_price`),
+    overridable per chain with the trading table's `min_operation_usd`
   - Cooldown: `cooldown_secs` per `(symbol, chain)` after a dispatch
   - At load, per symbol, the chain targets plus the floor must not exceed 1
 - **USDC global**:
@@ -4903,7 +4903,7 @@ trigger can vouch for: the broker balance, one slot per hedged chain that
 rebalances the symbol (its wrapped vault balance converted through that chain's
 ERC-4626 ratio, its effective target share, the band, its operational limit, its
 minimum operation size and whether its wallet is gas-ready), the floors, the
-cooling chains and the symbol's last hedge price. A hedge-only listing
+cooling chains and the symbol's last onchain fill price. A hedge-only listing
 (`rebalancing = "disabled"`) is neither slotted nor counted: its prefunded
 inventory is outside the planner's total, so it never moves the other chains'
 targets.

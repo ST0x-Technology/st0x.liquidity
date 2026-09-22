@@ -783,7 +783,7 @@ pub(crate) struct RebalancingService {
     /// When each `(symbol, chain)` pair last dispatched an operation, so a
     /// transfer truncated by a limit is not re-planned every tick.
     equity_cooldowns: RwLock<HashMap<(Symbol, Chain), DateTime<Utc>>>,
-    /// The hedging side's last prices, attached through
+    /// Each symbol's last onchain fill price, attached through
     /// `set_last_price_reader`; without one no minimum can be valued and
     /// every plan declines.
     last_prices: RwLock<Option<Arc<dyn LastPriceReader>>>,
