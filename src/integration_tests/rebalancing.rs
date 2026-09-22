@@ -805,6 +805,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             ExecutionThreshold::whole_share(),
         )),
         transfer_services: EquityTransferServices::panicking(),
+        primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -2187,6 +2188,7 @@ async fn mint_api_failure_preserves_requested_intent() {
             ExecutionThreshold::whole_share(),
         )),
         transfer_services: EquityTransferServices::panicking(),
+        primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -2823,6 +2825,7 @@ async fn mint_accepted_sets_offchain_inflight() {
                     ExecutionThreshold::whole_share(),
                 )),
                 transfer_services: EquityTransferServices::panicking(),
+                primary_chain: Chain::Base,
                 job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
             };
             let _ = Job::perform(&job, &ctx).await;
@@ -3055,6 +3058,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
             ExecutionThreshold::whole_share(),
         )),
         transfer_services: EquityTransferServices::panicking(),
+        primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();

@@ -3326,6 +3326,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             mint_store: built.mint.clone(),
             position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
             transfer_services: equity_transfer_services,
+            primary_chain,
             job_queue: deps.schedulers.transfer_equity_to_market_making.clone(),
         });
 
