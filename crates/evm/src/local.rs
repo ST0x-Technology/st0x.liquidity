@@ -234,7 +234,10 @@ mod tests {
     use alloy::consensus::Transaction as _;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::U256;
+    use alloy::providers::ext::AnvilApi as _;
+    use alloy::rpc::types::TransactionRequest;
     use alloy::sol;
+    use alloy::sol_types::SolCall as _;
 
     use crate::NoOpErrorRegistry;
     use crate::inflight_nonces::NonceOwnership;
@@ -387,6 +390,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, amount);
+    }
+
+    /// Reproduces a same-block state race: our transfer is estimated while
+    /// the recipient holds a balance, then the recipient empties it earlier in
+    /// the same block, so our write becomes zero->nonzero and costs more gas
+    /// than was estimated. The padded gas limit must absorb that.
+    #[tokio::test]
+    async fn padded_gas_limit_survives_state_change_before_inclusion() {
+        let (anvil, wallet, token_address, _signer) = setup_anvil_with_token().await;
+        let recipient = anvil.addresses()[1];
+        let recipient_key = anvil.keys()[1].clone();
+        let initial_balance = U256::from(1000);
+
+        wallet
+            .submit::<NoOpErrorRegistry, _>(
+                token_address,
+                IERC20::transferCall {
+                    to: recipient,
+                    amount: initial_balance,
+                },
+                "fund recipient",
+            )
+            .await
+            .unwrap();
+
+        let recipient_provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(PrivateKeySigner::from(recipient_key)))
+            .connect_http(anvil.endpoint().parse().unwrap());
+        recipient_provider.anvil_set_auto_mine(false).await.unwrap();
+
+        let calldata = Bytes::from(
+            IERC20::transferCall {
+                to: recipient,
+                amount: U256::from(1),
+            }
+            .abi_encode(),
+        );
+        let unpadded_estimate = wallet
+            .provider()
+            .estimate_gas(
+                TransactionRequest::default()
+                    .from(wallet.address())
+                    .to(token_address)
+                    .input(calldata.clone().into()),
+            )
+            .await
+            .unwrap();
+
+        let tx_hash = wallet
+            .send_pending(token_address, calldata, "transfer raced by a drain")
+            .await
+            .unwrap();
+
+        // Higher tip so anvil orders the drain ahead of our pending transfer.
+        let drain = IERC20::new(token_address, &recipient_provider)
+            .transfer(Address::random(), initial_balance)
+            .max_priority_fee_per_gas(100_000_000_000)
+            .max_fee_per_gas(200_000_000_000)
+            .send()
+            .await
+            .unwrap();
+
+        recipient_provider.anvil_mine(Some(1), None).await.unwrap();
+
+        let drain_receipt = drain.get_receipt().await.unwrap();
+        let receipt = wallet.await_receipt(tx_hash).await.unwrap();
+
+        assert_eq!(receipt.block_number, drain_receipt.block_number);
+        assert!(
+            drain_receipt.transaction_index < receipt.transaction_index,
+            "the drain must execute first for the race to happen"
+        );
+        assert!(receipt.status(), "padded transfer must not run out of gas");
+        assert!(
+            receipt.gas_used > unpadded_estimate,
+            "the race must cost more than the unpadded estimate ({} <= {unpadded_estimate}), \
+             otherwise this test does not exercise the padding",
+            receipt.gas_used
+        );
     }
 
     #[tokio::test]

@@ -171,6 +171,26 @@ const NONCE_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// is bounded -- see the module-level note on best-effort replacement.
 const FEE_BUMP_PCT_PER_ATTEMPT: u64 = 15;
 
+/// Headroom, in percent, added on top of `eth_estimateGas` when pinning a
+/// transaction's gas limit.
+///
+/// The estimate reflects state at estimation time, but the transaction
+/// executes against whatever state precedes it in its block. A fill that
+/// empties a Raindex vault in the same block turns our `deposit4`'s balance
+/// write from nonzero->nonzero (~2.9k gas) into zero->nonzero (~20k gas),
+/// and an unpadded estimate then runs out of gas and reverts. Only gas
+/// actually used is charged, so generous headroom costs nothing.
+const GAS_LIMIT_HEADROOM_PCT: u64 = 50;
+
+/// Pad a gas estimate by [`GAS_LIMIT_HEADROOM_PCT`] with checked
+/// arithmetic, rounding up.
+fn pad_gas_estimate(estimate: u64) -> Result<u64, EvmError> {
+    estimate
+        .checked_mul(100 + GAS_LIMIT_HEADROOM_PCT)
+        .map(|scaled| scaled.div_ceil(100))
+        .ok_or(EvmError::GasLimitOverflow { estimate })
+}
+
 /// Scale a fee value up by `pct` percent with checked arithmetic, rounding
 /// up.
 ///
@@ -193,9 +213,10 @@ fn bump_fee(value: u128, pct: u64) -> Result<u128, EvmError> {
 /// a scripted mock instead of a live RPC and signing fillers.
 #[async_trait]
 pub(crate) trait TxSubmitter: Send + Sync {
-    /// Fill, sign, and broadcast `tx`, returning its hash. Pre-set fields
-    /// (nonce, fees) are respected; absent ones are filled by the
-    /// provider's fillers.
+    /// Fill, sign, and broadcast `tx`, returning its hash. The gas limit is
+    /// pinned to the padded `eth_estimateGas` result (see
+    /// [`GAS_LIMIT_HEADROOM_PCT`]). Other pre-set fields (nonce, fees) are
+    /// respected; absent ones are filled by the provider's fillers.
     async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError>;
 
     /// Assigns the next nonce for `address` via `nonce_manager`, mirroring
@@ -243,6 +264,8 @@ pub(crate) trait TxSubmitter: Send + Sync {
 #[async_trait]
 impl<P: Provider> TxSubmitter for P {
     async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError> {
+        let estimate = self.estimate_gas(tx.clone()).await?;
+        let tx = tx.gas_limit(pad_gas_estimate(estimate)?);
         let pending = self.send_transaction(tx).await?;
         Ok(*pending.tx_hash())
     }
@@ -310,6 +333,7 @@ where
     let nonce = submitter.assign_nonce(nonce_manager, address).await?;
 
     let tx = TransactionRequest::default()
+        .from(address)
         .to(contract)
         .input(calldata.clone().into())
         .nonce(nonce);
@@ -744,6 +768,7 @@ where
         nonce_manager.set_next_nonce(address, next_nonce).await;
 
         let retry_tx = TransactionRequest::default()
+            .from(address)
             .to(contract)
             .input(calldata.clone().into());
 
@@ -887,6 +912,7 @@ where
         let max_priority_fee_per_gas = bump_fee(estimate.max_priority_fee_per_gas, pct)?;
 
         let tx = TransactionRequest::default()
+            .from(address)
             .to(contract)
             .input(calldata.clone().into())
             .nonce(nonce)
@@ -1404,6 +1430,23 @@ mod tests {
         .await;
 
         (result, nonce_manager, in_flight)
+    }
+
+    #[test]
+    fn pad_gas_estimate_adds_headroom_rounding_up() {
+        assert_eq!(pad_gas_estimate(128_156).unwrap(), 192_234);
+        assert_eq!(pad_gas_estimate(21_001).unwrap(), 31_502);
+        assert_eq!(pad_gas_estimate(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn pad_gas_estimate_overflow_is_a_hard_error() {
+        let error = pad_gas_estimate(u64::MAX).unwrap_err();
+
+        assert!(
+            matches!(error, EvmError::GasLimitOverflow { estimate } if estimate == u64::MAX),
+            "expected GasLimitOverflow, got {error:?}"
+        );
     }
 
     #[test]
