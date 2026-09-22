@@ -85,7 +85,8 @@ pub enum PlannedDirection {
 }
 
 /// Why no operation was planned. A per-chain reason names the best-ranked
-/// candidate that was dropped for it.
+/// candidate that was dropped for it, and outranks a symbol-wide reason met
+/// on a later candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclineReason {
     OffchainUnpolled,
@@ -216,7 +217,9 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
             let floor = (total * input.alpaca_floor.inner())?;
             let mintable = (offchain.available() - floor)?;
             if mintable.is_zero()? || mintable.is_negative()? {
-                return Ok(EquityPlan::Decline(DeclineReason::FloorCapped));
+                return Ok(EquityPlan::Decline(
+                    first_drop.unwrap_or(DeclineReason::FloorCapped),
+                ));
             }
             if quantity.inner().gt(mintable.inner())? {
                 debug!(
@@ -233,10 +236,14 @@ pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, Equi
         let quantity = truncate_for_alpaca(&input.symbol, quantity)?;
 
         let Some(price) = input.last_price else {
-            return Ok(EquityPlan::Decline(DeclineReason::PriceMissing));
+            return Ok(EquityPlan::Decline(
+                first_drop.unwrap_or(DeclineReason::PriceMissing),
+            ));
         };
         if price_is_stale(&price, input.now, input.price_staleness_bound) {
-            return Ok(EquityPlan::Decline(DeclineReason::PriceStale));
+            return Ok(EquityPlan::Decline(
+                first_drop.unwrap_or(DeclineReason::PriceStale),
+            ));
         }
         let value = (quantity.inner() * price.price)?;
         if value.lt(slot.min_operation_usd.inner().inner())? {
