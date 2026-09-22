@@ -3780,18 +3780,40 @@ impl RebalancingService {
     /// A declined plan is a decision too: the counter keeps the idle planner
     /// distinguishable from a silent one, every reason but the steady state
     /// is worth a line, and a venue the trigger cannot vouch for is worth a
-    /// warning.
-    fn record_equity_decline(symbol: &Symbol, reason: &DeclineReason) {
+    /// warning that says how stale its poll is when the caller knows.
+    fn record_equity_decline(
+        &self,
+        symbol: &Symbol,
+        reason: &DeclineReason,
+        staleness: Option<StaleSnapshot>,
+    ) {
         let label = reason.metric_label();
         counter!("equity_plan_declined_total", "reason" => label).increment(1);
 
-        match reason {
-            DeclineReason::WithinBand => {
+        match (reason, staleness) {
+            (DeclineReason::WithinBand, _) => {
                 debug!(target: "rebalance", %symbol, reason = label, "Declined equity plan");
             }
-            DeclineReason::ChainUnpolled { chain }
-            | DeclineReason::ChainStale { chain }
-            | DeclineReason::NotInRegistry { chain } => {
+            (
+                DeclineReason::ChainUnpolled { chain } | DeclineReason::ChainStale { chain },
+                Some(staleness),
+            ) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    %chain,
+                    %staleness,
+                    bound_secs = self.config.inventory_staleness_bound.as_secs(),
+                    reason = label,
+                    "Declined equity plan"
+                );
+            }
+            (
+                DeclineReason::ChainUnpolled { chain }
+                | DeclineReason::ChainStale { chain }
+                | DeclineReason::NotInRegistry { chain },
+                _,
+            ) => {
                 warn!(
                     target: "rebalance",
                     %symbol,
@@ -3800,9 +3822,12 @@ impl RebalancingService {
                     "Declined equity plan"
                 );
             }
-            DeclineReason::BelowMinimum { chain }
-            | DeclineReason::NoGas { chain }
-            | DeclineReason::CoolingDown { chain } => {
+            (
+                DeclineReason::BelowMinimum { chain }
+                | DeclineReason::NoGas { chain }
+                | DeclineReason::CoolingDown { chain },
+                _,
+            ) => {
                 info!(
                     target: "rebalance",
                     %symbol,
@@ -3811,13 +3836,16 @@ impl RebalancingService {
                     "Declined equity plan"
                 );
             }
-            DeclineReason::OffchainUnpolled
-            | DeclineReason::NoPolledChain
-            | DeclineReason::Inflight
-            | DeclineReason::TotalZero
-            | DeclineReason::FloorCapped
-            | DeclineReason::PriceMissing
-            | DeclineReason::PriceStale => {
+            (
+                DeclineReason::OffchainUnpolled
+                | DeclineReason::NoPolledChain
+                | DeclineReason::Inflight
+                | DeclineReason::TotalZero
+                | DeclineReason::FloorCapped
+                | DeclineReason::PriceMissing
+                | DeclineReason::PriceStale,
+                _,
+            ) => {
                 info!(target: "rebalance", %symbol, reason = label, "Declined equity plan");
             }
         }
@@ -3846,7 +3874,7 @@ impl RebalancingService {
         let operation = match plan {
             EquityPlan::Operation(operation) => operation,
             EquityPlan::Decline(reason) => {
-                Self::record_equity_decline(symbol, &reason);
+                self.record_equity_decline(symbol, &reason, None);
                 return Ok(None);
             }
         };
@@ -3858,11 +3886,12 @@ impl RebalancingService {
             .await?
             .is_none()
         {
-            Self::record_equity_decline(
+            self.record_equity_decline(
                 symbol,
                 &DeclineReason::NotInRegistry {
                     chain: operation.chain,
                 },
+                None,
             );
             return Ok(None);
         }
@@ -4297,19 +4326,7 @@ impl RebalancingService {
                         DeclineReason::ChainStale { chain }
                     }
                 };
-                // Counted like every other decline, but logged here so the
-                // line keeps how stale the poll is and which bound it missed.
-                let label = reason.metric_label();
-                counter!("equity_plan_declined_total", "reason" => label).increment(1);
-                warn!(
-                    target: "rebalance",
-                    %symbol,
-                    %chain,
-                    %staleness,
-                    bound_secs = self.config.inventory_staleness_bound.as_secs(),
-                    reason = label,
-                    "Declined equity plan"
-                );
+                self.record_equity_decline(symbol, &reason, Some(staleness));
                 return Ok(());
             }
         }
