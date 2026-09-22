@@ -10947,6 +10947,59 @@ mod tests {
         assert_eq!(jobs[0].symbol, symbol);
     }
 
+    /// Robinhood lists AAPL hedge-only (`rebalancing = "disabled"`) with a
+    /// prefunded 100 shares and, as in prod, no wrapper. That inventory is
+    /// outside the planner's total: Base is sized against its own 20 and
+    /// the broker's 80 alone, so it mints 30, not the 80 a total of 200
+    /// would ask for.
+    #[tokio::test]
+    async fn hedge_only_chain_inventory_is_outside_the_planner_total() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .update_equity_at(
+                &symbol,
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let mut hedge_only = rebalancing_enabled_equities(&["AAPL"]);
+        hedge_only
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = OperationMode::Disabled;
+        let config = RebalancingServiceConfig {
+            chains: BTreeMap::from([
+                (
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                ),
+                (
+                    Chain::Robinhood,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: hedge_only,
+                        cash: None,
+                    }),
+                ),
+            ]),
+            ..test_config()
+        };
+        let trigger =
+            make_trigger_with_inventory_and_registry_config(inventory, &symbol, config).await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(jobs.len(), 1, "Base alone is under its target");
+        assert_eq!(jobs[0].chain, Chain::Base);
+        assert_eq!(jobs[0].quantity, shares(30));
+    }
+
     /// Cross-chain staleness rule: an equity evaluation must not run off a
     /// chain whose last successful poll is older than the configured bound.
     /// `whitelisted_symbol_passes_equity_trigger` is the always-fresh
