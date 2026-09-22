@@ -6557,7 +6557,9 @@ impl RebalancingService {
                 // When recovery is enabled, reconstruct as HeldForRecovery so
                 // claim_guard_for_recovery_or_orphan can claim the slot. When recovery
                 // is disabled, ActiveTransfer is correct — resume_interrupted_transfers
-                // will call resume_mint and the transfer job retries normally.
+                // will call resume_mint and the transfer job retries normally. The
+                // recovery jobs run on the primary chain only, so a mint on any other
+                // chain is never held: nothing would ever release it.
                 //
                 // TokensWrapped and VaultDepositSubmitted are always reconstructed as
                 // ActiveTransfer: the deposit is idempotent and resume_interrupted_transfers
@@ -6567,6 +6569,7 @@ impl RebalancingService {
 
                 let primary_chain = self.inventory.read().await.primary_chain();
                 if is_pre_wrap_post_receipt_state
+                    && entity.chain() == primary_chain
                     && self
                         .config
                         .wrapped_equity_recovery_enabled(primary_chain, symbol)
