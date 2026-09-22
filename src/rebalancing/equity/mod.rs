@@ -34,9 +34,11 @@ use alloy::hex::FromHexError;
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -58,6 +60,7 @@ use st0x_wrapper::{
 
 use super::RebalancingService;
 use super::trigger::RecoveryClaim;
+use crate::alerts::Notifier;
 use crate::bot_gas::redrive::BotGasFailureClassifier;
 use crate::bot_gas::{
     BotGasEnqueueFailure, BotGasOperationCategory, BotGasReceiptCostEnqueuer,
@@ -80,6 +83,88 @@ use crate::vault_lookup::{VaultLookup, VaultLookupError};
 /// finite retry budget.
 const WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY: std::time::Duration =
     std::time::Duration::from_secs(30);
+
+/// Duration after which repeated withdrawal-reconciliation redrives page the
+/// operator via the notifier. Mirrors the USDC sibling's
+/// `WITHDRAWAL_POLL_ALERT_DEADLINE`: the deadline is durable, anchored on the
+/// persisted `VaultWithdrawSubmitting`/`VaultWithdrawSubmitted` timestamp, so
+/// the countdown survives restarts. A prepared vault withdrawal signed at a fee
+/// the market then outran can never confirm and is never fee-bumped, so before
+/// the deadline the redrive is silent; the deadline guards that otherwise-silent
+/// stall from becoming a multi-day outage while later sends from this wallet
+/// queue behind the stuck nonce.
+const WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Redrive delay used AFTER the withdrawal-reconciliation alert deadline has
+/// elapsed. Mirrors `WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY`: slows the
+/// cadence from 30 s to prevent alert fatigue while the guard stays held and the
+/// idempotent resume keeps running (or an operator reconciles the withdrawal).
+const WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY: Duration =
+    Duration::from_secs(30 * 60);
+
+/// The durable timestamp a stuck withdrawal's reconciliation deadline is
+/// anchored on, or `None` when the aggregate is not in a withdrawal-submitting
+/// state -- in which case the redrive stays silent, since only a submitted
+/// withdrawal can be stuck awaiting confirmation.
+fn withdrawal_reconciliation_anchor(aggregate: &EquityRedemption) -> Option<DateTime<Utc>> {
+    match aggregate {
+        EquityRedemption::VaultWithdrawSubmitting { submitting_at, .. } => Some(*submitting_at),
+        EquityRedemption::VaultWithdrawSubmitted { submitted_at, .. } => Some(*submitted_at),
+        _ => None,
+    }
+}
+
+/// Chooses the next withdrawal-reconciliation redrive delay, paging the operator
+/// once the durable deadline anchored on the aggregate's persisted submit
+/// timestamp has elapsed.
+///
+/// Before the deadline the redrive is silent at
+/// [`WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY`]; at or after it the operator is
+/// paged on every redrive and the cadence slows to
+/// [`WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY`] to avoid alert
+/// fatigue. A prepared vault withdrawal is never fee-bumped
+/// (`submit::broadcast_prepared` only ever rebroadcasts identical bytes), so a
+/// withdrawal the market out-fees stalls indefinitely; this bounds that
+/// otherwise-silent stall into a paged, deadline-driven incident. Alerting can
+/// never fail the redrive -- a delivery error is logged and swallowed, matching
+/// the USDC sibling.
+pub(crate) async fn withdrawal_reconciliation_redrive_delay(
+    redemption_store: &Store<EquityRedemption>,
+    aggregate_id: &RedemptionAggregateId,
+    notifier: &Arc<dyn Notifier>,
+) -> Duration {
+    let elapsed = redemption_store
+        .load(aggregate_id)
+        .await
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(withdrawal_reconciliation_anchor)
+        .and_then(|anchor| Utc::now().signed_duration_since(anchor).to_std().ok());
+
+    match elapsed {
+        Some(elapsed) if elapsed >= WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE => {
+            let message = format!(
+                "Equity redemption {aggregate_id}: Raindex vault withdrawal has stayed \
+                 unconfirmed for {elapsed:?} (>{WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE:?}). A \
+                 prepared withdrawal signed at a fee the market then outran cannot confirm and \
+                 is never fee-bumped, so later sends from this wallet queue behind its nonce. \
+                 Automatic redrive continues at a slower cadence (guard held). Verify the \
+                 withdrawal on-chain and reconcile or replace it."
+            );
+            if let Err(alert_error) = notifier.notify(&message).await {
+                warn!(
+                    target: "rebalance",
+                    %aggregate_id,
+                    %alert_error,
+                    "Failed to deliver withdrawal-reconciliation deadline alert"
+                );
+            }
+            WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY
+        }
+        _ => WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+    }
+}
 
 /// Data extracted from the TokensReceived aggregate state for
 /// onchain verification and subsequent wrapping.
@@ -913,6 +998,14 @@ impl CrossVenueEquityTransfer {
             redemption_store,
             mint_authorization: ConfiguredMintAuthorization::VaultDirectOnly,
         }
+    }
+
+    /// The redemption event store, for callers that must read a redemption's
+    /// durable state directly -- e.g. the reconciliation-redrive deadline
+    /// ([`withdrawal_reconciliation_redrive_delay`]) driven by the generic
+    /// resume job, whose ctx holds only this transfer.
+    pub(crate) fn redemption_store(&self) -> &Arc<Store<EquityRedemption>> {
+        &self.redemption_store
     }
 
     /// Opts this transfer into orchestrator-mode mint authorization.

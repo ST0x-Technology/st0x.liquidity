@@ -1107,6 +1107,7 @@ impl Conductor {
             transfer: recovery_transfer.clone(),
             position_authority: (resume_position_store, ctx.execution_threshold),
             job_queue: resume_tokenization_queue.clone(),
+            notifier: notifier.clone(),
         });
 
         let conductor = builder::spawn()
@@ -3062,6 +3063,9 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
 /// chain's [`ChainTokenization`] until chain selection moves into the global
 /// rebalancer; the other hedged chains' services are built and preflighted
 /// so that move is a lookup, not a rewire.
+// Wiring builder: extraction would scatter the wiring across helpers without
+// reducing complexity (see `builder::spawn`'s identical rationale).
+#[allow(clippy::too_many_lines)]
 fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     tokenizations: BTreeMap<Chain, ChainTokenization<Signer>>,
@@ -3289,6 +3293,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             redemption_store: built.redemption.clone(),
             position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
             job_queue: deps.schedulers.transfer_equity_to_hedging.clone(),
+            notifier: deps.notifier.clone(),
         });
 
         Ok(RebalancingInfrastructure {

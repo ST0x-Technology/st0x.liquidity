@@ -974,6 +974,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             ExecutionThreshold::whole_share(),
         )),
         job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        notifier: Arc::new(crate::alerts::LogNotifier),
     };
     Job::perform(&job, &ctx).await.unwrap();
 

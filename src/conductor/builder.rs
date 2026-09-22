@@ -2513,6 +2513,7 @@ mod tests {
             redemption_store,
             position_authority: None,
             job_queue: queue.clone(),
+            notifier: Arc::new(crate::alerts::LogNotifier),
         });
         let monitor = register_transfer_equity_to_hedging_worker(
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),

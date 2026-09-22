@@ -32,7 +32,9 @@ use super::job::{
 };
 use super::{
     CrossVenueEquityTransfer, MintError, RedemptionError, WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+    withdrawal_reconciliation_redrive_delay,
 };
+use crate::alerts::Notifier;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -116,6 +118,11 @@ pub(crate) struct ResumeTokenizationCtx {
     /// worst -- see `redrive_on_bot_gas_failure`'s doc for why every job
     /// that can hit this failure must route through it.
     pub(crate) job_queue: ResumeTokenizationJobQueue,
+    /// Operational-alert channel for the withdrawal-reconciliation deadline
+    /// ([`withdrawal_reconciliation_redrive_delay`]): once a stuck prepared
+    /// withdrawal passes its durable deadline this resume pages the operator
+    /// instead of redriving silently forever.
+    pub(crate) notifier: Arc<dyn Notifier>,
 }
 
 /// Errors emitted by [`ResumeTokenizationAggregate::perform`].
@@ -243,15 +250,29 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
         };
 
         if error.is_reconciliation_pending() {
+            // Only a redemption's withdrawal confirmation is reconciliation-
+            // pending (mints never produce it), so page + slow the redrive once
+            // the durable deadline anchored on the persisted submit timestamp
+            // elapses; before it, stay silent at the 30s cadence.
+            let delay = match &self.target {
+                ResumeTokenizationTarget::Redemption(aggregate_id) => {
+                    withdrawal_reconciliation_redrive_delay(
+                        ctx.transfer.redemption_store(),
+                        aggregate_id,
+                        &ctx.notifier,
+                    )
+                    .await
+                }
+                ResumeTokenizationTarget::Mint(_) => WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+            };
             warn!(
                 target: "tokenization",
                 resume_target = %self.target,
+                ?delay,
                 "Withdrawal reconciliation remains inconclusive; scheduling a durable resume"
             );
             let mut job_queue = ctx.job_queue.clone();
-            job_queue
-                .push_with_delay(self.clone(), WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY)
-                .await?;
+            job_queue.push_with_delay(self.clone(), delay).await?;
             return Ok(());
         }
 
@@ -450,6 +471,7 @@ mod tests {
             transfer,
             position_authority: (position_store, ExecutionThreshold::whole_share()),
             job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
+            notifier: Arc::new(crate::alerts::LogNotifier),
         };
         (ctx, mint_store, redemption_store, tokenizer)
     }
@@ -967,6 +989,7 @@ mod tests {
             transfer,
             position_authority: (position_store, ExecutionThreshold::whole_share()),
             job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
+            notifier: Arc::new(crate::alerts::LogNotifier),
         };
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
@@ -1079,6 +1102,7 @@ mod tests {
             transfer,
             position_authority: (position_store, ExecutionThreshold::whole_share()),
             job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
+            notifier: Arc::new(crate::alerts::LogNotifier),
         };
 
         Job::perform(&job, &ctx)
