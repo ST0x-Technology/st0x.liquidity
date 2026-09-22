@@ -7639,6 +7639,7 @@ mod tests {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("parked-broker-order-id"),
                 placed_shares: order.shares,
+                placed_at: Utc::now(),
                 is_extended_hours: false,
                 limit_price: None,
             })

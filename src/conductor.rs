@@ -1019,8 +1019,10 @@ impl Conductor {
         // Shared with every placement path so the in-bot process-tx route
         // serializes its broker submission against live hedging (ADR 0014).
         let counter_trade_submission_lock = Arc::new(Mutex::new(()));
-        let process_tx_order_placer: Arc<dyn OrderPlacer> =
-            Arc::new(ExecutorOrderPlacer(executor.clone()));
+        let process_tx_order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+            executor: executor.clone(),
+            close_flatten_policy: None,
+        });
 
         let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
             setup_apalis_queues(&pool, &apalis_pool, event_sender, &ctx.chains).await?;
@@ -10471,6 +10473,7 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })

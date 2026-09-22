@@ -2851,6 +2851,7 @@ pub mod process_tx {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: false,
                     limit_price: None,
                 })
@@ -2864,6 +2865,7 @@ pub mod process_tx {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
                     placed_shares: order.shares,
+                    placed_at: Utc::now(),
                     is_extended_hours: order.extended_hours,
                     limit_price: Some(order.limit_price),
                 })
@@ -2900,8 +2902,10 @@ pub mod process_tx {
                 },
             );
 
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             let source = OnChainTradeSource::Inventory {
                 operator: Address::repeat_byte(0x8b),
@@ -3030,8 +3034,10 @@ pub mod process_tx {
         async fn process_tx_resumes_witnessed_but_unacknowledged_fill() {
             let pool = setup_test_db().await;
             let ctx = create_base_test_ctx();
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             let onchain_trade = onchain_trade_builder().with_block_number(1).build();
             let block_timestamp = onchain_trade.block_timestamp.unwrap();
@@ -3106,8 +3112,10 @@ pub mod process_tx {
         async fn process_tx_witnesses_and_acknowledges_new_fill() {
             let pool = setup_test_db().await;
             let ctx = create_base_test_ctx();
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             // block_number is required for the Witness step on a new fill.
             let onchain_trade = onchain_trade_builder().with_block_number(42).build();
@@ -3163,8 +3171,10 @@ pub mod process_tx {
         async fn process_tx_then_normal_path_does_not_double_count() {
             let (pool, apalis_pool) = try_setup_test_pools().await.unwrap();
             let ctx = create_base_test_ctx();
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             let onchain_trade = onchain_trade_builder().with_block_number(42).build();
 
@@ -3281,8 +3291,10 @@ pub mod process_tx {
         async fn process_tx_fails_on_missing_block_number() {
             let pool = setup_test_db().await;
             let ctx = create_base_test_ctx();
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             let onchain_trade = onchain_trade_builder().with_block_number(None).build();
 
@@ -3313,8 +3325,10 @@ pub mod process_tx {
         async fn process_tx_fails_on_missing_block_timestamp() {
             let pool = setup_test_db().await;
             let ctx = create_base_test_ctx();
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             // block_number is set so the new-fill branch is reached; block_timestamp
             // is None so the bail fires before the witness step.
@@ -4060,8 +4074,10 @@ pub mod process_tx {
         async fn process_tx_concurrent_witness_resumes_acknowledge() {
             let pool = setup_test_db().await;
             let ctx = create_base_test_ctx();
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             let onchain_trade = onchain_trade_builder().with_block_number(42).build();
             let block_timestamp = onchain_trade.block_timestamp.unwrap();
@@ -4159,8 +4175,10 @@ pub mod process_tx {
                 },
             );
 
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             let onchain_trade = onchain_trade_builder().with_block_number(42).build();
             let block_timestamp = onchain_trade.block_timestamp.unwrap();
@@ -4271,8 +4289,10 @@ pub mod process_tx {
         async fn process_tx_does_not_double_count_witnessed_fill_after_newer_fill_acknowledged() {
             let pool = setup_test_db().await;
             let ctx = create_base_test_ctx();
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             // Fill A and fill B: same tx_hash, different log_index so they have
             // distinct (tx_hash, log_index) identities.
@@ -4421,8 +4441,10 @@ pub mod process_tx {
         async fn process_tx_none_path_does_not_recount_legacy_position_fill() {
             let pool = setup_test_db().await;
             let ctx = create_base_test_ctx();
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
 
             // Fill A and fill B have distinct (tx_hash, log_index) identities.
             let fill_a = onchain_trade_builder().with_block_number(10).build();
