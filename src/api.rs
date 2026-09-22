@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_config::{BrokerCtx, HedgedChain, OpsApiConfig};
+use st0x_config::{BrokerCtx, Ctx, HedgedChain, OpsApiConfig};
 use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, Trade,
     TradingVenue,
@@ -52,7 +52,7 @@ use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
 use crate::iap_auth::{IapVerifier, require_iap};
-use crate::offchain::order::{OffchainOrderId, OrderPlacer};
+use crate::offchain::order::{OffchainOrderId, OrderPlacer, PollOrderStatusJobQueue};
 use crate::operator::OperatorError;
 use crate::operator::equity_transfer::{
     EquityTransferKind, FailTransferError, validate_failure_reason,
@@ -1331,6 +1331,11 @@ pub(crate) struct ProcessTxHandle {
     /// reactors (the rebalancing inventory and pending-order gate update at
     /// once, not on the next inventory poll).
     pub(crate) stores: ProcessTxStores,
+    /// The trading loop's poll-status queue and interval, so a hedge the
+    /// in-bot route submits is enrolled for status polling immediately rather
+    /// than waiting for the next startup recovery sweep.
+    pub(crate) poll_status_queue: PollOrderStatusJobQueue,
+    pub(crate) poll_interval: std::time::Duration,
 }
 
 /// Serializes operator transfer-recovery requests so they cannot race through
@@ -2617,6 +2622,9 @@ enum ProcessTxOutcomeResponse {
         direction: String,
         disposition: &'static str,
     },
+    HedgePlacementCleared {
+        symbol: String,
+    },
 }
 
 impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
@@ -2655,6 +2663,9 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
                     HedgeDisposition::ClearedForRetry => "cleared_for_retry",
                     HedgeDisposition::Finalized => "finalized",
                 },
+            },
+            ProcessTxOutcome::HedgePlacementCleared { symbol } => Self::HedgePlacementCleared {
+                symbol: symbol.to_string(),
             },
         }
     }
@@ -2704,6 +2715,56 @@ fn spawn_process_tx_task(
     task: impl Future<Output = Result<ProcessTxReport, OperatorError>> + Send + 'static,
 ) -> tokio::task::JoinHandle<Result<ProcessTxReport, OperatorError>> {
     tokio::spawn(task)
+}
+
+/// Runs the process-tx workload on a detached `tokio` task and awaits its
+/// result, mapping a task-join failure and the operator error to HTTP
+/// responses.
+///
+/// The workload is spawned (not awaited inline) so that dropping the request
+/// future -- a client disconnect or cancellation -- detaches the in-flight
+/// broker placement instead of cancelling it: a hedge that has already reached
+/// the broker must run through to its `Submitted` event even when nobody is
+/// waiting on the response (RAI-2250). Awaiting `process_tx` inline here would
+/// reintroduce that cancellation bug.
+async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + Clone + 'static>(
+    tx_hash: TxHash,
+    ctx: Ctx,
+    pool: sqlx::SqlitePool,
+    trading_chain: HedgedChain,
+    provider: ChainProvider,
+    cache: SymbolCache,
+    handle: &ProcessTxHandle,
+) -> Result<ProcessTxReport, (StatusCode, Json<ErrorResponse>)> {
+    let stores = handle.stores.clone();
+    let order_placer = Arc::clone(&handle.order_placer);
+    let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
+    let poll_status_queue = handle.poll_status_queue.clone();
+    let poll_interval = handle.poll_interval;
+    spawn_process_tx_task(async move {
+        process_tx::process_tx(
+            tx_hash,
+            &ctx,
+            &pool,
+            process_tx::ProcessTxChainContext::new(&trading_chain, &provider, &cache),
+            &stores,
+            order_placer,
+            Some(&counter_trade_submission_lock),
+            Some((&poll_status_queue, poll_interval)),
+        )
+        .await
+    })
+    .await
+    .map_err(|error| {
+        error!(%error, "process-tx worker task failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "process-tx worker task failed".to_owned(),
+            }),
+        )
+    })?
+    .map_err(ops_operator_error)
 }
 
 /// Accounts a missed on-chain fill and places the opposite hedge inside the
@@ -2768,41 +2829,16 @@ async fn process_transaction(
     let transport = alloy::transports::http::Http::with_client(http_client, rpc_url);
     let rpc_client = alloy::rpc::client::ClientBuilder::default().transport(transport, is_local);
     let provider = ProviderBuilder::new().connect_client(rpc_client);
-    let cache = SymbolCache::default();
-
-    // Keep the state-changing workflow alive if the client disconnects. Tokio
-    // detaches a spawned task when its JoinHandle is dropped, so cancellation
-    // of this request cannot strand a live broker order before its Submitted
-    // event is persisted.
-    let ctx = state.ctx.clone();
-    let pool = state.pool.clone();
-    let stores = handle.stores.clone();
-    let order_placer = Arc::clone(&handle.order_placer);
-    let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
-    let report = spawn_process_tx_task(async move {
-        process_tx::process_tx(
-            tx_hash,
-            &ctx,
-            &pool,
-            process_tx::ProcessTxChainContext::new(&trading_chain, &provider),
-            &cache,
-            &stores,
-            order_placer,
-            Some(&counter_trade_submission_lock),
-        )
-        .await
-    })
-    .await
-    .map_err(|error| {
-        error!(%error, "process-tx worker task failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "process-tx worker task failed".to_owned(),
-            }),
-        )
-    })?
-    .map_err(ops_operator_error)?;
+    let report = spawn_and_join_process_tx(
+        tx_hash,
+        state.ctx.clone(),
+        state.pool.clone(),
+        trading_chain,
+        provider,
+        SymbolCache::default(),
+        handle,
+    )
+    .await?;
 
     let response = ProcessTxResponse::try_from(report).map_err(|error| {
         error!(%error, "failed to format the process-tx response");
@@ -3108,7 +3144,10 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use alloy::primitives::{Address, TxHash};
+    use alloy::primitives::{Address, IntoLogData, TxHash, address, fixed_bytes, uint};
+    use alloy::providers::mock::Asserter;
+    use alloy::rpc::types::Log;
+    use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
@@ -3121,8 +3160,8 @@ mod tests {
     use uuid::uuid;
 
     use st0x_config::{
-        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
-        create_test_ctx_with_order_owner,
+        BrokerCtx, ChainEquityAsset, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel,
+        OperationMode, RestApiCtx, create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
@@ -3130,8 +3169,8 @@ mod tests {
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletError,
-        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId, Positive,
-        SupportedExecutor, Symbol, TimeInForce,
+        CancellationOutcome, DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId,
+        LimitOrder, MarketOrder, Positive, SupportedExecutor, Symbol, TimeInForce,
     };
     use st0x_finance::{FractionalShares, Usd, Usdc};
     use st0x_float_macro::float;
@@ -3140,12 +3179,15 @@ mod tests {
     };
 
     use super::*;
+    use crate::bindings::IRaindexV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::dashboard;
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::inventory::{
         self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
     };
-    use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
+    use crate::offchain::order::{
+        OffchainOrder, OffchainOrderEvent, OffchainOrderId, OrderPlacementResult,
+    };
     use crate::onchain_trade::{
         InventoryVenue, OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource,
     };
@@ -3159,6 +3201,9 @@ mod tests {
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
     use crate::rebalancing::usdc::UsdcTransferError;
+    use crate::test_utils::{
+        TEST_POLL_INTERVAL, get_test_order, seed_get_test_order_token_symbols, setup_test_pools,
+    };
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef};
 
@@ -7549,6 +7594,20 @@ mod tests {
             }),
         ));
 
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::HedgePlacementCleared {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+            },
+            serde_json::json!({
+                "fill": fill_json,
+                "outcome": "hedge_placement_cleared",
+                "symbol": "AAPL",
+            }),
+        ));
+
         for (report, expected) in cases {
             assert_eq!(
                 serde_json::to_value(ProcessTxResponse::try_from(report).unwrap()).unwrap(),
@@ -7557,38 +7616,179 @@ mod tests {
         }
     }
 
-    /// Dropping the HTTP request waiter must detach, not cancel, the process-tx
-    /// worker that may already have submitted a live broker order.
+    /// `OrderPlacer` whose market placement parks on a `Notify`: it signals that
+    /// the broker call has begun, waits to be released, then signals that it
+    /// completed. Driving `process_transaction`'s placement through this lets a
+    /// test abort the request future mid-placement and prove the broker call
+    /// still runs to completion.
+    struct ParkedOrderPlacer {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        finished: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl OrderPlacer for ParkedOrderPlacer {
+        async fn place_market_order(
+            &self,
+            order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.finished.notify_one();
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("parked-broker-order-id"),
+                placed_shares: order.shares,
+                is_extended_hours: false,
+                limit_price: None,
+            })
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("process-tx market hedge must not place a limit order")
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("process-tx placement must not cancel")
+        }
+    }
+
+    /// Aborting the HTTP request future after the broker placement has begun
+    /// must NOT cancel that placement: `process_transaction` runs the process-tx
+    /// workload on a detached task, so a live broker order completes even when
+    /// nobody awaits the response (RAI-2250). This drives the real handler path
+    /// -- a mocked provider decodes a tradeable fill, and the published
+    /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify` -- aborts
+    /// the request once placement has begun, and asserts the placement still
+    /// finishes. Awaiting the workload inline instead of
+    /// `spawn_process_tx_task(...).await` would cancel the parked placement and
+    /// hang `finished`, which is the regression this test guards.
     #[tokio::test]
     async fn process_tx_task_survives_request_cancellation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let finished = Arc::new(Notify::new());
-
-        let worker_started = Arc::clone(&started);
-        let worker_release = Arc::clone(&release);
-        let worker_finished = Arc::clone(&finished);
-        let request = tokio::spawn(async move {
-            spawn_process_tx_task(async move {
-                worker_started.notify_one();
-                worker_release.notified().await;
-                worker_finished.notify_one();
-                Ok(ProcessTxReport {
-                    fill: None,
-                    outcome: ProcessTxOutcome::NoTradeableEvents,
-                })
-            })
-            .await
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ParkedOrderPlacer {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            finished: Arc::clone(&finished),
         });
 
-        started.notified().await;
+        // A `TakeOrderV3` fill against the bot's own order (`get_test_order`),
+        // with the equity token on the input leg and USDC on the output leg, so
+        // the decoder classifies a 1-share on-chain BUY at 150 USDC. The
+        // opposite hedge is a market SELL, which reaches the parked placer
+        // without a buy preflight.
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let order_owner = get_test_order().owner;
+        let tx_hash =
+            fixed_bytes!("0x4545454545454545454545454545454545454545454545454545454545454545");
+        let take_order = TakeOrderV3 {
+            sender: address!("0x2222222222222222222222222222222222222222"),
+            config: TakeOrderConfigV4 {
+                order: get_test_order(),
+                inputIOIndex: U256::from(1),
+                outputIOIndex: U256::from(0),
+                signedContext: vec![SignedContextV1 {
+                    signer: Address::ZERO,
+                    signature: Vec::new().into(),
+                    context: Vec::new(),
+                }],
+            },
+            input: Float::from_fixed_decimal_lossy(uint!(150_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(1_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+        };
+        let orderbook_log = Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: take_order.to_log_data(),
+            },
+            block_hash: None,
+            block_number: None,
+            block_timestamp: Some(1_700_000_000),
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(7),
+            removed: false,
+        };
+        let receipt = serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x1",
+            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
+            "blockNumber": "0x2a",
+            "from": "0x1234567890123456789012345678901234567890",
+            "to": orderbook,
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x77359400",
+            "cumulativeGasUsed": "0x5208",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": [orderbook_log]
+        });
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let cache = SymbolCache::default();
+        seed_get_test_order_token_symbols(&cache);
+
+        let mut ctx = create_test_ctx_with_order_owner(order_owner);
+        ctx.chains.primary_mut().orderbook = orderbook;
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        let trading_chain = ctx.chains.primary().clone();
+
+        let stores = ProcessTxStores::standalone(&pool, Arc::clone(&order_placer))
+            .await
+            .expect("standalone stores must build");
+        let handle = ProcessTxHandle {
+            order_placer,
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            stores,
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
+        };
+
+        let request = tokio::spawn(async move {
+            spawn_and_join_process_tx(tx_hash, ctx, pool, trading_chain, provider, cache, &handle)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("the broker placement must begin");
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
 
         release.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(1), finished.notified())
+        tokio::time::timeout(Duration::from_secs(5), finished.notified())
             .await
-            .expect("detached process-tx worker must finish after request cancellation");
+            .expect("the detached broker placement must finish after request cancellation");
     }
 
     #[tokio::test]

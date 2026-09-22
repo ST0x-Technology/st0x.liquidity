@@ -937,11 +937,15 @@ fn publish_process_tx_handle(
     order_placer: Arc<dyn OrderPlacer>,
     counter_trade_submission_lock: Arc<Mutex<()>>,
     stores: ProcessTxStores,
+    poll_status_queue: PollOrderStatusJobQueue,
+    poll_interval: Duration,
 ) {
     let _ = process_tx_cell.set(crate::api::ProcessTxHandle {
         order_placer,
         counter_trade_submission_lock,
         stores,
+        poll_status_queue,
+        poll_interval,
     });
 }
 
@@ -1163,6 +1167,12 @@ impl Conductor {
         )
         .await?;
 
+        // Clone before the builder consumes `poll_status_queue`: the in-bot
+        // process-tx route enrolls a submitted hedge for status polling on the
+        // same queue and interval the trading loop uses.
+        let process_tx_poll_status_queue = poll_status_queue.clone();
+        let process_tx_poll_interval = ctx.order_polling_interval();
+
         let job_cleanup = spawn_finished_job_cleanup(
             pool.clone(),
             apalis_pool.clone(),
@@ -1265,6 +1275,8 @@ impl Conductor {
             process_tx_order_placer,
             counter_trade_submission_lock,
             process_tx_stores,
+            process_tx_poll_status_queue,
+            process_tx_poll_interval,
         );
 
         conductor

@@ -1487,6 +1487,7 @@ pub mod position {
 /// opposite hedge, shared by the operator CLI and the ops API.
 pub mod process_tx {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use alloy::primitives::TxHash;
     use alloy::providers::Provider;
@@ -1512,11 +1513,11 @@ pub mod process_tx {
     };
     use crate::offchain::order::{
         OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
-        TerminalPositionFinalization, client_order_id_for_placement,
-        place_offchain_order_at_broker, position_command_for_finalization,
+        PollOrderStatusJobQueue, TerminalPositionFinalization, client_order_id_for_placement,
+        place_offchain_order_at_broker, position_command_for_finalization, push_poll_job_if_absent,
         terminal_position_finalization,
     };
-    use crate::onchain::accumulator::check_execution_readiness;
+    use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
     use crate::onchain::trade::{BotOperator, RecoveryActors};
     use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
     use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
@@ -1591,7 +1592,8 @@ pub mod process_tx {
         /// because live buying power could not cover it. The fill was settled
         /// without placing a hedge.
         BuyPreflightDeferred { symbol: Symbol },
-        /// A hedge order was placed at the broker.
+        /// A hedge order was placed at the broker and either accepted (still in
+        /// flight) or reconciled to a terminal broker state.
         HedgePlaced {
             symbol: Symbol,
             offchain_order_id: OffchainOrderId,
@@ -1599,6 +1601,10 @@ pub mod process_tx {
             direction: Direction,
             disposition: HedgeDisposition,
         },
+        /// Broker placement failed or the just-placed order vanished, so the
+        /// position's pending marker was cleared for the normal pipeline to
+        /// re-hedge. No hedge is in flight; the fill was still accounted.
+        HedgePlacementCleared { symbol: Symbol },
     }
 
     /// The decoded fill, when one was found, and its processing outcome.
@@ -1652,19 +1658,27 @@ pub mod process_tx {
         }
     }
 
-    /// Selected hedged-chain configuration and its matching RPC provider.
+    /// The per-chain inputs needed to fetch and decode the target transaction:
+    /// the selected hedged-chain configuration, its matching RPC provider, and
+    /// the symbol cache the decoder resolves tickers through.
     pub struct ProcessTxChainContext<'a, P> {
         trading_chain: &'a HedgedChain,
         provider: &'a P,
+        cache: &'a SymbolCache,
     }
 
     impl<'a, P> ProcessTxChainContext<'a, P> {
-        /// Couples the chain decoder configuration to the provider selected by
-        /// the caller for that chain.
-        pub const fn new(trading_chain: &'a HedgedChain, provider: &'a P) -> Self {
+        /// Couples the chain decoder configuration to the provider and symbol
+        /// cache the caller selected for that chain.
+        pub const fn new(
+            trading_chain: &'a HedgedChain,
+            provider: &'a P,
+            cache: &'a SymbolCache,
+        ) -> Self {
             Self {
                 trading_chain,
                 provider,
+                cache,
             }
         }
     }
@@ -1678,21 +1692,25 @@ pub mod process_tx {
     /// `submission_lock` so the pending-hedge inspection and the broker
     /// placement serialize against the trading loop (ADR 0014). Under the lock,
     /// the shared `Position` aggregate's pending-order gate prevents a racing
-    /// tick from double-placing the hedge. The CLI runs in a separate process
-    /// with standalone stores, no shared lock, and passes `None`.
+    /// tick from double-placing the hedge, and passes `Some` poll enrollment so
+    /// a newly submitted hedge is enqueued for status polling under the guards,
+    /// mirroring the live placement path. The CLI runs in a separate process
+    /// with standalone stores, no shared lock, and passes `None` for both,
+    /// relying on startup recovery to enrol its submitted orders.
     pub async fn process_tx<P: Provider + Clone + 'static>(
         tx_hash: TxHash,
         ctx: &Ctx,
         pool: &SqlitePool,
         chain: ProcessTxChainContext<'_, P>,
-        cache: &SymbolCache,
         stores: &ProcessTxStores,
         order_placer: Arc<dyn OrderPlacer>,
         submission_lock: Option<&Mutex<()>>,
+        poll_enrollment: Option<(&PollOrderStatusJobQueue, Duration)>,
     ) -> Result<ProcessTxReport, OperatorError> {
         let ProcessTxChainContext {
             trading_chain,
             provider,
+            cache,
         } = chain;
         let actors = RecoveryActors {
             order_owner: trading_chain.vault_owner,
@@ -1711,6 +1729,7 @@ pub mod process_tx {
                     stores,
                     order_placer,
                     submission_lock,
+                    poll_enrollment,
                 )
                 .await?;
                 Ok(ProcessTxReport {
@@ -1743,6 +1762,7 @@ pub mod process_tx {
         stores: &ProcessTxStores,
         order_placer: Arc<dyn OrderPlacer>,
         submission_lock: Option<&Mutex<()>>,
+        poll_enrollment: Option<(&PollOrderStatusJobQueue, Duration)>,
     ) -> Result<ProcessTxOutcome, OperatorError> {
         let trade_id = OnChainTradeId::new(
             onchain_trade.chain,
@@ -1762,8 +1782,8 @@ pub mod process_tx {
         let ProcessTxStores {
             onchain_trade: onchain_trade_store,
             position: position_store,
-            position_projection,
             offchain_order: offchain_order_store,
+            ..
         } = stores;
         let Some(block_number) = onchain_trade.block_number else {
             return Err(RejectionReason::FillMissingBlockNumber { trade_id }.into());
@@ -1807,62 +1827,18 @@ pub mod process_tx {
             .await
             .context("failed to acquire the counter-trade submission file lock")?;
 
-        match reconcile_existing_pending_order(offchain_order_store, position_store, base_symbol)
-            .await?
-        {
-            None | Some(HedgeDisposition::ClearedForRetry | HedgeDisposition::Finalized) => {}
-            Some(HedgeDisposition::InFlight) => {
-                mark_and_settle_fill(
-                    onchain_trade_store,
-                    position_store,
-                    &trade_id,
-                    &onchain_trade,
-                )
-                .await?;
-                return Ok(ProcessTxOutcome::PendingHedgeInFlight);
-            }
-        }
-
-        let trading_enabled = trading_chain.assets.is_trading_enabled(base_symbol);
-
-        if !trading_enabled {
-            mark_and_settle_fill(
-                onchain_trade_store,
-                position_store,
-                &trade_id,
-                &onchain_trade,
-            )
-            .await?;
-            return Ok(ProcessTxOutcome::TradingDisabled {
-                symbol: base_symbol.clone(),
-            });
-        }
-
-        let executor_type = ctx.broker.to_supported_executor();
-        // process-tx is a manual recovery verb: a `MockExecutor` forces the
-        // readiness check to treat the market as open so the operator can place
-        // the hedge regardless of session, matching the CLI path.
-        let executor = MockExecutor::new();
-        let Some(params) = check_execution_readiness(
-            &executor,
-            position_projection,
+        let params = match gate_fill_for_placement(
+            ctx,
+            stores,
+            trading_chain,
+            &onchain_trade,
+            &trade_id,
             base_symbol,
-            executor_type,
-            &trading_chain.assets,
-            &ctx.assets,
-            trading_enabled,
         )
-        .await
-        .context("failed to check execution readiness")?
-        else {
-            mark_and_settle_fill(
-                onchain_trade_store,
-                position_store,
-                &trade_id,
-                &onchain_trade,
-            )
-            .await?;
-            return Ok(ProcessTxOutcome::BelowExecutionThreshold);
+        .await?
+        {
+            FillGate::Settled(outcome) => return Ok(outcome),
+            FillGate::Ready(params) => params,
         };
 
         let offchain_order_id = OffchainOrderId::new();
@@ -1872,7 +1848,7 @@ pub mod process_tx {
             order_placer.as_ref(),
             &params.symbol,
             offchain_order_id,
-            executor_type,
+            params.executor,
         )
         .await
         {
@@ -1895,7 +1871,7 @@ pub mod process_tx {
         // the aggregate claim, and the broker placement all serialize against the
         // trading loop.
         let (hedge_shares, buying_power_reservation) = if params.direction == Direction::Buy {
-            match preflight_buy(
+            let Some(preflight) = preflight_buy(
                 pool,
                 order_placer.as_ref(),
                 &params.symbol,
@@ -1903,21 +1879,19 @@ pub mod process_tx {
                 client_order_id.clone(),
             )
             .await?
-            {
-                Some(preflight) => preflight,
-                None => {
-                    mark_and_settle_fill(
-                        onchain_trade_store,
-                        position_store,
-                        &trade_id,
-                        &onchain_trade,
-                    )
-                    .await?;
-                    return Ok(ProcessTxOutcome::BuyPreflightDeferred {
-                        symbol: params.symbol.clone(),
-                    });
-                }
-            }
+            else {
+                mark_and_settle_fill(
+                    onchain_trade_store,
+                    position_store,
+                    &trade_id,
+                    &onchain_trade,
+                )
+                .await?;
+                return Ok(ProcessTxOutcome::BuyPreflightDeferred {
+                    symbol: params.symbol.clone(),
+                });
+            };
+            preflight
         } else {
             (params.shares, None)
         };
@@ -1988,13 +1962,136 @@ pub mod process_tx {
         )
         .await?;
 
-        Ok(ProcessTxOutcome::HedgePlaced {
-            symbol: params.symbol.clone(),
-            offchain_order_id,
-            shares: hedge_shares,
-            direction: params.direction,
+        finalize_hedge_outcome(
             disposition,
-        })
+            &params.symbol,
+            offchain_order_id,
+            hedge_shares,
+            params.direction,
+            poll_enrollment,
+        )
+        .await
+    }
+
+    /// Outcome of gating a decoded fill before placement: either the fill was
+    /// settled with a terminal outcome, or the position is ready and yields the
+    /// placement parameters.
+    enum FillGate {
+        Settled(ProcessTxOutcome),
+        Ready(ExecutionCtx),
+    }
+
+    /// Gates a decoded fill before placement: reconciles any live pending hedge,
+    /// honours the trading-enabled flag, and checks execution readiness. Each
+    /// gate settles the fill and reports its terminal outcome; a ready position
+    /// yields the placement parameters. Runs under the caller's submission
+    /// guards so the readiness decision cannot race the live trading loop.
+    async fn gate_fill_for_placement(
+        ctx: &Ctx,
+        stores: &ProcessTxStores,
+        trading_chain: &HedgedChain,
+        onchain_trade: &OnchainTrade,
+        trade_id: &OnChainTradeId,
+        base_symbol: &Symbol,
+    ) -> Result<FillGate, OperatorError> {
+        let ProcessTxStores {
+            onchain_trade: onchain_trade_store,
+            position: position_store,
+            position_projection,
+            offchain_order: offchain_order_store,
+        } = stores;
+
+        match reconcile_existing_pending_order(offchain_order_store, position_store, base_symbol)
+            .await?
+        {
+            None | Some(HedgeDisposition::ClearedForRetry | HedgeDisposition::Finalized) => {}
+            Some(HedgeDisposition::InFlight) => {
+                mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
+                    .await?;
+                return Ok(FillGate::Settled(ProcessTxOutcome::PendingHedgeInFlight));
+            }
+        }
+
+        let trading_enabled = trading_chain.assets.is_trading_enabled(base_symbol);
+
+        if !trading_enabled {
+            mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
+                .await?;
+            return Ok(FillGate::Settled(ProcessTxOutcome::TradingDisabled {
+                symbol: base_symbol.clone(),
+            }));
+        }
+
+        let executor_type = ctx.broker.to_supported_executor();
+        // process-tx is a manual recovery verb: a `MockExecutor` forces the
+        // readiness check to treat the market as open so the operator can place
+        // the hedge regardless of session, matching the CLI path.
+        let executor = MockExecutor::new();
+        let Some(params) = check_execution_readiness(
+            &executor,
+            position_projection,
+            base_symbol,
+            executor_type,
+            &trading_chain.assets,
+            &ctx.assets,
+            trading_enabled,
+        )
+        .await
+        .context("failed to check execution readiness")?
+        else {
+            mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
+                .await?;
+            return Ok(FillGate::Settled(ProcessTxOutcome::BelowExecutionThreshold));
+        };
+
+        Ok(FillGate::Ready(params))
+    }
+
+    /// Resolves a post-placement disposition into a process-tx outcome. A
+    /// submitted hedge is enrolled for status polling under the still-held
+    /// submission guards, mirroring the live path; a cleared placement reports
+    /// that no hedge was placed, and a finalized one needs no poll job.
+    async fn finalize_hedge_outcome(
+        disposition: HedgeDisposition,
+        symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
+        hedge_shares: Positive<FractionalShares>,
+        direction: Direction,
+        poll_enrollment: Option<(&PollOrderStatusJobQueue, Duration)>,
+    ) -> Result<ProcessTxOutcome, OperatorError> {
+        match disposition {
+            HedgeDisposition::ClearedForRetry => Ok(ProcessTxOutcome::HedgePlacementCleared {
+                symbol: symbol.clone(),
+            }),
+            HedgeDisposition::InFlight | HedgeDisposition::Finalized => {
+                if let (HedgeDisposition::InFlight, Some((poll_status_queue, poll_interval))) =
+                    (disposition, poll_enrollment)
+                {
+                    push_poll_job_if_absent(
+                        poll_status_queue.clone(),
+                        offchain_order_id,
+                        poll_interval,
+                    )
+                    .await
+                    .inspect_err(|error| {
+                        error!(
+                            %offchain_order_id,
+                            %symbol,
+                            %error,
+                            "Failed to enqueue PollOrderStatus for the process-tx hedge"
+                        );
+                    })
+                    .map_err(|error| OperatorError::Operational(anyhow::Error::new(error)))?;
+                }
+                Ok(ProcessTxOutcome::HedgePlaced {
+                    symbol: symbol.clone(),
+                    offchain_order_id,
+                    shares: hedge_shares,
+                    direction,
+                    disposition,
+                })
+            }
+        }
     }
 
     /// Completes fill accounting after the recovery path has resolved its hedge decision.
@@ -2353,8 +2450,8 @@ pub mod process_tx {
         };
         use crate::offchain::order::{
             BrokerOrderPlacement, CancellationReason, ExecutorOrderPlacer, OffchainOrder,
-            OffchainOrderId, OrderPlacementResult, OrderPlacer, PollOrderStatusJobQueue,
-            RetainedFill, noop_order_placer,
+            OffchainOrderId, OrderPlacementResult, OrderPlacer, PollOrderStatus,
+            PollOrderStatusJobQueue, RetainedFill, noop_order_placer,
         };
         use crate::onchain::trade::RaindexTradeEvent;
         use crate::onchain_trade::{
@@ -2424,10 +2521,10 @@ pub mod process_tx {
                 tx_hash,
                 &ctx,
                 &pool,
-                ProcessTxChainContext::new(&trading_chain, &provider),
-                &SymbolCache::default(),
+                ProcessTxChainContext::new(&trading_chain, &provider, &SymbolCache::default()),
                 &stores,
                 order_placer,
+                None,
                 None,
             )
             .await
@@ -2867,6 +2964,7 @@ pub mod process_tx {
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2971,6 +3069,7 @@ pub mod process_tx {
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3022,6 +3121,7 @@ pub mod process_tx {
                 &pool,
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
+                None,
                 None,
             )
             .await
@@ -3075,6 +3175,7 @@ pub mod process_tx {
                 &pool,
                 &stores_for(&pool, &order_placer).await,
                 order_placer.clone(),
+                None,
                 None,
             )
             .await
@@ -3192,6 +3293,7 @@ pub mod process_tx {
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
                 None,
+                None,
             )
             .await
             .unwrap_err();
@@ -3229,6 +3331,7 @@ pub mod process_tx {
                 &pool,
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
+                None,
                 None,
             )
             .await
@@ -3288,18 +3391,19 @@ pub mod process_tx {
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
                 None,
+                None,
             )
             .await
             .unwrap();
-            assert!(
-                matches!(
-                    outcome,
-                    ProcessTxOutcome::HedgePlaced {
-                        disposition: HedgeDisposition::ClearedForRetry,
-                        ..
-                    }
-                ),
-                "failed placement must resolve to a hedge cleared for retry, got: {outcome:?}"
+            let ProcessTxOutcome::HedgePlacementCleared { symbol } = &outcome else {
+                panic!(
+                    "failed placement must clear the hedge, not report it placed, got: {outcome:?}"
+                );
+            };
+            assert_eq!(
+                symbol,
+                &Symbol::new("AAPL").unwrap(),
+                "the cleared outcome must name the fill's symbol"
             );
 
             // pending_offchain_order_id must be cleared: the position must not be
@@ -3999,6 +4103,7 @@ pub mod process_tx {
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -4112,6 +4217,7 @@ pub mod process_tx {
                 &pool,
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
+                None,
                 None,
             )
             .await
@@ -4266,6 +4372,7 @@ pub mod process_tx {
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -4393,6 +4500,7 @@ pub mod process_tx {
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -4462,6 +4570,7 @@ pub mod process_tx {
                 &pool,
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
+                None,
                 None,
             )
             .await
@@ -4533,6 +4642,70 @@ pub mod process_tx {
             );
         }
 
+        /// A live in-bot submission (poll enrollment `Some`) must enqueue exactly
+        /// one `PollOrderStatus` job for the submitted hedge, mirroring the live
+        /// placement path so the order is reconciled without waiting for a
+        /// startup recovery sweep.
+        #[tokio::test]
+        async fn process_tx_live_submission_enqueues_one_poll_job() {
+            let (pool, apalis_pool) = try_setup_test_pools().await.unwrap();
+
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                Symbol::new("AAPL").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
+            let poll_status_queue = PollOrderStatusJobQueue::new(&apalis_pool);
+            let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+
+            let outcome = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+                Some((&poll_status_queue, TEST_POLL_INTERVAL)),
+            )
+            .await
+            .unwrap();
+
+            let ProcessTxOutcome::HedgePlaced {
+                offchain_order_id,
+                disposition: HedgeDisposition::InFlight,
+                ..
+            } = outcome
+            else {
+                panic!("a live submission must resolve to an in-flight hedge, got: {outcome:?}");
+            };
+
+            let poll_job_count: i64 = sqlx_apalis::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM Jobs \
+                 WHERE job_type = ? \
+                   AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+                   AND status IN ('Pending', 'Queued', 'Running')",
+            )
+            .bind(std::any::type_name::<PollOrderStatus>())
+            .bind(offchain_order_id.to_string())
+            .fetch_one(&apalis_pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                poll_job_count, 1,
+                "a live in-bot submission must enqueue exactly one PollOrderStatus job"
+            );
+        }
+
         /// A concurrent process-tx and a live trading tick both racing to hedge
         /// the same symbol must place a single broker order. Both converge on the
         /// same Position `PlaceOffChainOrder` gate under the shared
@@ -4587,7 +4760,8 @@ pub mod process_tx {
                     &pool,
                     &stores,
                     order_placer.clone(),
-                    Some(&lock)
+                    Some(&lock),
+                    None
                 ),
                 process_found_trade(
                     fill_b,
@@ -4595,7 +4769,8 @@ pub mod process_tx {
                     &pool,
                     &stores,
                     order_placer.clone(),
-                    Some(&lock)
+                    Some(&lock),
+                    None
                 ),
             );
 
@@ -4777,10 +4952,17 @@ pub mod process_tx {
 
             // 1 share buy at 150 -> net +1 -> the opposite hedge is placed.
             let onchain_trade = onchain_trade_builder().with_block_number(42).build();
-            let outcome =
-                process_found_trade(onchain_trade, &ctx, &pool, &stores, order_placer, None)
-                    .await
-                    .unwrap();
+            let outcome = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(outcome, ProcessTxOutcome::HedgePlaced { .. }),
                 "got {outcome:?}"
@@ -4836,6 +5018,7 @@ pub mod process_tx {
                 &pool,
                 &stores_for(&pool, &order_placer).await,
                 order_placer,
+                None,
                 None,
             )
             .await

@@ -678,10 +678,10 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         tx_hash,
         ctx,
         pool,
-        ProcessTxChainContext::new(trading_chain, provider),
-        cache,
+        ProcessTxChainContext::new(trading_chain, provider, cache),
         &stores,
         order_placer,
+        None,
         None,
     )
     .await?;
@@ -786,6 +786,12 @@ fn render_process_tx_outcome<W: Write>(
                     "The order reached a terminal broker state and the position was finalized."
                 )?,
             }
+        }
+        ProcessTxOutcome::HedgePlacementCleared { symbol } => {
+            writeln!(
+                stdout,
+                "No hedge placed for {symbol}: broker placement failed or the order vanished. The pending order was cleared so the normal pipeline can re-hedge."
+            )?;
         }
     }
     Ok(())
@@ -2959,6 +2965,17 @@ mod tests {
             },
             format!(
                 "{fill_summary}Trade accumulated but the buy preflight deferred the hedge for {}: live buying power could not cover it. Settled the fill.\n",
+                symbol()
+            ),
+        ));
+
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::HedgePlacementCleared { symbol: symbol() },
+            },
+            format!(
+                "{fill_summary}No hedge placed for {}: broker placement failed or the order vanished. The pending order was cleared so the normal pipeline can re-hedge.\n",
                 symbol()
             ),
         ));
