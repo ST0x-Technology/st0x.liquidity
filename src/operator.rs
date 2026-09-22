@@ -105,14 +105,6 @@ pub enum RejectionReason {
     #[error("Fill {trade_id}: missing block_number, cannot witness fill")]
     FillMissingBlockNumber { trade_id: OnChainTradeId },
     #[error(
-        "existing pending offchain order {offchain_order_id} for {symbol} is still Pending \
-         before placement; refusing to clear the position claim"
-    )]
-    OffchainOrderStillPendingBeforePlacement {
-        offchain_order_id: OffchainOrderId,
-        symbol: Symbol,
-    },
-    #[error(
         "offchain order {offchain_order_id} for {symbol} is in an unexpected post-placement \
          state; refusing to clear the position claim"
     )]
@@ -1550,6 +1542,10 @@ pub mod process_tx {
         /// The order reached a terminal broker state and the position was
         /// finalized.
         Finalized,
+        /// A prior placement was deferred by broker admission and the order was
+        /// left Pending. Only the gate before placement returns this; the fill
+        /// is settled against the retained intent and reported as a deferral.
+        Deferred,
     }
 
     /// Decoded on-chain fill identity and economics reported to operators.
@@ -2065,13 +2061,16 @@ pub mod process_tx {
         {
             None | Some((_, HedgeDisposition::ClearedForRetry | HedgeDisposition::Finalized)) => {}
             Some((pending_offchain_order_id, HedgeDisposition::InFlight)) => {
-                mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
-                    .await?;
-                // Restore the poll job for the still live hedge before reporting
-                // it in flight, mirroring the live placement path: an existing
-                // Submitted/PartiallyFilled/Cancelling order left un-enrolled
-                // would sit un-polled until the next startup recovery sweep. The
-                // enqueue is guarded against duplicates, so a re-drive adds no duplicate.
+                // Enroll the still live hedge for status polling before settling
+                // the fill, mirroring the live placement path: an existing
+                // Submitted/PartiallyFilled/Cancelling order that is not enrolled
+                // would sit unpolled until the next startup recovery sweep.
+                // Enrollment must succeed before the fill settles: were the fill
+                // settled first and the enqueue then failed, the retry would
+                // short circuit as AlreadyAccounted and never restore the poll
+                // job. Leaving the fill unsettled lets the retry resume and run
+                // enrollment again; the enqueue is guarded against duplicates, so
+                // running it again after a partial success adds no duplicate.
                 if let Some((poll_status_queue, poll_interval)) = poll_enrollment {
                     push_poll_job_if_absent(
                         poll_status_queue.clone(),
@@ -2089,7 +2088,25 @@ pub mod process_tx {
                     })
                     .map_err(|error| OperatorError::Operational(anyhow::Error::new(error)))?;
                 }
+                mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
+                    .await?;
                 return Ok(FillGate::Settled(ProcessTxOutcome::PendingHedgeInFlight));
+            }
+            Some((_, HedgeDisposition::Deferred)) => {
+                // A prior process-tx deferred its placement and left this order
+                // Pending (HedgePlacementDeferred). The later fill has already
+                // been applied to the position by account_for_onchain_fill;
+                // settle it against the retained intent and report the deferral
+                // rather than surfacing a rejection with partially applied
+                // accounting. The normal pipeline still owns retrying the
+                // retained Pending order once admission permits.
+                mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
+                    .await?;
+                return Ok(FillGate::Settled(
+                    ProcessTxOutcome::HedgePlacementDeferred {
+                        symbol: base_symbol.clone(),
+                    },
+                ));
             }
         }
 
@@ -2167,6 +2184,16 @@ pub mod process_tx {
                 PlacedHedgeDisposition::InFlight
             }
             HedgeDisposition::Finalized => PlacedHedgeDisposition::Finalized,
+            HedgeDisposition::Deferred => {
+                // Only the gate before placement classifies a retained Pending
+                // order as deferred; reconcile_post_place_state never returns it,
+                // so reaching here means an invariant broke rather than a state to
+                // report as a placed hedge.
+                return Err(OperatorError::Operational(anyhow::anyhow!(
+                    "reconciliation after placement produced a deferred disposition for {symbol}; \
+                     refusing to report the hedge as placed"
+                )));
+            }
         };
         Ok(ProcessTxOutcome::HedgePlaced {
             symbol: symbol.clone(),
@@ -2457,13 +2484,16 @@ pub mod process_tx {
                 Ok(HedgeDisposition::ClearedForRetry)
             }
             Some(OffchainOrder::Pending { .. }) => match context {
-                PlacementContext::PrePlacement => {
-                    Err(RejectionReason::OffchainOrderStillPendingBeforePlacement {
-                        offchain_order_id,
-                        symbol: symbol.clone(),
-                    }
-                    .into())
-                }
+                // A retained Pending order before placement is the legitimate
+                // state a prior HedgePlacementDeferred leaves. Classify it as a
+                // deferral so the gate settles the later fill and reports the
+                // deferral instead of a rejection with partially applied
+                // accounting; the normal pipeline still owns retrying the
+                // retained intent once admission permits.
+                PlacementContext::PrePlacement => Ok(HedgeDisposition::Deferred),
+                // After this run placed the order, a Pending state is not a
+                // legitimate resting state: the broker call returned without a
+                // terminal or in flight order, so refuse rather than clear.
                 PlacementContext::PostPlacement => {
                     Err(RejectionReason::OffchainOrderUnexpectedPostPlacementState {
                         offchain_order_id,
@@ -4297,85 +4327,121 @@ pub mod process_tx {
             }
         }
 
-        /// Pending-order rejections must identify their placement phase and order.
+        /// A Pending order after placement is not a legitimate resting state and
+        /// must surface as a typed rejection that keeps the position claim.
         #[tokio::test]
-        async fn pending_order_refusal_names_the_placement_phase() {
-            for context in [
-                PlacementContext::PrePlacement,
-                PlacementContext::PostPlacement,
-            ] {
-                let pool = setup_test_db().await;
-                let symbol = Symbol::new("AAPL").unwrap();
-                let offchain_order_id = OffchainOrderId::new();
-                let block_timestamp = Utc::now();
-                let position_store = seed_position_with_pending_order(
-                    &pool,
-                    &symbol,
-                    offchain_order_id,
-                    block_timestamp,
-                )
-                .await;
-                let pending_order = OffchainOrder::Pending {
-                    symbol: symbol.clone(),
-                    shares: positive_shares("1"),
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::DryRun,
-                    placed_at: block_timestamp,
-                    client_order_id: None,
-                    limit_price: None,
-                    market_session: st0x_execution::MarketSession::Regular,
-                    close_flatten: false,
-                    buying_power_reservation: None,
-                };
+        async fn pending_order_after_placement_is_a_typed_rejection() {
+            let pool = setup_test_db().await;
+            let symbol = Symbol::new("AAPL").unwrap();
+            let offchain_order_id = OffchainOrderId::new();
+            let block_timestamp = Utc::now();
+            let position_store = seed_position_with_pending_order(
+                &pool,
+                &symbol,
+                offchain_order_id,
+                block_timestamp,
+            )
+            .await;
+            let pending_order = OffchainOrder::Pending {
+                symbol: symbol.clone(),
+                shares: positive_shares("1"),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                placed_at: block_timestamp,
+                client_order_id: None,
+                limit_price: None,
+                market_session: st0x_execution::MarketSession::Regular,
+                close_flatten: false,
+                buying_power_reservation: None,
+            };
 
-                let error = reconcile_offchain_order_state(
-                    Some(pending_order),
-                    &position_store,
-                    &symbol,
-                    offchain_order_id,
-                    context,
-                )
-                .await
-                .unwrap_err();
-                let reason = match error {
-                    OperatorError::Rejected(reason) => reason,
-                    other @ OperatorError::Operational(_) => panic!(
-                        "a Pending order must surface as a typed rejection for {context:?}, got: {other}"
-                    ),
-                };
-                let names_phase = match (context, &reason) {
-                    (
-                        PlacementContext::PrePlacement,
-                        RejectionReason::OffchainOrderStillPendingBeforePlacement {
-                            offchain_order_id: id,
-                            symbol: rejected,
-                        },
-                    )
-                    | (
-                        PlacementContext::PostPlacement,
+            let error = reconcile_offchain_order_state(
+                Some(pending_order),
+                &position_store,
+                &symbol,
+                offchain_order_id,
+                PlacementContext::PostPlacement,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    OperatorError::Rejected(
                         RejectionReason::OffchainOrderUnexpectedPostPlacementState {
                             offchain_order_id: id,
                             symbol: rejected,
                         },
-                    ) => *id == offchain_order_id && *rejected == symbol,
-                    _ => false,
-                };
-                assert!(
-                    names_phase,
-                    "the rejection must carry the placement phase and the order for {context:?}, got: {reason:?}"
-                );
+                    ) if *id == offchain_order_id && *rejected == symbol
+                ),
+                "a Pending order after placement must be a typed rejection carrying the order, got: {error}"
+            );
 
-                let position = position_store
-                    .load(&symbol)
-                    .await
-                    .unwrap()
-                    .expect("position should exist after setup");
-                assert_eq!(
-                    position.pending_offchain_order_id,
-                    Some(offchain_order_id),
-                    "a refusal must leave the position claim in place for {context:?}"
-                );
-            }
+            let position = position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .expect("position should exist after setup");
+            assert_eq!(
+                position.pending_offchain_order_id,
+                Some(offchain_order_id),
+                "a refusal must leave the position claim in place"
+            );
+        }
+
+        /// A retained Pending order before placement is the state a prior
+        /// deferral leaves; it must classify as a deferral and keep the claim so
+        /// the later fill can settle instead of surfacing a rejection.
+        #[tokio::test]
+        async fn retained_pending_order_before_placement_is_a_deferral() {
+            let pool = setup_test_db().await;
+            let symbol = Symbol::new("AAPL").unwrap();
+            let offchain_order_id = OffchainOrderId::new();
+            let block_timestamp = Utc::now();
+            let position_store = seed_position_with_pending_order(
+                &pool,
+                &symbol,
+                offchain_order_id,
+                block_timestamp,
+            )
+            .await;
+            let pending_order = OffchainOrder::Pending {
+                symbol: symbol.clone(),
+                shares: positive_shares("1"),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                placed_at: block_timestamp,
+                client_order_id: None,
+                limit_price: None,
+                market_session: st0x_execution::MarketSession::Regular,
+                close_flatten: false,
+                buying_power_reservation: None,
+            };
+
+            let disposition = reconcile_offchain_order_state(
+                Some(pending_order),
+                &position_store,
+                &symbol,
+                offchain_order_id,
+                PlacementContext::PrePlacement,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(disposition, HedgeDisposition::Deferred),
+                "a retained Pending order before placement must classify as a deferral, got: {disposition:?}"
+            );
+
+            let position = position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .expect("position should exist after setup");
+            assert_eq!(
+                position.pending_offchain_order_id,
+                Some(offchain_order_id),
+                "a deferral must leave the position claim in place"
+            );
         }
 
         /// An unpriced terminal fill must reject reconciliation and retain the claim.
@@ -5245,6 +5311,130 @@ pub mod process_tx {
             );
         }
 
+        /// A later process-tx for a symbol whose prior fill deferred placement
+        /// must settle its own fill against the retained Pending order and report
+        /// the deferral, rather than surfacing a rejection with the fill applied
+        /// to the position but never settled.
+        #[tokio::test]
+        async fn process_tx_second_fill_settles_against_retained_deferral() {
+            let pool = setup_test_db().await;
+
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                Symbol::new("AAPL").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(DeferringOrderPlacer);
+            let stores = stores_for(&pool, &order_placer).await;
+
+            let first_fill = onchain_trade_builder()
+                .with_log_index(1)
+                .with_block_number(42)
+                .build();
+            let first_outcome = process_found_trade(
+                first_fill,
+                &ctx,
+                &pool,
+                &stores,
+                order_placer.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    first_outcome,
+                    ProcessTxOutcome::HedgePlacementDeferred { .. }
+                ),
+                "the first fill must defer placement and leave a Pending order, got: {first_outcome:?}"
+            );
+
+            let second_fill = onchain_trade_builder()
+                .with_log_index(2)
+                .with_block_number(43)
+                .build();
+            let second_trade_id = OnChainTradeId::new(
+                second_fill.chain,
+                second_fill.tx_hash,
+                second_fill.log_index,
+            );
+            let second_position_trade_id = TradeId {
+                chain: second_fill.chain,
+                tx_hash: second_fill.tx_hash,
+                log_index: second_fill.log_index,
+            };
+            let second_outcome =
+                process_found_trade(second_fill, &ctx, &pool, &stores, order_placer, None, None)
+                    .await
+                    .unwrap();
+            let ProcessTxOutcome::HedgePlacementDeferred { symbol } = &second_outcome else {
+                panic!(
+                    "the later fill must settle against the retained deferral, got: {second_outcome:?}"
+                );
+            };
+            assert_eq!(symbol, &Symbol::new("AAPL").unwrap());
+
+            // The later fill is settled: acknowledged on the trade and dropped
+            // from the position's pending acknowledgement set.
+            let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let onchain_state = onchain_trade_store
+                .load(&second_trade_id)
+                .await
+                .unwrap()
+                .expect("the later fill must be witnessed");
+            assert!(
+                onchain_state.is_acknowledged(),
+                "the later fill must be acknowledged"
+            );
+
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let position = position_store
+                .load(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("the position must exist after fill accounting");
+            assert!(
+                !position
+                    .pending_acknowledged_trade_ids
+                    .contains(&second_position_trade_id),
+                "the later fill must be settled out of the pending acknowledgement set"
+            );
+
+            // The pending intent is still retained for the normal pipeline.
+            let pending_order_id = position
+                .pending_offchain_order_id
+                .expect("the retained deferral must keep the pending offchain order id");
+            let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(noop_order_placer())
+                .await
+                .unwrap();
+            let offchain_order = offchain_order_store
+                .load(&pending_order_id)
+                .await
+                .unwrap()
+                .expect("the retained pending order must be persisted");
+            assert!(
+                matches!(offchain_order, OffchainOrder::Pending { .. }),
+                "the retained order must still be Pending, got: {offchain_order:?}"
+            );
+        }
+
         /// An existing in-flight hedge (`Submitted`) discovered before placement
         /// must be enrolled for status polling exactly once, mirroring the live
         /// path, rather than left un-polled until the next startup recovery
@@ -5330,6 +5520,196 @@ pub mod process_tx {
             assert_eq!(
                 poll_job_count, 1,
                 "an existing in-flight hedge must be enrolled for exactly one PollOrderStatus job"
+            );
+        }
+
+        /// A poll enqueue failure while settling an existing in flight hedge must
+        /// leave the fill unsettled so the retry can run enrollment again,
+        /// instead of settling first and stranding the poll job when the retry
+        /// short circuits as AlreadyAccounted. The first attempt uses a closed
+        /// poll queue whose push fails; the retry uses a working queue and must
+        /// enroll exactly one job and settle.
+        #[tokio::test]
+        async fn process_tx_poll_enqueue_failure_defers_settlement_until_retry() {
+            let (pool, apalis_pool) = try_setup_test_pools().await.unwrap();
+
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                Symbol::new("AAPL").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
+            let stores = stores_for(&pool, &order_placer).await;
+            let poll_status_queue = PollOrderStatusJobQueue::new(&apalis_pool);
+
+            // A closed apalis pool whose every query and push fails, standing in
+            // for a broken queue write during enrollment.
+            let broken_apalis_pool = try_setup_test_pools().await.unwrap().1;
+            broken_apalis_pool.close().await;
+            let broken_poll_queue = PollOrderStatusJobQueue::new(&broken_apalis_pool);
+
+            // The first fill submits an in flight hedge with no enrollment.
+            let first_fill = onchain_trade_builder()
+                .with_log_index(1)
+                .with_block_number(42)
+                .build();
+            let first_outcome = process_found_trade(
+                first_fill,
+                &ctx,
+                &pool,
+                &stores,
+                order_placer.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let ProcessTxOutcome::HedgePlaced {
+                offchain_order_id,
+                disposition: PlacedHedgeDisposition::InFlight,
+                ..
+            } = first_outcome
+            else {
+                panic!("the first fill must submit an in flight hedge, got: {first_outcome:?}");
+            };
+
+            // The second fill finds the in flight hedge; the closed queue fails
+            // enrollment, so the attempt errors before the fill is settled.
+            let second_fill = onchain_trade_builder()
+                .with_log_index(2)
+                .with_block_number(43)
+                .build();
+            let second_trade_id = OnChainTradeId::new(
+                second_fill.chain,
+                second_fill.tx_hash,
+                second_fill.log_index,
+            );
+            let second_position_trade_id = TradeId {
+                chain: second_fill.chain,
+                tx_hash: second_fill.tx_hash,
+                log_index: second_fill.log_index,
+            };
+            let failed = process_found_trade(
+                second_fill,
+                &ctx,
+                &pool,
+                &stores,
+                order_placer.clone(),
+                None,
+                Some((&broken_poll_queue, TEST_POLL_INTERVAL)),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(failed, OperatorError::Operational(_)),
+                "a broken poll enqueue must surface as an operational failure, got: {failed:?}"
+            );
+
+            // The fill is not settled: the trade is witnessed but not
+            // acknowledged, and it is still in the pending acknowledgement set.
+            let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let onchain_state = onchain_trade_store
+                .load(&second_trade_id)
+                .await
+                .unwrap()
+                .expect("the second fill must be witnessed even when enrollment fails");
+            assert!(
+                !onchain_state.is_acknowledged(),
+                "a failed enrollment must leave the fill unacknowledged for the retry"
+            );
+
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let position = position_store
+                .load(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("the position must exist after fill accounting");
+            assert!(
+                position
+                    .pending_acknowledged_trade_ids
+                    .contains(&second_position_trade_id),
+                "an unsettled fill must remain in the pending acknowledgement set"
+            );
+
+            let poll_job_count_before: i64 = sqlx_apalis::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM Jobs \
+                 WHERE job_type = ? \
+                   AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+                   AND status IN ('Pending', 'Queued', 'Running')",
+            )
+            .bind(std::any::type_name::<PollOrderStatus>())
+            .bind(offchain_order_id.to_string())
+            .fetch_one(&apalis_pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                poll_job_count_before, 0,
+                "a failed enrollment must not enqueue a poll job"
+            );
+
+            // The retry uses a working queue: enrollment succeeds, the fill
+            // settles, and exactly one poll job is enrolled.
+            let second_fill_retry = onchain_trade_builder()
+                .with_log_index(2)
+                .with_block_number(43)
+                .build();
+            let retry_outcome = process_found_trade(
+                second_fill_retry,
+                &ctx,
+                &pool,
+                &stores,
+                order_placer,
+                None,
+                Some((&poll_status_queue, TEST_POLL_INTERVAL)),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(retry_outcome, ProcessTxOutcome::PendingHedgeInFlight),
+                "the retry must settle the fill against the in flight hedge, got: {retry_outcome:?}"
+            );
+
+            let settled_position = position_store
+                .load(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("the position must exist after the retry");
+            assert!(
+                !settled_position
+                    .pending_acknowledged_trade_ids
+                    .contains(&second_position_trade_id),
+                "the retry must settle the fill out of the pending acknowledgement set"
+            );
+
+            let poll_job_count_after: i64 = sqlx_apalis::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM Jobs \
+                 WHERE job_type = ? \
+                   AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+                   AND status IN ('Pending', 'Queued', 'Running')",
+            )
+            .bind(std::any::type_name::<PollOrderStatus>())
+            .bind(offchain_order_id.to_string())
+            .fetch_one(&apalis_pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                poll_job_count_after, 1,
+                "the retry must enroll exactly one PollOrderStatus job"
             );
         }
 
