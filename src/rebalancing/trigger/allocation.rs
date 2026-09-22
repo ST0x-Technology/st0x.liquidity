@@ -478,6 +478,22 @@ mod tests {
         assert_eq!(plan, EquityPlan::Decline(DeclineReason::WithinBand));
     }
 
+    /// The price guard runs after ranking, so an idle symbol is reported as
+    /// within its band rather than as a price problem.
+    #[test]
+    fn balanced_inventory_without_a_price_stays_within_band() {
+        let plan = plan_equity_operation(&EquityPlanInput {
+            last_price: None,
+            ..input(
+                Some(balance("40")),
+                BTreeMap::from([(Chain::Base, slot("60", "0.5"))]),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(plan, EquityPlan::Decline(DeclineReason::WithinBand));
+    }
+
     /// SPEC scenario: 85% of AAPL sits at the broker; mint back toward 50/50.
     #[test]
     fn heavy_broker_inventory_mints_the_deviation() {
