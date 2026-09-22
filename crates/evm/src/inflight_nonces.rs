@@ -121,7 +121,12 @@ impl InFlightNonces {
         tx_hash: TxHash,
         policy: DropPolicy,
     ) {
-        self.nonce_manager.occupy_nonce(address, nonce);
+        match policy {
+            DropPolicy::Release => self.nonce_manager.occupy_in_flight_nonce(address, nonce),
+            DropPolicy::RetainForRebroadcast => {
+                self.nonce_manager.reserve_durable_nonce(address, nonce);
+            }
+        }
         self.nonces
             .entry(address)
             .or_default()

@@ -17,11 +17,16 @@
 //!   lower bound, skipping the RPC re-fetch. Nonce-too-low recovery then asks
 //!   the allocator for the exact reservation-aware nonce and pins that value
 //!   onto the retry transaction.
-//! - The occupancy set protects both prepared transactions and accepted
-//!   in-flight transactions. Allocation skips occupied values after every
-//!   cache seed or invalidation. Generic ownership is released after a
-//!   definitive receipt or drop; durable prepared ownership survives drops
-//!   for exact rebroadcast and is released only by confirmation or an
+//! - Held nonces carry whether allocation must skip them. A prepared
+//!   (not-yet-broadcast) reservation and a durable prepared transaction
+//!   retained for exact rebroadcast are skipped so a fresh send never
+//!   overwrites those exact bytes. A generic broadcast-but-unconfirmed nonce
+//!   is deliberately *not* skipped: allocation must be able to land back on
+//!   the wallet's own stuck under-gassed transaction to replace it (see the
+//!   `latest` fetch below and `submit::send_with_recovery`), rather than
+//!   queue the next send behind it forever. Generic ownership is released
+//!   after a definitive receipt or drop; durable prepared ownership survives
+//!   drops for exact rebroadcast and is released only by confirmation or an
 //!   explicit discard-before-broadcast decision.
 //!
 //! The cold-cache fetch intentionally uses `latest`, not `pending`.
@@ -40,7 +45,7 @@ use alloy::transports::TransportResult;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::lock::Mutex;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::trace;
 
@@ -49,13 +54,29 @@ use tracing::trace;
 /// changes.
 ///
 /// Each nonce entry holds the nonce the *next* send from that address should
-/// use, or `None` when it must be fetched from the RPC. Occupied nonces are
-/// tracked separately so cache invalidation can discard stale RPC-derived
-/// state without erasing prepared or broadcast-but-unconfirmed ownership.
+/// use, or `None` when it must be fetched from the RPC. Held nonces are
+/// tracked separately, each tagged with whether allocation must skip it, so
+/// cache invalidation can discard stale RPC-derived state without erasing
+/// prepared or broadcast-but-unconfirmed ownership.
 #[derive(Clone, Debug, Default)]
 pub struct ResettableNonceManager {
     nonces: Arc<DashMap<Address, Arc<Mutex<Option<u64>>>>>,
-    occupied: Arc<DashMap<Address, BTreeSet<u64>>>,
+    occupied: Arc<DashMap<Address, BTreeMap<u64, NonceHold>>>,
+}
+
+/// Why a nonce is currently held, which decides whether allocation may land
+/// back on it after a cache seed or invalidation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonceHold {
+    /// A prepared (not-yet-broadcast) reservation or a durable prepared
+    /// transaction retained for exact rebroadcast. Allocation skips it: a
+    /// fresh send here would steal or overwrite those exact bytes.
+    Reserved,
+    /// A generic broadcast-but-unconfirmed send. Allocation may land back on
+    /// it so the wallet can replace its own stuck under-gassed transaction
+    /// with a fee-bumped resubmit; skipping it would leave the next send
+    /// queued behind the stuck one until it mines or the process restarts.
+    Replaceable,
 }
 
 impl ResettableNonceManager {
@@ -92,7 +113,7 @@ impl ResettableNonceManager {
     pub(crate) async fn reserve_prepared_nonce(&self, address: Address, nonce: u64) {
         let slot = self.slot(address);
         let mut cached = slot.lock().await;
-        self.occupy_nonce(address, nonce);
+        self.hold_nonce(address, nonce, NonceHold::Reserved);
         let next = nonce.saturating_add(1);
         *cached = Some(cached.map_or(next, |current| current.max(next)));
     }
@@ -118,12 +139,40 @@ impl ResettableNonceManager {
         }
     }
 
-    /// Marks a nonce occupied by a prepared or broadcast-but-unconfirmed
-    /// transaction. The corresponding in-flight policy decides whether a
-    /// definitive drop releases or retains that ownership.
+    /// Reserves `nonce` for exact rebroadcast of a durable prepared
+    /// transaction. Allocation skips it, exactly like a prepared reservation:
+    /// a fresh send here would overwrite bytes that must be rebroadcast
+    /// verbatim.
     #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
-    pub(crate) fn occupy_nonce(&self, address: Address, nonce: u64) {
-        self.occupied.entry(address).or_default().insert(nonce);
+    pub(crate) fn reserve_durable_nonce(&self, address: Address, nonce: u64) {
+        self.hold_nonce(address, nonce, NonceHold::Reserved);
+    }
+
+    /// Marks `nonce` occupied by a generic broadcast-but-unconfirmed send.
+    /// Unlike a reservation it stays re-allocatable: the wallet's own stuck
+    /// under-gassed transaction at this nonce must remain reachable so
+    /// `submit::send_with_recovery` can land back on it and fee-bump it,
+    /// instead of queuing the next send behind it.
+    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    pub(crate) fn occupy_in_flight_nonce(&self, address: Address, nonce: u64) {
+        self.hold_nonce(address, nonce, NonceHold::Replaceable);
+    }
+
+    /// Records a hold on `nonce`. A `Reserved` hold is sticky: a later
+    /// `Replaceable` hold never downgrades it, so a durable reservation
+    /// cannot be silently turned replaceable and overwritten.
+    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    fn hold_nonce(&self, address: Address, nonce: u64, hold: NonceHold) {
+        self.occupied
+            .entry(address)
+            .or_default()
+            .entry(nonce)
+            .and_modify(|existing| {
+                if hold == NonceHold::Reserved {
+                    *existing = NonceHold::Reserved;
+                }
+            })
+            .or_insert(hold);
     }
 
     /// Releases one definitively resolved nonce.
@@ -131,7 +180,7 @@ impl ResettableNonceManager {
     pub(crate) fn release_occupied_nonce(&self, address: Address, nonce: u64) -> bool {
         self.occupied
             .get_mut(&address)
-            .is_some_and(|mut occupied| occupied.remove(&nonce))
+            .is_some_and(|mut occupied| occupied.remove(&nonce).is_some())
     }
 
     /// The per-address cache slot, created empty on first access.
@@ -144,12 +193,13 @@ impl ResettableNonceManager {
         Arc::clone(entry.value())
     }
 
-    /// Whether a prepared or broadcast-but-unconfirmed transaction currently
-    /// owns `nonce`.
-    fn is_occupied(&self, address: Address, nonce: u64) -> bool {
+    /// Whether a prepared or durable-rebroadcast reservation currently holds
+    /// `nonce`, so allocation must skip it. A generic broadcast-but-
+    /// unconfirmed nonce is *not* reserved and stays re-allocatable.
+    fn is_reserved(&self, address: Address, nonce: u64) -> bool {
         self.occupied
             .get(&address)
-            .is_some_and(|occupied| occupied.contains(&nonce))
+            .is_some_and(|held| matches!(held.get(&nonce), Some(NonceHold::Reserved)))
     }
 
     /// The nonce the next send from `address` would use, without assigning
@@ -197,7 +247,7 @@ impl NonceManager for ResettableNonceManager {
             // `latest` (mined) count, not `pending`.
             provider.get_transaction_count(address).latest().await?
         };
-        while self.is_occupied(address, next_nonce) {
+        while self.is_reserved(address, next_nonce) {
             let advanced = next_nonce.saturating_add(1);
             if advanced == next_nonce {
                 break;
@@ -349,7 +399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filling_released_gap_skips_higher_in_flight_nonce() {
+    async fn filling_released_gap_reallocates_generic_in_flight_nonce() {
         let manager = ResettableNonceManager::default();
         let in_flight = InFlightNonces::new(manager.clone());
         let provider = ProviderBuilder::new().connect_anvil();
@@ -371,9 +421,39 @@ mod tests {
         );
         assert_eq!(
             manager.get_next_nonce(&provider, address).await.unwrap(),
-            in_flight_nonce + 1,
-            "after filling the released gap, allocation must skip the higher \
-             broadcast-but-unconfirmed nonce"
+            in_flight_nonce,
+            "a generic broadcast-but-unconfirmed nonce is not skipped: allocation \
+             lands back on it so the wallet can replace its own stuck transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidation_reallocates_generic_in_flight_nonce_for_replacement() {
+        // Regression: a generic broadcast-but-unconfirmed nonce must remain
+        // re-allocatable after invalidation. `submit::send_with_recovery`'s
+        // stuck-transaction recovery depends on landing back on the wallet's
+        // own stuck under-gassed nonce to get "replacement underpriced" and
+        // fee-bump it; skipping it (as a prepared reservation is skipped) left
+        // the next send queued behind the stuck one until it mined or the
+        // process restarted.
+        let manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(manager.clone());
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+
+        let in_flight_nonce = manager.get_next_nonce(&provider, address).await.unwrap();
+        in_flight.record(
+            address,
+            in_flight_nonce,
+            alloy::primitives::TxHash::repeat_byte(0x42),
+        );
+        manager.invalidate();
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            in_flight_nonce,
+            "an invalidated cache must re-fetch and land back on the wallet's own \
+             in-flight nonce, not skip past it"
         );
     }
 
