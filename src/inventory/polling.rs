@@ -30,7 +30,7 @@ use st0x_tokenization::{ClientRequestId, TokenizationRequestId};
 use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 
 use super::BroadcastingInventory;
-use super::divergence::InventoryDivergenceRecoveryCtx;
+use super::divergence::{InventoryDivergenceRecoveryCtx, ReconciliationGeneration};
 use super::view::{HedgeOrderGateCorrection, Venue};
 use crate::alerts::Notifier;
 use crate::inventory::freshness::PollFreshness;
@@ -622,6 +622,20 @@ where
             );
             return Ok(());
         };
+        let equity_reconciliations = self
+            .divergence_recovery
+            .as_ref()
+            .map(|recovery| {
+                recovery
+                    .gate
+                    .claim_pending_onchain_equity_reconciles(vault_polling.chain)
+            })
+            .unwrap_or_default();
+        let usdc_reconciliation = self.divergence_recovery.as_ref().and_then(|recovery| {
+            recovery
+                .gate
+                .claim_pending_onchain_cash_reconcile(vault_polling.chain)
+        });
 
         // One pinned block per chain: every vaultBalance2 read below observes
         // this exact chain state, and the snapshot events record it so the
@@ -638,6 +652,7 @@ where
             &registry,
             block_number,
             fetched_at,
+            equity_reconciliations,
         )
         .await?;
         self.poll_onchain_usdc(
@@ -646,6 +661,7 @@ where
             &registry,
             block_number,
             fetched_at,
+            usdc_reconciliation,
         )
         .await?;
 
@@ -669,6 +685,7 @@ where
         registry: &VaultRegistry,
         block_number: u64,
         fetched_at: DateTime<Utc>,
+        reconciliation_generations: BTreeMap<Symbol, ReconciliationGeneration>,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.equity_vaults.is_empty() {
             debug!(
@@ -737,20 +754,25 @@ where
                 actual: fetched_tokens,
             });
         }
-
         let symbols: Vec<Symbol> = balances.keys().cloned().collect();
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OnchainEquity {
-                    chain: vault_polling.chain,
-                    balances,
-                    fetched_at,
-                    block_number: Some(block_number),
-                },
-            )
-            .await?;
+        let command = if reconciliation_generations.is_empty() {
+            InventorySnapshotCommand::OnchainEquity {
+                chain: vault_polling.chain,
+                balances,
+                fetched_at,
+                block_number: Some(block_number),
+            }
+        } else {
+            InventorySnapshotCommand::ReconcileOnchainEquity {
+                chain: vault_polling.chain,
+                balances,
+                fetched_at,
+                block_number: Some(block_number),
+                generations: reconciliation_generations,
+            }
+        };
+        self.snapshot.send(snapshot_id, command).await?;
 
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
@@ -771,6 +793,7 @@ where
         registry: &VaultRegistry,
         block_number: u64,
         fetched_at: DateTime<Utc>,
+        reconciliation_generation: Option<ReconciliationGeneration>,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.usdc_vaults.is_empty() {
             debug!(
@@ -803,17 +826,22 @@ where
             .copied()
             .try_fold(vault_balances[0], |acc, balance| acc + balance)?;
 
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::OnchainUsdc {
-                    chain: vault_polling.chain,
-                    usdc_balance,
-                    fetched_at,
-                    block_number: Some(block_number),
-                },
-            )
-            .await?;
+        let command = reconciliation_generation.map_or(
+            InventorySnapshotCommand::OnchainUsdc {
+                chain: vault_polling.chain,
+                usdc_balance,
+                fetched_at,
+                block_number: Some(block_number),
+            },
+            |generation| InventorySnapshotCommand::ReconcileOnchainUsdc {
+                chain: vault_polling.chain,
+                usdc_balance,
+                fetched_at,
+                block_number: Some(block_number),
+                generation,
+            },
+        );
+        self.snapshot.send(snapshot_id, command).await?;
 
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves this slot falsely fresh.
@@ -982,6 +1010,11 @@ where
         &self,
         snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let pending_reconciliations = self
+            .divergence_recovery
+            .as_ref()
+            .map(|recovery| recovery.gate.claim_pending_offchain_equity_reconciles())
+            .unwrap_or_default();
         // Captured before the broker read: the stamp must lower-bound the
         // broker's as-of time so a pre-fill read can never be stamped after
         // the fill was applied to the view (guard 2's comparison). Stamping
@@ -1012,6 +1045,32 @@ where
                 },
             )
             .await?;
+
+        if let Some(recovery) = &self.divergence_recovery {
+            for (symbol, generation) in pending_reconciliations {
+                let ledger_position = recovery
+                    .inventory
+                    .read()
+                    .await
+                    .equity_available(&symbol, Venue::Hedging);
+                self.snapshot
+                    .send(
+                        snapshot_id,
+                        InventorySnapshotCommand::ReconcileOffchainEquity {
+                            position: positions
+                                .get(&symbol)
+                                .copied()
+                                .unwrap_or(FractionalShares::ZERO),
+                            symbol,
+                            fetched_at,
+                            ledger_position,
+                            consecutive_polls: 0,
+                            generation: Some(generation),
+                        },
+                    )
+                    .await?;
+            }
+        }
 
         // Stamped only after `send` returns Ok, so a failed persist (which
         // propagates via `?` above) never leaves these slots falsely fresh.
@@ -1530,6 +1589,7 @@ where
                     fetched_at,
                     ledger_position: escalation.ledger,
                     consecutive_polls: escalation.consecutive_polls,
+                    generation: None,
                 },
             )
             .await?;

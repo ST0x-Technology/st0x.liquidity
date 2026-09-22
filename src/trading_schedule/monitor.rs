@@ -232,7 +232,7 @@ impl TradingScheduleMonitor {
             for identity in self.store.due_wakeups(now).await? {
                 if emitted.insert(identity.clone()) {
                     if let Err(error) = queue
-                        .push_idempotent(&identity, CheckPositions { one_shot: true })
+                        .push_idempotent(&identity, CheckPositions::one_shot())
                         .await
                     {
                         emitted.remove(&identity);

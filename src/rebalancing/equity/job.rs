@@ -26,11 +26,13 @@ use std::time::Duration;
 
 use apalis_core::error::BoxDynError;
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
-use st0x_event_sorcery::Store;
+use st0x_config::ExecutionThreshold;
+use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
 use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
@@ -43,6 +45,8 @@ use crate::conductor::job::{
     BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
+use crate::position::{EquityTransferReservationId, Position, PositionCommand, PositionError};
+use crate::position_check::equity_transfer_retry_delay;
 use crate::rebalancing::trigger::{GuardGeneration, GuardState, remove_active_transfer};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 
@@ -107,6 +111,9 @@ pub(crate) struct TransferEquityToMarketMakingCtx {
     /// transitioning the guard. Absent/pre-receipt/terminal states propagate
     /// `Err` so apalis retries normally.
     pub(crate) mint_store: Arc<Store<TokenizedEquityMint>>,
+    /// Position authority that restores this job's reservation before any
+    /// transfer side effect and releases it after terminal completion.
+    pub(crate) position_authority: Option<PositionReservationAuthority>,
     /// The same per-chain services map the aggregates read. Used to gate the
     /// `HeldForRecovery` handoff on `wrapped_equity_recovery = "enabled"` for
     /// the symbol on the job's own chain -- the same predicate the inventory
@@ -128,13 +135,15 @@ pub(crate) enum TransferEquityToMarketMakingJobError {
     Transfer(#[from] MintTransferError),
     #[error(transparent)]
     Enqueue(#[from] QueuePushError),
+    #[error(transparent)]
+    PositionReservation(#[from] SendError<Position>),
 }
 
 impl BotGasFailureClassifier for TransferEquityToMarketMakingJobError {
     fn is_bot_gas_enqueue_failure(&self) -> bool {
         match self {
             Self::Transfer(inner) => inner.is_bot_gas_enqueue_failure(),
-            Self::Enqueue(_) => false,
+            Self::Enqueue(_) | Self::PositionReservation(_) => false,
         }
     }
 }
@@ -182,8 +191,70 @@ pub(crate) struct TransferEquityToMarketMaking {
     /// lands.
     #[serde(default)]
     pub(crate) backpressure_streak: BackpressureStreak,
+    /// Number of consecutive reservation-restoration deferrals. Persisted in
+    /// the replacement payload so a long-lived hedge backs off across rows.
+    #[serde(default)]
+    pub(crate) position_reservation_retry_attempts: u32,
 }
 
+pub(crate) type PositionReservationAuthority = (Arc<Store<Position>>, ExecutionThreshold);
+
+pub(super) async fn restore_position_reservation(
+    store: &Store<Position>,
+    symbol: &Symbol,
+    threshold: ExecutionThreshold,
+    reservation_id: EquityTransferReservationId,
+) -> Result<bool, SendError<Position>> {
+    match store
+        .send(
+            symbol,
+            PositionCommand::RestoreEquityTransferReservation {
+                symbol: symbol.clone(),
+                threshold,
+                reservation_id,
+            },
+        )
+        .await
+    {
+        Ok(()) => Ok(true),
+        Err(AggregateError::UserError(LifecycleError::Apply(
+            PositionError::PendingExecution { .. }
+            | PositionError::EquityTransferBlockedByFailedOrderAnchor { .. }
+            | PositionError::EquityTransferBlockedByHedge { .. }
+            | PositionError::EquityTransferHedgeEligibilityUnknown { .. },
+        ))) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) async fn has_live_sibling_equity_transfer<JobPayload>(
+    pool: &apalis_sqlite::SqlitePool,
+    task_identity: &TaskIdentity,
+    same_owner: impl Fn(&JobPayload) -> bool,
+) -> Result<bool, BoxDynError>
+where
+    JobPayload: DeserializeOwned,
+{
+    let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+        "SELECT job FROM Jobs \
+         WHERE id <> ? AND job_type = ? \
+         AND (status IN ('Pending', 'Queued', 'Running') \
+              OR (status = 'Failed' AND attempts < max_attempts))",
+    )
+    .bind(task_identity.as_str())
+    .bind(std::any::type_name::<JobPayload>())
+    .fetch_all(pool)
+    .await?;
+
+    for payload in payloads {
+        let sibling: JobPayload = serde_json::from_slice(&payload)?;
+        if same_owner(&sibling) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
 impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
     type Output = ();
     type Error = TransferEquityToMarketMakingJobError;
@@ -207,6 +278,32 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
         &self,
         ctx: &TransferEquityToMarketMakingCtx,
     ) -> Result<Self::Output, Self::Error> {
+        if let Some((position_store, position_threshold)) = &ctx.position_authority
+            && !restore_position_reservation(
+                position_store,
+                &self.symbol,
+                *position_threshold,
+                EquityTransferReservationId::from_uuid(self.issuer_request_id.0),
+            )
+            .await?
+        {
+            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
+            let mut retry = self.clone();
+            retry.position_reservation_retry_attempts =
+                self.position_reservation_retry_attempts.saturating_add(1);
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                issuer_request_id = %self.issuer_request_id,
+                position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
+                retry_delay_secs = retry_delay.as_secs(),
+                "Hedge admission deferred equity mint reservation restoration; rescheduling"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(retry, retry_delay).await?;
+            return Ok(());
+        }
+
         let result = ctx
             .transfer
             .resume_equity_to_market_making(
@@ -217,14 +314,40 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
             )
             .await;
 
-        // Success needs no post-processing. Only a `PostReceipt` error (Alpaca
-        // already delivered the tokens onchain) gets the recovery handoff below;
-        // any other transfer error propagates for apalis to retry.
+        // The terminal lifecycle reactor runs inside the mint aggregate's
+        // SQLite transaction, so it cannot synchronously write the Position
+        // aggregate without risking `database is locked`. Release ownership
+        // here, after the transfer command and all of its reactors have
+        // committed, before the worker can return and hedging can resume.
         let Err(transfer_error) = result else {
+            if let Some((position_store, _)) = &ctx.position_authority {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.issuer_request_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
             return Ok(());
         };
 
         if let Some(delay) = transfer_error.gas_readiness_retry_interval() {
+            if let Some((position_store, _)) = &ctx.position_authority {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.issuer_request_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
@@ -390,15 +513,50 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
         ctx: &TransferEquityToMarketMakingCtx,
         task_identity: &TaskIdentity,
     ) -> Result<(), BoxDynError> {
-        if let Some(_aggregate) = ctx.mint_store.load(&self.issuer_request_id).await? {
+        if let Some(aggregate) = ctx.mint_store.load(&self.issuer_request_id).await?
+            && !aggregate.is_terminal()
+        {
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
                 issuer_request_id = %self.issuer_request_id,
                 %task_identity,
-                "Terminal mint attempt retained its guard because a lifecycle aggregate exists"
+                "Terminal mint attempt retained its guard because a live lifecycle aggregate exists"
             );
             return Ok(());
+        }
+        if has_live_sibling_equity_transfer::<Self>(
+            ctx.job_queue.pool(),
+            task_identity,
+            |sibling| {
+                sibling.issuer_request_id == self.issuer_request_id
+                    && sibling.generation == self.generation
+            },
+        )
+        .await?
+        {
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                issuer_request_id = %self.issuer_request_id,
+                generation = ?self.generation,
+                %task_identity,
+                "Terminal mint attempt retained ownership because a sibling job row is still live"
+            );
+            return Ok(());
+        }
+
+        if let Some((position_store, _)) = &ctx.position_authority {
+            position_store
+                .send(
+                    &self.symbol,
+                    PositionCommand::ReleaseEquityTransfer {
+                        reservation_id: EquityTransferReservationId::from_uuid(
+                            self.issuer_request_id.0,
+                        ),
+                    },
+                )
+                .await?;
         }
 
         let released =
@@ -535,6 +693,9 @@ pub(crate) struct TransferEquityToHedgingCtx {
     pub(crate) transfer: Arc<dyn ResumeEquityToHedging>,
     pub(crate) equity_in_progress: Arc<RwLock<HashMap<Symbol, GuardState>>>,
     pub(crate) redemption_store: Arc<Store<EquityRedemption>>,
+    /// Position authority that restores this job's reservation before any
+    /// transfer side effect and releases it after terminal completion.
+    pub(crate) position_authority: Option<PositionReservationAuthority>,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget.
@@ -548,13 +709,15 @@ pub(crate) enum TransferEquityToHedgingJobError {
     Transfer(#[from] Box<RedemptionError>),
     #[error(transparent)]
     Enqueue(#[from] QueuePushError),
+    #[error(transparent)]
+    PositionReservation(#[from] SendError<Position>),
 }
 
 impl BotGasFailureClassifier for TransferEquityToHedgingJobError {
     fn is_bot_gas_enqueue_failure(&self) -> bool {
         match self {
             Self::Transfer(inner) => inner.is_bot_gas_enqueue_failure(),
-            Self::Enqueue(_) => false,
+            Self::Enqueue(_) | Self::PositionReservation(_) => false,
         }
     }
 }
@@ -587,6 +750,10 @@ pub(crate) struct TransferEquityToHedging {
     /// ready when that follow-up lands.
     #[serde(default)]
     pub(crate) backpressure_streak: BackpressureStreak,
+    /// Number of consecutive reservation-restoration deferrals. Persisted in
+    /// the replacement payload so a long-lived hedge backs off across rows.
+    #[serde(default)]
+    pub(crate) position_reservation_retry_attempts: u32,
 }
 
 impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
@@ -612,16 +779,66 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
     }
 
     async fn perform(&self, ctx: &TransferEquityToHedgingCtx) -> Result<Self::Output, Self::Error> {
+        if let Some((position_store, position_threshold)) = &ctx.position_authority
+            && !restore_position_reservation(
+                position_store,
+                &self.symbol,
+                *position_threshold,
+                EquityTransferReservationId::from_uuid(self.aggregate_id.0),
+            )
+            .await?
+        {
+            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
+            let mut retry = self.clone();
+            retry.position_reservation_retry_attempts =
+                self.position_reservation_retry_attempts.saturating_add(1);
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                aggregate_id = %self.aggregate_id,
+                position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
+                retry_delay_secs = retry_delay.as_secs(),
+                "Hedge admission deferred equity redemption reservation restoration; rescheduling"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(retry, retry_delay).await?;
+            return Ok(());
+        }
+
         let result = ctx
             .transfer
             .resume_equity_to_hedging(&self.aggregate_id, &self.symbol, self.chain, self.quantity)
             .await;
 
         let Err(error) = result else {
+            if let Some((position_store, _)) = &ctx.position_authority {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.aggregate_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
             return Ok(());
         };
 
         if let Some(delay) = error.gas_readiness_retry_interval() {
+            if let Some((position_store, _)) = &ctx.position_authority {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.aggregate_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
@@ -655,15 +872,47 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         ctx: &TransferEquityToHedgingCtx,
         task_identity: &TaskIdentity,
     ) -> Result<(), BoxDynError> {
-        if let Some(_aggregate) = ctx.redemption_store.load(&self.aggregate_id).await? {
+        if let Some(aggregate) = ctx.redemption_store.load(&self.aggregate_id).await?
+            && !aggregate.is_terminal()
+        {
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
                 aggregate_id = %self.aggregate_id,
                 %task_identity,
-                "Terminal redemption attempt retained its guard because a lifecycle aggregate exists"
+                "Terminal redemption attempt retained its guard because a live lifecycle aggregate exists"
             );
             return Ok(());
+        }
+        if has_live_sibling_equity_transfer::<Self>(
+            ctx.job_queue.pool(),
+            task_identity,
+            |sibling| {
+                sibling.aggregate_id == self.aggregate_id && sibling.generation == self.generation
+            },
+        )
+        .await?
+        {
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                aggregate_id = %self.aggregate_id,
+                generation = ?self.generation,
+                %task_identity,
+                "Terminal redemption attempt retained ownership because a sibling job row is still live"
+            );
+            return Ok(());
+        }
+
+        if let Some((position_store, _)) = &ctx.position_authority {
+            position_store
+                .send(
+                    &self.symbol,
+                    PositionCommand::ReleaseEquityTransfer {
+                        reservation_id: EquityTransferReservationId::from_uuid(self.aggregate_id.0),
+                    },
+                )
+                .await?;
         }
 
         let released =
@@ -688,10 +937,10 @@ mod tests {
 
     use alloy::primitives::{Address, TxHash, U256};
     use serde_json::json;
-    use st0x_config::ChainEquities;
-    use st0x_config::{ChainEquityAsset, OperationMode};
-    use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
+    use st0x_config::{ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_evm::Chain;
+    use st0x_execution::{Direction, Positive, SupportedExecutor};
     use st0x_float_macro::float;
     use st0x_raindex::Raindex;
     use st0x_tokenization::issuer_request_id;
@@ -706,7 +955,9 @@ mod tests {
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::native_gas::ConfiguredGasReadiness;
     use crate::native_gas::GasReadinessFailure;
+    use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
+    use crate::position::TradeId;
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::{EquityTransferServices, MintError};
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
@@ -793,9 +1044,79 @@ mod tests {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             mint_store,
+            position_authority: None,
             transfer_services,
             job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
         }
+    }
+
+    async fn pending_hedge_position() -> (Arc<Store<Position>>, Symbol) {
+        let (position_pool, _) = crate::test_utils::setup_test_pools().await;
+        let position_store = Arc::new(test_store::<Position>(position_pool, ()));
+        let symbol = Symbol::new("AAPL").unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(10)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        (position_store, symbol)
+    }
+
+    async fn confirmed_position_reservation(
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+    ) -> Arc<Store<Position>> {
+        let position_store = Arc::new(test_store::<Position>(
+            crate::test_utils::setup_test_db().await,
+            (),
+        ));
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        position_store
     }
 
     /// Records the resume call and returns a configurable outcome, so the
@@ -887,12 +1208,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gas_readiness_failure_delayed_redrives_without_releasing_guard() {
+    async fn gas_readiness_failure_releases_reservation_before_delayed_redrive() {
         let symbol = Symbol::new("AAPL").unwrap();
         let retry_interval = Duration::from_secs(17);
+        let issuer_request_id = issuer_request_id("low-gas");
+        let position_store = confirmed_position_reservation(
+            &symbol,
+            EquityTransferReservationId::from_uuid(issuer_request_id.0),
+        )
+        .await;
         let mut ctx = test_ctx(Arc::new(GasReadinessFailureMintResume(retry_interval))).await;
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         ctx.job_queue = TransferEquityToMarketMakingJobQueue::new(&apalis_pool);
+        ctx.position_authority = Some((
+            Arc::clone(&position_store),
+            ExecutionThreshold::whole_share(),
+        ));
         ctx.equity_in_progress.write().unwrap().insert(
             symbol.clone(),
             GuardState::ActiveTransfer {
@@ -901,11 +1232,12 @@ mod tests {
         );
         let job = TransferEquityToMarketMaking {
             chain: Chain::Base,
-            issuer_request_id: issuer_request_id("low-gas"),
+            issuer_request_id: issuer_request_id.clone(),
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -919,6 +1251,16 @@ mod tests {
             Some(&GuardState::ActiveTransfer {
                 generation: GuardGeneration::default()
             })
+        );
+        assert_eq!(
+            position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the gas redrive must release its exact Position reservation"
         );
         let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
             "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
@@ -953,6 +1295,7 @@ mod tests {
                     quantity,
                     generation: GuardGeneration::default(),
                     backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
                 })
                 .await
                 .expect_err("push to a closed pool must fail");
@@ -991,6 +1334,7 @@ mod tests {
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -1055,6 +1399,7 @@ mod tests {
                     quantity,
                     generation: GuardGeneration::default(),
                     backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
                 })
                 .await
                 .expect_err("push to a closed pool must fail");
@@ -1088,6 +1433,7 @@ mod tests {
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::perform(&job, &ctx)
@@ -1108,6 +1454,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_hedge_defers_transfer_until_reservation_can_be_restored() {
+        let (position_store, symbol) = pending_hedge_position().await;
+
+        let stub = Arc::new(RecordingResume::success());
+        let mut ctx = test_ctx(Arc::clone(&stub) as Arc<dyn ResumeEquityToMarketMaking>).await;
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+        let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
+            issuer_request_id: issuer_request_id("mint-deferred-by-hedge"),
+            symbol,
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 3,
+        };
+        let scheduled_after = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert!(
+            stub.captured.lock().unwrap().is_none(),
+            "the transfer must not run before its Position reservation is restored"
+        );
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(ctx.job_queue.pool())
+        .await
+        .unwrap();
+        let retry: TransferEquityToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(retry.position_reservation_retry_attempts, 4);
+        assert!(
+            run_at >= scheduled_after + 8,
+            "the fourth reservation retry must use the shared 8-second backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_hedge_backs_off_redemption_reservation_restoration() {
+        let (position_store, symbol) = pending_hedge_position().await;
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let stub = Arc::new(RecordingRedemptionResume {
+            fail: false,
+            captured: Mutex::new(None),
+        });
+        let mut ctx = redemption_test_ctx(
+            stub.clone(),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: redemption_aggregate_id("redemption-deferred-by-hedge"),
+            symbol,
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 3,
+        };
+
+        let scheduled_after = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert!(
+            stub.captured.lock().unwrap().is_none(),
+            "the redemption must not run before its Position reservation is restored"
+        );
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let retry: TransferEquityToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(retry.position_reservation_retry_attempts, 4);
+        assert!(
+            run_at >= scheduled_after + 8,
+            "the fourth reservation retry must use the shared 8-second backoff"
+        );
+    }
+
+    #[tokio::test]
     async fn perform_forwards_id_symbol_and_quantity_to_resume() {
         let stub = Arc::new(RecordingResume::success());
         let ctx = test_ctx(Arc::clone(&stub) as Arc<dyn ResumeEquityToMarketMaking>).await;
@@ -1117,8 +1547,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -1141,8 +1571,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1172,8 +1602,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1264,8 +1694,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // TokensWrapped propagates Err: apalis retries resume_mint (idempotent
@@ -1329,8 +1759,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // VaultDepositSubmitted propagates Err so apalis retries the transfer job,
@@ -1403,8 +1833,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Must return Ok(()) — apalis does not retry; UnwrappedEquityRecovery takes over.
@@ -1474,8 +1904,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Must return Ok(()) — apalis does not retry; UnwrappedEquityRecovery takes over.
@@ -1546,8 +1976,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Must return Ok(()) so apalis marks the stale job Done -- no retry.
@@ -1614,8 +2044,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1696,8 +2126,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1778,8 +2208,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Terminal aggregate must propagate Err — it is not a recoverable state.
@@ -1847,8 +2277,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Idempotent: guard already held, state is recoverable -> still Ok(()).
@@ -1900,8 +2330,8 @@ mod tests {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(5)),
             generation: GuardGeneration::default(),
-
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1928,6 +2358,7 @@ mod tests {
             quantity: FractionalShares::new(float!(2.5)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let expected = json!({
@@ -1937,6 +2368,7 @@ mod tests {
             "chain": "base",
             "generation": 0_u64,
             "backpressure_streak": 0_u32,
+            "position_reservation_retry_attempts": 0_u32,
         });
 
         assert_eq!(serde_json::to_value(&job).unwrap(), expected);
@@ -1948,6 +2380,10 @@ mod tests {
         assert_eq!(roundtripped.quantity, job.quantity);
         assert_eq!(roundtripped.generation, job.generation);
         assert_eq!(roundtripped.backpressure_streak, job.backpressure_streak);
+        assert_eq!(
+            roundtripped.position_reservation_retry_attempts,
+            job.position_reservation_retry_attempts
+        );
 
         // Old rows without the generation/backpressure_streak fields must
         // deserialize to 0 for both (RAI-1494's
@@ -1969,6 +2405,10 @@ mod tests {
             BackpressureStreak::default(),
             "missing backpressure_streak must default to 0"
         );
+        assert_eq!(
+            legacy.position_reservation_retry_attempts, 0,
+            "missing position_reservation_retry_attempts must default to 0"
+        );
     }
 
     #[test]
@@ -1980,6 +2420,7 @@ mod tests {
         });
         let job: TransferEquityToMarketMaking = serde_json::from_value(legacy_payload).unwrap();
         assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+        assert_eq!(job.position_reservation_retry_attempts, 0);
     }
 
     #[test]
@@ -1992,6 +2433,7 @@ mod tests {
         let job: TransferEquityToHedging = serde_json::from_value(legacy_payload).unwrap();
         assert_eq!(job.generation, GuardGeneration::default());
         assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+        assert_eq!(job.position_reservation_retry_attempts, 0);
     }
 
     /// Records the redemption resume call and returns a configurable outcome.
@@ -2018,21 +2460,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redemption_gas_readiness_failure_delayed_redrives_without_consuming_budget() {
+    async fn redemption_gas_readiness_failure_releases_reservation_before_delayed_redrive() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let retry_interval = Duration::from_secs(23);
-        let ctx = redemption_test_ctx(
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aggregate_id = redemption_aggregate_id("low-gas");
+        let position_store = confirmed_position_reservation(
+            &symbol,
+            EquityTransferReservationId::from_uuid(aggregate_id.0),
+        )
+        .await;
+        let mut ctx = redemption_test_ctx(
             Arc::new(GasReadinessFailureRedemptionResume(retry_interval)),
             TransferEquityToHedgingJobQueue::new(&apalis_pool),
         )
         .await;
+        ctx.position_authority = Some((
+            Arc::clone(&position_store),
+            ExecutionThreshold::whole_share(),
+        ));
         let job = TransferEquityToHedging {
             chain: Chain::Base,
-            aggregate_id: redemption_aggregate_id("low-gas"),
-            symbol: Symbol::new("AAPL").unwrap(),
+            aggregate_id: aggregate_id.clone(),
+            symbol: symbol.clone(),
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak(4),
+            position_reservation_retry_attempts: 0,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -2040,6 +2494,16 @@ mod tests {
             .await
             .expect("low gas must delayed-redrive without consuming the apalis retry budget");
         let after = chrono::Utc::now().timestamp();
+        assert_eq!(
+            position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the gas redrive must release its exact Position reservation"
+        );
 
         let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
             "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
@@ -2113,6 +2577,7 @@ mod tests {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             redemption_store: Arc::new(test_store(pool, services)),
+            position_authority: None,
             job_queue,
         }
     }
@@ -2172,6 +2637,7 @@ mod tests {
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -2239,6 +2705,7 @@ mod tests {
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -2269,6 +2736,7 @@ mod tests {
             quantity: FractionalShares::new(float!(10)),
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -2304,6 +2772,7 @@ mod tests {
                 chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             };
             let task_identity = TaskIdentity::for_test("terminal-mint-cleanup");
 
@@ -2316,6 +2785,75 @@ mod tests {
 
             assert_eq!(ctx.equity_in_progress.read().unwrap().get(&symbol), None);
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_mint_cleanup_preserves_ownership_while_sibling_row_is_live() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::from_parts(NonZeroU32::new(3).unwrap(), 1);
+        let mut ctx = test_ctx(Arc::new(RecordingResume::success())).await;
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation });
+
+        let position_pool = crate::test_utils::setup_test_db().await;
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(position_pool)
+            .build(())
+            .await
+            .unwrap();
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: issuer_request_id("live-sibling-mint-cleanup"),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
+            generation,
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+        let reservation_id = EquityTransferReservationId::from_uuid(job.issuer_request_id.0);
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+
+        let mut queue = ctx.job_queue.clone();
+        queue.push(job.clone()).await.unwrap();
+
+        Job::on_terminal_attempt(&job, &ctx, &TaskIdentity::for_test("current-terminal-row"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&GuardState::ActiveTransfer { generation })
+        );
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation
+                .unwrap()
+                .status,
+            crate::position::EquityTransferReservationStatus::Confirmed
+        );
     }
 
     #[tokio::test]
@@ -2348,6 +2886,7 @@ mod tests {
             chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::on_terminal_attempt(
@@ -2361,6 +2900,103 @@ mod tests {
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
             Some(&GuardState::ActiveTransfer { generation })
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_mint_cleanup_releases_when_aggregate_is_terminal() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::from_parts(NonZeroU32::new(3).unwrap(), 3);
+        let issuer_request_id = issuer_request_id("terminal-mint-terminal-aggregate");
+        let mut ctx = test_ctx(Arc::new(RecordingResume::success())).await;
+
+        // Drive the mint to a terminal Failed state: a terminal aggregate no
+        // longer owns the reservation, so cleanup must release it.
+        ctx.mint_store
+            .send(
+                &issuer_request_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: issuer_request_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        submit_requested_mint(&ctx, &issuer_request_id).await;
+        ctx.mint_store
+            .send(&issuer_request_id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+        ctx.mint_store
+            .send(
+                &issuer_request_id,
+                TokenizedEquityMintCommand::FailWrapping {
+                    reason: "test: forced terminal state".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let position_pool = crate::test_utils::setup_test_db().await;
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(position_pool)
+            .build(())
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(issuer_request_id.0);
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation });
+
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: issuer_request_id.clone(),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
+            generation,
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &TaskIdentity::for_test("terminal-mint-terminal-aggregate"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.equity_in_progress.read().unwrap().get(&symbol), None);
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
         );
     }
 
@@ -2382,6 +3018,7 @@ mod tests {
             chain: Chain::Base,
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let old_job = TransferEquityToMarketMaking {
             issuer_request_id: issuer_request_id("old-terminal-mint-cleanup"),
@@ -2390,6 +3027,7 @@ mod tests {
             chain: Chain::Base,
             generation: GuardGeneration::from_parts(NonZeroU32::new(3).unwrap(), 2),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let task_identity = TaskIdentity::for_test("preserved-mint-cleanup");
 
@@ -2418,6 +3056,7 @@ mod tests {
             chain: Chain::Base,
             generation: current_generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::on_terminal_attempt(&current_job, &ctx, &task_identity)
@@ -2453,6 +3092,7 @@ mod tests {
             chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::on_terminal_attempt(
@@ -2501,6 +3141,7 @@ mod tests {
                 chain: Chain::Base,
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
             };
 
             Job::on_terminal_attempt(
@@ -2555,6 +3196,7 @@ mod tests {
             chain: Chain::Base,
             generation,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::on_terminal_attempt(
@@ -2571,6 +3213,105 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn terminal_redemption_cleanup_releases_when_aggregate_is_terminal() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::from_parts(NonZeroU32::new(5).unwrap(), 3);
+        let aggregate_id = redemption_aggregate_id("terminal-redemption-terminal-aggregate");
+        let mut ctx = redemption_test_ctx(
+            Arc::new(RecordingRedemptionResume {
+                fail: false,
+                captured: Mutex::new(None),
+            }),
+            hedging_test_job_queue().await,
+        )
+        .await;
+
+        // Drive the redemption to a terminal Failed state: a terminal aggregate
+        // no longer owns the reservation, so cleanup must release it.
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    amount: U256::from(1_u64),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "test: forced terminal state".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let position_pool = crate::test_utils::setup_test_db().await;
+        let (position_store, position_projection) = StoreBuilder::<Position>::new(position_pool)
+            .build(())
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(aggregate_id.0);
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), GuardState::ActiveTransfer { generation });
+
+        let job = TransferEquityToHedging {
+            aggregate_id,
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(1)),
+            chain: Chain::Base,
+            generation,
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &TaskIdentity::for_test("terminal-redemption-terminal-aggregate"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.equity_in_progress.read().unwrap().get(&symbol), None);
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+    }
+
     #[test]
     fn redemption_payload_roundtrips_through_json() {
         let job = TransferEquityToHedging {
@@ -2580,6 +3321,7 @@ mod tests {
             quantity: FractionalShares::new(float!(2.5)),
             generation: GuardGeneration::from_parts(NonZeroU32::new(1).unwrap(), 1),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let expected = json!({
@@ -2589,6 +3331,7 @@ mod tests {
             "quantity": "2.5",
             "generation": 4_294_967_297_u64,
             "backpressure_streak": 0_u32,
+            "position_reservation_retry_attempts": 0_u32,
         });
         assert_eq!(serde_json::to_value(&job).unwrap(), expected);
         let deserialized: TransferEquityToHedging = serde_json::from_value(expected).unwrap();
@@ -2597,6 +3340,10 @@ mod tests {
         assert_eq!(deserialized.symbol, job.symbol);
         assert_eq!(deserialized.quantity, job.quantity);
         assert_eq!(deserialized.generation, job.generation);
+        assert_eq!(
+            deserialized.position_reservation_retry_attempts,
+            job.position_reservation_retry_attempts
+        );
     }
 
     /// Rows queued before the payload carried a chain were all Base.
@@ -2628,6 +3375,7 @@ mod tests {
             chain: Chain::Ethereum,
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let serialized = serde_json::to_value(&mint).unwrap();
         assert_eq!(serialized["chain"], json!("ethereum"));
@@ -2642,6 +3390,7 @@ mod tests {
             chain: Chain::Ethereum,
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let serialized = serde_json::to_value(&redemption).unwrap();
         assert_eq!(serialized["chain"], json!("ethereum"));

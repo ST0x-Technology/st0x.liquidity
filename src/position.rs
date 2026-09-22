@@ -14,6 +14,7 @@ use metrics::gauge;
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, ProjectionError, Table};
@@ -76,6 +77,48 @@ impl AnchorDisposition {
         }
     }
 }
+/// Durable per-symbol admission claim held while an equity transfer is sized
+/// and handed to the persistent job queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EquityTransferReservationId(Uuid);
+
+impl EquityTransferReservationId {
+    pub(crate) fn generate() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub(crate) const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    pub(crate) const fn into_uuid(self) -> Uuid {
+        self.0
+    }
+}
+impl From<Uuid> for EquityTransferReservationId {
+    fn from(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl std::fmt::Display for EquityTransferReservationId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EquityTransferReservationStatus {
+    Reserved,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquityTransferReservation {
+    pub id: EquityTransferReservationId,
+    pub status: EquityTransferReservationStatus,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
@@ -84,6 +127,11 @@ pub struct Position {
     pub accumulated_long: FractionalShares,
     pub accumulated_short: FractionalShares,
     pub pending_offchain_order_id: Option<OffchainOrderId>,
+    /// Authoritative cross-workflow exclusion for this symbol. The inventory
+    /// mirror remains snapshot suppression only; hedge and transfer admission
+    /// are serialized through this aggregate.
+    #[serde(default)]
+    pub equity_transfer_reservation: Option<EquityTransferReservation>,
     /// Idempotency anchor: the `OffchainOrderId` from the last failed
     /// placement that has not yet been followed by a successful fill.
     /// Subsequent placement attempts reuse this id as their broker-side
@@ -142,6 +190,10 @@ impl std::fmt::Debug for Position {
             .field("accumulated_long", &self.accumulated_long)
             .field("accumulated_short", &self.accumulated_short)
             .field("pending_offchain_order_id", &self.pending_offchain_order_id)
+            .field(
+                "equity_transfer_reservation",
+                &self.equity_transfer_reservation,
+            )
             .field(
                 "last_failed_offchain_order_id",
                 &self.last_failed_offchain_order_id,
@@ -258,6 +310,7 @@ fn evolve_onchain_order_fill(
         accumulated_long,
         accumulated_short,
         last_acknowledged_trade_id: Some(trade_id.clone()),
+        equity_transfer_reservation: entity.reservation_after_position_change(),
         last_updated: Some(seen_at),
         // Use economic block time, not ingestion time, so a delayed backfill
         // cannot make an old price look fresh.
@@ -280,7 +333,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 8;
+    const SCHEMA_VERSION: u64 = 10;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -295,6 +348,7 @@ impl EventSourced for Position {
                 accumulated_long: FractionalShares::ZERO,
                 accumulated_short: FractionalShares::ZERO,
                 pending_offchain_order_id: None,
+                equity_transfer_reservation: None,
                 last_failed_offchain_order_id: None,
                 last_acknowledged_trade_id: None,
                 pending_acknowledged_trade_ids: BTreeSet::new(),
@@ -354,6 +408,11 @@ impl EventSourced for Position {
                 }))
             }
 
+            event @ (EquityTransferReserved { .. }
+            | EquityTransferReservationConfirmed { .. }
+            | EquityTransferReservationReleased { .. }) => {
+                Ok(entity.evolve_equity_transfer_reservation(event))
+            }
             OffChainOrderPlaced { .. } if entity.pending_offchain_order_id.is_some() => Ok(None),
 
             OffChainOrderPlaced {
@@ -453,6 +512,7 @@ impl EventSourced for Position {
             } => Ok(Some(Self {
                 threshold: *new_threshold,
                 last_updated: Some(*updated_at),
+                equity_transfer_reservation: entity.reservation_after_position_change(),
                 ..entity.clone()
             })),
 
@@ -465,6 +525,7 @@ impl EventSourced for Position {
                 record_position_gauge(&entity.symbol, target_net);
                 Ok(Some(Self {
                     net: *target_net,
+                    equity_transfer_reservation: entity.reservation_after_position_change(),
                     last_updated: Some(*adjusted_at),
                     last_price: price_usdc
                         .map(|price| PriceObservation {
@@ -538,6 +599,52 @@ impl EventSourced for Position {
                 },
                 seen_at,
             )),
+
+            ReserveEquityTransfer {
+                symbol,
+                threshold,
+                reservation_id,
+            } => {
+                let now = Utc::now();
+                Ok(vec![
+                    PositionEvent::Initialized {
+                        symbol,
+                        threshold,
+                        initialized_at: now,
+                    },
+                    PositionEvent::EquityTransferReserved {
+                        reservation_id,
+                        reserved_at: now,
+                    },
+                ])
+            }
+
+            RestoreEquityTransferReservation {
+                symbol,
+                threshold,
+                reservation_id,
+            } => {
+                let now = Utc::now();
+                Ok(vec![
+                    PositionEvent::Initialized {
+                        symbol,
+                        threshold,
+                        initialized_at: now,
+                    },
+                    PositionEvent::EquityTransferReserved {
+                        reservation_id,
+                        reserved_at: now,
+                    },
+                    PositionEvent::EquityTransferReservationConfirmed {
+                        reservation_id,
+                        confirmed_at: now,
+                    },
+                ])
+            }
+
+            // Cleanup is idempotent and must not create a Position merely to
+            // release a reservation that is already absent.
+            ReleaseEquityTransfer { .. } => Ok(vec![]),
 
             // Pruning a fill the position never applied is a no-op; never
             // initialize the aggregate just to settle an absent trade.
@@ -637,15 +744,24 @@ impl EventSourced for Position {
                 seen_at,
             ),
 
+            ReserveEquityTransfer { reservation_id, .. } => {
+                self.reserve_equity_transfer_events(reservation_id, Utc::now())
+            }
+
+            ConfirmEquityTransfer { reservation_id } => {
+                self.confirm_equity_transfer_events(reservation_id, Utc::now())
+            }
+
+            ReleaseEquityTransfer { reservation_id } => {
+                Ok(self.release_equity_transfer_events(reservation_id, Utc::now()))
+            }
+
+            RestoreEquityTransferReservation { reservation_id, .. } => {
+                self.restore_equity_transfer_reservation_events(reservation_id, Utc::now())
+            }
+
             SettleOnChainFill { trade_id } => {
-                if self.pending_acknowledged_trade_ids.contains(&trade_id) {
-                    Ok(vec![PositionEvent::OnChainFillSettled {
-                        trade_id,
-                        settled_at: Utc::now(),
-                    }])
-                } else {
-                    Ok(vec![])
-                }
+                Ok(self.settle_onchain_fill_events(trade_id, Utc::now()))
             }
 
             PlaceOffChainOrder {
@@ -757,11 +873,14 @@ impl EventSourced for Position {
                 }])
             }
 
-            UpdateThreshold { threshold } => Ok(vec![PositionEvent::ThresholdUpdated {
-                old_threshold: self.threshold,
-                new_threshold: threshold,
-                updated_at: Utc::now(),
-            }]),
+            UpdateThreshold { threshold } => {
+                self.validate_operator_mutation_allowed()?;
+                Ok(vec![PositionEvent::ThresholdUpdated {
+                    old_threshold: self.threshold,
+                    new_threshold: threshold,
+                    updated_at: Utc::now(),
+                }])
+            }
 
             ManuallyAdjustPosition {
                 target_net,
@@ -770,6 +889,8 @@ impl EventSourced for Position {
                 price_usdc,
                 ..
             } => {
+                self.validate_operator_mutation_allowed()?;
+
                 if let Some(pending) = self.pending_offchain_order_id {
                     return Err(PositionError::ManualAdjustmentBlockedByPendingExecution {
                         offchain_order_id: pending,
@@ -837,6 +958,11 @@ impl Position {
         if let Some(pending) = self.pending_offchain_order_id {
             return Err(PositionError::PendingExecution {
                 offchain_order_id: pending,
+            });
+        }
+        if let Some(reservation) = self.equity_transfer_reservation {
+            return Err(PositionError::EquityTransferPending {
+                reservation_id: reservation.id,
             });
         }
 
@@ -966,6 +1092,226 @@ impl Position {
             },
         ])
     }
+    fn settle_onchain_fill_events(
+        &self,
+        trade_id: TradeId,
+        settled_at: DateTime<Utc>,
+    ) -> Vec<PositionEvent> {
+        if self.pending_acknowledged_trade_ids.contains(&trade_id) {
+            vec![PositionEvent::OnChainFillSettled {
+                trade_id,
+                settled_at,
+            }]
+        } else {
+            vec![]
+        }
+    }
+
+    /// Any position or threshold change invalidates a tentative transfer
+    /// reservation so hedge eligibility is re-evaluated before confirmation.
+    /// A confirmed reservation already has a durable transfer owner and must
+    /// remain until that lifecycle releases it.
+    fn reservation_after_position_change(&self) -> Option<EquityTransferReservation> {
+        self.equity_transfer_reservation
+            .filter(|reservation| reservation.status == EquityTransferReservationStatus::Confirmed)
+    }
+
+    fn validate_operator_mutation_allowed(&self) -> Result<(), PositionError> {
+        if let Some(EquityTransferReservation {
+            id: reservation_id,
+            status: EquityTransferReservationStatus::Confirmed,
+        }) = self.equity_transfer_reservation
+        {
+            return Err(
+                PositionError::OperatorMutationBlockedByConfirmedEquityTransfer { reservation_id },
+            );
+        }
+
+        Ok(())
+    }
+
+    fn evolve_equity_transfer_reservation(&self, event: &PositionEvent) -> Option<Self> {
+        use PositionEvent::{
+            EquityTransferReservationConfirmed, EquityTransferReservationReleased,
+            EquityTransferReserved,
+        };
+
+        match event {
+            EquityTransferReserved {
+                reservation_id,
+                reserved_at,
+            } => Some(Self {
+                equity_transfer_reservation: Some(EquityTransferReservation {
+                    id: *reservation_id,
+                    status: EquityTransferReservationStatus::Reserved,
+                }),
+                last_updated: Some(*reserved_at),
+                ..self.clone()
+            }),
+            EquityTransferReservationConfirmed {
+                reservation_id,
+                confirmed_at,
+            } if self
+                .equity_transfer_reservation
+                .is_some_and(|reservation| reservation.id == *reservation_id) =>
+            {
+                Some(Self {
+                    equity_transfer_reservation: Some(EquityTransferReservation {
+                        id: *reservation_id,
+                        status: EquityTransferReservationStatus::Confirmed,
+                    }),
+                    last_updated: Some(*confirmed_at),
+                    ..self.clone()
+                })
+            }
+            EquityTransferReservationReleased {
+                reservation_id,
+                released_at,
+            } if self
+                .equity_transfer_reservation
+                .is_some_and(|reservation| reservation.id == *reservation_id) =>
+            {
+                Some(Self {
+                    equity_transfer_reservation: None,
+                    last_updated: Some(*released_at),
+                    ..self.clone()
+                })
+            }
+            EquityTransferReservationConfirmed { .. }
+            | EquityTransferReservationReleased { .. } => None,
+            _ => unreachable!("called only for equity transfer reservation events"),
+        }
+    }
+
+    fn reserve_equity_transfer_events(
+        &self,
+        reservation_id: EquityTransferReservationId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        if let Some(pending) = self.pending_offchain_order_id {
+            return Err(PositionError::PendingExecution {
+                offchain_order_id: pending,
+            });
+        }
+        if let Some(offchain_order_id) = self.last_failed_offchain_order_id {
+            return Err(PositionError::EquityTransferBlockedByFailedOrderAnchor {
+                offchain_order_id,
+            });
+        }
+
+        if let Some(reservation) = self.equity_transfer_reservation {
+            return Err(PositionError::EquityTransferReservationExists {
+                reservation_id: reservation.id,
+            });
+        }
+
+        if self.create_trigger_reason(&self.threshold)?.is_some() {
+            return Err(PositionError::EquityTransferBlockedByHedge {
+                net_position: self.net,
+                threshold: self.threshold,
+            });
+        }
+
+        if matches!(self.threshold, ExecutionThreshold::DollarValue(_))
+            && self.last_price.is_none()
+            && !self.net.is_zero()?
+        {
+            return Err(PositionError::EquityTransferHedgeEligibilityUnknown {
+                net_position: self.net,
+                threshold: self.threshold,
+            });
+        }
+
+        Ok(vec![PositionEvent::EquityTransferReserved {
+            reservation_id,
+            reserved_at: now,
+        }])
+    }
+
+    fn confirm_equity_transfer_events(
+        &self,
+        reservation_id: EquityTransferReservationId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        match self.equity_transfer_reservation {
+            Some(EquityTransferReservation {
+                id,
+                status: EquityTransferReservationStatus::Reserved,
+            }) if id == reservation_id => {
+                Ok(vec![PositionEvent::EquityTransferReservationConfirmed {
+                    reservation_id,
+                    confirmed_at: now,
+                }])
+            }
+            Some(EquityTransferReservation {
+                id,
+                status: EquityTransferReservationStatus::Confirmed,
+            }) if id == reservation_id => Ok(vec![]),
+            Some(existing) => Err(PositionError::EquityTransferReservationMismatch {
+                expected: existing.id,
+                actual: reservation_id,
+            }),
+            None => Err(PositionError::NoEquityTransferReservation { reservation_id }),
+        }
+    }
+
+    fn release_equity_transfer_events(
+        &self,
+        reservation_id: EquityTransferReservationId,
+        now: DateTime<Utc>,
+    ) -> Vec<PositionEvent> {
+        if self
+            .equity_transfer_reservation
+            .is_some_and(|reservation| reservation.id == reservation_id)
+        {
+            vec![PositionEvent::EquityTransferReservationReleased {
+                reservation_id,
+                released_at: now,
+            }]
+        } else {
+            vec![]
+        }
+    }
+
+    fn restore_equity_transfer_reservation_events(
+        &self,
+        reservation_id: EquityTransferReservationId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        if let Some(pending) = self.pending_offchain_order_id {
+            return Err(PositionError::PendingExecution {
+                offchain_order_id: pending,
+            });
+        }
+
+        match self.equity_transfer_reservation {
+            Some(EquityTransferReservation {
+                id,
+                status: EquityTransferReservationStatus::Confirmed,
+            }) if id == reservation_id => Ok(vec![]),
+            Some(EquityTransferReservation {
+                id,
+                status: EquityTransferReservationStatus::Reserved,
+            }) if id == reservation_id => {
+                Ok(vec![PositionEvent::EquityTransferReservationConfirmed {
+                    reservation_id,
+                    confirmed_at: now,
+                }])
+            }
+            Some(existing) => Err(PositionError::EquityTransferReservationMismatch {
+                expected: existing.id,
+                actual: reservation_id,
+            }),
+            None => {
+                let mut events = self.reserve_equity_transfer_events(reservation_id, now)?;
+                events.push(PositionEvent::EquityTransferReservationConfirmed {
+                    reservation_id,
+                    confirmed_at: now,
+                });
+                Ok(events)
+            }
+        }
+    }
 
     fn place_offchain_order_events(
         &self,
@@ -975,6 +1321,12 @@ impl Position {
         executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
     ) -> Result<Vec<PositionEvent>, PositionError> {
+        if let Some(reservation) = self.equity_transfer_reservation {
+            return Err(PositionError::EquityTransferPending {
+                reservation_id: reservation.id,
+            });
+        }
+
         if let Some(pending) = self.pending_offchain_order_id {
             return Err(PositionError::PendingExecution {
                 offchain_order_id: pending,
@@ -994,6 +1346,25 @@ impl Position {
                     "Order placement rejected: {error}",
                 );
             })?;
+
+        let live_shares =
+            Positive::new(self.net.abs()?).map_err(|_| PositionError::ThresholdNotMet {
+                net_position: self.net,
+                threshold: self.threshold,
+            })?;
+        let live_direction = if self.net.is_negative()? {
+            Direction::Buy
+        } else {
+            Direction::Sell
+        };
+        if direction != live_direction || shares > live_shares {
+            return Err(PositionError::StaleHedgeRequest {
+                requested_direction: direction,
+                requested_shares: shares,
+                live_direction,
+                live_shares,
+            });
+        }
 
         Ok(vec![PositionEvent::OffChainOrderPlaced {
             offchain_order_id,
@@ -1124,15 +1495,15 @@ impl Position {
     /// - `shares`: Full fractional amount, optionally
     ///   capped by `shares_limit`
     ///
-    /// Returns `Ok(None)` if threshold is not met or no
-    /// price available for dollar-value threshold.
+    /// Returns `Ok(None)` if an offchain order or equity transfer is pending,
+    /// the threshold is not met, or no price is available for a dollar-value threshold.
     ///
     /// Returns `Err` on arithmetic overflow.
     pub fn is_ready_for_execution(
         &self,
         shares_limit: Option<Positive<FractionalShares>>,
     ) -> Result<Option<(Direction, FractionalShares)>, PositionError> {
-        if self.pending_offchain_order_id.is_some() {
+        if self.pending_offchain_order_id.is_some() || self.equity_transfer_reservation.is_some() {
             return Ok(None);
         }
 
@@ -1197,6 +1568,64 @@ pub enum PositionError {
          pending execution {offchain_order_id:?}"
     )]
     PendingExecution { offchain_order_id: OffchainOrderId },
+    #[error(
+        "Cannot place offchain order: equity transfer reservation \
+         {reservation_id} owns this symbol"
+    )]
+    EquityTransferPending {
+        reservation_id: EquityTransferReservationId,
+    },
+    #[error(
+        "Cannot place stale hedge {requested_direction:?} {requested_shares}: \
+         live position requires at most {live_direction:?} {live_shares}"
+    )]
+    StaleHedgeRequest {
+        requested_direction: Direction,
+        requested_shares: Positive<FractionalShares>,
+        live_direction: Direction,
+        live_shares: Positive<FractionalShares>,
+    },
+    #[error("Equity transfer reservation {reservation_id} already owns this symbol")]
+    EquityTransferReservationExists {
+        reservation_id: EquityTransferReservationId,
+    },
+    #[error(
+        "Cannot reserve equity transfer: failed-order anchor {offchain_order_id:?} may still own \
+         this symbol"
+    )]
+    EquityTransferBlockedByFailedOrderAnchor { offchain_order_id: OffchainOrderId },
+    #[error(
+        "Cannot reserve equity transfer: position {net_position:?} requires a hedge under \
+         threshold {threshold:?}"
+    )]
+    EquityTransferBlockedByHedge {
+        net_position: FractionalShares,
+        threshold: ExecutionThreshold,
+    },
+    #[error(
+        "Cannot reserve equity transfer: hedge eligibility for nonzero position \
+         {net_position:?} is unknown under threshold {threshold:?}"
+    )]
+    EquityTransferHedgeEligibilityUnknown {
+        net_position: FractionalShares,
+        threshold: ExecutionThreshold,
+    },
+    #[error("Equity transfer reservation {reservation_id} is absent or was invalidated")]
+    NoEquityTransferReservation {
+        reservation_id: EquityTransferReservationId,
+    },
+    #[error("Equity transfer reservation ID mismatch: expected {expected}, got {actual}")]
+    EquityTransferReservationMismatch {
+        expected: EquityTransferReservationId,
+        actual: EquityTransferReservationId,
+    },
+    #[error(
+        "Cannot manually adjust the position or update its threshold while confirmed equity \
+         transfer reservation {reservation_id} owns this symbol"
+    )]
+    OperatorMutationBlockedByConfirmedEquityTransfer {
+        reservation_id: EquityTransferReservationId,
+    },
     #[error(
         "Cannot acknowledge onchain fill: trade {trade_id} \
          was already applied to this position"
@@ -1298,6 +1727,30 @@ pub enum PositionCommand {
     SettleOnChainFill {
         trade_id: TradeId,
     },
+    /// Claims this symbol for equity transfer sizing only when no live or
+    /// ambiguously failed broker order owns it. The command is also valid
+    /// against an uninitialized aggregate: zero exposure is not hedge-ready,
+    /// and the supplied threshold seeds the Position.
+    ReserveEquityTransfer {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        reservation_id: EquityTransferReservationId,
+    },
+    /// Commits the exact reservation immediately before durable job enqueue.
+    ConfirmEquityTransfer {
+        reservation_id: EquityTransferReservationId,
+    },
+    /// Idempotently releases only the matching owner.
+    ReleaseEquityTransfer {
+        reservation_id: EquityTransferReservationId,
+    },
+    /// Startup-only recovery for a durable transfer job whose Position
+    /// reservation predates this schema or was not projected before restart.
+    RestoreEquityTransferReservation {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        reservation_id: EquityTransferReservationId,
+    },
     PlaceOffChainOrder {
         offchain_order_id: OffchainOrderId,
         shares: Positive<FractionalShares>,
@@ -1306,9 +1759,10 @@ pub enum PositionCommand {
         threshold: ExecutionThreshold,
     },
     /// Claims the position for a broker order found under a preserved failed
-    /// idempotency anchor. This deliberately bypasses the current hedge
-    /// threshold: the broker side effect may already exist and must be polled
-    /// and accounted even if later onchain fills changed the net exposure.
+    /// idempotency anchor, unless an equity transfer already owns it. This
+    /// deliberately bypasses the current hedge threshold: the broker side
+    /// effect may already exist and must be polled and accounted even if later
+    /// onchain fills changed the net exposure.
     RecoverFailedOffChainOrder {
         expected_failed_offchain_order_id: OffchainOrderId,
         offchain_order_id: OffchainOrderId,
@@ -1419,6 +1873,18 @@ pub enum PositionEvent {
         trade_id: TradeId,
         settled_at: DateTime<Utc>,
     },
+    EquityTransferReserved {
+        reservation_id: EquityTransferReservationId,
+        reserved_at: DateTime<Utc>,
+    },
+    EquityTransferReservationConfirmed {
+        reservation_id: EquityTransferReservationId,
+        confirmed_at: DateTime<Utc>,
+    },
+    EquityTransferReservationReleased {
+        reservation_id: EquityTransferReservationId,
+        released_at: DateTime<Utc>,
+    },
     OffChainOrderPlaced {
         offchain_order_id: OffchainOrderId,
         shares: Positive<FractionalShares>,
@@ -1481,12 +1947,15 @@ impl PositionEvent {
             OnChainOrderFilled { seen_at, .. } => *seen_at,
             OnChainFillApplied { applied_at, .. } => *applied_at,
             OnChainFillSettled { settled_at, .. } => *settled_at,
+            EquityTransferReserved { reserved_at, .. } => *reserved_at,
+            EquityTransferReservationConfirmed { confirmed_at, .. } => *confirmed_at,
+            EquityTransferReservationReleased { released_at, .. }
+            | FailedOrderAnchorReleased { released_at, .. } => *released_at,
             OffChainOrderPlaced { placed_at, .. } => *placed_at,
             OffChainOrderFilled {
                 broker_timestamp, ..
             } => *broker_timestamp,
             OffChainOrderFailed { failed_at, .. } => *failed_at,
-            FailedOrderAnchorReleased { released_at, .. } => *released_at,
             OffChainOrderCancelled { cancelled_at, .. } => *cancelled_at,
             ThresholdUpdated { updated_at, .. } => *updated_at,
             ManualPositionAdjusted { adjusted_at, .. } => *adjusted_at,
@@ -1502,6 +1971,13 @@ impl DomainEvent for PositionEvent {
             OnChainOrderFilled { .. } => Self::ON_CHAIN_ORDER_FILLED_EVENT_TYPE.to_string(),
             OnChainFillApplied { .. } => "PositionEvent::OnChainFillApplied".to_string(),
             OnChainFillSettled { .. } => "PositionEvent::OnChainFillSettled".to_string(),
+            EquityTransferReserved { .. } => "PositionEvent::EquityTransferReserved".to_string(),
+            EquityTransferReservationConfirmed { .. } => {
+                "PositionEvent::EquityTransferReservationConfirmed".to_string()
+            }
+            EquityTransferReservationReleased { .. } => {
+                "PositionEvent::EquityTransferReservationReleased".to_string()
+            }
             OffChainOrderPlaced { .. } => "PositionEvent::OffChainOrderPlaced".to_string(),
             OffChainOrderFilled { .. } => "PositionEvent::OffChainOrderFilled".to_string(),
             OffChainOrderFailed { .. } => "PositionEvent::OffChainOrderFailed".to_string(),
@@ -1599,6 +2075,36 @@ impl PartialEq for PositionEvent {
                     settled_at: c2,
                 },
             ) => t1 == t2 && c1 == c2,
+            (
+                Self::EquityTransferReserved {
+                    reservation_id: r1,
+                    reserved_at: a1,
+                },
+                Self::EquityTransferReserved {
+                    reservation_id: r2,
+                    reserved_at: a2,
+                },
+            )
+            | (
+                Self::EquityTransferReservationConfirmed {
+                    reservation_id: r1,
+                    confirmed_at: a1,
+                },
+                Self::EquityTransferReservationConfirmed {
+                    reservation_id: r2,
+                    confirmed_at: a2,
+                },
+            )
+            | (
+                Self::EquityTransferReservationReleased {
+                    reservation_id: r1,
+                    released_at: a1,
+                },
+                Self::EquityTransferReservationReleased {
+                    reservation_id: r2,
+                    released_at: a2,
+                },
+            ) => r1 == r2 && a1 == a2,
             (
                 Self::OffChainOrderPlaced {
                     offchain_order_id: o1,
@@ -1861,6 +2367,34 @@ impl std::fmt::Debug for PositionCommand {
                 .debug_struct("SettleOnChainFill")
                 .field("trade_id", trade_id)
                 .finish(),
+            Self::ReserveEquityTransfer {
+                symbol,
+                threshold,
+                reservation_id,
+            } => f
+                .debug_struct("ReserveEquityTransfer")
+                .field("symbol", symbol)
+                .field("threshold", threshold)
+                .field("reservation_id", reservation_id)
+                .finish(),
+            Self::ConfirmEquityTransfer { reservation_id } => f
+                .debug_struct("ConfirmEquityTransfer")
+                .field("reservation_id", reservation_id)
+                .finish(),
+            Self::ReleaseEquityTransfer { reservation_id } => f
+                .debug_struct("ReleaseEquityTransfer")
+                .field("reservation_id", reservation_id)
+                .finish(),
+            Self::RestoreEquityTransferReservation {
+                symbol,
+                threshold,
+                reservation_id,
+            } => f
+                .debug_struct("RestoreEquityTransferReservation")
+                .field("symbol", symbol)
+                .field("threshold", threshold)
+                .field("reservation_id", reservation_id)
+                .finish(),
             Self::PlaceOffChainOrder {
                 offchain_order_id,
                 shares,
@@ -2024,6 +2558,30 @@ impl std::fmt::Debug for PositionEvent {
                 .field("trade_id", trade_id)
                 .field("settled_at", settled_at)
                 .finish(),
+            Self::EquityTransferReserved {
+                reservation_id,
+                reserved_at,
+            } => f
+                .debug_struct("EquityTransferReserved")
+                .field("reservation_id", reservation_id)
+                .field("reserved_at", reserved_at)
+                .finish(),
+            Self::EquityTransferReservationConfirmed {
+                reservation_id,
+                confirmed_at,
+            } => f
+                .debug_struct("EquityTransferReservationConfirmed")
+                .field("reservation_id", reservation_id)
+                .field("confirmed_at", confirmed_at)
+                .finish(),
+            Self::EquityTransferReservationReleased {
+                reservation_id,
+                released_at,
+            } => f
+                .debug_struct("EquityTransferReservationReleased")
+                .field("reservation_id", reservation_id)
+                .field("released_at", released_at)
+                .finish(),
             Self::OffChainOrderPlaced {
                 offchain_order_id,
                 shares,
@@ -2154,7 +2712,7 @@ mod tests {
     use serde_json::json;
     use st0x_execution::Positive;
 
-    use st0x_event_sorcery::{LifecycleError, StoreBuilder, TestHarness, replay};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, TestHarness, replay};
 
     use st0x_finance::Usdc;
 
@@ -2261,6 +2819,76 @@ mod tests {
             })
             .await
             .then_expect_error();
+    }
+
+    #[tokio::test]
+    async fn failed_order_anchor_blocks_transfer_reservation_below_hedge_threshold() {
+        let anchor = OffchainOrderId::new();
+        let reservation_id = EquityTransferReservationId::generate();
+        let mut history = failed_anchor_history(anchor);
+        history.push(PositionEvent::OnChainOrderFilled {
+            trade_id: TradeId {
+                chain: Chain::Base,
+                tx_hash: TxHash::random(),
+                log_index: 2,
+            },
+            amount: FractionalShares::new(float!(1)),
+            direction: Direction::Sell,
+            price_usdc: float!(100),
+            block_timestamp: Utc::now(),
+            block_number: None,
+            seen_at: Utc::now(),
+        });
+
+        let error = TestHarness::<Position>::with(())
+            .given(history)
+            .when(PositionCommand::ReserveEquityTransfer {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                reservation_id,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(
+                PositionError::EquityTransferBlockedByFailedOrderAnchor {
+                    offchain_order_id
+                }
+            ) if offchain_order_id == anchor
+        ));
+    }
+
+    #[tokio::test]
+    async fn transfer_reservation_blocks_failed_order_recovery() {
+        let anchor = OffchainOrderId::new();
+        let recovery = OffchainOrderId::new();
+        let reservation_id = EquityTransferReservationId::generate();
+        let mut history = failed_anchor_history(anchor);
+        history.push(PositionEvent::EquityTransferReserved {
+            reservation_id,
+            reserved_at: Utc::now(),
+        });
+
+        let error = TestHarness::<Position>::with(())
+            .given(history)
+            .when(PositionCommand::RecoverFailedOffChainOrder {
+                expected_failed_offchain_order_id: anchor,
+                offchain_order_id: recovery,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::EquityTransferPending {
+                reservation_id: actual
+            }) if actual == reservation_id
+        ));
     }
 
     #[test]
@@ -2876,6 +3504,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_hedge_direction_and_oversize_are_rejected() {
+        let threshold = one_share_threshold();
+        let given = vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    chain: Chain::Base,
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(2)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                block_number: None,
+                seen_at: Utc::now(),
+            },
+        ];
+
+        let wrong_direction = TestHarness::<Position>::with(())
+            .given(given.clone())
+            .when(PositionCommand::PlaceOffChainOrder {
+                offchain_order_id: OffchainOrderId::new(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Buy,
+                executor: SupportedExecutor::DryRun,
+                threshold,
+            })
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            wrong_direction,
+            LifecycleError::Apply(PositionError::StaleHedgeRequest {
+                live_direction: Direction::Sell,
+                ..
+            })
+        ));
+
+        let oversize = TestHarness::<Position>::with(())
+            .given(given)
+            .when(PositionCommand::PlaceOffChainOrder {
+                offchain_order_id: OffchainOrderId::new(),
+                shares: Positive::new(FractionalShares::new(float!(3))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                threshold,
+            })
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            oversize,
+            LifecycleError::Apply(PositionError::StaleHedgeRequest {
+                live_direction: Direction::Sell,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn place_offchain_order_below_threshold_fails() {
         let threshold = one_share_threshold();
 
@@ -2913,6 +3604,427 @@ mod tests {
         assert!(matches!(
             error,
             LifecycleError::Apply(PositionError::ThresholdNotMet { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn hedge_ready_position_rejects_transfer_reservation_before_hedge_claim() {
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                    seen_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::ReserveEquityTransfer {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                reservation_id,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::EquityTransferBlockedByHedge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn hedge_ready_position_rejects_missing_transfer_reservation_restore() {
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                    seen_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::RestoreEquityTransferReservation {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                reservation_id,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::EquityTransferBlockedByHedge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_hedge_and_transfer_reservation_admission_never_both_succeed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = one_share_threshold();
+        let offchain_order_id = OffchainOrderId::new();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let reservation_id = EquityTransferReservationId::generate();
+        let (reservation, hedge) = tokio::join!(
+            store.send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            ),
+            store.send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold,
+                },
+            ),
+        );
+
+        hedge.unwrap();
+        assert!(matches!(
+            reservation,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::EquityTransferBlockedByHedge { .. }
+                    | PositionError::PendingExecution { .. }
+            )))
+        ));
+        let position = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.pending_offchain_order_id, Some(offchain_order_id));
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn onchain_fill_invalidates_unconfirmed_transfer_reservation() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let confirmation = store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await;
+        assert!(matches!(
+            confirmation,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::NoEquityTransferReservation { .. }
+            )))
+        ));
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_adjustment_invalidates_unconfirmed_transfer_reservation() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: FractionalShares::new(float!(2)),
+                    reason: "operator correction".to_string(),
+                    threshold,
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let confirmation = store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await;
+        assert!(matches!(
+            confirmation,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::NoEquityTransferReservation { .. }
+            )))
+        ));
+
+        let position = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.net, FractionalShares::new(float!(2)));
+        assert!(position.is_ready_for_execution(None).unwrap().is_some());
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn threshold_update_invalidates_unconfirmed_transfer_reservation() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        let new_threshold =
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(10))).unwrap());
+        store
+            .send(
+                &symbol,
+                PositionCommand::UpdateThreshold {
+                    threshold: new_threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        let confirmation = store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await;
+        assert!(matches!(
+            confirmation,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::NoEquityTransferReservation { .. }
+            )))
+        ));
+
+        let position = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.threshold, new_threshold);
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn confirmed_transfer_reservation_blocks_operator_mutations() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+
+        store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+
+        let adjustment = store
+            .send(
+                &symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: FractionalShares::new(float!(2)),
+                    reason: "operator correction".to_string(),
+                    threshold,
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            adjustment,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::OperatorMutationBlockedByConfirmedEquityTransfer {
+                    reservation_id: actual
+                }
+            ))) if actual == reservation_id
+        ));
+
+        let threshold_update = store
+            .send(
+                &symbol,
+                PositionCommand::UpdateThreshold {
+                    threshold: ExecutionThreshold::shares(
+                        Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                    ),
+                },
+            )
+            .await;
+        assert!(matches!(
+            threshold_update,
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                PositionError::OperatorMutationBlockedByConfirmedEquityTransfer {
+                    reservation_id: actual
+                }
+            ))) if actual == reservation_id
+        ));
+
+        let position = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(position.net, FractionalShares::ZERO);
+        assert_eq!(position.threshold, threshold);
+        assert_eq!(
+            position.equity_transfer_reservation,
+            Some(EquityTransferReservation {
+                id: reservation_id,
+                status: EquityTransferReservationStatus::Confirmed,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_reservation_blocks_place_offchain_order() {
+        let threshold = one_share_threshold();
+        let reservation_id = EquityTransferReservationId::generate();
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::EquityTransferReserved {
+                    reservation_id,
+                    reserved_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::PlaceOffChainOrder {
+                offchain_order_id: OffchainOrderId::new(),
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                threshold,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::EquityTransferPending {
+                reservation_id: actual,
+            }) if actual == reservation_id
         ));
     }
 
@@ -4763,6 +5875,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(1.212)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            equity_transfer_reservation: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
@@ -4788,6 +5901,32 @@ mod tests {
     }
 
     #[test]
+    fn is_ready_for_execution_waits_for_equity_transfer_reservation() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(float!(1.212)),
+            accumulated_long: FractionalShares::new(float!(1.212)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_offchain_order_id: None,
+            equity_transfer_reservation: Some(EquityTransferReservation {
+                id: EquityTransferReservationId::generate(),
+                status: EquityTransferReservationStatus::Confirmed,
+            }),
+            last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
+            pending_acknowledged_trade_ids: BTreeSet::new(),
+            threshold: ExecutionThreshold::whole_share(),
+            last_updated: Some(Utc::now()),
+            last_price: Some(PriceObservation {
+                price: float!(150),
+                observed_at: Utc::now(),
+            }),
+        };
+
+        assert_eq!(position.is_ready_for_execution(None).unwrap(), None);
+    }
+
+    #[test]
     fn is_ready_for_execution_returns_fractional_buy_for_negative_position() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -4795,6 +5934,7 @@ mod tests {
             accumulated_long: FractionalShares::ZERO,
             accumulated_short: FractionalShares::new(float!(2.567)),
             pending_offchain_order_id: None,
+            equity_transfer_reservation: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
@@ -4827,6 +5967,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            equity_transfer_reservation: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
@@ -4862,6 +6003,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(30)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            equity_transfer_reservation: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
@@ -4897,6 +6039,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            equity_transfer_reservation: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
@@ -4931,6 +6074,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(10)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            equity_transfer_reservation: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
@@ -4966,6 +6110,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(10)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            equity_transfer_reservation: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
@@ -5001,6 +6146,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            equity_transfer_reservation: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
@@ -5085,6 +6231,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(120)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            equity_transfer_reservation: None,
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),

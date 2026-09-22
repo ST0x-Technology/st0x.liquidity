@@ -452,6 +452,18 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
         .expected_net(float!(0))
         .build()];
 
+    // The mint terminal event releases the Position reservation; the deferred
+    // hedge is then placed and polled asynchronously. Wait for that observable
+    // completion instead of racing the broker mock while its order is still
+    // `New`.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
+
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
         .take_results(&take_results)
@@ -617,6 +629,17 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .expected_accumulated_short(float!(22.5))
         .expected_net(float!(0))
         .build()];
+
+    // Mint completion and hedge completion are independent asynchronous
+    // lifecycles. Wait for the Position aggregate to reach the expected net
+    // before inspecting broker state.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     assert_equity_rebalancing_flow()
         .expected_positions(&expected_positions)
@@ -1016,6 +1039,17 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
         .expected_accumulated_short(float!(0))
         .expected_net(float!(0))
         .build()];
+
+    // Redemption completion can win the race with the independently queued
+    // hedge. Drive the bot until the Position aggregate is neutral before
+    // asserting the broker order.
+    poll_for_hedge_completion(
+        &mut bot,
+        &infra.db_path,
+        &expected_positions[0],
+        Duration::from_secs(30),
+    )
+    .await;
 
     let redemption_wallet_balance_after =
         crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
@@ -2078,18 +2112,6 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         "Expected a completed mint request after restart"
     );
 
-    // The finalized-block fill monitor ingests fills a few blocks behind the
-    // tip, so the per-fill hedges settle shortly after the mint completes.
-    // Wait for every hedge fill before the one-shot broker-state assertion.
-    poll_for_events_with_timeout(
-        &mut bot2,
-        &infra.db_path,
-        "OffchainOrderEvent::Filled",
-        i64::try_from(take_results.len())?,
-        Duration::from_secs(120),
-    )
-    .await;
-
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(float!(22.5))
@@ -2101,11 +2123,14 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         .expected_net(float!(0))
         .build()];
 
+    // The transfer reservation coalesces fills received while the mint is
+    // active. Verify the resulting aggregate hedge, not the number of broker
+    // orders used to reach the neutral position.
     poll_for_hedge_completion(
         &mut bot2,
         &infra.db_path,
         &expected_positions[0],
-        Duration::from_secs(30),
+        Duration::from_secs(120),
     )
     .await;
 

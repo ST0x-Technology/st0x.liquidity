@@ -1460,7 +1460,9 @@ impl PartialEq for TokenizedEquityMint {
 impl Eq for TokenizedEquityMint {}
 
 impl TokenizedEquityMint {
-    pub(crate) fn symbol(&self) -> &Symbol {
+    /// The equity symbol this mint is for. `pub` for the operator CLI, which
+    /// refuses a resume whose `--symbol` disagrees with the record.
+    pub fn symbol(&self) -> &Symbol {
         match self {
             Self::MintRequested { symbol, .. }
             | Self::MintAccepted { symbol, .. }
@@ -1516,7 +1518,7 @@ impl TokenizedEquityMint {
     /// An exhaustive `match` is intentional: adding a new variant to the enum
     /// without updating this function causes a compile error, preventing silent
     /// mis-classification of new states.
-    pub(crate) fn is_terminal(&self) -> bool {
+    pub fn is_terminal(&self) -> bool {
         match self {
             Self::DepositedIntoRaindex { .. } | Self::Failed { .. } | Self::Reconciled { .. } => {
                 true

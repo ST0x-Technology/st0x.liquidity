@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
+use st0x_event_sorcery::SendError;
 use tracing::{debug, trace, warn};
 
 use st0x_execution::{FractionalShares, Positive, Symbol};
@@ -20,6 +21,7 @@ use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold, Venue,
 };
+use crate::position::Position;
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
 const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
@@ -45,6 +47,10 @@ pub(crate) enum EquityTriggerError {
     Wrapper(#[from] WrapperError),
     #[error("Float arithmetic error during truncation: {0}")]
     Float(#[from] FloatError),
+    #[error("position authority is not wired")]
+    PositionAuthorityNotWired,
+    #[error(transparent)]
+    PositionReservation(#[from] SendError<Position>),
 }
 
 /// Discriminates why the equity in-progress slot is held.
@@ -86,6 +92,16 @@ impl GuardGeneration {
 
     pub(crate) const fn is_legacy(self) -> bool {
         self.0 == 0
+    }
+
+    pub(crate) const fn boot_nonce(self) -> u32 {
+        let bytes = self.0.to_be_bytes();
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    pub(crate) const fn counter(self) -> u32 {
+        let bytes = self.0.to_be_bytes();
+        u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
     }
 }
 

@@ -21,15 +21,25 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
+use st0x_event_sorcery::SendError;
+use st0x_execution::Symbol;
 use st0x_tokenization::IssuerRequestId;
 
+use super::job::{
+    PositionReservationAuthority, has_live_sibling_equity_transfer, restore_position_reservation,
+};
 use super::{CrossVenueEquityTransfer, MintError, RedemptionError};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
-use crate::conductor::job::{BackpressureStreak, Job, JobQueue, Label};
+use crate::conductor::job::{
+    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
+};
 use crate::equity_redemption::RedemptionAggregateId;
+use crate::position::{EquityTransferReservationId, Position, PositionCommand};
+use crate::position_check::equity_transfer_retry_delay;
 
 /// Apalis queue type for [`ResumeTokenizationAggregate`].
 pub(crate) type ResumeTokenizationJobQueue = JobQueue<ResumeTokenizationAggregate>;
@@ -63,6 +73,11 @@ impl fmt::Display for ResumeTokenizationTarget {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ResumeTokenizationAggregate {
     pub(crate) target: ResumeTokenizationTarget,
+    /// Symbol whose durable Position reservation this resume owns. Legacy rows
+    /// written before this field existed deserialize as `None` and are
+    /// discarded fail-closed; startup enqueues a fresh symbol-bearing row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) symbol: Option<Symbol>,
     /// Count of consecutive broker rate-limit (429) reschedules leading up to
     /// this attempt (RAI-1494). `#[serde(default)]` so a row enqueued under
     /// the pre-this-change payload shape still deserializes to `0` instead of
@@ -77,6 +92,10 @@ pub(crate) struct ResumeTokenizationAggregate {
     /// so the payload schema is ready when that follow-up lands.
     #[serde(default)]
     pub(crate) backpressure_streak: BackpressureStreak,
+    /// Number of consecutive reservation-restoration deferrals. Persisted in
+    /// the replacement payload so a long-lived hedge backs off across rows.
+    #[serde(default)]
+    pub(crate) position_reservation_retry_attempts: u32,
 }
 
 /// Dependencies the job needs.
@@ -85,6 +104,9 @@ pub(crate) struct ResumeTokenizationAggregate {
 /// the chain its record names rather than assuming the primary.
 pub(crate) struct ResumeTokenizationCtx {
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
+    /// Position authority holding the reservation that excludes concurrent
+    /// hedges while this generic resume drives the aggregate.
+    pub(crate) position_authority: PositionReservationAuthority,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget. This is the startup
@@ -101,6 +123,10 @@ pub(crate) enum ResumeTokenizationJobError {
     Mint(#[from] MintError),
     #[error(transparent)]
     Redemption(#[from] RedemptionError),
+    #[error(transparent)]
+    PositionReservation(#[from] SendError<Position>),
+    #[error(transparent)]
+    Enqueue(#[from] QueuePushError),
 }
 
 impl BotGasFailureClassifier for ResumeTokenizationJobError {
@@ -108,6 +134,7 @@ impl BotGasFailureClassifier for ResumeTokenizationJobError {
         match self {
             Self::Mint(inner) => inner.is_bot_gas_enqueue_failure(),
             Self::Redemption(inner) => inner.is_bot_gas_enqueue_failure(),
+            Self::PositionReservation(_) | Self::Enqueue(_) => false,
         }
     }
 }
@@ -144,6 +171,46 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
     }
 
     async fn perform(&self, ctx: &ResumeTokenizationCtx) -> Result<Self::Output, Self::Error> {
+        let Some(symbol) = &self.symbol else {
+            warn!(
+                target: "tokenization",
+                resume_target = %self.target,
+                "Discarding legacy symbol-less tokenization resume row; startup owns the guarded replacement"
+            );
+            return Ok(());
+        };
+        let (position_store, position_threshold) = &ctx.position_authority;
+        let reservation_id = match &self.target {
+            ResumeTokenizationTarget::Mint(id) => EquityTransferReservationId::from_uuid(id.0),
+            ResumeTokenizationTarget::Redemption(id) => {
+                EquityTransferReservationId::from_uuid(id.0)
+            }
+        };
+        if !restore_position_reservation(
+            position_store,
+            symbol,
+            *position_threshold,
+            reservation_id,
+        )
+        .await?
+        {
+            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
+            let mut retry = self.clone();
+            let retry_attempts = self.position_reservation_retry_attempts.saturating_add(1);
+            retry.position_reservation_retry_attempts = retry_attempts;
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(retry, retry_delay).await?;
+            warn!(
+                target: "tokenization",
+                %symbol,
+                resume_target = %self.target,
+                position_reservation_retry_attempts = retry_attempts,
+                retry_delay_secs = retry_delay.as_secs(),
+                "Hedge admission deferred tokenization reservation restoration; rescheduling"
+            );
+            return Ok(());
+        }
+
         let result = match &self.target {
             ResumeTokenizationTarget::Mint(issuer_request_id) => ctx
                 .transfer
@@ -158,6 +225,12 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
         };
 
         let Err(error) = result else {
+            position_store
+                .send(
+                    symbol,
+                    PositionCommand::ReleaseEquityTransfer { reservation_id },
+                )
+                .await?;
             return Ok(());
         };
 
@@ -167,15 +240,85 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
         // doc for why this matters especially for this startup crash-recovery job.
         redrive_on_bot_gas_failure(self, &ctx.job_queue, BOT_GAS_ENQUEUE_REDRIVE_DELAY, error).await
     }
+
+    async fn on_terminal_attempt(
+        &self,
+        ctx: &ResumeTokenizationCtx,
+        task_identity: &TaskIdentity,
+    ) -> Result<(), apalis_core::error::BoxDynError> {
+        let Some(symbol) = &self.symbol else {
+            return Ok(());
+        };
+        let target_is_live = match &self.target {
+            ResumeTokenizationTarget::Mint(id) => ctx
+                .transfer
+                .mint_store
+                .load(id)
+                .await?
+                .is_some_and(|aggregate| !aggregate.is_terminal()),
+            ResumeTokenizationTarget::Redemption(id) => ctx
+                .transfer
+                .redemption_store
+                .load(id)
+                .await?
+                .is_some_and(|aggregate| !aggregate.is_terminal()),
+        };
+        if target_is_live {
+            warn!(
+                target: "tokenization",
+                resume_target = %self.target,
+                %task_identity,
+                "Terminal resume attempt retained its reservation because the target aggregate is live"
+            );
+            return Ok(());
+        }
+        if has_live_sibling_equity_transfer::<Self>(
+            ctx.job_queue.pool(),
+            task_identity,
+            |sibling| sibling.target == self.target,
+        )
+        .await?
+        {
+            warn!(
+                target: "tokenization",
+                resume_target = %self.target,
+                %task_identity,
+                "Terminal resume attempt retained its reservation because a sibling job row is live"
+            );
+            return Ok(());
+        }
+
+        let reservation_id = match &self.target {
+            ResumeTokenizationTarget::Mint(id) => EquityTransferReservationId::from_uuid(id.0),
+            ResumeTokenizationTarget::Redemption(id) => {
+                EquityTransferReservationId::from_uuid(id.0)
+            }
+        };
+        ctx.position_authority
+            .0
+            .send(
+                symbol,
+                PositionCommand::ReleaseEquityTransfer { reservation_id },
+            )
+            .await?;
+        warn!(
+            target: "tokenization",
+            resume_target = %self.target,
+            %task_identity,
+            "Terminal resume attempt checked its exact Position reservation"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256};
     use serde_json::json;
-    use st0x_config::ChainEquities;
+    use st0x_config::{ChainEquities, ExecutionThreshold};
     use st0x_event_sorcery::test_store;
     use st0x_evm::Chain;
+    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor};
     use st0x_float_macro::float;
     use st0x_raindex::{Raindex, RaindexVaultId};
     use st0x_tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
@@ -189,7 +332,9 @@ mod tests {
     };
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::native_gas::ConfiguredGasReadiness;
+    use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
+    use crate::position::TradeId;
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
@@ -256,7 +401,8 @@ mod tests {
         };
 
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
-        let redemption_store = Arc::new(test_store(pool, transfer_services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let position_store = Arc::new(test_store(pool, ()));
 
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             transfer_services,
@@ -266,6 +412,7 @@ mod tests {
 
         let ctx = ResumeTokenizationCtx {
             transfer,
+            position_authority: (position_store, ExecutionThreshold::whole_share()),
             job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
         };
         (ctx, mint_store, redemption_store, tokenizer)
@@ -350,8 +497,9 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
-
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Terminal aggregate: resume_mint returns Ok(()) immediately.
@@ -405,8 +553,9 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
-
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let calls_before = tokenizer.call_count();
@@ -488,8 +637,9 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id),
-
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         // Completed aggregate is terminal: resume_redemption returns Ok(()).
@@ -540,8 +690,9 @@ mod tests {
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id.clone()),
-
+            symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         Job::perform(&job, &ctx).await.unwrap();
 
@@ -600,7 +751,8 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(bot_gas_queue.clone()),
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
-        let redemption_store = Arc::new(test_store(pool, transfer_services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let position_store = Arc::new(test_store(pool, ()));
 
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             EquityTransferServices {
@@ -658,11 +810,14 @@ mod tests {
 
         let ctx = ResumeTokenizationCtx {
             transfer,
+            position_authority: (position_store, ExecutionThreshold::whole_share()),
             job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
         };
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         Job::perform(&job, &ctx)
@@ -714,7 +869,8 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
-        let redemption_store = Arc::new(test_store(pool, transfer_services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let position_store = Arc::new(test_store(pool, ()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             EquityTransferServices {
                 bot_gas_enqueuer,
@@ -729,7 +885,7 @@ mod tests {
             .send(
                 &id,
                 EquityRedemptionCommand::Redeem {
-                    symbol,
+                    symbol: symbol.clone(),
                     chain: Chain::Base,
                     quantity: float!(1.0),
                     token: Address::ZERO,
@@ -752,10 +908,13 @@ mod tests {
         let calls_before_resume = tokenizer.call_count();
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id.clone()),
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         let ctx = ResumeTokenizationCtx {
             transfer,
+            position_authority: (position_store, ExecutionThreshold::whole_share()),
             job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
         };
 
@@ -777,6 +936,7 @@ mod tests {
         .fetch_one(&apalis_pool)
         .await
         .unwrap();
+
         let redriven: ResumeTokenizationAggregate = serde_json::from_slice(&payload).unwrap();
         assert!(matches!(
             redriven.target,
@@ -789,17 +949,105 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pending_hedge_backs_off_generic_resume_reservation_restoration() {
+        let (ctx, _, _, tokenizer) = build_ctx().await;
+        let id = issuer_request_id("resume-deferred-by-hedge");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let position_store = &ctx.position_authority.0;
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(10)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id.clone()),
+            symbol: Some(symbol),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 3,
+        };
+
+        let calls_before = tokenizer.call_count();
+        let scheduled_after = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert_eq!(
+            tokenizer.call_count(),
+            calls_before,
+            "the aggregate must not resume before its Position reservation is restored"
+        );
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_one(ctx.job_queue.pool())
+        .await
+        .unwrap();
+        let retry: ResumeTokenizationAggregate = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(retry.target, ResumeTokenizationTarget::Mint(id));
+        assert_eq!(retry.position_reservation_retry_attempts, 4);
+        assert!(
+            run_at >= scheduled_after + 8,
+            "the fourth reservation retry must use the shared 8-second backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_symbol_less_resume_is_discarded_before_transfer() {
+        let (ctx, _, _, _) = build_ctx().await;
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(issuer_request_id("legacy-symbol-less")),
+            symbol: None,
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a legacy symbol-less row must be discarded without invoking transfer");
+    }
+
     /// `perform` on a `Mint` target with a non-existent aggregate propagates
     /// the error so apalis retries.
     #[tokio::test]
     async fn perform_mint_target_propagates_error_for_missing_aggregate() {
         let (ctx, _, _, _tokenizer) = build_ctx().await;
         let id = issuer_request_id("resume-mint-missing");
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id),
-
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -818,11 +1066,13 @@ mod tests {
     async fn perform_redemption_target_propagates_error_for_missing_aggregate() {
         let (ctx, _, _, _tokenizer) = build_ctx().await;
         let id = redemption_aggregate_id("resume-redemption-missing");
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
 
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id),
-
+            symbol: Some(symbol),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -834,6 +1084,190 @@ mod tests {
             "missing redemption aggregate must propagate EntityNotFound so apalis retries, \
              got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_releases_orphaned_reservation_idempotently() {
+        let (ctx, _, _, _) = build_ctx().await;
+        let id = issuer_request_id("orphaned-terminal-resume");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id),
+            symbol: Some(symbol.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+        let task_identity =
+            crate::conductor::job::TaskIdentity::for_test("orphaned-terminal-resume");
+
+        Job::on_terminal_attempt(&job, &ctx, &task_identity)
+            .await
+            .unwrap();
+        Job::on_terminal_attempt(&job, &ctx, &task_identity)
+            .await
+            .unwrap();
+
+        let position = ctx
+            .position_authority
+            .0
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            position.equity_transfer_reservation.is_none(),
+            "a terminal resume with no live aggregate or sibling must release its reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_preserves_reservation_for_live_target() {
+        let (ctx, mint_store, _, _) = build_ctx().await;
+        let id = issuer_request_id("live-target-terminal-resume");
+        let symbol = Symbol::new("AAPL").unwrap();
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    chain: Chain::Base,
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id),
+            symbol: Some(symbol.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &crate::conductor::job::TaskIdentity::for_test("live-target-terminal-resume"),
+        )
+        .await
+        .unwrap();
+
+        let position = ctx
+            .position_authority
+            .0
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            position.equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                status: crate::position::EquityTransferReservationStatus::Confirmed,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_preserves_reservation_for_live_sibling() {
+        let (ctx, _, _, _) = build_ctx().await;
+        let id = issuer_request_id("live-sibling-terminal-resume");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id),
+            symbol: Some(symbol.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+        let mut queue = ctx.job_queue.clone();
+        queue.push(job.clone()).await.unwrap();
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &crate::conductor::job::TaskIdentity::for_test("current-terminal-resume"),
+        )
+        .await
+        .unwrap();
+
+        let position = ctx
+            .position_authority
+            .0
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            position.equity_transfer_reservation,
+            Some(crate::position::EquityTransferReservation {
+                status: crate::position::EquityTransferReservationStatus::Confirmed,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -858,7 +1292,7 @@ mod tests {
                 &id,
                 TokenizedEquityMintCommand::RequestMint {
                     issuer_request_id: id.clone(),
-                    symbol,
+                    symbol: symbol.clone(),
                     quantity: float!(1.0),
                     chain: Chain::Base,
                     wallet: Address::ZERO,
@@ -867,9 +1301,33 @@ mod tests {
             .await
             .unwrap();
 
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(id.clone()),
+            symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         Job::perform(&job, &ctx).await.unwrap();
 
@@ -883,6 +1341,17 @@ mod tests {
                 }) if issuer_request_id == &id && tokenization_request_id == &provider_request_id
             ),
             "reconciliation must preserve both provider identifiers: {reconciled:?}"
+        );
+        let position = ctx
+            .position_authority
+            .0
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("reservation owner Position must remain");
+        assert!(
+            position.equity_transfer_reservation.is_none(),
+            "a terminal generic resume must release its exact Position reservation"
         );
     }
 
@@ -938,10 +1407,33 @@ mod tests {
 
         let calls_before = tokenizer.call_count();
 
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority
+            .0
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+
         let job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(id.clone()),
-
+            symbol: Some(symbol.clone()),
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
         Job::perform(&job, &ctx).await.unwrap();
 
@@ -958,6 +1450,17 @@ mod tests {
             matches!(resumed, Some(EquityRedemption::Completed { .. })),
             "resume must drive the SendPending redemption to Completed, got {resumed:?}"
         );
+        let position = ctx
+            .position_authority
+            .0
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("reservation owner Position must remain");
+        assert!(
+            position.equity_transfer_reservation.is_none(),
+            "a terminal generic redemption resume must release its exact reservation"
+        );
     }
 
     /// Job payload for both variants serializes and deserializes correctly.
@@ -968,12 +1471,15 @@ mod tests {
 
         let mint_job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Mint(mint_id.clone()),
+            symbol: None,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let expected_mint = json!({
             "target": { "Mint": mint_id.to_string() },
             "backpressure_streak": 0_u32,
+            "position_reservation_retry_attempts": 0_u32,
         });
         assert_eq!(serde_json::to_value(&mint_job).unwrap(), expected_mint);
 
@@ -988,15 +1494,19 @@ mod tests {
             roundtripped_mint.backpressure_streak,
             BackpressureStreak::default()
         );
+        assert_eq!(roundtripped_mint.position_reservation_retry_attempts, 0);
 
         let redemption_job = ResumeTokenizationAggregate {
             target: ResumeTokenizationTarget::Redemption(redemption_id.clone()),
+            symbol: None,
             backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
         };
 
         let expected_redemption = json!({
             "target": { "Redemption": redemption_id.to_string() },
             "backpressure_streak": 0_u32,
+            "position_reservation_retry_attempts": 0_u32,
         });
         assert_eq!(
             serde_json::to_value(&redemption_job).unwrap(),
@@ -1014,6 +1524,10 @@ mod tests {
             roundtripped_redemption.backpressure_streak,
             BackpressureStreak::default()
         );
+        assert_eq!(
+            roundtripped_redemption.position_reservation_retry_attempts,
+            0
+        );
     }
 
     /// Mandatory RAI-1494 test (M1): a row enqueued before `backpressure_streak`
@@ -1025,5 +1539,6 @@ mod tests {
 
         let job: ResumeTokenizationAggregate = serde_json::from_value(legacy_payload).unwrap();
         assert_eq!(job.backpressure_streak, BackpressureStreak::default());
+        assert_eq!(job.position_reservation_retry_attempts, 0);
     }
 }

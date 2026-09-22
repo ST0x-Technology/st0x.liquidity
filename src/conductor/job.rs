@@ -883,6 +883,10 @@ impl TaskIdentity {
     pub(crate) fn for_test(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl<IdType: fmt::Display> From<&TaskId<IdType>> for TaskIdentity {
