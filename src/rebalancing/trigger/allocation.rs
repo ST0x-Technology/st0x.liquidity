@@ -371,6 +371,7 @@ mod tests {
         EquityPlanInput {
             symbol: Symbol::new("AAPL").unwrap(),
             offchain,
+            listing_chains: onchain.keys().copied().collect(),
             onchain,
             has_inflight: false,
             alpaca_floor: target("0"),
@@ -782,6 +783,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan, mint(Chain::Base, "25"));
+    }
+
+    /// HyperEVM lists the symbol but has no slot. Sized against the broker
+    /// and Base alone, Base would redeem 16 shares that the complete total
+    /// asks to mint straight back, so the symbol declines naming the chain.
+    #[test]
+    fn listing_chain_without_a_slot_declines_the_symbol() {
+        let plan = plan_equity_operation(&EquityPlanInput {
+            listing_chains: BTreeSet::from([Chain::Base, Chain::HyperEvm]),
+            ..input(
+                Some(balance("20")),
+                BTreeMap::from([(Chain::Base, slot("40", "0.4"))]),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            EquityPlan::Decline(DeclineReason::ChainUnpolled {
+                chain: Chain::HyperEvm
+            })
+        );
     }
 
     #[test]
