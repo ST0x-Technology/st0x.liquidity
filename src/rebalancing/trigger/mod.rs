@@ -7682,6 +7682,7 @@ mod tests {
     use super::*;
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::conductor::job::Job;
+    use crate::conductor::job::TaskIdentity;
     use crate::equity_redemption::{
         DetectionFailure, EquityRedemptionCommand, UnwrappedProvenance, redemption_aggregate_id,
     };
@@ -7698,6 +7699,10 @@ mod tests {
     };
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
+    use crate::rebalancing::equity::{
+        MintError, MintTransferError, ResumeEquityToMarketMaking, TransferEquityToMarketMakingCtx,
+        TransferEquityToMarketMakingJobError,
+    };
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
@@ -20698,7 +20703,6 @@ mod tests {
         Arc<Store<TokenizedEquityMint>>,
         Arc<Store<EquityRedemption>>,
     ) {
-        let pool = crate::test_utils::setup_test_db().await;
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
                 Chain::Base,
@@ -20715,6 +20719,19 @@ mod tests {
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
+        attach_live_equity_stores_with(service, services).await
+    }
+
+    /// Builds the mint and redemption stores over `services` with `service`
+    /// as their reactor and installs them on the service.
+    async fn attach_live_equity_stores_with(
+        service: &Arc<RebalancingService>,
+        services: EquityTransferServices,
+    ) -> (
+        Arc<Store<TokenizedEquityMint>>,
+        Arc<Store<EquityRedemption>>,
+    ) {
+        let pool = crate::test_utils::setup_test_db().await;
         let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
             .build(services.clone())
@@ -20971,6 +20988,225 @@ mod tests {
                 .await
                 .contains_key(&id)
         );
+    }
+
+    /// A transfer whose every attempt fails after the tokens landed.
+    struct PostReceiptResume;
+
+    #[async_trait]
+    impl ResumeEquityToMarketMaking for PostReceiptResume {
+        async fn resume_equity_to_market_making(
+            &self,
+            issuer_request_id: &IssuerRequestId,
+            _symbol: &Symbol,
+            _chain: Chain,
+            _quantity: FractionalShares,
+        ) -> Result<(), MintTransferError> {
+            Err(MintTransferError::PostReceipt(MintError::EntityNotFound {
+                issuer_request_id: issuer_request_id.clone(),
+                expected_state: "test-induced-post",
+            }))
+        }
+    }
+
+    /// Services for Base and HyperEVM, each listing `symbol` with wrapped
+    /// equity recovery enabled, so the test proves it is the chain and not
+    /// the recovery flag that keeps a secondary-chain mint out of the handoff.
+    fn recovery_enabled_services_on_both_chains(symbol: &Symbol) -> EquityTransferServices {
+        let equities = ChainEquities {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Disabled,
+                    rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery: OperationMode::Enabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            )]),
+        };
+        EquityTransferServices {
+            chains: [Chain::Base, Chain::HyperEvm]
+                .into_iter()
+                .map(|chain| {
+                    (
+                        chain,
+                        ChainEquityServices {
+                            wallet: Address::ZERO,
+                            raindex: Arc::new(MockRaindex::new()),
+                            vault_lookup: Arc::new(MockVaultLookup::new()),
+                            tokenizer: Arc::new(MockTokenizer::new()),
+                            wrapper: Arc::new(MockWrapper::new()),
+                            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                            gas_readiness: ConfiguredGasReadiness::Unwired,
+                            equities: equities.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        }
+    }
+
+    /// A secondary-chain mint stuck after receipt is never handed to the
+    /// primary-chain recovery jobs, so an exhausted transfer job leaves the
+    /// symbol guard and the Position reservation in place. The transfer
+    /// timeout sweep is the durable owner that unlatches it on any chain: it
+    /// fails the mint, clears the guard and releases the reservation.
+    #[tokio::test]
+    async fn secondary_chain_mint_exhausted_after_receipt_is_unlatched_by_the_transfer_timeout() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let id = issuer_request_id("exhausted-secondary-mint");
+        let service = make_trigger_with_inventory(InventoryView::default().with_equity(
+            symbol.clone(),
+            shares(100),
+            shares(100),
+        ))
+        .await;
+        let services = recovery_enabled_services_on_both_chains(&symbol);
+        let (mint_store, _) = attach_live_equity_stores_with(&service, services.clone()).await;
+        let position_store = service
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let position_projection = service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        seed_confirmed_transfer_reservation(
+            &service,
+            &symbol,
+            EquityTransferReservationId::from_uuid(id.0),
+        )
+        .await;
+
+        // The trigger claims the guard before the job row exists and the job
+        // carries that claim's generation.
+        let guard = service
+            .try_claim_equity_guard_for_transfer(&symbol)
+            .expect("test owns the transfer guard");
+        let generation = guard.generation();
+        guard.defuse();
+
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::HyperEvm,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.mint_tracking.read().await.get(&id).unwrap().stage,
+            MintTrackingStage::TokensReceived
+        );
+
+        let ctx = TransferEquityToMarketMakingCtx {
+            transfer: Arc::new(PostReceiptResume),
+            equity_in_progress: Arc::clone(&service.equity_in_progress),
+            mint_store: mint_store.clone(),
+            position_authority: Some((position_store, ExecutionThreshold::whole_share())),
+            transfer_services: services,
+            primary_chain: Chain::Base,
+            job_queue: service.transfer_equity_to_market_making_queue.clone(),
+        };
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: id.clone(),
+            symbol: symbol.clone(),
+            quantity: shares(5),
+            chain: Chain::HyperEvm,
+            generation,
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        let error = Job::perform(&job, &ctx).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
+            ),
+            "a secondary-chain PostReceipt must propagate for retry, got {error:?}"
+        );
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &TaskIdentity::for_test("exhausted-secondary-mint"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            service.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::ActiveTransfer { generation }),
+            "exhaustion keeps the guard while the mint aggregate is live"
+        );
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation
+                .unwrap()
+                .status,
+            EquityTransferReservationStatus::Confirmed
+        );
+
+        service
+            .expire_stuck_operations(Utc::now() + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service.equity_in_progress.read().unwrap().get(&symbol),
+            None,
+            "the transfer timeout must release the exhausted secondary-chain mint's guard"
+        );
+        let mint = mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, TokenizedEquityMint::Failed { .. }),
+            "the transfer timeout must fail the mint, got {mint:?}"
+        );
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the transfer timeout must release the Position reservation"
+        );
+        assert!(!service.mint_tracking.read().await.contains_key(&id));
     }
 
     #[tokio::test]
