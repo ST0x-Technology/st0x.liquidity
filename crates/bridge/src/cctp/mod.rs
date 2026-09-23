@@ -446,6 +446,8 @@ pub enum CctpError {
     MintAndWithdrawEventNotFound,
     #[error("transaction {tx_hash} receipt has no block number")]
     TxReceiptMissingBlock { tx_hash: TxHash },
+    #[error("USDC credited by transaction {tx_hash} overflows U256")]
+    UsdcCreditOverflow { tx_hash: TxHash },
     #[error("Message too short for nonce extraction: got {length} bytes, need at least 44")]
     MessageTooShort { length: usize },
     #[error("Message too short for receiveMessage recovery: got {length} bytes, need at least 148")]
@@ -563,6 +565,7 @@ impl CctpError {
             | Self::MessageSentEventNotFound { .. }
             | Self::MintAndWithdrawEventNotFound
             | Self::TxReceiptMissingBlock { .. }
+            | Self::UsdcCreditOverflow { .. }
             | Self::MessageTooShort { .. }
             | Self::MessageTooShortForRecovery { .. }
             | Self::MessageDestinationDomainMismatch { .. }
@@ -1152,6 +1155,17 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// the mint's block is the scan lower bound.
     pub async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
         self.ethereum.tx_block(tx_hash).await
+    }
+
+    /// Returns the USDC that `tx_hash` paid `recipient` on Ethereum: the sum of
+    /// its USDC `Transfer` logs to `recipient`. Credits a transfer from the
+    /// transaction that delivered its USDC rather than from a balance change.
+    pub async fn ethereum_usdc_credit(
+        &self,
+        tx_hash: TxHash,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        self.ethereum.usdc_credited_in_tx(tx_hash, recipient).await
     }
 
     /// Sends `amount` (USDC smallest unit, 6 decimals) of Ethereum USDC from the

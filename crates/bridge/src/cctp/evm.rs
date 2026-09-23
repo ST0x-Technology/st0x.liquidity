@@ -810,6 +810,29 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(Some(head.saturating_sub(tx_block).saturating_add(1)))
     }
 
+    /// Sums the USDC `Transfer` logs in `tx_hash`'s receipt that pay `recipient`:
+    /// what that transaction credited to `recipient`, exact in base units.
+    pub(super) async fn usdc_credited_in_tx(
+        &self,
+        tx_hash: TxHash,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        let receipt = self.wallet.await_receipt(tx_hash).await?;
+
+        receipt
+            .inner
+            .logs()
+            .iter()
+            .filter(|log| log.address() == self.usdc_address)
+            .filter_map(|log| IERC20::Transfer::decode_log(log.as_ref()).ok())
+            .filter(|transfer| transfer.to == recipient)
+            .try_fold(U256::ZERO, |credited, transfer| {
+                credited
+                    .checked_add(transfer.value)
+                    .ok_or(CctpError::UsdcCreditOverflow { tx_hash })
+            })
+    }
+
     /// Sends `amount` of this endpoint's USDC from the wallet to `to`, waiting
     /// for the configured confirmation depth, and returns the transfer tx hash.
     ///

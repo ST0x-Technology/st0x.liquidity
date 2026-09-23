@@ -305,45 +305,33 @@ pub enum UsdcTransferError {
     WithdrawalRefMustBeAlpacaId {
         id: crate::usdc_rebalance::UsdcRebalanceId,
     },
+    /// A legacy AlpacaToBase aggregate confirmed its withdrawal without a tx
+    /// hash, so nothing delivered-USDC can be credited from. The manager moves
+    /// the aggregate to `BridgingFailed`.
     #[error(
-        "USDC rebalance {id}: market-maker Ethereum wallet balance {current} \
-         has not increased above preflight baseline {baseline} \
-         (nominal amount: {nominal}); waiting for withdrawal to settle on-chain"
+        "USDC rebalance {id}: no recorded withdrawal tx hash; cannot credit \
+         Ethereum USDC to the Alpaca withdrawal"
     )]
-    WalletUsdcInsufficient {
-        id: UsdcRebalanceId,
-        nominal: Usdc,
-        current: U256,
-        baseline: U256,
-    },
-    /// A legacy AlpacaToBase aggregate reached settlement without the exact
-    /// preflight Ethereum wallet balance. Any current balance may include
-    /// tolerated ambient dust, so no amount can be safely attributed to the
-    /// withdrawal. The manager moves the aggregate to `BridgingFailed`.
-    #[error(
-        "USDC rebalance {id}: persisted preflight wallet balance is missing; \
-         cannot attribute Ethereum USDC to the Alpaca withdrawal"
-    )]
-    MissingPreflightBalance { id: UsdcRebalanceId },
-    /// The Ethereum wallet balance increased by more than the nominal
-    /// withdrawal after the persisted preflight baseline. USDC arriving after
-    /// preflight cannot be distinguished from this withdrawal's funds. The
+    WithdrawalTxMissing { id: UsdcRebalanceId },
+    /// The withdrawal tx paid the market-maker wallet nothing, or more than
+    /// the nominal withdrawal, so it is not this withdrawal's delivery. The
     /// aggregate is moved to `BridgingFailed` for operator reconciliation; no
     /// burn is attempted.
     #[error(
-        "USDC rebalance {id}: market-maker wallet holds {balance} USDC and its \
-         increase from the preflight baseline exceeds nominal {nominal}; \
-         ambient/residual USDC detected; failed for operator reconciliation"
+        "USDC rebalance {id}: withdrawal tx {tx} credited {credited} base units to \
+         the market-maker wallet against nominal {nominal}; failed for operator \
+         reconciliation"
     )]
-    WalletUsdcAmbientBalance {
+    WithdrawalCreditMismatch {
         id: UsdcRebalanceId,
-        balance: Usdc,
+        tx: TxHash,
+        credited: U256,
         nominal: Usdc,
     },
     /// The market-maker wallet holds more than the tolerated 0.01 USDC dust
     /// ceiling before the Alpaca leg starts, so the transfer refuses before
     /// conversion. No cash leaves Alpaca and no aggregate event is emitted.
-    /// Unlike [`Self::WalletUsdcAmbientBalance`] (settlement time, aggregate
+    /// Unlike [`Self::WithdrawalCreditMismatch`] (settlement time, aggregate
     /// moved to `BridgingFailed`, guard cleared by the terminal event), this
     /// refusal has no aggregate, so the job layer must release the in-progress
     /// guard itself and alert the operator to sweep the wallet.
@@ -561,9 +549,8 @@ impl UsdcTransferError {
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
-            | Self::WalletUsdcInsufficient { .. }
-            | Self::MissingPreflightBalance { .. }
-            | Self::WalletUsdcAmbientBalance { .. }
+            | Self::WithdrawalTxMissing { .. }
+            | Self::WithdrawalCreditMismatch { .. }
             | Self::WalletUsdcAmbientPreflight { .. }
             | Self::WalletUsdcAmbientPreflightUnrepresentable { .. }
             | Self::PreflightBalanceUnavailable { .. }
@@ -618,9 +605,8 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
-            | Self::WalletUsdcInsufficient { .. }
-            | Self::MissingPreflightBalance { .. }
-            | Self::WalletUsdcAmbientBalance { .. }
+            | Self::WithdrawalTxMissing { .. }
+            | Self::WithdrawalCreditMismatch { .. }
             | Self::WalletUsdcAmbientPreflight { .. }
             | Self::WalletUsdcAmbientPreflightUnrepresentable { .. }
             | Self::PreflightBalanceUnavailable { .. }

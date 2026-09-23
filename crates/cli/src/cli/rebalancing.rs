@@ -644,8 +644,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// Whether a manual-transfer outcome is a retryable wait the BOT's worker
 /// should drive, not the CLI. The set mirrors the apalis worker's own
 /// delayed-redrive outcomes: `AttestationTimedOut`, the settlement-wait
-/// errors (`WithdrawalTxUnderconfirmed`, `WalletUsdcInsufficient`,
-/// `SettlementCheckTransient`), a non-backpressure
+/// errors (`WithdrawalTxUnderconfirmed`, `SettlementCheckTransient`), a non-backpressure
 /// `WithdrawalPollInconclusive` (Alpaca unreachable), and
 /// `MintRecoveryInconclusive`. The CLI must NOT keep redriving these itself:
 /// its process would race the bot's worker on the same aggregate (the
@@ -657,7 +656,6 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
     match error {
         UsdcTransferError::AttestationTimedOut { .. }
         | UsdcTransferError::WithdrawalTxUnderconfirmed { .. }
-        | UsdcTransferError::WalletUsdcInsufficient { .. }
         | UsdcTransferError::SettlementCheckTransient { .. }
         | UsdcTransferError::MintRecoveryInconclusive { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
@@ -705,8 +703,8 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::ConversionOutcomeUnresolved { .. }
         | UsdcTransferError::PostDepositConversionShortFill { .. }
         | UsdcTransferError::WithdrawalRefMustBeAlpacaId { .. }
-        | UsdcTransferError::WalletUsdcAmbientBalance { .. }
-        | UsdcTransferError::MissingPreflightBalance { .. }
+        | UsdcTransferError::WithdrawalTxMissing { .. }
+        | UsdcTransferError::WithdrawalCreditMismatch { .. }
         | UsdcTransferError::WalletUsdcAmbientPreflight { .. }
         | UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable { .. }
         | UsdcTransferError::PreflightBalanceUnavailable { .. }
@@ -2383,12 +2381,6 @@ mod tests {
                 tx: b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 required: 3,
                 actual: 1,
-            },
-            UsdcTransferError::WalletUsdcInsufficient {
-                id: id.clone(),
-                nominal: Usdc::new(float!(100)),
-                current: U256::ZERO,
-                baseline: U256::ZERO,
             },
             UsdcTransferError::SettlementCheckTransient {
                 id: id.clone(),

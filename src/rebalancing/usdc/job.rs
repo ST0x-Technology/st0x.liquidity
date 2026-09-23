@@ -1522,10 +1522,9 @@ impl TransferUsdcToMarketMaking {
                     .await?;
             }
             // Settlement-wait errors: the withdrawal tx has not yet reached the
-            // required on-chain confirmation depth, the Ethereum wallet has not yet
-            // received the withdrawn USDC, or an RPC call in the settlement phase
-            // (confirmation re-check, balance read, or burn scan) failed
-            // transiently. These are all safe to delayed-redrive because the
+            // required on-chain confirmation depth, or an RPC call in the
+            // settlement phase (confirmation re-check, credit read, or burn scan)
+            // failed transiently. These are all safe to delayed-redrive because the
             // aggregate is in a durable state (WithdrawalComplete or
             // BridgingSubmitting) -- they must NOT consume apalis retry budget
             // (only 3 retries, ~7 s total). Re-enqueue with
@@ -1539,15 +1538,6 @@ impl TransferUsdcToMarketMaking {
                     settlement_err,
                     id,
                     "withdrawal tx not yet sufficiently confirmed",
-                )
-                .await?;
-            }
-            Err(ref settlement_err @ UsdcTransferError::WalletUsdcInsufficient { ref id, .. }) => {
-                self.handle_settlement_wait_redrive(
-                    ctx,
-                    settlement_err,
-                    id,
-                    "market-maker wallet has insufficient USDC (withdrawal not yet settled)",
                 )
                 .await?;
             }
@@ -1620,43 +1610,44 @@ impl TransferUsdcToMarketMaking {
                      nothing to redrive, leaving for operator reconciliation"
                 );
             }
-            // USDC arriving after the persisted preflight baseline made the
-            // attributable increase exceed the nominal withdrawal. The aggregate
-            // has already moved to BridgingFailed via FailBridging.
-            Err(UsdcTransferError::WalletUsdcAmbientBalance {
+            // The withdrawal tx did not pay this withdrawal (nothing, or more
+            // than nominal). The aggregate has already moved to BridgingFailed
+            // via FailBridging.
+            Err(UsdcTransferError::WithdrawalCreditMismatch {
                 id,
-                balance,
+                tx,
+                credited,
                 nominal,
             }) => {
                 warn!(
                     target: "rebalance",
                     %id,
-                    %balance,
+                    %tx,
+                    %credited,
                     %nominal,
-                    "Alpaca->Base USDC transfer failed: wallet increase exceeded nominal; \
-                     bridge marked failed for operator reconciliation"
+                    "Alpaca->Base USDC transfer failed: withdrawal tx credit does not match \
+                     the withdrawal; bridge marked failed for operator reconciliation"
                 );
                 let message = format!(
-                    "USDC transfer {id} failed: wallet balance {balance} increased by more \
-                     than nominal {nominal} after preflight. Bridge marked failed; manual \
-                     operator reconciliation required."
+                    "USDC transfer {id} failed: withdrawal tx {tx} credited {credited} base \
+                     units to the market-maker wallet against nominal {nominal}. Bridge \
+                     marked failed; manual operator reconciliation required."
                 );
-                deliver_market_making_alert(&ctx.notifier, &message, "ambient-balance").await;
+                deliver_market_making_alert(&ctx.notifier, &message, "withdrawal-credit").await;
             }
-            Err(UsdcTransferError::MissingPreflightBalance { id }) => {
+            Err(UsdcTransferError::WithdrawalTxMissing { id }) => {
                 error!(
                     target: "rebalance",
                     %id,
-                    "Alpaca->Base USDC transfer failed: persisted preflight wallet \
-                     balance missing; bridge marked failed for operator reconciliation"
+                    "Alpaca->Base USDC transfer failed: no recorded withdrawal tx hash; \
+                     bridge marked failed for operator reconciliation"
                 );
                 let message = format!(
-                    "USDC transfer {id} has no persisted preflight wallet balance, so the \
-                     Alpaca withdrawal cannot be distinguished from ambient dust. Bridge \
-                     marked failed; manual operator reconciliation required."
+                    "USDC transfer {id} has no recorded withdrawal tx hash, so no Ethereum \
+                     USDC can be credited to it. Bridge marked failed; manual operator \
+                     reconciliation required."
                 );
-                deliver_market_making_alert(&ctx.notifier, &message, "missing-preflight-baseline")
-                    .await;
+                deliver_market_making_alert(&ctx.notifier, &message, "missing-withdrawal-tx").await;
             }
             // Pre-flight refusals (see the variants' docs): no aggregate
             // exists, so each settles worker-side -- log, page through its
@@ -2527,7 +2518,7 @@ mod tests {
         /// the job pages and must not redrive.
         SettlementDeadlineElapsed,
         PreviouslyFailed,
-        AmbientBalance,
+        WithdrawalCreditMismatch,
         /// Fail-closed burn-submission terminals: a burn may be in flight, so the
         /// job must NOT auto-redrive (a redrive could reburn).
         BurnSubmitInconclusive,
@@ -2558,9 +2549,10 @@ mod tests {
                 Self::PreviouslyFailed => {
                     UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }
                 }
-                Self::AmbientBalance => UsdcTransferError::WalletUsdcAmbientBalance {
+                Self::WithdrawalCreditMismatch => UsdcTransferError::WithdrawalCreditMismatch {
                     id: id.clone(),
-                    balance: Usdc::new(float!(1)),
+                    tx: TxHash::from([0xEF; 32]),
+                    credited: U256::ZERO,
                     nominal: Usdc::new(float!(1)),
                 },
                 Self::BurnSubmitInconclusive => {
@@ -4691,10 +4683,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_making_job_treats_ambient_balance_as_clean_terminal() {
+    async fn market_making_job_treats_withdrawal_credit_mismatch_as_clean_terminal() {
         let pool = setup_queue_pool().await;
         let ctx = market_making_ctx(
-            Arc::new(TerminalAlpacaToBase(TerminalOutcome::AmbientBalance)),
+            Arc::new(TerminalAlpacaToBase(
+                TerminalOutcome::WithdrawalCreditMismatch,
+            )),
             &pool,
         );
         let job = TransferUsdcToMarketMaking {
@@ -4706,12 +4700,12 @@ mod tests {
 
         job.perform(&ctx)
             .await
-            .expect("ambient balance must be a clean terminal outcome, not a job error");
+            .expect("a credit mismatch must be a clean terminal outcome, not a job error");
 
         assert_eq!(
             pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
             0,
-            "an ambient-balance failure must not be redriven and must not trip the breaker"
+            "a credit-mismatch failure must not be redriven and must not trip the breaker"
         );
     }
 
@@ -5164,24 +5158,6 @@ mod tests {
         }
     }
 
-    struct InsufficientUsdcBalance;
-
-    #[async_trait]
-    impl ResumeAlpacaToBase for InsufficientUsdcBalance {
-        async fn resume_alpaca_to_base(
-            &self,
-            id: &UsdcRebalanceId,
-            _amount: Usdc,
-        ) -> Result<(), UsdcTransferError> {
-            Err(UsdcTransferError::WalletUsdcInsufficient {
-                id: id.clone(),
-                nominal: Usdc::new(float!(1)),
-                current: U256::ZERO,
-                baseline: U256::ZERO,
-            })
-        }
-    }
-
     /// Hypothesis: WithdrawalTxUnderconfirmed re-enqueues with
     /// SETTLEMENT_REDRIVE_DELAY and returns Ok (job stays alive, no apalis
     /// retry budget consumed).
@@ -5204,50 +5180,6 @@ mod tests {
             pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
             1,
             "WithdrawalTxUnderconfirmed must re-enqueue a delayed replacement job"
-        );
-
-        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
-        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(
-            rescheduled.id, job.id,
-            "the rescheduled job must resume the same aggregate id"
-        );
-        assert!(
-            rescheduled.amount.eq(&job.amount).unwrap(),
-            "the rescheduled job must carry the same amount, got {} vs {}",
-            rescheduled.amount,
-            job.amount
-        );
-        assert!(
-            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
-                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
-            "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
-             run_at={run_at} before={before} after={after}"
-        );
-    }
-
-    /// Hypothesis: WalletUsdcInsufficient re-enqueues with
-    /// SETTLEMENT_REDRIVE_DELAY and returns Ok (job stays alive, no apalis
-    /// retry budget consumed).
-    #[tokio::test]
-    async fn market_making_job_reschedules_insufficient_usdc_balance() {
-        let pool = setup_queue_pool().await;
-        let ctx = market_making_ctx(Arc::new(InsufficientUsdcBalance), &pool);
-        let job = TransferUsdcToMarketMaking {
-            id: UsdcRebalanceId(Uuid::new_v4()),
-            amount: Usdc::new(float!(100)),
-            revert_redrive_attempts: 0,
-            backpressure_streak: BackpressureStreak::default(),
-        };
-
-        let before = Utc::now().timestamp();
-        job.perform(&ctx).await.unwrap();
-        let after = Utc::now().timestamp();
-
-        assert_eq!(
-            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
-            1,
-            "WalletUsdcInsufficient must re-enqueue a delayed replacement job"
         );
 
         let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
@@ -6734,18 +6666,20 @@ mod tests {
         );
     }
 
-    /// WalletUsdcAmbientBalance (market-making) must fire a notifier alert
+    /// WithdrawalCreditMismatch (market-making) must fire a notifier alert
     /// because it leaves the aggregate in an operator-reconciliation-bound
     /// state. The failure already emitted `FailBridging`, so the reactor
     /// clears the guard event-driven -- the worker must NOT release it, or a
     /// second rebalance could start on top of the unreconciled one.
     #[tokio::test]
-    async fn market_making_job_fires_alert_on_ambient_balance() {
+    async fn market_making_job_fires_alert_on_withdrawal_credit_mismatch() {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let guard_release = Arc::new(RecordingGuardRelease::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::AmbientBalance)),
+            transfer: Arc::new(TerminalAlpacaToBase(
+                TerminalOutcome::WithdrawalCreditMismatch,
+            )),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
@@ -6761,13 +6695,13 @@ mod tests {
 
         job.perform(&ctx)
             .await
-            .expect("ambient balance is a clean terminal outcome");
+            .expect("a credit mismatch is a clean terminal outcome");
 
         let messages = notifier.messages();
         assert_eq!(
             messages.len(),
             1,
-            "ambient balance must fire exactly one alert"
+            "a credit mismatch must fire exactly one alert"
         );
         assert!(
             messages[0].contains(&job.id.to_string()),
@@ -6776,7 +6710,7 @@ mod tests {
         );
         assert!(
             !guard_release.released.load(Ordering::SeqCst),
-            "a post-flight ambient failure must leave the guard for the \
+            "a settlement credit failure must leave the guard for the \
              event-driven reactor, never release it from the worker"
         );
     }
