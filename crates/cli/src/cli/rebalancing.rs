@@ -705,6 +705,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::WithdrawalRefMustBeAlpacaId { .. }
         | UsdcTransferError::WithdrawalTxMissing { .. }
         | UsdcTransferError::WithdrawalCreditMismatch { .. }
+        | UsdcTransferError::WithdrawalCreditUnreadable { .. }
         | UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
         | UsdcTransferError::BurnRecordTaskFailed { .. }
         | UsdcTransferError::BurnRecordFailed { .. }
