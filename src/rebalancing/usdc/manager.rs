@@ -1223,7 +1223,7 @@ impl<
                     id,
                     amount,
                     preflight_balance,
-                    withdrawal_tx,
+                    Some(withdrawal_tx),
                     initiated_at,
                     Utc::now(),
                 )
@@ -1552,7 +1552,7 @@ impl<
             id,
             filled_amount,
             preflight_balance,
-            withdrawal_tx,
+            Some(withdrawal_tx),
             initiated_at,
             Utc::now(),
         )
@@ -2090,7 +2090,7 @@ impl<
             id,
             usdc_amount,
             Some(preflight_balance),
-            withdrawal_tx,
+            Some(withdrawal_tx),
             initiated_at,
             Utc::now(),
         )
@@ -2166,7 +2166,7 @@ impl<
         id: &UsdcRebalanceId,
         transfer_id: &AlpacaTransferId,
         initiated_at: DateTime<Utc>,
-    ) -> Result<Option<alloy::primitives::TxHash>, UsdcTransferError> {
+    ) -> Result<TxHash, UsdcTransferError> {
         let transfer = match self
             .alpaca_wallet
             .poll_transfer_until_complete(transfer_id)
@@ -2254,20 +2254,39 @@ impl<
             return Err(UsdcTransferError::WithdrawalFailed { status });
         }
 
+        // The transfer is credited only from the tx that delivered its USDC, and
+        // Alpaca can report Complete before the hash. Stay `Withdrawing` and
+        // re-poll the same transfer id until the hash is present.
+        let Some(withdrawal_tx) = transfer.tx else {
+            warn!(
+                target: "rebalance",
+                %id, %transfer_id,
+                "Alpaca withdrawal is complete but reports no tx hash yet; keeping \
+                 Withdrawing state for delayed redrive"
+            );
+            return Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id: id.clone(),
+                initiated_at,
+                source: AlpacaWalletError::CompletedTransferMissingTx {
+                    transfer_id: *transfer_id,
+                },
+            });
+        };
+
         // Advance the aggregate to WithdrawalComplete NOW, before the on-chain
         // confirmation-depth check below. This is intentional: if the confirmation
         // wait returns early (tx not yet mined or under-confirmed), the aggregate is
         // already in WithdrawalComplete, so on apalis redrive the resume path enters
-        // continue_alpaca_to_base_from_withdrawal_complete and uses the staleness-safe
-        // fallback balance gate -- it never re-polls Alpaca. Without this ordering, a
+        // continue_alpaca_to_base_from_withdrawal_complete and re-runs the
+        // confirmation check -- it never re-polls Alpaca. Without this ordering, a
         // transient Alpaca API error on a redrive would hit the poll_transfer error arm
         // and send FailWithdrawal against a withdrawal that already succeeded.
-        let withdrawal_tx = transfer.tx;
-
         self.cqrs
             .send(
                 id,
-                UsdcRebalanceCommand::ConfirmWithdrawal { withdrawal_tx },
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: Some(withdrawal_tx),
+                },
             )
             .await?;
 
@@ -2276,74 +2295,60 @@ impl<
         // PRIMARY settlement gate: wait for the configured required_confirmations
         // on the on-chain tx that delivered the withdrawn USDC to the market-maker
         // wallet. Alpaca reports "Complete" before the tx is visible network-wide on
-        // load-balanced RPC nodes, so a balance-read immediately after the status
-        // change can hit a lagging node and return stale data. If the tx is not yet
-        // sufficiently confirmed, return WithdrawalTxUnderconfirmed (retryable) --
-        // the aggregate is already in WithdrawalComplete and withdrawal_tx is
-        // persisted, so on apalis redrive the resume path enters
+        // load-balanced RPC nodes, so reading the tx immediately after the status
+        // change can hit a lagging node. If the tx is not yet sufficiently
+        // confirmed, return WithdrawalTxUnderconfirmed (retryable) -- the aggregate
+        // is already in WithdrawalComplete and withdrawal_tx is persisted, so on
+        // apalis redrive the resume path enters
         // continue_alpaca_to_base_from_withdrawal_complete and re-runs this same
-        // confirmation check durably before any burn. If the tx hash is absent
-        // (Alpaca did not return one), fall through directly to the balance gate.
-        if let Some(tx) = withdrawal_tx {
-            match self
-                .cctp_bridge
-                .ethereum_tx_confirmations(tx)
-                .await
-                .map_err(|error| UsdcTransferError::SettlementCheckTransient {
+        // confirmation check durably before any burn.
+        match self
+            .cctp_bridge
+            .ethereum_tx_confirmations(withdrawal_tx)
+            .await
+            .map_err(|error| UsdcTransferError::SettlementCheckTransient {
+                id: id.clone(),
+                source: Box::new(error),
+            })? {
+            None => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    tx = %withdrawal_tx,
+                    "Alpaca withdrawal tx not yet mined; retrying"
+                );
+                return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
                     id: id.clone(),
-                    source: Box::new(error),
-                })? {
-                None => {
-                    // Tx not yet mined; aggregate is already WithdrawalComplete so
-                    // apalis redrive enters the balance-gate path, not Alpaca re-poll.
-                    warn!(
-                        target: "rebalance",
-                        %id,
-                        %tx,
-                        "Alpaca withdrawal tx not yet mined; retrying"
-                    );
-                    return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
-                        id: id.clone(),
-                        tx,
-                        required: self.required_confirmations,
-                        actual: 0,
-                    });
-                }
-                Some(confirmations) if confirmations < self.required_confirmations => {
-                    // Under-confirmed; aggregate is already WithdrawalComplete so
-                    // apalis redrive enters the balance-gate path, not Alpaca re-poll.
-                    warn!(
-                        target: "rebalance",
-                        %id,
-                        %tx,
-                        confirmations,
-                        required = self.required_confirmations,
-                        "Alpaca withdrawal tx under-confirmed; retrying"
-                    );
-                    return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
-                        id: id.clone(),
-                        tx,
-                        required: self.required_confirmations,
-                        actual: confirmations,
-                    });
-                }
-                Some(confirmations) => {
-                    info!(
-                        target: "rebalance",
-                        %id,
-                        %tx,
-                        confirmations,
-                        "Alpaca withdrawal tx confirmed on-chain"
-                    );
-                }
+                    tx: withdrawal_tx,
+                    required: self.required_confirmations,
+                    actual: 0,
+                });
             }
-        } else {
-            warn!(
-                target: "rebalance",
-                %id,
-                "Alpaca withdrawal transfer has no tx hash; skipping confirmation check \
-                 (fallback balance gate will verify USDC is present before burn)"
-            );
+            Some(confirmations) if confirmations < self.required_confirmations => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    tx = %withdrawal_tx,
+                    confirmations,
+                    required = self.required_confirmations,
+                    "Alpaca withdrawal tx under-confirmed; retrying"
+                );
+                return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
+                    id: id.clone(),
+                    tx: withdrawal_tx,
+                    required: self.required_confirmations,
+                    actual: confirmations,
+                });
+            }
+            Some(confirmations) => {
+                info!(
+                    target: "rebalance",
+                    %id,
+                    tx = %withdrawal_tx,
+                    confirmations,
+                    "Alpaca withdrawal tx confirmed on-chain"
+                );
+            }
         }
 
         Ok(withdrawal_tx)
@@ -14418,116 +14423,6 @@ mod tests {
         );
     }
 
-    /// Hypothesis (combined path): when Alpaca returns no tx_hash AND the wallet
-    /// balance is insufficient (USDC not yet settled), poll_and_confirm_withdrawal
-    /// still advances the aggregate to WithdrawalComplete (guard latched), and
-    /// the subsequent balance gate returns WalletUsdcInsufficient (retryable) --
-    /// no burn is attempted.
-    #[tokio::test]
-    async fn withdrawal_tx_absent_and_insufficient_balance_returns_wallet_usdc_insufficient() {
-        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
-
-        // Deploy USDC chain with ZERO balance -- withdrawal not yet settled.
-        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
-
-        let server = MockServer::start();
-        let (manager, cqrs) =
-            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
-
-        let transfer_uuid = Uuid::new_v4();
-        // tx_hash is None -- Alpaca did not return one.
-        let _transfer_mock = mock_complete_withdrawal_with_tx(&server, transfer_uuid, None);
-
-        let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = usdc("1");
-        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
-
-        // Stage at Withdrawing.
-        cqrs.send(
-            &id,
-            UsdcRebalanceCommand::InitiateConversion {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount,
-                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
-            },
-        )
-        .await
-        .unwrap();
-        cqrs.send(
-            &id,
-            UsdcRebalanceCommand::ConfirmConversion {
-                conversion: par_conversion(amount),
-            },
-        )
-        .await
-        .unwrap();
-        cqrs.send(
-            &id,
-            UsdcRebalanceCommand::Initiate {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount,
-                withdrawal: TransferRef::AlpacaId(withdrawal_id),
-            },
-        )
-        .await
-        .unwrap();
-
-        // poll_and_confirm_withdrawal succeeds (no tx hash to check) and advances
-        // the aggregate to WithdrawalComplete.
-        manager
-            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
-            .await
-            .unwrap();
-
-        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
-        assert!(
-            matches!(
-                state,
-                UsdcRebalance::WithdrawalComplete {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    ..
-                }
-            ),
-            "Aggregate must be WithdrawalComplete after absent-tx poll; got: {state:?}"
-        );
-
-        // continue_alpaca_to_base_from_withdrawal_complete reads the wallet balance
-        // and returns WalletUsdcInsufficient (retryable) because the wallet holds
-        // zero USDC. No FailBridging is emitted; the aggregate stays in
-        // WithdrawalComplete for the next delayed-redrive attempt.
-        let error = manager
-            .continue_alpaca_to_base_from_withdrawal_complete(
-                &id,
-                amount,
-                Some(U256::ZERO),
-                None,
-                Utc::now(),
-                Utc::now(),
-            )
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(error, UsdcTransferError::WalletUsdcInsufficient { .. }),
-            "Expected WalletUsdcInsufficient when balance is zero; got: {error:?}"
-        );
-
-        // Aggregate must still be in WithdrawalComplete -- the balance gate is
-        // staleness-safe (no FailBridging emitted on zero balance).
-        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
-        assert!(
-            matches!(
-                state,
-                UsdcRebalance::WithdrawalComplete {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    ..
-                }
-            ),
-            "Aggregate must remain WithdrawalComplete after zero balance; got: {state:?}"
-        );
-    }
-
     /// Hypothesis: on ANY poll error (ApiError, TransferTimeout, reqwest::Error),
     /// `poll_and_confirm_withdrawal` returns `WithdrawalPollInconclusive` WITHOUT
     /// emitting `FailWithdrawal`. The aggregate stays in `Withdrawing` with the
@@ -14927,6 +14822,14 @@ mod tests {
     async fn poll_and_confirm_withdrawal_after_prior_inconclusive_adopts_complete() {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
         let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+        // Confirm the delivering tx to the required depth (inclusion counts as 1).
+        ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap()
+            .anvil_mine(Some(3 - 1), None)
+            .await
+            .unwrap();
 
         let server = MockServer::start();
         let (manager, cqrs) =
@@ -14995,7 +14898,6 @@ mod tests {
         error_mock.delete();
 
         // Second call (simulating the delayed-redrive re-poll): Alpaca now reports COMPLETE.
-        // No tx hash so the aggregate goes to WithdrawalComplete without a confirmation check.
         let complete_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
                 .path(format!(
@@ -15013,7 +14915,7 @@ mod tests {
                     "from_address": "0x0000000000000000000000000000000000000001",
                     "to_address": "0x2222222222222222222222222222222222222222",
                     "status": "COMPLETE",
-                    "tx_hash": null,
+                    "tx_hash": format!("{:#x}", chain.mint_tx),
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0",
                     "fees": "0"
@@ -15179,7 +15081,7 @@ mod tests {
                     "from_address": "0x0000000000000000000000000000000000000001",
                     "to_address": "0x2222222222222222222222222222222222222222",
                     "status": "COMPLETE",
-                    "tx_hash": null,
+                    "tx_hash": format!("{:#x}", chain.mint_tx),
                     "created_at": "2024-01-01T00:00:00Z",
                     "network_fee": "0",
                     "fees": "0"
