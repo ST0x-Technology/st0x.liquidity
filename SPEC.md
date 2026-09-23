@@ -4172,13 +4172,15 @@ enum BridgeStage { Burn, Attestation, Mint }
   field carry `None` and fall back to re-polling Circle: the attestation is
   permanently retrievable, so a timeout there retries until success rather than
   failing (bounding it would strand recoverable funds). The re-polled nonce is
-  cross-checked against the recorded `cctp_nonce` the same way. A hard re-poll
-  error marks `BridgingFailed` only when the destination chain reads the
-  recorded nonce unused on every read over the mint recovery probe window (one
-  read can come from a node behind the mint); when the nonce reads consumed (the
-  mint landed) or the read fails, the resume redrives so a later attempt adopts
-  the mint. The `attestation_retry_deadline` bounds only the
-  `AwaitingAttestation` wait (where the attestation may never arrive).
+  cross-checked against the recorded `cctp_nonce` the same way, and the
+  BaseToAlpaca `BridgingFailed` recovery checks it again before it mints, so a
+  mismatch stays failed for operator reconciliation. A hard re-poll error marks
+  `BridgingFailed` only when the destination chain reads the recorded nonce
+  unused on every read over the mint recovery probe window (one read can come
+  from a node behind the mint); when the nonce reads consumed (the mint landed)
+  or the read fails, the resume redrives so a later attempt adopts the mint. The
+  `attestation_retry_deadline` bounds only the `AwaitingAttestation` wait (where
+  the attestation may never arrive).
 - Bridge mint transaction requires valid attestation
 - Bridge mint transaction must be confirmed before destination deposit
 - A `receiveMessage()` revert because the CCTP nonce was already used is
