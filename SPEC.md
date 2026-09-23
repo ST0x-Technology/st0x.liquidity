@@ -705,7 +705,7 @@ The per-symbol equity lock is re-armed at startup from every open mint and
 redemption aggregate, and the transfer job row plus the transfer's first event
 are the durable reservation a restart honours: a restart between a job's push
 and its first event finds the pending row and dispatches nothing else for the
-symbol. That re-arm predates the allocation planner and is unchanged by it.
+symbol.
 
 Historical backfill resumes from a persisted database checkpoint. The configured
 `deployment_block` is only the initial seed for the first startup or for an
