@@ -1533,6 +1533,40 @@ mod tests {
         );
     }
 
+    /// Wrapped-equity recovery runs only on the primary chain, so a
+    /// secondary listing that enables it is refused at load rather than
+    /// silently left without recovery.
+    #[test]
+    fn registry_rejects_wrapped_equity_recovery_on_a_secondary_chain() {
+        let mut ethereum = primary_trading_config_toml(false);
+        ethereum.assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+        let configs = BTreeMap::from([
+            (Chain::Base, chain_config(Some(trading_config_toml()))),
+            (Chain::Ethereum, chain_config(Some(ethereum))),
+        ]);
+
+        let error =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[chains.ethereum.trading.assets.equities.AAPL] sets wrapped_equity_recovery = \
+             \"enabled\", but wrapped-equity recovery runs only on the primary chain (base)"
+        );
+    }
+
     #[test]
     fn registry_rejects_a_non_active_primary_chain() {
         for lifecycle in [ChainLifecycle::ObserveOnly, ChainLifecycle::Prefunded] {
