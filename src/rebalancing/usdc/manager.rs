@@ -13879,7 +13879,7 @@ mod tests {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
         let nominal = usdc("1000");
         let chain = deploy_ethereum_usdc_chain_with_balance(
-            U256::from(998_000_000u64),
+            U256::from(1_000_000_000u64),
             market_maker_wallet,
         )
         .await;
