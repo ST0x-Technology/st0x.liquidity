@@ -446,8 +446,9 @@ impl<
     }
 
     /// Compares the USDC credited to open transfers and not yet sent with the
-    /// Ethereum wallet balance. Pages on a shortfall and logs unattributed
-    /// USDC; never fails a transfer, and a read failure only warns.
+    /// Ethereum wallet balance. Pages on a shortfall or an underivable ledger
+    /// and logs unattributed USDC; never fails a transfer. A failed balance
+    /// read only warns.
     pub(crate) async fn check_ethereum_credit_ledger(
         &self,
         id: &UsdcRebalanceId,
@@ -457,10 +458,18 @@ impl<
             return CreditLedgerCheck::Unwired;
         };
 
+        // Pages: an unreadable open transfer stays open until reconciled, so the
+        // shortfall check would otherwise stay off without anyone noticing.
         let credits = match open_ethereum_credits(pool, &self.cqrs).await {
             Ok(credits) => credits,
             Err(error) => {
-                warn!(target: "rebalance", %id, %error, "Could not derive the Ethereum credit ledger");
+                error!(
+                    target: "operational_alert",
+                    alert = true,
+                    %id,
+                    %error,
+                    "Could not derive the Ethereum credit ledger; the USDC shortfall check is off"
+                );
                 return CreditLedgerCheck::Unavailable;
             }
         };
@@ -473,7 +482,13 @@ impl<
         {
             Ok(outstanding) => outstanding,
             Err(error) => {
-                warn!(target: "rebalance", %id, %error, "Could not total the Ethereum credit ledger");
+                error!(
+                    target: "operational_alert",
+                    alert = true,
+                    %id,
+                    %error,
+                    "Could not total the Ethereum credit ledger; the USDC shortfall check is off"
+                );
                 return CreditLedgerCheck::Unavailable;
             }
         };
