@@ -4968,7 +4968,7 @@ mod tests {
     use super::*;
     use crate::bot_gas::pending_bot_gas_jobs;
     use crate::telemetry::TelemetrySender;
-    use crate::test_utils::{TestAnvilInstance, spawn_anvil, spawn_anvil_pair};
+    use crate::test_utils::{TestAnvilInstance, persist_event, spawn_anvil, spawn_anvil_pair};
     use crate::usdc_rebalance::{
         RebalanceDirection, ReconcileReason, TransferRef, UsdcRebalanceError, UsdcRebalanceEvent,
     };
@@ -13751,6 +13751,60 @@ mod tests {
         );
         assert!(logs_contain("operational_alert"));
         assert!(logs_contain("shortfall=59.99"));
+    }
+
+    /// An open aggregate the ledger cannot read turns the shortfall check off,
+    /// so that pages too, naming the aggregate.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn credit_ledger_pages_when_an_open_transfer_cannot_be_read() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(40_000_000u64), market_maker_wallet)
+                .await;
+
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let manager = CrossVenueCashTransfer::new(
+            InstrumentedAlpacaBroker::new(
+                create_test_broker_service(&server).await,
+                TelemetrySender::disabled(),
+            ),
+            Arc::new(create_test_wallet_service(&server)),
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        )
+        .with_credit_ledger(pool.clone());
+
+        persist_event::<UsdcRebalance>(
+            &pool,
+            "poisoned-rebalance-id",
+            1,
+            &UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: usdc("100"),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                initiated_at: Utc::now(),
+            },
+        )
+        .await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        assert_eq!(
+            manager.check_ethereum_credit_ledger(&id).await,
+            CreditLedgerCheck::Unavailable
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain("poisoned-rebalance-id"));
     }
 
     /// The ledger sums the credits of every open transfer in the shared
