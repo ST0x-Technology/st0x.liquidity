@@ -14338,12 +14338,11 @@ mod tests {
         );
     }
 
-    /// Hypothesis: when Alpaca returns no tx_hash on the withdrawal transfer,
-    /// poll_and_confirm_withdrawal logs a warning and falls through -- it sends
-    /// ConfirmWithdrawal and advances the aggregate to WithdrawalComplete.
-    /// (The fallback balance gate covers the burn step.)
+    /// Alpaca can report a withdrawal Complete before it reports the tx hash.
+    /// The transfer is credited only from that tx, so the withdrawal stays
+    /// `Withdrawing` and the poll is inconclusive until the hash appears.
     #[tokio::test]
-    async fn withdrawal_tx_absent_falls_through_to_balance_gate() {
+    async fn completed_withdrawal_without_tx_hash_stays_withdrawing() {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
         let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
 
@@ -14390,22 +14389,32 @@ mod tests {
         .await
         .unwrap();
 
-        // Falls through to ConfirmWithdrawal even without a tx hash.
-        manager
+        let error = manager
             .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
             .await
-            .unwrap();
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::WithdrawalPollInconclusive {
+                    source: AlpacaWalletError::CompletedTransferMissingTx { transfer_id },
+                    ..
+                } if transfer_id == withdrawal_id
+            ),
+            "Complete without a tx hash must stay inconclusive, got: {error:?}"
+        );
 
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(
                 state,
-                UsdcRebalance::WithdrawalComplete {
+                UsdcRebalance::Withdrawing {
                     direction: RebalanceDirection::AlpacaToBase,
                     ..
                 }
             ),
-            "WithdrawalComplete expected when tx_hash is absent (fall-through); got: {state:?}"
+            "Aggregate must stay Withdrawing until Alpaca reports the tx hash; got: {state:?}"
         );
     }
 
