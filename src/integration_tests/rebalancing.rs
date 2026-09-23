@@ -1253,10 +1253,6 @@ async fn mark_pending_equity_transfer_jobs_done(apalis_pool: &apalis_sqlite::Sql
     .unwrap();
 }
 
-/// Drives an `EquityRedemption` of `quantity` whole shares from vault
-/// withdrawal to completion through the service's reactor, the way the
-/// transfer saga would, so the inventory and the symbol lock settle exactly
-/// as they do in production.
 /// Drives the dispatched redemption `id` to `Completed` through the service's
 /// reactor, then waits for the detached post-commit release of the Position
 /// reservation the job owns, so the next tick can reserve the symbol again.
@@ -1426,7 +1422,6 @@ async fn mint_is_capped_to_keep_the_alpaca_floor() {
     })
     .await;
     seed_vault_registry(&pool, Chain::Base, &symbol, Address::random()).await;
-    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(44)).await;
 
     build_imbalanced_inventory(Imbalance::Equity {
         inventory: &inventory,
