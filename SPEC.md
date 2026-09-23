@@ -3896,8 +3896,10 @@ already-submitted action instead of re-issuing it:
   The log scan is bounded: it starts at the destination head captured when the
   attestation is recorded, or, for a transfer recorded before that head was
   captured, a fixed lookback from the current head. A consumed nonce whose mint
-  is not found in that window fails the resume for operator reconciliation; the
-  bot never scans back to genesis.
+  is not found in that window, or a message that can never mint on the
+  destination chain, marks `BridgingFailed` (keeping the burn tx and nonce), so
+  `transfer reconcile --kind usdc` can settle it; the bot never scans back to
+  genesis. Other lookup failures redrive.
 
 ##### Commands
 
