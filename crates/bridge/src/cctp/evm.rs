@@ -953,7 +953,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         };
 
         match self
-            .locate_mint_receipt_with_lag_retries(&received_message, Some(from_block))
+            .locate_mint_receipt_with_lag_retries(&received_message, from_block)
             .await
         {
             Ok(mint_receipt) => Ok(Some(mint_receipt)),
@@ -1004,12 +1004,11 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// `MintAndWithdraw`.
     ///
     /// `min_block` floors the backward scan; passed straight through to
-    /// [`find_received_message_tx`](Self::find_received_message_tx), see its
-    /// doc for when a floor is (and is not) safe to pass.
+    /// [`find_received_message_tx`](Self::find_received_message_tx).
     async fn locate_mint_receipt(
         &self,
         received_message: &CctpReceivedMessage<'_>,
-        min_block: Option<u64>,
+        min_block: u64,
     ) -> Result<MintReceipt, CctpError> {
         let (tx_hash, message_received_log_index) = self
             .find_received_message_tx(
@@ -1058,10 +1057,10 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// apply to their own `get_logs` scans. This runs at most once per
     /// `recover_already_minted` call (not once per probe). Each retry's scan
     /// is additionally floored at [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`]
-    /// chunks behind the current head (falling back to an unbounded scan if
-    /// the head read itself fails), so `SCAN_ATTEMPTS` retries are genuinely
+    /// chunks behind the current head, so `SCAN_ATTEMPTS` retries are genuinely
     /// a handful of quick attempts instead of each one repeating a full
-    /// backward walk to genesis.
+    /// backward walk to genesis. A failed head read is returned as-is: there is
+    /// no floor to scan from, and the caller redrives.
     ///
     /// Any other failure means the nonce is authoritatively consumed but the
     /// receipt could not be validated (a reverted mint tx, a mismatched log, a
@@ -1073,20 +1072,9 @@ impl<W: Wallet> CctpEndpoint<W> {
         &self,
         received_message: &CctpReceivedMessage<'_>,
     ) -> Result<MintReceipt, CctpError> {
-        let min_block = match self.current_block().await {
-            Ok(head) => Some(head.saturating_sub(
-                CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS),
-            )),
-            Err(error) => {
-                warn!(
-                    target: "bridge",
-                    ?error,
-                    "Failed to read the chain head to floor the reconstruction scan; \
-                     falling back to an unbounded backward scan for this attempt"
-                );
-                None
-            }
-        };
+        let min_block = self.current_block().await?.saturating_sub(
+            CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS),
+        );
 
         self.locate_mint_receipt_with_lag_retries(received_message, min_block)
             .await
@@ -1098,7 +1086,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     async fn locate_mint_receipt_with_lag_retries(
         &self,
         received_message: &CctpReceivedMessage<'_>,
-        min_block: Option<u64>,
+        min_block: u64,
     ) -> Result<MintReceipt, CctpError> {
         let mut attempt = 1;
 
@@ -1305,9 +1293,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// its hash alongside the matched `MessageReceived` log index (used to
     /// correlate the right `MintAndWithdraw` within a multicall transaction).
     ///
-    /// `min_block` floors how far back the scan walks. `None` walks to block
-    /// 0; only [`reconstruct_existing_mint`](Self::reconstruct_existing_mint)
-    /// passes it, and only when its head read fails. Otherwise the floor is
+    /// `min_block` floors how far back the scan walks:
     /// [`find_existing_mint`](Self::find_existing_mint)'s captured or legacy
     /// floor, or [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`] below the head for
     /// the reconstruction that just saw the nonce become consumed.
@@ -1316,7 +1302,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         source_domain: u32,
         nonce: B256,
         message_body: &[u8],
-        min_block: Option<u64>,
+        min_block: u64,
     ) -> Result<(TxHash, u64), CctpError> {
         let latest = self
             .wallet
@@ -1330,7 +1316,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         // inverted range is rejected outright by most providers and would be
         // charged against the caller's scan attempts as if the mint were
         // missing.
-        let floor = min_block.unwrap_or(0).min(latest);
+        let floor = min_block.min(latest);
         let mut to_block = latest;
         let mut saw_nonce = false;
 

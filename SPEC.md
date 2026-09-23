@@ -4202,24 +4202,25 @@ enum BridgeStage { Burn, Attestation, Mint }
   expensive log scan and receipt reconstruction described above run only once
   per recovery attempt, after a read confirms the nonce consumed, not on every
   probe, and are themselves bounded to a handful of recent chunks rather than a
-  full-chain walk back to genesis. The burn is irreversible and the attestation
-  is valid, so any party -- including a third-party relayer -- may deliver the
-  mint moments after our own submission failed; a mint that lands inside the
-  window is recovered per the log checks above and the transfer proceeds to the
-  destination deposit. If the window expires WITHOUT ever getting a conclusive
-  `usedNonces()` read (every remaining probe itself failed transiently), OR the
-  nonce is confirmed consumed but its receipt could not be reconstructed (a
-  lagging log scan, a mismatched log, a reverted mint transaction), the transfer
-  is NOT marked `BridgingFailed` -- declaring a terminal failure on unobserved
-  state, or on funds already known to have moved, would strand the rebalancing
-  guard on a false negative. The transfer instead stays in whatever
-  non-terminal-for-this-purpose state it was already in when recovery ran:
-  `Attested` (or the Ethereum-direction equivalent) for a first mint attempt,
-  whose resume adopts an already-landed mint via a bounded scan before minting
-  again; or `BridgingFailed` when recovering an already-failed post-burn
-  transfer, whose next redrive re-attempts the mint directly instead
-  (idempotency there comes from CCTP's nonce being authoritative, not from that
-  bounded scan).
+  full-chain walk back to genesis; when the head read that sets this floor
+  fails, recovery is inconclusive (below) and never scans without a floor. The
+  burn is irreversible and the attestation is valid, so any party -- including a
+  third-party relayer -- may deliver the mint moments after our own submission
+  failed; a mint that lands inside the window is recovered per the log checks
+  above and the transfer proceeds to the destination deposit. If the window
+  expires WITHOUT ever getting a conclusive `usedNonces()` read (every remaining
+  probe itself failed transiently), OR the nonce is confirmed consumed but its
+  receipt could not be reconstructed (a lagging log scan, a mismatched log, a
+  reverted mint transaction), the transfer is NOT marked `BridgingFailed` --
+  declaring a terminal failure on unobserved state, or on funds already known to
+  have moved, would strand the rebalancing guard on a false negative. The
+  transfer instead stays in whatever non-terminal-for-this-purpose state it was
+  already in when recovery ran: `Attested` (or the Ethereum-direction
+  equivalent) for a first mint attempt, whose resume adopts an already-landed
+  mint via a bounded scan before minting again; or `BridgingFailed` when
+  recovering an already-failed post-burn transfer, whose next redrive
+  re-attempts the mint directly instead (idempotency there comes from CCTP's
+  nonce being authoritative, not from that bounded scan).
 - **Inconclusive mint recovery: redrive and operator alert**: the job layer
   schedules an unbounded delayed redrive (like the settlement-phase
   RPC-transient case above) rather than consuming the apalis retry budget, since
