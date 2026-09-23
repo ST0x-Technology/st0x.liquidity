@@ -774,17 +774,99 @@ impl<
                 );
                 Ok(AttestationPollOutcome::TimedOut)
             }
-            Err(error) => {
-                warn!(target: "rebalance", %id, ?error, "Attestation polling failed");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("attestation polling failed: {error}"),
-                        },
-                    )
-                    .await?;
-                Err(UsdcTransferError::Cctp(Box::new(error)))
+            Err(error) => Err(self.fail_bridging_on_poll_error(id, error).await),
+        }
+    }
+
+    /// Latches `BridgingFailed` for a hard (non-timeout) attestation poll
+    /// error and returns the error to surface.
+    async fn fail_bridging_on_poll_error(
+        &self,
+        id: &UsdcRebalanceId,
+        error: CctpError,
+    ) -> UsdcTransferError {
+        warn!(target: "rebalance", %id, ?error, "Attestation polling failed");
+
+        if let Err(send_error) = self
+            .cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: format!("attestation polling failed: {error}"),
+                },
+            )
+            .await
+        {
+            return send_error.into();
+        }
+
+        UsdcTransferError::Cctp(Box::new(error))
+    }
+
+    /// Re-polls Circle for an `Attested` transfer that predates envelope
+    /// persistence.
+    ///
+    /// A timeout retries (see [`Self::continue_from_attested`]). A hard error
+    /// latches `BridgingFailed` only once the destination chain reads the
+    /// recorded `cctp_nonce` unused: when its mint has landed, or the read
+    /// fails, the resume redrives via `MintRecoveryInconclusive` so a later
+    /// attempt can adopt that mint.
+    async fn repoll_attested_attestation(
+        &self,
+        id: &UsdcRebalanceId,
+        mint_direction: BridgeDirection,
+        burn_tx: TxHash,
+        cctp_nonce: B256,
+        initiated_at: DateTime<Utc>,
+    ) -> Result<AttestationResponse, UsdcTransferError> {
+        let error = match self
+            .cctp_bridge
+            .poll_attestation(mint_direction, burn_tx)
+            .await
+        {
+            Ok(response) => return Ok(response),
+            Err(CctpError::AttestationTimeout { attempts, source }) => {
+                warn!(target: "rebalance", %id, attempts, ?source, "Circle attestation re-poll timed out");
+                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
+            }
+            Err(error) => error,
+        };
+
+        match self
+            .cctp_bridge
+            .mint_nonce_consumed(mint_direction, cctp_nonce)
+            .await
+        {
+            Ok(false) => Err(self.fail_bridging_on_poll_error(id, error).await),
+            Ok(true) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %cctp_nonce,
+                    ?error,
+                    "Circle re-poll failed, but the recorded nonce is consumed; redriving \
+                     to adopt its mint"
+                );
+                Err(UsdcTransferError::MintRecoveryInconclusive {
+                    id: id.clone(),
+                    initiated_at,
+                    source: Box::new(error),
+                })
+            }
+            Err(nonce_error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %cctp_nonce,
+                    ?error,
+                    ?nonce_error,
+                    "Circle re-poll failed and the recorded nonce could not be read; redriving"
+                );
+                Err(UsdcTransferError::MintRecoveryInconclusive {
+                    id: id.clone(),
+                    initiated_at,
+                    source: Box::new(error),
+                })
             }
         }
     }
@@ -889,6 +971,7 @@ impl<
         attestation: Vec<u8>,
         cctp_nonce: B256,
         message: Option<Vec<u8>>,
+        initiated_at: DateTime<Utc>,
     ) -> Result<AttestationResponse, UsdcTransferError> {
         let Some(message) = message else {
             warn!(
@@ -896,15 +979,9 @@ impl<
                 %id,
                 "Attested transfer predates envelope persistence; re-polling Circle for the attestation"
             );
-            let response = match self
-                .poll_cctp_attestation(id, mint_direction, burn_tx)
-                .await?
-            {
-                AttestationPollOutcome::Received(response) => response,
-                AttestationPollOutcome::TimedOut => {
-                    return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
-                }
-            };
+            let response = self
+                .repoll_attested_attestation(id, mint_direction, burn_tx, cctp_nonce, initiated_at)
+                .await?;
 
             return self.require_recorded_nonce(id, response, cctp_nonce).await;
         };
@@ -2230,6 +2307,7 @@ impl<
                 attestation,
                 cctp_nonce,
                 message,
+                initiated_at,
             )
             .await?;
 
@@ -3751,8 +3829,9 @@ impl<
     /// by design: reaching `Attested` means Circle already issued an attestation
     /// once, so a re-poll timeout is transient and bounding it would strand
     /// already-burned USDC. The `attestation_retry_deadline` bounds only the
-    /// `AwaitingAttestation` wait. A hard (non-timeout) poll error still fails
-    /// the bridge -- see [`Self::poll_cctp_attestation`].
+    /// `AwaitingAttestation` wait. A hard (non-timeout) poll error fails the
+    /// bridge only while the recorded nonce reads unused -- see
+    /// [`Self::repoll_attested_attestation`].
     async fn continue_from_attested(
         &self,
         id: &UsdcRebalanceId,
@@ -3775,6 +3854,7 @@ impl<
                 attestation,
                 cctp_nonce,
                 message,
+                initiated_at,
             )
             .await?;
 
@@ -5508,6 +5588,14 @@ mod tests {
             unimplemented!("MockBridge: find_attested_mint not used in this test")
         }
 
+        async fn mint_nonce_consumed(
+            &self,
+            _direction: BridgeDirection,
+            _nonce: B256,
+        ) -> Result<bool, CctpError> {
+            unimplemented!("MockBridge: mint_nonce_consumed not used in this test")
+        }
+
         async fn destination_block(&self, _direction: BridgeDirection) -> Result<u64, CctpError> {
             unimplemented!("MockBridge: destination_block not used in this test")
         }
@@ -5682,6 +5770,14 @@ mod tests {
                 .await
         }
 
+        async fn mint_nonce_consumed(
+            &self,
+            direction: BridgeDirection,
+            nonce: B256,
+        ) -> Result<bool, CctpError> {
+            self.inner.mint_nonce_consumed(direction, nonce).await
+        }
+
         async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, CctpError> {
             self.inner.destination_block(direction).await
         }
@@ -5838,6 +5934,14 @@ mod tests {
             Err((self.lookup_error)())
         }
 
+        async fn mint_nonce_consumed(
+            &self,
+            direction: BridgeDirection,
+            nonce: B256,
+        ) -> Result<bool, CctpError> {
+            self.inner.mint_nonce_consumed(direction, nonce).await
+        }
+
         async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, CctpError> {
             self.inner.destination_block(direction).await
         }
@@ -5991,6 +6095,14 @@ mod tests {
             self.inner
                 .find_attested_mint(direction, attestation, scan_from_block)
                 .await
+        }
+
+        async fn mint_nonce_consumed(
+            &self,
+            direction: BridgeDirection,
+            nonce: B256,
+        ) -> Result<bool, CctpError> {
+            self.inner.mint_nonce_consumed(direction, nonce).await
         }
 
         async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, CctpError> {
@@ -9958,6 +10070,7 @@ mod tests {
                 vec![0x01],
                 valid_message_nonce(),
                 None,
+                Utc::now(),
             )
             .await
             .unwrap();
@@ -9993,6 +10106,7 @@ mod tests {
                 vec![0x01],
                 valid_message_nonce(),
                 Some(vec![0u8; 10]),
+                Utc::now(),
             )
             .await
             .unwrap_err();
@@ -10038,6 +10152,7 @@ mod tests {
                 vec![0x01],
                 recorded,
                 Some(valid_cctp_message()),
+                Utc::now(),
             )
             .await
             .unwrap_err();
@@ -10089,6 +10204,7 @@ mod tests {
                 vec![0x01],
                 recorded,
                 None,
+                Utc::now(),
             )
             .await
             .unwrap_err();
@@ -12365,12 +12481,14 @@ mod tests {
         assert_ne!(mint_tx_hash, other_mint.tx);
     }
 
-    /// A legacy `Attested` transfer (no persisted envelope) whose mint already
-    /// landed must not latch `BridgingFailed` when the Circle re-poll fails:
-    /// its recorded nonce is consumed on chain, so the resume redrives and
-    /// adopts that mint once Circle answers.
-    #[tokio::test]
-    async fn legacy_attested_repoll_failure_does_not_fail_a_landed_mint() {
+    /// Drives a real BaseToAlpaca transfer to `Attested`, minting it on chain
+    /// when `mint_landed`, then rebuilds its attestation as a legacy transfer
+    /// (no persisted envelope) while Circle answers the re-poll with a
+    /// malformed response. Returns the rebuild error, the aggregate id, and the
+    /// state the aggregate is left in.
+    async fn legacy_attested_repoll_failure(
+        mint_landed: bool,
+    ) -> (UsdcTransferError, UsdcRebalanceId, UsdcRebalance) {
         let chains = deploy_dual_chain_cctp().await;
 
         let attestation = CctpAttestationMock::start().await;
@@ -12417,10 +12535,12 @@ mod tests {
             .poll_attestation(BridgeDirection::BaseToEthereum, burn.tx)
             .await
             .unwrap();
-        cctp_bridge
-            .mint(BridgeDirection::BaseToEthereum, &attestation_response)
-            .await
-            .unwrap();
+        if mint_landed {
+            cctp_bridge
+                .mint(BridgeDirection::BaseToEthereum, &attestation_response)
+                .await
+                .unwrap();
+        }
 
         // Circle now answers the re-poll with a malformed `complete` response.
         let circle = MockServer::start();
@@ -12498,9 +12618,25 @@ mod tests {
                 attestation_response.as_bytes().to_vec(),
                 attestation_response.nonce(),
                 None,
+                Utc::now(),
             )
             .await
             .unwrap_err();
+
+        assert_eq!(repoll_mock.calls(), 1);
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+
+        (error, id, state)
+    }
+
+    /// A legacy `Attested` transfer whose mint already landed must not latch
+    /// `BridgingFailed` when the Circle re-poll fails: its recorded nonce is
+    /// consumed on chain, so the resume redrives and adopts that mint once
+    /// Circle answers.
+    #[tokio::test]
+    async fn legacy_attested_repoll_failure_does_not_fail_a_landed_mint() {
+        let (error, id, state) = legacy_attested_repoll_failure(true).await;
 
         assert!(
             matches!(
@@ -12509,12 +12645,29 @@ mod tests {
             ),
             "a failed re-poll for a landed mint must redrive, got: {error:?}",
         );
-        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(state, UsdcRebalance::Attested { .. }),
             "a landed mint must not latch BridgingFailed on a Circle failure, got: {state:?}",
         );
-        assert_eq!(repoll_mock.calls(), 1);
+    }
+
+    /// With the recorded nonce still unused, a hard re-poll failure fails the
+    /// bridge as before: nothing was minted.
+    #[tokio::test]
+    async fn legacy_attested_repoll_failure_fails_the_bridge_while_the_nonce_is_unused() {
+        let (error, _, state) = legacy_attested_repoll_failure(false).await;
+
+        let UsdcTransferError::Cctp(cctp_error) = error else {
+            panic!("a failed re-poll with an unused nonce must fail the bridge, got: {error:?}");
+        };
+        assert!(
+            matches!(*cctp_error, CctpError::MalformedAttestation { .. }),
+            "got: {cctp_error:?}"
+        );
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "got: {state:?}"
+        );
     }
 
     /// The un-fail core: a post-burn `BridgingFailed` whose mint actually landed

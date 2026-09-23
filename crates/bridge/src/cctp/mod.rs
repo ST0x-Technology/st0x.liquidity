@@ -1388,6 +1388,27 @@ where
             .await
     }
 
+    async fn mint_nonce_consumed(
+        &self,
+        direction: BridgeDirection,
+        nonce: B256,
+    ) -> Result<bool, Self::Error> {
+        let consumed = match direction {
+            BridgeDirection::EthereumToBase => {
+                self.base
+                    .is_nonce_used::<OpenChainErrorRegistry>(nonce)
+                    .await?
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.ethereum
+                    .is_nonce_used::<OpenChainErrorRegistry>(nonce)
+                    .await?
+            }
+        };
+
+        Ok(consumed)
+    }
+
     async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error> {
         match direction {
             BridgeDirection::EthereumToBase => self.base.current_block().await,
