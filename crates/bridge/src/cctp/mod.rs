@@ -448,6 +448,12 @@ pub enum CctpError {
     TxReceiptMissingBlock { tx_hash: TxHash },
     #[error("USDC credited by transaction {tx_hash} overflows U256")]
     UsdcCreditOverflow { tx_hash: TxHash },
+    #[error("USDC Transfer log in transaction {tx_hash} does not decode: {source}")]
+    UsdcTransferLogDecode {
+        tx_hash: TxHash,
+        #[source]
+        source: alloy::sol_types::Error,
+    },
     #[error("Message too short for nonce extraction: got {length} bytes, need at least 44")]
     MessageTooShort { length: usize },
     #[error("Message too short for receiveMessage recovery: got {length} bytes, need at least 148")]
@@ -566,6 +572,7 @@ impl CctpError {
             | Self::MintAndWithdrawEventNotFound
             | Self::TxReceiptMissingBlock { .. }
             | Self::UsdcCreditOverflow { .. }
+            | Self::UsdcTransferLogDecode { .. }
             | Self::MessageTooShort { .. }
             | Self::MessageTooShortForRecovery { .. }
             | Self::MessageDestinationDomainMismatch { .. }
