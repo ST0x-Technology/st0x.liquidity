@@ -5839,6 +5839,7 @@ mod tests {
             failed_at: chrono::Utc::now(),
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         route_placement_outcome(&ctx, &symbol, offchain_order_id, Some(failed))
@@ -5931,6 +5932,7 @@ mod tests {
             failed_at: chrono::Utc::now(),
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         route_placement_outcome(&ctx, &symbol, second_order_id, Some(failed))

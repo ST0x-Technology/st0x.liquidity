@@ -395,7 +395,8 @@ fn clamp_to_i64(value: usize) -> i64 {
 
 /// Converts one view row, or skips it with a warning when the stored payload
 /// cannot be read -- a corrupt or superseded row must not take the whole page
-/// down with it.
+/// down with it. A readable row whose terminal is not a trade, a deferred
+/// placement, is skipped without a warning: it is expected, not damage.
 fn convert_row(
     view_id: &str,
     payload: &str,
@@ -408,7 +409,10 @@ fn convert_row(
     };
 
     let trade = match parse_row(view_id, payload, side) {
-        Ok(trade) => trade,
+        Ok(Some(trade)) => trade,
+        // A deferred placement never reached the broker, so its row holds a
+        // terminal that is not a trade and has nothing to render.
+        Ok(None) => return Ok(None),
         Err(error) => {
             warn!(
                 target: "dashboard",
@@ -443,11 +447,13 @@ fn convert_row(
     Ok(Some(trade))
 }
 
-fn parse_row(view_id: &str, payload: &str, side: Side) -> Result<Trade, TradeRowError> {
+fn parse_row(view_id: &str, payload: &str, side: Side) -> Result<Option<Trade>, TradeRowError> {
     match side {
         Side::Onchain => {
             let OnChainTradeProjectionPayload::Live(trade) = serde_json::from_str(payload)?;
-            Ok(trade.try_into_trade(&OnChainTradeId::from_str(view_id)?)?)
+            Ok(Some(
+                trade.try_into_trade(&OnChainTradeId::from_str(view_id)?)?,
+            ))
         }
         Side::Offchain => {
             let OffchainOrderProjectionPayload::Live(order) = serde_json::from_str(payload)?;
@@ -900,6 +906,53 @@ mod tests {
         let result = page(&pool, &TradeQuery::newest(V3)).await;
         assert_eq!(result.total, 0);
         assert!(result.trades.is_empty());
+    }
+
+    /// A deferred placement never reached the broker, so it is a terminal
+    /// order with no fill and no trade -- unlike a genuine failure, which the
+    /// same page still serves.
+    #[tokio::test]
+    async fn deferred_placements_are_absent_from_history() {
+        let pool = setup_test_db().await;
+        let store = offchain_store(&pool).await;
+
+        let deferred_id = OffchainOrderId::new();
+        place(&store, &deferred_id, "NVDA").await;
+        store
+            .send(
+                &deferred_id,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "hedge placement deferred".to_string(),
+                    kind: OffchainOrderFailureKind::Deferral,
+                },
+            )
+            .await
+            .unwrap();
+
+        let failed_id = OffchainOrderId::new();
+        place(&store, &failed_id, "NVDA").await;
+        store
+            .send(
+                &failed_id,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "asset is not tradable".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
+                },
+            )
+            .await
+            .unwrap();
+
+        let trades = page(&pool, &TradeQuery::newest(V3)).await.trades;
+
+        assert_eq!(
+            trades.iter().map(|trade| &trade.id).collect::<Vec<_>>(),
+            vec![&failed_id.to_string()],
+            "only the genuine failure may be served as a trade"
+        );
+        assert!(matches!(
+            &trades[0].outcome,
+            TradeOutcome::Failed { error, .. } if error == "asset is not tradable"
+        ));
     }
 
     /// The comparator's exact branches: descending time, then ascending sort

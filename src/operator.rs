@@ -4583,6 +4583,7 @@ pub mod process_tx {
                 failed_at: block_timestamp,
                 market_session: st0x_execution::MarketSession::Regular,
                 close_flatten: false,
+                kind: OffchainOrderFailureKind::Failure,
             };
 
             let disposition = reconcile_offchain_order_state(
@@ -4666,6 +4667,7 @@ pub mod process_tx {
                 failed_at: block_timestamp,
                 market_session: st0x_execution::MarketSession::Regular,
                 close_flatten: false,
+                kind: OffchainOrderFailureKind::Failure,
             };
 
             let disposition = reconcile_offchain_order_state(

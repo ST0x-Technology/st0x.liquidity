@@ -685,6 +685,12 @@ pub enum OffchainOrder {
         market_session: MarketSession,
         #[serde(default)]
         close_flatten: bool,
+        /// Whether this terminal records an expected deferral or a genuine
+        /// failure, so the dashboard can keep a deferred placement -- which
+        /// never reached the broker -- out of the trade feed. Projections
+        /// persisted before this field existed replay as genuine failures.
+        #[serde(default)]
+        kind: OffchainOrderFailureKind,
     },
     /// Terminal state after a successful broker cancellation. Distinct
     /// from `Failed` so analytics and the cancel-and-replace recovery
@@ -966,18 +972,20 @@ impl EventSourced for OffchainOrder {
                 *cancel_requested_at,
             )),
 
-            // The failure kind is reliability accounting metadata: a deferral
-            // and a genuine failure produce the identical terminal entity.
+            // The entity records the failure kind so the dashboard can tell a
+            // deferral -- which never reached the broker and is therefore not
+            // a trade -- from a genuine failure.
             Failed {
                 error,
                 filled_shares,
                 failed_at,
-                kind: _,
+                kind,
             } => Ok(evolve_failed(
                 entity,
                 error.clone(),
                 *filled_shares,
                 *failed_at,
+                *kind,
             )),
 
             Cancelled {
@@ -1634,6 +1642,7 @@ fn evolve_failed(
     error: String,
     filled_shares: Option<FractionalShares>,
     failed_at: DateTime<Utc>,
+    kind: OffchainOrderFailureKind,
 ) -> Option<OffchainOrder> {
     match entity {
         OffchainOrder::Pending {
@@ -1659,6 +1668,7 @@ fn evolve_failed(
             failed_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
+            kind,
         }),
         OffchainOrder::Submitted {
             symbol,
@@ -1685,6 +1695,7 @@ fn evolve_failed(
             failed_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
+            kind,
         }),
         OffchainOrder::PartiallyFilled {
             symbol,
@@ -1721,6 +1732,7 @@ fn evolve_failed(
             failed_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
+            kind,
         }),
         OffchainOrder::Cancelling {
             symbol,
@@ -1748,6 +1760,7 @@ fn evolve_failed(
             failed_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
+            kind,
         }),
         OffchainOrder::Filled { .. }
         | OffchainOrder::Failed { .. }
@@ -1982,11 +1995,13 @@ fn terminal_quantity_provenance(
 }
 
 impl OffchainOrder {
-    /// Renders a terminal fill or failure as a dashboard [`Trade`].
+    /// Renders a terminal fill or failure as a dashboard [`Trade`], or `None`
+    /// when the terminal is a deferred placement: it never reached the broker,
+    /// so it has no fill and is not a trade the feed can show.
     pub(crate) fn try_into_trade(
         self,
         id: &OffchainOrderId,
-    ) -> Result<Trade, TradeConversionError> {
+    ) -> Result<Option<Trade>, TradeConversionError> {
         let (symbol, shares, direction, executor, occurred_at, outcome) = match self {
             Self::Filled {
                 symbol,
@@ -2003,6 +2018,10 @@ impl OffchainOrder {
                 filled_at,
                 TradeOutcome::Filled,
             ),
+            Self::Failed {
+                kind: OffchainOrderFailureKind::Deferral,
+                ..
+            } => return Ok(None),
             Self::Failed {
                 symbol,
                 shares,
@@ -2075,7 +2094,7 @@ impl OffchainOrder {
             Self::Cancelling { .. } => return Err(TradeConversionError::Cancelling),
         };
 
-        Ok(Trade {
+        Ok(Some(Trade {
             id: id.to_string(),
             occurred_at,
             venue: match executor {
@@ -2086,7 +2105,7 @@ impl OffchainOrder {
             symbol,
             shares,
             outcome,
-        })
+        }))
     }
 
     pub fn symbol(&self) -> &Symbol {
@@ -4063,6 +4082,7 @@ mod tests {
             failed_at: failure_time,
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         let finalization =
@@ -4098,6 +4118,7 @@ mod tests {
             failed_at: failure_time,
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         let finalization =
@@ -4128,6 +4149,7 @@ mod tests {
             failed_at: failure_time,
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         let finalization =
@@ -4163,11 +4185,13 @@ mod tests {
             failed_at: failure_time,
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         let trade = order
             .try_into_trade(&OffchainOrderId::new())
-            .expect("valid terminal failure should convert");
+            .expect("valid terminal failure should convert")
+            .expect("a genuine failure must render as a trade");
         assert_eq!(trade.occurred_at, failure_time);
         assert!(trade.shares.inner().inner().eq(float!(2)).unwrap());
         match trade.outcome {
@@ -4232,11 +4256,13 @@ mod tests {
             failed_at,
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         let trade = order
             .try_into_trade(&OffchainOrderId::new())
-            .expect("overfilled terminal failures must remain visible");
+            .expect("overfilled terminal failures must remain visible")
+            .expect("a genuine failure must render as a trade");
         let TradeOutcome::Failed {
             filled_shares,
             remaining_shares,
@@ -4265,6 +4291,48 @@ mod tests {
         );
     }
 
+    /// A deferred placement never reached the broker: the terminal carries no
+    /// fill, so it is not a trade and the dashboard must not render one. The
+    /// identical terminal recorded as a genuine failure still converts.
+    #[test]
+    fn deferred_placement_terminal_is_not_a_trade() {
+        let failed_at = Utc::now();
+        let terminal = |kind| OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            requested_shares: None,
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            retained_fill: None,
+            filled_shares: None,
+            executor_order_id: None,
+            error: "hedge placement deferred".to_string(),
+            placed_at: failed_at,
+            failed_at,
+            market_session: MarketSession::Regular,
+            close_flatten: false,
+            kind,
+        };
+
+        let deferred = terminal(OffchainOrderFailureKind::Deferral)
+            .try_into_trade(&OffchainOrderId::new())
+            .unwrap();
+        assert!(
+            deferred.is_none(),
+            "a deferred placement never reached the broker and must not \
+             render as a trade, got: {deferred:?}"
+        );
+
+        let trade = terminal(OffchainOrderFailureKind::Failure)
+            .try_into_trade(&OffchainOrderId::new())
+            .unwrap()
+            .expect("a genuine failure must render as a trade");
+        let TradeOutcome::Failed { error, .. } = trade.outcome else {
+            panic!("a genuine failure must keep its failure outcome");
+        };
+        assert_eq!(error, "hedge placement deferred");
+    }
+
     #[test]
     fn cancelled_trade_distinguishes_explicit_zero_fill() {
         let cancelled_at = Utc::now();
@@ -4284,7 +4352,10 @@ mod tests {
             cancelled_at,
         };
 
-        let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
+        let trade = order
+            .try_into_trade(&OffchainOrderId::new())
+            .unwrap()
+            .expect("a cancelled terminal must render as a trade");
         assert_eq!(trade.shares, requested);
         let TradeOutcome::Cancelled {
             accepted_shares,
@@ -4331,7 +4402,10 @@ mod tests {
             cancelled_at,
         };
 
-        let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
+        let trade = order
+            .try_into_trade(&OffchainOrderId::new())
+            .unwrap()
+            .expect("a cancelled terminal must render as a trade");
         let TradeOutcome::Cancelled {
             filled_shares,
             remaining_shares,
@@ -4376,7 +4450,10 @@ mod tests {
         });
 
         let state: OffchainOrder = serde_json::from_value(legacy_payload).unwrap();
-        let trade = state.try_into_trade(&OffchainOrderId::new()).unwrap();
+        let trade = state
+            .try_into_trade(&OffchainOrderId::new())
+            .unwrap()
+            .expect("a cancelled terminal must render as a trade");
         let TradeOutcome::Cancelled {
             accepted_shares,
             filled_shares,
@@ -4413,9 +4490,13 @@ mod tests {
             failed_at,
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
-        let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
+        let trade = order
+            .try_into_trade(&OffchainOrderId::new())
+            .unwrap()
+            .expect("a genuine failure must render as a trade");
         let TradeOutcome::Failed { filled_shares, .. } = trade.outcome else {
             panic!("failed order must retain its failure outcome");
         };
@@ -4458,7 +4539,10 @@ mod tests {
             ),
             "legacy Failed payload must default fill metadata to None, got: {state:?}"
         );
-        let trade = state.try_into_trade(&OffchainOrderId::new()).unwrap();
+        let trade = state
+            .try_into_trade(&OffchainOrderId::new())
+            .unwrap()
+            .expect("a legacy failure must render as a trade");
         let TradeOutcome::Failed {
             accepted_shares,
             filled_shares,
@@ -4578,6 +4662,7 @@ mod tests {
             failed_at: placed_at,
             market_session: MarketSession::Extended,
             close_flatten: true,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         for (variant, state) in [
@@ -4666,7 +4751,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .try_into_trade(&id)
-            .unwrap();
+            .unwrap()
+            .expect("a genuine failure must render as a trade");
         assert!(trade.shares.inner().inner().eq(float!(100)).unwrap());
         let TradeOutcome::Failed {
             accepted_shares,
@@ -4716,7 +4802,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .try_into_trade(&id)
-            .unwrap();
+            .unwrap()
+            .expect("a genuine failure must render as a trade");
         let TradeOutcome::Failed {
             accepted_shares,
             filled_shares,

@@ -17016,6 +17016,7 @@ mod tests {
             failed_at: Utc::now(),
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         let result =
@@ -17075,6 +17076,7 @@ mod tests {
             failed_at: Utc::now(),
             market_session: MarketSession::Regular,
             close_flatten: false,
+            kind: OffchainOrderFailureKind::Failure,
         };
 
         dispatch_post_place_state(Some(failed_state), &symbol, &cqrs, offchain_order_id)
