@@ -1445,6 +1445,40 @@ async fn mint_is_capped_to_keep_the_alpaca_floor() {
     assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
 }
 
+/// Base's 60 of AAPL's 120 shares rank its 24-share redemption first, but
+/// Base's vault registry does not know the token, so the planner moves on
+/// to HyperEVM's 48-share shortfall instead of declining the symbol.
+#[tokio::test]
+async fn chain_missing_from_its_registry_yields_to_the_next_candidate() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(two_chain_trigger_config()).await;
+    let other = Symbol::new("MSFT").unwrap();
+    seed_vault_registry(&pool, Chain::Base, &other, Address::random()).await;
+    seed_vault_registry(&pool, Chain::HyperEvm, &symbol, Address::random()).await;
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(60),
+        offchain: float!(60),
+    })
+    .await;
+    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(0)).await;
+    service.check_and_trigger_equity(&symbol).await.unwrap();
+
+    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(mint.chain, Chain::HyperEvm);
+    assert_eq!(mint.quantity, FractionalShares::new(float!(48)));
+    assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
+}
+
 /// Base holds 80 of AAPL's 100 shares against a 50% target but may move
 /// only 10 per operation: the first tick redeems 10, and while that leaves
 /// Base over target, the next tick declines it as cooling down instead of
