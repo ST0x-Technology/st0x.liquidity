@@ -103,8 +103,9 @@ pub struct AllocationConfig {
 
 impl AllocationConfig {
     /// Checks the targets against the chain tables: a target may name only a
-    /// hedged chain, every rebalanced listing needs an effective target, and
-    /// per symbol those targets plus the floor must not exceed 1. A listing
+    /// hedged chain, every rebalanced listing needs an effective target that is
+    /// zero or above the deviation band, and per symbol those targets plus the
+    /// floor must not exceed 1. A listing
     /// with rebalancing disabled is never planned, so it needs no target and
     /// does not count.
     ///
@@ -148,6 +149,17 @@ impl AllocationConfig {
                         chain: *chain,
                         symbol: symbol.clone(),
                     })?;
+                // An empty chain is `target * total` short, never outside a
+                // band of `deviation * total` unless the target exceeds it.
+                let target_positive = target.inner().gt(Float::zero()?)?;
+                if target_positive && !target.inner().gt(self.deviation.inner())? {
+                    return Err(AllocationConfigError::TargetWithinBand {
+                        chain: *chain,
+                        symbol: symbol.clone(),
+                        target: target.inner(),
+                        deviation: self.deviation.inner(),
+                    });
+                }
                 let running = match sums.get(symbol) {
                     Some(sum) => (*sum + target.inner())?,
                     None => target.inner(),
@@ -257,6 +269,18 @@ pub enum AllocationConfigError {
          [chains.{chain}.trading.assets.equities.{symbol}]"
     )]
     MissingTarget { chain: Chain, symbol: Symbol },
+    #[error(
+        "{symbol} targets {} on {chain}, which is not above the deviation band of {}, \
+         so the chain could never be minted into",
+        format_float_with_fallback(target),
+        format_float_with_fallback(deviation)
+    )]
+    TargetWithinBand {
+        chain: Chain,
+        symbol: Symbol,
+        target: Float,
+        deviation: Float,
+    },
     #[error(
         "{symbol}: its chain target shares plus alpaca_floor sum to {}, which exceeds 1",
         format_float_with_fallback(total)

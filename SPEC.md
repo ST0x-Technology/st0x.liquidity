@@ -4894,7 +4894,10 @@ emits imbalance detection events.
     onchain fill price (the block-timestamped `Position.last_price`),
     overridable per chain with the trading table's `min_operation_usd`
   - Cooldown: `cooldown_secs` per `(symbol, chain)` after a dispatch
-  - At load, per symbol, the chain targets plus the floor must not exceed 1
+  - At load, per symbol, the chain targets plus the floor must not exceed 1, and
+    a positive target must exceed the band: an empty chain is only
+    `target * total` short, so a target at or inside the band is never minted
+    into
 - **USDC global**:
   - Target ratio: 0.5 (aim for 50% onchain, 50% offchain)
   - Deviation threshold: 0.3 (trigger when ratio deviates by +/-0.3 from target)
