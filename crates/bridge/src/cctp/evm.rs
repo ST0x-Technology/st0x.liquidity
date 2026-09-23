@@ -89,12 +89,16 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 /// over the sub-minute recency this bound relies on, while still cutting a
 /// worst-case scan from thousands of chunks to three.
 ///
-/// [`CctpEndpoint::find_existing_mint`]'s own scan is NOT bounded by this:
-/// it is a proactive check run during crash-recovery resume, which may be
-/// re-checking a transfer that stalled for an arbitrary, unbounded amount of
-/// time (e.g. days, waiting on an operator) before this code ever runs, so
-/// the "the mint is recent" argument above does not hold there.
+/// [`CctpEndpoint::find_existing_mint`] does not rely on this recency
+/// argument: it floors its scan at the destination head captured before the
+/// mint, or at [`LEGACY_MINT_SCAN_LOOKBACK_CHUNKS`] for transfers without one.
 const RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS: u64 = 3;
+
+/// Chunks [`CctpEndpoint::find_existing_mint`] looks back from the head when
+/// the transfer has no captured scan floor (its attestation was recorded
+/// before the floor existed). A mint older than this is left to the operator
+/// rather than found by a scan to genesis on every resume.
+const LEGACY_MINT_SCAN_LOOKBACK_CHUNKS: u64 = 3;
 
 /// Delay between the `usedNonces()` probes that
 /// [`CctpEvm::recover_already_minted`] runs after a failed `receiveMessage`.
@@ -918,10 +922,17 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// here. Used proactively by crash-recovery resume, before minting.
     /// [`recover_already_minted`](Self::recover_already_minted) does not call
     /// this directly -- see its own doc for why.
+    ///
+    /// The log scan for a consumed nonce is floored at `scan_from_block`, or
+    /// [`LEGACY_MINT_SCAN_LOOKBACK_CHUNKS`] below the head when it is `None`.
+    /// A log still missing after the lag retries is
+    /// [`CctpError::MintNotFoundInScanWindow`]: every resume would otherwise
+    /// repeat a walk to genesis.
     pub(super) async fn find_existing_mint<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
         message: &[u8],
+        scan_from_block: Option<u64>,
     ) -> Result<Option<MintReceipt>, CctpError> {
         let received_message = validate_message_shape(message, direction)?;
 
@@ -934,14 +945,29 @@ impl<W: Wallet> CctpEndpoint<W> {
             return Ok(None);
         }
 
-        // No lower bound: a crash-recovery resume may be re-checking a
-        // transfer that stalled for an unbounded amount of time before this
-        // runs, so the mint cannot be assumed recent here -- unlike
-        // `reconstruct_existing_mint`'s bounded retry (see
-        // `RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`'s doc).
-        self.locate_mint_receipt(&received_message, None)
+        let from_block = match scan_from_block {
+            Some(block) => block,
+            None => self.current_block().await?.saturating_sub(
+                CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(LEGACY_MINT_SCAN_LOOKBACK_CHUNKS),
+            ),
+        };
+
+        match self
+            .locate_mint_receipt_with_lag_retries(&received_message, Some(from_block))
             .await
-            .map(Some)
+        {
+            Ok(mint_receipt) => Ok(Some(mint_receipt)),
+            Err(CctpError::AlreadyMintedMessageNotFound { nonce }) => {
+                warn!(
+                    target: "bridge",
+                    %nonce,
+                    from_block,
+                    "CCTP nonce consumed but its mint is not in the scan window"
+                );
+                Err(CctpError::MintNotFoundInScanWindow { nonce, from_block })
+            }
+            Err(other_error) => Err(other_error),
+        }
     }
 
     /// Cheap authoritative gate: `true` once `nonce` has been consumed on this
@@ -1062,6 +1088,18 @@ impl<W: Wallet> CctpEndpoint<W> {
             }
         };
 
+        self.locate_mint_receipt_with_lag_retries(received_message, min_block)
+            .await
+    }
+
+    /// [`locate_mint_receipt`](Self::locate_mint_receipt), retrying only
+    /// [`CctpError::AlreadyMintedMessageNotFound`] (log-index lag behind the
+    /// node's own `usedNonces()` answer) up to `SCAN_ATTEMPTS` times.
+    async fn locate_mint_receipt_with_lag_retries(
+        &self,
+        received_message: &CctpReceivedMessage<'_>,
+        min_block: Option<u64>,
+    ) -> Result<MintReceipt, CctpError> {
         let mut attempt = 1;
 
         loop {
@@ -1267,18 +1305,12 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// its hash alongside the matched `MessageReceived` log index (used to
     /// correlate the right `MintAndWithdraw` within a multicall transaction).
     ///
-    /// `min_block` floors how far back the scan walks: `None` (used by
-    /// [`find_existing_mint`](Self::find_existing_mint)'s proactive
-    /// crash-recovery check) leaves it unbounded, walking all the way to
-    /// block 0 if needed, since that caller may be re-checking a transfer
-    /// that stalled for an unbounded amount of time. `Some(block)` (used by
-    /// [`reconstruct_existing_mint`](Self::reconstruct_existing_mint)'s
-    /// retry, see [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`]) stops the walk
-    /// there instead, since that caller only runs immediately after this
-    /// same recovery attempt's own probe loop observed the nonce become
-    /// consumed, so the matching log cannot be older than the floor. A hard
-    /// limit is deliberately omitted in the unbounded case to avoid failing
-    /// recovery when a deep reorg or lagging node pushes the log back.
+    /// `min_block` floors how far back the scan walks. `None` walks to block
+    /// 0; only [`reconstruct_existing_mint`](Self::reconstruct_existing_mint)
+    /// passes it, and only when its head read fails. Otherwise the floor is
+    /// [`find_existing_mint`](Self::find_existing_mint)'s captured or legacy
+    /// floor, or [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`] below the head for
+    /// the reconstruction that just saw the nonce become consumed.
     async fn find_received_message_tx(
         &self,
         source_domain: u32,

@@ -2341,6 +2341,7 @@ mod tests {
             attestation: vec![],
             cctp_nonce: B256::ZERO,
             message: None,
+            mint_scan_from_block: Some(100),
             attested_at: ts(105),
         }
     }

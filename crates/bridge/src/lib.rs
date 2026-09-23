@@ -182,11 +182,23 @@ pub trait Bridge: Send + Sync + 'static {
     /// chain, or `None` while that nonce is unused, for crash-safe resume. The
     /// match is by nonce, so another transfer's mint to the same recipient is
     /// never returned.
+    ///
+    /// `scan_from_block` floors the log scan for a consumed nonce: the
+    /// [`Bridge::destination_block`] captured before the mint, or `None` for a
+    /// transfer that predates it, which looks back a fixed window from the
+    /// head. A consumed nonce whose mint is not found above the floor is an
+    /// error for operator reconciliation, never a scan to genesis.
     async fn find_attested_mint(
         &self,
         direction: BridgeDirection,
         attestation: &Self::Attestation,
+        scan_from_block: Option<u64>,
     ) -> Result<Option<MintReceipt>, Self::Error>;
+
+    /// Returns the current head of the mint destination chain for `direction`.
+    /// Captured when the attestation is recorded -- before the mint -- as the
+    /// floor of [`Bridge::find_attested_mint`]'s scan.
+    async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error>;
 
     /// Returns the current head of the burn source chain for `direction`.
     /// Captured before the burn call so crash-safe resume ([`Bridge::find_recent_burn`])

@@ -4104,6 +4104,7 @@ mod tests {
                         "0x000000000000000000000000000000000000000000000000000000000000CAFE"
                     ),
                     message: vec![0xCD],
+                    mint_scan_from_block: 1,
                 },
             )
             .await
@@ -4476,6 +4477,7 @@ mod tests {
                         "0x000000000000000000000000000000000000000000000000000000000000CAFE"
                     ),
                     message: vec![0xBB],
+                    mint_scan_from_block: 1,
                 },
             )
             .await
@@ -4529,6 +4531,7 @@ mod tests {
                         "0x000000000000000000000000000000000000000000000000000000000000CAFE"
                     ),
                     message: vec![0xBB],
+                    mint_scan_from_block: 1,
                 },
             )
             .await
