@@ -1767,28 +1767,20 @@ impl<
             });
         }
 
-        // Log the fee delta when Alpaca deducted a withdrawal fee so operators
-        // have an audit trail for P&L reconciliation.
-        let received = u256_to_usdc(credited)?;
-        if received < amount {
-            match amount - received {
-                Ok(delta) => info!(
-                    target: "rebalance",
-                    %id,
-                    nominal = %amount,
-                    %received,
-                    %delta,
-                    "Alpaca withdrawal fee deducted; bridging the credited amount, not nominal"
-                ),
-                Err(error) => warn!(
-                    target: "rebalance",
-                    %id,
-                    %error,
-                    nominal = %amount,
-                    %received,
-                    "Alpaca fee-delta subtraction failed; delta unknown"
-                ),
-            }
+        // Bridge what was credited, but page on any shortfall: Alpaca reports no
+        // withdrawal fee, so a short credit may also be a partial or wrong tx,
+        // and nothing else accounts for the rest of the withdrawn USDC.
+        if credited < nominal {
+            warn!(
+                target: "operational_alert",
+                alert = true,
+                %id,
+                %withdrawal_tx,
+                credited = %display_usdc(credited),
+                requested = %amount,
+                shortfall = %display_usdc(nominal - credited),
+                "Alpaca withdrawal credited less USDC than requested; bridging the credited amount"
+            );
         }
 
         // The burn lands in a strictly later block than the withdrawal

@@ -4340,10 +4340,12 @@ Alpaca to Base:
      receipt. The credit is the sum of that transaction's USDC `Transfer` logs
      to the market-maker wallet, exact in USDC base units. The wallet balance is
      never used for attribution. Two cases:
-     - **0 < credit <= nominal**: burn exactly the credit (this accounts for
-       Alpaca withdrawal fees) and persist it in
+     - **0 < credit <= nominal**: burn exactly the credit and persist it in
        `BridgingSubmitting.burn_amount`, so a crash-resume scan targets the
-       exact burned amount.
+       exact burned amount. A credit below nominal also raises a warning-level
+       operator alert (`operational_alert`) with the credited, requested and
+       shortfall amounts: Alpaca reports no withdrawal fee, so the gap may be a
+       partial or wrong transaction rather than a fee.
      - **credit = 0 or credit > nominal**: the reported transaction did not pay
        this withdrawal. Emit `FailBridging` without attempting a burn and
        surface `WithdrawalCreditMismatch` for operator reconciliation. The job
