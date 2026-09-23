@@ -599,8 +599,9 @@ that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
   `transfer resume --kind usdc`: its `find_recent_burn` scan adopts the orphan
   burn, persists `BridgingInitiated`, and the transfer continues normally.
 
-`transfer reconcile` is the path for persisted post-burn terminal failures (e.g.
-`DepositFailed`, `BridgingFailed` with a burn tx recorded).
+`transfer reconcile` is the path for persisted terminal failures whose funds
+left the source venue (e.g. `DepositFailed`, `BridgingFailed` with a burn tx
+recorded, any `AlpacaToBase` `BridgingFailed`).
 
     stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn not attempted"
 
@@ -626,13 +627,17 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   --reason "redeemed manually"
 ```
 
-- `--kind usdc` drives a stuck post-burn USDC rebalance to the clearing terminal
-  `Reconciled` state, releasing the rebalancing guard. It is accepted from any
-  of the post-burn terminal failures: `DepositFailed` (any direction), a
+- `--kind usdc` drives a stuck USDC rebalance whose funds already left the
+  source venue to the clearing terminal `Reconciled` state, releasing the
+  rebalancing guard. It is accepted from: `DepositFailed` (any direction), a
   post-burn `BridgingFailed` (one carrying a `burn_tx_hash` or `cctp_nonce`),
-  and a `BaseToAlpaca` `ConversionFailed`. Its `--reason` must be one of
-  `funds-moved-manually` or `deposit-credited-offline`; any other value is
-  rejected. Valid only from a post-burn terminal failure.
+  any `AlpacaToBase` `BridgingFailed` (the withdrawal completed, so the funds
+  left Alpaca even with no burn, e.g. the settlement deadline, a missing
+  withdrawal tx hash, or a withdrawal credit mismatch), and a `BaseToAlpaca`
+  `ConversionFailed`. Its `--reason` must be one of `funds-moved-manually` or
+  `deposit-credited-offline`; any other value is rejected. Every other state is
+  rejected, including `WithdrawalFailed` and an `AlpacaToBase`
+  `ConversionFailed`, whose funds never left Alpaca.
 - `--kind mint` / `--kind redemption` mark an equity transfer stuck in `Failed`
   as terminal `Reconciled`. This is a pure bookkeeping transition: it emits no
   reactor effect and dispatches no inventory update. One nuance for redemptions

@@ -1703,8 +1703,8 @@ impl<
         let amount = normalize_alpaca_usdc(amount)?;
         let nominal = usdc_to_u256(amount)?;
 
-        // Only a legacy aggregate confirmed its withdrawal without a tx hash.
-        // With no delivering tx there is nothing to credit the transfer from.
+        // A legacy aggregate, or the no-hash deadline path interrupted between
+        // ConfirmWithdrawal and FailBridging: nothing to credit the transfer from.
         let Some(withdrawal_tx) = withdrawal_tx else {
             error!(
                 target: "rebalance",
@@ -4875,13 +4875,13 @@ fn normalized_alpaca_usdc_to_u256(amount: Usdc) -> Result<U256, UsdcTransferErro
     usdc_to_u256(normalize_alpaca_usdc(amount)?)
 }
 
-/// Converts a U256 amount (with 6 decimals) to USDC decimal.
 /// Renders a USDC base-unit amount for logs, falling back to base units when
 /// it does not fit [`Usdc`].
 fn display_usdc(amount: U256) -> String {
     u256_to_usdc(amount).map_or_else(|_| format!("{amount} base units"), |usdc| usdc.to_string())
 }
 
+/// Converts a U256 amount (with 6 decimals) to USDC decimal.
 pub(crate) fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
     Ok(Usdc::new(Float::from_fixed_decimal(amount, 6)?))
 }
