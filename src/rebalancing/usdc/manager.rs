@@ -2268,8 +2268,19 @@ impl<
 
         // The transfer is credited only from the tx that delivered its USDC, and
         // Alpaca can report Complete before the hash. Stay `Withdrawing` and
-        // re-poll the same transfer id until the hash is present.
+        // re-poll the same transfer id until the hash is present, but only up
+        // to the settlement deadline: a hash that never arrives would hold the
+        // cash guard forever.
         let Some(withdrawal_tx) = transfer.tx else {
+            let deadline_elapsed = (Utc::now() - initiated_at)
+                .to_std()
+                .is_ok_and(|elapsed| elapsed >= self.settlement_retry_deadline);
+            if deadline_elapsed {
+                return self
+                    .fail_completed_withdrawal_without_tx(id, transfer_id, initiated_at)
+                    .await;
+            }
+
             warn!(
                 target: "rebalance",
                 %id, %transfer_id,
@@ -2364,6 +2375,48 @@ impl<
         }
 
         Ok(withdrawal_tx)
+    }
+
+    /// Alpaca reported the withdrawal Complete but never its tx hash within
+    /// the settlement deadline. The funds left Alpaca, so this is a pre-burn
+    /// `BridgingFailed` (reconcile-eligible), never `FailWithdrawal`.
+    async fn fail_completed_withdrawal_without_tx(
+        &self,
+        id: &UsdcRebalanceId,
+        transfer_id: &AlpacaTransferId,
+        initiated_at: DateTime<Utc>,
+    ) -> Result<TxHash, UsdcTransferError> {
+        error!(
+            target: "rebalance",
+            %id,
+            %transfer_id,
+            %initiated_at,
+            "Alpaca withdrawal is complete but reported no tx hash before the settlement \
+             deadline; failing for operator reconciliation"
+        );
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: format!(
+                        "Alpaca withdrawal {transfer_id} completed but reported no tx hash \
+                         before the settlement deadline; settle the withdrawn funds with \
+                         `transfer reconcile --kind usdc`"
+                    ),
+                },
+            )
+            .await?;
+
+        Err(UsdcTransferError::WithdrawalTxMissing { id: id.clone() })
     }
 
     /// Converts a `CctpError::MintRecoveryInconclusive` into the redrive

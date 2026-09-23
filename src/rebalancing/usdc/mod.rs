@@ -303,9 +303,9 @@ pub enum UsdcTransferError {
     WithdrawalRefMustBeAlpacaId {
         id: crate::usdc_rebalance::UsdcRebalanceId,
     },
-    /// A legacy AlpacaToBase aggregate confirmed its withdrawal without a tx
-    /// hash, so nothing delivered-USDC can be credited from. The manager moves
-    /// the aggregate to `BridgingFailed`.
+    /// An AlpacaToBase withdrawal has no tx hash to credit the delivered USDC
+    /// from: a legacy aggregate, or Alpaca never reported the hash before the
+    /// settlement deadline. The manager moves the aggregate to `BridgingFailed`.
     #[error(
         "USDC rebalance {id}: no recorded withdrawal tx hash; cannot credit \
          Ethereum USDC to the Alpaca withdrawal"

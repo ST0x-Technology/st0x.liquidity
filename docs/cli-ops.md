@@ -503,10 +503,22 @@ Alpaca dashboard. The resume enqueues only when no live row exists (for example,
 after the job's retries are exhausted and the row is terminal `Failed`).
 
 When the resume does enqueue, the bot's worker re-polls Alpaca for the recorded
-transfer and proceeds normally if the withdrawal has completed (the common
-case), or emits `FailWithdrawal` if Alpaca reports Failed with no tx hash. If
-Alpaca reports Failed with a tx hash, polling stays inconclusive and the guard
-remains held. The `--direction` must be `to-raindex` for AlpacaToBase.
+transfer and proceeds normally if the withdrawal has completed with a tx hash
+(the common case), or emits `FailWithdrawal` if Alpaca reports Failed with no tx
+hash. If Alpaca reports Failed with a tx hash, polling stays inconclusive and
+the guard remains held. The `--direction` must be `to-raindex` for AlpacaToBase.
+
+**Complete with no tx hash**: the transfer is credited only from the tx that
+delivered its USDC, so a Complete withdrawal whose `tx_hash` is still null is
+also inconclusive and re-polled (same 4-hour alert). The wait is bounded by
+`[rebalancing] settlement_retry_deadline_secs`, counted from
+`Withdrawing.initiated_at`. Past it, the bot fails the bridge (`BridgingFailed`,
+no burn), stops re-polling, and pages with "has no recorded withdrawal tx hash".
+The USDC is then in the Ethereum wallet but not credited to any transfer. Like
+every AlpacaToBase `BridgingFailed`, the guard stays held until
+`transfer reconcile --kind usdc` settles the transfer (see "Reconciling Stuck
+Failed Transfers" below): find the withdrawal tx on Etherscan (the Alpaca
+transfer UUID is in the log), move the funds by hand, then reconcile.
 
 **Known limitation -- permanent `TransferNotFound`**: if `transfer resume`
 consistently reports inconclusive and Alpaca's dashboard confirms the withdrawal
