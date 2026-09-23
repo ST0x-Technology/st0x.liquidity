@@ -619,10 +619,12 @@ mod tests {
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
 
-    use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
+    use crate::offchain::order::{
+        OffchainOrder, OffchainOrderEvent, OffchainOrderFailureKind, OffchainOrderId,
+    };
     use crate::performance::projection::HedgeLatencyProjection;
     use crate::performance::test_helpers::{
-        fill_event, placed_event, position_failed_event, position_filled_event,
+        fill_event, placed_event, position_filled_event, position_retired_event,
         report_performances, run_position_stream, symbol, timestamp,
     };
     use crate::position::{Position, PositionEvent};
@@ -833,7 +835,10 @@ mod tests {
             .await
             .unwrap();
         harness
-            .receive::<Position>(symbol(), position_failed_event(order_id, 6))
+            .receive::<Position>(
+                symbol(),
+                position_retired_event(order_id, 6, OffchainOrderFailureKind::Failure),
+            )
             .await
             .unwrap();
 

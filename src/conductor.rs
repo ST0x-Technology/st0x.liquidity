@@ -81,11 +81,11 @@ use crate::mint_authorization::{
 };
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use crate::offchain::order::{
-    ExecutorOrderPlacer, OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
-    PollOrderStatus, PollOrderStatusJobQueue, TerminalPositionFinalization,
-    client_order_id_for_placement, finalize_cancelled_position_or_log_unpriced,
-    place_offchain_order_at_broker, position_command_for_finalization, push_poll_job_if_absent,
-    terminal_position_finalization,
+    ExecutorOrderPlacer, OffchainOrder, OffchainOrderFailureKind, OffchainOrderId,
+    OffchainOrderPlacement, OrderPlacer, PollOrderStatus, PollOrderStatusJobQueue,
+    TerminalPositionFinalization, client_order_id_for_placement,
+    finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
+    position_command_for_finalization, push_poll_job_if_absent, terminal_position_finalization,
 };
 #[cfg(test)]
 use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
@@ -4180,6 +4180,7 @@ async fn recover_single_orphaned_order(
                             // No broker terminality classification available
                             // here; fail-safe preserves.
                             anchor: AnchorDisposition::Preserve,
+                            kind: OffchainOrderFailureKind::Failure,
                         },
                     )
                     .await?;
@@ -4228,6 +4229,7 @@ async fn resolve_terminal_claimed_order(
                     offchain_order_id: order_id,
                     error: "pending offchain order has no offchain order aggregate".to_string(),
                     anchor: missing_order_anchor,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await?;
@@ -5703,6 +5705,7 @@ async fn dispatch_post_place_state(
                         // No broker terminality classification available
                         // here; fail-safe preserves.
                         anchor: AnchorDisposition::Preserve,
+                        kind: OffchainOrderFailureKind::Failure,
                     },
                 )
                 .await?;
@@ -5741,6 +5744,7 @@ async fn dispatch_post_place_state(
                         offchain_order_id,
                         error: "Offchain order missing after Place".to_string(),
                         anchor: AnchorDisposition::Preserve,
+                        kind: OffchainOrderFailureKind::Failure,
                     },
                 )
                 .await?;
@@ -6039,6 +6043,7 @@ where
                             // No broker terminality classification available
                             // here; fail-safe preserves.
                             anchor: AnchorDisposition::Preserve,
+                            kind: OffchainOrderFailureKind::Failure,
                         },
                     )
                     .await?;
@@ -10301,6 +10306,7 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "lost placement response".to_string(),
                     anchor: AnchorDisposition::Preserve,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -14833,6 +14839,7 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "lost placement response".to_string(),
                     anchor: AnchorDisposition::Preserve,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

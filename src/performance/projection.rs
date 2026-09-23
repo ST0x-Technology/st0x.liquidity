@@ -17,7 +17,9 @@ use tracing::{debug, warn};
 
 use st0x_execution::Symbol;
 
-use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
+use crate::offchain::order::{
+    OffchainOrder, OffchainOrderEvent, OffchainOrderFailureKind, OffchainOrderId,
+};
 use crate::position::{Position, PositionEvent, TradeId};
 
 use super::{PerformanceError, covered_fills, uncovered_fills_on_connection};
@@ -78,11 +80,25 @@ impl HedgeLatencyProjection {
             PositionEvent::OffChainOrderFailed {
                 offchain_order_id,
                 failed_at,
+                kind: OffchainOrderFailureKind::Failure,
                 ..
             } => {
                 self.offchain_order_failed(offchain_order_id, failed_at)
                     .await
             }
+            // A deferral retires the order without a broker failure (ADR 0022)
+            // and an intentional cancellation never was one either: both leave
+            // the exposure for the standing pipeline to hedge again, so the
+            // cycle is neither a fill nor a failure and must not be reported as
+            // a failed hedge cycle.
+            PositionEvent::OffChainOrderFailed {
+                offchain_order_id,
+                kind: OffchainOrderFailureKind::Deferral,
+                ..
+            }
+            | PositionEvent::OffChainOrderCancelled {
+                offchain_order_id, ..
+            } => self.drop_pending_cycle(offchain_order_id).await,
             // A manual adjustment means accumulated fills no longer drive
             // hedging decisions; attributing them to a later hedge would
             // overstate its exposure window. Record the reset boundary so the
@@ -91,9 +107,6 @@ impl HedgeLatencyProjection {
             PositionEvent::ManualPositionAdjusted { adjusted_at, .. } => {
                 self.manual_position_adjusted(&symbol, adjusted_at).await
             }
-            PositionEvent::OffChainOrderCancelled {
-                offchain_order_id, ..
-            } => self.offchain_order_cancelled(offchain_order_id).await,
         }
     }
 
@@ -298,11 +311,12 @@ impl HedgeLatencyProjection {
         Ok(())
     }
 
-    /// An intentionally cancelled hedge is neither a fill nor a failure, so it
-    /// must not linger as a never-resolved pending cycle nor count toward
-    /// failure-rate analytics. Drop the pending cycle row; a cycle that already
-    /// recorded a terminal outcome (fill/failure) is left untouched.
-    async fn offchain_order_cancelled(
+    /// An intentionally cancelled hedge and a deferred one are neither a fill
+    /// nor a failure, so neither must linger as a never-resolved pending cycle
+    /// nor count toward failure-rate analytics. Drop the pending cycle row; a
+    /// cycle that already recorded a terminal outcome (fill/failure) is left
+    /// untouched.
+    async fn drop_pending_cycle(
         &self,
         offchain_order_id: OffchainOrderId,
     ) -> Result<(), ProjectionError> {
@@ -406,7 +420,7 @@ mod tests {
 
     use crate::performance::report::{HedgeOutcome, ReportRange, load_hedge_performance};
     use crate::performance::test_helpers::{
-        fill_event, placed_event, position_failed_event, position_filled_event,
+        fill_event, placed_event, position_filled_event, position_retired_event,
         run_position_stream, symbol, timestamp,
     };
     use crate::position::{PositionEvent, TradeId};
@@ -423,7 +437,7 @@ mod tests {
             vec![
                 fill_event(1, 0, 1),
                 placed_event(order_id, 2),
-                position_failed_event(order_id, 5),
+                position_retired_event(order_id, 5, OffchainOrderFailureKind::Failure),
             ],
         )
         .await;
@@ -450,7 +464,7 @@ mod tests {
         for event in [
             fill_event(1, 0, 1),
             placed_event(failed_order, 2),
-            position_failed_event(failed_order, 5),
+            position_retired_event(failed_order, 5, OffchainOrderFailureKind::Failure),
             placed_event(retry_order, 10),
         ] {
             harness.receive::<Position>(symbol(), event).await.unwrap();
@@ -510,7 +524,7 @@ mod tests {
                     price_usdc: None,
                     adjusted_at: timestamp(5),
                 },
-                position_failed_event(adjusted_order, 6),
+                position_retired_event(adjusted_order, 6, OffchainOrderFailureKind::Failure),
                 placed_event(later_order, 10),
             ],
         )
@@ -655,10 +669,59 @@ mod tests {
     async fn failed_event_with_no_prior_placement_produces_no_cycles() {
         let order_id = OffchainOrderId::new();
 
-        let (_pool, performance) =
-            run_position_stream(symbol(), vec![position_failed_event(order_id, 5)]).await;
+        let (_pool, performance) = run_position_stream(
+            symbol(),
+            vec![position_retired_event(
+                order_id,
+                5,
+                OffchainOrderFailureKind::Failure,
+            )],
+        )
+        .await;
 
         assert!(performance.cycles.is_empty());
+    }
+
+    /// The failure kind decides whether a retirement is a hedge cycle outcome:
+    /// a `Deferral` never reached the broker (ADR 0022), so its still-pending
+    /// cycle is dropped and the report shows no failed hedge, while a genuine
+    /// `Failure` still stamps the cycle failed.
+    #[tokio::test]
+    async fn deferred_retirement_drops_the_cycle_while_a_failure_records_it() {
+        let deferred_order = OffchainOrderId::new();
+        let failed_order = OffchainOrderId::new();
+
+        let (pool, performance) = run_position_stream(
+            symbol(),
+            vec![
+                fill_event(1, 0, 1),
+                placed_event(deferred_order, 2),
+                position_retired_event(deferred_order, 3, OffchainOrderFailureKind::Deferral),
+                placed_event(failed_order, 4),
+                position_retired_event(failed_order, 5, OffchainOrderFailureKind::Failure),
+            ],
+        )
+        .await;
+
+        let deferred_row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT failed_at FROM hedge_cycle WHERE offchain_order_id = ?")
+                .bind(deferred_order.to_string())
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            deferred_row, None,
+            "a deferral must leave no hedge cycle row at all, not one stamped failed"
+        );
+
+        assert_eq!(performance.cycles.len(), 1);
+        assert_eq!(performance.cycles[0].offchain_order_id, failed_order);
+        assert_eq!(
+            performance.cycles[0].outcome,
+            HedgeOutcome::Failed {
+                failed_at: timestamp(5)
+            }
+        );
     }
 
     /// A Submitted event arrives for an order_id that was never placed. The

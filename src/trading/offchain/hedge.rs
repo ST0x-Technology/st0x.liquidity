@@ -37,8 +37,8 @@ use crate::conductor::job::{
 #[cfg(test)]
 use crate::offchain::order::PollOrderStatus;
 use crate::offchain::order::{
-    CounterTradeOrderKind, JobError, OffchainOrder, OffchainOrderId, OffchainOrderPlacement,
-    OrderPlacer, PollOrderStatusJobQueue, client_order_id_for_placement,
+    CounterTradeOrderKind, JobError, OffchainOrder, OffchainOrderFailureKind, OffchainOrderId,
+    OffchainOrderPlacement, OrderPlacer, PollOrderStatusJobQueue, client_order_id_for_placement,
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
     push_poll_job_if_absent,
 };
@@ -1339,6 +1339,7 @@ async fn route_placement_outcome(
                         // No broker terminality classification available
                         // here; fail-safe preserves.
                         anchor: AnchorDisposition::Preserve,
+                        kind: OffchainOrderFailureKind::Failure,
                     },
                 )
                 .await?;
@@ -1373,6 +1374,7 @@ async fn route_placement_outcome(
                         offchain_order_id,
                         error: "Offchain order missing after Place".to_string(),
                         anchor: AnchorDisposition::Preserve,
+                        kind: OffchainOrderFailureKind::Failure,
                     },
                 )
                 .await?;
@@ -3116,6 +3118,7 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "lost placement response".to_string(),
                     anchor: AnchorDisposition::Preserve,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -3564,6 +3567,7 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "lost placement response".to_string(),
                     anchor: AnchorDisposition::Preserve,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -5898,6 +5902,7 @@ mod tests {
                     offchain_order_id: first_order_id,
                     error: "first attempt lost in flight".to_string(),
                     anchor: AnchorDisposition::Preserve,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -8967,6 +8972,7 @@ mod tests {
                     offchain_order_id: expired_order_id,
                     error: "expired".to_string(),
                     anchor: AnchorDisposition::Release,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

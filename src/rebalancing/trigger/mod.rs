@@ -7370,7 +7370,7 @@ mod tests {
     use crate::inventory::view::{EquityReconcileBusy, InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::mint_authorization::ConfiguredMintAuthorizer;
-    use crate::offchain::order::OffchainOrderId;
+    use crate::offchain::order::{OffchainOrderFailureKind, OffchainOrderId};
     use crate::onchain::mock::MockRaindex;
     use crate::position::{
         AnchorDisposition, Position, PositionCommand, PositionEvent, TradeId, TriggerReason,
@@ -11121,6 +11121,7 @@ mod tests {
             error: "test failure".to_string(),
             failed_at: Utc::now(),
             anchor: AnchorDisposition::Preserve,
+            kind: OffchainOrderFailureKind::Failure,
         }
     }
 
@@ -11832,6 +11833,7 @@ mod tests {
                     offchain_order_id,
                     error: "test terminal failure".to_string(),
                     anchor: AnchorDisposition::Release,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -11983,6 +11985,7 @@ mod tests {
                     offchain_order_id,
                     error: "test terminal failure".to_string(),
                     anchor: AnchorDisposition::Release,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

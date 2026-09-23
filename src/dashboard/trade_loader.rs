@@ -198,22 +198,31 @@ fn side_filter(query: &TradeQuery, side: Side) -> Option<Filter> {
     }
 
     // Onchain trades are fills, which every protocol carries, so only the
-    // offchain side narrows by terminal outcome -- and only when the protocol
-    // drops one, since `occurred_at IS NOT NULL` already selects exactly the
-    // terminal rows.
-    //
-    // The leading `+` strips the term's index affinity without changing its
-    // meaning. Without it SQLite drives the scan from
-    // `idx_offchain_order_view_status` and sorts every match in a temp
-    // b-tree; with it, the ordering index drives the scan and LIMIT stops it
-    // early -- which is the whole point of paging in SQL.
-    if side == Side::Offchain
-        && let Some(statuses) = query.trade_protocol.narrowed_terminal_statuses()
-    {
-        filter.push_in(
-            "+status",
-            statuses.iter().map(|status| (*status).to_owned()),
-        );
+    // offchain side narrows terminal rows further -- `occurred_at IS NOT NULL`
+    // already selects exactly the terminal ones.
+    if side == Side::Offchain {
+        // A deferred placement is terminal and carries a `failed_at`, so it
+        // has an `occurred_at` like any other failure, but it is not a trade:
+        // `OffchainOrder::try_into_trade` yields nothing for it. Left in the
+        // result set it would inflate `total` and consume a slot under
+        // LIMIT/OFFSET while returning no trade, so it is excluded here rather
+        // than after the page is cut. `IS NOT` is SQLite's NULL-safe
+        // comparison: `Filled`/`Cancelled` rows have no `kind` key at all, and
+        // neither do failures persisted before the discriminator existed --
+        // both extract to NULL and must still match.
+        filter.push_predicate("json_extract(payload, '$.Live.Failed.kind') IS NOT 'Deferral'");
+
+        // The leading `+` strips the term's index affinity without changing
+        // its meaning. Without it SQLite drives the scan from
+        // `idx_offchain_order_view_status` and sorts every match in a temp
+        // b-tree; with it, the ordering index drives the scan and LIMIT stops
+        // it early -- which is the whole point of paging in SQL.
+        if let Some(statuses) = query.trade_protocol.narrowed_terminal_statuses() {
+            filter.push_in(
+                "+status",
+                statuses.iter().map(|status| (*status).to_owned()),
+            );
+        }
     }
 
     if let Some(since) = query.since {
@@ -278,6 +287,13 @@ impl Filter {
     fn push_comparison(&mut self, column: &str, operator: &str, value: String) {
         self.clauses.push(format!("{column} {operator} ?"));
         self.binds.push(value);
+    }
+
+    /// Appends a clause that binds nothing -- a predicate over the row's own
+    /// columns rather than a caller-supplied value. `&'static str` keeps the
+    /// text out of reach of anything a request can influence.
+    fn push_predicate(&mut self, predicate: &'static str) {
+        self.clauses.push(predicate.to_owned());
     }
 
     /// Terminal trades are exactly the rows with an outcome timestamp, so
@@ -910,24 +926,21 @@ mod tests {
 
     /// A deferred placement never reached the broker, so it is a terminal
     /// order with no fill and no trade -- unlike a genuine failure, which the
-    /// same page still serves.
+    /// same page still serves. Excluding it in SQL is what keeps `total` and
+    /// the page window honest: counted, the newest deferral would both
+    /// over-report the history and take a slot a real trade needs.
     #[tokio::test]
     async fn deferred_placements_are_absent_from_history() {
         let pool = setup_test_db().await;
         let store = offchain_store(&pool).await;
 
-        let deferred_id = OffchainOrderId::new();
-        place(&store, &deferred_id, "NVDA").await;
-        store
-            .send(
-                &deferred_id,
-                OffchainOrderCommand::MarkPlacementFailed {
-                    error: "hedge placement deferred".to_string(),
-                    kind: OffchainOrderFailureKind::Deferral,
-                },
-            )
-            .await
-            .unwrap();
+        let filled_id = OffchainOrderId::new();
+        fill(
+            &store,
+            &filled_id,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )
+        .await;
 
         let failed_id = OffchainOrderId::new();
         place(&store, &failed_id, "NVDA").await;
@@ -942,17 +955,59 @@ mod tests {
             .await
             .unwrap();
 
-        let trades = page(&pool, &TradeQuery::newest(V3)).await.trades;
+        let deferred_id = OffchainOrderId::new();
+        place(&store, &deferred_id, "NVDA").await;
+        store
+            .send(
+                &deferred_id,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "hedge placement deferred".to_string(),
+                    kind: OffchainOrderFailureKind::Deferral,
+                },
+            )
+            .await
+            .unwrap();
+
+        let history = page(&pool, &TradeQuery::newest(V3)).await;
 
         assert_eq!(
-            trades.iter().map(|trade| &trade.id).collect::<Vec<_>>(),
-            vec![&failed_id.to_string()],
-            "only the genuine failure may be served as a trade"
+            history
+                .trades
+                .iter()
+                .map(|trade| &trade.id)
+                .collect::<Vec<_>>(),
+            vec![&failed_id.to_string(), &filled_id.to_string()],
+            "only the genuine terminals may be served as trades"
         );
         assert!(matches!(
-            &trades[0].outcome,
+            &history.trades[0].outcome,
             TradeOutcome::Failed { error, .. } if error == "asset is not tradable"
         ));
+        assert_eq!(history.total, 2, "the deferral must not be counted");
+        assert!(!history.has_more);
+
+        // The deferral is the newest of the three rows, so a counted one would
+        // fill a single-trade page by itself and leave it empty once dropped.
+        let first = page(
+            &pool,
+            &TradeQuery {
+                limit: 1,
+                ..TradeQuery::all(V3)
+            },
+        )
+        .await;
+
+        assert_eq!(
+            first
+                .trades
+                .iter()
+                .map(|trade| &trade.id)
+                .collect::<Vec<_>>(),
+            vec![&failed_id.to_string()],
+            "the newest real trade must hold the page's only slot"
+        );
+        assert_eq!(first.total, 2);
+        assert!(first.has_more);
     }
 
     /// The comparator's exact branches: descending time, then ascending sort

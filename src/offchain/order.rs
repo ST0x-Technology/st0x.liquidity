@@ -2300,6 +2300,7 @@ pub fn position_command_for_finalization(
                 offchain_order_id,
                 error,
                 anchor,
+                kind: OffchainOrderFailureKind::Failure,
             })
         }
         TerminalPositionFinalization::UnpricedFill { .. } => None,

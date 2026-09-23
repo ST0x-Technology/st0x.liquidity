@@ -2617,6 +2617,7 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "lost placement response".to_string(),
                     anchor: crate::position::AnchorDisposition::Preserve,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -4085,6 +4086,7 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "dry-run placement failed".to_string(),
                     anchor: AnchorDisposition::Preserve,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

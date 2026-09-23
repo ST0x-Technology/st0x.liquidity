@@ -50,7 +50,8 @@ use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
 use crate::offchain::order::poll_status::PollOrderStatusCtx;
 use crate::offchain::order::{
     ExecutorOrderPlacer, HandleOrderRejection, HandleOrderRejectionJobQueue, OffchainOrder,
-    OffchainOrderCommand, OffchainOrderId, PollOrderStatus, ReconcileOrderFillJobQueue,
+    OffchainOrderCommand, OffchainOrderFailureKind, OffchainOrderId, PollOrderStatus,
+    ReconcileOrderFillJobQueue,
 };
 use crate::onchain::OnchainTrade;
 use crate::onchain::trade::RaindexTradeEvent;
@@ -316,6 +317,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                                 offchain_order_id: order_id,
                                 error,
                                 anchor: AnchorDisposition::Preserve,
+                                kind: OffchainOrderFailureKind::Failure,
                             },
                         )
                         .await?;
