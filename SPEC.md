@@ -4933,7 +4933,9 @@ it never moves the other chains' targets.
   primary chain only, so a failed redemption elsewhere would strand its tokens.
   The trigger reads a chain's registry and probes its wallet's gas only once the
   planner picks the chain, and re-plans without that chain when either fails, so
-  a symbol within its band reads neither.
+  a symbol within its band reads neither. Each chain is read at most once per
+  check: the re-plan after the Position reservation reuses the first plan's
+  results.
 - Quantity: `|deviation|` capped by the chain's operational limit. A mint is
   further capped so the broker keeps the larger of `alpaca_floor * total` and
   the hedge floor available; a broker at or below that declines the whole symbol

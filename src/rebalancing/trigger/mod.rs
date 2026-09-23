@@ -327,6 +327,15 @@ impl RebalancingServiceConfig {
     }
 }
 
+/// What the registry lookup and gas probe found for a chain the planner
+/// picked, kept for one equity check so neither runs twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainReadiness {
+    NotInRegistry,
+    NoGas,
+    Ready,
+}
+
 /// Why a chain's snapshot fails the cross-chain staleness rule.
 #[derive(Clone, Copy)]
 enum StaleSnapshot {
@@ -3669,7 +3678,11 @@ impl RebalancingService {
     /// Builds the planner's view of `symbol` -- one slot per hedged chain
     /// that rebalances it, the broker balance, the floors, the cooldowns
     /// and the last price -- and plans.
-    async fn plan_equity(&self, symbol: &Symbol) -> Result<EquityPlan, equity::EquityTriggerError> {
+    async fn plan_equity(
+        &self,
+        symbol: &Symbol,
+        probes: &mut BTreeMap<Chain, ChainReadiness>,
+    ) -> Result<EquityPlan, equity::EquityTriggerError> {
         let (venues, primary_chain) = {
             let inventory = self.inventory.read().await;
             (inventory.equity_venues(symbol)?, inventory.primary_chain())
@@ -3737,18 +3750,21 @@ impl RebalancingService {
         let last_price = reader.last_price(symbol).await?;
         let cooldowns = self.equity_cooldowns(symbol, Utc::now()).await;
 
-        self.plan_dispatchable_operation(EquityPlanInput {
-            symbol: symbol.clone(),
-            offchain: venues.offchain,
-            listing_chains,
-            onchain,
-            has_inflight: venues.has_inflight,
-            alpaca_floor: self.config.allocation.alpaca_floor,
-            hedge_floor: self.config.hedge_floor.for_symbol(symbol),
-            cooldowns,
-            last_price,
-            primary_chain,
-        })
+        self.plan_dispatchable_operation(
+            EquityPlanInput {
+                symbol: symbol.clone(),
+                offchain: venues.offchain,
+                listing_chains,
+                onchain,
+                has_inflight: venues.has_inflight,
+                alpaca_floor: self.config.allocation.alpaca_floor,
+                hedge_floor: self.config.hedge_floor.for_symbol(symbol),
+                cooldowns,
+                last_price,
+                primary_chain,
+            },
+            probes,
+        )
         .await
     }
 
@@ -3756,10 +3772,12 @@ impl RebalancingService {
     /// the chosen chain's vault registry and probes its wallet. A chain that
     /// fails either is marked and the symbol re-planned, so the next
     /// candidate is tried and a within-band symbol reads nothing. Each pass
-    /// marks one more chain, so the loop ends within the slots.
+    /// marks one more chain, so the loop ends within the slots. Results are
+    /// kept in `probes`, so the re-plan after the reservation reuses them.
     async fn plan_dispatchable_operation(
         &self,
         mut input: EquityPlanInput,
+        probes: &mut BTreeMap<Chain, ChainReadiness>,
     ) -> Result<EquityPlan, equity::EquityTriggerError> {
         loop {
             let plan = plan_equity_operation(&input)?;
@@ -3767,11 +3785,14 @@ impl RebalancingService {
                 return Ok(plan);
             };
             let chain = operation.chain;
-            let registry_known = self
-                .load_token_address(chain, &input.symbol)
-                .await?
-                .is_some();
-            if registry_known && self.equity_chain_gas_is_ready(chain).await {
+            let readiness = if let Some(readiness) = probes.get(&chain) {
+                *readiness
+            } else {
+                let readiness = self.probe_chain_readiness(chain, &input.symbol).await?;
+                probes.insert(chain, readiness);
+                readiness
+            };
+            if readiness == ChainReadiness::Ready {
                 return Ok(plan);
             }
 
@@ -3784,12 +3805,27 @@ impl RebalancingService {
                 );
                 return Ok(EquityPlan::Decline(DeclineReason::NoGas { chain }));
             };
-            if registry_known {
-                slot.gas_ready = false;
-            } else {
-                slot.registry_known = false;
+            match readiness {
+                ChainReadiness::NotInRegistry => slot.registry_known = false,
+                ChainReadiness::NoGas => slot.gas_ready = false,
+                ChainReadiness::Ready => {}
             }
         }
+    }
+
+    async fn probe_chain_readiness(
+        &self,
+        chain: Chain,
+        symbol: &Symbol,
+    ) -> Result<ChainReadiness, equity::EquityTriggerError> {
+        if self.load_token_address(chain, symbol).await?.is_none() {
+            return Ok(ChainReadiness::NotInRegistry);
+        }
+        if !self.equity_chain_gas_is_ready(chain).await {
+            return Ok(ChainReadiness::NoGas);
+        }
+
+        Ok(ChainReadiness::Ready)
     }
 
     /// The chains still inside their cooldown for `symbol`; expired entries
@@ -3917,8 +3953,9 @@ impl RebalancingService {
     async fn plan_equity_operation_or_skip(
         &self,
         symbol: &Symbol,
+        probes: &mut BTreeMap<Chain, ChainReadiness>,
     ) -> Result<Option<PlannedOperation>, equity::EquityTriggerError> {
-        let plan = match self.plan_equity(symbol).await {
+        let plan = match self.plan_equity(symbol, probes).await {
             Ok(plan) => plan,
             Err(equity::EquityTriggerError::Wrapper(WrapperError::SymbolNotConfigured(symbol))) => {
                 warn!(
@@ -4380,8 +4417,14 @@ impl RebalancingService {
         // Plan once before taking the durable Position reservation so that
         // common no-op checks append no reservation/release events. Inventory
         // can change after this read, so the post-reservation plan below
-        // remains authoritative.
-        if self.plan_equity_operation_or_skip(symbol).await?.is_none() {
+        // remains authoritative; it reuses this plan's registry and gas
+        // probes.
+        let mut probes = BTreeMap::new();
+        if self
+            .plan_equity_operation_or_skip(symbol, &mut probes)
+            .await?
+            .is_none()
+        {
             return Ok(());
         }
 
@@ -4394,7 +4437,10 @@ impl RebalancingService {
         }
 
         let attempt = async {
-            let Some(operation) = self.plan_equity_operation_or_skip(symbol).await? else {
+            let Some(operation) = self
+                .plan_equity_operation_or_skip(symbol, &mut probes)
+                .await?
+            else {
                 return Ok(false);
             };
 
@@ -12853,7 +12899,10 @@ mod tests {
             Arc::new(LogNotifier),
         );
 
-        let error = trigger.plan_equity(&symbol).await.unwrap_err();
+        let error = trigger
+            .plan_equity(&symbol, &mut BTreeMap::new())
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
