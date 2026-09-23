@@ -8719,13 +8719,14 @@ mod tests {
     }
 
     /// The shipped prod and staging configs run Robinhood Chain as a
-    /// prefunded hedge-only secondary: fills on the two launch equities are
+    /// prefunded hedge-only secondary: fills on every listed equity are
     /// ingested and hedged, nothing is rebalanced, and Bebop is not mapped.
+    /// Both list the two launch equities; prod also lists PLBY and GRND.
     #[test]
     fn shipped_configs_hedge_robinhood_prefunded_without_rebalancing() {
         let orderbook = address!("0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20");
         let inventory = address!("0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30");
-        let expected_equities = BTreeMap::from([
+        let launch_equities = [
             (
                 Symbol::new("DNUT").unwrap(),
                 (
@@ -8740,13 +8741,41 @@ mod tests {
                     address!("0x685DFd386968B58D895F934485820C479C79a8bB"),
                 ),
             ),
-        ]);
+        ];
+        let prod_only_equities = [
+            (
+                Symbol::new("PLBY").unwrap(),
+                (
+                    address!("0x4a18036Dce22168D8891919a1c75aC2CAf9a08AB"),
+                    address!("0xBe127eeD812DC1F622227FAdc8639d4138B47b2e"),
+                ),
+            ),
+            (
+                Symbol::new("GRND").unwrap(),
+                (
+                    address!("0xdca06fddf5320870C8E9D0534aa102677C36bCc4"),
+                    address!("0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"),
+                ),
+            ),
+        ];
+        let prod_equities: BTreeMap<Symbol, (Address, Address)> = launch_equities
+            .iter()
+            .chain(prod_only_equities.iter())
+            .cloned()
+            .collect();
+        let staging_equities: BTreeMap<Symbol, (Address, Address)> =
+            launch_equities.iter().cloned().collect();
 
-        for (name, config_str) in [
-            ("prod", include_str!("../../../config/prod/st0x-hedge.toml")),
+        for (name, config_str, expected_equities) in [
+            (
+                "prod",
+                include_str!("../../../config/prod/st0x-hedge.toml"),
+                &prod_equities,
+            ),
             (
                 "staging",
                 include_str!("../../../config/staging/st0x-hedge.toml"),
+                &staging_equities,
             ),
         ] {
             let config: Config = toml::from_str(config_str).unwrap();
@@ -8800,7 +8829,7 @@ mod tests {
                     )
                 })
                 .collect();
-            assert_eq!(equities, expected_equities, "{name}");
+            assert_eq!(&equities, expected_equities, "{name}");
             assert!(
                 !ChainRole::Secondary.rebalances_equity(&trading.assets),
                 "{name}: no Robinhood equity may opt into rebalancing"
