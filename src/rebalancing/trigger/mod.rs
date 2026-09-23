@@ -3703,7 +3703,6 @@ impl RebalancingService {
                 },
                 |target| (true, target),
             );
-            let gas_ready = enabled && self.equity_chain_gas_is_ready(chain).await;
 
             onchain.insert(
                 chain,
@@ -3714,7 +3713,8 @@ impl RebalancingService {
                     band: self.config.allocation.deviation,
                     operational_limit: listing.operational_limit,
                     min_operation_usd: config.min_operation_usd,
-                    gas_ready,
+                    // Probed only once the planner picks the chain.
+                    gas_ready: true,
                     enabled,
                 },
             );
@@ -3733,7 +3733,7 @@ impl RebalancingService {
         let last_price = reader.last_price(symbol).await?;
         let cooldowns = self.equity_cooldowns(symbol, Utc::now()).await;
 
-        Ok(plan_equity_operation(&EquityPlanInput {
+        self.plan_gas_ready_operation(EquityPlanInput {
             symbol: symbol.clone(),
             offchain: venues.offchain,
             listing_chains,
@@ -3743,7 +3743,39 @@ impl RebalancingService {
             hedge_floor: self.config.hedge_floor.for_symbol(symbol),
             cooldowns,
             last_price,
-        })?)
+        })
+        .await
+    }
+
+    /// Plans with every chain assumed gas-ready, then probes the chosen
+    /// chain's wallet. A dry chain is marked and the symbol re-planned, so
+    /// the next candidate is tried and a within-band symbol probes nothing.
+    /// Each pass marks one more chain, so the loop ends within the slots.
+    async fn plan_gas_ready_operation(
+        &self,
+        mut input: EquityPlanInput,
+    ) -> Result<EquityPlan, equity::EquityTriggerError> {
+        loop {
+            let plan = plan_equity_operation(&input)?;
+            let EquityPlan::Operation(operation) = &plan else {
+                return Ok(plan);
+            };
+            let chain = operation.chain;
+            if self.equity_chain_gas_is_ready(chain).await {
+                return Ok(plan);
+            }
+
+            let Some(slot) = input.onchain.get_mut(&chain) else {
+                error!(
+                    target: "rebalance",
+                    symbol = %input.symbol,
+                    %chain,
+                    "The planner chose a chain without a slot; declining it as not gas-ready"
+                );
+                return Ok(EquityPlan::Decline(DeclineReason::NoGas { chain }));
+            };
+            slot.gas_ready = false;
+        }
     }
 
     /// The chains still inside their cooldown for `symbol`; expired entries

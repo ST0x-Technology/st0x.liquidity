@@ -4921,7 +4921,9 @@ targets.
   candidate when `|deviation|` exceeds `band * total`.
 - Ranking: redemptions (over target) before mints, larger deviation first, ties
   by chain order. A candidate whose wallet is not gas-ready, or whose chain is
-  cooling down, is skipped and the next one evaluated.
+  cooling down, is skipped and the next one evaluated. The trigger probes a
+  wallet's gas only once the planner picks its chain, and re-plans without that
+  chain when it is dry, so a symbol within its band reads no balance.
 - Quantity: `|deviation|` capped by the chain's operational limit. A mint is
   further capped so the broker keeps the larger of `alpaca_floor * total` and
   the hedge floor available; a broker at or below that declines the whole symbol
