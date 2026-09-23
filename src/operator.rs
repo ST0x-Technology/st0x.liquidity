@@ -5,6 +5,7 @@
 //! implementation modules themselves private.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use st0x_evm::Chain;
 use st0x_execution::{ExecutorOrderId, FractionalShares, Symbol};
 
 use crate::offchain::order::OffchainOrderId;
@@ -129,6 +130,20 @@ pub enum RejectionReason {
         anchor: OffchainOrderId,
         executor_order_id: ExecutorOrderId,
     },
+    #[error(
+        "process-tx decoded a fill on {decoded}, but the request selected {requested}; refusing \
+         to hedge a fill from a chain other than the one requested"
+    )]
+    DecodedChainMismatch { requested: Chain, decoded: Chain },
+    #[error(
+        "position {symbol} holds pending offchain order {offchain_order_id} that was never sent \
+         to the broker, and the trading schedule is disabled so it is not a deferred retry; \
+         refusing to place over it and preserving the claim for reconciliation"
+    )]
+    RetainedPendingWithoutSchedule {
+        offchain_order_id: OffchainOrderId,
+        symbol: Symbol,
+    },
 }
 
 /// The failure of a shared operator recovery command, letting a caller-facing
@@ -139,6 +154,11 @@ pub enum OperatorError {
     /// input was invalid; the caller surfaces this to the operator.
     #[error(transparent)]
     Rejected(#[from] RejectionReason),
+    /// A placement preflight returned a reservation for the wrong direction or
+    /// symbol; an internal invariant violation surfaced to the caller as a 500
+    /// whose body carries this typed reason.
+    #[error(transparent)]
+    PreflightReservationMismatch(#[from] process_tx::PreflightReservationMismatch),
     /// An infrastructure failure while loading or sending a command.
     #[error("{0:#}")]
     Operational(anyhow::Error),
@@ -615,8 +635,8 @@ pub mod offchain {
 
         #[cfg(feature = "test-support")]
         pub use crate::offchain::order::{
-            CancellationReason, CounterTradeOrderKind, OffchainOrderEvent, PollOrderStatusJobQueue,
-            noop_order_placer,
+            CancellationReason, CounterTradeOrderKind, OffchainOrderEvent,
+            OffchainOrderFailureKind, PollOrderStatusJobQueue, noop_order_placer,
         };
     }
 
@@ -1512,10 +1532,11 @@ pub mod process_tx {
         execute_settle_fill, is_expected_place_offchain_order_rejection,
     };
     use crate::offchain::order::{
-        OffchainOrder, OffchainOrderCommand, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
-        PlaceOffchainOrderError, PollOrderStatusJobQueue, TerminalPositionFinalization,
-        client_order_id_for_placement, place_offchain_order_at_broker,
-        position_command_for_finalization, push_poll_job_if_absent, terminal_position_finalization,
+        OffchainOrder, OffchainOrderCommand, OffchainOrderFailureKind, OffchainOrderId,
+        OffchainOrderPlacement, OrderPlacer, PlaceOffchainOrderError, PollOrderStatusJobQueue,
+        TerminalPositionFinalization, client_order_id_for_placement,
+        place_offchain_order_at_broker, position_command_for_finalization, push_poll_job_if_absent,
+        terminal_position_finalization,
     };
     use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
     use crate::onchain::trade::{BotOperator, RecoveryActors};
@@ -1579,7 +1600,8 @@ pub mod process_tx {
     /// terminal broker state and the position was finalized. A cleared
     /// placement is not reachable here -- `finalize_hedge_outcome` routes
     /// `ClearedForRetry` to `HedgePlacementCleared` instead.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
     pub enum PlacedHedgeDisposition {
         /// The broker accepted the order; the next order-status recovery sweep
         /// reconciles it to a terminal state.
@@ -1627,13 +1649,20 @@ pub mod process_tx {
         /// position's pending marker was cleared for the normal pipeline to
         /// re-hedge. No hedge is in flight; the fill was still accounted.
         HedgePlacementCleared { symbol: Symbol },
-        /// A placement was deferred by broker admission under the schedule aware
-        /// close flatten policy. The fill was settled and no hedge from this run
-        /// is in flight. Either process-tx deferred its own placement and cleared
-        /// the claim so the standing pipeline hedges again from scratch (ADR 0022),
-        /// or the live pipeline is already holding a deferred Pending order for
-        /// its own retry and process-tx placed no second hedge over it.
+        /// process-tx cleared its own broker-admission-deferred placement (ADR
+        /// 0022): the fill was settled, the never-sent Pending order was failed,
+        /// and the position claim was cleared. No hedge from this run is in
+        /// flight; the standing CheckPositions pipeline re-hedges the remaining
+        /// exposure from a fresh preflight.
         HedgePlacementDeferred { symbol: Symbol },
+        /// The live pipeline is already holding a deferred `Pending` hedge for
+        /// its own retry, so process-tx settled the fill against that retained
+        /// intent and placed no second hedge over it. The claim is preserved and
+        /// the live pipeline still owns retrying it once admission permits.
+        PendingHedgeDeferred {
+            symbol: Symbol,
+            offchain_order_id: OffchainOrderId,
+        },
     }
 
     /// The decoded fill, when one was found, and its processing outcome.
@@ -1643,7 +1672,8 @@ pub mod process_tx {
         pub outcome: ProcessTxOutcome,
     }
 
-    /// The three stores a process-tx writes through.
+    /// The stores a process-tx writes through, plus the trading-schedule flag
+    /// that gates how a retained pending hedge is classified.
     ///
     /// In the bot process these are the conductor's wired stores, so every
     /// event the fill produces reaches the running reactors: the
@@ -1651,19 +1681,30 @@ pub mod process_tx {
     /// pending-order gate immediately, rather than after the next inventory
     /// poll. The offline CLI has no reactors to reach and builds standalone
     /// stores with default projections.
+    ///
+    /// `schedule_enabled` mirrors the live pipeline's
+    /// `CloseFlattenPolicy::schedule_enabled`: only a schedule-enabled process
+    /// treats a pre-placement `Pending` order as a legitimate deferred retry.
+    /// Both processes derive it from the same configuration through
+    /// [`crate::trading_schedule::schedule_enabled`], so an offline CLI run
+    /// classifies a leftover pending hedge exactly as the bot would.
     #[derive(Clone)]
     pub struct ProcessTxStores {
         pub onchain_trade: Arc<Store<OnChainTrade>>,
         pub position: Arc<Store<Position>>,
         pub position_projection: Arc<Projection<Position>>,
         pub offchain_order: Arc<Store<OffchainOrder>>,
+        pub schedule_enabled: bool,
     }
 
     impl ProcessTxStores {
         /// Standalone stores with default projections and no reactors, for a
-        /// process with no running bot to dispatch to.
+        /// process with no running bot to dispatch to. The trading schedule
+        /// flag comes from `ctx`, the same configuration the conductor derives
+        /// it from.
         pub async fn standalone(
             pool: &SqlitePool,
+            ctx: &Ctx,
             order_placer: Arc<dyn OrderPlacer>,
         ) -> anyhow::Result<Self> {
             let (onchain_trade, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
@@ -1683,6 +1724,7 @@ pub mod process_tx {
                 position,
                 position_projection,
                 offchain_order,
+                schedule_enabled: crate::trading_schedule::schedule_enabled(ctx),
             })
         }
     }
@@ -1709,6 +1751,20 @@ pub mod process_tx {
                 provider,
                 cache,
             }
+        }
+    }
+
+    /// Guards a decoded fill against a chain other than the one the request
+    /// selected. The decoder is fed the requested chain, so a divergence is an
+    /// invariant break: refuse rather than hedge a fill from an unselected chain.
+    fn ensure_decoded_chain_matches(
+        decoded: Chain,
+        requested: Chain,
+    ) -> Result<(), RejectionReason> {
+        if decoded == requested {
+            Ok(())
+        } else {
+            Err(RejectionReason::DecodedChainMismatch { requested, decoded })
         }
     }
 
@@ -1750,6 +1806,10 @@ pub mod process_tx {
         match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await
         {
             Ok(Some(onchain_trade)) => {
+                // The decoder is fed the requested chain, so a decoded fill on a
+                // different chain is an invariant break: refuse rather than hedge
+                // a fill from a chain the operator did not select.
+                ensure_decoded_chain_matches(onchain_trade.chain, trading_chain.chain)?;
                 let fill = ProcessTxFill::from(&onchain_trade);
                 let outcome = process_found_trade(
                     onchain_trade,
@@ -1811,7 +1871,6 @@ pub mod process_tx {
         let ProcessTxStores {
             onchain_trade: onchain_trade_store,
             position: position_store,
-            offchain_order: offchain_order_store,
             ..
         } = stores;
         let Some(block_number) = onchain_trade.block_number else {
@@ -1871,6 +1930,42 @@ pub mod process_tx {
             FillGate::Ready(params) => params,
         };
 
+        place_ready_hedge(
+            ctx,
+            pool,
+            stores,
+            order_placer,
+            params,
+            &trade_id,
+            &onchain_trade,
+            poll_enrollment,
+        )
+        .await
+    }
+
+    /// Places the hedge for a fill the gate marked ready: reconciles a preserved
+    /// failed-order anchor, runs the placement preflight, claims the position,
+    /// places the order at the broker, and resolves the post-placement
+    /// disposition. Each early exit settles the fill; the in-flight success path
+    /// enrolls the poll job before settling so a failed enqueue leaves the fill
+    /// unsettled for a retry. Runs under the caller's still-held submission
+    /// guards.
+    async fn place_ready_hedge(
+        ctx: &Ctx,
+        pool: &SqlitePool,
+        stores: &ProcessTxStores,
+        order_placer: Arc<dyn OrderPlacer>,
+        params: ExecutionCtx,
+        trade_id: &OnChainTradeId,
+        onchain_trade: &OnchainTrade,
+        poll_enrollment: Option<(&PollOrderStatusJobQueue, Duration)>,
+    ) -> Result<ProcessTxOutcome, OperatorError> {
+        let ProcessTxStores {
+            onchain_trade: onchain_trade_store,
+            position: position_store,
+            offchain_order: offchain_order_store,
+            ..
+        } = stores;
         let offchain_order_id = OffchainOrderId::new();
 
         let anchor = match reconcile_failed_anchor(
@@ -1886,14 +1981,26 @@ pub mod process_tx {
             Err(error) => {
                 // Settle the fill before surfacing the failure so accounting is
                 // durable whether this is a typed rejection (a broker order still
-                // holds the anchor) or an operational store/RPC failure.
-                mark_and_settle_fill(
+                // holds the anchor) or an operational store/RPC failure. A settle
+                // failure is logged but must not replace the captured error: the
+                // typed rejection is the outcome the caller has to see, and an
+                // incidental settle failure would demote it to a generic
+                // operational failure.
+                if let Err(settle_error) = mark_and_settle_fill(
                     onchain_trade_store,
                     position_store,
-                    &trade_id,
-                    &onchain_trade,
+                    trade_id,
+                    onchain_trade,
                 )
-                .await?;
+                .await
+                {
+                    error!(
+                        %offchain_order_id,
+                        symbol = %params.symbol,
+                        %settle_error,
+                        "Failed to settle the fill after the anchor reconciliation failure"
+                    );
+                }
                 return Err(error);
             }
         };
@@ -1915,13 +2022,8 @@ pub mod process_tx {
         )
         .await?
         else {
-            mark_and_settle_fill(
-                onchain_trade_store,
-                position_store,
-                &trade_id,
-                &onchain_trade,
-            )
-            .await?;
+            mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
+                .await?;
             return Ok(ProcessTxOutcome::PreflightDeferred {
                 symbol: params.symbol.clone(),
             });
@@ -1947,13 +2049,8 @@ pub mod process_tx {
                     symbol = %params.symbol,
                     "Position::PlaceOffChainOrder rejected by domain state: {error}"
                 );
-                mark_and_settle_fill(
-                    onchain_trade_store,
-                    position_store,
-                    &trade_id,
-                    &onchain_trade,
-                )
-                .await?;
+                mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
+                    .await?;
                 return Ok(ProcessTxOutcome::PlacementRejected {
                     symbol: params.symbol.clone(),
                 });
@@ -1983,20 +2080,103 @@ pub mod process_tx {
             // claim to the retry eligible state so the normal CheckPositions
             // pipeline detects the unhedged exposure again and preflights a fresh
             // hedge from scratch, replaying no stale shares or reservation terms.
+            // A deferral returns before the broker call, so the retired id is
+            // released rather than left as an anchor for an order that was never
+            // created.
             Err(PlaceOffchainOrderError::Deferred) => {
-                clear_deferred_placement(
-                    onchain_trade_store,
-                    position_store,
-                    offchain_order_store,
+                fail_unsent_placement(
+                    stores,
                     &params.symbol,
                     offchain_order_id,
-                    &trade_id,
-                    &onchain_trade,
+                    trade_id,
+                    onchain_trade,
+                    "process-tx placement deferred by broker admission".to_owned(),
+                    OffchainOrderFailureKind::Deferral,
+                    AnchorDisposition::Release,
                 )
                 .await?;
                 return Ok(ProcessTxOutcome::HedgePlacementDeferred {
                     symbol: params.symbol.clone(),
                 });
+            }
+            // Neither an admission failure nor backpressure left an order the
+            // broker accepted, so both clear the claim to the retry eligible
+            // state, settle the fill, and surface the operational failure with
+            // the real cause recorded on the durable events. They differ in how
+            // far the attempt got: an admission failure returns before the broker
+            // call, so its id is released, while backpressure means the broker
+            // WAS contacted and may have created an order, so its id is preserved
+            // as the anchor that forces the next attempt through
+            // reconcile_failed_anchor. The clearing itself must not mask the
+            // broker failure: a settle failure is logged and the original error
+            // still wins, so a backpressure classification survives for the
+            // caller's retry policy. A store/persistence error (`Command`) leaves
+            // the order state uncertain, so that one keeps the plain operational
+            // return without touching the claim.
+            Err(PlaceOffchainOrderError::Admission { source }) => {
+                // The wrapper's own `Display` is not usable as the durable
+                // reason: thiserror never walks `#[source]`, so it would drop
+                // the admission cause, and its canned text claims the pending
+                // intent is retained, the opposite of what this path does.
+                let reason = format!(
+                    "process-tx admission failure; claim cleared, order not sent to broker: {}",
+                    render_cause_chain(&*source)
+                );
+                if let Err(clear_error) = fail_unsent_placement(
+                    stores,
+                    &params.symbol,
+                    offchain_order_id,
+                    trade_id,
+                    onchain_trade,
+                    reason,
+                    OffchainOrderFailureKind::Failure,
+                    AnchorDisposition::Release,
+                )
+                .await
+                {
+                    error!(
+                        %offchain_order_id,
+                        symbol = %params.symbol,
+                        %clear_error,
+                        "Failed to clear the unsent placement after a broker admission failure"
+                    );
+                }
+                return Err(
+                    anyhow::Error::new(PlaceOffchainOrderError::Admission { source })
+                        .context("failed to place the offchain order at the broker")
+                        .into(),
+                );
+            }
+            Err(PlaceOffchainOrderError::Backpressure { source }) => {
+                let reason = format!(
+                    "process-tx backpressure; claim cleared, failed order id preserved as \
+                     idempotency anchor: {}",
+                    render_cause_chain(&*source)
+                );
+                if let Err(clear_error) = fail_unsent_placement(
+                    stores,
+                    &params.symbol,
+                    offchain_order_id,
+                    trade_id,
+                    onchain_trade,
+                    reason,
+                    OffchainOrderFailureKind::Failure,
+                    AnchorDisposition::Preserve,
+                )
+                .await
+                {
+                    error!(
+                        %offchain_order_id,
+                        symbol = %params.symbol,
+                        %clear_error,
+                        "Failed to clear the unsent placement after broker backpressure"
+                    );
+                }
+                return Err(
+                    anyhow::Error::new(PlaceOffchainOrderError::Backpressure { source })
+                        .context("failed to place the offchain order at the broker")
+                        .into(),
+                );
             }
             Err(error) => {
                 return Err(anyhow::Error::new(error)
@@ -2013,15 +2193,13 @@ pub mod process_tx {
         )
         .await?;
 
-        mark_and_settle_fill(
-            onchain_trade_store,
-            position_store,
-            &trade_id,
-            &onchain_trade,
-        )
-        .await?;
-
-        finalize_hedge_outcome(
+        // Resolve the disposition first: for an in-flight hedge this enrolls the
+        // poll job. Settle the fill only after that succeeds, mirroring the
+        // gate's existing-in-flight branch: a failed enqueue returns here and
+        // leaves the fill unsettled so the retry re-enrolls then settles, rather
+        // than settling first and stranding the poll job when the retry short
+        // circuits as AlreadyAccounted.
+        let outcome = finalize_hedge_outcome(
             disposition,
             &params.symbol,
             offchain_order_id,
@@ -2029,7 +2207,11 @@ pub mod process_tx {
             params.direction,
             poll_enrollment,
         )
-        .await
+        .await?;
+
+        mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade).await?;
+
+        Ok(outcome)
     }
 
     /// Outcome of gating a decoded fill before placement: either the fill was
@@ -2059,6 +2241,7 @@ pub mod process_tx {
             position: position_store,
             position_projection,
             offchain_order: offchain_order_store,
+            schedule_enabled,
         } = stores;
 
         match reconcile_existing_pending_order(offchain_order_store, position_store, base_symbol)
@@ -2097,22 +2280,50 @@ pub mod process_tx {
                     .await?;
                 return Ok(FillGate::Settled(ProcessTxOutcome::PendingHedgeInFlight));
             }
-            Some((_, HedgeDisposition::Deferred)) => {
-                // The live pipeline deferred its own placement and is holding
-                // this order Pending with the claim set until admission permits
-                // its retry (process-tx no longer retains a Pending; ADR 0022).
-                // The later fill has already been applied to the position by
-                // account_for_onchain_fill; settle it against that retained
+            Some((pending_offchain_order_id, HedgeDisposition::Deferred)) if *schedule_enabled => {
+                // A schedule-enabled live pipeline deferred its own placement and
+                // is holding this order Pending with the claim set until admission
+                // permits its retry (process-tx no longer retains a Pending; ADR
+                // 0022). The later fill has already been applied to the position
+                // by account_for_onchain_fill; settle it against that retained
                 // intent and report the deferral rather than placing a second
-                // hedge over it. The live pipeline still owns retrying its
-                // Pending order once admission permits.
+                // hedge over it. The live pipeline still owns retrying its Pending
+                // order once admission permits.
                 mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
                     .await?;
-                return Ok(FillGate::Settled(
-                    ProcessTxOutcome::HedgePlacementDeferred {
-                        symbol: base_symbol.clone(),
-                    },
-                ));
+                return Ok(FillGate::Settled(ProcessTxOutcome::PendingHedgeDeferred {
+                    symbol: base_symbol.clone(),
+                    offchain_order_id: pending_offchain_order_id,
+                }));
+            }
+            Some((pending_offchain_order_id, HedgeDisposition::Deferred)) => {
+                // Schedule disabled: a Pending order is not a legitimate deferred
+                // resting state (matching the live path's strict schedule_enabled
+                // check). Settle the fill and preserve the claim, then surface a
+                // typed rejection instead of placing a second hedge over an order
+                // that was never sent. A settle failure is logged and the typed
+                // rejection still wins, so an incidental store failure cannot
+                // demote it to a generic operational failure.
+                if let Err(settle_error) = mark_and_settle_fill(
+                    onchain_trade_store,
+                    position_store,
+                    trade_id,
+                    onchain_trade,
+                )
+                .await
+                {
+                    error!(
+                        %pending_offchain_order_id,
+                        symbol = %base_symbol,
+                        %settle_error,
+                        "Failed to settle the fill while refusing a retained pending order"
+                    );
+                }
+                return Err(RejectionReason::RetainedPendingWithoutSchedule {
+                    offchain_order_id: pending_offchain_order_id,
+                    symbol: base_symbol.clone(),
+                }
+                .into());
             }
         }
 
@@ -2152,9 +2363,12 @@ pub mod process_tx {
     }
 
     /// Resolves a post-placement disposition into a process-tx outcome. A
-    /// submitted hedge is enrolled for status polling under the still-held
-    /// submission guards, mirroring the live path; a cleared placement reports
-    /// that no hedge was placed, and a finalized one needs no poll job.
+    /// submitted (`InFlight`) hedge is enrolled for status polling under the
+    /// still-held submission guards, mirroring the live path. The caller settles
+    /// the fill only after this returns Ok, so a failed enqueue here leaves the
+    /// fill unsettled for the retry rather than settling first and stranding the
+    /// poll job. A cleared placement reports that no hedge was placed, and a
+    /// finalized one needs no poll job.
     async fn finalize_hedge_outcome(
         disposition: HedgeDisposition,
         symbol: &Symbol,
@@ -2222,27 +2436,56 @@ pub mod process_tx {
         Ok(())
     }
 
-    /// Retires a placement the broker deferred: fails the still Pending order and
-    /// clears the position claim to the retry eligible state (ADR 0022), then
-    /// settles the fill. Drives the aggregate to Failed before clearing the claim,
-    /// the order the failed placement path uses, and preserves the idempotency
-    /// anchor so no prior anchor is lost. The standing pipeline then hedges the
-    /// remaining exposure again from a fresh preflight.
-    async fn clear_deferred_placement(
-        onchain_trade_store: &Store<OnChainTrade>,
-        position_store: &Store<Position>,
-        offchain_order_store: &Store<OffchainOrder>,
+    /// Renders an error together with every link of its `source()` chain.
+    ///
+    /// A durable failure reason has to carry the real cause, and thiserror's
+    /// generated `Display` never walks `#[source]`: formatting a wrapper alone
+    /// would persist its canned message and discard the broker error that
+    /// explains the failure to whoever reads the event back.
+    fn render_cause_chain(error: &(dyn std::error::Error + 'static)) -> String {
+        std::iter::successors(Some(error), |error| error.source())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ")
+    }
+
+    /// Retires a placement the broker never accepted: fails the still Pending
+    /// order with `reason` and clears the position claim to the retry eligible
+    /// state (ADR 0022), then settles the fill. Drives the aggregate to Failed
+    /// before clearing the claim, the order the failed placement path uses. The
+    /// `anchor` disposition says whether the retired id stays as the idempotency
+    /// anchor: a placement that never reached the broker releases it, so no
+    /// phantom anchor reconciliation is scheduled for an order the broker never
+    /// saw, while a placement whose broker call did run preserves it so the next
+    /// attempt reconciles whatever the broker may have created. The standing
+    /// pipeline then hedges the remaining exposure again from a fresh preflight.
+    ///
+    /// `kind` records whether the retirement is a schedule or admission deferral
+    /// or a genuine failure. The position side is identical either way -- the
+    /// claim is cleared and the order goes terminal -- but only a genuine
+    /// failure is counted as a hedge failure by the reliability projection.
+    async fn fail_unsent_placement(
+        stores: &ProcessTxStores,
         symbol: &Symbol,
         offchain_order_id: OffchainOrderId,
         trade_id: &OnChainTradeId,
         onchain_trade: &OnchainTrade,
+        reason: String,
+        kind: OffchainOrderFailureKind,
+        anchor: AnchorDisposition,
     ) -> Result<(), OperatorError> {
-        let reason = "process-tx placement deferred by broker admission";
+        let ProcessTxStores {
+            onchain_trade: onchain_trade_store,
+            position: position_store,
+            offchain_order: offchain_order_store,
+            ..
+        } = stores;
         offchain_order_store
             .send(
                 &offchain_order_id,
                 OffchainOrderCommand::MarkPlacementFailed {
-                    error: reason.to_owned(),
+                    error: reason.clone(),
+                    kind,
                 },
             )
             .await
@@ -2252,12 +2495,12 @@ pub mod process_tx {
                 symbol,
                 PositionCommand::FailOffChainOrder {
                     offchain_order_id,
-                    error: reason.to_owned(),
-                    anchor: AnchorDisposition::Preserve,
+                    error: reason,
+                    anchor,
                 },
             )
             .await
-            .context("failed to clear the deferred offchain order from the position")?;
+            .context("failed to clear the unsent offchain order from the position")?;
         mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade).await?;
         Ok(())
     }
@@ -2330,7 +2573,7 @@ pub mod process_tx {
     /// a buy it never reserved cash for, so each one fails closed here as an
     /// operational failure instead of falling back to the requested size.
     #[derive(Debug, thiserror::Error)]
-    enum PreflightReservationMismatch {
+    pub enum PreflightReservationMismatch {
         #[error(
             "placement preflight for a buy of {symbol} returned an equity reservation; a buy \
              must reserve cash buying power, so the hedge is refused"
@@ -2363,11 +2606,12 @@ pub mod process_tx {
         shares: Positive<FractionalShares>,
         direction: Direction,
         client_order_id: ClientOrderId,
-    ) -> anyhow::Result<
+    ) -> Result<
         Option<(
             Positive<FractionalShares>,
             Option<BuyingPowerReservationCents>,
         )>,
+        OperatorError,
     > {
         let reserved = if direction == Direction::Buy {
             match live_buying_power_reservations(pool).await {
@@ -2380,7 +2624,7 @@ pub mod process_tx {
                     );
                     return Ok(None);
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(OperatorError::Operational(error.into())),
             }
         } else {
             BuyingPowerReservationCents::ZERO
@@ -2414,7 +2658,10 @@ pub mod process_tx {
                 }),
             ) => (
                 required,
-                Some(BuyingPowerReservationCents::new(estimated_cost_cents)?),
+                Some(
+                    BuyingPowerReservationCents::new(estimated_cost_cents)
+                        .map_err(anyhow::Error::from)?,
+                ),
             ),
             (
                 Direction::Sell,
@@ -2674,6 +2921,7 @@ pub mod process_tx {
     #[cfg(test)]
     mod tests {
         use std::sync::Arc;
+        use std::time::Duration;
 
         use alloy::primitives::{Address, B256, TxHash, U256};
         use alloy::providers::{ProviderBuilder, mock::Asserter};
@@ -2683,26 +2931,28 @@ pub mod process_tx {
 
         use st0x_config::{
             ChainAssets, ChainEquityAsset, Ctx, ExecutionThreshold, HedgedChain, HedgingAssets,
-            OperationMode,
+            OperationMode, PricingCtx, TradingScheduleConfig, TradingScheduleMode,
         };
         use st0x_event_sorcery::{AggregateError, SendError, StoreBuilder};
         use st0x_evm::Chain;
         use st0x_execution::{
-            BuyingPowerReservationCents, CancellationOutcome, ClientOrderId, CounterTradePreflight,
-            CounterTradeReservation, CounterTradeSkipReason, Direction, ExecutorOrderId,
-            FractionalShares, LimitOrder, MarketOrder, MockExecutor, Positive, SupportedExecutor,
-            Symbol,
+            AlpacaBrokerApiError, BuyingPowerReservationCents, CancellationOutcome, ClientOrderId,
+            CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction,
+            ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, MockExecutor, Positive,
+            SupportedExecutor, Symbol,
         };
         use st0x_registry::SymbolCache;
 
         use crate::bindings::IRaindexV6::{ClearConfigV2, ClearV3};
+        use crate::conductor::job::find_backpressure;
         use crate::conductor::{
             TradeProcessingCqrs, execute_acknowledge_fill, execute_mark_acknowledged,
             process_queued_trade,
         };
         use crate::offchain::order::{
             BrokerOrderPlacement, CancellationReason, CounterTradeOrderKind, ExecutorOrderPlacer,
-            OffchainOrder, OffchainOrderId, OrderPlacementResult, OrderPlacer, PlacementAdmission,
+            OffchainOrder, OffchainOrderCommand, OffchainOrderEvent, OffchainOrderFailureKind,
+            OffchainOrderId, OrderPlacementResult, OrderPlacer, PlacementAdmission,
             PollOrderStatus, PollOrderStatusJobQueue, RetainedFill, noop_order_placer,
         };
         use crate::onchain::trade::RaindexTradeEvent;
@@ -2721,8 +2971,9 @@ pub mod process_tx {
         use super::{
             HedgeDisposition, OperatorError, PlacedHedgeDisposition, PlacementContext,
             PreflightReservationMismatch, ProcessTxChainContext, ProcessTxFill, ProcessTxOutcome,
-            ProcessTxStores, RejectionReason, preflight_placement, process_found_trade, process_tx,
-            reconcile_failed_anchor, reconcile_offchain_order_state, reconcile_post_place_state,
+            ProcessTxStores, RejectionReason, ensure_decoded_chain_matches, preflight_placement,
+            process_found_trade, process_tx, reconcile_failed_anchor,
+            reconcile_offchain_order_state, reconcile_post_place_state,
         };
 
         /// Parses a positive share quantity for process-tx fixtures.
@@ -2735,6 +2986,24 @@ pub mod process_tx {
             try_setup_test_db()
                 .await
                 .expect("test database setup must succeed")
+        }
+
+        /// Reads back the failure kind the placement path persisted on the
+        /// offchain order's terminal `Failed` event. A deferral and a genuine
+        /// failure are indistinguishable from the aggregate state alone, so the
+        /// durable event is the only place the classification is observable.
+        async fn persisted_failure_kind(pool: &sqlx::SqlitePool) -> OffchainOrderFailureKind {
+            let (payload,): (String,) = sqlx::query_as(
+                "SELECT payload FROM events WHERE event_type = 'OffchainOrderEvent::Failed'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let event: OffchainOrderEvent = serde_json::from_str(&payload).unwrap();
+            let OffchainOrderEvent::Failed { kind, .. } = event else {
+                panic!("a Failed event row must deserialize to Failed, got: {event:?}");
+            };
+            kind
         }
 
         /// Returns the valid baseline onchain trade fixture used throughout this module.
@@ -3185,9 +3454,9 @@ pub mod process_tx {
             .await
             .unwrap_err();
 
-            let mismatch = error
-                .downcast_ref::<PreflightReservationMismatch>()
-                .expect("a buy reserved against equity must be a typed mismatch");
+            let OperatorError::PreflightReservationMismatch(mismatch) = &error else {
+                panic!("a buy reserved against equity must be a typed mismatch, got: {error}");
+            };
             assert!(
                 matches!(
                     mismatch,
@@ -3223,9 +3492,9 @@ pub mod process_tx {
             .await
             .unwrap_err();
 
-            let mismatch = error
-                .downcast_ref::<PreflightReservationMismatch>()
-                .expect("a sell reserved against cash must be a typed mismatch");
+            let OperatorError::PreflightReservationMismatch(mismatch) = &error else {
+                panic!("a sell reserved against cash must be a typed mismatch, got: {error}");
+            };
             assert!(
                 matches!(
                     mismatch,
@@ -3262,9 +3531,9 @@ pub mod process_tx {
             .await
             .unwrap_err();
 
-            let mismatch = error
-                .downcast_ref::<PreflightReservationMismatch>()
-                .expect("equity reserved in another symbol must be a typed mismatch");
+            let OperatorError::PreflightReservationMismatch(mismatch) = &error else {
+                panic!("equity reserved in another symbol must be a typed mismatch, got: {error}");
+            };
             assert!(
                 matches!(
                     mismatch,
@@ -3587,12 +3856,9 @@ pub mod process_tx {
             .await
             .unwrap_err();
 
-            let OperatorError::Operational(operational) = &error else {
-                panic!("a mismatched reservation must be an operational failure, got: {error}");
+            let OperatorError::PreflightReservationMismatch(mismatch) = &error else {
+                panic!("a mismatched reservation must be a typed preflight mismatch, got: {error}");
             };
-            let mismatch = operational
-                .downcast_ref::<PreflightReservationMismatch>()
-                .expect("the operational failure must carry the typed mismatch");
             assert!(
                 matches!(
                     mismatch,
@@ -3620,11 +3886,13 @@ pub mod process_tx {
         /// Standalone stores for the offline-path tests; the reactor-wired
         /// path is covered by
         /// `wired_position_store_updates_rebalancing_inventory_immediately`.
+        /// The base test context configures no trading schedule, so these
+        /// stores come out with the schedule disabled.
         async fn stores_for(
             pool: &sqlx::SqlitePool,
             order_placer: &Arc<dyn OrderPlacer>,
         ) -> ProcessTxStores {
-            ProcessTxStores::standalone(pool, order_placer.clone())
+            ProcessTxStores::standalone(pool, &create_base_test_ctx(), order_placer.clone())
                 .await
                 .expect("standalone stores must build")
         }
@@ -5716,24 +5984,876 @@ pub mod process_tx {
                 "a deferred admission must clear the pending offchain order claim"
             );
 
-            // The abandoned order is driven out of Pending to Failed and kept as
-            // the preserved idempotency anchor, so no stuck Pending order is left
-            // for a recovery path to replay.
-            let anchor = position
-                .last_failed_offchain_order_id
-                .expect("clearing on defer must preserve the failed order anchor");
+            // A deferral never reaches the broker, so the retired order id is
+            // released instead of resting as the idempotency anchor: keeping it
+            // would make CheckPositions skip the position and schedule an anchor
+            // reconciliation lookup for an order the broker never created.
+            assert_eq!(
+                position.last_failed_offchain_order_id, None,
+                "a never sent deferral must release the failed order anchor"
+            );
+
+            // The abandoned order is still driven out of Pending to Failed, so no
+            // stuck Pending order is left for a recovery path to replay.
+            let (deferred_order_id,): (String,) = sqlx::query_as(
+                "SELECT DISTINCT aggregate_id FROM events \
+                 WHERE event_type LIKE 'OffchainOrderEvent%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let deferred_order_id: OffchainOrderId = deferred_order_id.parse().unwrap();
             let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .build(noop_order_placer())
                 .await
                 .unwrap();
             let offchain_order = offchain_order_store
-                .load(&anchor)
+                .load(&deferred_order_id)
                 .await
                 .unwrap()
-                .expect("the anchored offchain order must be persisted");
+                .expect("the deferred offchain order must be persisted");
             assert!(
                 matches!(offchain_order, OffchainOrder::Failed { .. }),
                 "the deferred order must be failed out of Pending, got: {offchain_order:?}"
+            );
+
+            // The terminal is recorded as a deferral, not a hedge failure, so
+            // the reliability projection leaves routine close flatten behavior
+            // out of the failure counts.
+            assert_eq!(
+                persisted_failure_kind(&pool).await,
+                OffchainOrderFailureKind::Deferral,
+                "a schedule deferral must persist as a deferral terminal"
+            );
+        }
+
+        /// `OrderPlacer` whose admission itself errors (never `Deferred`),
+        /// standing in for a broker admission service that is unreachable. The
+        /// order is left Pending without ever being sent, so process-tx must
+        /// clear the claim exactly as it does for a `Deferred` admission.
+        struct AdmissionRejectingOrderPlacer;
+
+        #[async_trait]
+        impl OrderPlacer for AdmissionRejectingOrderPlacer {
+            async fn prepare_placement(
+                &self,
+                _order: &MarketOrder,
+                _kind: &CounterTradeOrderKind,
+            ) -> Result<PlacementAdmission, Box<dyn std::error::Error + Send + Sync>> {
+                Err("admission service unavailable".into())
+            }
+
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("a rejected admission must not reach the broker")
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("a rejected admission must not place a limit order")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                panic!("a rejected admission must not cancel")
+            }
+        }
+
+        /// A broker admission that errors (not a schedule deferral) leaves the
+        /// order Pending without ever sending it, so process-tx must clear the
+        /// claim and settle the fill just like a `Deferred` admission, then
+        /// surface the operational failure rather than stranding a never-sent
+        /// Pending order on the position.
+        #[tokio::test]
+        async fn process_tx_admission_rejection_clears_pending_claim_and_settles() {
+            let pool = setup_test_db().await;
+
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                Symbol::new("AAPL").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(AdmissionRejectingOrderPlacer);
+            let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            let trade_id =
+                OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+            let position_trade_id = TradeId {
+                chain: onchain_trade.chain,
+                tx_hash: onchain_trade.tx_hash,
+                log_index: onchain_trade.log_index,
+            };
+
+            let failed = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(failed, OperatorError::Operational(_)),
+                "an admission rejection must surface as an operational failure, got: {failed:?}"
+            );
+
+            let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let onchain_state = onchain_trade_store
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .expect("the fill must be witnessed after an admission rejection");
+            assert!(
+                onchain_state.is_acknowledged(),
+                "clearing on an admission rejection must settle the fill"
+            );
+
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let position = position_store
+                .load(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("the position must exist after fill accounting");
+            assert!(
+                !position
+                    .pending_acknowledged_trade_ids
+                    .contains(&position_trade_id),
+                "the settled fill must leave the pending acknowledgement set"
+            );
+            assert_eq!(
+                position.pending_offchain_order_id, None,
+                "an admission rejection must clear the never sent pending offchain order claim"
+            );
+            assert_eq!(
+                position.last_failed_offchain_order_id, None,
+                "a never sent admission rejection must release the failed order anchor"
+            );
+
+            // The real admission cause reaches the durable order, not a canned
+            // deferral string.
+            let (rejected_order_id,): (String,) = sqlx::query_as(
+                "SELECT DISTINCT aggregate_id FROM events \
+                 WHERE event_type LIKE 'OffchainOrderEvent%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let rejected_order_id: OffchainOrderId = rejected_order_id.parse().unwrap();
+            let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(noop_order_placer())
+                .await
+                .unwrap();
+            let offchain_order = offchain_order_store
+                .load(&rejected_order_id)
+                .await
+                .unwrap()
+                .expect("the rejected offchain order must be persisted");
+            let OffchainOrder::Failed { error, .. } = offchain_order else {
+                panic!(
+                    "an admission rejection must fail the order out of Pending, got: {offchain_order:?}"
+                );
+            };
+            assert!(
+                error.contains("admission service unavailable"),
+                "the durable failure must record the real admission cause, got: {error}"
+            );
+            assert!(
+                !error.contains("pending intent is retained"),
+                "process-tx clears the claim, so the reason must not claim retention, got: {error}"
+            );
+            assert!(
+                error.contains("claim cleared"),
+                "the durable failure must state what process-tx did, got: {error}"
+            );
+            assert_eq!(
+                persisted_failure_kind(&pool).await,
+                OffchainOrderFailureKind::Failure,
+                "an admission failure must persist as a genuine failure terminal"
+            );
+        }
+
+        /// `OrderPlacer` whose admission passes and whose broker call is rate
+        /// limited, standing in for a live broker returning a 429. Unlike a
+        /// deferral or an admission failure, the broker WAS contacted here, so
+        /// the attempt may have created an order.
+        struct RateLimitedOrderPlacer;
+
+        #[async_trait]
+        impl OrderPlacer for RateLimitedOrderPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err(Box::new(AlpacaBrokerApiError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    alpaca_code: None,
+                    message: "rate limited".to_string(),
+                    retry_after: Some(Duration::from_secs(7)),
+                }))
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("a rate limited market hedge must not place a limit order")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                panic!("a rate limited placement must not cancel")
+            }
+        }
+
+        /// Broker backpressure differs from a deferral or an admission failure:
+        /// the broker WAS contacted, so an order may exist. process-tx still
+        /// fails the Pending order, clears the claim, and settles the fill, but
+        /// it PRESERVES the idempotency anchor so the next attempt reconciles
+        /// whatever the broker may have created. The surfaced failure must keep
+        /// its 429 in the chain so the caller's retry policy still classifies it
+        /// as backpressure.
+        #[tokio::test]
+        async fn process_tx_backpressure_clears_pending_claim_and_settles() {
+            let pool = setup_test_db().await;
+
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                Symbol::new("AAPL").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(RateLimitedOrderPlacer);
+            let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            let trade_id =
+                OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+            let position_trade_id = TradeId {
+                chain: onchain_trade.chain,
+                tx_hash: onchain_trade.tx_hash,
+                log_index: onchain_trade.log_index,
+            };
+
+            let failed = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            let OperatorError::Operational(operational) = &failed else {
+                panic!(
+                    "broker backpressure must surface as an operational failure, got: {failed:?}"
+                )
+            };
+            let backpressure = find_backpressure(operational.as_ref())
+                .expect("the surfaced failure must still classify as backpressure");
+            assert_eq!(backpressure.retry_after, Some(Duration::from_secs(7)));
+
+            let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let onchain_state = onchain_trade_store
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .expect("the fill must be witnessed after broker backpressure");
+            assert!(
+                onchain_state.is_acknowledged(),
+                "clearing on backpressure must settle the fill"
+            );
+
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let position = position_store
+                .load(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("the position must exist after fill accounting");
+            assert!(
+                !position
+                    .pending_acknowledged_trade_ids
+                    .contains(&position_trade_id),
+                "the settled fill must leave the pending acknowledgement set"
+            );
+            assert_eq!(
+                position.pending_offchain_order_id, None,
+                "backpressure must clear the pending offchain order claim"
+            );
+
+            let (rate_limited_order_id,): (String,) = sqlx::query_as(
+                "SELECT DISTINCT aggregate_id FROM events \
+                 WHERE event_type LIKE 'OffchainOrderEvent%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let rate_limited_order_id: OffchainOrderId = rate_limited_order_id.parse().unwrap();
+            assert_eq!(
+                position.last_failed_offchain_order_id,
+                Some(rate_limited_order_id),
+                "backpressure reached the broker, so the anchor must be preserved for \
+                 reconciliation"
+            );
+
+            let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(noop_order_placer())
+                .await
+                .unwrap();
+            let offchain_order = offchain_order_store
+                .load(&rate_limited_order_id)
+                .await
+                .unwrap()
+                .expect("the rate limited offchain order must be persisted");
+            let OffchainOrder::Failed { error, .. } = offchain_order else {
+                panic!("backpressure must fail the order out of Pending, got: {offchain_order:?}")
+            };
+            assert!(
+                error.contains("rate limited"),
+                "the durable failure must record the real rate limit cause, got: {error}"
+            );
+            assert!(
+                error.contains("429"),
+                "the durable failure must record the broker status of the cause, got: {error}"
+            );
+            assert!(
+                !error.contains("pending intent is retained"),
+                "process-tx clears the claim, so the reason must not claim retention, got: {error}"
+            );
+            assert!(
+                error.contains("idempotency anchor"),
+                "the durable failure must state that the anchor was preserved, got: {error}"
+            );
+            assert_eq!(
+                persisted_failure_kind(&pool).await,
+                OffchainOrderFailureKind::Failure,
+                "backpressure must persist as a genuine failure terminal"
+            );
+        }
+
+        /// A poll enqueue failure while enrolling a freshly placed hedge must
+        /// leave the fill unsettled so the retry can enroll again, mirroring the
+        /// existing-in-flight branch. The broker order is placed, but the closed
+        /// queue fails enrollment before the fill settles; the retry with a
+        /// working queue enrolls exactly one job and settles against the in-flight
+        /// hedge.
+        #[tokio::test]
+        async fn process_tx_fresh_placement_poll_enqueue_failure_defers_settlement_until_retry() {
+            let (pool, apalis_pool) = try_setup_test_pools().await.unwrap();
+
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                Symbol::new("AAPL").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
+            let stores = stores_for(&pool, &order_placer).await;
+            let poll_status_queue = PollOrderStatusJobQueue::new(&apalis_pool);
+
+            let broken_apalis_pool = try_setup_test_pools().await.unwrap().1;
+            broken_apalis_pool.close().await;
+            let broken_poll_queue = PollOrderStatusJobQueue::new(&broken_apalis_pool);
+
+            let fill = onchain_trade_builder()
+                .with_log_index(1)
+                .with_block_number(42)
+                .build();
+            let trade_id = OnChainTradeId::new(fill.chain, fill.tx_hash, fill.log_index);
+            let position_trade_id = TradeId {
+                chain: fill.chain,
+                tx_hash: fill.tx_hash,
+                log_index: fill.log_index,
+            };
+
+            // Fresh placement: the broker accepts, but enrolling the poll job on
+            // the closed queue fails before the fill settles.
+            let failed = process_found_trade(
+                fill,
+                &ctx,
+                &pool,
+                &stores,
+                order_placer.clone(),
+                None,
+                Some((&broken_poll_queue, TEST_POLL_INTERVAL)),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(failed, OperatorError::Operational(_)),
+                "a broken poll enqueue must surface as an operational failure, got: {failed:?}"
+            );
+
+            // The placement itself succeeded, so the position claims the submitted
+            // order, but the fill is not settled: witnessed, not acknowledged.
+            let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let onchain_state = onchain_trade_store
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .expect("the fill must be witnessed even when enrollment fails");
+            assert!(
+                !onchain_state.is_acknowledged(),
+                "a failed enrollment must leave the fill unacknowledged for the retry"
+            );
+
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let position = position_store
+                .load(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("the position must exist after placement");
+            assert!(
+                position
+                    .pending_acknowledged_trade_ids
+                    .contains(&position_trade_id),
+                "an unsettled fill must remain in the pending acknowledgement set"
+            );
+            let offchain_order_id = position
+                .pending_offchain_order_id
+                .expect("the fresh placement must claim a pending offchain order");
+
+            let poll_job_count_before: i64 = sqlx_apalis::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM Jobs \
+                 WHERE job_type = ? \
+                   AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+                   AND status IN ('Pending', 'Queued', 'Running')",
+            )
+            .bind(std::any::type_name::<PollOrderStatus>())
+            .bind(offchain_order_id.to_string())
+            .fetch_one(&apalis_pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                poll_job_count_before, 0,
+                "a failed enrollment must not enqueue a poll job"
+            );
+
+            // The retry with a working queue settles the fill against the now
+            // in-flight hedge and enrolls exactly one poll job.
+            let fill_retry = onchain_trade_builder()
+                .with_log_index(1)
+                .with_block_number(42)
+                .build();
+            let retry_outcome = process_found_trade(
+                fill_retry,
+                &ctx,
+                &pool,
+                &stores,
+                order_placer,
+                None,
+                Some((&poll_status_queue, TEST_POLL_INTERVAL)),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(retry_outcome, ProcessTxOutcome::PendingHedgeInFlight),
+                "the retry must settle the fill against the in-flight hedge, got: {retry_outcome:?}"
+            );
+
+            let settled_position = position_store
+                .load(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("the position must exist after the retry");
+            assert!(
+                !settled_position
+                    .pending_acknowledged_trade_ids
+                    .contains(&position_trade_id),
+                "the retry must settle the fill out of the pending acknowledgement set"
+            );
+
+            let poll_job_count_after: i64 = sqlx_apalis::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM Jobs \
+                 WHERE job_type = ? \
+                   AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+                   AND status IN ('Pending', 'Queued', 'Running')",
+            )
+            .bind(std::any::type_name::<PollOrderStatus>())
+            .bind(offchain_order_id.to_string())
+            .fetch_one(&apalis_pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                poll_job_count_after, 1,
+                "the retry must enroll exactly one PollOrderStatus job"
+            );
+        }
+
+        /// A pre-placement `Pending` order is a legitimate deferred retry only
+        /// when the trading schedule is enabled. With the schedule disabled the
+        /// gate must settle the fill, preserve the claim, and surface a typed
+        /// rejection (matching the live path's strict `schedule_enabled` check);
+        /// with it enabled it must settle the fill, preserve the claim, and
+        /// report the retained deferral.
+        #[tokio::test]
+        async fn process_tx_retained_pending_gates_on_the_schedule() {
+            for schedule_enabled in [false, true] {
+                let pool = setup_test_db().await;
+                let symbol = Symbol::new("AAPL").unwrap();
+
+                let mut ctx = create_base_test_ctx();
+                ctx.chains.primary_mut().assets.equities.symbols.insert(
+                    symbol.clone(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_ids: vec![],
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                );
+
+                let pending_id = OffchainOrderId::new();
+                let block_timestamp = Utc::now();
+                // The live pipeline's retained deferred state: the position claims
+                // a pending order that rests in `Pending` at the broker.
+                let position_store =
+                    seed_position_with_pending_order(&pool, &symbol, pending_id, block_timestamp)
+                        .await;
+                let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+                    .build(noop_order_placer())
+                    .await
+                    .unwrap();
+                offchain_order_store
+                    .send(
+                        &pending_id,
+                        OffchainOrderCommand::PlaceReserved {
+                            symbol: symbol.clone(),
+                            shares: positive_shares("1"),
+                            direction: Direction::Sell,
+                            executor: SupportedExecutor::DryRun,
+                            client_order_id: ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                            kind: CounterTradeOrderKind::Market,
+                            buying_power_reservation: None,
+                            placed_at: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                let later_fill = onchain_trade_builder()
+                    .with_log_index(9)
+                    .with_block_number(43)
+                    .build();
+                let later_trade_id =
+                    OnChainTradeId::new(later_fill.chain, later_fill.tx_hash, later_fill.log_index);
+                let later_position_trade_id = TradeId {
+                    chain: later_fill.chain,
+                    tx_hash: later_fill.tx_hash,
+                    log_index: later_fill.log_index,
+                };
+
+                // Placement is never reached: the gate resolves the pre-placement
+                // Pending order before any broker call.
+                let order_placer = noop_order_placer();
+                let mut stores = stores_for(&pool, &order_placer).await;
+                stores.schedule_enabled = schedule_enabled;
+
+                let result =
+                    process_found_trade(later_fill, &ctx, &pool, &stores, order_placer, None, None)
+                        .await;
+
+                if schedule_enabled {
+                    let outcome = result.expect("a schedule-enabled retained Pending must defer");
+                    let ProcessTxOutcome::PendingHedgeDeferred {
+                        symbol: deferred_symbol,
+                        offchain_order_id,
+                    } = &outcome
+                    else {
+                        panic!("a retained Pending under a schedule must defer, got: {outcome:?}");
+                    };
+                    assert_eq!(deferred_symbol, &symbol);
+                    assert_eq!(offchain_order_id, &pending_id);
+                } else {
+                    let error =
+                        result.expect_err("a schedule-disabled retained Pending must reject");
+                    assert!(
+                        matches!(
+                            &error,
+                            OperatorError::Rejected(RejectionReason::RetainedPendingWithoutSchedule {
+                                offchain_order_id,
+                                symbol: rejected_symbol,
+                            }) if *offchain_order_id == pending_id && rejected_symbol == &symbol
+                        ),
+                        "a schedule-disabled retained Pending must be a typed rejection, got: {error:?}"
+                    );
+                }
+
+                // Both branches settle the fill and preserve the claim.
+                let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                    .build(())
+                    .await
+                    .unwrap();
+                let onchain_state = onchain_trade_store
+                    .load(&later_trade_id)
+                    .await
+                    .unwrap()
+                    .expect("the later fill must be witnessed");
+                assert!(
+                    onchain_state.is_acknowledged(),
+                    "both branches must settle the later fill (schedule_enabled={schedule_enabled})"
+                );
+
+                let position = position_store
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .expect("the position must exist");
+                assert!(
+                    !position
+                        .pending_acknowledged_trade_ids
+                        .contains(&later_position_trade_id),
+                    "both branches must settle the fill out of the pending acknowledgement set \
+                     (schedule_enabled={schedule_enabled})"
+                );
+                assert_eq!(
+                    position.pending_offchain_order_id,
+                    Some(pending_id),
+                    "both branches must preserve the pending claim \
+                     (schedule_enabled={schedule_enabled})"
+                );
+            }
+        }
+
+        /// The `schedule_enabled` flag a CLI run works from is derived from the
+        /// deployed configuration, not hardcoded: a config whose trading
+        /// schedule is enforcing must let a leftover Pending hedge settle and
+        /// report its deferral, while an observing (or absent) schedule keeps
+        /// the typed rejection.
+        #[tokio::test]
+        async fn standalone_stores_derive_the_schedule_flag_from_config() {
+            for schedule_mode in [
+                None,
+                Some(TradingScheduleMode::Observe),
+                Some(TradingScheduleMode::Enabled),
+            ] {
+                let pool = setup_test_db().await;
+                let symbol = Symbol::new("AAPL").unwrap();
+
+                let mut ctx = create_base_test_ctx();
+                ctx.chains.primary_mut().assets.equities.symbols.insert(
+                    symbol.clone(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_ids: vec![],
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                );
+                ctx.pricing = Some(pricing_ctx_with_schedule(schedule_mode));
+
+                let pending_id = OffchainOrderId::new();
+                let position_store =
+                    seed_position_with_pending_order(&pool, &symbol, pending_id, Utc::now()).await;
+                let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+                    .build(noop_order_placer())
+                    .await
+                    .unwrap();
+                offchain_order_store
+                    .send(
+                        &pending_id,
+                        OffchainOrderCommand::PlaceReserved {
+                            symbol: symbol.clone(),
+                            shares: positive_shares("1"),
+                            direction: Direction::Sell,
+                            executor: SupportedExecutor::DryRun,
+                            client_order_id: ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                            kind: CounterTradeOrderKind::Market,
+                            buying_power_reservation: None,
+                            placed_at: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                let later_fill = onchain_trade_builder()
+                    .with_log_index(9)
+                    .with_block_number(43)
+                    .build();
+                let later_trade_id =
+                    OnChainTradeId::new(later_fill.chain, later_fill.tx_hash, later_fill.log_index);
+
+                let order_placer = noop_order_placer();
+                let stores = ProcessTxStores::standalone(&pool, &ctx, order_placer.clone())
+                    .await
+                    .expect("standalone stores must build");
+                assert_eq!(
+                    stores.schedule_enabled,
+                    schedule_mode == Some(TradingScheduleMode::Enabled),
+                    "the standalone flag must follow the configured mode ({schedule_mode:?})"
+                );
+
+                let result =
+                    process_found_trade(later_fill, &ctx, &pool, &stores, order_placer, None, None)
+                        .await;
+
+                if schedule_mode == Some(TradingScheduleMode::Enabled) {
+                    let outcome = result.expect(
+                        "an enforcing schedule must defer the retained \
+                                                 Pending",
+                    );
+                    let ProcessTxOutcome::PendingHedgeDeferred {
+                        symbol: deferred_symbol,
+                        offchain_order_id,
+                    } = &outcome
+                    else {
+                        panic!("a configured schedule must defer, got: {outcome:?}");
+                    };
+                    assert_eq!(deferred_symbol, &symbol);
+                    assert_eq!(offchain_order_id, &pending_id);
+                } else {
+                    let error = result.expect_err("an unenforced schedule must reject");
+                    assert!(
+                        matches!(
+                            &error,
+                            OperatorError::Rejected(RejectionReason::RetainedPendingWithoutSchedule {
+                                offchain_order_id,
+                                symbol: rejected_symbol,
+                            }) if *offchain_order_id == pending_id && rejected_symbol == &symbol
+                        ),
+                        "an unenforced schedule must reject the retained Pending ({schedule_mode:?}), got: {error:?}"
+                    );
+                }
+
+                let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                    .build(())
+                    .await
+                    .unwrap();
+                let onchain_state = onchain_trade_store
+                    .load(&later_trade_id)
+                    .await
+                    .unwrap()
+                    .expect("the later fill must be witnessed");
+                assert!(
+                    onchain_state.is_acknowledged(),
+                    "every branch must settle the later fill ({schedule_mode:?})"
+                );
+
+                let position = position_store
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .expect("the position must exist");
+                assert_eq!(
+                    position.pending_offchain_order_id,
+                    Some(pending_id),
+                    "every branch must preserve the pending claim ({schedule_mode:?})"
+                );
+            }
+        }
+
+        /// A pricing context carrying a trading schedule in `mode`, or none at
+        /// all, standing in for the deployed config a CLI run reads.
+        fn pricing_ctx_with_schedule(mode: Option<TradingScheduleMode>) -> PricingCtx {
+            let mut pricing = PricingCtx::new(
+                url::Url::parse("wss://pricing.test/ws").unwrap(),
+                "pricing-test-key".to_owned(),
+            )
+            .unwrap();
+            pricing.trading_schedule = mode.map(|mode| {
+                let mut config: TradingScheduleConfig = toml::from_str(
+                    r#"
+                    mode = "observe"
+                    environment = "staging"
+                    poll_interval_secs = 5
+                    request_timeout_secs = 3
+                    response_freshness_secs = 30
+                    calendar_max_age_secs = 7200
+                    evidence_clock_skew_secs = 2
+                    emergency_buffer_secs = 900
+                    [[scopes]]
+                    id = "regular"
+                    profile_revision = "v1"
+                    extended_hours = false
+                    assets = ["AAPL"]
+                "#,
+                )
+                .unwrap();
+                config.mode = mode;
+                config
+            });
+            pricing
+        }
+
+        /// The decoded-chain guard passes when the decoded fill matches the
+        /// requested chain and rejects, naming both chains, when it does not.
+        #[test]
+        fn ensure_decoded_chain_matches_rejects_a_divergent_chain() {
+            ensure_decoded_chain_matches(Chain::Base, Chain::Base)
+                .expect("a matching chain must pass the guard");
+
+            let error = ensure_decoded_chain_matches(Chain::Ethereum, Chain::Base).unwrap_err();
+            let RejectionReason::DecodedChainMismatch { requested, decoded } = &error else {
+                panic!("a divergent chain must be a DecodedChainMismatch, got: {error:?}");
+            };
+            assert_eq!(*requested, Chain::Base);
+            assert_eq!(*decoded, Chain::Ethereum);
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("base") && rendered.contains("ethereum"),
+                "the rejection must name both chains, got: {rendered}"
             );
         }
 
@@ -5867,9 +6987,18 @@ pub mod process_tx {
                 after_first.pending_offchain_order_id, None,
                 "the first defer must clear the pending claim"
             );
-            let first_anchor = after_first
-                .last_failed_offchain_order_id
-                .expect("the first defer must preserve the failed order anchor");
+            assert_eq!(
+                after_first.last_failed_offchain_order_id, None,
+                "the first defer never reached the broker, so it must release the anchor"
+            );
+            let (deferred_order_id,): (String,) = sqlx::query_as(
+                "SELECT DISTINCT aggregate_id FROM events \
+                 WHERE event_type LIKE 'OffchainOrderEvent%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let deferred_order_id: OffchainOrderId = deferred_order_id.parse().unwrap();
 
             let second_fill = onchain_trade_builder()
                 .with_log_index(2)
@@ -5901,7 +7030,7 @@ pub mod process_tx {
                 );
             };
             assert_ne!(
-                offchain_order_id, first_anchor,
+                offchain_order_id, deferred_order_id,
                 "the later fill must place a fresh order, not replay the deferred one"
             );
 
@@ -5954,7 +7083,7 @@ pub mod process_tx {
 
             // The deferred order stays terminal and is never replayed.
             let deferred_order = offchain_order_store
-                .load(&first_anchor)
+                .load(&deferred_order_id)
                 .await
                 .unwrap()
                 .expect("the deferred order must be persisted");
@@ -6335,7 +7464,10 @@ pub mod process_tx {
                     | ProcessTxOutcome::PlacementRejected { .. },
                 ) => true,
                 Err(OperatorError::Operational(error)) => is_aggregate_conflict(error),
-                Ok(_) | Err(OperatorError::Rejected(_)) => false,
+                Ok(_)
+                | Err(
+                    OperatorError::Rejected(_) | OperatorError::PreflightReservationMismatch(_),
+                ) => false,
             };
             assert!(
                 expected_result(&outcome_a) && expected_result(&outcome_b),
@@ -6484,6 +7616,7 @@ pub mod process_tx {
                 position,
                 position_projection,
                 offchain_order: standalone.offchain_order,
+                schedule_enabled: standalone.schedule_enabled,
             };
 
             // 1 share buy at 150 -> net +1 -> the opposite hedge is placed.

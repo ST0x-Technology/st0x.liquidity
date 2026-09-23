@@ -5519,6 +5519,23 @@ effect rather than a generic intent:
   (defaulting to the primary), returns the decoded fill alongside its outcome,
   and runs the accounting and placement on a detached task so a client
   disconnect cannot strand a placed order before its Submitted event persists.
+  **On an admission deferral** (ADR 0022), broker admission defers the placement
+  before any broker call, so process-tx fails the order, releases its id,
+  settles the fill, and returns `ProcessTxOutcome::HedgePlacementDeferred` so
+  the standing periodic position check hedges the exposure again. **On an
+  admission error**, broker admission similarly fails before the broker call, so
+  process-tx fails the order, releases its id, clears the claim, settles the
+  fill, and surfaces the error to the caller (500 from the REST route, nonzero
+  exit from the CLI). **On broker backpressure**, the broker call did run, so
+  process-tx preserves the failed order id as the idempotency anchor, clears the
+  claim, settles the fill, and surfaces the error; the standing position check
+  then runs anchor recovery under that client id. None of these cases retain a
+  Pending intent. This behavior lives in the shared process-tx placement path
+  used by both the CLI and the REST route. **Before placement**, a Pending claim
+  already held by the live pipeline is settled against and reported as a
+  deferral (PendingHedgeDeferred) when the schedule is enabled, and rejected
+  (after settling the fill) as RetainedPendingWithoutSchedule when the schedule
+  is disabled.
 
 **Standing rules:**
 
@@ -5593,10 +5610,12 @@ effect rather than a generic intent:
   `(tx_hash, log_index)` concurrently. The durable dedup guard and the CQRS
   apply are separate transactions, so any concurrent actor processing the same
   fill can slip through the TOCTOU window. The **in-bot REST route lifts this
-  precondition**: it holds the shared submission lock across the position claim
-  and broker placement and gates on full startup readiness, so it runs safely
-  against the live pipeline without stopping the bot; the same durable dedup
-  guard still rejects a re-drive of an already-recorded fill.
+  precondition**: the durable dedup guard plus the serialization of each
+  Position aggregate instance and its duplicate fill and pending state checks
+  make concurrent accounting of the same fill safe, while the shared submission
+  lock (acquired after accounting returns) serializes only the position claim
+  and broker placement, so it runs safely against the live pipeline without
+  stopping the bot.
 
 ### Event Processing Flow
 

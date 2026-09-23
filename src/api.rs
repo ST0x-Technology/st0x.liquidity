@@ -2423,14 +2423,21 @@ fn ops_precondition_error(error: impl std::fmt::Display) -> (StatusCode, Json<Er
 }
 
 /// Maps a shared operator command failure to a response: a caller-facing
-/// rejection becomes a `400`, an operational failure a logged `500` carrying
-/// the full error chain.
+/// rejection becomes a `400`, a preflight reservation mismatch a `500` whose
+/// body carries the typed invariant reason, and any other operational failure a
+/// logged `500` carrying the full error chain.
 fn ops_operator_error(error: OperatorError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
         OperatorError::Rejected(reason) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: reason.to_string(),
+            }),
+        ),
+        OperatorError::PreflightReservationMismatch(mismatch) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: mismatch.to_string(),
             }),
         ),
         OperatorError::Operational(error) => ops_store_error(format!("{error:#}")),
@@ -2567,13 +2574,24 @@ struct ProcessTxResponse {
     outcome: ProcessTxOutcomeResponse,
 }
 
+/// Maps a hedge direction to its stable wire form. Serializing `Direction`
+/// directly would emit the dashboard's snake_case (`"buy"`/`"sell"`), so the
+/// process-tx wire keeps its own explicit `"Buy"`/`"Sell"` mapping rather than a
+/// Debug rendering that could drift if the enum's Debug output changed.
+fn process_tx_direction_wire(direction: st0x_execution::Direction) -> &'static str {
+    match direction {
+        st0x_execution::Direction::Buy => "Buy",
+        st0x_execution::Direction::Sell => "Sell",
+    }
+}
+
 /// Operator-relevant identity and economics of the decoded on-chain fill.
 #[derive(Debug, Serialize)]
 struct ProcessTxFillResponse {
     tx_hash: String,
     log_index: u64,
     symbol: String,
-    direction: String,
+    direction: &'static str,
     quantity: String,
     price: String,
 }
@@ -2586,7 +2604,7 @@ impl TryFrom<ProcessTxFill> for ProcessTxFillResponse {
             tx_hash: fill.tx_hash.to_string(),
             log_index: fill.log_index,
             symbol: fill.symbol.to_string(),
-            direction: format!("{:?}", fill.direction),
+            direction: process_tx_direction_wire(fill.direction),
             quantity: fill.quantity.to_string(),
             price: format_float(&fill.price)?,
         })
@@ -2619,14 +2637,18 @@ enum ProcessTxOutcomeResponse {
         symbol: String,
         offchain_order_id: String,
         shares: String,
-        direction: String,
-        disposition: &'static str,
+        direction: &'static str,
+        disposition: PlacedHedgeDisposition,
     },
     HedgePlacementCleared {
         symbol: String,
     },
     HedgePlacementDeferred {
         symbol: String,
+    },
+    PendingHedgeDeferred {
+        symbol: String,
+        offchain_order_id: String,
     },
 }
 
@@ -2660,17 +2682,21 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
                 symbol: symbol.to_string(),
                 offchain_order_id: offchain_order_id.to_string(),
                 shares: shares.to_string(),
-                direction: format!("{direction:?}"),
-                disposition: match disposition {
-                    PlacedHedgeDisposition::InFlight => "in_flight",
-                    PlacedHedgeDisposition::Finalized => "finalized",
-                },
+                direction: process_tx_direction_wire(direction),
+                disposition,
             },
             ProcessTxOutcome::HedgePlacementCleared { symbol } => Self::HedgePlacementCleared {
                 symbol: symbol.to_string(),
             },
             ProcessTxOutcome::HedgePlacementDeferred { symbol } => Self::HedgePlacementDeferred {
                 symbol: symbol.to_string(),
+            },
+            ProcessTxOutcome::PendingHedgeDeferred {
+                symbol,
+                offchain_order_id,
+            } => Self::PendingHedgeDeferred {
+                symbol: symbol.to_string(),
+                offchain_order_id: offchain_order_id.to_string(),
             },
         }
     }
@@ -2759,7 +2785,7 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "process-tx worker task failed".to_owned(),
+                error: format!("process-tx worker task failed: {error}"),
             }),
         )
     })?
@@ -2844,7 +2870,7 @@ async fn process_transaction(
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "failed to format the process-tx response".to_owned(),
+                error: format!("failed to format the process-tx response: {error}"),
             }),
         )
     })?;
@@ -3168,8 +3194,9 @@ mod tests {
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletError,
-        CancellationOutcome, DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId,
-        LimitOrder, MarketOrder, Positive, SupportedExecutor, Symbol, TimeInForce,
+        BuyingPowerReservationCents, CancellationOutcome, CounterTradePreflight,
+        CounterTradeReservation, DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction,
+        ExecutorOrderId, LimitOrder, MarketOrder, Positive, SupportedExecutor, Symbol, TimeInForce,
     };
     use st0x_finance::{FractionalShares, Usd, Usdc};
     use st0x_float_macro::float;
@@ -3185,7 +3212,8 @@ mod tests {
         self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
     };
     use crate::offchain::order::{
-        OffchainOrder, OffchainOrderEvent, OffchainOrderId, OrderPlacementResult,
+        OffchainOrder, OffchainOrderEvent, OffchainOrderFailureKind, OffchainOrderId,
+        OrderPlacementResult,
     };
     use crate::onchain_trade::{
         InventoryVenue, OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource,
@@ -5032,6 +5060,7 @@ mod tests {
                     error: "rejected".to_string(),
                     filled_shares: None,
                     failed_at: now,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -7204,6 +7233,19 @@ mod tests {
             ops_operator_error(OperatorError::Operational(anyhow::anyhow!("db down"))).0,
             StatusCode::INTERNAL_SERVER_ERROR
         );
+
+        let mismatch = process_tx::PreflightReservationMismatch::SellReservedOtherSymbol {
+            symbol: Symbol::new("AAPL").unwrap(),
+            reserved: Symbol::new("MSTR").unwrap(),
+        };
+        let expected = mismatch.to_string();
+        let (status, Json(body)) =
+            ops_operator_error(OperatorError::PreflightReservationMismatch(mismatch));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body.error, expected,
+            "the body must carry the typed mismatch reason, not a generic message"
+        );
     }
 
     #[test]
@@ -7620,12 +7662,55 @@ mod tests {
             }),
         ));
 
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::PendingHedgeDeferred {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    offchain_order_id: OffchainOrderId::from_uuid(uuid!(
+                        "22222222-2222-4222-8222-222222222222"
+                    )),
+                },
+            },
+            serde_json::json!({
+                "fill": fill_json,
+                "outcome": "pending_hedge_deferred",
+                "symbol": "AAPL",
+                "offchain_order_id": "22222222-2222-4222-8222-222222222222",
+            }),
+        ));
+
         for (report, expected) in cases {
             assert_eq!(
                 serde_json::to_value(ProcessTxResponse::try_from(report).unwrap()).unwrap(),
                 expected,
             );
         }
+    }
+
+    /// Exhaustive by construction: adding a `ProcessTxOutcome` variant makes this
+    /// match fail to compile until the new variant gets a wire mapping in
+    /// `ProcessTxOutcomeResponse::from` and a serialization case in
+    /// `process_tx_response_serializes_each_mapped_outcome`.
+    #[test]
+    fn process_tx_outcome_variants_are_all_wire_mapped() {
+        fn assert_mapped(outcome: &ProcessTxOutcome) {
+            match outcome {
+                ProcessTxOutcome::NoTradeableEvents
+                | ProcessTxOutcome::TransactionNotFound { .. }
+                | ProcessTxOutcome::AlreadyAccounted
+                | ProcessTxOutcome::PendingHedgeInFlight
+                | ProcessTxOutcome::BelowExecutionThreshold
+                | ProcessTxOutcome::TradingDisabled { .. }
+                | ProcessTxOutcome::PlacementRejected { .. }
+                | ProcessTxOutcome::PreflightDeferred { .. }
+                | ProcessTxOutcome::HedgePlaced { .. }
+                | ProcessTxOutcome::HedgePlacementCleared { .. }
+                | ProcessTxOutcome::HedgePlacementDeferred { .. }
+                | ProcessTxOutcome::PendingHedgeDeferred { .. } => {}
+            }
+        }
+        assert_mapped(&ProcessTxOutcome::NoTradeableEvents);
     }
 
     /// `OrderPlacer` whose market placement parks on a `Notify`: it signals that
@@ -7776,7 +7861,7 @@ mod tests {
         );
         let trading_chain = ctx.chains.primary().clone();
 
-        let stores = ProcessTxStores::standalone(&pool, Arc::clone(&order_placer))
+        let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
             .await
             .expect("standalone stores must build");
         let handle = ProcessTxHandle {
@@ -7802,6 +7887,350 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), finished.notified())
             .await
             .expect("the detached broker placement must finish after request cancellation");
+    }
+
+    /// An operational failure from the process-tx workload maps to a 500 through
+    /// the handler seam: a failing RPC endpoint surfaces as an operational error
+    /// that `spawn_and_join_process_tx` renders as a 500.
+    #[tokio::test]
+    async fn spawn_and_join_process_tx_maps_an_operational_failure_to_500() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let trading_chain = ctx.chains.primary().clone();
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
+        let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
+            .await
+            .expect("standalone stores must build");
+        let handle = ProcessTxHandle {
+            order_placer,
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            stores,
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
+        };
+
+        let Err((status, Json(_body))) = spawn_and_join_process_tx(
+            TxHash::repeat_byte(0x33),
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            SymbolCache::default(),
+            &handle,
+        )
+        .await
+        else {
+            panic!("a failing RPC endpoint must surface as an error");
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A domain rejection from the process-tx workload maps to a 400 through the
+    /// handler seam: with the trading schedule disabled (a standalone process), a
+    /// retained pre-placement `Pending` hedge is a typed rejection that
+    /// `spawn_and_join_process_tx` renders as a 400.
+    #[tokio::test]
+    async fn spawn_and_join_process_tx_maps_a_domain_rejection_to_400() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let pending_order_id = OffchainOrderId::new();
+        // The live pipeline's retained deferred state: a position claim over a
+        // pending offchain order that rests in `Pending`, never sent.
+        seed_pending_position(&pool, &symbol, pending_order_id).await;
+        st0x_event_sorcery::send_command::<OffchainOrder>(
+            &pool,
+            &pending_order_id,
+            crate::offchain::order::OffchainOrderCommand::Place {
+                symbol: symbol.clone(),
+                shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+                client_order_id: st0x_execution::ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                kind: crate::offchain::order::CounterTradeOrderKind::Market,
+            },
+            crate::offchain::order::noop_order_placer(),
+        )
+        .await
+        .unwrap();
+
+        // A `TakeOrderV3` fill against the bot's own order, decoding a 1-share
+        // on-chain BUY of AAPL (opposite hedge is a market SELL), mirroring the
+        // cancellation test's fixture.
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let order_owner = get_test_order().owner;
+        let tx_hash =
+            fixed_bytes!("0x4646464646464646464646464646464646464646464646464646464646464646");
+        let take_order = TakeOrderV3 {
+            sender: address!("0x2222222222222222222222222222222222222222"),
+            config: TakeOrderConfigV4 {
+                order: get_test_order(),
+                inputIOIndex: U256::from(1),
+                outputIOIndex: U256::from(0),
+                signedContext: vec![SignedContextV1 {
+                    signer: Address::ZERO,
+                    signature: Vec::new().into(),
+                    context: Vec::new(),
+                }],
+            },
+            input: Float::from_fixed_decimal_lossy(uint!(150_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(1_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+        };
+        let orderbook_log = Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: take_order.to_log_data(),
+            },
+            block_hash: None,
+            block_number: None,
+            block_timestamp: Some(1_700_000_000),
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(7),
+            removed: false,
+        };
+        let receipt = serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x1",
+            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
+            "blockNumber": "0x2a",
+            "from": "0x1234567890123456789012345678901234567890",
+            "to": orderbook,
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x77359400",
+            "cumulativeGasUsed": "0x5208",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": [orderbook_log]
+        });
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let cache = SymbolCache::default();
+        seed_get_test_order_token_symbols(&cache);
+
+        let mut ctx = create_test_ctx_with_order_owner(order_owner);
+        ctx.chains.primary_mut().orderbook = orderbook;
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            symbol.clone(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        let trading_chain = ctx.chains.primary().clone();
+
+        let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
+        let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
+            .await
+            .expect("standalone stores must build");
+        assert!(
+            !stores.schedule_enabled,
+            "this context configures no trading schedule, so the stores must have it disabled"
+        );
+        let handle = ProcessTxHandle {
+            order_placer,
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            stores,
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
+        };
+
+        let Err((status, Json(body))) =
+            spawn_and_join_process_tx(tx_hash, ctx, pool, trading_chain, provider, cache, &handle)
+                .await
+        else {
+            panic!("a schedule-disabled retained Pending must surface as a rejection");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {}", body.error);
+        assert!(
+            body.error.contains("schedule is disabled"),
+            "the 400 body must explain the schedule-disabled rejection, got: {}",
+            body.error
+        );
+    }
+
+    /// `OrderPlacer` whose placement preflight answers a sell with a buying
+    /// power reservation, the wrong reservation for a sell. Driving a sell hedge
+    /// through it forces a `PreflightReservationMismatch` so the handler seam can
+    /// be observed mapping that typed invariant to a 500.
+    struct MismatchOrderPlacer;
+
+    #[async_trait]
+    impl OrderPlacer for MismatchOrderPlacer {
+        async fn preflight_counter_trade_with_reserved_buying_power(
+            &self,
+            _order: MarketOrder,
+            _reserved: BuyingPowerReservationCents,
+        ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::BuyingPower {
+                    required: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    estimated_cost_cents: 15_000,
+                    available_buying_power_cents: 100_000,
+                }),
+            })
+        }
+
+        async fn place_market_order(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("a mismatched preflight must fail closed before placement")
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("process-tx market hedge must not place a limit order")
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("a mismatched preflight must not cancel")
+        }
+    }
+
+    /// A placement preflight reservation mismatch is an internal invariant
+    /// violation, not a bad operator request, so it must map to a 500 through
+    /// the handler seam. The 500 body must carry the typed mismatch reason
+    /// rather than the generic operational chain.
+    #[tokio::test]
+    async fn spawn_and_join_process_tx_maps_a_preflight_reservation_mismatch_to_500() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(MismatchOrderPlacer);
+
+        // A `TakeOrderV3` fill against the bot's own order decoding a 1-share
+        // on-chain BUY of AAPL, whose opposite hedge is a market SELL. The
+        // placer answers that sell's preflight with a buying power reservation,
+        // the reservation a buy would earn, so the sell fails closed.
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let order_owner = get_test_order().owner;
+        let tx_hash =
+            fixed_bytes!("0x4747474747474747474747474747474747474747474747474747474747474747");
+        let take_order = TakeOrderV3 {
+            sender: address!("0x2222222222222222222222222222222222222222"),
+            config: TakeOrderConfigV4 {
+                order: get_test_order(),
+                inputIOIndex: U256::from(1),
+                outputIOIndex: U256::from(0),
+                signedContext: vec![SignedContextV1 {
+                    signer: Address::ZERO,
+                    signature: Vec::new().into(),
+                    context: Vec::new(),
+                }],
+            },
+            input: Float::from_fixed_decimal_lossy(uint!(150_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(1_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+        };
+        let orderbook_log = Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: take_order.to_log_data(),
+            },
+            block_hash: None,
+            block_number: None,
+            block_timestamp: Some(1_700_000_000),
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(7),
+            removed: false,
+        };
+        let receipt = serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x1",
+            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
+            "blockNumber": "0x2a",
+            "from": "0x1234567890123456789012345678901234567890",
+            "to": orderbook,
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x77359400",
+            "cumulativeGasUsed": "0x5208",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": [orderbook_log]
+        });
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let cache = SymbolCache::default();
+        seed_get_test_order_token_symbols(&cache);
+
+        let mut ctx = create_test_ctx_with_order_owner(order_owner);
+        ctx.chains.primary_mut().orderbook = orderbook;
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+        let trading_chain = ctx.chains.primary().clone();
+
+        let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
+            .await
+            .expect("standalone stores must build");
+        let handle = ProcessTxHandle {
+            order_placer,
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            stores,
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
+        };
+
+        let Err((status, Json(body))) =
+            spawn_and_join_process_tx(tx_hash, ctx, pool, trading_chain, provider, cache, &handle)
+                .await
+        else {
+            panic!("a sell that received a buying power reservation must fail closed");
+        };
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "body: {}",
+            body.error
+        );
+        assert_eq!(
+            body.error,
+            "placement preflight for a sell of AAPL returned a buying power reservation; a sell \
+             must reserve equity inventory, so the hedge is refused",
+            "the 500 body must carry the typed mismatch reason, not the generic message"
+        );
     }
 
     #[tokio::test]

@@ -1279,7 +1279,9 @@ mod tests {
         FailureInjector, TerminalFailureSignal, build_supervised_worker, build_worker_inner,
     };
     use crate::dashboard::{TradeQuery, query_trades};
-    use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent};
+    use crate::offchain::order::{
+        OffchainOrderCommand, OffchainOrderEvent, OffchainOrderFailureKind,
+    };
     use crate::onchain_trade::{
         InventoryVenue, OnChainTradeCommand, OnChainTradeError, OnChainTradeSource,
     };
@@ -1638,6 +1640,7 @@ mod tests {
                     error: "broker unavailable".to_string(),
                     filled_shares: None,
                     failed_at: now,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -1669,6 +1672,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker unavailable".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -2107,6 +2111,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker unavailable".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -2954,6 +2959,7 @@ mod tests {
             error: "asset is not tradable".to_string(),
             filled_shares: None,
             failed_at: now,
+            kind: OffchainOrderFailureKind::Failure,
         };
         harness.receive::<OffchainOrder>(id, failed).await.unwrap();
 

@@ -2219,7 +2219,7 @@ mod tests {
     use st0x_float_macro::float;
     use st0x_hedge::operator::mint_authorization::ConfiguredMintAuthorizer;
     use st0x_hedge::operator::native_gas::ConfiguredGasReadiness;
-    use st0x_hedge::operator::offchain::order::OffchainOrderEvent;
+    use st0x_hedge::operator::offchain::order::{OffchainOrderEvent, OffchainOrderFailureKind};
     use st0x_hedge::operator::onchain::mock::MockRaindex;
     use st0x_hedge::operator::rebalancing::equity::{ChainEquityServices, EquityTransferServices};
     use st0x_hedge::operator::test_utils::{try_positive_shares, try_setup_test_db};
@@ -3681,6 +3681,7 @@ mod tests {
             error: "rejected".to_string(),
             filled_shares: None,
             failed_at: Utc::now(),
+            kind: OffchainOrderFailureKind::Failure,
         };
         sqlx::query(
             "INSERT INTO events \

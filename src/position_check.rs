@@ -1740,7 +1740,8 @@ mod tests {
     use crate::offchain::order::poll_status::PollOrderStatusCtx;
     use crate::offchain::order::{
         CounterTradeOrderKind, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
-        OrderPlacementResult, PollOrderStatus, ReconcileOrderFillJobQueue,
+        OffchainOrderFailureKind, OrderPlacementResult, PollOrderStatus,
+        ReconcileOrderFillJobQueue,
     };
     use crate::position::{
         AnchorDisposition, EquityTransferReservationId, PositionCommand, TradeId,
@@ -2590,6 +2591,7 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -4070,6 +4072,7 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "dry-run placement failed".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

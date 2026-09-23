@@ -2271,7 +2271,7 @@ mod tests {
     use crate::conductor::job::Job;
     use crate::offchain::order::{
         BrokerOrderPlacement, ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand,
-        OrderPlacementResult, OrderPlacer,
+        OffchainOrderFailureKind, OrderPlacementResult, OrderPlacer,
     };
     use crate::position::{
         AnchorDisposition, EquityTransferReservationId, Position, PositionCommand, TradeId,
@@ -2727,6 +2727,7 @@ mod tests {
                 &order_id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -3090,6 +3091,7 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -3537,6 +3539,7 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

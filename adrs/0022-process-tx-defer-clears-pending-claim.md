@@ -27,10 +27,15 @@ position claim.
 
 On a `process-tx` admission deferral, do not retain a Pending intent. Fail the
 still Pending `OffchainOrder` and clear the position claim to the retry eligible
-state, exactly as the failed placement path does, preserving the idempotency
-anchor. The fill is settled and the deferral is reported. The standing
-`CheckPositions` pipeline then detects the unhedged exposure again and
-preflights a fresh hedge from scratch.
+state, exactly as the failed placement path does. The terminal records why it
+was retired: the `MarkPlacementFailed` command and the `Failed` event carry an
+`OffchainOrderFailureKind`, and a deferral persists `Deferral` while every other
+retirement persists `Failure`. A deferral and an admission failure both return
+before the broker call, so the retired order id is released instead of being
+kept as the idempotency anchor; only a failure whose broker call did run, such
+as backpressure, preserves it. The fill is settled and the deferral is reported.
+The standing `CheckPositions` pipeline then detects the unhedged exposure again
+and preflights a fresh hedge from scratch.
 
 Clearing the claim removes the only pointer the recovery paths scan, so the
 abandoned Pending order is never driven back through the broker. Every retry
@@ -41,10 +46,20 @@ share eligibility rather than replaying stale terms.
 
 - No stale shares or reservation terms are ever replayed by a recovery path. The
   next hedge is always sized by a fresh preflight.
-- No schema change is needed. The behavior lives entirely in the placement flow
-  and the aggregate commands it already uses.
+- A never sent order id is not kept as the idempotency anchor. Releasing it
+  stops `CheckPositions` from skipping the position and scheduling an anchor
+  reconciliation lookup at the broker for an order that was never created.
+- No database schema change is needed. The behavior lives in the placement flow
+  and the aggregate commands it already uses; the only durable addition is the
+  `OffchainOrderFailureKind` field on the `Failed` event, which older payloads
+  omit and read back as `Failure`.
 - The `process-tx` route reports the deferral, while the standing pipeline owns
   the retry.
+- A deferral is persisted as a deferral kind terminal, so the reliability
+  projection does not count it as a hedge failure and no
+  `lifecycle_failure_event` row is written for it. Genuine failures, including
+  events persisted before the discriminator existed, still count: the event
+  field defaults to `Failure` when absent.
 - The retained intent handling added earlier for the `process-tx` case is
   removed. The Pending classification observed before placement now covers only
   a hedge the live pipeline itself deferred and is holding for its own retry,

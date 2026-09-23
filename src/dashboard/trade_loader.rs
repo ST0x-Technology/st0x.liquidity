@@ -522,7 +522,8 @@ mod tests {
 
     use super::*;
     use crate::offchain::order::{
-        CancellationReason, CounterTradeOrderKind, OffchainOrderCommand, noop_order_placer,
+        CancellationReason, CounterTradeOrderKind, OffchainOrderCommand, OffchainOrderFailureKind,
+        noop_order_placer,
     };
     use crate::onchain_trade::{
         InventoryVenue, OnChainTradeCommand, OnChainTradeSource, ParseOnChainTradeIdError,
@@ -790,6 +791,7 @@ mod tests {
                 &failed_id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "asset is not tradable".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -1086,6 +1088,7 @@ mod tests {
                     &id,
                     OffchainOrderCommand::MarkPlacementFailed {
                         error: format!("failure {index}"),
+                        kind: OffchainOrderFailureKind::Failure,
                     },
                 )
                 .await

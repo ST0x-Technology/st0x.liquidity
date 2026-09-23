@@ -133,6 +133,7 @@ pub struct OffchainOrderPlacement {
 fn missing_pending_limit_price_failure(order_id: OffchainOrderId) -> OffchainOrderCommand {
     OffchainOrderCommand::MarkPlacementFailed {
         error: PlaceOffchainOrderError::PendingLimitPriceMissing { order_id }.to_string(),
+        kind: OffchainOrderFailureKind::Failure,
     }
 }
 
@@ -417,6 +418,7 @@ pub async fn place_offchain_order_at_broker(
 
             OffchainOrderCommand::MarkPlacementFailed {
                 error: error.to_string(),
+                kind: OffchainOrderFailureKind::Failure,
             }
         }
     };
@@ -964,10 +966,13 @@ impl EventSourced for OffchainOrder {
                 *cancel_requested_at,
             )),
 
+            // The failure kind is reliability accounting metadata: a deferral
+            // and a genuine failure produce the identical terminal entity.
             Failed {
                 error,
                 filled_shares,
                 failed_at,
+                kind: _,
             } => Ok(evolve_failed(
                 entity,
                 error.clone(),
@@ -1242,11 +1247,12 @@ impl EventSourced for OffchainOrder {
             // concurrent attempt already accepted. Enforcing it here -- against the
             // aggregate's authoritative state -- closes the load-then-send race a
             // caller-side re-check could not.
-            OffchainOrderCommand::MarkPlacementFailed { error } => match self {
+            OffchainOrderCommand::MarkPlacementFailed { error, kind } => match self {
                 Self::Pending { .. } => Ok(vec![OffchainOrderEvent::Failed {
                     error,
                     filled_shares: None,
                     failed_at: Utc::now(),
+                    kind,
                 }]),
                 Self::Submitted { symbol, .. }
                 | Self::PartiallyFilled { symbol, .. }
@@ -1371,6 +1377,7 @@ fn mark_failed_events(
         error,
         filled_shares,
         failed_at,
+        kind: OffchainOrderFailureKind::Failure,
     }])
 }
 
@@ -1391,6 +1398,7 @@ fn mark_failed_unfilled_events(
                 error,
                 filled_shares: None,
                 failed_at,
+                kind: OffchainOrderFailureKind::Failure,
             }])
         }
         OffchainOrder::PartiallyFilled { shares_filled, .. } => {
@@ -2541,6 +2549,7 @@ async fn reconcile_pre_cancel(
                     error,
                     filled_shares: shares_filled,
                     failed_at,
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
         }
@@ -3254,6 +3263,26 @@ impl CounterTradeOrderKind {
     }
 }
 
+/// Distinguishes the two terminals an `OffchainOrder` failure can record, so
+/// reliability accounting counts only the genuine ones.
+///
+/// A schedule or admission gate declining to send a placement is an expected
+/// outcome of the close flatten policy (ADR 0022), not a broker failure: the
+/// exposure stays unhedged and the standing pipeline hedges it again from a
+/// fresh preflight. Every other terminal -- a broker error, backpressure, a
+/// store failure, a broker rejection observed while polling -- is a genuine
+/// failure.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OffchainOrderFailureKind {
+    /// A schedule or admission gate deferred the placement before the broker
+    /// accepted it. Never counted as a hedge failure.
+    Deferral,
+    /// The order genuinely failed. The default for events persisted before this
+    /// discriminator existed, so legacy terminals keep counting as failures.
+    #[default]
+    Failure,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OffchainOrderCommand {
     Place {
@@ -3343,7 +3372,11 @@ pub enum OffchainOrderCommand {
     /// `Pending`, so a stale attempt cannot fail a live order a concurrent attempt
     /// already accepted. The poll-rejection path instead uses `MarkFailed`, which
     /// may fail a live `Submitted`/`PartiallyFilled` order.
-    MarkPlacementFailed { error: String },
+    MarkPlacementFailed {
+        error: String,
+        /// Whether the retirement is an expected deferral or a genuine failure.
+        kind: OffchainOrderFailureKind,
+    },
     MarkFailed {
         error: String,
         /// Broker-reported cumulative fill quantity. `None` means the caller
@@ -3448,6 +3481,11 @@ pub enum OffchainOrderEvent {
         #[serde(default)]
         filled_shares: Option<FractionalShares>,
         failed_at: DateTime<Utc>,
+        /// Whether this terminal records an expected deferral or a genuine
+        /// failure. Legacy events predating the field are genuine failures, so
+        /// their reliability accounting is unchanged.
+        #[serde(default)]
+        kind: OffchainOrderFailureKind,
     },
     Cancelled {
         reason: CancellationReason,
@@ -4666,6 +4704,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker did not accept order".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -6043,6 +6082,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker unreachable".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -6070,6 +6110,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "stale broker error".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -6881,6 +6922,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker rejected".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -6946,12 +6988,12 @@ mod tests {
             error: "broker rejected".to_string(),
             filled_shares: None,
             failed_at,
+            kind: OffchainOrderFailureKind::Failure,
         })
         .unwrap();
-        failed_value["Failed"]
-            .as_object_mut()
-            .unwrap()
-            .remove("filled_shares");
+        let failed_object = failed_value["Failed"].as_object_mut().unwrap();
+        failed_object.remove("filled_shares");
+        failed_object.remove("kind");
 
         let legacy_events: Vec<OffchainOrderEvent> = [
             placed_value,

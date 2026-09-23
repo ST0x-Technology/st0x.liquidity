@@ -53,7 +53,7 @@ use st0x_event_sorcery::{EntityList, EventSourced, IdempotentReactor, Reactor, d
 
 use super::{PerformanceError, ReportRange};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
-use crate::offchain::order::{OffchainOrder, OffchainOrderEvent};
+use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderFailureKind};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent};
 
@@ -432,12 +432,23 @@ impl Reactor for LifecycleFailureProjection {
 impl IdempotentReactor for LifecycleFailureProjection {}
 
 /// Failure signal carried by an `OffchainOrder` event, if any.
+///
+/// A `Failed` terminal that records a schedule or admission deferral (ADR 0022)
+/// is not a hedge failure: the placement was never sent, the exposure stays
+/// visible to the standing pipeline, and counting it would report routine close
+/// flatten behavior as broker failure. Only a genuine failure is counted.
 fn offchain_order_failure(event: &OffchainOrderEvent) -> Option<(FailureEventType, DateTime<Utc>)> {
     match event {
-        OffchainOrderEvent::Failed { failed_at, .. } => {
-            Some((FailureEventType::OffchainOrderFailed, *failed_at))
+        OffchainOrderEvent::Failed {
+            failed_at,
+            kind: OffchainOrderFailureKind::Failure,
+            ..
+        } => Some((FailureEventType::OffchainOrderFailed, *failed_at)),
+        OffchainOrderEvent::Failed {
+            kind: OffchainOrderFailureKind::Deferral,
+            ..
         }
-        OffchainOrderEvent::Placed { .. }
+        | OffchainOrderEvent::Placed { .. }
         | OffchainOrderEvent::Submitted { .. }
         | OffchainOrderEvent::Accepted { .. }
         | OffchainOrderEvent::PartiallyFilled { .. }
@@ -839,6 +850,7 @@ mod tests {
             error: "rejected".to_string(),
             filled_shares: None,
             failed_at: timestamp(failed_offset),
+            kind: OffchainOrderFailureKind::Failure,
         }
     }
 
@@ -1270,12 +1282,7 @@ mod tests {
         let samples: Vec<(FailureEventType, String)> = vec![
             (
                 FailureEventType::OffchainOrderFailed,
-                OffchainOrderEvent::Failed {
-                    error: "rejected".to_string(),
-                    filled_shares: None,
-                    failed_at: timestamp(0),
-                }
-                .event_type(),
+                offchain_order_failed(0).event_type(),
             ),
             (
                 FailureEventType::ConversionFailed,
@@ -1447,22 +1454,9 @@ mod tests {
         // as_str() discriminator -- restoring per-arm drift coverage.
 
         // offchain_order_failure
-        let (event_type, _) = offchain_order_failure(&OffchainOrderEvent::Failed {
-            error: "rejected".to_string(),
-            filled_shares: None,
-            failed_at: timestamp(0),
-        })
-        .unwrap();
+        let (event_type, _) = offchain_order_failure(&offchain_order_failed(0)).unwrap();
         assert_eq!(event_type, FailureEventType::OffchainOrderFailed);
-        assert_eq!(
-            event_type.as_str(),
-            OffchainOrderEvent::Failed {
-                error: "rejected".to_string(),
-                filled_shares: None,
-                failed_at: timestamp(0),
-            }
-            .event_type()
-        );
+        assert_eq!(event_type.as_str(), offchain_order_failed(0).event_type());
 
         // usdc_rebalance_failure -- BridgingFailed and DepositFailed are the
         // most prone to copy-paste error (two similar variant names).
@@ -1603,6 +1597,42 @@ mod tests {
                 failed_at: timestamp(0),
             }
             .event_type()
+        );
+    }
+
+    #[test]
+    fn deferral_terminal_is_not_counted_as_a_hedge_failure() {
+        let deferred = OffchainOrderEvent::Failed {
+            error: "process-tx placement deferred by broker admission".to_string(),
+            filled_shares: None,
+            failed_at: timestamp(0),
+            kind: OffchainOrderFailureKind::Deferral,
+        };
+
+        assert_eq!(offchain_order_failure(&deferred), None);
+        assert_eq!(
+            offchain_order_failure(&offchain_order_failed(0)),
+            Some((FailureEventType::OffchainOrderFailed, timestamp(0)))
+        );
+    }
+
+    #[test]
+    fn legacy_failed_payload_without_a_kind_is_counted_as_a_failure() {
+        // Every `Failed` event persisted before the deferral discriminator
+        // existed recorded a genuine failure; dropping those from the failure
+        // counts would silently rewrite reliability history.
+        let legacy = json!({
+            "Failed": {
+                "error": "broker rejected",
+                "failed_at": timestamp(0),
+            }
+        });
+
+        let event: OffchainOrderEvent = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(
+            offchain_order_failure(&event),
+            Some((FailureEventType::OffchainOrderFailed, timestamp(0)))
         );
     }
 

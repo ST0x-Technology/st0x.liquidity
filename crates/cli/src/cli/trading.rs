@@ -671,9 +671,13 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     // The CLI runs outside the bot: no reactors to reach, so standalone stores.
-    let stores =
-        st0x_hedge::operator::process_tx::ProcessTxStores::standalone(pool, order_placer.clone())
-            .await?;
+    // Their trading schedule flag is derived from the same config the bot uses.
+    let stores = st0x_hedge::operator::process_tx::ProcessTxStores::standalone(
+        pool,
+        ctx,
+        order_placer.clone(),
+    )
+    .await?;
     let report = st0x_hedge::operator::process_tx::process_tx(
         tx_hash,
         ctx,
@@ -792,7 +796,16 @@ fn render_process_tx_outcome<W: Write>(
         ProcessTxOutcome::HedgePlacementDeferred { symbol } => {
             writeln!(
                 stdout,
-                "Hedge placement for {symbol} was deferred by broker admission; the pending order intent was retained for the normal pipeline to retry once admission permits. Settled the fill."
+                "No hedge placed for {symbol}: broker admission deferred the placement, so the never-sent pending order was cleared and the fill settled. The standing CheckPositions pipeline will re-hedge the exposure once admission permits."
+            )?;
+        }
+        ProcessTxOutcome::PendingHedgeDeferred {
+            symbol,
+            offchain_order_id,
+        } => {
+            writeln!(
+                stdout,
+                "No hedge placed for {symbol}: the live pipeline is already holding a deferred pending hedge (order {offchain_order_id}) for its own retry, so the fill was settled against that retained intent. The live pipeline still owns retrying it once admission permits."
             )?;
         }
     }
@@ -2984,7 +2997,22 @@ mod tests {
                 outcome: ProcessTxOutcome::HedgePlacementDeferred { symbol: symbol() },
             },
             format!(
-                "{fill_summary}Hedge placement for {} was deferred by broker admission; the pending order intent was retained for the normal pipeline to retry once admission permits. Settled the fill.\n",
+                "{fill_summary}No hedge placed for {}: broker admission deferred the placement, so the never-sent pending order was cleared and the fill settled. The standing CheckPositions pipeline will re-hedge the exposure once admission permits.\n",
+                symbol()
+            ),
+        ));
+
+        let pending_deferred_order_id = OffchainOrderId::new();
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::PendingHedgeDeferred {
+                    symbol: symbol(),
+                    offchain_order_id: pending_deferred_order_id,
+                },
+            },
+            format!(
+                "{fill_summary}No hedge placed for {}: the live pipeline is already holding a deferred pending hedge (order {pending_deferred_order_id}) for its own retry, so the fill was settled against that retained intent. The live pipeline still owns retrying it once admission permits.\n",
                 symbol()
             ),
         ));

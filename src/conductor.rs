@@ -1103,6 +1103,11 @@ impl Conductor {
         let startup_policy =
             CloseFlattenPolicy::from_secs(ctx.extended_hours_close_flatten_window_secs)?
                 .with_schedule(trading_schedule.clone());
+        // The same flag, derived from config, that the offline CLI computes for its
+        // standalone stores, so both processes classify a retained Pending
+        // hedge identically. Read here because `startup_policy` is moved into
+        // the placer and offchain store below.
+        let process_tx_schedule_enabled = crate::trading_schedule::schedule_enabled(&ctx);
 
         // Built from the same `startup_policy` as the conductor's own placer so
         // the in-bot process-tx route runs `recover_order_by_client_id` and the
@@ -1142,6 +1147,7 @@ impl Conductor {
             position: frameworks.position.clone(),
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
+            schedule_enabled: process_tx_schedule_enabled,
         };
 
         let TradingJobQueues {
@@ -6115,7 +6121,8 @@ mod tests {
         MintAuthorizationError, MockMintAuthorizer, StubVaultModeReader, VaultModeCheckError,
     };
     use crate::offchain::order::{
-        CancellationReason, CounterTradeOrderKind, OrderPlacementResult, RetainedFill,
+        CancellationReason, CounterTradeOrderKind, OffchainOrderFailureKind, OrderPlacementResult,
+        RetainedFill,
     };
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
     use crate::onchain::mock::MockRaindex;
@@ -7020,6 +7027,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "asset is not tradable".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -10257,6 +10265,7 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -14800,6 +14809,7 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
+                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
