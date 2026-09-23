@@ -183,10 +183,12 @@ primary = false
 vault_id = "0xfab"
 rebalancing = "disabled"
 
-# The two launch equities, addresses from st0x.registry
+# Robinhood equities, addresses from st0x.registry
 # token-lists/robinhood.json (tokenized_equity = unwrappedAddress,
 # tokenized_equity_derivative = the wt token). Their broker policy tables
-# [assets.equities.DNUT] / [assets.equities.FGI] are shared with Base.
+# [assets.equities.<SYM>] are shared with Base. PLBY and GRND already had
+# live orders and funded 0xfab vaults here; without these tables their fills
+# were recorded but never hedged.
 
 [chains.robinhood.trading.assets.equities.DNUT]
 trading = "enabled"
@@ -203,6 +205,22 @@ wrapped_equity_recovery = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0xfEa217600e2b00bBB2172a99345016a0cEb7d29f"
 tokenized_equity_derivative = "0x685DFd386968B58D895F934485820C479C79a8bB"
+
+[chains.robinhood.trading.assets.equities.PLBY]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x4a18036Dce22168D8891919a1c75aC2CAf9a08AB"
+tokenized_equity_derivative = "0xBe127eeD812DC1F622227FAdc8639d4138B47b2e"
+
+[chains.robinhood.trading.assets.equities.GRND]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xdca06fddf5320870C8E9D0534aa102677C36bCc4"
+tokenized_equity_derivative = "0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"
 
 [wallet]
 # Keyless Turnkey auth: the API key lives in Cloud KMS; the secrets file
