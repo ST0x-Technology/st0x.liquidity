@@ -515,6 +515,7 @@ async fn seed_alpaca_to_base(
                 attestation: attestation.clone(),
                 cctp_nonce,
                 message: attestation,
+                mint_scan_from_block: from_block + 20,
                 attested_at: t7,
             },
         )
@@ -660,6 +661,7 @@ async fn seed_base_to_alpaca(
                 attestation: attestation.clone(),
                 cctp_nonce,
                 message: attestation,
+                mint_scan_from_block: from_block + 20,
                 attested_at: t5,
             },
         )

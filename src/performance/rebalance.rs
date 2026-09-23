@@ -1065,6 +1065,7 @@ mod tests {
                 attestation: vec![1],
                 cctp_nonce: B256::random(),
                 message: None,
+                mint_scan_from_block: None,
                 attested_at: timestamp(670),
             },
             UsdcRebalanceEvent::Bridged {
@@ -1954,6 +1955,7 @@ mod tests {
                 attestation: vec![1],
                 cctp_nonce: B256::random(),
                 message: None,
+                mint_scan_from_block: None,
                 attested_at: timestamp(3_600),
             },
         ];
@@ -2187,6 +2189,7 @@ mod tests {
                     attestation: vec![1],
                     cctp_nonce: B256::random(),
                     message: None,
+                    mint_scan_from_block: None,
                     attested_at: timestamp(150_000),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2419,6 +2422,7 @@ mod tests {
                 attestation: vec![1],
                 cctp_nonce: B256::random(),
                 message: None,
+                mint_scan_from_block: None,
                 attested_at: timestamp(670),
             },
             UsdcRebalanceEvent::Bridged {

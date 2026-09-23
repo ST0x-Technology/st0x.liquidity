@@ -462,6 +462,14 @@ pub enum CctpError {
     MessageDestinationDomainMismatch { expected: u32, actual: u32 },
     #[error("already-minted CCTP nonce {nonce} had no matching MessageReceived log")]
     AlreadyMintedMessageNotFound { nonce: B256 },
+    /// The nonce is consumed on chain but its mint is not in the bounded
+    /// resume scan: it landed below the floor, or the node cannot return its
+    /// log. Not retried by the bot; an operator reconciles it.
+    #[error(
+        "CCTP nonce {nonce} is consumed but no matching MessageReceived log was found at \
+         or after block {from_block}; manual reconciliation required"
+    )]
+    MintNotFoundInScanWindow { nonce: B256, from_block: u64 },
     #[error(
         "recovered CCTP MessageReceived log for nonce {nonce} did not match the attested message"
     )]
@@ -577,6 +585,7 @@ impl CctpError {
             | Self::MessageTooShortForRecovery { .. }
             | Self::MessageDestinationDomainMismatch { .. }
             | Self::AlreadyMintedMessageNotFound { .. }
+            | Self::MintNotFoundInScanWindow { .. }
             | Self::RecoveredMintMessageMismatch { .. }
             | Self::RecoveredMintLogMissingTxHash { .. }
             | Self::RecoveredMintReceiptReverted { .. }
@@ -1086,20 +1095,32 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// a pre-attestation envelope must handle this case deliberately (e.g. by
     /// re-polling the attestation) rather than treating it as "not yet
     /// minted".
+    ///
+    /// `scan_from_block` floors the log scan for a consumed nonce; `None` looks
+    /// back a fixed window from the head (see [`crate::Bridge::find_attested_mint`]).
     pub async fn find_existing_mint(
         &self,
         direction: BridgeDirection,
         message: &[u8],
+        scan_from_block: Option<u64>,
     ) -> Result<Option<crate::MintReceipt>, CctpError> {
         let receipt = match direction {
             BridgeDirection::EthereumToBase => {
                 self.base
-                    .find_existing_mint::<OpenChainErrorRegistry>(direction, message)
+                    .find_existing_mint::<OpenChainErrorRegistry>(
+                        direction,
+                        message,
+                        scan_from_block,
+                    )
                     .await?
             }
             BridgeDirection::BaseToEthereum => {
                 self.ethereum
-                    .find_existing_mint::<OpenChainErrorRegistry>(direction, message)
+                    .find_existing_mint::<OpenChainErrorRegistry>(
+                        direction,
+                        message,
+                        scan_from_block,
+                    )
                     .await?
             }
         };
@@ -1361,9 +1382,17 @@ where
         &self,
         direction: BridgeDirection,
         attestation: &Self::Attestation,
+        scan_from_block: Option<u64>,
     ) -> Result<Option<crate::MintReceipt>, Self::Error> {
-        self.find_existing_mint(direction, &attestation.message)
+        self.find_existing_mint(direction, &attestation.message, scan_from_block)
             .await
+    }
+
+    async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.base.current_block().await,
+            BridgeDirection::BaseToEthereum => self.ethereum.current_block().await,
+        }
     }
 
     async fn source_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error> {
@@ -3655,7 +3684,7 @@ mod tests {
 
         // Before the mint the nonce is unconsumed, so there is nothing to recover.
         let before = bridge
-            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce)
+            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce, None)
             .await
             .unwrap();
         assert_eq!(
@@ -3675,7 +3704,7 @@ mod tests {
         // After the mint the nonce is consumed; recovery reconstructs the exact
         // receipt (tx + net amount + fee) from the on-chain events without re-minting.
         let recovered = bridge
-            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce)
+            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce, None)
             .await
             .unwrap()
             .expect("consumed nonce must report the existing mint");
@@ -3700,6 +3729,7 @@ mod tests {
             .find_existing_mint::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
                 &message_with_nonce,
+                None,
             )
             .await
             .unwrap_err();
@@ -3729,6 +3759,7 @@ mod tests {
             .find_existing_mint::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
                 &mismatched_message,
+                None,
             )
             .await
             .unwrap_err();
@@ -4520,10 +4551,12 @@ mod tests {
         )
         .with_node_sync_poll_interval(Duration::ZERO);
 
-        flaky_endpoint
+        // No captured floor: a transfer attested before the floor existed.
+        let error = flaky_endpoint
             .find_existing_mint::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
                 &message_with_nonce,
+                None,
             )
             .await
             .unwrap_err();
@@ -4534,6 +4567,17 @@ mod tests {
             "the scan must stop at the lookback floor {}, but it reached block {lowest}",
             head - lookback,
         );
+
+        let nonce = extract_nonce_from_message(&message_with_nonce).unwrap();
+        let CctpError::MintNotFoundInScanWindow {
+            nonce: error_nonce,
+            from_block,
+        } = error
+        else {
+            panic!("a consumed nonce outside the window must fail for reconciliation: {error:?}");
+        };
+        assert_eq!(error_nonce, nonce);
+        assert_eq!(from_block, head - lookback);
     }
 
     /// The window-exhaustion branch of `recover_already_minted` -- every
@@ -4658,7 +4702,11 @@ mod tests {
 
         let error = bridge
             .base
-            .find_existing_mint::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, &raw_message)
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &raw_message,
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -5213,6 +5261,11 @@ mod tests {
         }
         let [minted, unminted] = <[AttestationResponse; 2]>::try_from(attestations).unwrap();
 
+        let scan_from_block = bridge
+            .destination_block(BridgeDirection::BaseToEthereum)
+            .await
+            .unwrap();
+
         let mint_receipt = bridge
             .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
@@ -5223,7 +5276,11 @@ mod tests {
             .unwrap();
 
         let found = bridge
-            .find_attested_mint(BridgeDirection::BaseToEthereum, &minted)
+            .find_attested_mint(
+                BridgeDirection::BaseToEthereum,
+                &minted,
+                Some(scan_from_block),
+            )
             .await
             .unwrap()
             .expect("the minted nonce must resolve to its mint");
@@ -5234,10 +5291,46 @@ mod tests {
         // Same recipient, same amount, later block: still not this nonce's mint.
         assert_eq!(
             bridge
-                .find_attested_mint(BridgeDirection::BaseToEthereum, &unminted)
+                .find_attested_mint(
+                    BridgeDirection::BaseToEthereum,
+                    &unminted,
+                    Some(scan_from_block),
+                )
                 .await
                 .unwrap(),
             None,
+        );
+
+        // A consumed nonce whose mint sits below the floor is left to the
+        // operator: advance the Ethereum head past the mint and scan from it.
+        bridge
+            .burn_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                burn_amount,
+                recipient,
+            )
+            .await
+            .unwrap();
+        let head_above_mint = bridge
+            .destination_block(BridgeDirection::BaseToEthereum)
+            .await
+            .unwrap();
+
+        let error = bridge
+            .find_attested_mint(
+                BridgeDirection::BaseToEthereum,
+                &minted,
+                Some(head_above_mint),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CctpError::MintNotFoundInScanWindow { nonce, from_block }
+                    if nonce == minted.nonce() && from_block == head_above_mint
+            ),
+            "a mint below the floor must fail for reconciliation, got: {error:?}",
         );
     }
 
