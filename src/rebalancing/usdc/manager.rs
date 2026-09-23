@@ -13836,6 +13836,132 @@ mod tests {
         );
     }
 
+    /// Mints `amount` USDC to `recipient` on `chain` in its own transaction:
+    /// stands in for USDC reaching the shared wallet from anywhere else.
+    async fn mint_usdc_to(chain: &EthereumUsdcChain, recipient: Address, amount: U256) -> TxHash {
+        let signer = PrivateKeySigner::from_bytes(&chain.bot_key).unwrap();
+        let bot_provider = ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(signer))
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+
+        TestMintBurnToken::new(USDC_ADDRESS, &bot_provider)
+            .mint(recipient, amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash
+    }
+
+    /// Stages an AlpacaToBase aggregate at `WithdrawalComplete` whose delivering
+    /// tx is `withdrawal_tx`.
+    async fn advance_to_withdrawal_complete_alpaca_to_base_with_tx(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        withdrawal_tx: TxHash,
+    ) {
+        use UsdcRebalanceCommand::*;
+
+        cqrs.send(
+            id,
+            InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                preflight_balance: U256::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            ConfirmWithdrawal {
+                withdrawal_tx: Some(withdrawal_tx),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The Ethereum wallet is shared, so USDC it holds beyond this withdrawal
+    /// (dust, a top-up, another transfer's funds) must not change the burn:
+    /// the credit is what the withdrawal tx paid the wallet.
+    #[tokio::test]
+    async fn settlement_burns_the_withdrawal_tx_credit_not_the_wallet_balance() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let nominal = usdc("1000");
+        let credited = U256::from(998_000_000u64);
+        let chain = deploy_ethereum_usdc_chain_with_balance(credited, market_maker_wallet).await;
+        let withdrawal_tx = chain.mint_tx;
+        mint_usdc_to(&chain, market_maker_wallet, U256::from(5_000_000u64)).await;
+
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider.anvil_mine(Some(3), None).await.unwrap();
+        // REVERT contract at the token messenger so the burn fails right after
+        // BeginBridging records the credited amount.
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, revert_bytecode)
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_withdrawal_complete_alpaca_to_base_with_tx(&cqrs, &id, nominal, withdrawal_tx)
+            .await;
+
+        let error = manager
+            .resume_alpaca_to_base(&id, nominal)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "the credited withdrawal must proceed to the burn; got: {error:?}"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::BridgingSubmitting {
+            direction,
+            burn_amount,
+            ..
+        } = state
+        else {
+            panic!("Expected BridgingSubmitting (burn attempted); got: {state:?}");
+        };
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(burn_amount, Some(usdc("998")));
+    }
+
     /// Hypothesis: when the pre-flight balance read itself fails (RPC down),
     /// the transfer surfaces `PreflightBalanceUnavailable` and stays a true
     /// no-op -- no Alpaca call, no aggregate event -- so the trigger can
