@@ -43,6 +43,10 @@ pub(crate) struct EquityPlanInput {
     /// The symbol's last onchain fill price, used to value the minimum
     /// operation size. Its age does not matter: it only sizes a dust bound.
     pub(crate) last_price: Option<PriceObservation>,
+    /// The only chain wallet recovery runs on. A redemption anywhere else
+    /// is never chosen: a failed one would strand its tokens with nothing
+    /// to recover them.
+    pub(crate) primary_chain: Chain,
 }
 
 /// One chain's slot in an [`EquityPlanInput`].
@@ -122,6 +126,10 @@ pub(crate) enum DeclineReason {
     NotInRegistry {
         chain: Chain,
     },
+    /// A redemption on a chain wallet recovery does not cover.
+    RedemptionUnrecoverable {
+        chain: Chain,
+    },
 }
 
 impl DeclineReason {
@@ -141,6 +149,7 @@ impl DeclineReason {
             Self::CoolingDown { .. } => "cooling_down",
             Self::PriceMissing => "price_missing",
             Self::NotInRegistry { .. } => "not_in_registry",
+            Self::RedemptionUnrecoverable { .. } => "redemption_unrecoverable",
         }
     }
 }
@@ -194,7 +203,7 @@ impl Candidate {
 /// Picks at most one operation for the symbol.
 ///
 /// The guards run first, then the best-ranked candidate that survives the
-/// registry, gas, cooldown, floor and minimum size checks wins. A missing price
+/// recovery, registry, gas, cooldown, floor and minimum size checks wins. A missing price
 /// declines the symbol before any
 /// candidate is tried; a per-chain drop on a higher-ranked candidate only
 /// outranks a later `FloorCapped`.
@@ -245,6 +254,12 @@ pub(crate) fn plan_equity_operation(
         let slot = &input.onchain[&candidate.chain];
         let direction = candidate.direction()?;
 
+        if direction == PlannedDirection::Redemption && candidate.chain != input.primary_chain {
+            first_drop.get_or_insert(DeclineReason::RedemptionUnrecoverable {
+                chain: candidate.chain,
+            });
+            continue;
+        }
         if !slot.registry_known {
             first_drop.get_or_insert(DeclineReason::NotInRegistry {
                 chain: candidate.chain,
@@ -525,6 +540,7 @@ mod tests {
             hedge_floor: FractionalShares::ZERO,
             cooldowns: BTreeSet::new(),
             last_price: Some(observed("100", now())),
+            primary_chain: Chain::Base,
         }
     }
 
@@ -959,6 +975,37 @@ mod tests {
         assert_eq!(with_alternative, mint(Chain::HyperEvm, "25"));
     }
 
+    /// HyperEVM sits 36 over its target. Wallet recovery runs on Base only,
+    /// so HyperEVM's redemption is declined, and Base's mint is the fallback
+    /// once Base is short.
+    #[test]
+    fn secondary_chain_redemption_is_skipped_and_recorded() {
+        let alone = plan_equity_operation(&input(
+            Some(balance("24")),
+            BTreeMap::from([
+                (Chain::Base, slot("36", "0.3")),
+                (Chain::HyperEvm, slot("60", "0.2")),
+            ]),
+        ))
+        .unwrap();
+        assert_eq!(
+            alone,
+            EquityPlan::Decline(DeclineReason::RedemptionUnrecoverable {
+                chain: Chain::HyperEvm
+            })
+        );
+
+        let with_alternative = plan_equity_operation(&input(
+            Some(balance("60")),
+            BTreeMap::from([
+                (Chain::Base, slot("0", "0.3")),
+                (Chain::HyperEvm, slot("60", "0.2")),
+            ]),
+        ))
+        .unwrap();
+        assert_eq!(with_alternative, mint(Chain::Base, "36"));
+    }
+
     /// Base's redemption ranks first but its wallet has no gas, and the
     /// fallback mint on HyperEVM is then floor-capped. The decline names
     /// the gas: the blocker on the best-ranked candidate.
@@ -1384,12 +1431,14 @@ mod tests {
             arb_percent(50),
             proptest::collection::btree_set(arb_chain(), 0..=2),
             proptest::option::weighted(0.2, arb_chain()),
+            arb_chain(),
         )
             .prop_map(
-                |(offchain, onchain, floor, cooldowns, unslotted)| EquityPlanInput {
+                |(offchain, onchain, floor, cooldowns, unslotted, primary_chain)| EquityPlanInput {
                     alpaca_floor: TargetShare::new(floor).unwrap(),
                     cooldowns,
                     last_price: Some(observed("1", now())),
+                    primary_chain,
                     listing_chains: onchain.keys().copied().chain(unslotted).collect(),
                     ..input(
                         Some(VenueBalance::new(offchain, FractionalShares::ZERO)),
@@ -1494,19 +1543,22 @@ mod tests {
             }
         }
 
-        /// A mint is chosen only when no admissible chain is over its band.
+        /// A mint is chosen only when no admissible chain is over its band,
+        /// and a redemption only on the primary chain.
         #[test]
         fn redemptions_rank_before_mints(input in arb_input()) {
             let EquityPlan::Operation(operation) = plan_equity_operation(&input).unwrap() else {
                 return Ok(());
             };
             if operation.direction == PlannedDirection::Redemption {
+                prop_assert_eq!(operation.chain, input.primary_chain);
                 return Ok(());
             }
 
             let (total, deviations) = deviations(&input);
             for (chain, slot) in &input.onchain {
                 let admissible = slot.enabled
+                    && *chain == input.primary_chain
                     && slot.registry_known
                     && slot.gas_ready
                     && !input.cooldowns.contains(chain);

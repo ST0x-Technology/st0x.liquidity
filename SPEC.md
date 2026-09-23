@@ -4928,10 +4928,12 @@ it never moves the other chains' targets.
 - Ranking: redemptions (over target) before mints, larger deviation first, ties
   by chain order. A candidate whose vault registry does not know the token
   (`not_in_registry`), whose wallet is not gas-ready, or whose chain is cooling
-  down, is skipped and the next one evaluated. The trigger reads a chain's
-  registry and probes its wallet's gas only once the planner picks the chain,
-  and re-plans without that chain when either fails, so a symbol within its band
-  reads neither.
+  down, is skipped and the next one evaluated. So is a redemption on any chain
+  but the primary (`redemption_unrecoverable`): wallet recovery runs on the
+  primary chain only, so a failed redemption elsewhere would strand its tokens.
+  The trigger reads a chain's registry and probes its wallet's gas only once the
+  planner picks the chain, and re-plans without that chain when either fails, so
+  a symbol within its band reads neither.
 - Quantity: `|deviation|` capped by the chain's operational limit. A mint is
   further capped so the broker keeps the larger of `alpaca_floor * total` and
   the hedge floor available; a broker at or below that declines the whole symbol
