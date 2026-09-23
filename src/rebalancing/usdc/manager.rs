@@ -13886,6 +13886,105 @@ mod tests {
         assert!(!logs_contain("operational_alert"));
     }
 
+    /// The reburn after a recorded burn reverted is a burn too, so the ledger
+    /// check runs before it, counting this transfer's credit.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn reburn_after_a_reverted_burn_checks_the_credit_ledger() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(40_000_000u64), market_maker_wallet)
+                .await;
+
+        let signer = PrivateKeySigner::from_bytes(&chain.bot_key).unwrap();
+        let bot_provider = ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(signer))
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
+        bot_provider
+            .anvil_set_code(
+                st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+                revert_bytecode.clone(),
+            )
+            .await
+            .unwrap();
+        let revert_addr = address!("0x00000000000000000000000000000000000000bb");
+        bot_provider
+            .anvil_set_code(revert_addr, revert_bytecode)
+            .await
+            .unwrap();
+        let reverted_tx = bot_provider
+            .send_transaction(alloy::rpc::types::TransactionRequest {
+                to: Some(revert_addr.into()),
+                gas: Some(100_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash;
+        let from_block = bot_provider.get_block_number().await.unwrap();
+        bot_provider.anvil_mine(Some(5), None).await.unwrap();
+
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let manager = CrossVenueCashTransfer::new(
+            InstrumentedAlpacaBroker::new(
+                create_test_broker_service(&server).await,
+                TelemetrySender::disabled(),
+            ),
+            Arc::new(create_test_wallet_service(&server)),
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        )
+        .with_credit_ledger(pool);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        advance_to_bridging_submitting_alpaca_to_base_with_burn_amount(
+            &cqrs, &id, amount, from_block, amount,
+        )
+        .await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::RecordPendingBurn {
+                burn_tx: reverted_tx,
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .resume_bridging_submitting_ethereum(
+                &id,
+                usdc_to_u256(amount).unwrap(),
+                from_block,
+                Some(reverted_tx),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "the reverted recorded burn must lead to a reburn; got: {error:?}"
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain("outstanding=100"));
+        assert!(logs_contain("shortfall=60"));
+    }
+
     /// The ledger check runs right before the Alpaca->Base burn, after the
     /// credit is recorded, so the wallet's other USDC is reported, not burned.
     #[tracing_test::traced_test]
