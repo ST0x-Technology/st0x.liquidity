@@ -14430,6 +14430,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn completed_withdrawal_without_tx_hash_fails_bridging_after_settlement_deadline() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let transfer_uuid = Uuid::new_v4();
+        let _transfer_mock = mock_complete_withdrawal_with_tx(&server, transfer_uuid, None);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        let initiated_at = Utc::now()
+            - chrono::Duration::from_std(TEST_SETTLEMENT_RETRY_DEADLINE).unwrap()
+            - chrono::Duration::seconds(1);
+
+        let error = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, initiated_at)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UsdcTransferError::WithdrawalTxMissing { id: error_id } if *error_id == id),
+            "Complete without a tx hash past the settlement deadline must fail the transfer, \
+             got: {error:?}"
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    burn_tx_hash: None,
+                    ..
+                }
+            ),
+            "Aggregate must be a pre-burn BridgingFailed so reconcile can settle it; got: {state:?}"
+        );
+    }
+
     /// Hypothesis: on ANY poll error (ApiError, TransferTimeout, reqwest::Error),
     /// `poll_and_confirm_withdrawal` returns `WithdrawalPollInconclusive` WITHOUT
     /// emitting `FailWithdrawal`. The aggregate stays in `Withdrawing` with the
