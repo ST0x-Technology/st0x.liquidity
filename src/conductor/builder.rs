@@ -2456,6 +2456,7 @@ mod tests {
             mint_store: Arc::new(test_store(cqrs_pool, services)),
             position_authority: None,
             transfer_services: EquityTransferServices::panicking(),
+            primary_chain: Chain::Base,
             job_queue,
         })
     }

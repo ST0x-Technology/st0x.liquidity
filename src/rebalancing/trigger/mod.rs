@@ -5,16 +5,17 @@ mod equity;
 mod freeze;
 mod usdc;
 
-#[cfg(test)]
-pub(crate) use equity::InProgressGuard;
 pub(crate) use equity::{
-    GUARD_GENERATION, GuardGeneration, GuardState, RecoveryGuard,
+    GUARD_GENERATION, GuardGeneration, GuardState, LastPriceReader, RecoveryGuard,
     claim_guard_for_recovery_or_orphan, remove_active_transfer,
 };
+#[cfg(test)]
+pub(crate) use equity::{InProgressGuard, StubLastPrice};
 
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use metrics::counter;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +26,9 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use rain_math_float::Float;
-use st0x_config::{ChainAssets, ExecutionThreshold, OperationMode};
+use st0x_config::{
+    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode, TargetShare,
+};
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, SendError,
     Store, deps,
@@ -36,6 +39,10 @@ use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId};
 use st0x_wrapper::{Wrapper, WrapperError};
 
+use self::allocation::{
+    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, PlannedDirection, PlannedOperation,
+    plan_equity_operation,
+};
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
 #[cfg(test)]
@@ -230,6 +237,27 @@ pub(crate) enum TokenAddressError {
     Persistence(#[from] AggregateError<LifecycleError<VaultRegistry>>),
 }
 
+/// One hedged chain's inputs to the equity planner.
+#[derive(Debug, Clone)]
+pub(crate) struct ChainRebalancingConfig {
+    pub(crate) assets: ChainAssets,
+    /// The smallest transfer worth its gas on this chain: the chain's own
+    /// override, else the allocation default.
+    pub(crate) min_operation_usd: Positive<Usdc>,
+}
+
+#[cfg(test)]
+impl ChainRebalancingConfig {
+    /// Test fixture: `assets` with a one-dollar minimum.
+    pub(crate) fn for_test(assets: ChainAssets) -> Self {
+        Self {
+            assets,
+            min_operation_usd: Positive::new(Usdc::new(st0x_float_macro::float!(1)))
+                .expect("one dollar is positive"),
+        }
+    }
+}
+
 /// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingServiceConfig {
@@ -238,13 +266,17 @@ pub(crate) struct RebalancingServiceConfig {
     /// quiet (unchanged) book still reads fresh. See `freshness.rs` module
     /// doc for why the snapshot aggregate's own stamps cannot serve here.
     pub(crate) poll_freshness: PollFreshness,
-    pub(crate) equity: ImbalanceThreshold,
     /// Bound on the age of a chain's inventory snapshot before that chain's
     /// imbalance evaluations are skipped as stale.
     pub(crate) inventory_staleness_bound: Duration,
     pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) transfer_timeout: Duration,
-    pub(crate) assets: ChainAssets,
+    /// Every hedged chain's asset table and minimum. The planner slots a
+    /// symbol on each chain that rebalances it; the USDC trigger reads the
+    /// primary's cash entry.
+    pub(crate) chains: BTreeMap<Chain, ChainRebalancingConfig>,
+    /// The per-chain target shares, broker floor, band and cooldown.
+    pub(crate) allocation: AllocationCtx,
     /// The broker-side cash reserve, which sits at the broker rather than on
     /// any chain, so it does not travel with the chain's cash vaults.
     pub(crate) cash_reserved: Option<Positive<Usd>>,
@@ -253,18 +285,55 @@ pub(crate) struct RebalancingServiceConfig {
 }
 
 impl RebalancingServiceConfig {
-    /// Whitelist gate for the equity rebalancing trigger: only symbols
-    /// explicitly configured with `rebalancing = "enabled"` are eligible.
-    /// Symbols observed in inventory but absent from the config are skipped
-    /// cleanly instead of falling through to the `WrapperService`
-    /// `SymbolNotConfigured` error backstop.
-    fn is_equity_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
-        self.assets
-            .equities
-            .symbols
-            .get(symbol)
-            .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
+    /// Whitelist gate for the equity rebalancing trigger: a symbol is
+    /// planned only when some hedged chain lists it with
+    /// `rebalancing = "enabled"`. Symbols observed in inventory but absent
+    /// from every table are skipped cleanly instead of falling through to
+    /// the `WrapperService` `SymbolNotConfigured` error backstop.
+    fn rebalances_equity(&self, symbol: &Symbol) -> bool {
+        self.chains
+            .values()
+            .any(|chain| chain.assets.is_rebalancing_enabled(symbol))
     }
+
+    /// Every hedged chain whose listing of `symbol` rebalances it. A
+    /// hedge-only listing (`rebalancing = "disabled"`) is neither slotted
+    /// nor counted: its prefunded inventory is outside the planner's total.
+    fn rebalancing_listings<'config>(
+        &'config self,
+        symbol: &'config Symbol,
+    ) -> impl Iterator<
+        Item = (
+            Chain,
+            &'config ChainRebalancingConfig,
+            &'config ChainEquityAsset,
+        ),
+    > {
+        self.chains.iter().filter_map(move |(chain, config)| {
+            config
+                .assets
+                .equities
+                .symbols
+                .get(symbol)
+                .filter(|listing| listing.rebalancing == OperationMode::Enabled)
+                .map(|listing| (*chain, config, listing))
+        })
+    }
+
+    fn wrapped_equity_recovery_enabled(&self, chain: Chain, symbol: &Symbol) -> bool {
+        self.chains
+            .get(&chain)
+            .is_some_and(|config| config.assets.is_wrapped_equity_recovery_enabled(symbol))
+    }
+}
+
+/// What the registry lookup and gas probe found for a chain the planner
+/// picked, kept for one equity check so neither runs twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainReadiness {
+    NotInRegistry,
+    NoGas,
+    Ready,
 }
 
 /// Why a chain's snapshot fails the cross-chain staleness rule.
@@ -647,27 +716,6 @@ fn mint_event_tokenization_request_id(
     }
 }
 
-/// Equity rebalancing decision produced by the imbalance check.
-/// [`RebalancingService::check_and_trigger_equity`] turns it into the
-/// matching apalis transfer job.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TriggeredOperation {
-    /// Mint tokenized equity (too much offchain).
-    Mint {
-        symbol: Symbol,
-        quantity: FractionalShares,
-    },
-    /// Redeem tokenized equity (too much onchain).
-    Redemption {
-        symbol: Symbol,
-        quantity: FractionalShares,
-        /// Wrapped (ERC-4626) token address for vault withdrawal.
-        wrapped_token: Address,
-        /// Unwrapped (underlying) token address for sending to Alpaca.
-        unwrapped_token: Address,
-    },
-}
-
 /// Marker left behind by a transfer timeout cleanup. Records when the
 /// cleanup ran and which symbol's inflight it cleared, so a late completion
 /// event for the tombstoned aggregate can release the symbol's inflight
@@ -734,10 +782,20 @@ pub(crate) struct RebalancingService {
     /// config, mirroring `set_stores`); `None` only in tests that do not
     /// exercise the gate.
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
-    /// Fresh-transfer gas admission, attached by the conductor through
+    /// Fresh USDC-transfer gas admission, attached by the conductor through
     /// `set_gas_readiness`. `Unwired` is fail-closed in production so a missed
     /// startup wiring step cannot move funds without checking native gas.
     gas_readiness: RwLock<ConfiguredGasReadiness>,
+    /// Per-chain gas admission for equity candidates, attached through
+    /// `set_equity_gas_readiness`; a chain without an entry is `Unwired`.
+    equity_gas_readiness: RwLock<BTreeMap<Chain, ConfiguredGasReadiness>>,
+    /// When each `(symbol, chain)` pair last dispatched an operation, so a
+    /// transfer truncated by a limit is not re-planned every tick.
+    equity_cooldowns: RwLock<HashMap<(Symbol, Chain), DateTime<Utc>>>,
+    /// Each symbol's last onchain fill price, attached through
+    /// `set_last_price_reader`; without one no minimum can be valued and
+    /// every plan declines.
+    last_prices: RwLock<Option<Arc<dyn LastPriceReader>>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     /// Symbols the inventory poller flagged with a pending snapshot
     /// divergence. Read here to suppress new equity transfers so a mint or
@@ -929,6 +987,9 @@ impl RebalancingService {
             inventory,
             freeze_status: RwLock::new(None),
             gas_readiness: RwLock::new(ConfiguredGasReadiness::default()),
+            equity_gas_readiness: RwLock::new(BTreeMap::new()),
+            equity_cooldowns: RwLock::new(HashMap::new()),
+            last_prices: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             divergence_gate: Arc::default(),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
@@ -1006,6 +1067,46 @@ impl RebalancingService {
 
     pub(crate) async fn set_gas_readiness(&self, readiness: Arc<GasReadiness>) {
         *self.gas_readiness.write().await = ConfiguredGasReadiness::Wired(readiness);
+    }
+
+    /// Attach one gas check per chain an equity transfer can run on; the
+    /// planner skips a candidate whose chain's wallet is not gas-ready.
+    pub(crate) async fn set_equity_gas_readiness(
+        &self,
+        readiness: BTreeMap<Chain, ConfiguredGasReadiness>,
+    ) {
+        *self.equity_gas_readiness.write().await = readiness;
+    }
+
+    /// Attach the last-price source the planner values the minimum
+    /// operation size with. Called by the conductor once the position
+    /// projection exists.
+    pub(crate) async fn set_last_price_reader(&self, reader: Arc<dyn LastPriceReader>) {
+        *self.last_prices.write().await = Some(reader);
+    }
+
+    async fn equity_chain_gas_is_ready(&self, chain: Chain) -> bool {
+        let readiness = self
+            .equity_gas_readiness
+            .read()
+            .await
+            .get(&chain)
+            .cloned()
+            .unwrap_or(ConfiguredGasReadiness::Unwired);
+
+        match readiness.ensure_ready(TransferGasRoute::Equity).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %chain,
+                    %error,
+                    "Equity candidates on this chain are skipped: its signing wallet is \
+                     not gas-ready"
+                );
+                false
+            }
+        }
     }
 
     async fn transfer_gas_is_ready(&self, route: TransferGasRoute) -> bool {
@@ -2723,11 +2824,15 @@ impl RebalancingService {
             // tests that pre-stage wallet wtSTOCK (e.g. for orderbook
             // mechanics) can opt out.
             BaseWalletWrappedEquity { balances, .. } => {
+                let primary_chain = self.inventory.read().await.primary_chain();
                 for (symbol, amount) in balances {
                     if *amount == FractionalShares::ZERO {
                         continue;
                     }
-                    if !self.config.assets.is_wrapped_equity_recovery_enabled(symbol) {
+                    if !self
+                        .config
+                        .wrapped_equity_recovery_enabled(primary_chain, symbol)
+                    {
                         continue;
                     }
 
@@ -2794,11 +2899,15 @@ impl RebalancingService {
             // config flag covers both detection paths since they share
             // the same "auto-recover misplaced equity" intent.
             BaseWalletUnwrappedEquity { balances, .. } => {
+                let primary_chain = self.inventory.read().await.primary_chain();
                 for (symbol, amount) in balances {
                     if *amount == FractionalShares::ZERO {
                         continue;
                     }
-                    if !self.config.assets.is_wrapped_equity_recovery_enabled(symbol) {
+                    if !self
+                        .config
+                        .wrapped_equity_recovery_enabled(primary_chain, symbol)
+                    {
                         continue;
                     }
 
@@ -2892,10 +3001,17 @@ impl RebalancingService {
     pub(crate) async fn enqueue_recovery_for_current_wallet_balances(&self) {
         let (wrapped, unwrapped) = {
             let view = self.inventory.read().await;
+            let primary = view.primary_chain();
             let mut wrapped = BTreeMap::new();
             let mut unwrapped = BTreeMap::new();
 
-            for symbol in self.config.assets.equities.symbols.keys() {
+            let listed = self
+                .config
+                .chains
+                .get(&primary)
+                .into_iter()
+                .flat_map(|config| config.assets.equities.symbols.keys());
+            for symbol in listed {
                 if let Some(amount) =
                     view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletWrapped)
                 {
@@ -3108,20 +3224,14 @@ impl RebalancingService {
                     self.divergence_gate
                         .request_onchain_cash_reconcile(trade_id.chain, *block_number);
                 }
-                // Only the primary chain rebalances: a secondary is
-                // prefunded and holds its own inventory, so its fill
-                // must not schedule work against the primary chain's
-                // balances. A clamped leg waits for the next pinned
-                // snapshot instead of sizing a transfer from an
-                // acknowledged intermediate balance.
-                if trade_id.chain == primary_chain {
-                    if equity_reconciled {
-                        self.equity_scheduler.enqueue_check(symbol).await;
-                    }
-                    if usdc_reconciled {
-                        self.usdc_scheduler.enqueue_check().await;
-                    }
-                }
+                self.schedule_fill_checks(
+                    symbol,
+                    trade_id.chain,
+                    primary_chain,
+                    equity_reconciled,
+                    usdc_reconciled,
+                )
+                .await;
 
                 Ok(())
             }
@@ -3565,68 +3675,304 @@ impl RebalancingService {
         self.inventory.read().await.is_restart_cash_tainted()
     }
 
-    async fn build_equity_operation(
+    /// Builds the planner's view of `symbol` -- one slot per hedged chain
+    /// that rebalances it, the broker balance, the floors, the cooldowns
+    /// and the last price -- and plans.
+    async fn plan_equity(
         &self,
         symbol: &Symbol,
-    ) -> Result<Option<TriggeredOperation>, equity::EquityTriggerError> {
-        // The trigger still dispatches on the primary chain; every lookup is
-        // keyed by it so the global rebalancer only has to pass a different
-        // chain in.
-        let chain = self.inventory.read().await.primary_chain();
-        let wrapped_token = self.load_token_address(chain, symbol).await?.ok_or(
-            equity::EquityTriggerError::TokenNotInRegistry(symbol.clone()),
-        )?;
+        probes: &mut BTreeMap<Chain, ChainReadiness>,
+    ) -> Result<EquityPlan, equity::EquityTriggerError> {
+        let (venues, primary_chain) = {
+            let inventory = self.inventory.read().await;
+            (inventory.equity_venues(symbol)?, inventory.primary_chain())
+        };
 
-        let wrapper = self
-            .wrappers
-            .get(&chain)
-            .ok_or(equity::EquityTriggerError::UnwiredWrapper { chain })?;
-        let unwrapped_token = wrapper.lookup_underlying(symbol)?;
-        let vault_ratio = wrapper.get_ratio_for_symbol(symbol).await?;
-        let shares_limit = self
-            .config
-            .assets
-            .equities
-            .symbols
-            .get(symbol)
-            .and_then(|config| config.operational_limit);
+        let mut listing_chains = BTreeSet::new();
+        let mut onchain = BTreeMap::new();
+        for (chain, config, listing) in self.config.rebalancing_listings(symbol) {
+            listing_chains.insert(chain);
+            // A slot can vanish between the freshness check and this read;
+            // the planner then declines the symbol naming the chain.
+            let Some(balance) = venues.onchain.get(&chain) else {
+                continue;
+            };
 
-        equity::check_imbalance_and_build_operation(
-            symbol,
-            &self.config.equity,
-            &self.inventory,
-            wrapped_token,
-            unwrapped_token,
-            &vault_ratio,
-            shares_limit,
-            self.config.hedge_floor.for_symbol(symbol),
+            let wrapper = self
+                .wrappers
+                .get(&chain)
+                .ok_or(equity::EquityTriggerError::UnwiredWrapper { chain })?;
+            let ratio = wrapper.get_ratio_for_symbol(symbol).await?;
+            let target = listing
+                .target_share
+                .or_else(|| self.config.allocation.targets.get(&chain).copied());
+            let (enabled, target) = target.map_or_else(
+                || {
+                    error!(
+                        target: "rebalance",
+                        %symbol,
+                        %chain,
+                        "A rebalancing-enabled listing has no target share; treating it as \
+                         disabled -- config validation should have refused this"
+                    );
+                    (false, TargetShare::ZERO)
+                },
+                |target| (true, target),
+            );
+
+            onchain.insert(
+                chain,
+                ChainSlot {
+                    balance: *balance,
+                    ratio,
+                    target,
+                    band: self.config.allocation.deviation,
+                    operational_limit: listing.operational_limit,
+                    min_operation_usd: config.min_operation_usd,
+                    // Both probed only once the planner picks the chain.
+                    gas_ready: true,
+                    registry_known: true,
+                    enabled,
+                },
+            );
+        }
+
+        let reader = self.last_prices.read().await.clone();
+        let Some(reader) = reader else {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "No last-price reader is wired, so the minimum operation size cannot \
+                 be valued"
+            );
+            return Ok(EquityPlan::Decline(DeclineReason::PriceMissing));
+        };
+        let last_price = reader.last_price(symbol).await?;
+        let cooldowns = self.equity_cooldowns(symbol, Utc::now()).await;
+
+        self.plan_dispatchable_operation(
+            EquityPlanInput {
+                symbol: symbol.clone(),
+                offchain: venues.offchain,
+                listing_chains,
+                onchain,
+                has_inflight: venues.has_inflight,
+                alpaca_floor: self.config.allocation.alpaca_floor,
+                hedge_floor: self.config.hedge_floor.for_symbol(symbol),
+                cooldowns,
+                last_price,
+                primary_chain,
+            },
+            probes,
         )
         .await
     }
 
-    async fn build_equity_operation_or_skip(
+    /// Plans with every chain assumed registered and gas-ready, then checks
+    /// the chosen chain's vault registry and probes its wallet. A chain that
+    /// fails either is marked and the symbol re-planned, so the next
+    /// candidate is tried and a within-band symbol reads nothing. Each pass
+    /// marks one more chain, so the loop ends within the slots. Results are
+    /// kept in `probes`, so the re-plan after the reservation reuses them.
+    async fn plan_dispatchable_operation(
+        &self,
+        mut input: EquityPlanInput,
+        probes: &mut BTreeMap<Chain, ChainReadiness>,
+    ) -> Result<EquityPlan, equity::EquityTriggerError> {
+        loop {
+            let plan = plan_equity_operation(&input)?;
+            let EquityPlan::Operation(operation) = &plan else {
+                return Ok(plan);
+            };
+            let chain = operation.chain;
+            let readiness = if let Some(readiness) = probes.get(&chain) {
+                *readiness
+            } else {
+                let readiness = self.probe_chain_readiness(chain, &input.symbol).await?;
+                probes.insert(chain, readiness);
+                readiness
+            };
+            if readiness == ChainReadiness::Ready {
+                return Ok(plan);
+            }
+
+            let Some(slot) = input.onchain.get_mut(&chain) else {
+                error!(
+                    target: "rebalance",
+                    symbol = %input.symbol,
+                    %chain,
+                    "The planner chose a chain without a slot; declining it as not gas-ready"
+                );
+                return Ok(EquityPlan::Decline(DeclineReason::NoGas { chain }));
+            };
+            match readiness {
+                ChainReadiness::NotInRegistry => slot.registry_known = false,
+                ChainReadiness::NoGas => slot.gas_ready = false,
+                ChainReadiness::Ready => {}
+            }
+        }
+    }
+
+    async fn probe_chain_readiness(
+        &self,
+        chain: Chain,
+        symbol: &Symbol,
+    ) -> Result<ChainReadiness, equity::EquityTriggerError> {
+        if self.load_token_address(chain, symbol).await?.is_none() {
+            return Ok(ChainReadiness::NotInRegistry);
+        }
+        if !self.equity_chain_gas_is_ready(chain).await {
+            return Ok(ChainReadiness::NoGas);
+        }
+
+        Ok(ChainReadiness::Ready)
+    }
+
+    /// The chains still inside their cooldown for `symbol`; expired entries
+    /// are dropped on the way.
+    async fn equity_cooldowns(&self, symbol: &Symbol, now: DateTime<Utc>) -> BTreeSet<Chain> {
+        let mut cooldowns = self.equity_cooldowns.write().await;
+        cooldowns.retain(|_, dispatched_at| {
+            now.signed_duration_since(*dispatched_at)
+                .to_std()
+                .is_ok_and(|age| age < self.config.allocation.cooldown)
+        });
+
+        cooldowns
+            .keys()
+            .filter(|(cooled, _)| cooled == symbol)
+            .map(|(_, chain)| *chain)
+            .collect()
+    }
+
+    /// The rebalancing work a fill asks for. Equity rebalancing is per
+    /// chain: a fill on a chain whose listing rebalances the symbol moves
+    /// that chain's slot, so it schedules the symbol's check, while a
+    /// hedge-only listing is prefunded and outside the planner's total. USDC
+    /// still rebalances on the primary chain only. A clamped leg waits for
+    /// the next pinned snapshot instead of sizing a transfer from an
+    /// acknowledged intermediate balance.
+    async fn schedule_fill_checks(
+        &self,
+        symbol: Symbol,
+        fill_chain: Chain,
+        primary_chain: Chain,
+        equity_reconciled: bool,
+        usdc_reconciled: bool,
+    ) {
+        let rebalances_here = self
+            .config
+            .rebalancing_listings(&symbol)
+            .any(|(chain, _, _)| chain == fill_chain);
+        if rebalances_here && equity_reconciled {
+            self.equity_scheduler.enqueue_check(symbol).await;
+        }
+
+        if fill_chain == primary_chain && usdc_reconciled {
+            self.usdc_scheduler.enqueue_check().await;
+        }
+    }
+
+    /// A declined plan is a decision too: the counter keeps the idle planner
+    /// distinguishable from a silent one, every reason but the steady state
+    /// is worth a line, and a venue the trigger cannot vouch for is worth a
+    /// warning that says how stale its poll is when the caller knows.
+    fn record_equity_decline(
         &self,
         symbol: &Symbol,
-    ) -> Result<Option<TriggeredOperation>, equity::EquityTriggerError> {
-        match self.build_equity_operation(symbol).await {
-            Ok(operation) => Ok(operation),
+        reason: &DeclineReason,
+        staleness: Option<StaleSnapshot>,
+    ) {
+        let label = reason.metric_label();
+        counter!("equity_plan_declined_total", "reason" => label).increment(1);
+
+        match (reason, staleness) {
+            (DeclineReason::WithinBand, _) => {
+                debug!(target: "rebalance", %symbol, reason = label, "Declined equity plan");
+            }
+            (
+                DeclineReason::ChainUnpolled { chain } | DeclineReason::ChainStale { chain },
+                Some(staleness),
+            ) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    %chain,
+                    %staleness,
+                    bound_secs = self.config.inventory_staleness_bound.as_secs(),
+                    reason = label,
+                    "Declined equity plan"
+                );
+            }
+            (
+                DeclineReason::ChainUnpolled { chain }
+                | DeclineReason::ChainStale { chain }
+                | DeclineReason::NotInRegistry { chain }
+                | DeclineReason::RedemptionUnrecoverable { chain },
+                _,
+            ) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    %chain,
+                    reason = label,
+                    "Declined equity plan"
+                );
+            }
+            (
+                DeclineReason::BelowMinimum { chain }
+                | DeclineReason::NoGas { chain }
+                | DeclineReason::CoolingDown { chain },
+                _,
+            ) => {
+                info!(
+                    target: "rebalance",
+                    %symbol,
+                    %chain,
+                    reason = label,
+                    "Declined equity plan"
+                );
+            }
+            (
+                DeclineReason::OffchainUnpolled
+                | DeclineReason::NoPolledChain
+                | DeclineReason::Inflight
+                | DeclineReason::TotalZero
+                | DeclineReason::FloorCapped
+                | DeclineReason::PriceMissing,
+                _,
+            ) => {
+                info!(target: "rebalance", %symbol, reason = label, "Declined equity plan");
+            }
+        }
+    }
+
+    /// Plans `symbol` and maps every skip -- an unconfigured symbol or a
+    /// declined plan -- to `None`, so the trigger reserves the symbol only
+    /// for an actionable operation.
+    async fn plan_equity_operation_or_skip(
+        &self,
+        symbol: &Symbol,
+        probes: &mut BTreeMap<Chain, ChainReadiness>,
+    ) -> Result<Option<PlannedOperation>, equity::EquityTriggerError> {
+        let plan = match self.plan_equity(symbol, probes).await {
+            Ok(plan) => plan,
             Err(equity::EquityTriggerError::Wrapper(WrapperError::SymbolNotConfigured(symbol))) => {
                 warn!(
                     target: "rebalance",
                     %symbol,
                     "Skipped equity trigger: symbol not configured"
                 );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        match plan {
+            EquityPlan::Operation(operation) => Ok(Some(operation)),
+            EquityPlan::Decline(reason) => {
+                self.record_equity_decline(symbol, &reason, None);
                 Ok(None)
             }
-            Err(equity::EquityTriggerError::TokenNotInRegistry(symbol)) => {
-                warn!(
-                    target: "rebalance",
-                    %symbol,
-                    "Skipped equity trigger: symbol not in vault registry"
-                );
-                Ok(None)
-            }
-            Err(error) => Err(error),
         }
     }
 
@@ -3954,11 +4300,11 @@ impl RebalancingService {
     ) -> Result<(), equity::EquityTriggerError> {
         self.expire_stuck_operations_with_logging().await;
 
-        if !self.config.is_equity_rebalancing_enabled(symbol) {
+        if !self.config.rebalances_equity(symbol) {
             debug!(
                 target: "rebalance",
                 %symbol,
-                "Skipped equity trigger: rebalancing not enabled for symbol"
+                "Skipped equity trigger: rebalancing not enabled for symbol on any chain"
             );
             return Ok(());
         }
@@ -4029,28 +4375,37 @@ impl RebalancingService {
 
         // Cross-chain staleness rule: never size an operation off a chain
         // whose onchain balance was not recently confirmed by a successful
-        // poll. Freshness comes from PollFreshness, which the poller stamps
-        // on every successful fetch, so an unchanged (event-suppressed) book
-        // still reads fresh; the snapshot aggregate's own stamps freeze on
-        // quiet books (see freshness.rs module doc).
-        let chain = self.inventory.read().await.primary_chain();
-        let last_polled = self.config.poll_freshness.last_observed(
-            PortfolioLocation::MarketMaking(chain),
-            &PortfolioAsset::Equity(symbol.clone()),
-        );
-        if let Some(staleness) =
-            stale_snapshot_age(last_polled, self.config.inventory_staleness_bound)
-        {
-            warn!(
-                target: "rebalance",
-                %symbol,
-                %chain,
-                %staleness,
-                bound_secs = self.config.inventory_staleness_bound.as_secs(),
-                "Skipped equity trigger: the chain's onchain inventory \
-                 poll is stale"
-            );
-            return Ok(());
+        // poll. Every chain rebalancing the symbol counts in the planner's
+        // total, so one unpolled or stale listing declines the symbol rather
+        // than sizing against a partial total. Freshness comes from
+        // PollFreshness, which the poller stamps on every successful fetch,
+        // so an unchanged (event-suppressed) book still reads fresh; the
+        // snapshot aggregate's own stamps freeze on quiet books (see
+        // freshness.rs module doc).
+        for (chain, _, _) in self.config.rebalancing_listings(symbol) {
+            let seeded = self
+                .inventory
+                .read()
+                .await
+                .onchain_equity_slot_seeded(symbol, chain);
+            let last_polled = seeded.then(|| {
+                self.config.poll_freshness.last_observed(
+                    PortfolioLocation::MarketMaking(chain),
+                    &PortfolioAsset::Equity(symbol.clone()),
+                )
+            });
+            if let Some(staleness) =
+                stale_snapshot_age(last_polled.flatten(), self.config.inventory_staleness_bound)
+            {
+                let reason = match staleness {
+                    StaleSnapshot::NeverPolled => DeclineReason::ChainUnpolled { chain },
+                    StaleSnapshot::AgedOut { .. } | StaleSnapshot::FutureStamp { .. } => {
+                        DeclineReason::ChainStale { chain }
+                    }
+                };
+                self.record_equity_decline(symbol, &reason, Some(staleness));
+                return Ok(());
+            }
         }
 
         let Some(guard) = self.try_claim_equity_guard_for_transfer(symbol) else {
@@ -4058,16 +4413,18 @@ impl RebalancingService {
             return Ok(());
         };
 
-        if !self.transfer_gas_is_ready(TransferGasRoute::Equity).await {
-            return Ok(());
-        }
-
         // Most checks are balanced or below the configured imbalance threshold.
-        // Size once before taking the durable Position reservation so that
+        // Plan once before taking the durable Position reservation so that
         // common no-op checks append no reservation/release events. Inventory
-        // can change after this read, so the post-reservation sizing below
-        // remains authoritative.
-        if self.build_equity_operation_or_skip(symbol).await?.is_none() {
+        // can change after this read, so the post-reservation plan below
+        // remains authoritative; it reuses this plan's registry and gas
+        // probes.
+        let mut probes = BTreeMap::new();
+        if self
+            .plan_equity_operation_or_skip(symbol, &mut probes)
+            .await?
+            .is_none()
+        {
             return Ok(());
         }
 
@@ -4080,12 +4437,15 @@ impl RebalancingService {
         }
 
         let attempt = async {
-            let Some(operation) = self.build_equity_operation_or_skip(symbol).await? else {
+            let Some(operation) = self
+                .plan_equity_operation_or_skip(symbol, &mut probes)
+                .await?
+            else {
                 return Ok(false);
             };
 
             // The restart taint needs no matching re-check: it is only seeded
-            // at boot, so it cannot appear during sizing. Snapshot divergence
+            // at boot, so it cannot appear during planning. Snapshot divergence
             // can appear and still suppresses dispatch, but hedge admission is
             // decided exclusively by the Position reservation below.
             if self.divergence_gate.is_engaged(symbol) {
@@ -4102,28 +4462,50 @@ impl RebalancingService {
                 return Ok(false);
             }
 
-            Ok(match operation {
-                TriggeredOperation::Mint { symbol, quantity } => {
+            let PlannedOperation {
+                chain,
+                direction,
+                quantity,
+            } = operation;
+            let dispatched = match direction {
+                PlannedDirection::Mint => {
                     self.enqueue_transfer_equity_to_market_making_with_reservation(
-                        symbol,
-                        quantity,
+                        symbol.clone(),
+                        quantity.inner(),
+                        chain,
                         guard.generation(),
                         reservation_id,
                     )
                     .await
                 }
-                TriggeredOperation::Redemption {
-                    symbol, quantity, ..
-                } => {
+                PlannedDirection::Redemption => {
                     self.enqueue_transfer_equity_to_hedging_with_reservation(
-                        symbol,
-                        quantity,
+                        symbol.clone(),
+                        quantity.inner(),
+                        chain,
                         guard.generation(),
                         reservation_id,
                     )
                     .await
                 }
-            })
+            };
+
+            if dispatched {
+                info!(
+                    target: "rebalance",
+                    %symbol,
+                    %chain,
+                    ?direction,
+                    %quantity,
+                    "Dispatched equity operation"
+                );
+                self.equity_cooldowns
+                    .write()
+                    .await
+                    .insert((symbol.clone(), chain), Utc::now());
+            }
+
+            Ok(dispatched)
         }
         .await;
 
@@ -4175,11 +4557,15 @@ impl RebalancingService {
         Ok(registry.token_by_symbol(symbol))
     }
 
-    /// Returns USDC rebalancing parameters if rebalancing is enabled in config.
-    fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>, Option<Usd>)> {
+    /// Returns USDC rebalancing parameters if rebalancing is enabled in
+    /// config, reading the cash asset of `chain` (the primary).
+    fn usdc_rebalancing_params(
+        &self,
+        chain: Chain,
+    ) -> Option<(ImbalanceThreshold, Option<Usdc>, Option<Usd>)> {
         let threshold = self.config.usdc.as_ref()?;
 
-        let cash = self.config.assets.cash.as_ref()?;
+        let cash = self.config.chains.get(&chain)?.assets.cash.as_ref()?;
         if cash.rebalancing != OperationMode::Enabled {
             return None;
         }
@@ -4194,7 +4580,8 @@ impl RebalancingService {
     pub(crate) async fn check_and_trigger_usdc(&self) {
         self.expire_stuck_operations_with_logging().await;
 
-        let Some((threshold, usdc_limit, reserved)) = self.usdc_rebalancing_params() else {
+        let chain = self.inventory.read().await.primary_chain();
+        let Some((threshold, usdc_limit, reserved)) = self.usdc_rebalancing_params(chain) else {
             return;
         };
 
@@ -4226,7 +4613,6 @@ impl RebalancingService {
         // bridge must not be sized off a chain with no recent successful
         // USDC poll (PollFreshness, not snapshot stamps: a static USDC
         // balance emits no events, yet stays fresh while polled).
-        let chain = self.inventory.read().await.primary_chain();
         let last_polled = self.config.poll_freshness.last_observed(
             PortfolioLocation::MarketMaking(chain),
             &PortfolioAsset::Usdc,
@@ -5079,11 +5465,13 @@ impl RebalancingService {
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
+        chain: Chain,
         generation: equity::GuardGeneration,
     ) -> bool {
         self.enqueue_transfer_equity_to_market_making_with_reservation(
             symbol,
             quantity,
+            chain,
             generation,
             EquityTransferReservationId::generate(),
         )
@@ -5094,6 +5482,7 @@ impl RebalancingService {
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
+        chain: Chain,
         generation: equity::GuardGeneration,
         reservation_id: EquityTransferReservationId,
     ) -> bool {
@@ -5154,10 +5543,6 @@ impl RebalancingService {
         }
 
         let issuer_request_id = IssuerRequestId(reservation_id.into_uuid());
-        // The allocation planner is what will choose a chain per operation;
-        // until then every rebalance runs on the primary chain, and the job
-        // records it so the saga and its resume agree on where it ran.
-        let chain = self.inventory.read().await.primary_chain();
 
         let push = queue
             .push(TransferEquityToMarketMaking {
@@ -5204,11 +5589,13 @@ impl RebalancingService {
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
+        chain: Chain,
         generation: equity::GuardGeneration,
     ) -> bool {
         self.enqueue_transfer_equity_to_hedging_with_reservation(
             symbol,
             quantity,
+            chain,
             generation,
             EquityTransferReservationId::generate(),
         )
@@ -5219,6 +5606,7 @@ impl RebalancingService {
         &self,
         symbol: Symbol,
         quantity: FractionalShares,
+        chain: Chain,
         generation: equity::GuardGeneration,
         reservation_id: EquityTransferReservationId,
     ) -> bool {
@@ -5276,7 +5664,6 @@ impl RebalancingService {
         }
 
         let aggregate_id = RedemptionAggregateId(reservation_id.into_uuid());
-        let chain = self.inventory.read().await.primary_chain();
 
         let push = queue
             .push(TransferEquityToHedging {
@@ -5597,6 +5984,12 @@ impl RebalancingService {
             self.release_timed_out_redemption_reservation(&id, &symbol)
                 .await;
         }
+    }
+
+    /// Test fixture: forgets every cooldown, as a restart would.
+    #[cfg(test)]
+    pub(crate) async fn clear_equity_cooldowns(&self) {
+        self.equity_cooldowns.write().await.clear();
     }
 
     /// Clears the in-progress flag for an equity symbol.
@@ -6278,7 +6671,9 @@ impl RebalancingService {
                 // When recovery is enabled, reconstruct as HeldForRecovery so
                 // claim_guard_for_recovery_or_orphan can claim the slot. When recovery
                 // is disabled, ActiveTransfer is correct — resume_interrupted_transfers
-                // will call resume_mint and the transfer job retries normally.
+                // will call resume_mint and the transfer job retries normally. The
+                // recovery jobs run on the primary chain only, so a mint on any other
+                // chain is never held: nothing would ever release it.
                 //
                 // TokensWrapped and VaultDepositSubmitted are always reconstructed as
                 // ActiveTransfer: the deposit is idempotent and resume_interrupted_transfers
@@ -6286,11 +6681,12 @@ impl RebalancingService {
                 let is_pre_wrap_post_receipt_state =
                     matches!(entity, TokensReceived { .. } | WrapSubmitted { .. });
 
+                let primary_chain = self.inventory.read().await.primary_chain();
                 if is_pre_wrap_post_receipt_state
+                    && entity.chain() == primary_chain
                     && self
                         .config
-                        .assets
-                        .is_wrapped_equity_recovery_enabled(symbol)
+                        .wrapped_equity_recovery_enabled(primary_chain, symbol)
                 {
                     self.mark_equity_held_for_recovery(symbol);
                 } else {
@@ -7361,6 +7757,7 @@ mod tests {
     use super::*;
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::conductor::job::Job;
+    use crate::conductor::job::TaskIdentity;
     use crate::equity_redemption::{
         DetectionFailure, EquityRedemptionCommand, UnwrappedProvenance, redemption_aggregate_id,
     };
@@ -7377,6 +7774,10 @@ mod tests {
     };
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
+    use crate::rebalancing::equity::{
+        MintError, MintTransferError, ResumeEquityToMarketMaking, TransferEquityToMarketMakingCtx,
+        TransferEquityToMarketMakingJobError,
+    };
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
@@ -7457,23 +7858,23 @@ mod tests {
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: HedgeFloor::default(),
-            equity: ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
-            },
+            allocation: AllocationCtx::base_test(),
             usdc: Some(ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.2),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: ChainAssets {
-                equities: rebalancing_enabled_equities(&["AAPL", "TSLA", "GOOG", "RKLB"]),
-                cash: Some(ChainCashAsset {
-                    vault_ids: Vec::new(),
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: None,
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities: rebalancing_enabled_equities(&["AAPL", "TSLA", "GOOG", "RKLB"]),
+                    cash: Some(ChainCashAsset {
+                        vault_ids: Vec::new(),
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
                 }),
-            },
+            )]),
         }
     }
 
@@ -7528,19 +7929,26 @@ mod tests {
         );
 
         let mut config = test_config();
-        config.assets.equities.symbols.insert(
-            symbol.clone(),
-            ChainEquityAsset {
-                tokenized_equity: Address::random(),
-                tokenized_equity_derivative: Address::random(),
-                vault_ids: Vec::new(),
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Enabled,
-                wrapped_equity_recovery: OperationMode::Enabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
+        config
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::random(),
+                    tokenized_equity_derivative: Address::random(),
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery: OperationMode::Enabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            );
 
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -7592,19 +8000,26 @@ mod tests {
         );
 
         let mut config = test_config();
-        config.assets.equities.symbols.insert(
-            symbol.clone(),
-            ChainEquityAsset {
-                tokenized_equity: Address::random(),
-                tokenized_equity_derivative: Address::random(),
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Enabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
+        config
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::random(),
+                    tokenized_equity_derivative: Address::random(),
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Disabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Enabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            );
 
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -7656,19 +8071,26 @@ mod tests {
         );
 
         let mut config = test_config();
-        config.assets.equities.symbols.insert(
-            symbol.clone(),
-            ChainEquityAsset {
-                tokenized_equity: Address::random(),
-                tokenized_equity_derivative: Address::random(),
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
+        config
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::random(),
+                    tokenized_equity_derivative: Address::random(),
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Disabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            );
 
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -7781,25 +8203,28 @@ mod tests {
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
-            assets: ChainAssets {
-                equities: ChainEquities {
-                    operational_limit: None,
-                    symbols: HashMap::from([(
-                        symbol.clone(),
-                        ChainEquityAsset {
-                            tokenized_equity: Address::ZERO,
-                            tokenized_equity_derivative: Address::ZERO,
-                            vault_ids: Vec::new(),
-                            trading: OperationMode::Disabled,
-                            rebalancing: OperationMode::Enabled,
-                            wrapped_equity_recovery: OperationMode::Enabled,
-                            operational_limit: None,
-                            target_share: None,
-                        },
-                    )]),
-                },
-                cash: None,
-            },
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            symbol.clone(),
+                            ChainEquityAsset {
+                                tokenized_equity: Address::ZERO,
+                                tokenized_equity_derivative: Address::ZERO,
+                                vault_ids: Vec::new(),
+                                trading: OperationMode::Disabled,
+                                rebalancing: OperationMode::Enabled,
+                                wrapped_equity_recovery: OperationMode::Enabled,
+                                operational_limit: None,
+                                target_share: None,
+                            },
+                        )]),
+                    },
+                    cash: None,
+                }),
+            )]),
             ..test_config()
         };
         let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -8018,6 +8443,48 @@ mod tests {
              (apalis transfer job retries normally)",
         )
         .await;
+    }
+
+    /// The recovery jobs run on the primary chain only, so a secondary-chain
+    /// mint held for recovery would block its symbol forever. It reconstructs
+    /// as `ActiveTransfer` even with recovery enabled on the primary.
+    #[tokio::test]
+    async fn recover_mint_state_holds_only_a_primary_chain_mint_for_recovery() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trigger = make_trigger_with_recovery_enabled(&symbol).await;
+
+        trigger
+            .recover_mint_state(
+                &issuer_request_id("startup-secondary-tokens-received"),
+                &TokenizedEquityMint::TokensReceived {
+                    chain: Chain::HyperEvm,
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                    issuer_request_id: issuer_request_id("startup-secondary-tokens-received"),
+                    tokenization_request_id: tokenization_request_id("TOK-TR-HL"),
+                    tx_hash: TxHash::ZERO,
+                    shares_minted: U256::from(5u64),
+                    fees: None,
+                    requested_at: now,
+                    accepted_at: now,
+                    received_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let guard = trigger
+            .equity_in_progress
+            .read()
+            .unwrap()
+            .get(&symbol)
+            .cloned();
+        assert!(
+            matches!(guard, Some(equity::GuardState::ActiveTransfer { .. })),
+            "a HyperEVM mint must not be held for a primary-chain recovery: {guard:?}"
+        );
     }
 
     #[tokio::test]
@@ -10507,10 +10974,13 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: test_config().equity,
+                allocation: test_config().allocation,
                 usdc: None,
                 transfer_timeout: test_config().transfer_timeout,
-                assets: ChainAssets::default(),
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets::default()),
+                )]),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             BTreeMap::from([(
@@ -10578,10 +11048,13 @@ mod tests {
             poll_freshness,
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
-            assets: ChainAssets {
-                equities,
-                cash: None,
-            },
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities,
+                    cash: None,
+                }),
+            )]),
             ..test_config()
         };
 
@@ -10661,6 +11134,73 @@ mod tests {
             "Whitelisted symbol with an imbalance should dispatch a mint job"
         );
         assert_eq!(jobs[0].symbol, symbol);
+    }
+
+    /// Robinhood lists AAPL hedge-only (`rebalancing = "disabled"`) with a
+    /// prefunded 100 shares and, as in prod, its own wrapper. That inventory
+    /// is outside the planner's total: Base is sized against its own 20 and
+    /// the broker's 80 alone, so it mints 30, not the 80 a total of 200
+    /// would ask for.
+    #[tokio::test]
+    async fn hedge_only_chain_inventory_is_outside_the_planner_total() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .update_equity_at(
+                &symbol,
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let mut hedge_only = rebalancing_enabled_equities(&["AAPL"]);
+        hedge_only
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = OperationMode::Disabled;
+        let config = RebalancingServiceConfig {
+            chains: BTreeMap::from([
+                (
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                ),
+                (
+                    Chain::Robinhood,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: hedge_only,
+                        cash: None,
+                    }),
+                ),
+            ]),
+            ..test_config()
+        };
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
+            inventory,
+            &symbol,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Robinhood,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+            config,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(jobs.len(), 1, "Base alone is under its target");
+        assert_eq!(jobs[0].chain, Chain::Base);
+        assert_eq!(jobs[0].quantity, shares(30));
     }
 
     /// Cross-chain staleness rule: an equity evaluation must not run off a
@@ -10773,6 +11313,131 @@ mod tests {
         );
     }
 
+    /// The trigger's own pre-plan skip is a decline too: a listing chain
+    /// whose poll aged out counts as `chain_stale`, one never polled since
+    /// boot as `chain_unpolled`, and the line says how stale against which
+    /// bound.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn unvouched_listing_chain_declines_are_counted_by_reason() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aged_out = PollFreshness::new();
+        aged_out.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now() - chrono::Duration::seconds(301),
+        );
+
+        for (freshness, reason) in [
+            (aged_out, "chain_stale"),
+            (PollFreshness::new(), "chain_unpolled"),
+        ] {
+            let trigger = make_imbalanced_trigger_with_freshness(
+                &symbol,
+                rebalancing_enabled_equities(&["AAPL"]),
+                freshness,
+            )
+            .await;
+
+            trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+            assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+            assert!(
+                logs_contain(reason),
+                "the decline must be recorded as {reason}"
+            );
+            assert!(
+                logs_contain("bound_secs=300"),
+                "the {reason} decline must say which bound the poll missed"
+            );
+        }
+    }
+
+    /// The post-plan registry gate is a decline too: the chosen chain not
+    /// knowing the token counts as `not_in_registry`.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn symbol_missing_from_the_chosen_chain_registry_is_a_counted_decline() {
+        let known = Symbol::new("AAPL").unwrap();
+        let unknown = Symbol::new("TSLA").unwrap();
+        let inventory =
+            InventoryView::default().with_equity(unknown.clone(), shares(20), shares(80));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &known).await;
+
+        trigger.check_and_trigger_equity(&unknown).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert!(
+            logs_contain("not_in_registry"),
+            "the decline must be recorded by reason"
+        );
+        assert!(
+            logs_contain("chain=base") && !logs_contain("chain=Some("),
+            "the decline names its chain like every other rebalance line"
+        );
+    }
+
+    /// A quiet symbol's last fill predates the inventory staleness bound, as
+    /// it does after every cooldown; its price still values the minimum.
+    #[tokio::test]
+    async fn last_fill_older_than_the_inventory_staleness_bound_still_plans() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(0.5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now() - chrono::Duration::hours(1),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        let position_projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        trigger.set_last_price_reader(position_projection).await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "an old last price must still value the minimum"
+        );
+        assert_eq!(jobs[0].chain, Chain::Base);
+        assert_eq!(jobs[0].quantity, shares(30));
+    }
+
+    fn base_equity_gas(readiness: Arc<GasReadiness>) -> BTreeMap<Chain, ConfiguredGasReadiness> {
+        BTreeMap::from([(Chain::Base, ConfiguredGasReadiness::Wired(readiness))])
+    }
+
     #[tokio::test]
     async fn low_gas_releases_equity_guard_and_funded_retry_dispatches() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -10780,12 +11445,12 @@ mod tests {
             make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
                 .await;
         trigger
-            .set_gas_readiness(crate::native_gas::GasReadiness::for_test(
+            .set_equity_gas_readiness(base_equity_gas(GasReadiness::for_test(
                 U256::ZERO,
                 U256::from(1_u64),
                 U256::MAX,
                 U256::from(1_u64),
-            ))
+            )))
             .await;
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
@@ -10801,7 +11466,7 @@ mod tests {
         );
 
         trigger
-            .set_gas_readiness(crate::native_gas::GasReadiness::always_ready_for_test())
+            .set_equity_gas_readiness(base_equity_gas(GasReadiness::always_ready_for_test()))
             .await;
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
@@ -10812,35 +11477,81 @@ mod tests {
         );
     }
 
+    /// The trigger plans before and after the Position reservation, but a
+    /// dispatch reads the chosen chain's gas balance only once.
     #[tokio::test]
-    async fn low_gas_skips_equity_ratio_read() {
+    async fn dispatch_probes_the_chosen_chains_gas_once() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(20), shares(80))
-            .with_usdc(usdc(1_000_000), usdc(1_000_000));
-        let wrapper = Arc::new(MockWrapper::new());
-        let trigger = make_trigger_with_inventory_registry_and_wrapper(
-            inventory,
-            &symbol,
-            Arc::clone(&wrapper),
-            test_config(),
-        )
-        .await;
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        let (readiness, reads) = GasReadiness::counting_for_test();
         trigger
-            .set_gas_readiness(crate::native_gas::GasReadiness::for_test(
-                U256::ZERO,
-                U256::from(1_u64),
-                U256::MAX,
-                U256::from(1_u64),
-            ))
+            .set_equity_gas_readiness(base_equity_gas(readiness))
             .await;
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
-        assert_eq!(
-            wrapper.ratio_calls(),
-            0,
-            "low gas must reject the transfer before its onchain ratio read"
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 1);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The gas gate sits after selection: the only candidate's chain is dry,
+    /// so the plan declines as `no_gas` and names the chain.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn low_gas_chain_declines_the_plan_as_no_gas() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        trigger
+            .set_equity_gas_readiness(base_equity_gas(GasReadiness::for_test(
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::MAX,
+                U256::from(1_u64),
+            )))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert!(
+            logs_contain("no_gas") && logs_contain("Declined equity plan"),
+            "the decline must be recorded with its reason"
+        );
+    }
+
+    /// Gas is probed only for the chain the planner picks: a symbol within
+    /// its band never reads the dry wallet's balance, so it never warns.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn within_band_symbol_does_not_probe_gas() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        trigger
+            .set_equity_gas_readiness(base_equity_gas(GasReadiness::for_test(
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::MAX,
+                U256::from(1_u64),
+            )))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert!(
+            logs_contain("within_band"),
+            "the symbol must decline as within its band"
+        );
+        assert!(
+            !logs_contain("not gas-ready"),
+            "a symbol within its band must not probe any chain's gas"
         );
     }
 
@@ -11204,6 +11915,9 @@ mod tests {
             )
             .await;
         trigger
+            .set_last_price_reader(Arc::new(StubLastPrice(float!(100))))
+            .await;
+        trigger
     }
 
     async fn make_trigger_with_inventory_and_registry(
@@ -11451,30 +12165,33 @@ mod tests {
         symbol: &Symbol,
         config: RebalancingServiceConfig,
     ) -> Arc<RebalancingService> {
-        make_trigger_with_inventory_registry_and_wrapper(
+        make_trigger_with_inventory_registry_and_wrappers(
             inventory,
             symbol,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             config,
         )
         .await
     }
 
-    async fn make_trigger_with_inventory_registry_and_wrapper(
+    async fn make_trigger_with_inventory_registry_and_wrappers(
         inventory: InventoryView,
         symbol: &Symbol,
-        wrapper: Arc<MockWrapper>,
+        wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
         config: RebalancingServiceConfig,
     ) -> Arc<RebalancingService> {
-        make_trigger_with_inventory_registry_wrapper_and_pool(inventory, symbol, wrapper, config)
+        make_trigger_with_inventory_registry_wrappers_and_pool(inventory, symbol, wrappers, config)
             .await
             .0
     }
 
-    async fn make_trigger_with_inventory_registry_wrapper_and_pool(
+    async fn make_trigger_with_inventory_registry_wrappers_and_pool(
         inventory: InventoryView,
         symbol: &Symbol,
-        wrapper: Arc<MockWrapper>,
+        wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
         config: RebalancingServiceConfig,
     ) -> (Arc<RebalancingService>, SqlitePool) {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -11514,15 +12231,19 @@ mod tests {
                 },
             )]),
             inventory,
-            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
+            wrappers,
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
         trigger
             .set_position_authority(position, position_projection, position_threshold)
             .await;
+        trigger
+            .set_last_price_reader(Arc::new(StubLastPrice(float!(100))))
+            .await;
         (trigger, pool)
     }
+
     #[tokio::test]
     async fn incident_order_transfer_reservation_prevents_redemption() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -11580,10 +12301,10 @@ mod tests {
     async fn equity_transfer_reservation_survives_queue_handoff() {
         let symbol = Symbol::new("AAPL").unwrap();
         let wrapper = Arc::new(MockWrapper::new());
-        let trigger = make_trigger_with_inventory_registry_and_wrapper(
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
             InventoryView::default().with_equity(symbol.clone(), shares(80), shares(20)),
             &symbol,
-            Arc::clone(&wrapper),
+            BTreeMap::from([(Chain::Base, Arc::clone(&wrapper) as Arc<dyn Wrapper>)]),
             test_config(),
         )
         .await;
@@ -11622,10 +12343,13 @@ mod tests {
     #[tokio::test]
     async fn balanced_equity_checks_do_not_append_position_events() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (trigger, pool) = make_trigger_with_inventory_registry_wrapper_and_pool(
+        let (trigger, pool) = make_trigger_with_inventory_registry_wrappers_and_pool(
             InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
             &symbol,
-            Arc::new(MockWrapper::new()),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
             test_config(),
         )
         .await;
@@ -12127,23 +12851,36 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// A primary chain whose registry resolves the token but that has no
-    /// wrapper wired is refused by name rather than reading its vault ratio
-    /// through another chain's wrapper.
+    /// A listing chain whose slot is polled but that has no wrapper wired is
+    /// refused by name rather than reading its vault ratio through another
+    /// chain's wrapper.
     #[tokio::test]
-    async fn build_equity_operation_refuses_a_primary_chain_without_a_wrapper() {
+    async fn plan_equity_refuses_a_listing_chain_without_a_wrapper() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::for_primary_chain(Chain::Ethereum).with_equity(
-            symbol.clone(),
-            shares(0),
-            shares(0),
-        );
+        let inventory = InventoryView::for_primary_chain(Chain::Ethereum)
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity_at(
+                &symbol,
+                Chain::Ethereum,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(0)),
+                Utc::now(),
+            )
+            .unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         seed_vault_registry(&pool, &symbol, Chain::Ethereum).await;
         let trigger = RebalancingService::new(
-            test_config(),
+            RebalancingServiceConfig {
+                chains: BTreeMap::from([(
+                    Chain::Ethereum,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                )]),
+                ..test_config()
+            },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             BTreeMap::from([(
                 Chain::Ethereum,
@@ -12162,7 +12899,10 @@ mod tests {
             Arc::new(LogNotifier),
         );
 
-        let error = trigger.build_equity_operation(&symbol).await.unwrap_err();
+        let error = trigger
+            .plan_equity(&symbol, &mut BTreeMap::new())
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -12699,10 +13439,10 @@ mod tests {
         let wrapper = Arc::new(MockWrapper::with_ratio(U256::from(
             1_500_000_000_000_000_000u64,
         )));
-        let reactor = make_trigger_with_inventory_registry_and_wrapper(
+        let reactor = make_trigger_with_inventory_registry_and_wrappers(
             inventory,
             &symbol,
-            wrapper,
+            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
             test_config(),
         )
         .await;
@@ -13745,13 +14485,14 @@ mod tests {
     }
 
     /// A fill on a hedged secondary chain belongs to that chain: it moves
-    /// the secondary's own inventory slot, leaves the primary's untouched,
-    /// and asks for no rebalancing (secondaries are prefunded, with
-    /// rebalancing disabled on every asset).
+    /// the secondary's own inventory slot and leaves the primary's untouched.
+    /// It asks for no rebalancing when the chain does not list the symbol
+    /// (Ethereum) or lists it hedge-only (Robinhood, prefunded and outside
+    /// the planner's total); USDC rebalances on the primary chain only.
     #[tokio::test]
     async fn secondary_chain_fill_stays_on_its_own_chain() {
-        for chain in [Chain::Ethereum, Chain::HyperEvm] {
-            let symbol = Symbol::new("AAPL").unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        for chain in [Chain::Ethereum, Chain::Robinhood] {
             let now = Utc::now();
             let inventory = InventoryView::default()
                 .with_equity(symbol.clone(), shares(50), shares(50))
@@ -13776,8 +14517,23 @@ mod tests {
                     now,
                 )
                 .unwrap();
+            let mut hedge_only = rebalancing_enabled_equities(&["AAPL"]);
+            hedge_only
+                .symbols
+                .get_mut(&symbol)
+                .expect("AAPL is configured")
+                .rebalancing = OperationMode::Disabled;
+            let mut config = test_config();
+            config.chains.insert(
+                Chain::Robinhood,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities: hedge_only,
+                    cash: None,
+                }),
+            );
 
-            let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+            let reactor =
+                make_trigger_with_inventory_and_registry_config(inventory, &symbol, config).await;
             let trigger = reactor.clone();
             let harness = ReactorHarness::new(reactor.clone());
 
@@ -13816,7 +14572,8 @@ mod tests {
             assert_eq!(
                 count_pending_equity_check_jobs(&trigger).await,
                 0,
-                "a secondary chain's fill must not schedule the primary's equity rebalancing"
+                "a fill on a chain that does not rebalance the symbol must not schedule \
+                 its equity check"
             );
             assert_eq!(
                 count_pending_usdc_check_jobs(&trigger).await,
@@ -13824,6 +14581,84 @@ mod tests {
                 "a secondary chain's fill must not schedule the primary's USDC rebalancing"
             );
         }
+    }
+
+    /// A fill on a secondary chain whose listing rebalances the symbol moves
+    /// that chain's own slot and so its deviation from its target, which the
+    /// planner manages: it asks for the symbol's equity check. USDC still
+    /// rebalances on the primary chain only.
+    #[tokio::test]
+    async fn rebalancing_secondary_chain_fill_schedules_the_equity_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(10000), usdc(10000))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::HyperEvm,
+                    balances: BTreeMap::from([(symbol.clone(), shares(20))]),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::HyperEvm,
+                    usdc_balance: usdc(5000),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap();
+        let mut config = test_config();
+        config.chains.insert(
+            Chain::HyperEvm,
+            ChainRebalancingConfig::for_test(ChainAssets {
+                equities: rebalancing_enabled_equities(&["AAPL"]),
+                cash: None,
+            }),
+        );
+        let reactor = make_trigger_with_inventory_registry_and_wrappers(
+            inventory,
+            &symbol,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::HyperEvm,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+            config,
+        )
+        .await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::HyperEvm),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            1,
+            "a rebalancing secondary's fill must schedule the symbol's equity check"
+        );
+        assert_eq!(
+            count_pending_usdc_check_jobs(&trigger).await,
+            0,
+            "USDC rebalancing still runs on the primary chain only"
+        );
     }
 
     /// Before a hedged secondary's first poll, no snapshot has seeded its
@@ -20053,7 +20888,6 @@ mod tests {
         Arc<Store<TokenizedEquityMint>>,
         Arc<Store<EquityRedemption>>,
     ) {
-        let pool = crate::test_utils::setup_test_db().await;
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
                 Chain::Base,
@@ -20070,6 +20904,19 @@ mod tests {
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
+        attach_live_equity_stores_with(service, services).await
+    }
+
+    /// Builds the mint and redemption stores over `services` with `service`
+    /// as their reactor and installs them on the service.
+    async fn attach_live_equity_stores_with(
+        service: &Arc<RebalancingService>,
+        services: EquityTransferServices,
+    ) -> (
+        Arc<Store<TokenizedEquityMint>>,
+        Arc<Store<EquityRedemption>>,
+    ) {
+        let pool = crate::test_utils::setup_test_db().await;
         let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(service.clone())
             .build(services.clone())
@@ -20328,6 +21175,225 @@ mod tests {
         );
     }
 
+    /// A transfer whose every attempt fails after the tokens landed.
+    struct PostReceiptResume;
+
+    #[async_trait]
+    impl ResumeEquityToMarketMaking for PostReceiptResume {
+        async fn resume_equity_to_market_making(
+            &self,
+            issuer_request_id: &IssuerRequestId,
+            _symbol: &Symbol,
+            _chain: Chain,
+            _quantity: FractionalShares,
+        ) -> Result<(), MintTransferError> {
+            Err(MintTransferError::PostReceipt(MintError::EntityNotFound {
+                issuer_request_id: issuer_request_id.clone(),
+                expected_state: "test-induced-post",
+            }))
+        }
+    }
+
+    /// Services for Base and HyperEVM, each listing `symbol` with wrapped
+    /// equity recovery enabled, so the test proves it is the chain and not
+    /// the recovery flag that keeps a secondary-chain mint out of the handoff.
+    fn recovery_enabled_services_on_both_chains(symbol: &Symbol) -> EquityTransferServices {
+        let equities = ChainEquities {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Disabled,
+                    rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery: OperationMode::Enabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            )]),
+        };
+        EquityTransferServices {
+            chains: [Chain::Base, Chain::HyperEvm]
+                .into_iter()
+                .map(|chain| {
+                    (
+                        chain,
+                        ChainEquityServices {
+                            wallet: Address::ZERO,
+                            raindex: Arc::new(MockRaindex::new()),
+                            vault_lookup: Arc::new(MockVaultLookup::new()),
+                            tokenizer: Arc::new(MockTokenizer::new()),
+                            wrapper: Arc::new(MockWrapper::new()),
+                            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                            gas_readiness: ConfiguredGasReadiness::Unwired,
+                            equities: equities.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        }
+    }
+
+    /// A secondary-chain mint stuck after receipt is never handed to the
+    /// primary-chain recovery jobs, so an exhausted transfer job leaves the
+    /// symbol guard and the Position reservation in place. The transfer
+    /// timeout sweep is the durable owner that unlatches it on any chain: it
+    /// fails the mint, clears the guard and releases the reservation.
+    #[tokio::test]
+    async fn secondary_chain_mint_exhausted_after_receipt_is_unlatched_by_the_transfer_timeout() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let id = issuer_request_id("exhausted-secondary-mint");
+        let service = make_trigger_with_inventory(InventoryView::default().with_equity(
+            symbol.clone(),
+            shares(100),
+            shares(100),
+        ))
+        .await;
+        let services = recovery_enabled_services_on_both_chains(&symbol);
+        let (mint_store, _) = attach_live_equity_stores_with(&service, services.clone()).await;
+        let position_store = service
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let position_projection = service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        seed_confirmed_transfer_reservation(
+            &service,
+            &symbol,
+            EquityTransferReservationId::from_uuid(id.0),
+        )
+        .await;
+
+        // The trigger claims the guard before the job row exists and the job
+        // carries that claim's generation.
+        let guard = service
+            .try_claim_equity_guard_for_transfer(&symbol)
+            .expect("test owns the transfer guard");
+        let generation = guard.generation();
+        guard.defuse();
+
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::HyperEvm,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.mint_tracking.read().await.get(&id).unwrap().stage,
+            MintTrackingStage::TokensReceived
+        );
+
+        let ctx = TransferEquityToMarketMakingCtx {
+            transfer: Arc::new(PostReceiptResume),
+            equity_in_progress: Arc::clone(&service.equity_in_progress),
+            mint_store: mint_store.clone(),
+            position_authority: Some((position_store, ExecutionThreshold::whole_share())),
+            transfer_services: services,
+            primary_chain: Chain::Base,
+            job_queue: service.transfer_equity_to_market_making_queue.clone(),
+        };
+        let job = TransferEquityToMarketMaking {
+            issuer_request_id: id.clone(),
+            symbol: symbol.clone(),
+            quantity: shares(5),
+            chain: Chain::HyperEvm,
+            generation,
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        let error = Job::perform(&job, &ctx).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
+            ),
+            "a secondary-chain PostReceipt must propagate for retry, got {error:?}"
+        );
+
+        Job::on_terminal_attempt(
+            &job,
+            &ctx,
+            &TaskIdentity::for_test("exhausted-secondary-mint"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            service.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::ActiveTransfer { generation }),
+            "exhaustion keeps the guard while the mint aggregate is live"
+        );
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation
+                .unwrap()
+                .status,
+            EquityTransferReservationStatus::Confirmed
+        );
+
+        service
+            .expire_stuck_operations(Utc::now() + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service.equity_in_progress.read().unwrap().get(&symbol),
+            None,
+            "the transfer timeout must release the exhausted secondary-chain mint's guard"
+        );
+        let mint = mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(mint, TokenizedEquityMint::Failed { .. }),
+            "the transfer timeout must fail the mint, got {mint:?}"
+        );
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the transfer timeout must release the Position reservation"
+        );
+        assert!(!service.mint_tracking.read().await.contains_key(&id));
+    }
+
     #[tokio::test]
     async fn failed_pre_enqueue_release_is_retained_for_retry() {
         let symbol = Symbol::new("tAAPL").unwrap();
@@ -20505,6 +21571,7 @@ mod tests {
             .enqueue_transfer_equity_to_hedging(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -20547,6 +21614,7 @@ mod tests {
             .enqueue_transfer_equity_to_hedging(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -20598,6 +21666,7 @@ mod tests {
             .enqueue_transfer_equity_to_hedging(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -20664,6 +21733,7 @@ mod tests {
             .enqueue_transfer_equity_to_market_making(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -20729,6 +21799,7 @@ mod tests {
             .enqueue_transfer_equity_to_hedging(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -20791,6 +21862,7 @@ mod tests {
             .enqueue_transfer_equity_to_market_making(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -20846,6 +21918,7 @@ mod tests {
             .enqueue_transfer_equity_to_hedging(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -20898,6 +21971,7 @@ mod tests {
             .enqueue_transfer_equity_to_hedging(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -20966,6 +22040,7 @@ mod tests {
             .enqueue_transfer_equity_to_hedging(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -21026,6 +22101,7 @@ mod tests {
             .enqueue_transfer_equity_to_market_making(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -21085,6 +22161,7 @@ mod tests {
             .enqueue_transfer_equity_to_hedging(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -21173,6 +22250,7 @@ mod tests {
             .enqueue_transfer_equity_to_market_making(
                 symbol,
                 FractionalShares::new(float!(1)),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -25579,13 +26657,13 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: ChainAssets::default(),
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets::default()),
+                )]),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             BTreeMap::from([(
@@ -25609,7 +26687,7 @@ mod tests {
         );
 
         assert!(
-            trigger.usdc_rebalancing_params().is_none(),
+            trigger.usdc_rebalancing_params(Chain::Base).is_none(),
             "Expected usdc_rebalancing_params to be None when cash ratio is absent"
         );
     }
@@ -25620,13 +26698,16 @@ mod tests {
         Arc::get_mut(&mut trigger)
             .unwrap()
             .config
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
             .assets
             .cash
             .as_mut()
             .unwrap()
             .rebalancing = OperationMode::Disabled;
 
-        assert!(trigger.usdc_rebalancing_params().is_none());
+        assert!(trigger.usdc_rebalancing_params(Chain::Base).is_none());
     }
 
     /// Spy reactor that records all dispatched events for verification.
@@ -26259,6 +27340,9 @@ mod tests {
             RebalancingSchedulers::new(&apalis_pool),
             Arc::new(crate::alerts::LogNotifier),
         ));
+        trigger
+            .set_last_price_reader(Arc::new(StubLastPrice(float!(100))))
+            .await;
         let reactor = trigger.clone();
 
         let id = InventorySnapshotId {
@@ -26360,6 +27444,9 @@ mod tests {
         trigger
             .set_position_authority(position, position_projection, position_threshold)
             .await;
+        trigger
+            .set_last_price_reader(Arc::new(StubLastPrice(float!(100))))
+            .await;
         let reactor = trigger.clone();
 
         let id = InventorySnapshotId {
@@ -26413,6 +27500,85 @@ mod tests {
             jobs.len(),
             1,
             "expected a redemption job for 100% onchain ratio once both venues have data"
+        );
+    }
+
+    /// Verifies logging shows when imbalance check skips due to partial data.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn logs_show_partial_data_skips_imbalance_check() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let symbol = Symbol::new("RKLB").unwrap();
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+        seed_vault_registry(&pool, &symbol, Chain::Base).await;
+
+        let trigger = Arc::new(RebalancingService::new(
+            test_config(),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            BTreeMap::from([(
+                Chain::Base,
+                VaultRegistryId {
+                    chain: st0x_evm::Chain::Base,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )]),
+            inventory.clone(),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::LogNotifier),
+        ));
+        trigger
+            .set_last_price_reader(Arc::new(StubLastPrice(float!(100))))
+            .await;
+        let reactor = trigger.clone();
+
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        // Apply ONLY onchain data - offchain not yet polled
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            chain: Chain::Base,
+            balances,
+            fetched_at: Utc::now(),
+            block_number: None,
+        };
+
+        apply_and_dispatch_snapshot(reactor.clone(), id.clone(), onchain_event)
+            .await
+            .unwrap();
+        drain_pending_jobs(&trigger).await.unwrap();
+
+        // Verify the logs show:
+        // 1. The snapshot event was applied
+        // 2. Imbalance check was skipped due to partial data
+        assert!(
+            logs_contain("Applied inventory snapshot event"),
+            "Should log when snapshot event is applied"
+        );
+        assert!(
+            logs_contain("Declined equity plan") && logs_contain("offchain_unpolled"),
+            "Should log that the plan declined because the broker venue is unpolled"
+        );
+        assert!(
+            !logs_contain("chain=None"),
+            "a symbol-wide decline carries no chain field"
+        );
+        assert!(
+            !logs_contain("Triggered equity rebalancing"),
+            "Should NOT trigger rebalancing with partial data"
         );
     }
 
@@ -26555,7 +27721,9 @@ mod tests {
             .unwrap();
         wait_for_redemption_reservation_release(&trigger, &id).await;
 
-        // After cancel: back to 80 onchain, 20 offchain -> imbalance should re-trigger
+        // After cancel: back to 80 onchain, 20 offchain -> once the first
+        // dispatch's cooldown has passed, the imbalance re-triggers.
+        trigger.clear_equity_cooldowns().await;
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert_eq!(
             take_pending_equity_redemption_jobs(&trigger).await.len(),
@@ -29503,6 +30671,7 @@ mod tests {
             .enqueue_transfer_equity_to_market_making(
                 Symbol::new("TSLA").unwrap(),
                 shares(30),
+                Chain::Base,
                 equity::GuardGeneration::default(),
             )
             .await;
@@ -29525,12 +30694,18 @@ mod tests {
                     .enqueue_transfer_equity_to_market_making(
                         symbol.clone(),
                         shares(10),
+                        Chain::Base,
                         generation,
                     )
                     .await
             } else {
                 trigger
-                    .enqueue_transfer_equity_to_hedging(symbol.clone(), shares(10), generation)
+                    .enqueue_transfer_equity_to_hedging(
+                        symbol.clone(),
+                        shares(10),
+                        Chain::Base,
+                        generation,
+                    )
                     .await
             };
             assert!(enqueued);
@@ -29547,6 +30722,7 @@ mod tests {
                     .enqueue_transfer_equity_to_market_making(
                         symbol.clone(),
                         shares(10),
+                        Chain::Base,
                         generation
                     )
                     .await,
@@ -29554,7 +30730,12 @@ mod tests {
             );
             assert!(
                 !trigger
-                    .enqueue_transfer_equity_to_hedging(symbol.clone(), shares(10), generation)
+                    .enqueue_transfer_equity_to_hedging(
+                        symbol.clone(),
+                        shares(10),
+                        Chain::Base,
+                        generation
+                    )
                     .await,
                 "the unacknowledged final attempt must block a new redemption"
             );
@@ -29568,6 +30749,7 @@ mod tests {
                     .enqueue_transfer_equity_to_market_making(
                         symbol.clone(),
                         shares(10),
+                        Chain::Base,
                         generation
                     )
                     .await,

@@ -90,11 +90,12 @@ impl ResumeEquityToMarketMaking for CrossVenueEquityTransfer {
 /// Dependencies the job needs to drive the mint.
 pub(crate) struct TransferEquityToMarketMakingCtx {
     pub(crate) transfer: Arc<dyn ResumeEquityToMarketMaking>,
-    /// Shared in-progress map. When a `PostReceipt` error surfaces and the
-    /// aggregate is in a pre-wrap post-receipt state (`TokensReceived` or
-    /// `WrapSubmitted`) AND `wrapped_equity_recovery` is enabled for the
-    /// symbol, the job transitions this entry from `ActiveTransfer` to
-    /// `HeldForRecovery` and returns `Ok(())` so apalis does not retry.
+    /// Shared in-progress map. When a `PostReceipt` error surfaces on a
+    /// primary-chain mint whose aggregate is in a pre-wrap post-receipt state
+    /// (`TokensReceived` or `WrapSubmitted`) AND `wrapped_equity_recovery` is
+    /// enabled for the symbol, the job transitions this entry from
+    /// `ActiveTransfer` to `HeldForRecovery` and returns `Ok(())` so apalis
+    /// does not retry.
     /// `UnwrappedEquityRecovery` claims the `HeldForRecovery` slot and
     /// re-wraps + deposits the tokens.
     ///
@@ -121,6 +122,9 @@ pub(crate) struct TransferEquityToMarketMakingCtx {
     /// ensures the two paths cannot disagree: if recovery is disabled,
     /// `Err(PostReceipt)` is returned instead and apalis retries.
     pub(crate) transfer_services: EquityTransferServices,
+    /// The chain the recovery jobs run on. A mint on any other chain is never
+    /// handed off: nothing would claim or release its `HeldForRecovery` slot.
+    pub(crate) primary_chain: Chain,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget or handing the symbol
@@ -396,7 +400,10 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                 // WrappedEquityRecovery remains orphan-only (absent guard).
                 //
                 // The handoff is only done when recovery is enabled. When
-                // disabled, propagate Err so apalis retries.
+                // disabled, propagate Err so apalis retries. The recovery
+                // jobs run on the primary chain only, so a mint on any other
+                // chain is never held: nothing would ever release it, and
+                // propagating Err retries the transfer instead.
                 let state = ctx
                     .mint_store
                     .load(&self.issuer_request_id)
@@ -441,7 +448,9 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                                 })
                         });
 
-                if is_post_receipt_recoverable && recovery_enabled {
+                let on_primary_chain = self.chain == ctx.primary_chain;
+
+                if is_post_receipt_recoverable && on_primary_chain && recovery_enabled {
                     match mark_held_for_recovery(
                         &ctx.equity_in_progress,
                         &self.symbol,
@@ -494,9 +503,10 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                     }
                 } else {
                     // Aggregate is absent, pre-receipt, already terminal,
-                    // TokensWrapped/VaultDepositSubmitted, DB load failed, or
-                    // recovery is disabled. Propagate Err so apalis retries or
-                    // records a failed job.
+                    // TokensWrapped/VaultDepositSubmitted, DB load failed,
+                    // recovery is disabled, or the mint is on a secondary
+                    // chain. Propagate Err so apalis retries or records a
+                    // failed job.
                     Err(TransferEquityToMarketMakingJobError::Transfer(
                         MintTransferError::PostReceipt(mint_error),
                     ))
@@ -1005,6 +1015,17 @@ mod tests {
         transfer: Arc<dyn ResumeEquityToMarketMaking>,
         recovery_mode: OperationMode,
     ) -> TransferEquityToMarketMakingCtx {
+        test_ctx_on_chains(transfer, recovery_mode, &[Chain::Base]).await
+    }
+
+    /// Builds a test ctx whose services map carries every chain in `chains`,
+    /// each listing AAPL with the given `wrapped_equity_recovery` mode; Base
+    /// is the primary chain.
+    async fn test_ctx_on_chains(
+        transfer: Arc<dyn ResumeEquityToMarketMaking>,
+        recovery_mode: OperationMode,
+        chains: &[Chain],
+    ) -> TransferEquityToMarketMakingCtx {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
@@ -1024,19 +1045,24 @@ mod tests {
             .insert(Symbol::new("AAPL").unwrap(), aapl_config);
 
         let transfer_services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: raindex.clone(),
-                    vault_lookup: Arc::new(MockVaultLookup::new()),
-                    tokenizer: Arc::new(MockTokenizer::new()),
-                    wrapper: wrapper.clone(),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities,
-                },
-            )]),
+            chains: chains
+                .iter()
+                .map(|chain| {
+                    (
+                        *chain,
+                        ChainEquityServices {
+                            wallet: Address::ZERO,
+                            raindex: raindex.clone(),
+                            vault_lookup: Arc::new(MockVaultLookup::new()),
+                            tokenizer: Arc::new(MockTokenizer::new()),
+                            wrapper: wrapper.clone(),
+                            mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                            gas_readiness: ConfiguredGasReadiness::Unwired,
+                            equities: equities.clone(),
+                        },
+                    )
+                })
+                .collect(),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(test_store(pool, transfer_services.clone()));
@@ -1047,6 +1073,7 @@ mod tests {
             mint_store,
             position_authority: None,
             transfer_services,
+            primary_chain: Chain::Base,
             job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
         }
     }
@@ -1846,6 +1873,75 @@ mod tests {
             Some(&GuardState::HeldForRecovery),
             "guard must transition to HeldForRecovery for TokensReceived so \
              UnwrappedEquityRecovery can resume the wrap+deposit"
+        );
+    }
+
+    /// The recovery jobs run on the primary chain only, so a mint on a
+    /// secondary chain is never handed off even with recovery enabled on
+    /// that chain: `PostReceipt` propagates as `Err` for apalis to retry
+    /// `resume_mint` and the guard stays `ActiveTransfer`.
+    #[tokio::test]
+    async fn perform_post_receipt_on_a_secondary_chain_mint_is_not_held_for_recovery() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let issuer_id = issuer_request_id("post-receipt-secondary-chain");
+        let ctx = test_ctx_on_chains(
+            Arc::new(RecordingResume::post_receipt_failure()),
+            OperationMode::Enabled,
+            &[Chain::Base, Chain::HyperEvm],
+        )
+        .await;
+
+        ctx.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::ActiveTransfer {
+                generation: GuardGeneration::default(),
+            },
+        );
+
+        ctx.mint_store
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::HyperEvm,
+                    issuer_request_id: issuer_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .expect("RequestMint must persist");
+
+        submit_requested_mint(&ctx, &issuer_id).await;
+
+        ctx.mint_store
+            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .await
+            .expect("Poll must transition to TokensReceived");
+
+        let job = TransferEquityToMarketMaking {
+            chain: Chain::HyperEvm,
+            issuer_request_id: issuer_id.clone(),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(5)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        let error = Job::perform(&job, &ctx).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
+            ),
+            "a secondary-chain PostReceipt must propagate for retry, got {error:?}"
+        );
+        let guard = ctx.equity_in_progress.read().unwrap().get(&symbol).cloned();
+        assert!(
+            matches!(guard, Some(GuardState::ActiveTransfer { .. })),
+            "a HyperEVM mint must not be held for a primary-chain recovery: {guard:?}"
         );
     }
 

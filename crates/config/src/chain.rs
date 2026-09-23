@@ -17,7 +17,9 @@ use st0x_execution::{Positive, Symbol};
 use st0x_finance::Usdc;
 
 use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode};
-use crate::enablement::{ChainEnablementError, ChainLifecycle, check_enablement};
+use crate::enablement::{
+    ChainEnablementError, ChainLifecycle, check_enablement, first_equity_matching,
+};
 
 /// Which block tag to use as the fill-ingestion cutoff.
 ///
@@ -582,6 +584,15 @@ pub enum ChainRegistryError {
         chains.iter().map(|chain| chain.as_str()).collect::<Vec<_>>().join(", ")
     )]
     MultiplePrimaryChains { chains: Vec<Chain> },
+    #[error(
+        "[chains.{chain}.trading.assets.equities.{symbol}] sets wrapped_equity_recovery = \
+         \"enabled\", but wrapped-equity recovery runs only on the primary chain ({primary_chain})"
+    )]
+    WrappedEquityRecoveryOnSecondary {
+        chain: Chain,
+        symbol: Symbol,
+        primary_chain: Chain,
+    },
     #[error(transparent)]
     Entry(#[from] ChainConfigError),
     #[error(transparent)]
@@ -680,6 +691,23 @@ fn enabled_chains(
             config.trading.is_some(),
             config.trading.as_ref().map(|trading| &trading.assets),
         )?;
+    }
+
+    // Recovery is wired for the primary chain only; a secondary listing that
+    // enables it would strand a failed mint's tokens with no signal.
+    for (chain, _, trading) in &hedged_chains {
+        if *chain == primary_chain {
+            continue;
+        }
+        if let Some(symbol) = first_equity_matching(&trading.assets, |equity| {
+            equity.wrapped_equity_recovery == OperationMode::Enabled
+        }) {
+            return Err(ChainRegistryError::WrappedEquityRecoveryOnSecondary {
+                chain: *chain,
+                symbol: symbol.clone(),
+                primary_chain,
+            });
+        }
     }
 
     Ok(EnabledChains {
@@ -1530,6 +1558,40 @@ mod tests {
                 ChainRegistryError::NoPrimaryChain { ref chains } if chains == &vec![Chain::Base]
             ),
             "got: {error}"
+        );
+    }
+
+    /// Wrapped-equity recovery runs only on the primary chain, so a
+    /// secondary listing that enables it is refused at load rather than
+    /// silently left without recovery.
+    #[test]
+    fn registry_rejects_wrapped_equity_recovery_on_a_secondary_chain() {
+        let mut ethereum = primary_trading_config_toml(false);
+        ethereum.assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+        let configs = BTreeMap::from([
+            (Chain::Base, chain_config(Some(trading_config_toml()))),
+            (Chain::Ethereum, chain_config(Some(ethereum))),
+        ]);
+
+        let error =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[chains.ethereum.trading.assets.equities.AAPL] sets wrapped_equity_recovery = \
+             \"enabled\", but wrapped-equity recovery runs only on the primary chain (base)"
         );
     }
 

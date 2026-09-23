@@ -43,6 +43,13 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
          floor's residual plus any other preflight shortfall"
     );
     metrics::describe_counter!(
+        "equity_plan_declined_total",
+        "Equity allocation plans that chose no operation, by reason (within_band, \
+         floor_capped, below_minimum, no_gas, cooling_down, price_missing, inflight, \
+         total_zero, offchain_unpolled, no_polled_chain, chain_unpolled, chain_stale, \
+         not_in_registry)"
+    );
+    metrics::describe_counter!(
         "onchain_events_total",
         "ClearV3, TakeOrderV3 and InventoryTrade events received from Raindex, by event_type"
     );

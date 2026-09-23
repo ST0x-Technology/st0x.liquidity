@@ -23,6 +23,10 @@ static EXACT_ONE: LazyLock<Float> = LazyLock::new(|| float!(1));
 pub struct TargetShare(Float);
 
 impl TargetShare {
+    /// No share of the total: the target of a venue that is counted but
+    /// never planned.
+    pub const ZERO: Self = Self(float!(0));
+
     /// # Errors
     ///
     /// Returns [`AllocationConfigError::TargetShareOutOfRange`] outside `[0, 1]`.
@@ -99,8 +103,9 @@ pub struct AllocationConfig {
 
 impl AllocationConfig {
     /// Checks the targets against the chain tables: a target may name only a
-    /// hedged chain, every rebalanced listing needs an effective target, and
-    /// per symbol those targets plus the floor must not exceed 1. A listing
+    /// hedged chain, every rebalanced listing needs an effective target that is
+    /// zero or above the deviation band, and per symbol those targets plus the
+    /// floor must not exceed 1. A listing
     /// with rebalancing disabled is never planned, so it needs no target and
     /// does not count.
     ///
@@ -144,6 +149,17 @@ impl AllocationConfig {
                         chain: *chain,
                         symbol: symbol.clone(),
                     })?;
+                // An empty chain is `target * total` short, never outside a
+                // band of `deviation * total` unless the target exceeds it.
+                let target_positive = target.inner().gt(Float::zero()?)?;
+                if target_positive && !target.inner().gt(self.deviation.inner())? {
+                    return Err(AllocationConfigError::TargetWithinBand {
+                        chain: *chain,
+                        symbol: symbol.clone(),
+                        target: target.inner(),
+                        deviation: self.deviation.inner(),
+                    });
+                }
                 let running = match sums.get(symbol) {
                     Some(sum) => (*sum + target.inner())?,
                     None => target.inner(),
@@ -195,6 +211,38 @@ impl AllocationCtx {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl AllocationCtx {
+    /// Test fixture: one chain at `target` with `band` around it, no broker
+    /// floor, a one-dollar minimum and a one-second cooldown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocationConfigError`] for a share outside `[0, 1]` or a
+    /// negative band.
+    pub fn single_chain_test(
+        chain: Chain,
+        target: Float,
+        band: Float,
+    ) -> Result<Self, AllocationConfigError> {
+        Ok(Self {
+            targets: BTreeMap::from([(chain, TargetShare::new(target)?)]),
+            alpaca_floor: TargetShare::ZERO,
+            deviation: DeviationBand::new(band)?,
+            min_operation_usd: Positive::new(Usdc::new(float!(1)))
+                .unwrap_or_else(|_| unreachable!("one dollar is positive")),
+            cooldown: Duration::from_secs(1),
+        })
+    }
+
+    /// The test builders' default: Base at 50% inside a 20% band.
+    #[must_use]
+    pub fn base_test() -> Self {
+        Self::single_chain_test(Chain::Base, float!(0.5), float!(0.2))
+            .unwrap_or_else(|_| unreachable!("hard-coded shares are valid"))
+    }
+}
+
 /// Why an allocation config was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum AllocationConfigError {
@@ -221,6 +269,18 @@ pub enum AllocationConfigError {
          [chains.{chain}.trading.assets.equities.{symbol}]"
     )]
     MissingTarget { chain: Chain, symbol: Symbol },
+    #[error(
+        "{symbol} targets {} on {chain}, which is not above the deviation band of {}, \
+         so the chain could never be minted into",
+        format_float_with_fallback(target),
+        format_float_with_fallback(deviation)
+    )]
+    TargetWithinBand {
+        chain: Chain,
+        symbol: Symbol,
+        target: Float,
+        deviation: Float,
+    },
     #[error(
         "{symbol}: its chain target shares plus alpaca_floor sum to {}, which exceeds 1",
         format_float_with_fallback(total)
@@ -414,6 +474,36 @@ mod tests {
         };
         assert_eq!(chain, Chain::HyperEvm);
         assert_eq!(symbol, aapl());
+    }
+
+    /// An empty chain is `target * total` short, which is never outside a band
+    /// of `deviation * total` when the target is at or inside it: such a chain
+    /// could drain but never refill. A zero target only ever drains, so it
+    /// passes.
+    #[test]
+    fn positive_target_at_or_inside_the_band_is_refused() {
+        let inside = BTreeMap::from([(
+            Chain::Base,
+            hedged(ChainLifecycle::Active, "enabled", r"target_share = 0.05"),
+        )]);
+
+        let error = allocation(r"{ base = 0.5 }", "0.1")
+            .validate(&inside)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "AAPL targets 0.05 on base, which is not above the deviation band of 0.05, \
+             so the chain could never be minted into"
+        );
+
+        let zero = BTreeMap::from([(
+            Chain::Base,
+            hedged(ChainLifecycle::Active, "enabled", r"target_share = 0"),
+        )]);
+        allocation(r"{ base = 0.5 }", "0.1")
+            .validate(&zero)
+            .unwrap();
     }
 
     /// A hedge-only listing is never planned, so it needs no target and

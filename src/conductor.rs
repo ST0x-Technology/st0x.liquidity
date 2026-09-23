@@ -127,8 +127,8 @@ use crate::rebalancing::usdc::{
     UsdcSettlementParams,
 };
 use crate::rebalancing::{
-    BaseWallet, ChainWallets, EthereumWallet, RebalancerServices, RebalancingSchedulers,
-    RebalancingService, RebalancingServiceConfig, to_wrapped_equities,
+    BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
+    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, to_wrapped_equities,
 };
 use crate::startup::StartupToken;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -2139,14 +2139,48 @@ async fn wire_freeze_guard(
     Ok(())
 }
 
-/// Wires the pre-dispatch safety checks used by fresh rebalancing transfers.
+/// Hands the trigger the handles only the query manifest can produce: the
+/// stores it emits timeout failures through, the Position authority that
+/// arbitrates transfer admission against hedges, and the position projection
+/// it values minimum operation sizes with.
+async fn attach_manifest_handles(
+    rebalancing_service: &RebalancingService,
+    built: &BuiltFrameworks,
+    execution_threshold: ExecutionThreshold,
+) {
+    rebalancing_service
+        .set_stores(
+            built.mint.clone(),
+            built.redemption.clone(),
+            built.usdc.clone(),
+        )
+        .await;
+    rebalancing_service
+        .set_position_authority(
+            built.position.clone(),
+            built.position_projection.clone(),
+            execution_threshold,
+        )
+        .await;
+    rebalancing_service
+        .set_last_price_reader(built.position_projection.clone())
+        .await;
+}
+
+/// Wires the pre-dispatch safety checks used by fresh rebalancing transfers:
+/// the USDC corridor's gas check, one gas check per equity chain, and the
+/// dividend freeze guard.
 async fn wire_transfer_admission_guards(
     rebalancing_service: &RebalancingService,
     gas_readiness: Arc<GasReadiness>,
+    equity_gas_readiness: BTreeMap<Chain, ConfiguredGasReadiness>,
     freeze_check: OperationMode,
     issuance: &IssuanceStatusCtx,
 ) -> anyhow::Result<()> {
     rebalancing_service.set_gas_readiness(gas_readiness).await;
+    rebalancing_service
+        .set_equity_gas_readiness(equity_gas_readiness)
+        .await;
     wire_freeze_guard(rebalancing_service, freeze_check, issuance).await
 }
 
@@ -2855,12 +2889,13 @@ fn build_equity_gas_readiness<Signer: Wallet>(
         .collect()
 }
 
-/// The pre-dispatch admission check the trigger and the USDC corridor share:
-/// the corridor spans Base and Ethereum, and the trigger's equity leg gates
-/// on the primary chain's own wallet until the global rebalancer picks the
-/// chain. Each transfer's own chain is checked again from its
-/// [`ChainEquityServices`] entry. Only the corridor's two wallets are wired
-/// here, so a primary outside the corridor refuses startup by name.
+/// The pre-dispatch admission check for the USDC corridor, which spans Base
+/// and Ethereum; its equity leg is the primary chain's own wallet, kept so
+/// the check stays complete. Equity candidates are gated per chain from
+/// [`build_equity_gas_readiness`] instead, and each transfer's own chain is
+/// checked again from its [`ChainEquityServices`] entry. Only the corridor's
+/// two wallets are wired here, so a primary outside the corridor refuses
+/// startup by name.
 fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
     wallets: &ChainWallets<Signer>,
     ctx: &Ctx,
@@ -2891,21 +2926,39 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
 
 /// Builds the trigger service from the validated rebalancing config plus the
 /// conductor-owned dependencies (the trigger config is the runtime projection
-/// of `RebalancingCtx` onto the primary chain's asset table).
+/// of `RebalancingCtx` onto every hedged chain's asset table).
 fn build_rebalancing_service(
     rebalancing_ctx: &RebalancingCtx,
     deps: &RebalancingDeps,
     registry_ids: BTreeMap<Chain, VaultRegistryId>,
     wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
 ) -> Arc<RebalancingService> {
+    let allocation = rebalancing_ctx.allocation.clone();
+    let chains = deps
+        .ctx
+        .chains
+        .hedged()
+        .map(|hedged| {
+            (
+                hedged.chain,
+                ChainRebalancingConfig {
+                    assets: hedged.assets.clone(),
+                    min_operation_usd: hedged
+                        .min_operation_usd
+                        .unwrap_or(allocation.min_operation_usd),
+                },
+            )
+        })
+        .collect();
+
     Arc::new(RebalancingService::new(
         RebalancingServiceConfig {
             poll_freshness: deps.poll_freshness.clone(),
             inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
-            equity: rebalancing_ctx.equity,
             usdc: rebalancing_ctx.usdc,
             transfer_timeout: rebalancing_ctx.transfer_timeout,
-            assets: deps.ctx.chains.primary().assets.clone(),
+            chains,
+            allocation,
             cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
             hedge_floor: deps.ctx.broker.hedge_floor().clone(),
         },
@@ -2919,12 +2972,14 @@ fn build_rebalancing_service(
 }
 
 /// Every hedged chain's equity transfer services, plus the per-chain vault
-/// registry ids the trigger reads and the per-chain ratio readers
-/// [`hedged_chain_wrappers`] builds. `chains` and `registry_ids` cover the
-/// chains that rebalance equity; `wrappers` covers every hedged chain.
+/// registry ids and gas checks the trigger reads and the per-chain ratio
+/// readers [`hedged_chain_wrappers`] builds. `chains`, `registry_ids` and
+/// `gas_readiness` cover the chains that rebalance equity; `wrappers` covers
+/// every hedged chain.
 struct HedgedEquityServices {
     chains: BTreeMap<Chain, ChainEquityServices>,
     registry_ids: BTreeMap<Chain, VaultRegistryId>,
+    gas_readiness: BTreeMap<Chain, ConfiguredGasReadiness>,
     wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
 }
 
@@ -2995,7 +3050,7 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
     }
 
     let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.clone().into_parts();
-    let mut gas_readiness = build_equity_gas_readiness(
+    let gas_readiness = build_equity_gas_readiness(
         deps.ctx
             .alerts
             .as_ref()
@@ -3044,7 +3099,8 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
                 wrapper: equity.wrapper.clone(),
                 mint_authorizer: equity.mint_authorizer.clone(),
                 gas_readiness: gas_readiness
-                    .remove(chain)
+                    .get(chain)
+                    .cloned()
                     .unwrap_or(ConfiguredGasReadiness::Unwired),
                 equities: hedged.assets.equities.clone(),
             },
@@ -3054,6 +3110,7 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
     Ok(HedgedEquityServices {
         chains,
         registry_ids,
+        gas_readiness,
         wrappers,
     })
 }
@@ -3127,6 +3184,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let HedgedEquityServices {
             chains: chain_services,
             registry_ids,
+            gas_readiness: equity_gas_readiness,
             wrappers,
         } = build_hedged_equity_services(&deps, &tokenizations, &wallets)?;
 
@@ -3148,6 +3206,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         wire_transfer_admission_guards(
             &rebalancing_service,
             gas_readiness.clone(),
+            equity_gas_readiness,
             rebalancing_ctx.freeze_check,
             &deps.ctx.issuance,
         )
@@ -3162,20 +3221,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )
         .await?;
 
-        rebalancing_service
-            .set_stores(
-                built.mint.clone(),
-                built.redemption.clone(),
-                built.usdc.clone(),
-            )
-            .await;
-        rebalancing_service
-            .set_position_authority(
-                built.position.clone(),
-                built.position_projection.clone(),
-                deps.ctx.execution_threshold,
-            )
-            .await;
+        attach_manifest_handles(&rebalancing_service, &built, deps.ctx.execution_threshold).await;
 
         let recovery_transfer = Arc::new(
             CrossVenueEquityTransfer::new(
@@ -3280,6 +3326,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             mint_store: built.mint.clone(),
             position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
             transfer_services: equity_transfer_services,
+            primary_chain,
             job_queue: deps.schedulers.transfer_equity_to_market_making.clone(),
         });
 
@@ -5922,8 +5969,8 @@ mod tests {
     use uuid::uuid;
 
     use st0x_config::{
-        BotGasValuationConfig, ChainAssets, ChainEquities, ChainEquityAsset, ExecutionThreshold,
-        OperationMode, OrchestratorConfig, create_test_ctx_with_order_owner,
+        AllocationCtx, BotGasValuationConfig, ChainAssets, ChainEquities, ChainEquityAsset,
+        ExecutionThreshold, OperationMode, OrchestratorConfig, create_test_ctx_with_order_owner,
         test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
@@ -5941,7 +5988,7 @@ mod tests {
     use st0x_raindex::{Raindex, RaindexContracts};
     use st0x_tokenization::mock::MockTokenizer;
     use st0x_tokenization::{IssuerRequestId, issuer_request_id, tokenization_request_id};
-    use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped, Wrapper};
+    use st0x_wrapper::{MockWrapper, Wrapper};
 
     use super::*;
     use crate::alerts::{CapturingNotifier, NotifierError};
@@ -6012,10 +6059,6 @@ mod tests {
     async fn pending_until_aborted<T>(dropped: Arc<AtomicBool>) -> T {
         let _drop_flag = TaskDropFlag(dropped);
         pending::<T>().await
-    }
-
-    fn one_to_one_ratio() -> UnderlyingPerWrapped {
-        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
     }
 
     #[test]
@@ -6672,16 +6715,16 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: Duration::from_secs(60),
-                assets: ChainAssets {
-                    equities: rebalancing_enabled_equities(&["AAPL"]),
-                    cash: None,
-                },
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                )]),
             },
             vault_registry,
             BTreeMap::from([(
@@ -7512,16 +7555,16 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: crate::inventory::ImbalanceThreshold {
-                    target: st0x_float_macro::float!(0.5),
-                    deviation: st0x_float_macro::float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: Duration::from_secs(60),
-                assets: ChainAssets {
-                    equities: rebalancing_enabled_equities(&["AAPL", "TSLA"]),
-                    cash: None,
-                },
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL", "TSLA"]),
+                        cash: None,
+                    }),
+                )]),
             },
             vault_registry,
             BTreeMap::from([(
@@ -8813,18 +8856,18 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: crate::inventory::ImbalanceThreshold {
-                    target: st0x_float_macro::float!(0.5),
-                    deviation: st0x_float_macro::float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: Duration::from_secs(60),
-                assets: ChainAssets {
-                    // wrapped_equity_recovery ENABLED: recover_mint_state will set
-                    // HeldForRecovery on TokensReceived, blocking the resume push.
-                    equities: recovery_equities(&symbol, OperationMode::Enabled),
-                    cash: None,
-                },
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        // wrapped_equity_recovery ENABLED: recover_mint_state will set
+                        // HeldForRecovery on TokensReceived, blocking the resume push.
+                        equities: recovery_equities(&symbol, OperationMode::Enabled),
+                        cash: None,
+                    }),
+                )]),
             },
             vault_registry,
             BTreeMap::from([(
@@ -8925,18 +8968,18 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: crate::inventory::ImbalanceThreshold {
-                    target: st0x_float_macro::float!(0.5),
-                    deviation: st0x_float_macro::float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: Duration::from_secs(60),
-                assets: ChainAssets {
-                    // wrapped_equity_recovery DISABLED: recover_mint_state keeps
-                    // ActiveTransfer, so the pre-wrap exclusion does NOT fire.
-                    equities: recovery_equities(&symbol, OperationMode::Disabled),
-                    cash: None,
-                },
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        // wrapped_equity_recovery DISABLED: recover_mint_state keeps
+                        // ActiveTransfer, so the pre-wrap exclusion does NOT fire.
+                        equities: recovery_equities(&symbol, OperationMode::Disabled),
+                        cash: None,
+                    }),
+                )]),
             },
             vault_registry2,
             BTreeMap::from([(
@@ -13076,19 +13119,19 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: Some(ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: ChainAssets {
-                    equities: rebalancing_enabled_equities(&["AAPL"]),
-                    cash: None,
-                },
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                )]),
             },
             vault_registry,
             BTreeMap::from([(
@@ -13117,10 +13160,11 @@ mod tests {
         trigger
             .set_position_authority(
                 Arc::clone(&position_store),
-                position_projection,
+                Arc::clone(&position_projection),
                 ExecutionThreshold::whole_share(),
             )
             .await;
+        reactor.set_last_price_reader(position_projection).await;
 
         // Acknowledge a fill -> fires position events -> trigger should react.
         position_store
@@ -13215,13 +13259,16 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: threshold,
+                allocation: AllocationCtx::base_test(),
                 usdc: Some(threshold),
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: ChainAssets {
-                    equities: rebalancing_enabled_equities(&["AAPL"]),
-                    cash: None,
-                },
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                )]),
             },
             vault_registry,
             BTreeMap::from([(
@@ -13250,10 +13297,11 @@ mod tests {
         trigger
             .set_position_authority(
                 Arc::clone(&position_store),
-                position_projection,
+                Arc::clone(&position_projection),
                 ExecutionThreshold::whole_share(),
             )
             .await;
+        reactor.set_last_price_reader(position_projection).await;
 
         // Add 50 onchain shares via CQRS -> trigger applies to inventory.
         position_store
@@ -13279,15 +13327,18 @@ mod tests {
             .await
             .unwrap();
 
-        // 50 onchain / 50 offchain = 50% ratio, within 30%-70% bounds -> balanced.
-        assert!(
-            inventory
-                .read()
-                .await
-                .check_equity_imbalance(&symbol, Chain::Base, &threshold, &one_to_one_ratio())
-                .unwrap()
-                .is_none(),
-            "50/50 inventory should be balanced (no imbalance detected)"
+        // 50 onchain / 50 offchain: the fill landed in Base's slot beside
+        // the broker's 50, which sits on the 50% target.
+        let venues = inventory.read().await.equity_venues(&symbol).unwrap();
+        assert_eq!(
+            venues.onchain[&Chain::Base].available(),
+            FractionalShares::new(float!(50)),
+            "the onchain fill must land in Base's slot"
+        );
+        assert_eq!(
+            venues.offchain.unwrap().available(),
+            FractionalShares::new(float!(50)),
+            "the broker balance must be untouched by the onchain fill"
         );
     }
 
@@ -13370,19 +13421,19 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: Some(ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: ChainAssets {
-                    equities: rebalancing_enabled_equities(&["AAPL"]),
-                    cash: None,
-                },
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                )]),
             },
             vault_registry,
             BTreeMap::from([(
@@ -13413,10 +13464,11 @@ mod tests {
         trigger
             .set_position_authority(
                 Arc::clone(&position_store),
-                position_projection,
+                Arc::clone(&position_projection),
                 position_threshold,
             )
             .await;
+        reactor.set_last_price_reader(position_projection).await;
 
         // Small onchain fill: 55/105 = 52.4%, within 30%-70%.
         position_store
@@ -13532,19 +13584,19 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
-                equity: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: Some(ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
-                assets: ChainAssets {
-                    equities: rebalancing_enabled_equities(&["AAPL"]),
-                    cash: None,
-                },
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                )]),
             },
             vault_registry,
             BTreeMap::from([(
@@ -13573,10 +13625,11 @@ mod tests {
         trigger
             .set_position_authority(
                 Arc::clone(&position_store),
-                position_projection,
+                Arc::clone(&position_projection),
                 ExecutionThreshold::whole_share(),
             )
             .await;
+        reactor.set_last_price_reader(position_projection).await;
 
         (position_store, pool, apalis_pool, symbol, reactor)
     }

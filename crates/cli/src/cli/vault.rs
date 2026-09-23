@@ -331,10 +331,6 @@ mod tests {
             pricing: None,
             rebalancing: Box::new(
                 RebalancingCtx::stub()
-                    .equity(ImbalanceThreshold {
-                        target: float!(0.5),
-                        deviation: float!(0.1),
-                    })
                     .usdc(ImbalanceThreshold {
                         target: float!(0.5),
                         deviation: float!(0.1),

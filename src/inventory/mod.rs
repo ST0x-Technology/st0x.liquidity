@@ -23,7 +23,7 @@ pub(crate) use polling::{
 pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};
 pub(crate) use venue_balance::{InventoryError, VenueBalance};
 pub(crate) use view::{
-    EquityImbalanceError, Imbalance, Inventory, InventoryView, InventoryViewError, Operator,
+    EquityVenuesError, Imbalance, Inventory, InventoryView, InventoryViewError, Operator,
     TransferOp, Venue,
 };
 pub use view::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};

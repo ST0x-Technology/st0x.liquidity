@@ -305,10 +305,13 @@
 
   type Deviation = { style: DeviationStyle }
 
+  // A null target (only per-symbol overrides configured) styles no row.
   const ratioDeviation = (ratio: number, isCash: boolean): Deviation | null => {
     if (!settings) return null
 
     const target = isCash ? (settings.usdcTarget ?? settings.equityTarget) : settings.equityTarget
+    if (target == null) return null
+
     const deviation = isCash
       ? (settings.usdcDeviation ?? settings.equityDeviation)
       : settings.equityDeviation
