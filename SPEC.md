@@ -3898,8 +3898,9 @@ already-submitted action instead of re-issuing it:
   captured, a fixed lookback from the current head. A consumed nonce whose mint
   is not found in that window, or a message that can never mint on the
   destination chain, marks `BridgingFailed` (keeping the burn tx and nonce), so
-  `transfer reconcile --kind usdc` can settle it; the bot never scans back to
-  genesis. Other lookup failures redrive.
+  `transfer reconcile --kind usdc` can settle it, and pages the operator at the
+  latch (an AlpacaToBase retry then finds the transfer failed and does not
+  alert); the bot never scans back to genesis. Other lookup failures redrive.
 
 ##### Commands
 
