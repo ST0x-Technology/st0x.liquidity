@@ -995,7 +995,8 @@ async fn run_usdc_transfer<Writer: Write>(
         },
         BotGasReceiptCostEnqueuer::Disabled,
     )
-    .with_gas_readiness(gas_readiness);
+    .with_gas_readiness(gas_readiness)
+    .with_credit_ledger(pool.clone());
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
 

@@ -3240,6 +3240,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
             built.usdc,
+            deps.pool.clone(),
             bot_gas_enqueuer.clone(),
             gas_readiness,
         );

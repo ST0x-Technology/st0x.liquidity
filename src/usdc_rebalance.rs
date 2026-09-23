@@ -83,7 +83,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
-use st0x_event_sorcery::{DomainEvent, EventSourced, Store, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Id, Usdc};
 
@@ -1270,6 +1270,44 @@ impl UsdcRebalance {
         })
     }
 
+    /// USDC this transfer was credited with that still sits in the shared
+    /// Ethereum wallet: credited from its delivering tx and not yet sent on.
+    /// An AlpacaToBase credit leaves with the burn, so a broadcast burn
+    /// (`pending_burn_tx`) no longer counts; a BaseToAlpaca credit leaves with
+    /// the Alpaca deposit send (`DepositInitiated`).
+    pub(crate) fn ethereum_wallet_credit(&self) -> Option<Usdc> {
+        match self {
+            Self::BridgingSubmitting {
+                direction: RebalanceDirection::AlpacaToBase,
+                burn_amount,
+                pending_burn_tx: None,
+                ..
+            } => *burn_amount,
+            Self::Bridged {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount_received,
+                ..
+            } => Some(*amount_received),
+            Self::BridgingSubmitting { .. }
+            | Self::Bridged { .. }
+            | Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => None,
+        }
+    }
+
     /// Whether an aggregate in this state should hold the single-rebalance
     /// guard (`usdc_in_progress`) when the guard is reconstructed on startup.
     ///
@@ -1791,6 +1829,55 @@ pub(crate) async fn any_rebalance_holds_guard(
     }
 
     Ok(false)
+}
+
+/// Why the Ethereum wallet credit ledger could not be derived.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EthereumCreditLedgerError {
+    #[error("failed to list open USDC rebalances: {0}")]
+    Query(#[from] sqlx::Error),
+    #[error("open USDC rebalance ids could not be parsed: {unparseable:?}")]
+    UnparseableIds { unparseable: Vec<String> },
+    #[error("failed to load USDC rebalance {id}: {source}")]
+    Load {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<SendError<UsdcRebalance>>,
+    },
+    #[error("USDC rebalance {id} has events but no materialized state")]
+    MissingState { id: UsdcRebalanceId },
+}
+
+/// The credited-not-yet-sent USDC of every open transfer in the shared
+/// Ethereum wallet, derived from the persisted aggregates (never stored).
+pub(crate) async fn open_ethereum_credits(
+    pool: &SqlitePool,
+    store: &Store<UsdcRebalance>,
+) -> Result<Vec<(UsdcRebalanceId, Usdc)>, EthereumCreditLedgerError> {
+    let InterruptedUsdcRebalances { ids, unparseable } =
+        interrupted_usdc_rebalance_ids(pool).await?;
+
+    if !unparseable.is_empty() {
+        return Err(EthereumCreditLedgerError::UnparseableIds { unparseable });
+    }
+
+    let mut credits = Vec::new();
+    for id in ids {
+        let entity = store
+            .load(&id)
+            .await
+            .map_err(|source| EthereumCreditLedgerError::Load {
+                id: id.clone(),
+                source: Box::new(source),
+            })?
+            .ok_or_else(|| EthereumCreditLedgerError::MissingState { id: id.clone() })?;
+
+        if let Some(credit) = entity.ethereum_wallet_credit() {
+            credits.push((id, credit));
+        }
+    }
+
+    Ok(credits)
 }
 
 #[async_trait]
@@ -9968,6 +10055,68 @@ mod tests {
         fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000aa");
     const MINT_TX: TxHash =
         fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000bb");
+
+    /// A transfer's Ethereum wallet credit is outstanding only between the
+    /// credit and the send: an AlpacaToBase burn intent with no broadcast burn,
+    /// or a BaseToAlpaca mint not yet forwarded to Alpaca.
+    #[test]
+    fn ethereum_wallet_credit_covers_only_credited_unsent_usdc() {
+        use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
+        use UsdcRebalance::*;
+
+        let now = Utc::now();
+        let amount = Usdc::new(float!(100));
+        let credited = Usdc::new(float!(99.99));
+        let burn_intent = |direction, pending_burn_tx| BridgingSubmitting {
+            direction,
+            amount,
+            from_block: 1,
+            initiated_at: now,
+            burn_amount: Some(credited),
+            pending_burn_tx,
+        };
+        let minted = |direction| Bridged {
+            direction,
+            amount,
+            amount_received: credited,
+            fee_collected: Usdc::new(float!(0.01)),
+            burn_tx_hash: BURN_TX,
+            mint_tx_hash: MINT_TX,
+            initiated_at: now,
+            minted_at: now,
+        };
+
+        assert_eq!(
+            burn_intent(AlpacaToBase, None).ethereum_wallet_credit(),
+            Some(credited)
+        );
+        assert_eq!(
+            burn_intent(AlpacaToBase, Some(BURN_TX)).ethereum_wallet_credit(),
+            None
+        );
+        assert_eq!(
+            burn_intent(BaseToAlpaca, None).ethereum_wallet_credit(),
+            None
+        );
+        assert_eq!(
+            minted(BaseToAlpaca).ethereum_wallet_credit(),
+            Some(credited)
+        );
+        assert_eq!(minted(AlpacaToBase).ethereum_wallet_credit(), None);
+        assert_eq!(
+            DepositInitiated {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: BURN_TX,
+                mint_tx_hash: MINT_TX,
+                deposit_ref: TransferRef::OnchainTx(BURN_TX),
+                initiated_at: now,
+                deposit_initiated_at: now,
+            }
+            .ethereum_wallet_credit(),
+            None
+        );
+    }
 
     #[test]
     fn holds_rebalance_guard_holds_for_in_progress_and_post_burn_failure() {

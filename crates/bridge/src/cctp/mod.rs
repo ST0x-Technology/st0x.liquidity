@@ -1119,9 +1119,8 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// Returns `holder`'s USDC balance on Ethereum, the source chain for
     /// AlpacaToBase burns.
     ///
-    /// Used as a fallback settlement gate before executing the CCTP burn:
-    /// verifies that withdrawn USDC is present in the market-maker wallet
-    /// before attempting to burn it. Delegates to the Ethereum endpoint,
+    /// The credit ledger compares it with the USDC credited to open transfers
+    /// before each burn or deposit send. Delegates to the Ethereum endpoint,
     /// not Base.
     pub async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
         self.ethereum
