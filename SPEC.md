@@ -3800,7 +3800,6 @@ enum UsdcRebalance {
         // AttestationResponse and mints without re-polling Circle. None for
         // transfers whose BridgeAttestationReceived predates this field.
         message: Option<Vec<u8>>,
-        mint_scan_from_block: u64,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
@@ -3883,12 +3882,13 @@ already-submitted action instead of re-issuing it:
   and adopt it rather than burning twice.
 - `Attested`: the CCTP mint is irreversible -- re-calling `receiveMessage`
   reverts on the already-used nonce, which would otherwise turn a successfully
-  minted transfer into a terminal `BridgingFailed`. Resume must scan the
-  destination chain for the already-submitted mint (`find_recent_mint`, matching
-  the `MintAndWithdraw` event) and adopt it -- recording `ConfirmBridging` with
-  the existing mint tx, amount, and fee -- before attempting a fresh mint. The
-  destination chain head is captured when the attestation is recorded so the
-  scan is bounded.
+  minted transfer into a terminal `BridgingFailed`. Resume must first ask the
+  destination chain whether this transfer's own CCTP nonce is consumed
+  (`usedNonces`) and, if so, adopt the mint that consumed it (the
+  `MessageReceived` log carrying that nonce, and the `MintAndWithdraw` of the
+  same call) -- recording `ConfirmBridging` with that mint tx, amount, and fee
+  -- before attempting a fresh mint. The match is by nonce, never by recipient
+  or amount: other transfers mint to the same wallet, possibly the same amount.
 
 ##### Commands
 
@@ -3919,7 +3919,7 @@ enum UsdcRebalanceCommand {
     // Records that attestation polling timed out, moving Bridging ->
     // AwaitingAttestation with the deadline beyond which retries stop.
     TimeoutAttestation { retry_deadline_at: DateTime<Utc> },
-    ReceiveAttestation { attestation: Vec<u8>, cctp_nonce: B256, message: Vec<u8>, mint_scan_from_block: u64 },
+    ReceiveAttestation { attestation: Vec<u8>, cctp_nonce: B256, message: Vec<u8> },
     ConfirmBridging { mint_tx: TxHash, amount_received: Usdc, fee_collected: Usdc },
     FailBridging { reason: String },
 
@@ -3982,7 +3982,6 @@ enum UsdcRebalanceEvent {
         // Circle. Option: None for events serialized before this field existed
         // (those resume via the legacy re-poll fallback).
         message: Option<Vec<u8>>,
-        mint_scan_from_block: u64,
         attested_at: DateTime<Utc>,
     },
     Bridged {
