@@ -326,7 +326,7 @@ pub fn check_enablement(
 
 /// Returns the lexicographically first matching symbol so startup errors do
 /// not depend on `HashMap` iteration order.
-fn first_equity_matching(
+pub(crate) fn first_equity_matching(
     assets: &ChainAssets,
     predicate: impl Fn(&ChainEquityAsset) -> bool,
 ) -> Option<&Symbol> {

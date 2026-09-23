@@ -237,19 +237,22 @@ vault shares the daily portfolio capture values in underlying units. The
 rebalancing trigger plans across every hedged chain's entry and dispatches each
 operation with its chain (see Equity Allocation Planner); the portfolio snapshot
 and the wrapped- and unwrapped-equity orphan-recovery aggregates still consume
-the primary chain's entry. A mint or redemption transfer resolves the entry of
-the chain its record names (see below). The tokenization preflight (below) runs
-once per hedged chain with that chain's wallet, orderbook and settlement stable,
-as does the stale-allowance revoke on each chain in managed inventory mode. The
-startup MAX approvals run on every hedged chain in either mode, but only the
-settlement-stable grant is unconditional: the equity grants (underlying to
-wrapper vault, wrapped token to the deposit spender) are made only on chains
-that rebalance equity, since a hedge-only secondary has no wrapper to approve.
-Both deposit grants name the spender that chain settles deposits through -- its
-orderbook in legacy inventory mode, its `RaindexInventory` in managed mode -- so
-the same two token identities are approved, and proved by the deploy gate, in
-either inventory mode. A hedged chain for which this build has no pinned
-settlement stable fails startup rather than borrowing another chain's address.
+the primary chain's entry. A secondary listing that sets
+`wrapped_equity_recovery = "enabled"` is refused at load, naming the chain and
+symbol, since no recovery would claim its stranded tokens. A mint or redemption
+transfer resolves the entry of the chain its record names (see below). The
+tokenization preflight (below) runs once per hedged chain with that chain's
+wallet, orderbook and settlement stable, as does the stale-allowance revoke on
+each chain in managed inventory mode. The startup MAX approvals run on every
+hedged chain in either mode, but only the settlement-stable grant is
+unconditional: the equity grants (underlying to wrapper vault, wrapped token to
+the deposit spender) are made only on chains that rebalance equity, since a
+hedge-only secondary has no wrapper to approve. Both deposit grants name the
+spender that chain settles deposits through -- its orderbook in legacy inventory
+mode, its `RaindexInventory` in managed mode -- so the same two token identities
+are approved, and proved by the deploy gate, in either inventory mode. A hedged
+chain for which this build has no pinned settlement stable fails startup rather
+than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
