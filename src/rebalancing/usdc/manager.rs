@@ -808,9 +808,10 @@ impl<
     ///
     /// A timeout retries (see [`Self::continue_from_attested`]). A hard error
     /// latches `BridgingFailed` only once the destination chain reads the
-    /// recorded `cctp_nonce` unused: when its mint has landed, or the read
-    /// fails, the resume redrives via `MintRecoveryInconclusive` so a later
-    /// attempt can adopt that mint.
+    /// recorded `cctp_nonce` unused across a probe window, so one lagging node
+    /// cannot fail a landed mint: when its mint has landed, or a read fails,
+    /// the resume redrives via `MintRecoveryInconclusive` so a later attempt
+    /// can adopt that mint.
     async fn repoll_attested_attestation(
         &self,
         id: &UsdcRebalanceId,
@@ -12564,7 +12565,7 @@ mod tests {
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
             alpaca_wallet,
-            Arc::new(bridge_with_circle_api(circle.base_url())),
+            Arc::new(bridge_with_circle_api(circle.base_url()).with_fast_mint_recovery_policy()),
             Arc::new(vault_service),
             cqrs.clone(),
             MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),

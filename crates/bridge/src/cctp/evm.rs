@@ -169,6 +169,19 @@ impl MintRecoveryConfig {
             probes: MINT_RECOVERY_PROBES,
         }
     }
+
+    /// Two probes 10 ms apart, for downstream tests (via
+    /// [`CctpBridge::with_fast_mint_recovery_policy`](super::CctpBridge::with_fast_mint_recovery_policy)).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) const fn fast() -> Self {
+        Self {
+            probe_interval: Duration::from_millis(10),
+            probes: match NonZeroU32::new(2) {
+                Some(probes) => probes,
+                None => panic!("fast mint recovery probes must be non-zero"),
+            },
+        }
+    }
 }
 
 /// Grace period before [`CctpEndpoint::burn_status`] may conclude a broadcast
@@ -997,6 +1010,31 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(!nonce_used.is_zero())
     }
 
+    /// Whether `nonce` is consumed, read over the mint recovery probe window.
+    ///
+    /// One read can come from a load-balanced node behind the block holding
+    /// the mint, so "unused" is returned only once every probe reads it unused.
+    /// The first consumed read returns `true`; a failed read is returned as-is.
+    pub(super) async fn is_nonce_used_across_probes<Registry: IntoErrorRegistry>(
+        &self,
+        nonce: B256,
+    ) -> Result<bool, EvmError> {
+        let mut poll = interval(self.mint_recovery_config.probe_interval);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        for probe in 1..=self.mint_recovery_config.probes.get() {
+            poll.tick().await;
+
+            if self.is_nonce_used::<Registry>(nonce).await? {
+                return Ok(true);
+            }
+
+            debug!(target: "bridge", %nonce, probe, "CCTP nonce reads unused");
+        }
+
+        Ok(false)
+    }
+
     /// Locates and validates the mint receipt for a message whose nonce
     /// [`is_nonce_used`](Self::is_nonce_used) already confirmed consumed.
     /// Scans for the `MessageReceived` log matching the attested source
@@ -1459,7 +1497,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// probe cadence. Test-only: lets recovery tests drive a short interval
     /// and probe count against real awaited state instead of racing or
     /// pausing the production multi-minute window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(super) fn with_mint_recovery_config(mut self, config: MintRecoveryConfig) -> Self {
         self.mint_recovery_config = config;
