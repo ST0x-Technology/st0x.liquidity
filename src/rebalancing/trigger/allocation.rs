@@ -57,6 +57,9 @@ pub(crate) struct ChainSlot {
     pub(crate) operational_limit: Option<Positive<FractionalShares>>,
     pub(crate) min_operation_usd: Positive<Usdc>,
     pub(crate) gas_ready: bool,
+    /// Whether the chain's vault registry knows the token: a mint has no
+    /// vault to land in and a redemption nothing to withdraw without it.
+    pub(crate) registry_known: bool,
     /// Whether the trigger resolved a target for this listing. A slot without
     /// one still counts in the total, so the total stays whole, but is never
     /// chosen. A hedge-only listing never reaches the planner at all.
@@ -115,8 +118,7 @@ pub(crate) enum DeclineReason {
         chain: Chain,
     },
     PriceMissing,
-    /// Raised by the trigger after planning: the chosen chain's vault
-    /// registry does not know the token.
+    /// The chain's vault registry does not know the token.
     NotInRegistry {
         chain: Chain,
     },
@@ -192,7 +194,7 @@ impl Candidate {
 /// Picks at most one operation for the symbol.
 ///
 /// The guards run first, then the best-ranked candidate that survives the
-/// gas, cooldown, floor and minimum size checks wins. A missing price
+/// registry, gas, cooldown, floor and minimum size checks wins. A missing price
 /// declines the symbol before any
 /// candidate is tried; a per-chain drop on a higher-ranked candidate only
 /// outranks a later `FloorCapped`.
@@ -243,6 +245,12 @@ pub(crate) fn plan_equity_operation(
         let slot = &input.onchain[&candidate.chain];
         let direction = candidate.direction()?;
 
+        if !slot.registry_known {
+            first_drop.get_or_insert(DeclineReason::NotInRegistry {
+                chain: candidate.chain,
+            });
+            continue;
+        }
         if !slot.gas_ready {
             first_drop.get_or_insert(DeclineReason::NoGas {
                 chain: candidate.chain,
@@ -491,6 +499,7 @@ mod tests {
             operational_limit: None,
             min_operation_usd: usdc("1"),
             gas_ready: true,
+            registry_known: true,
             enabled: true,
         }
     }
@@ -1333,9 +1342,18 @@ mod tests {
             proptest::option::of(arb_shares()),
             any::<bool>(),
             any::<bool>(),
+            any::<bool>(),
         )
             .prop_map(
-                |(available, target_share, band_width, limit, gas_ready, enabled)| ChainSlot {
+                |(
+                    available,
+                    target_share,
+                    band_width,
+                    limit,
+                    gas_ready,
+                    registry_known,
+                    enabled,
+                )| ChainSlot {
                     balance: VenueBalance::new(available, FractionalShares::ZERO),
                     ratio: one_to_one(),
                     target: TargetShare::new(target_share).unwrap(),
@@ -1343,6 +1361,7 @@ mod tests {
                     operational_limit: limit.and_then(|limit| Positive::new(limit).ok()),
                     min_operation_usd: usdc("0.000000001"),
                     gas_ready,
+                    registry_known,
                     enabled,
                 },
             )
@@ -1487,7 +1506,10 @@ mod tests {
 
             let (total, deviations) = deviations(&input);
             for (chain, slot) in &input.onchain {
-                let admissible = slot.enabled && slot.gas_ready && !input.cooldowns.contains(chain);
+                let admissible = slot.enabled
+                    && slot.registry_known
+                    && slot.gas_ready
+                    && !input.cooldowns.contains(chain);
                 let band = (total * slot.band.inner()).unwrap();
                 let over = deviations[chain].inner().gt(band.inner()).unwrap();
                 prop_assert!(!(admissible && over), "{chain} is over its band");

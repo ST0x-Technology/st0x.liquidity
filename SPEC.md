@@ -4907,11 +4907,11 @@ Every equity check plans one symbol from a pure function over the venues the
 trigger can vouch for: the broker balance, one slot per hedged chain that
 rebalances the symbol (its wrapped vault balance converted through that chain's
 ERC-4626 ratio, its effective target share, the band, its operational limit, its
-minimum operation size and whether its wallet is gas-ready), the floors, the
-cooling chains and the symbol's last onchain fill price. A hedge-only listing
-(`rebalancing = "disabled"`) is neither slotted nor counted: its prefunded
-inventory is outside the planner's total, so it never moves the other chains'
-targets.
+minimum operation size, whether its vault registry knows the token and whether
+its wallet is gas-ready), the floors, the cooling chains and the symbol's last
+onchain fill price. A hedge-only listing (`rebalancing = "disabled"`) is neither
+slotted nor counted: its prefunded inventory is outside the planner's total, so
+it never moves the other chains' targets.
 
 - Guards, in order: the broker venue unpolled, no chain slot at all, a
   rebalancing chain without a slot, or any transfer in flight for the symbol
@@ -4923,10 +4923,12 @@ targets.
   `underlying on chain - target share * total`, in shares. A chain is a
   candidate when `|deviation|` exceeds `band * total`.
 - Ranking: redemptions (over target) before mints, larger deviation first, ties
-  by chain order. A candidate whose wallet is not gas-ready, or whose chain is
-  cooling down, is skipped and the next one evaluated. The trigger probes a
-  wallet's gas only once the planner picks its chain, and re-plans without that
-  chain when it is dry, so a symbol within its band reads no balance.
+  by chain order. A candidate whose vault registry does not know the token
+  (`not_in_registry`), whose wallet is not gas-ready, or whose chain is cooling
+  down, is skipped and the next one evaluated. The trigger reads a chain's
+  registry and probes its wallet's gas only once the planner picks the chain,
+  and re-plans without that chain when either fails, so a symbol within its band
+  reads neither.
 - Quantity: `|deviation|` capped by the chain's operational limit. A mint is
   further capped so the broker keeps the larger of `alpaca_floor * total` and
   the hedge floor available; a broker at or below that declines the whole symbol
@@ -4935,15 +4937,14 @@ targets.
 - Minimum: with no last price the plan declines; the price's age does not
   matter, since it only values this dust bound. A candidate whose quantity times
   price is below the chain's minimum is skipped and the next one evaluated.
-- Dispatch: the chosen chain must know the token in its vault registry (else
-  `not_in_registry`); the operation is enqueued as that chain's mint or
-  redemption and the `(symbol, chain)` cooldown starts. One operation per symbol
-  is in flight at a time (the per-symbol lock, the job row and the transfer's
-  first event).
-- Telemetry: every declined plan, the trigger's own staleness and registry skips
-  included, increments `equity_plan_declined_total` by reason and is logged with
-  the symbol and, where one applies, the chain; a planned operation logs its
-  chain, direction, quantity, the total and every chain's deviation.
+- Dispatch: the operation is enqueued as the chosen chain's mint or redemption
+  and the `(symbol, chain)` cooldown starts. One operation per symbol is in
+  flight at a time (the per-symbol lock, the job row and the transfer's first
+  event).
+- Telemetry: every declined plan, the trigger's own staleness skips included,
+  increments `equity_plan_declined_total` by reason and is logged with the
+  symbol and, where one applies, the chain; a planned operation logs its chain,
+  direction, quantity, the total and every chain's deviation.
 
 ##### Trigger Events
 

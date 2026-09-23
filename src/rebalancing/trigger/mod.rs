@@ -3713,8 +3713,9 @@ impl RebalancingService {
                     band: self.config.allocation.deviation,
                     operational_limit: listing.operational_limit,
                     min_operation_usd: config.min_operation_usd,
-                    // Probed only once the planner picks the chain.
+                    // Both probed only once the planner picks the chain.
                     gas_ready: true,
+                    registry_known: true,
                     enabled,
                 },
             );
@@ -3733,7 +3734,7 @@ impl RebalancingService {
         let last_price = reader.last_price(symbol).await?;
         let cooldowns = self.equity_cooldowns(symbol, Utc::now()).await;
 
-        self.plan_gas_ready_operation(EquityPlanInput {
+        self.plan_dispatchable_operation(EquityPlanInput {
             symbol: symbol.clone(),
             offchain: venues.offchain,
             listing_chains,
@@ -3747,11 +3748,12 @@ impl RebalancingService {
         .await
     }
 
-    /// Plans with every chain assumed gas-ready, then probes the chosen
-    /// chain's wallet. A dry chain is marked and the symbol re-planned, so
-    /// the next candidate is tried and a within-band symbol probes nothing.
-    /// Each pass marks one more chain, so the loop ends within the slots.
-    async fn plan_gas_ready_operation(
+    /// Plans with every chain assumed registered and gas-ready, then checks
+    /// the chosen chain's vault registry and probes its wallet. A chain that
+    /// fails either is marked and the symbol re-planned, so the next
+    /// candidate is tried and a within-band symbol reads nothing. Each pass
+    /// marks one more chain, so the loop ends within the slots.
+    async fn plan_dispatchable_operation(
         &self,
         mut input: EquityPlanInput,
     ) -> Result<EquityPlan, equity::EquityTriggerError> {
@@ -3761,7 +3763,11 @@ impl RebalancingService {
                 return Ok(plan);
             };
             let chain = operation.chain;
-            if self.equity_chain_gas_is_ready(chain).await {
+            let registry_known = self
+                .load_token_address(chain, &input.symbol)
+                .await?
+                .is_some();
+            if registry_known && self.equity_chain_gas_is_ready(chain).await {
                 return Ok(plan);
             }
 
@@ -3774,7 +3780,11 @@ impl RebalancingService {
                 );
                 return Ok(EquityPlan::Decline(DeclineReason::NoGas { chain }));
             };
-            slot.gas_ready = false;
+            if registry_known {
+                slot.gas_ready = false;
+            } else {
+                slot.registry_known = false;
+            }
         }
     }
 
@@ -3896,10 +3906,9 @@ impl RebalancingService {
         }
     }
 
-    /// Plans `symbol` and maps every skip -- an unconfigured symbol, a
-    /// declined plan, a chosen chain whose registry lacks the token -- to
-    /// `None`, so the trigger reserves the symbol only for an actionable
-    /// operation.
+    /// Plans `symbol` and maps every skip -- an unconfigured symbol or a
+    /// declined plan -- to `None`, so the trigger reserves the symbol only
+    /// for an actionable operation.
     async fn plan_equity_operation_or_skip(
         &self,
         symbol: &Symbol,
@@ -3916,32 +3925,13 @@ impl RebalancingService {
             }
             Err(error) => return Err(error),
         };
-        let operation = match plan {
-            EquityPlan::Operation(operation) => operation,
+        match plan {
+            EquityPlan::Operation(operation) => Ok(Some(operation)),
             EquityPlan::Decline(reason) => {
                 self.record_equity_decline(symbol, &reason, None);
-                return Ok(None);
+                Ok(None)
             }
-        };
-
-        // The chosen chain must know the token: a mint has no vault to land
-        // in and a redemption nothing to withdraw without a registry entry.
-        if self
-            .load_token_address(operation.chain, symbol)
-            .await?
-            .is_none()
-        {
-            self.record_equity_decline(
-                symbol,
-                &DeclineReason::NotInRegistry {
-                    chain: operation.chain,
-                },
-                None,
-            );
-            return Ok(None);
         }
-
-        Ok(Some(operation))
     }
 
     fn try_claim_usdc_guard(&self) -> Option<usdc::InProgressGuard> {
