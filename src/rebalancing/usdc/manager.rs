@@ -12365,6 +12365,158 @@ mod tests {
         assert_ne!(mint_tx_hash, other_mint.tx);
     }
 
+    /// A legacy `Attested` transfer (no persisted envelope) whose mint already
+    /// landed must not latch `BridgingFailed` when the Circle re-poll fails:
+    /// its recorded nonce is consumed on chain, so the resume redrives and
+    /// adopts that mint once Circle answers.
+    #[tokio::test]
+    async fn legacy_attested_repoll_failure_does_not_fail_a_landed_mint() {
+        let chains = deploy_dual_chain_cctp().await;
+
+        let attestation = CctpAttestationMock::start().await;
+        let _watcher = attestation
+            .start_watcher(
+                ProviderBuilder::new()
+                    .connect(&chains.ethereum_endpoint)
+                    .await
+                    .unwrap(),
+                ProviderBuilder::new()
+                    .connect(&chains.base_endpoint)
+                    .await
+                    .unwrap(),
+                chains.attester_key,
+            )
+            .await
+            .unwrap();
+
+        let bridge_with_circle_api = |circle_api_base: String| {
+            CctpBridge::try_from_ctx(CctpCtx {
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base,
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap()
+        };
+        let cctp_bridge = bridge_with_circle_api(attestation.base_url());
+
+        let market_maker_wallet = chains.bot_address;
+        let amount = usdc("100");
+
+        let burn = cctp_bridge
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                usdc_to_u256(amount).unwrap(),
+                market_maker_wallet,
+            )
+            .await
+            .unwrap();
+        let attestation_response = cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn.tx)
+            .await
+            .unwrap();
+        cctp_bridge
+            .mint(BridgeDirection::BaseToEthereum, &attestation_response)
+            .await
+            .unwrap();
+
+        // Circle now answers the re-poll with a malformed `complete` response.
+        let circle = MockServer::start();
+        let repoll_mock = mock_malformed_complete_attestation(&circle);
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(bridge_with_circle_api(circle.base_url())),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn.tx),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateBridging { burn_tx: burn.tx },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: attestation_response.as_bytes().to_vec(),
+                cctp_nonce: attestation_response.nonce(),
+                message: attestation_response.message_bytes().to_vec(),
+                mint_scan_from_block: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        // `None` envelope: the legacy path that re-polls Circle.
+        let error = manager
+            .attested_attestation_response(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                burn.tx,
+                attestation_response.as_bytes().to_vec(),
+                attestation_response.nonce(),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::MintRecoveryInconclusive { id: error_id, .. } if *error_id == id
+            ),
+            "a failed re-poll for a landed mint must redrive, got: {error:?}",
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "a landed mint must not latch BridgingFailed on a Circle failure, got: {state:?}",
+        );
+        assert_eq!(repoll_mock.calls(), 1);
+    }
+
     /// The un-fail core: a post-burn `BridgingFailed` whose mint actually landed
     /// is un-failed and driven to terminal on resume. We mint for real, then fail
     /// the aggregate post-burn, then resume. `recover_from_bridging_failed`
