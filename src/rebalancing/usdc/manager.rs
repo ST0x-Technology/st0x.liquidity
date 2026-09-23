@@ -12636,7 +12636,7 @@ mod tests {
     /// Circle answers.
     #[tokio::test]
     async fn legacy_attested_repoll_failure_does_not_fail_a_landed_mint() {
-        let (error, id, state) = legacy_attested_repoll_failure(true).await;
+        let (error, id, state) = Box::pin(legacy_attested_repoll_failure(true)).await;
 
         assert!(
             matches!(
@@ -12655,7 +12655,7 @@ mod tests {
     /// bridge as before: nothing was minted.
     #[tokio::test]
     async fn legacy_attested_repoll_failure_fails_the_bridge_while_the_nonce_is_unused() {
-        let (error, _, state) = legacy_attested_repoll_failure(false).await;
+        let (error, _, state) = Box::pin(legacy_attested_repoll_failure(false)).await;
 
         let UsdcTransferError::Cctp(cctp_error) = error else {
             panic!("a failed re-poll with an unused nonce must fail the bridge, got: {error:?}");
