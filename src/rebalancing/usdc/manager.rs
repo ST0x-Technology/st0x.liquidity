@@ -18357,8 +18357,9 @@ mod tests {
         );
     }
 
-    /// A message that can never mint on this chain fails at once: every
-    /// redrive would read the same bytes.
+    /// A message that can never mint on this chain fails at once (every
+    /// redrive would read the same bytes) into a state the operator can
+    /// reconcile.
     #[tokio::test]
     async fn placeholder_nonce_attested_mint_lookup_fails_at_once() {
         let (error, _, _, state) =
@@ -18375,24 +18376,26 @@ mod tests {
             "got: {cctp_error:?}"
         );
         assert!(
-            matches!(state, UsdcRebalance::Attested { .. }),
-            "got: {state:?}"
+            matches!(state, UsdcRebalance::BridgingFailed { .. })
+                && state.is_reconcilable_failure(),
+            "a lookup that can never succeed must latch a reconcilable BridgingFailed, \
+             got: {state:?}"
         );
     }
 
-    /// A consumed nonce whose mint is not in the bounded scan fails the resume
-    /// for operator reconciliation instead of redriving the same scan forever.
-    /// Nothing is latched: the aggregate stays `Attested`.
-    #[tokio::test]
-    async fn attested_mint_outside_the_scan_window_fails_for_reconciliation() {
-        let (error, _, _, state) =
-            resume_attested_with_failing_mint_lookup(RebalanceDirection::BaseToAlpaca, || {
-                CctpError::MintNotFoundInScanWindow {
-                    nonce: B256::repeat_byte(0x07),
-                    from_block: 100,
-                }
-            })
-            .await;
+    /// Resumes an `Attested` transfer in `direction` whose consumed nonce has
+    /// no mint in the bounded scan, and asserts it fails at once into a state
+    /// `transfer reconcile --kind usdc` accepts, keeping the burn and nonce.
+    async fn assert_mint_outside_the_scan_window_latches_for_reconciliation(
+        direction: RebalanceDirection,
+    ) {
+        let (error, _, _, state) = resume_attested_with_failing_mint_lookup(direction, || {
+            CctpError::MintNotFoundInScanWindow {
+                nonce: B256::repeat_byte(0x07),
+                from_block: 100,
+            }
+        })
+        .await;
 
         let UsdcTransferError::Cctp(cctp_error) = error else {
             panic!("a mint outside the scan window must not redrive; got: {error:?}");
@@ -18405,10 +18408,44 @@ mod tests {
             ),
             "got: {cctp_error:?}"
         );
+        let UsdcRebalance::BridgingFailed {
+            direction: failed_direction,
+            burn_tx_hash,
+            cctp_nonce,
+            ..
+        } = &state
+        else {
+            panic!("the transfer must latch BridgingFailed for reconciliation, got: {state:?}");
+        };
+        assert_eq!(*failed_direction, direction);
         assert!(
-            matches!(state, UsdcRebalance::Attested { .. }),
-            "aggregate must remain at Attested (no FailBridging emitted); got: {state:?}"
+            burn_tx_hash.is_some(),
+            "the burn must be kept, got: {state:?}"
         );
+        assert!(
+            cctp_nonce.is_some(),
+            "the nonce must be kept, got: {state:?}"
+        );
+        assert!(
+            state.is_reconcilable_failure(),
+            "`transfer reconcile --kind usdc` must accept the latched state, got: {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attested_mint_outside_the_scan_window_latches_for_reconciliation_base_to_alpaca() {
+        assert_mint_outside_the_scan_window_latches_for_reconciliation(
+            RebalanceDirection::BaseToAlpaca,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attested_mint_outside_the_scan_window_latches_for_reconciliation_alpaca_to_base() {
+        assert_mint_outside_the_scan_window_latches_for_reconciliation(
+            RebalanceDirection::AlpacaToBase,
+        )
+        .await;
     }
 
     /// Builds a `CrossVenueCashTransfer` wired to a real (anvil-backed)
