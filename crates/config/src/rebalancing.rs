@@ -197,7 +197,7 @@ fn default_settlement_retry_deadline_secs() -> u64 {
 /// holds only the rebalancing-specific trigger thresholds.
 #[derive(Clone)]
 pub struct RebalancingCtx {
-    /// See [`RebalancingConfig::allocation`].
+    /// The validated `[rebalancing.allocation]` section.
     pub allocation: AllocationCtx,
     pub usdc: Option<ImbalanceThreshold>,
     pub transfer_timeout: Duration,
