@@ -1729,6 +1729,7 @@ mod tests {
         remaining_empty_scans: Arc<AtomicU32>,
         lowest_from_block: Arc<AtomicU64>,
         head_offset: u64,
+        remaining_failing_head_reads: Arc<AtomicU32>,
     }
 
     #[async_trait]
@@ -1740,8 +1741,20 @@ mod tests {
         fn get_block_number(&self) -> ProviderCall<NoParams, U64, BlockNumber> {
             let inner = self.inner.clone();
             let head_offset = self.head_offset;
+            let should_fail = self
+                .remaining_failing_head_reads
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
 
             ProviderCall::BoxedFuture(Box::pin(async move {
+                if should_fail {
+                    return Err(TransportErrorKind::custom_str(
+                        "synthetic head read failure",
+                    ));
+                }
+
                 Ok(inner.get_block_number().await? + head_offset)
             }))
         }
@@ -1819,6 +1832,7 @@ mod tests {
                 remaining_empty_scans: Arc::new(AtomicU32::new(failures.empty_log_scans)),
                 lowest_from_block: Arc::new(AtomicU64::new(u64::MAX)),
                 head_offset: 0,
+                remaining_failing_head_reads: Arc::new(AtomicU32::new(0)),
             };
             Self {
                 inner,
@@ -1851,6 +1865,14 @@ mod tests {
         /// Reports the chain head `head_offset` blocks above the real one.
         fn with_reported_head_offset(mut self, head_offset: u64) -> Self {
             self.provider.head_offset = head_offset;
+            self
+        }
+
+        /// Fails the first `failing_head_reads` `get_block_number` calls.
+        fn with_failing_head_reads(self, failing_head_reads: u32) -> Self {
+            self.provider
+                .remaining_failing_head_reads
+                .store(failing_head_reads, Ordering::SeqCst);
             self
         }
 
@@ -4599,6 +4621,86 @@ mod tests {
         };
         assert_eq!(error_nonce, nonce);
         assert_eq!(from_block, head - lookback);
+    }
+
+    /// A failed head read leaves the reconstruction scan without a floor, so
+    /// it must redrive instead of walking the log index back to genesis.
+    #[tokio::test]
+    async fn recover_already_minted_never_scans_without_a_floor_when_the_head_read_fails() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_200_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_failing_head_reads(1);
+        let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO)
+        .with_mint_recovery_config(MintRecoveryConfig {
+            probe_interval: Duration::from_millis(5),
+            probes: NonZeroU32::new(1).unwrap(),
+        });
+
+        let error = flaky_endpoint
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                EvmError::Reverted {
+                    tx_hash: TxHash::repeat_byte(0xEE),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            lowest_scanned_block.load(Ordering::SeqCst),
+            u64::MAX,
+            "no log scan may run without a floor"
+        );
+        let CctpError::MintRecoveryInconclusive { recovery_error } = error else {
+            panic!("a failed head read must redrive; got: {error:?}");
+        };
+        assert!(
+            matches!(*recovery_error, CctpError::RpcTransport(_)),
+            "got: {recovery_error:?}"
+        );
     }
 
     /// The window-exhaustion branch of `recover_already_minted` -- every
