@@ -2151,6 +2151,7 @@ mod tests {
         SettlementDeadlineElapsed,
         PreviouslyFailed,
         WithdrawalCreditMismatch,
+        WithdrawalTxMissing,
         /// Fail-closed burn-submission terminals: a burn may be in flight, so the
         /// job must NOT auto-redrive (a redrive could reburn).
         BurnSubmitInconclusive,
@@ -2187,6 +2188,9 @@ mod tests {
                     credited: U256::ZERO,
                     nominal: Usdc::new(float!(1)),
                 },
+                Self::WithdrawalTxMissing => {
+                    UsdcTransferError::WithdrawalTxMissing { id: id.clone() }
+                }
                 Self::BurnSubmitInconclusive => {
                     UsdcTransferError::BurnSubmitInconclusive { id: id.clone() }
                 }
@@ -5863,6 +5867,46 @@ mod tests {
         assert!(
             messages[0].contains(&job.id.to_string()),
             "alert must include the transfer id; got: {:?}",
+            messages[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn market_making_job_pages_without_redrive_on_withdrawal_tx_missing() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::WithdrawalTxMissing)),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx)
+            .await
+            .expect("a missing withdrawal tx hash is a clean terminal outcome");
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "a transfer with no withdrawal tx hash must not be redriven"
+        );
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly one alert expected; got: {messages:?}"
+        );
+        assert!(
+            messages[0].contains(&job.id.to_string())
+                && messages[0].contains("no recorded withdrawal tx hash"),
+            "alert must name the transfer and the missing tx hash; got: {:?}",
             messages[0]
         );
     }
