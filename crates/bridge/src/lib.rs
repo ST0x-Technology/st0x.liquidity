@@ -198,6 +198,8 @@ pub trait Bridge: Send + Sync + 'static {
     /// Returns whether `nonce` is consumed (`usedNonces`) on the mint
     /// destination chain for `direction`: `true` once its mint has landed.
     /// Needs only the nonce, for a resume that has no message envelope yet.
+    /// `false` means every read over a probe window found the nonce unused, so
+    /// one lagging node cannot hide a landed mint.
     async fn mint_nonce_consumed(
         &self,
         direction: BridgeDirection,

@@ -730,6 +730,21 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self
     }
 
+    /// Shortens both endpoints' `usedNonces()` probe window to two probes
+    /// 10 ms apart. Test-only seam, like
+    /// [`with_fast_burn_drop_policy`](Self::with_fast_burn_drop_policy).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_fast_mint_recovery_policy(mut self) -> Self {
+        self.ethereum = self
+            .ethereum
+            .with_mint_recovery_config(evm::MintRecoveryConfig::fast());
+        self.base = self
+            .base
+            .with_mint_recovery_config(evm::MintRecoveryConfig::fast());
+        self
+    }
+
     fn new(
         ethereum: CctpEndpoint<EthWallet>,
         base: CctpEndpoint<BaseWallet>,
@@ -1396,12 +1411,12 @@ where
         let consumed = match direction {
             BridgeDirection::EthereumToBase => {
                 self.base
-                    .is_nonce_used::<OpenChainErrorRegistry>(nonce)
+                    .is_nonce_used_across_probes::<OpenChainErrorRegistry>(nonce)
                     .await?
             }
             BridgeDirection::BaseToEthereum => {
                 self.ethereum
-                    .is_nonce_used::<OpenChainErrorRegistry>(nonce)
+                    .is_nonce_used_across_probes::<OpenChainErrorRegistry>(nonce)
                     .await?
             }
         };
