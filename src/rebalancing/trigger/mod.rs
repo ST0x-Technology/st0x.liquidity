@@ -11302,6 +11302,63 @@ mod tests {
         );
     }
 
+    /// A quiet symbol's last fill predates the inventory staleness bound, as
+    /// it does after every cooldown; its price still values the minimum.
+    #[tokio::test]
+    async fn last_fill_older_than_the_inventory_staleness_bound_still_plans() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(0.5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now() - chrono::Duration::hours(1),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        let position_projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        trigger.set_last_price_reader(position_projection).await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "an old last price must still value the minimum"
+        );
+        assert_eq!(jobs[0].chain, Chain::Base);
+        assert_eq!(jobs[0].quantity, shares(30));
+    }
+
     fn base_equity_gas(readiness: Arc<GasReadiness>) -> BTreeMap<Chain, ConfiguredGasReadiness> {
         BTreeMap::from([(Chain::Base, ConfiguredGasReadiness::Wired(readiness))])
     }
