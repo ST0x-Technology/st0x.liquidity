@@ -641,6 +641,13 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   `deposit-credited-offline`; any other value is rejected. Every other state is
   rejected, including `WithdrawalFailed` and an `AlpacaToBase`
   `ConversionFailed`, whose funds never left Alpaca.
+- An `Attested` resume whose CCTP nonce is used on chain but whose mint is not
+  in the bounded log scan (`MintNotFoundInScanWindow`), or whose message can
+  never mint on the destination chain, marks the transfer `BridgingFailed` with
+  its burn tx and nonce kept, so `--kind usdc` accepts it. Find the mint on
+  chain (the `MessageReceived` log for the recorded nonce) before you reconcile.
+  For BaseToAlpaca, a later resume still retries the mint through the post-burn
+  `BridgingFailed` recovery.
 - `--kind mint` / `--kind redemption` mark an equity transfer stuck in `Failed`
   as terminal `Reconciled`. This is a pure bookkeeping transition: it emits no
   reactor effect and dispatches no inventory update. One nuance for redemptions

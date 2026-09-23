@@ -367,7 +367,7 @@ enum MintCallSite {
 
 /// Identifies which of the two `Bridge::find_attested_mint` call sites failed
 /// while resuming from `Attested`, so
-/// `CrossVenueCashTransfer::redrive_on_mint_scan_failure`'s `warn!` log names
+/// `CrossVenueCashTransfer::handle_mint_scan_failure`'s `warn!` log names
 /// the direction without a hand-maintained string fragment.
 #[derive(Debug, Clone, Copy)]
 enum MintScanCallSite {
@@ -383,6 +383,49 @@ impl std::fmt::Display for MintScanCallSite {
             Self::AlpacaToBase => write!(formatter, "Alpaca->Base"),
             Self::BaseToAlpaca => write!(formatter, "Base->Alpaca"),
         }
+    }
+}
+
+/// Whether a `find_attested_mint` failure recurs on every retry: the message
+/// bytes can never mint on this chain, or the bounded scan already missed the
+/// consumed nonce's mint. Exhaustive so a new `CctpError` needs a decision.
+/// Variants the lookup never produces redrive, the conservative choice for
+/// burned USDC.
+fn mint_scan_failure_is_permanent(error: &CctpError) -> bool {
+    match error {
+        CctpError::PlaceholderNonce
+        | CctpError::MessageDestinationDomainMismatch { .. }
+        | CctpError::MessageTooShortForRecovery { .. }
+        | CctpError::MintNotFoundInScanWindow { .. } => true,
+
+        CctpError::Evm(_)
+        | CctpError::Contract(_)
+        | CctpError::RpcTransport(_)
+        | CctpError::SolType(_)
+        | CctpError::ScanInconclusive { .. }
+        | CctpError::BurnTxPending { .. }
+        | CctpError::Http(_)
+        | CctpError::AttestationTimeout { .. }
+        | CctpError::MalformedAttestation { .. }
+        | CctpError::MessageSentEventNotFound { .. }
+        | CctpError::MintAndWithdrawEventNotFound
+        | CctpError::TxReceiptMissingBlock { .. }
+        | CctpError::UsdcCreditOverflow { .. }
+        | CctpError::UsdcTransferLogDecode { .. }
+        | CctpError::MessageTooShort { .. }
+        | CctpError::AlreadyMintedMessageNotFound { .. }
+        | CctpError::RecoveredMintMessageMismatch { .. }
+        | CctpError::RecoveredMintLogMissingTxHash { .. }
+        | CctpError::RecoveredMintReceiptReverted { .. }
+        | CctpError::RecoveredMintAndWithdrawEventNotFound { .. }
+        | CctpError::MintRecoveryInconclusive { .. }
+        | CctpError::FeeCalculationOverflow
+        | CctpError::Float(_)
+        | CctpError::AmountConversion(_)
+        | CctpError::FastTransferFeeNotAvailable { .. }
+        | CctpError::AmountBelowFastTransferFee { .. }
+        | CctpError::HexDecode(_)
+        | CctpError::FeeValueParse(_) => false,
     }
 }
 
@@ -2347,15 +2390,18 @@ impl<
         call_site: MintScanCallSite,
         initiated_at: DateTime<Utc>,
     ) -> Result<Option<MintReceipt>, UsdcTransferError> {
-        let Some(mint_receipt) = self
+        let mint_receipt = match self
             .cctp_bridge
             .find_attested_mint(mint_direction, attestation, mint_scan_from_block)
             .await
-            .map_err(|error| {
-                Self::redrive_on_mint_scan_failure(id, error, call_site, initiated_at)
-            })?
-        else {
-            return Ok(None);
+        {
+            Ok(Some(mint_receipt)) => mint_receipt,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                return Err(self
+                    .handle_mint_scan_failure(id, error, call_site, initiated_at)
+                    .await);
+            }
         };
 
         info!(
@@ -2820,50 +2866,63 @@ impl<
     }
 
     /// Maps a `Bridge::find_attested_mint` failure hit while resuming from
-    /// `Attested`, BEFORE any mint is attempted, to a redrive.
+    /// `Attested`, BEFORE any mint is attempted, to a redrive or a latched
+    /// failure.
     ///
     /// The lookup only reads chain state (`usedNonces`, then the nonce's
-    /// `MessageReceived` log and receipt), so a failure leaves the nonce state
-    /// unknown, or known consumed with its receipt not yet readable. The USDC is
-    /// already burned, so this redrives via `MintRecoveryInconclusive` (whose
-    /// deadline-gated alert still applies) instead of consuming the apalis retry
-    /// budget. A revert-shaped `usedNonces` answer is a provider artifact (the
-    /// getter cannot revert), so it redrives too. A message that can never mint
-    /// on this chain fails at once: a retry reads the same bytes. So does a
-    /// consumed nonce whose mint is not in the bounded scan: it is left to the
-    /// operator instead of rescanning the same window on every redrive.
-    fn redrive_on_mint_scan_failure(
+    /// `MessageReceived` log and receipt), so most failures leave the nonce
+    /// state unknown, or known consumed with its receipt not yet readable. The
+    /// USDC is already burned, so those redrive via `MintRecoveryInconclusive`
+    /// (whose deadline-gated alert still applies) instead of consuming the
+    /// apalis retry budget. A revert-shaped `usedNonces` answer is a provider
+    /// artifact (the getter cannot revert), so it redrives too. A lookup that
+    /// can never succeed (a message that cannot mint on this chain, or a
+    /// consumed nonce whose mint is not in the bounded scan) latches
+    /// `BridgingFailed`, which keeps the burn and nonce, so
+    /// `transfer reconcile --kind usdc` can settle it.
+    async fn handle_mint_scan_failure(
+        &self,
         id: &UsdcRebalanceId,
         error: CctpError,
         call_site: MintScanCallSite,
         initiated_at: DateTime<Utc>,
     ) -> UsdcTransferError {
-        if let CctpError::PlaceholderNonce
-        | CctpError::MessageDestinationDomainMismatch { .. }
-        | CctpError::MessageTooShortForRecovery { .. }
-        | CctpError::MintNotFoundInScanWindow { .. } = error
-        {
+        if !mint_scan_failure_is_permanent(&error) {
             warn!(
                 target: "rebalance",
                 %id,
                 %call_site,
-                "Attested mint lookup failed for operator reconciliation: {error}"
+                "CCTP mint lookup failed while resuming from Attested; \
+                 nonce state unknown, will retry: {error}"
             );
-            return UsdcTransferError::Cctp(Box::new(error));
+            return UsdcTransferError::MintRecoveryInconclusive {
+                id: id.clone(),
+                initiated_at,
+                source: Box::new(error),
+            };
         }
 
         warn!(
             target: "rebalance",
             %id,
             %call_site,
-            "CCTP mint lookup failed while resuming from Attested; \
-             nonce state unknown, will retry: {error}"
+            "Attested mint lookup cannot succeed; failing the bridge for operator \
+             reconciliation: {error}"
         );
-        UsdcTransferError::MintRecoveryInconclusive {
-            id: id.clone(),
-            initiated_at,
-            source: Box::new(error),
+        if let Err(send_error) = self
+            .cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: format!("attested mint lookup failed: {error}"),
+                },
+            )
+            .await
+        {
+            return send_error.into();
         }
+
+        UsdcTransferError::Cctp(Box::new(error))
     }
 
     #[instrument(target = "rebalance", skip(self, attestation_response), fields(%id), level = tracing::Level::DEBUG)]
