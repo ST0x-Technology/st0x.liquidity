@@ -14127,8 +14127,10 @@ mod tests {
     async fn alpaca_to_base_burn_checks_the_credit_ledger() {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
         let nominal = usdc("1000");
+        // Credited 2 USDC short of nominal: the ledger must count the 998
+        // credited, so the 5 USDC minted apart is all that is unattributed.
         let chain = deploy_ethereum_usdc_chain_with_balance(
-            U256::from(1_000_000_000u64),
+            U256::from(998_000_000u64),
             market_maker_wallet,
         )
         .await;
@@ -14181,7 +14183,9 @@ mod tests {
             "the credited withdrawal must proceed to the burn; got: {error:?}"
         );
         assert!(logs_contain("unattributed=5"));
-        assert!(!logs_contain("operational_alert"));
+        assert!(!logs_contain("short of the credits"));
+        assert!(logs_contain("credited less USDC than requested"));
+        assert!(logs_contain("shortfall=2"));
     }
 
     /// Mints `amount` USDC to `recipient` on `chain` in its own transaction:
