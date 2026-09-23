@@ -693,7 +693,6 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::MissingFilledAveragePrice { .. }
         | UsdcTransferError::ResumeIndeterminateConversion { .. }
         | UsdcTransferError::ConversionPlacementFailed { .. }
-        | UsdcTransferError::ResumeWithoutMintScanBound { .. }
         | UsdcTransferError::AttestationRetryDeadlineElapsed { .. }
         | UsdcTransferError::AttestationRetryDeadlineOverflow { .. }
         | UsdcTransferError::AttestationNonceMismatch { .. }
@@ -4105,7 +4104,6 @@ mod tests {
                         "0x000000000000000000000000000000000000000000000000000000000000CAFE"
                     ),
                     message: vec![0xCD],
-                    mint_scan_from_block: 1,
                 },
             )
             .await
@@ -4478,7 +4476,6 @@ mod tests {
                         "0x000000000000000000000000000000000000000000000000000000000000CAFE"
                     ),
                     message: vec![0xBB],
-                    mint_scan_from_block: 1,
                 },
             )
             .await
@@ -4532,7 +4529,6 @@ mod tests {
                         "0x000000000000000000000000000000000000000000000000000000000000CAFE"
                     ),
                     message: vec![0xBB],
-                    mint_scan_from_block: 1,
                 },
             )
             .await

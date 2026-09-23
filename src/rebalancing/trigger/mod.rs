@@ -17951,7 +17951,6 @@ mod tests {
                     attestation: vec![0x01],
                     cctp_nonce: B256::left_padding_from(&42u64.to_be_bytes()),
                     message: valid_cctp_message(),
-                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -19325,7 +19324,6 @@ mod tests {
             attestation: vec![1, 2, 3, 4],
             cctp_nonce: B256::left_padding_from(&42u64.to_be_bytes()),
             message: None,
-            mint_scan_from_block: Some(100),
             attested_at: Utc::now(),
         }
     }
@@ -24370,7 +24368,6 @@ mod tests {
                     attestation: vec![0x01],
                     cctp_nonce: alloy::primitives::B256::left_padding_from(&42u64.to_be_bytes()),
                     message: valid_cctp_message(),
-                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -26159,7 +26156,6 @@ mod tests {
                         &cctp_nonce_seed.to_be_bytes(),
                     ),
                     message: valid_cctp_message(),
-                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -27041,7 +27037,6 @@ mod tests {
                 attestation: vec![0x01],
                 cctp_nonce: alloy::primitives::B256::left_padding_from(&42u64.to_be_bytes()),
                 message: valid_cctp_message(),
-                mint_scan_from_block: 100,
             },
             UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx,
@@ -27484,7 +27479,6 @@ mod tests {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
                     message: valid_cctp_message(),
-                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -27577,7 +27571,6 @@ mod tests {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: B256::left_padding_from(&67890u64.to_be_bytes()),
                     message: valid_cctp_message(),
-                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -27894,7 +27887,6 @@ mod tests {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: B256::left_padding_from(&99999u64.to_be_bytes()),
                     message: valid_cctp_message(),
-                    mint_scan_from_block: 100,
                 },
             )
             .await
