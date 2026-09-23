@@ -1474,6 +1474,40 @@ async fn chain_missing_from_its_registry_yields_to_the_next_candidate() {
     assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
 }
 
+/// HyperEVM holds 60 of AAPL's 120 shares, 12 over its 40% target, so its
+/// redemption would rank first. Wallet recovery runs on the primary chain
+/// (Base) only, and a failed HyperEVM redemption would strand its tokens,
+/// so the planner skips it and mints Base's 16-share shortfall.
+#[tokio::test]
+async fn secondary_chain_redemption_yields_to_a_primary_chain_mint() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(two_chain_trigger_config()).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, Address::random()).await;
+    seed_vault_registry(&pool, Chain::HyperEvm, &symbol, Address::random()).await;
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(20),
+        offchain: float!(40),
+    })
+    .await;
+    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(60)).await;
+    service.check_and_trigger_equity(&symbol).await.unwrap();
+
+    assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
+    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(mint.chain, Chain::Base);
+    assert_eq!(mint.quantity, FractionalShares::new(float!(16)));
+}
+
 /// Base's 24-share redemption outranks HyperEVM's 48-share mint, but
 /// Base's wallet is dry, so the trigger re-plans without Base and the mint
 /// lands on HyperEVM.
