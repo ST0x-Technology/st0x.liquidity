@@ -4440,6 +4440,14 @@ impl RebalancingService {
             };
 
             if dispatched {
+                info!(
+                    target: "rebalance",
+                    %symbol,
+                    %chain,
+                    ?direction,
+                    %quantity,
+                    "Dispatched equity operation"
+                );
                 self.equity_cooldowns
                     .write()
                     .await

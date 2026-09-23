@@ -4946,8 +4946,9 @@ it never moves the other chains' targets.
   event).
 - Telemetry: every declined plan, the trigger's own staleness skips included,
   increments `equity_plan_declined_total` by reason and is logged with the
-  symbol and, where one applies, the chain; a planned operation logs its chain,
-  direction, quantity, the total and every chain's deviation.
+  symbol and, where one applies, the chain; a dispatched operation logs its
+  chain, direction and quantity once, and each plan logs the total and every
+  chain's deviation at debug.
 
 ##### Trigger Events
 

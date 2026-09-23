@@ -3,7 +3,7 @@
 
 use rain_math_float::{Float, FloatError};
 use std::collections::{BTreeMap, BTreeSet};
-use tracing::{debug, info};
+use tracing::debug;
 
 use st0x_config::{DeviationBand, TargetShare};
 use st0x_evm::Chain;
@@ -294,7 +294,7 @@ pub(crate) fn plan_equity_operation(
             continue;
         }
 
-        info!(
+        debug!(
             target: "rebalance",
             symbol = %input.symbol,
             chain = %candidate.chain,
