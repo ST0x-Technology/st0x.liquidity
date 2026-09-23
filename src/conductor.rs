@@ -3313,6 +3313,89 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
     })
 }
 
+/// The primary chain's rebalancing services, and the shared handles the rest
+/// of the rebalancing wiring hangs off, once the startup preflights have
+/// passed.
+struct PrimaryRebalancingServices<Signer: Wallet> {
+    primary_chain: Chain,
+    market_maker_wallet: Address,
+    gas_readiness: Arc<GasReadiness>,
+    bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
+    raindex_service: Arc<RaindexService<Signer>>,
+    tokenizer: Arc<dyn Tokenizer>,
+    mint_authorization: MintAuthorizationInfra,
+}
+
+/// Resolves the primary chain's equity leg -- the rebalancer, the recovery
+/// jobs and the resume paths all run on it -- builds the handles the rest of
+/// the rebalancing wiring shares, and runs the startup preflights that gate
+/// them: inventory access, the stale-allowance revoke and tokenization.
+/// Nothing downstream is built until those pass.
+async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
+    deps: &RebalancingDeps,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    wallets: &ChainWallets<Signer>,
+) -> anyhow::Result<PrimaryRebalancingServices<Signer>> {
+    let primary_chain = deps.ctx.chains.primary().chain;
+    let primary = tokenizations.get(&primary_chain).with_context(|| {
+        format!("no tokenization services were built for the primary chain {primary_chain}")
+    })?;
+    let primary_equity = match &primary.equity {
+        EquityTokenization::Rebalancing(equity) => equity,
+        EquityTokenization::HedgeOnly => anyhow::bail!(
+            "the primary chain {primary_chain} was built hedge-only, but the rebalancer \
+             runs on its equity leg"
+        ),
+    };
+    info!(
+        chain = %primary.chain,
+        "Initializing rebalancing infrastructure on the primary chain's tokenization services"
+    );
+    let market_maker_wallet = primary.wallet.address();
+    let gas_readiness = build_transfer_gas_readiness(wallets, &deps.ctx)?;
+
+    // The worker consuming this queue is always registered
+    // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
+    // config is missing), so the enqueuer and the worker can never
+    // disagree: every enqueued row has a consumer.
+    let bot_gas_enqueuer =
+        BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
+
+    let raindex_service = build_rebalancing_raindex_service(
+        &primary.wallet,
+        deps.ctx.chains.primary(),
+        market_maker_wallet,
+    );
+
+    // One issuance client serves the tokenization preflight's vault-mode
+    // reads and both mint-authorization consumers (the saga's vault-mode
+    // read and the delivery job), from the same `[issuance]` credentials
+    // as the freeze guard's own instance.
+    let issuance_client = Arc::new(IssuanceClient::new(
+        deps.ctx.issuance.base_url.clone(),
+        deps.ctx.issuance.api_key.header_value(),
+    )?);
+
+    preflight_inventory_access(&raindex_service, &deps.ctx).await?;
+    revoke_stale_orderbook_allowances(&deps.ctx, tokenizations).await;
+    preflight_tokenization(&deps.ctx, tokenizations, issuance_client.as_ref()).await?;
+
+    let tokenizer = primary_equity.tokenizer.clone();
+
+    let mint_authorization =
+        build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
+
+    Ok(PrimaryRebalancingServices {
+        primary_chain,
+        market_maker_wallet,
+        gas_readiness,
+        bot_gas_enqueuer,
+        raindex_service,
+        tokenizer,
+        mint_authorization,
+    })
+}
+
 /// The rebalancer, the recovery jobs and the resume paths run on the primary
 /// chain's [`ChainTokenization`] until chain selection moves into the global
 /// rebalancer; the other hedged chains' services are built and preflighted
@@ -3330,54 +3413,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker;
 
-        let primary_chain = deps.ctx.chains.primary().chain;
-        let primary = tokenizations.get(&primary_chain).with_context(|| {
-            format!("no tokenization services were built for the primary chain {primary_chain}")
-        })?;
-        let primary_equity = match &primary.equity {
-            EquityTokenization::Rebalancing(equity) => equity,
-            EquityTokenization::HedgeOnly => anyhow::bail!(
-                "the primary chain {primary_chain} was built hedge-only, but the rebalancer \
-                 runs on its equity leg"
-            ),
-        };
-        info!(
-            chain = %primary.chain,
-            "Initializing rebalancing infrastructure on the primary chain's tokenization services"
-        );
-        let market_maker_wallet = primary.wallet.address();
-        let gas_readiness = build_transfer_gas_readiness(&wallets, &deps.ctx)?;
-
-        // The worker consuming this queue is always registered
-        // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
-        // config is missing), so the enqueuer and the worker can never
-        // disagree: every enqueued row has a consumer.
-        let bot_gas_enqueuer =
-            BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
-
-        let raindex_service = build_rebalancing_raindex_service(
-            &primary.wallet,
-            deps.ctx.chains.primary(),
+        let PrimaryRebalancingServices {
+            primary_chain,
             market_maker_wallet,
-        );
-
-        // One issuance client serves the tokenization preflight's vault-mode
-        // reads and both mint-authorization consumers (the saga's vault-mode
-        // read and the delivery job), from the same `[issuance]` credentials
-        // as the freeze guard's own instance.
-        let issuance_client = Arc::new(IssuanceClient::new(
-            deps.ctx.issuance.base_url.clone(),
-            deps.ctx.issuance.api_key.header_value(),
-        )?);
-
-        preflight_inventory_access(&raindex_service, &deps.ctx).await?;
-        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await;
-        preflight_tokenization(&deps.ctx, &tokenizations, issuance_client.as_ref()).await?;
-
-        let tokenizer = primary_equity.tokenizer.clone();
-
-        let mint_authorization =
-            build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
+            gas_readiness,
+            bot_gas_enqueuer,
+            raindex_service,
+            tokenizer,
+            mint_authorization,
+        } = build_primary_rebalancing_services(&deps, &tokenizations, &wallets).await?;
 
         let HedgedEquityServices {
             chains: chain_services,
