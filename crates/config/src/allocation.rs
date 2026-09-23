@@ -452,6 +452,36 @@ mod tests {
         assert_eq!(symbol, aapl());
     }
 
+    /// An empty chain is `target * total` short, which is never outside a band
+    /// of `deviation * total` when the target is at or inside it: such a chain
+    /// could drain but never refill. A zero target only ever drains, so it
+    /// passes.
+    #[test]
+    fn positive_target_at_or_inside_the_band_is_refused() {
+        let inside = BTreeMap::from([(
+            Chain::Base,
+            hedged(ChainLifecycle::Active, "enabled", r"target_share = 0.05"),
+        )]);
+
+        let error = allocation(r"{ base = 0.5 }", "0.1")
+            .validate(&inside)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "AAPL targets 0.05 on base, which is not above the deviation band of 0.05, \
+             so the chain could never be minted into"
+        );
+
+        let zero = BTreeMap::from([(
+            Chain::Base,
+            hedged(ChainLifecycle::Active, "enabled", r"target_share = 0"),
+        )]);
+        allocation(r"{ base = 0.5 }", "0.1")
+            .validate(&zero)
+            .unwrap();
+    }
+
     /// A hedge-only listing is never planned, so it needs no target and
     /// its chain's default does not count against the symbol.
     #[test]
