@@ -12189,6 +12189,172 @@ mod tests {
         );
     }
 
+    /// Another transfer's same-amount mint to the shared wallet lands after this
+    /// transfer's attestation. Resume must mint this transfer's own nonce, not
+    /// adopt the other mint.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_attested_ignores_another_transfers_mint() {
+        let chains = deploy_dual_chain_cctp().await;
+
+        let attestation = CctpAttestationMock::start().await;
+        let _watcher = attestation
+            .start_watcher(
+                ProviderBuilder::new()
+                    .connect(&chains.ethereum_endpoint)
+                    .await
+                    .unwrap(),
+                ProviderBuilder::new()
+                    .connect(&chains.base_endpoint)
+                    .await
+                    .unwrap(),
+                chains.attester_key,
+            )
+            .await
+            .unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: attestation.base_url(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        let market_maker_wallet = chains.bot_address;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let own_burn = cctp_bridge
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                amount_u256,
+                market_maker_wallet,
+            )
+            .await
+            .unwrap();
+        let own_attestation = cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, own_burn.tx)
+            .await
+            .unwrap();
+
+        let other_burn = cctp_bridge
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                amount_u256,
+                market_maker_wallet,
+            )
+            .await
+            .unwrap();
+        let other_attestation = cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, other_burn.tx)
+            .await
+            .unwrap();
+
+        let mint_scan_from_block = ProviderBuilder::new()
+            .connect(&chains.ethereum_endpoint)
+            .await
+            .unwrap()
+            .get_block_number()
+            .await
+            .unwrap();
+        let other_mint = cctp_bridge
+            .mint(BridgeDirection::BaseToEthereum, &other_attestation)
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(own_burn.tx),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: own_burn.tx,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: own_attestation.as_bytes().to_vec(),
+                cctp_nonce: own_attestation.nonce(),
+                message: own_attestation.message_bytes().to_vec(),
+                mint_scan_from_block,
+            },
+        )
+        .await
+        .unwrap();
+
+        // No Alpaca deposit address is mocked, so resume stops right after the
+        // mint leg; only the mint it recorded matters here.
+        manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        let own_mint = cctp_bridge
+            .find_existing_mint(
+                BridgeDirection::BaseToEthereum,
+                own_attestation.message_bytes(),
+            )
+            .await
+            .unwrap()
+            .expect("resume must mint this transfer's own nonce");
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::Bridged { mint_tx_hash, .. } = state else {
+            panic!("Expected Bridged after the mint leg, got: {state:?}");
+        };
+        assert_eq!(mint_tx_hash, own_mint.tx);
+        assert_ne!(mint_tx_hash, other_mint.tx);
+    }
+
     /// The un-fail core: a post-burn `BridgingFailed` whose mint actually landed
     /// is un-failed and driven to terminal on resume. We mint for real, then fail
     /// the aggregate post-burn, then resume. `recover_from_bridging_failed`
