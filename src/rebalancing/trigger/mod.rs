@@ -1,5 +1,6 @@
 //! Rebalancing trigger that reacts to inventory imbalances.
 
+pub(crate) mod allocation;
 mod equity;
 mod freeze;
 mod usdc;
@@ -7537,6 +7538,7 @@ mod tests {
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
 
@@ -7600,6 +7602,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
 
@@ -7663,6 +7666,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
 
@@ -7790,6 +7794,7 @@ mod tests {
                             rebalancing: OperationMode::Enabled,
                             wrapped_equity_recovery: OperationMode::Enabled,
                             operational_limit: None,
+                            target_share: None,
                         },
                     )]),
                 },

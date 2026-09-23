@@ -7857,6 +7857,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         let trading_chain = ctx.chains.primary().clone();
@@ -8034,6 +8035,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         let trading_chain = ctx.chains.primary().clone();
@@ -8198,6 +8200,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         let trading_chain = ctx.chains.primary().clone();

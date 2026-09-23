@@ -1701,6 +1701,7 @@ mod tests {
             rebalancing,
             wrapped_equity_recovery: OperationMode::Disabled,
             operational_limit: None,
+            target_share: None,
         }
     }
 

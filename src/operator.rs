@@ -3249,6 +3249,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -3624,6 +3625,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -3725,6 +3727,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -3826,6 +3829,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -3989,6 +3993,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -4482,6 +4487,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -5301,6 +5307,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -5707,6 +5714,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -5812,6 +5820,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -5916,6 +5925,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -6089,6 +6099,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -6258,6 +6269,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -6396,6 +6408,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -6561,6 +6574,7 @@ pub mod process_tx {
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
+                        target_share: None,
                     },
                 );
 
@@ -6702,6 +6716,7 @@ pub mod process_tx {
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
+                        target_share: None,
                     },
                 );
                 ctx.pricing = Some(pricing_ctx_with_schedule(schedule_mode));
@@ -6945,6 +6960,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -7115,6 +7131,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -7204,6 +7221,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -7401,6 +7419,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
 
@@ -7606,6 +7625,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);
@@ -7676,6 +7696,7 @@ pub mod process_tx {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(SucceedingOrderPlacer);

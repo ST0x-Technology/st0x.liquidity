@@ -553,7 +553,7 @@ fn mintable_above_floor(
     Ok(Some(excess))
 }
 
-fn cap_shares(
+pub(super) fn cap_shares(
     symbol: &Symbol,
     quantity: FractionalShares,
     shares_limit: Option<Positive<FractionalShares>>,
@@ -580,7 +580,7 @@ fn cap_shares(
 
 /// Truncates to the Alpaca API decimal limit, logging a warning when
 /// sub-nanoshare digits are dropped.
-fn truncate_for_alpaca(
+pub(super) fn truncate_for_alpaca(
     symbol: &Symbol,
     quantity: FractionalShares,
 ) -> Result<FractionalShares, FloatError> {
