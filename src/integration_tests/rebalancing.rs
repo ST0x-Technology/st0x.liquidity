@@ -54,7 +54,7 @@ use crate::inventory::{
     Venue,
 };
 use crate::mint_authorization::ConfiguredMintAuthorizer;
-use crate::native_gas::ConfiguredGasReadiness;
+use crate::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{
@@ -1462,6 +1462,56 @@ async fn chain_missing_from_its_registry_yields_to_the_next_candidate() {
     let other = Symbol::new("MSFT").unwrap();
     seed_vault_registry(&pool, Chain::Base, &other, Address::random()).await;
     seed_vault_registry(&pool, Chain::HyperEvm, &symbol, Address::random()).await;
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(60),
+        offchain: float!(60),
+    })
+    .await;
+    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(0)).await;
+    service.check_and_trigger_equity(&symbol).await.unwrap();
+
+    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(mint.chain, Chain::HyperEvm);
+    assert_eq!(mint.quantity, FractionalShares::new(float!(48)));
+    assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
+}
+
+/// Base's 24-share redemption outranks HyperEVM's 48-share mint, but
+/// Base's wallet is dry, so the trigger re-plans without Base and the mint
+/// lands on HyperEVM.
+#[tokio::test]
+async fn dry_top_ranked_chain_yields_to_the_funded_next_candidate() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(two_chain_trigger_config()).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, Address::random()).await;
+    seed_vault_registry(&pool, Chain::HyperEvm, &symbol, Address::random()).await;
+    service
+        .set_equity_gas_readiness(BTreeMap::from([
+            (
+                Chain::Base,
+                ConfiguredGasReadiness::Wired(GasReadiness::for_test(
+                    U256::ZERO,
+                    U256::from(1_u64),
+                    U256::MAX,
+                    U256::from(1_u64),
+                )),
+            ),
+            (
+                Chain::HyperEvm,
+                ConfiguredGasReadiness::Wired(GasReadiness::always_ready_for_test()),
+            ),
+        ]))
+        .await;
     build_imbalanced_inventory(Imbalance::Equity {
         inventory: &inventory,
         position_cqrs: &position_cqrs,
