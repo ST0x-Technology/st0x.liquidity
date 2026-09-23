@@ -4952,14 +4952,13 @@ it never moves the other chains' targets.
 
 ##### Trigger Events
 
-When thresholds crossed AND minimum amounts met, InventoryView emits:
+For equity, the planner above returns `EquityPlan::Operation` (a chain, a
+direction and a quantity) or `EquityPlan::Decline` with its reason. For USDC,
+`InventoryView` reports an `Imbalance` (`TooMuchOnchain` or `TooMuchOffchain`)
+when the ratio leaves its band.
 
-- `EquityImbalanceDetected { symbol, direction: Mint/Redeem, quantity,
-  estimated_value_usd }`
-- `UsdcImbalanceDetected { direction: AlpacaToBase/BaseToAlpaca, amount }`
-
-The trigger reacts to these events by enqueueing the matching transfer job
-(`TransferEquityToMarketMaking`, `TransferEquityToHedging`,
+The trigger reacts to an operation or an imbalance by enqueueing the matching
+transfer job (`TransferEquityToMarketMaking`, `TransferEquityToHedging`,
 `TransferUsdcToMarketMaking`, or `TransferUsdcToHedging`), whose worker drives
 the TokenizedEquityMint, EquityRedemption, or UsdcRebalance aggregate.
 
