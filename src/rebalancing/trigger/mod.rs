@@ -3731,10 +3731,7 @@ impl RebalancingService {
             return Ok(EquityPlan::Decline(DeclineReason::PriceMissing));
         };
         let last_price = reader.last_price(symbol).await?;
-        // Stamped after the price read so an observation made during the
-        // reads above is never mistaken for a future one.
-        let now = Utc::now();
-        let cooldowns = self.equity_cooldowns(symbol, now).await;
+        let cooldowns = self.equity_cooldowns(symbol, Utc::now()).await;
 
         Ok(plan_equity_operation(&EquityPlanInput {
             symbol: symbol.clone(),
@@ -3746,8 +3743,6 @@ impl RebalancingService {
             hedge_floor: self.config.hedge_floor.for_symbol(symbol),
             cooldowns,
             last_price,
-            price_staleness_bound: self.config.inventory_staleness_bound,
-            now,
         })?)
     }
 
@@ -3861,8 +3856,7 @@ impl RebalancingService {
                 | DeclineReason::Inflight
                 | DeclineReason::TotalZero
                 | DeclineReason::FloorCapped
-                | DeclineReason::PriceMissing
-                | DeclineReason::PriceStale,
+                | DeclineReason::PriceMissing,
                 _,
             ) => {
                 info!(target: "rebalance", %symbol, reason = label, "Declined equity plan");

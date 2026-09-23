@@ -1,11 +1,8 @@
 //! Pure equity allocation planner: at most one mint or redemption per
 //! symbol, chosen from per-chain target shares.
 
-use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Not;
-use std::time::Duration;
 use tracing::{debug, info};
 
 use st0x_config::{DeviationBand, TargetShare};
@@ -43,11 +40,9 @@ pub(crate) struct EquityPlanInput {
     pub(crate) hedge_floor: FractionalShares,
     /// Chains that ran an operation for this symbol too recently.
     pub(crate) cooldowns: BTreeSet<Chain>,
-    /// The symbol's last onchain fill price, block-timestamped, used to
-    /// value the minimum operation size.
+    /// The symbol's last onchain fill price, used to value the minimum
+    /// operation size. Its age does not matter: it only sizes a dust bound.
     pub(crate) last_price: Option<PriceObservation>,
-    pub(crate) price_staleness_bound: Duration,
-    pub(crate) now: DateTime<Utc>,
 }
 
 /// One chain's slot in an [`EquityPlanInput`].
@@ -120,7 +115,6 @@ pub(crate) enum DeclineReason {
         chain: Chain,
     },
     PriceMissing,
-    PriceStale,
     /// Raised by the trigger after planning: the chosen chain's vault
     /// registry does not know the token.
     NotInRegistry {
@@ -144,7 +138,6 @@ impl DeclineReason {
             Self::NoGas { .. } => "no_gas",
             Self::CoolingDown { .. } => "cooling_down",
             Self::PriceMissing => "price_missing",
-            Self::PriceStale => "price_stale",
             Self::NotInRegistry { .. } => "not_in_registry",
         }
     }
@@ -199,7 +192,8 @@ impl Candidate {
 /// Picks at most one operation for the symbol.
 ///
 /// The guards run first, then the best-ranked candidate that survives the
-/// gas, cooldown, floor and minimum size checks wins. A missing or stale price declines the symbol before any
+/// gas, cooldown, floor and minimum size checks wins. A missing price
+/// declines the symbol before any
 /// candidate is tried; a per-chain drop on a higher-ranked candidate only
 /// outranks a later `FloorCapped`.
 pub(crate) fn plan_equity_operation(
@@ -243,9 +237,6 @@ pub(crate) fn plan_equity_operation(
     let Some(price) = input.last_price else {
         return Ok(EquityPlan::Decline(DeclineReason::PriceMissing));
     };
-    if price_is_stale(&price, input.now, input.price_staleness_bound) {
-        return Ok(EquityPlan::Decline(DeclineReason::PriceStale));
-    }
 
     let mut first_drop = None;
     for candidate in candidates {
@@ -386,15 +377,6 @@ fn format_deviations(deviations: &BTreeMap<Chain, FractionalShares>) -> String {
         .join(" ")
 }
 
-/// A price older than the bound, or stamped in the future, cannot value a
-/// minimum.
-fn price_is_stale(price: &PriceObservation, now: DateTime<Utc>, bound: Duration) -> bool {
-    now.signed_duration_since(price.observed_at)
-        .to_std()
-        .is_ok_and(|age| age <= bound)
-        .not()
-}
-
 fn cap_shares(
     symbol: &Symbol,
     quantity: FractionalShares,
@@ -451,7 +433,6 @@ fn truncate_for_alpaca(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::time::Duration;
 
     use alloy::primitives::U256;
     use chrono::{DateTime, TimeDelta, Utc};
@@ -468,8 +449,6 @@ mod tests {
     use super::*;
     use crate::inventory::VenueBalance;
     use crate::position::PriceObservation;
-
-    const STALENESS_BOUND: Duration = Duration::from_secs(300);
 
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_800_000_000, 0).unwrap()
@@ -537,8 +516,6 @@ mod tests {
             hedge_floor: FractionalShares::ZERO,
             cooldowns: BTreeSet::new(),
             last_price: Some(observed("100", now())),
-            price_staleness_bound: STALENESS_BOUND,
-            now: now(),
         }
     }
 
@@ -990,27 +967,18 @@ mod tests {
         );
     }
 
-    /// The same gasless Base over an unpriced or stale symbol: the price
+    /// The same gasless Base over an unpriced symbol: the missing price
     /// declines the symbol before any candidate is tried, so the gas drop
     /// never masks it.
     #[test]
-    fn price_declines_pre_empt_a_higher_ranked_drop() {
-        let price_missing = plan_equity_operation(&EquityPlanInput {
+    fn missing_price_pre_empts_a_higher_ranked_drop() {
+        let plan = plan_equity_operation(&EquityPlanInput {
             last_price: None,
             ..input(Some(balance("20")), gasless_base_and_hyperevm())
         })
         .unwrap();
-        assert_eq!(
-            price_missing,
-            EquityPlan::Decline(DeclineReason::PriceMissing)
-        );
 
-        let price_stale = plan_equity_operation(&EquityPlanInput {
-            last_price: Some(observed("100", now() - TimeDelta::seconds(301))),
-            ..input(Some(balance("20")), gasless_base_and_hyperevm())
-        })
-        .unwrap();
-        assert_eq!(price_stale, EquityPlan::Decline(DeclineReason::PriceStale));
+        assert_eq!(plan, EquityPlan::Decline(DeclineReason::PriceMissing));
     }
 
     /// Base's redemption ranks first but its wallet has no gas; HyperEVM's
@@ -1042,12 +1010,15 @@ mod tests {
         assert_eq!(plan, EquityPlan::Decline(DeclineReason::PriceMissing));
     }
 
+    /// The price only values the minimum, so its age does not matter: a
+    /// quiet symbol's month-old fill, or one stamped ahead of this host's
+    /// clock, still sizes the mint.
     #[test]
-    fn stale_or_future_price_declines() {
-        let aged_out = now() - TimeDelta::seconds(301);
+    fn old_or_future_price_still_values_the_minimum() {
+        let month_old = now() - TimeDelta::days(30);
         let future = now() + TimeDelta::seconds(1);
 
-        for observed_at in [aged_out, future] {
+        for observed_at in [month_old, future] {
             let plan = plan_equity_operation(&EquityPlanInput {
                 last_price: Some(observed("100", observed_at)),
                 ..input(
@@ -1057,26 +1028,8 @@ mod tests {
             })
             .unwrap();
 
-            assert_eq!(
-                plan,
-                EquityPlan::Decline(DeclineReason::PriceStale),
-                "observed at {observed_at}"
-            );
+            assert_eq!(plan, mint(Chain::Base, "35"), "observed at {observed_at}");
         }
-    }
-
-    #[test]
-    fn price_at_the_staleness_bound_is_still_fresh() {
-        let plan = plan_equity_operation(&EquityPlanInput {
-            last_price: Some(observed("100", now() - TimeDelta::seconds(300))),
-            ..input(
-                Some(balance("85")),
-                BTreeMap::from([(Chain::Base, slot("15", "0.5"))]),
-            )
-        })
-        .unwrap();
-
-        assert_eq!(plan, mint(Chain::Base, "35"));
     }
 
     /// Base's 6-share mint is worth $600 against its $1000 minimum, so the

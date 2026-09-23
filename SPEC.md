@@ -4927,9 +4927,9 @@ targets.
   the hedge floor available; a broker at or below that declines the whole symbol
   (the floor is symbol-wide, so no other mint could pass). The result is
   truncated to nine decimals.
-- Minimum: with no last price, or one older than the inventory staleness bound,
-  the plan declines; a candidate whose quantity times price is below the chain's
-  minimum is skipped and the next one evaluated.
+- Minimum: with no last price the plan declines; the price's age does not
+  matter, since it only values this dust bound. A candidate whose quantity times
+  price is below the chain's minimum is skipped and the next one evaluated.
 - Dispatch: the chosen chain must know the token in its vault registry (else
   `not_in_registry`); the operation is enqueued as that chain's mint or
   redemption and the `(symbol, chain)` cooldown starts. One operation per symbol
