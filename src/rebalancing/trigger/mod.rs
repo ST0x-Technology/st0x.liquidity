@@ -11424,6 +11424,37 @@ mod tests {
         );
     }
 
+    /// Gas is probed only for the chain the planner picks: a symbol within
+    /// its band never reads the dry wallet's balance, so it never warns.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn within_band_symbol_does_not_probe_gas() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        trigger
+            .set_equity_gas_readiness(base_equity_gas(GasReadiness::for_test(
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::MAX,
+                U256::from(1_u64),
+            )))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert!(
+            logs_contain("within_band"),
+            "the symbol must decline as within its band"
+        );
+        assert!(
+            !logs_contain("not gas-ready"),
+            "a symbol within its band must not probe any chain's gas"
+        );
+    }
+
     #[tokio::test]
     async fn frozen_asset_skips_equity_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
