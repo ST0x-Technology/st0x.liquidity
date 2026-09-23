@@ -11431,6 +11431,25 @@ mod tests {
         );
     }
 
+    /// The trigger plans before and after the Position reservation, but a
+    /// dispatch reads the chosen chain's gas balance only once.
+    #[tokio::test]
+    async fn dispatch_probes_the_chosen_chains_gas_once() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        let (readiness, reads) = GasReadiness::counting_for_test();
+        trigger
+            .set_equity_gas_readiness(base_equity_gas(readiness))
+            .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 1);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// The gas gate sits after selection: the only candidate's chain is dry,
     /// so the plan declines as `no_gas` and names the chain.
     #[tracing_test::traced_test]
