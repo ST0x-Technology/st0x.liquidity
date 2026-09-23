@@ -1380,9 +1380,10 @@ mod tests {
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::address;
-    use alloy::primitives::{B256, Bytes, b256, keccak256};
+    use alloy::primitives::{B256, BlockNumber, Bytes, U64, b256, keccak256};
     use alloy::providers::ext::AnvilApi as _;
-    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::providers::{Provider, ProviderBuilder, ProviderCall};
+    use alloy::rpc::client::NoParams;
     use alloy::rpc::json_rpc::ErrorPayload;
     use alloy::rpc::types::TransactionReceipt;
     use alloy::signers::Signer;
@@ -1397,7 +1398,7 @@ mod tests {
     use std::borrow::Cow;
     use std::num::NonZeroU32;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::time::Duration;
 
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -1668,22 +1669,42 @@ mod tests {
     /// `usedNonces()` already reports the nonce consumed but the
     /// `MessageReceived` log has not yet been indexed by the queried node.
     /// Wrapped by [`FlakyProbeWallet`], never constructed directly by tests.
+    /// Records the lowest `from_block` any scan asked for, so a test can
+    /// assert how far back a scan walked, and reports the head `head_offset`
+    /// blocks above the real one, standing in for a long chain that anvil
+    /// would take minutes to mine.
     #[derive(Clone)]
     struct FlakyGetLogsProvider<InnerProvider> {
         inner: InnerProvider,
         remaining_empty_scans: Arc<AtomicU32>,
+        lowest_from_block: Arc<AtomicU64>,
+        head_offset: u64,
     }
 
     #[async_trait]
-    impl<InnerProvider: Provider + Clone> Provider for FlakyGetLogsProvider<InnerProvider> {
+    impl<InnerProvider: Provider + Clone + 'static> Provider for FlakyGetLogsProvider<InnerProvider> {
         fn root(&self) -> &alloy::providers::RootProvider {
             self.inner.root()
+        }
+
+        fn get_block_number(&self) -> ProviderCall<NoParams, U64, BlockNumber> {
+            let inner = self.inner.clone();
+            let head_offset = self.head_offset;
+
+            ProviderCall::BoxedFuture(Box::pin(async move {
+                Ok(inner.get_block_number().await? + head_offset)
+            }))
         }
 
         async fn get_logs(
             &self,
             filter: &alloy::rpc::types::Filter,
         ) -> alloy::transports::TransportResult<Vec<alloy::rpc::types::Log>> {
+            if let Some(from_block) = filter.get_from_block() {
+                self.lowest_from_block
+                    .fetch_min(from_block, Ordering::SeqCst);
+            }
+
             let should_return_empty = self
                 .remaining_empty_scans
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -1746,6 +1767,8 @@ mod tests {
             let provider = FlakyGetLogsProvider {
                 inner: inner.provider().clone(),
                 remaining_empty_scans: Arc::new(AtomicU32::new(failures.empty_log_scans)),
+                lowest_from_block: Arc::new(AtomicU64::new(u64::MAX)),
+                head_offset: 0,
             };
             Self {
                 inner,
@@ -1773,6 +1796,18 @@ mod tests {
         /// consumed (not merely that recovery happened to succeed anyway).
         fn remaining_empty_log_scans(&self) -> Arc<AtomicU32> {
             Arc::clone(&self.provider.remaining_empty_scans)
+        }
+
+        /// Reports the chain head `head_offset` blocks above the real one.
+        fn with_reported_head_offset(mut self, head_offset: u64) -> Self {
+            self.provider.head_offset = head_offset;
+            self
+        }
+
+        /// Returns a handle to the lowest `from_block` any `get_logs` scan
+        /// asked for (`u64::MAX` until the first scan).
+        fn lowest_scanned_block(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.provider.lowest_from_block)
         }
     }
 
@@ -4424,6 +4459,80 @@ mod tests {
             ),
             "the wrapped recovery_error must be the exhausted-retries \
              AlreadyMintedMessageNotFound; got: {recovery_error:?}"
+        );
+    }
+
+    /// A nonce the chain reports consumed whose `MessageReceived` log the
+    /// queried node never returns (log-index lag, pruned logs) must not send
+    /// the resume lookup walking back to genesis on every redrive.
+    #[tokio::test]
+    async fn find_existing_mint_scan_stays_bounded_when_the_used_nonce_log_is_invisible() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_300_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // Three 20_000-block chunks of lookback; the reported head sits far
+        // above it, as on a real chain.
+        let lookback = 60_000;
+        let head_offset = 1_000_000;
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let head = base_provider.get_block_number().await.unwrap() + head_offset;
+
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(head_offset);
+        let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+            )
+            .await
+            .unwrap_err();
+
+        let lowest = lowest_scanned_block.load(Ordering::SeqCst);
+        assert!(
+            lowest >= head - lookback,
+            "the scan must stop at the lookback floor {}, but it reached block {lowest}",
+            head - lookback,
         );
     }
 
