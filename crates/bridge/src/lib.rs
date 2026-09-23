@@ -178,23 +178,15 @@ pub trait Bridge: Send + Sync + 'static {
         from_block: u64,
     ) -> Result<Option<TxHash>, Self::Error>;
 
-    /// Scans the mint destination chain for an already-submitted mint to
-    /// `recipient` strictly after `from_block`, for crash-safe resume. Returns
-    /// the receipt so the caller can adopt the existing mint instead of
-    /// re-minting, which reverts on the already-used CCTP nonce and otherwise
-    /// fails the transfer for USDC that was in fact minted.
-    async fn find_recent_mint(
+    /// Returns the mint that consumed `attestation`'s nonce on the destination
+    /// chain, or `None` while that nonce is unused, for crash-safe resume. The
+    /// match is by nonce, so another transfer's mint to the same recipient is
+    /// never returned.
+    async fn find_attested_mint(
         &self,
         direction: BridgeDirection,
-        recipient: Address,
-        from_block: u64,
+        attestation: &Self::Attestation,
     ) -> Result<Option<MintReceipt>, Self::Error>;
-
-    /// Returns the current head of the mint destination chain for `direction`.
-    /// Captured when the attestation is recorded -- before the mint -- so the
-    /// crash-safe resume scan in [`Bridge::find_recent_mint`] is bounded to
-    /// blocks mined strictly after it.
-    async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error>;
 
     /// Returns the current head of the burn source chain for `direction`.
     /// Captured before the burn call so crash-safe resume ([`Bridge::find_recent_burn`])

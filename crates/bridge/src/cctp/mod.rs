@@ -1357,38 +1357,13 @@ where
         }
     }
 
-    /// Scans the mint destination chain for an already-submitted mint to
-    /// `recipient` strictly after `from_block`, for crash-safe resume. Delegates
-    /// to the destination endpoint for the given direction.
-    async fn find_recent_mint(
+    async fn find_attested_mint(
         &self,
         direction: BridgeDirection,
-        recipient: Address,
-        from_block: u64,
+        attestation: &Self::Attestation,
     ) -> Result<Option<crate::MintReceipt>, Self::Error> {
-        let receipt = match direction {
-            BridgeDirection::EthereumToBase => {
-                self.base.find_recent_mint(recipient, from_block).await?
-            }
-            BridgeDirection::BaseToEthereum => {
-                self.ethereum
-                    .find_recent_mint(recipient, from_block)
-                    .await?
-            }
-        };
-
-        Ok(receipt.map(|receipt| crate::MintReceipt {
-            tx: receipt.tx,
-            amount: receipt.amount,
-            fee: receipt.fee_collected,
-        }))
-    }
-
-    async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error> {
-        match direction {
-            BridgeDirection::EthereumToBase => self.base.current_block().await,
-            BridgeDirection::BaseToEthereum => self.ethereum.current_block().await,
-        }
+        self.find_existing_mint(direction, &attestation.message)
+            .await
     }
 
     async fn source_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error> {
@@ -5102,138 +5077,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_recent_mint_returns_receipt_of_real_mint() {
+    async fn find_attested_mint_returns_only_the_mint_of_its_own_nonce() {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
         let recipient = bridge.ethereum.owner();
         let burn_amount = U256::from(5_000_000u64);
 
-        // Capture the destination (Ethereum) head before minting, exactly as the
-        // resume path does via `Bridge::destination_block`.
-        let from_block = bridge
-            .destination_block(BridgeDirection::BaseToEthereum)
-            .await
-            .unwrap();
-
-        let burn_receipt = bridge
-            .burn_internal::<NoOpErrorRegistry>(
-                BridgeDirection::BaseToEthereum,
-                burn_amount,
-                recipient,
-            )
-            .await
-            .unwrap();
-
-        let message = cctp
-            .extract_message_from_burn_tx(burn_receipt.tx, false)
-            .await
-            .unwrap();
-
-        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+        let mut attestations = Vec::new();
+        for _ in 0..2 {
+            let burn_receipt = bridge
+                .burn_internal::<NoOpErrorRegistry>(
+                    BridgeDirection::BaseToEthereum,
+                    burn_amount,
+                    recipient,
+                )
+                .await
+                .unwrap();
+            let message = cctp
+                .extract_message_from_burn_tx(burn_receipt.tx, false)
+                .await
+                .unwrap();
+            let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+            attestations
+                .push(AttestationResponse::from_parts(message_with_nonce, attestation).unwrap());
+        }
+        let [minted, unminted] = <[AttestationResponse; 2]>::try_from(attestations).unwrap();
 
         let mint_receipt = bridge
             .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
-                message_with_nonce,
-                attestation,
+                minted.message.clone(),
+                minted.attestation.clone(),
             )
             .await
             .unwrap();
 
         let found = bridge
-            .find_recent_mint(BridgeDirection::BaseToEthereum, recipient, from_block)
+            .find_attested_mint(BridgeDirection::BaseToEthereum, &minted)
             .await
             .unwrap()
-            .expect("scan must find the submitted mint");
+            .expect("the minted nonce must resolve to its mint");
+        assert_eq!(found.tx, mint_receipt.tx);
+        assert_eq!(found.amount, mint_receipt.amount);
+        assert_eq!(found.fee, mint_receipt.fee_collected);
 
-        assert_eq!(
-            found.tx, mint_receipt.tx,
-            "scan must return the real mint's tx"
-        );
-        assert_eq!(
-            found.amount, mint_receipt.amount,
-            "adopted amount must match the mint",
-        );
-        assert_eq!(
-            found.fee, mint_receipt.fee_collected,
-            "adopted fee must match the mint",
-        );
-    }
-
-    #[tokio::test]
-    async fn find_recent_mint_returns_none_for_wrong_recipient_or_below_scan_bound() {
-        let cctp = LocalCctp::new().await.unwrap();
-        let bridge = cctp.create_bridge().await.unwrap();
-
-        let recipient = bridge.ethereum.owner();
-        let burn_amount = U256::from(5_000_000u64);
-
-        let from_block = bridge
-            .destination_block(BridgeDirection::BaseToEthereum)
-            .await
-            .unwrap();
-
-        let burn_receipt = bridge
-            .burn_internal::<NoOpErrorRegistry>(
-                BridgeDirection::BaseToEthereum,
-                burn_amount,
-                recipient,
-            )
-            .await
-            .unwrap();
-
-        let message = cctp
-            .extract_message_from_burn_tx(burn_receipt.tx, false)
-            .await
-            .unwrap();
-
-        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
-
-        bridge
-            .mint_internal::<NoOpErrorRegistry>(
-                BridgeDirection::BaseToEthereum,
-                message_with_nonce,
-                attestation,
-            )
-            .await
-            .unwrap();
-
-        let other_recipient = address!("0x000000000000000000000000000000000000dEaD");
-
+        // Same recipient, same amount, later block: still not this nonce's mint.
         assert_eq!(
             bridge
-                .find_recent_mint(BridgeDirection::BaseToEthereum, other_recipient, from_block)
+                .find_attested_mint(BridgeDirection::BaseToEthereum, &unminted)
                 .await
                 .unwrap(),
             None,
-            "a mint to a different recipient must not be adopted",
-        );
-
-        // Advance the Ethereum head past the mint with an unrelated burn, then
-        // scan from the new head: the mint now sits below the scan bound and must
-        // not be adopted (as a prior transfer's mint would be excluded on resume).
-        bridge
-            .burn_internal::<NoOpErrorRegistry>(
-                BridgeDirection::EthereumToBase,
-                burn_amount,
-                recipient,
-            )
-            .await
-            .unwrap();
-
-        let head_above_mint = bridge
-            .destination_block(BridgeDirection::BaseToEthereum)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            bridge
-                .find_recent_mint(BridgeDirection::BaseToEthereum, recipient, head_above_mint)
-                .await
-                .unwrap(),
-            None,
-            "a mint below the scan bound must not be adopted",
         );
     }
 
@@ -5312,8 +5207,8 @@ mod tests {
             "a transfer whose value differs must not be adopted",
         );
 
-        // Scanning from a bound above the send's block excludes it (mirroring the
-        // find_recent_mint below-bound exclusion); the head is already far enough
+        // Scanning from a bound above the send's block excludes it; the head is
+        // already far enough
         // past `above_block` for the absence to resolve to None.
         assert_eq!(
             bridge

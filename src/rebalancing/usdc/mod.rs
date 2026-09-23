@@ -178,12 +178,6 @@ pub enum UsdcTransferError {
     )]
     ConversionPlacementFailed { id: UsdcRebalanceId },
     #[error(
-        "USDC rebalance {id} cannot resume from Attested state: no mint scan \
-         bound was captured (pre-resume-hardening event); manual reconciliation \
-         required"
-    )]
-    ResumeWithoutMintScanBound { id: UsdcRebalanceId },
-    #[error(
         "USDC rebalance {id} attestation polling timed out; retrying until \
          attestation retry deadline"
     )]
@@ -400,10 +394,10 @@ pub enum UsdcTransferError {
     /// A post-burn CCTP mint whose recovery could not be resolved: the recovery
     /// window expired without ever getting a conclusive `usedNonces()` read, the
     /// nonce read consumed but its receipt could not be reconstructed, or the
-    /// pre-mint scan for an already-submitted mint (`find_recent_mint`, run on
-    /// `Attested` resume before minting is attempted) failed on a transport-class
-    /// error. The aggregate stays in whichever durable pre-mint state it was
-    /// already in (`Bridging`, `AwaitingAttestation`, `Attested`, or a post-burn
+    /// pre-mint lookup of the nonce's mint (`find_attested_mint`, run on
+    /// `Attested` resume before minting is attempted) failed. The aggregate
+    /// stays in whichever durable pre-mint state it was already in
+    /// (`Bridging`, `AwaitingAttestation`, `Attested`, or a post-burn
     /// `BridgingFailed`), so this is safe to delayed-redrive: declaring a
     /// terminal failure here would strand the rebalancing guard on state that
     /// was never actually observed, or on funds that may have already moved.
@@ -509,7 +503,6 @@ impl UsdcTransferError {
             | Self::BotGasEnqueue(_)
             | Self::ConversionOutcomeUnresolved { .. }
             | Self::PostDepositConversionShortFill { .. }
-            | Self::ResumeWithoutMintScanBound { .. }
             | Self::AttestationTimedOut { .. }
             | Self::AttestationRetryDeadlineElapsed { .. }
             | Self::SettlementRetryDeadlineElapsed { .. }
@@ -565,7 +558,6 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::ConversionBelowWithdrawalMinimum { .. }
             | Self::ConversionOutcomeUnresolved { .. }
             | Self::PostDepositConversionShortFill { .. }
-            | Self::ResumeWithoutMintScanBound { .. }
             | Self::AttestationTimedOut { .. }
             | Self::AttestationRetryDeadlineElapsed { .. }
             | Self::WithdrawalPollInconclusive { .. }
