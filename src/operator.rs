@@ -1686,7 +1686,7 @@ pub mod process_tx {
     /// `CloseFlattenPolicy::schedule_enabled`: only a schedule-enabled process
     /// treats a pre-placement `Pending` order as a legitimate deferred retry.
     /// Both processes derive it from the same configuration through
-    /// [`crate::trading_schedule::schedule_enabled`], so an offline CLI run
+    /// `trading_schedule::schedule_enabled`, so an offline CLI run
     /// classifies a leftover pending hedge exactly as the bot would.
     #[derive(Clone)]
     pub struct ProcessTxStores {
