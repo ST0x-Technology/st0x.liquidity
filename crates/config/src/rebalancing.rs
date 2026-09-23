@@ -1178,6 +1178,38 @@ mod tests {
         );
     }
 
+    /// The likeliest stale config carries only the old table; it is refused
+    /// by name, not as a missing `allocation` field.
+    #[test]
+    fn retired_equity_threshold_without_allocation_is_refused_by_name() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [equity]
+            target = 0.5
+            deviation = 0.2
+
+            [usdc]
+            mode = "disabled"
+            "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+
+        assert!(
+            matches!(error, RebalancingCtxError::RetiredEquityThreshold),
+            "expected the retired key refused by name, got {error:?}"
+        );
+    }
+
     #[test]
     fn allocation_section_is_required() {
         let error = toml::from_str::<RebalancingConfig>(
