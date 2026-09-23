@@ -2320,12 +2320,42 @@ pub mod process_tx {
         Ok(None)
     }
 
+    /// A placement preflight verdict that contradicts the order it was run for.
+    ///
+    /// `OrderPlacer` is a type erased trait object, so nothing in the type
+    /// system stops an implementation from answering a buy with an equity
+    /// reservation, a sell with a buying power reservation, or a sell with
+    /// equity reserved in some other symbol. Placing on such a verdict would
+    /// submit a sell the broker never reserved inventory or floor room for, or
+    /// a buy it never reserved cash for, so each one fails closed here as an
+    /// operational failure instead of falling back to the requested size.
+    #[derive(Debug, thiserror::Error)]
+    enum PreflightReservationMismatch {
+        #[error(
+            "placement preflight for a buy of {symbol} returned an equity reservation; a buy \
+             must reserve cash buying power, so the hedge is refused"
+        )]
+        BuyReservedEquity { symbol: Symbol },
+        #[error(
+            "placement preflight for a sell of {symbol} returned a buying power reservation; a \
+             sell must reserve equity inventory, so the hedge is refused"
+        )]
+        SellReservedBuyingPower { symbol: Symbol },
+        #[error(
+            "placement preflight for a sell of {symbol} reserved equity in {reserved}; the hedge \
+             is refused rather than sold against another symbol's inventory"
+        )]
+        SellReservedOtherSymbol { symbol: Symbol, reserved: Symbol },
+    }
+
     /// Runs the safety preflight at placement time for either direction, mirroring
     /// the live path's `preflight_fresh_placement`: a buy prices the hedge
     /// against live cash buying power reservations, a sell reserves equity
     /// inventory against the hedge floor and non fractionable sizing. Returns
     /// `None` to defer, or the broker approved (possibly clamped) share count
-    /// and the buying power reservation to attach to a buy order.
+    /// and the buying power reservation to attach to a buy order. A reservation
+    /// that does not match the direction it was requested for fails closed with
+    /// a [`PreflightReservationMismatch`].
     async fn preflight_placement(
         pool: &SqlitePool,
         order_placer: &dyn OrderPlacer,
@@ -2374,19 +2404,57 @@ pub mod process_tx {
             }
             CounterTradePreflight::Allowed { reservation } => reservation,
         };
-        let placed_shares = match reservation.as_ref() {
-            Some(
-                CounterTradeReservation::Equity { required, .. }
-                | CounterTradeReservation::BuyingPower { required, .. },
-            ) => *required,
-            None => shares,
-        };
-        let buying_power_reservation = match reservation {
-            Some(CounterTradeReservation::BuyingPower {
-                estimated_cost_cents,
-                ..
-            }) => Some(BuyingPowerReservationCents::new(estimated_cost_cents)?),
-            Some(CounterTradeReservation::Equity { .. }) | None => None,
+        let (placed_shares, buying_power_reservation) = match (direction, reservation) {
+            (
+                Direction::Buy,
+                Some(CounterTradeReservation::BuyingPower {
+                    required,
+                    estimated_cost_cents,
+                    ..
+                }),
+            ) => (
+                required,
+                Some(BuyingPowerReservationCents::new(estimated_cost_cents)?),
+            ),
+            (
+                Direction::Sell,
+                Some(CounterTradeReservation::Equity {
+                    symbol: reserved_symbol,
+                    required,
+                    ..
+                }),
+            ) if &reserved_symbol == symbol => (required, None),
+            (
+                Direction::Sell,
+                Some(CounterTradeReservation::Equity {
+                    symbol: reserved_symbol,
+                    ..
+                }),
+            ) => {
+                return Err(PreflightReservationMismatch::SellReservedOtherSymbol {
+                    symbol: symbol.clone(),
+                    reserved: reserved_symbol,
+                }
+                .into());
+            }
+            (Direction::Buy, Some(CounterTradeReservation::Equity { .. })) => {
+                return Err(PreflightReservationMismatch::BuyReservedEquity {
+                    symbol: symbol.clone(),
+                }
+                .into());
+            }
+            (Direction::Sell, Some(CounterTradeReservation::BuyingPower { .. })) => {
+                return Err(PreflightReservationMismatch::SellReservedBuyingPower {
+                    symbol: symbol.clone(),
+                }
+                .into());
+            }
+            // The `OrderPlacer` default allows with no reservation, which is
+            // what a placer that runs no preflight of its own returns: the dry
+            // run executor with no inventory to reserve against, and the
+            // operator placers that never price a hedge. Nothing was reserved
+            // and nothing was clamped, so the requested size stands.
+            (Direction::Buy | Direction::Sell, None) => (shares, None),
         };
         Ok(Some((placed_shares, buying_power_reservation)))
     }
@@ -2652,8 +2720,8 @@ pub mod process_tx {
 
         use super::{
             HedgeDisposition, OperatorError, PlacedHedgeDisposition, PlacementContext,
-            ProcessTxChainContext, ProcessTxFill, ProcessTxOutcome, ProcessTxStores,
-            RejectionReason, preflight_placement, process_found_trade, process_tx,
+            PreflightReservationMismatch, ProcessTxChainContext, ProcessTxFill, ProcessTxOutcome,
+            ProcessTxStores, RejectionReason, preflight_placement, process_found_trade, process_tx,
             reconcile_failed_anchor, reconcile_offchain_order_state, reconcile_post_place_state,
         };
 
@@ -3090,6 +3158,124 @@ pub mod process_tx {
             );
         }
 
+        /// A buy whose preflight answers with an equity reservation is a
+        /// malformed verdict from the type erased placer: the buy was never
+        /// priced against cash, so it must fail closed instead of placing on
+        /// the requested size.
+        #[tokio::test]
+        async fn preflight_buy_fails_closed_on_an_equity_reservation() {
+            let pool = setup_test_db().await;
+            let error = preflight_placement(
+                &pool,
+                &PreflightPlacer {
+                    verdict: CounterTradePreflight::Allowed {
+                        reservation: Some(CounterTradeReservation::Equity {
+                            symbol: Symbol::new("AAPL").unwrap(),
+                            required: positive_shares("1"),
+                            available: FractionalShares::new(st0x_float_macro::float!(1)),
+                        }),
+                    },
+                    place: false,
+                },
+                &Symbol::new("AAPL").unwrap(),
+                positive_shares("1"),
+                Direction::Buy,
+                ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+            )
+            .await
+            .unwrap_err();
+
+            let mismatch = error
+                .downcast_ref::<PreflightReservationMismatch>()
+                .expect("a buy reserved against equity must be a typed mismatch");
+            assert!(
+                matches!(
+                    mismatch,
+                    PreflightReservationMismatch::BuyReservedEquity { symbol }
+                        if symbol == &Symbol::new("AAPL").unwrap()
+                ),
+                "got: {mismatch}"
+            );
+        }
+
+        /// A sell whose preflight answers with a buying power reservation never
+        /// reserved inventory against the hedge floor, so it must fail closed.
+        #[tokio::test]
+        async fn preflight_sell_fails_closed_on_a_buying_power_reservation() {
+            let pool = setup_test_db().await;
+            let error = preflight_placement(
+                &pool,
+                &PreflightPlacer {
+                    verdict: CounterTradePreflight::Allowed {
+                        reservation: Some(CounterTradeReservation::BuyingPower {
+                            required: positive_shares("1"),
+                            estimated_cost_cents: 5_000,
+                            available_buying_power_cents: 100_000,
+                        }),
+                    },
+                    place: false,
+                },
+                &Symbol::new("AAPL").unwrap(),
+                positive_shares("1"),
+                Direction::Sell,
+                ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+            )
+            .await
+            .unwrap_err();
+
+            let mismatch = error
+                .downcast_ref::<PreflightReservationMismatch>()
+                .expect("a sell reserved against cash must be a typed mismatch");
+            assert!(
+                matches!(
+                    mismatch,
+                    PreflightReservationMismatch::SellReservedBuyingPower { symbol }
+                        if symbol == &Symbol::new("AAPL").unwrap()
+                ),
+                "got: {mismatch}"
+            );
+        }
+
+        /// Equity reserved in another symbol says nothing about the inventory
+        /// this sell would draw down, so the hedge must fail closed rather than
+        /// place against a reservation held elsewhere.
+        #[tokio::test]
+        async fn preflight_sell_fails_closed_on_a_reservation_for_another_symbol() {
+            let pool = setup_test_db().await;
+            let error = preflight_placement(
+                &pool,
+                &PreflightPlacer {
+                    verdict: CounterTradePreflight::Allowed {
+                        reservation: Some(CounterTradeReservation::Equity {
+                            symbol: Symbol::new("MSFT").unwrap(),
+                            required: positive_shares("1"),
+                            available: FractionalShares::new(st0x_float_macro::float!(1)),
+                        }),
+                    },
+                    place: false,
+                },
+                &Symbol::new("AAPL").unwrap(),
+                positive_shares("1"),
+                Direction::Sell,
+                ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+            )
+            .await
+            .unwrap_err();
+
+            let mismatch = error
+                .downcast_ref::<PreflightReservationMismatch>()
+                .expect("equity reserved in another symbol must be a typed mismatch");
+            assert!(
+                matches!(
+                    mismatch,
+                    PreflightReservationMismatch::SellReservedOtherSymbol { symbol, reserved }
+                        if symbol == &Symbol::new("AAPL").unwrap()
+                            && reserved == &Symbol::new("MSFT").unwrap()
+                ),
+                "got: {mismatch}"
+            );
+        }
+
         /// Insufficient offchain equity inventory must defer the sell hedge
         /// (`None`): the shared preflight now reserves equity for sells too, so
         /// a sell can no longer bypass the available shares check.
@@ -3245,6 +3431,189 @@ pub mod process_tx {
                 shares,
                 positive_shares("1"),
                 "the persisted broker order must carry the floor clamped quantity"
+            );
+        }
+
+        /// The process-tx exit path for a deferred hedge, driven end to end: a
+        /// sell whose preflight skips must report `PreflightDeferred`, settle
+        /// the fill durably (acknowledged in the `OnChainTrade` aggregate and
+        /// dropped from the position pending acknowledgement set), and leave no
+        /// offchain order claim on the position for the standing pipeline to
+        /// trip over.
+        #[tokio::test]
+        async fn process_tx_sell_deferred_by_preflight_settles_the_fill_without_a_claim() {
+            let pool = setup_test_db().await;
+
+            let symbol = Symbol::new("AAPL").unwrap();
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+
+            // A 2 share buy nets +2, so the hedge is a Sell of 2 shares that the
+            // broker has no inventory to cover.
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(PreflightPlacer {
+                verdict: CounterTradePreflight::Skipped(
+                    CounterTradeSkipReason::InsufficientEquity {
+                        required: positive_shares("2"),
+                        available: FractionalShares::new(st0x_float_macro::float!(0)),
+                    },
+                ),
+                place: false,
+            });
+            let onchain_trade = onchain_trade_builder()
+                .with_block_number(42)
+                .with_amount(st0x_float_macro::float!(2))
+                .build();
+            let trade_id =
+                OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+            let position_trade_id = TradeId {
+                chain: onchain_trade.chain,
+                tx_hash: onchain_trade.tx_hash,
+                log_index: onchain_trade.log_index,
+            };
+
+            let outcome = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let ProcessTxOutcome::PreflightDeferred {
+                symbol: deferred_symbol,
+            } = &outcome
+            else {
+                panic!("a skipped sell preflight must defer the hedge, got: {outcome:?}");
+            };
+            assert_eq!(deferred_symbol, &symbol);
+
+            let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let onchain_state = onchain_trade_store
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .expect("the deferred fill must still be witnessed");
+            assert!(
+                onchain_state.is_acknowledged(),
+                "a deferred hedge must leave the fill acknowledged"
+            );
+
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let position = position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .expect("the position must exist after fill accounting");
+            assert!(
+                !position
+                    .pending_acknowledged_trade_ids
+                    .contains(&position_trade_id),
+                "a deferred hedge must settle the fill out of the pending acknowledgement set"
+            );
+            assert_eq!(
+                position.pending_offchain_order_id, None,
+                "a deferred hedge must claim no offchain order"
+            );
+        }
+
+        /// A sell handed a buying power reservation was never checked against
+        /// the equity the broker holds, so `process_found_trade` must fail
+        /// closed as an operational failure and claim no offchain order rather
+        /// than place the raw requested size.
+        #[tokio::test]
+        async fn process_tx_sell_fails_closed_on_a_buying_power_reservation() {
+            let pool = setup_test_db().await;
+
+            let symbol = Symbol::new("AAPL").unwrap();
+            let mut ctx = create_base_test_ctx();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Enabled,
+                    rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                },
+            );
+
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(PreflightPlacer {
+                verdict: CounterTradePreflight::Allowed {
+                    reservation: Some(CounterTradeReservation::BuyingPower {
+                        required: positive_shares("2"),
+                        estimated_cost_cents: 20_000,
+                        available_buying_power_cents: 100_000,
+                    }),
+                },
+                place: false,
+            });
+            let onchain_trade = onchain_trade_builder()
+                .with_block_number(42)
+                .with_amount(st0x_float_macro::float!(2))
+                .build();
+
+            let error = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+            let OperatorError::Operational(operational) = &error else {
+                panic!("a mismatched reservation must be an operational failure, got: {error}");
+            };
+            let mismatch = operational
+                .downcast_ref::<PreflightReservationMismatch>()
+                .expect("the operational failure must carry the typed mismatch");
+            assert!(
+                matches!(
+                    mismatch,
+                    PreflightReservationMismatch::SellReservedBuyingPower { symbol: refused }
+                        if refused == &symbol
+                ),
+                "got: {mismatch}"
+            );
+
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let position = position_store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .expect("the position must exist after fill accounting");
+            assert_eq!(
+                position.pending_offchain_order_id, None,
+                "a refused hedge must claim no offchain order"
             );
         }
 
