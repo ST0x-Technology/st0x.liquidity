@@ -4595,6 +4595,15 @@ impl<
                 }
             }
             Ok(None) if reburn_on_empty => {
+                // The recorded burn reverted, so its credit is still in the
+                // wallet. Clear the hash first so the ledger counts it again;
+                // the pre-broadcast clear in `submit_and_record_burn` is then
+                // a no-op.
+                self.cqrs
+                    .send(id, UsdcRebalanceCommand::ClearPendingBurn)
+                    .await?;
+                self.check_ethereum_credit_ledger(id).await;
+
                 self.burn_recording_pending(
                     id,
                     BridgeDirection::EthereumToBase,

@@ -4395,13 +4395,15 @@ The ledger is derived from open `UsdcRebalance` aggregates, never stored
 separately. A transfer is credited-not-yet-sent while its credited USDC sits in
 the Ethereum wallet: an AlpacaToBase `BridgingSubmitting` with a `burn_amount`
 and no broadcast burn, or a BaseToAlpaca `Bridged`. Right before an AlpacaToBase
-burn or a BaseToAlpaca deposit send, the bot reads the wallet's USDC balance and
-compares it with the outstanding total. A shortfall pages the operator
-(`operational_alert`); a surplus is logged as unattributed USDC. If an open
-aggregate cannot be read (unparseable id, failed load), the ledger cannot be
-derived and that pages too, naming the aggregate, because the shortfall check is
-off until it is fixed. A failed wallet balance read only warns. The check never
-blocks or fails a transfer.
+burn (including the reburn after a recorded burn reverted, which first clears
+the reverted hash so the transfer's credit counts again) or a BaseToAlpaca
+deposit send, the bot reads the wallet's USDC balance and compares it with the
+outstanding total. A shortfall pages the operator (`operational_alert`); a
+surplus is logged as unattributed USDC. If an open aggregate cannot be read
+(unparseable id, failed load), the ledger cannot be derived and that pages too,
+naming the aggregate, because the shortfall check is off until it is fixed. A
+failed wallet balance read only warns. The check never blocks or fails a
+transfer.
 
 ###### Fast Transfer Benefits
 
