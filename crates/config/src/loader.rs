@@ -1798,7 +1798,7 @@ fn validate_config(
             return Err(CtxError::MissingRebalancing);
         };
         RebalancingCtx::new(rebalancing)?;
-        rebalancing.allocation.validate(&config.chains)?;
+        rebalancing.allocation()?.validate(&config.chains)?;
 
         let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
 
@@ -1935,7 +1935,7 @@ fn parse_and_validate(
     };
 
     let rebalancing = Box::new(RebalancingCtx::new(&rebalancing_config)?);
-    rebalancing_config.allocation.validate(&config.chains)?;
+    rebalancing_config.allocation()?.validate(&config.chains)?;
 
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
 
@@ -2957,7 +2957,7 @@ pub fn test_issuance_status_ctx(base_url: Url) -> IssuanceStatusCtx {
 pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
     let config = RebalancingConfig {
         equity: None,
-        allocation: crate::AllocationConfig {
+        allocation: Some(crate::AllocationConfig {
             targets: std::collections::BTreeMap::from([(
                 st0x_evm::Chain::Base,
                 crate::TargetShare::new(float!(0.5))
@@ -2969,7 +2969,7 @@ pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
             min_operation_usd: st0x_execution::Positive::new(st0x_finance::Usdc::new(float!(1)))
                 .unwrap_or_else(|_| unreachable!("one dollar is positive")),
             cooldown_secs: 1,
-        },
+        }),
         usdc: crate::UsdcRebalancing::Disabled,
         inventory_staleness_bound_secs: 300,
         transfer_timeout_secs: 1800,

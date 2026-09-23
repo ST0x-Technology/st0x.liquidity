@@ -64,6 +64,11 @@ pub enum RebalancingCtxError {
          min_operation_usd and cooldown_secs"
     )]
     RetiredEquityThreshold,
+    #[error(
+        "[rebalancing.allocation] is required: set targets, alpaca_floor, deviation, \
+         min_operation_usd and cooldown_secs"
+    )]
+    MissingAllocation,
     #[error("[rebalancing.allocation]: {0}")]
     Allocation(#[from] AllocationConfigError),
     #[error("invalid wallet config: {0}")]
@@ -93,8 +98,10 @@ pub struct RebalancingConfig {
     #[serde(default)]
     pub(crate) equity: Option<IgnoredAny>,
     /// Per-chain equity allocation for the planner, validated against the
-    /// hedged chains at load.
-    pub allocation: AllocationConfig,
+    /// hedged chains at load. Required, but optional at parse time so a
+    /// stale config is refused by [`Self::allocation`] with the retired key
+    /// named instead of a bare missing field.
+    pub(crate) allocation: Option<AllocationConfig>,
     pub usdc: UsdcRebalancing,
     pub transfer_timeout_secs: u64,
     /// Per-attempt wall-clock bound for a single Base->Alpaca transfer job
@@ -161,6 +168,20 @@ pub struct RebalancingConfig {
     pub freeze_check: OperationMode,
 }
 
+impl RebalancingConfig {
+    /// The allocation table, refusing the retired `[rebalancing.equity]`
+    /// by name before a missing `[rebalancing.allocation]`.
+    pub(crate) fn allocation(&self) -> Result<&AllocationConfig, RebalancingCtxError> {
+        if self.equity.is_some() {
+            return Err(RebalancingCtxError::RetiredEquityThreshold);
+        }
+
+        self.allocation
+            .as_ref()
+            .ok_or(RebalancingCtxError::MissingAllocation)
+    }
+}
+
 fn default_inventory_staleness_bound_secs() -> u64 {
     300
 }
@@ -216,9 +237,7 @@ impl RebalancingCtx {
     /// Construct from config. Validates only rebalancing-specific
     /// trigger thresholds; wallet construction lives elsewhere.
     pub fn new(config: &RebalancingConfig) -> Result<Self, RebalancingCtxError> {
-        if config.equity.is_some() {
-            return Err(RebalancingCtxError::RetiredEquityThreshold);
-        }
+        let allocation = config.allocation()?;
         if config.transfer_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferTimeout);
         }
@@ -248,7 +267,7 @@ impl RebalancingCtx {
         }
 
         Ok(Self {
-            allocation: AllocationCtx::new(&config.allocation)?,
+            allocation: AllocationCtx::new(allocation)?,
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
             inventory_staleness_bound: Duration::from_secs(config.inventory_staleness_bound_secs),
@@ -433,12 +452,20 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
         assert!(
-            config.allocation.targets[&Chain::Base]
+            config.allocation().unwrap().targets[&Chain::Base]
                 .inner()
                 .eq(float!(0.5))
                 .unwrap()
         );
-        assert!(config.allocation.deviation.inner().eq(float!(0.2)).unwrap());
+        assert!(
+            config
+                .allocation()
+                .unwrap()
+                .deviation
+                .inner()
+                .eq(float!(0.2))
+                .unwrap()
+        );
 
         let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
             panic!("expected UsdcRebalancing::Enabled");
@@ -997,7 +1024,7 @@ mod tests {
         ))
         .unwrap();
 
-        let allocation = &config.allocation;
+        let allocation = config.allocation().unwrap();
         assert_eq!(allocation.targets.len(), 2);
         assert!(
             allocation.targets[&Chain::Base]
@@ -1212,7 +1239,7 @@ mod tests {
 
     #[test]
     fn allocation_section_is_required() {
-        let error = toml::from_str::<RebalancingConfig>(
+        let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
@@ -1226,11 +1253,13 @@ mod tests {
             mode = "disabled"
             "#,
         )
-        .unwrap_err();
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
 
         assert!(
-            error.message().contains("allocation"),
-            "expected the missing allocation section named, got: {error}"
+            matches!(error, RebalancingCtxError::MissingAllocation),
+            "expected the missing allocation section named, got {error:?}"
         );
     }
 }
