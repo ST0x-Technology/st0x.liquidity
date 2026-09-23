@@ -1728,14 +1728,45 @@ impl<
         self.require_withdrawal_tx_confirmed(id, withdrawal_tx, confirmed_at)
             .await?;
 
-        // Deadline-gated like the confirmation check: a persistent receipt-read
-        // failure must not redrive forever unbounded.
         let credited = match self
             .cctp_bridge
             .ethereum_usdc_credit(withdrawal_tx, self.market_maker_wallet)
             .await
         {
             Ok(credited) => credited,
+            // The receipt was read but its credit cannot be computed; a reread
+            // gives the same answer, so fail now instead of redriving.
+            Err(
+                error @ (CctpError::UsdcTransferLogDecode { .. }
+                | CctpError::UsdcCreditOverflow { .. }),
+            ) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    %withdrawal_tx,
+                    ?error,
+                    "Alpaca withdrawal tx credit cannot be computed; failing for operator \
+                     reconciliation"
+                );
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!(
+                                "withdrawal tx {withdrawal_tx} USDC credit cannot be \
+                                 computed: {error}; operator reconciliation required"
+                            ),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcTransferError::WithdrawalCreditUnreadable {
+                    id: id.clone(),
+                    tx: withdrawal_tx,
+                    source: Box::new(error),
+                });
+            }
+            // Deadline-gated like the confirmation check: a persistent receipt-read
+            // failure must not redrive forever unbounded.
             Err(error) => {
                 self.check_settlement_deadline(
                     id,
@@ -13708,7 +13739,11 @@ mod tests {
                 .unwrap_err();
 
             assert!(
-                !matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                matches!(
+                    &error,
+                    UsdcTransferError::WithdrawalCreditUnreadable { id: error_id, tx, .. }
+                        if *error_id == id && *tx == chain.mint_tx
+                ),
                 "a deterministic credit-read error must not redrive; got: {error:?}"
             );
             let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");

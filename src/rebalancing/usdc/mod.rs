@@ -326,6 +326,20 @@ pub enum UsdcTransferError {
         credited: U256,
         nominal: Usdc,
     },
+    /// The withdrawal tx receipt was read, but its USDC credit cannot be
+    /// computed (an undecodable Transfer log, or a sum that overflows). A reread
+    /// cannot change the receipt, so the aggregate is moved to `BridgingFailed`
+    /// for operator reconciliation; no burn is attempted.
+    #[error(
+        "USDC rebalance {id}: USDC credit of withdrawal tx {tx} cannot be computed; \
+         failed for operator reconciliation"
+    )]
+    WithdrawalCreditUnreadable {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        #[source]
+        source: Box<CctpError>,
+    },
     /// The retryable settlement wait outlived the configured settlement
     /// retry deadline (anchored on the durable `WithdrawalComplete`
     /// `confirmed_at`). `FailBridging` has already been sent by the time
@@ -488,6 +502,7 @@ impl UsdcTransferError {
             | Self::WithdrawalRefMustBeAlpacaId { .. }
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }
+            | Self::WithdrawalCreditUnreadable { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::SettlementCheckTransient { .. }
             | Self::MintRecoveryInconclusive { .. }
@@ -541,6 +556,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::WithdrawalRefMustBeAlpacaId { .. }
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }
+            | Self::WithdrawalCreditUnreadable { .. }
             | Self::SettlementRetryDeadlineElapsed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::SettlementCheckTransient { .. }

@@ -4352,6 +4352,11 @@ Alpaca to Base:
        treats this as a clean terminal with no redrive. A legacy
        `WithdrawalComplete` with no recorded tx hash also fails closed with
        `WithdrawalTxMissing`; it never falls back to the wallet balance.
+     - **credit cannot be computed** (an undecodable USDC `Transfer` log, or a
+       sum that overflows): a reread cannot change the receipt, so emit
+       `FailBridging` at once and surface `WithdrawalCreditUnreadable`, paged
+       with no redrive. Only receipt-read (RPC) failures stay on the
+       deadline-gated transient path.
 5. Ensure standing allowance to TokenMessenger (see above)
 6. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee (after
    allowance step to keep fee fresh across the cold-path ~30 s node-sync wait)

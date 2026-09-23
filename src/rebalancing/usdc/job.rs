@@ -1419,6 +1419,22 @@ impl TransferUsdcToMarketMaking {
                 );
                 deliver_market_making_alert(&ctx.notifier, &message, "withdrawal-credit").await;
             }
+            Err(UsdcTransferError::WithdrawalCreditUnreadable { id, tx, source }) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    %tx,
+                    error = ?source,
+                    "Alpaca->Base USDC transfer failed: withdrawal tx credit cannot be \
+                     computed; bridge marked failed for operator reconciliation"
+                );
+                let message = format!(
+                    "USDC transfer {id} failed: the USDC credit of withdrawal tx {tx} cannot \
+                     be computed ({source}). Bridge marked failed; manual operator \
+                     reconciliation required."
+                );
+                deliver_market_making_alert(&ctx.notifier, &message, "withdrawal-credit").await;
+            }
             Err(UsdcTransferError::WithdrawalTxMissing { id }) => {
                 error!(
                     target: "rebalance",
@@ -2151,6 +2167,7 @@ mod tests {
         SettlementDeadlineElapsed,
         PreviouslyFailed,
         WithdrawalCreditMismatch,
+        WithdrawalCreditUnreadable,
         WithdrawalTxMissing,
         /// Fail-closed burn-submission terminals: a burn may be in flight, so the
         /// job must NOT auto-redrive (a redrive could reburn).
@@ -2187,6 +2204,13 @@ mod tests {
                     tx: TxHash::from([0xEF; 32]),
                     credited: U256::ZERO,
                     nominal: Usdc::new(float!(1)),
+                },
+                Self::WithdrawalCreditUnreadable => UsdcTransferError::WithdrawalCreditUnreadable {
+                    id: id.clone(),
+                    tx: TxHash::from([0xEF; 32]),
+                    source: Box::new(CctpError::UsdcCreditOverflow {
+                        tx_hash: TxHash::from([0xEF; 32]),
+                    }),
                 },
                 Self::WithdrawalTxMissing => {
                     UsdcTransferError::WithdrawalTxMissing { id: id.clone() }
@@ -5907,6 +5931,47 @@ mod tests {
             messages[0].contains(&job.id.to_string())
                 && messages[0].contains("no recorded withdrawal tx hash"),
             "alert must name the transfer and the missing tx hash; got: {:?}",
+            messages[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn market_making_job_pages_without_redrive_on_withdrawal_credit_unreadable() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TerminalAlpacaToBase(
+                TerminalOutcome::WithdrawalCreditUnreadable,
+            )),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx)
+            .await
+            .expect("an uncomputable withdrawal credit is a clean terminal outcome");
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "an uncomputable withdrawal credit must not be redriven"
+        );
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly one alert expected; got: {messages:?}"
+        );
+        assert!(
+            messages[0].contains(&job.id.to_string()) && messages[0].contains("cannot be computed"),
+            "alert must name the transfer and the uncomputable credit; got: {:?}",
             messages[0]
         );
     }
