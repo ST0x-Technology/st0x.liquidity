@@ -2885,7 +2885,7 @@ impl<
     /// can never succeed (a message that cannot mint on this chain, or a
     /// consumed nonce whose mint is not in the bounded scan) latches
     /// `BridgingFailed`, which keeps the burn and nonce, so
-    /// `transfer reconcile --kind usdc` can settle it.
+    /// `transfer reconcile --kind usdc` can settle it, and pages.
     async fn handle_mint_scan_failure(
         &self,
         id: &UsdcRebalanceId,
@@ -2915,20 +2915,8 @@ impl<
             "Attested mint lookup cannot succeed; failing the bridge for operator \
              reconciliation: {error}"
         );
-        if let Err(send_error) = self
-            .cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::FailBridging {
-                    reason: format!("attested mint lookup failed: {error}"),
-                },
-            )
-            .await
-        {
-            return send_error.into();
-        }
-
-        UsdcTransferError::Cctp(Box::new(error))
+        let reason = format!("attested mint lookup failed: {error}");
+        self.latch_unresolvable_mint(id, reason, error).await
     }
 
     /// Latches a post-burn `BridgingFailed` (burn and nonce kept, so
