@@ -49,7 +49,7 @@ directly; `resume_bridging_submitting` scans first):
 A reusable `find_recent_usdc_transfer(from, to, amount, from_block)` helper on
 the CCTP bridge runs the scan with `eth_getLogs` on the USDC `Transfer` topic
 filtered by the indexed `from`/`to` and matching the exact value, mirroring the
-existing `find_recent_mint` / `find_recent_burn` scans.
+existing `find_recent_burn` scan.
 
 ## Crash-safety argument
 
