@@ -3528,11 +3528,12 @@ impl<
             Some(UsdcRebalance::BridgingFailed {
                 direction,
                 burn_tx_hash,
+                cctp_nonce,
                 initiated_at,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                self.recover_from_bridging_failed(id, burn_tx_hash, initiated_at)
+                self.recover_from_bridging_failed(id, burn_tx_hash, cctp_nonce, initiated_at)
                     .await
             }
 
@@ -3556,11 +3557,14 @@ impl<
     /// burn tx) has no mint to adopt and is left for manual reconciliation.
     ///
     /// BaseToAlpaca only (mint lands on Ethereum); an `AlpacaToBase`
-    /// `BridgingFailed` is still surfaced for manual reconciliation.
+    /// `BridgingFailed` is still surfaced for manual reconciliation. When an
+    /// attestation was recorded, the re-polled nonce must be `cctp_nonce`: a
+    /// mismatch is refused on every retry, never minted.
     async fn recover_from_bridging_failed(
         &self,
         id: &UsdcRebalanceId,
         burn_tx_hash: Option<TxHash>,
+        cctp_nonce: Option<B256>,
         initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
         let Some(burn_tx_hash) = burn_tx_hash else {
@@ -3606,6 +3610,18 @@ impl<
             }
             Err(error) => return Err(UsdcTransferError::Cctp(Box::new(error))),
         };
+
+        let reconstructed = attestation.nonce();
+        if let Some(recorded) = cctp_nonce
+            && reconstructed != recorded
+        {
+            warn!(target: "rebalance", %id, %reconstructed, %recorded, "Re-polled attestation nonce does not match the recorded cctp_nonce; not minting");
+            return Err(UsdcTransferError::AttestationNonceMismatch {
+                id: id.clone(),
+                recorded,
+                reconstructed,
+            });
+        }
 
         // Idempotent: if the nonce was already consumed, `mint` returns the
         // existing receipt via `recover_already_minted` instead of re-minting.
