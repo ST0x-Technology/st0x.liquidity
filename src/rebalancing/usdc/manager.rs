@@ -12850,6 +12850,54 @@ mod tests {
         );
     }
 
+    /// An AlpacaToBase retry finds a latched `BridgingFailed` and does not
+    /// alert, so a hard attestation poll error must page at the latch.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn alpaca_to_base_attestation_poll_hard_error_pages_the_operator() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx = TxHash::from([7u8; 32]);
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, usdc("1")).await;
+        cqrs.send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new()
+            .with_failing_repoll_on_consumed_nonce(|| CctpError::MessageTooShort { length: 0 });
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
+
+        let error = manager
+            .continue_alpaca_to_base_from_bridging(
+                &id,
+                U256::from(1_000_000u64),
+                burn_tx,
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UsdcTransferError::Cctp(cctp_error)
+                if matches!(**cctp_error, CctpError::MessageTooShort { length: 0 })),
+            "got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "got: {state:?}"
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the burned USDC cannot be minted automatically"
+        )));
+    }
+
     /// A `BridgingFailed` latched on a nonce mismatch must stay failed: the
     /// recovery re-polls Circle, and minting that answer would trust the very
     /// response the recorded `cctp_nonce` check rejected.
