@@ -982,7 +982,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// multi-minute recovery window would multiply its cost by the probe
     /// count for no benefit, since this cheap view call already gives an
     /// authoritative answer.
-    async fn is_nonce_used<Registry: IntoErrorRegistry>(
+    pub(super) async fn is_nonce_used<Registry: IntoErrorRegistry>(
         &self,
         nonce: B256,
     ) -> Result<bool, EvmError> {

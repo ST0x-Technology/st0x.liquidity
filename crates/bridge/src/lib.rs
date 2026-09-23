@@ -195,6 +195,15 @@ pub trait Bridge: Send + Sync + 'static {
         scan_from_block: Option<u64>,
     ) -> Result<Option<MintReceipt>, Self::Error>;
 
+    /// Returns whether `nonce` is consumed (`usedNonces`) on the mint
+    /// destination chain for `direction`: `true` once its mint has landed.
+    /// Needs only the nonce, for a resume that has no message envelope yet.
+    async fn mint_nonce_consumed(
+        &self,
+        direction: BridgeDirection,
+        nonce: B256,
+    ) -> Result<bool, Self::Error>;
+
     /// Returns the current head of the mint destination chain for `direction`.
     /// Captured when the attestation is recorded -- before the mint -- as the
     /// floor of [`Bridge::find_attested_mint`]'s scan.
