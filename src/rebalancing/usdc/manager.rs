@@ -52,10 +52,6 @@ const BURN_RECORD_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Alpaca accepts USD conversion notionals only to whole-cent precision.
 const USD_CONVERSION_NOTIONAL_DECIMAL_PLACES: u8 = 2;
 
-/// Ambient USDC tolerated in the public market-maker wallet. USDC has six
-/// decimals, so 10,000 base units is 0.01 USDC.
-const AMBIENT_DUST_THRESHOLD: U256 = U256::from_limbs([10_000, 0, 0, 0]);
-
 /// A definitive Alpaca `40310000` placement rejection creates no order, so it
 /// is safe to retry this many times inside one durable conversion attempt. The
 /// 2026-08-25 incident missed the balance eleven times and succeeded on the
@@ -798,7 +794,6 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
-        preflight_balance: U256,
     ) -> Result<Usdc, UsdcTransferError> {
         let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
@@ -819,7 +814,6 @@ impl<
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: correlation_id.clone(),
-                    preflight_balance,
                 },
             )
             .await?;
@@ -1976,61 +1970,8 @@ impl<
 
         info!(target: "rebalance", %amount, "Starting Alpaca to Base rebalance");
 
-        // Pre-flight wallet check: ambient USDC above AMBIENT_DUST_THRESHOLD in
-        // the market-maker wallet violates the bounded-residue invariant.
-        // Refuse BEFORE the conversion (the first aggregate event), so the
-        // transfer is a true no-op: nothing to resume or
-        // reconcile, only a wallet sweep for the operator. Persist an accepted
-        // balance exactly and subtract it at settlement; tolerated dust is
-        // therefore never mistaken for the withdrawal or included in the burn.
-        // The fixed threshold raises the cost of pre-flight nuisance dusting but
-        // cannot prevent hostile transfers after the baseline read.
-        //
-        // Every failure inside this block maps to a pre-flight variant whose
-        // worker arm releases the guard: no aggregate exists yet, so any
-        // error that escaped to a generic terminal arm would latch the guard
-        // with nothing to ever clear it. Deliberately NOT
-        // `read_ethereum_usdc_balance`, whose `SettlementCheckTransient`
-        // contract assumes a durable post-withdrawal aggregate to redrive.
-        let preflight_balance = self
-            .cctp_bridge
-            .ethereum_usdc_balance(self.market_maker_wallet)
-            .await
-            .map_err(|error| UsdcTransferError::PreflightBalanceUnavailable {
-                id: id.clone(),
-                source: Box::new(UsdcTransferError::Cctp(Box::new(error))),
-            })?;
-        if preflight_balance > AMBIENT_DUST_THRESHOLD {
-            // The above-threshold balance is already established, so a failing
-            // display conversion must stay an ambient REFUSAL (page, release,
-            // no redrive) -- rerouting to the warn-only "balance could not be
-            // determined" would silently loop on a deterministic failure.
-            let balance = u256_to_usdc(preflight_balance).map_err(|error| {
-                UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable {
-                    id: id.clone(),
-                    raw: preflight_balance,
-                    source: Box::new(error),
-                }
-            })?;
-            error!(
-                target: "rebalance",
-                %id,
-                %balance,
-                nominal = %amount,
-                "Market-maker wallet already holds USDC; refusing to start \
-                 the Alpaca->Base rebalance before any Alpaca call"
-            );
-            return Err(UsdcTransferError::WalletUsdcAmbientPreflight {
-                id: id.clone(),
-                balance,
-                nominal: amount,
-            });
-        }
-
         // Convert USD to USDC - use the actual received amount for subsequent steps
-        let usdc_amount = self
-            .execute_usd_to_usdc_conversion(id, amount, preflight_balance)
-            .await?;
+        let usdc_amount = self.execute_usd_to_usdc_conversion(id, amount).await?;
 
         let transfer = self.initiate_alpaca_withdrawal(id, usdc_amount).await?;
 
@@ -5725,7 +5666,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -5822,7 +5762,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -6692,7 +6631,7 @@ mod tests {
         let amount = usdc("1000");
 
         manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .unwrap();
 
@@ -6752,7 +6691,7 @@ mod tests {
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let received = manager
-            .execute_usd_to_usdc_conversion(&id, usdc("69.38"), U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
             .await
             .unwrap();
 
@@ -6906,7 +6845,7 @@ mod tests {
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let received = manager
-            .execute_usd_to_usdc_conversion(&id, usdc("69.38"), U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
             .await
             .unwrap();
 
@@ -6961,7 +6900,7 @@ mod tests {
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let error = manager
-            .execute_usd_to_usdc_conversion(&id, usdc("69.38"), U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
             .await
             .unwrap_err();
 
@@ -7001,7 +6940,7 @@ mod tests {
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let error = manager
-            .execute_usd_to_usdc_conversion(&id, usdc("69.38"), U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
             .await
             .unwrap_err();
 
@@ -7071,7 +7010,7 @@ mod tests {
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let error = manager
-            .execute_usd_to_usdc_conversion(&id, usdc("69.38"), U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
             .await
             .unwrap_err();
 
@@ -7129,7 +7068,7 @@ mod tests {
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let received = manager
-            .execute_usd_to_usdc_conversion(&id, usdc("9794.02"), U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, usdc("9794.02"))
             .await
             .unwrap();
         assert_eq!(received, usdc("9794.019706"));
@@ -7204,7 +7143,7 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         let zero_error = manager
-            .execute_usd_to_usdc_conversion(&id, usdc("0"), U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, usdc("0"))
             .await
             .unwrap_err();
         assert!(
@@ -7213,7 +7152,7 @@ mod tests {
         );
 
         let negative_error = manager
-            .execute_usd_to_usdc_conversion(&id, usdc("-5"), U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, usdc("-5"))
             .await
             .unwrap_err();
         assert!(
@@ -7398,7 +7337,7 @@ mod tests {
         let amount = usdc("1000");
 
         manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .unwrap();
     }
@@ -7448,9 +7387,7 @@ mod tests {
 
         assert!(
             matches!(
-                manager
-                    .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
-                    .await,
+                manager.execute_usd_to_usdc_conversion(&id, amount).await,
                 Err(UsdcTransferError::AlpacaBrokerApi(
                     AlpacaBrokerApiError::CryptoOrderFailed {
                         reason: CryptoOrderFailureReason::Canceled,
@@ -7626,7 +7563,7 @@ mod tests {
         let amount = usdc("1000");
 
         manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .unwrap_err();
 
@@ -7639,7 +7576,6 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                    preflight_balance: U256::ZERO,
                 },
             )
             .await;
@@ -7707,7 +7643,7 @@ mod tests {
         let amount = usdc("1000");
 
         let error = manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .unwrap_err();
 
@@ -7791,7 +7727,7 @@ mod tests {
         let amount = usdc("1000");
 
         manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .unwrap_err();
 
@@ -8009,9 +7945,7 @@ mod tests {
 
         assert!(
             matches!(
-                manager
-                    .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
-                    .await,
+                manager.execute_usd_to_usdc_conversion(&id, amount).await,
                 Err(UsdcTransferError::AlpacaBrokerApi(
                     AlpacaBrokerApiError::CryptoOrderFailed {
                         reason: CryptoOrderFailureReason::Expired,
@@ -8049,7 +7983,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -8085,7 +8018,7 @@ mod tests {
         assert!(
             matches!(
                 manager
-                    .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+                    .execute_usd_to_usdc_conversion(&id, amount)
                     .await,
                 Err(UsdcTransferError::Aggregate(error))
                     if matches!(
@@ -8144,7 +8077,7 @@ mod tests {
         });
 
         manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .unwrap_err();
 
@@ -8157,7 +8090,6 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                    preflight_balance: U256::ZERO,
                 },
             )
             .await;
@@ -8214,7 +8146,7 @@ mod tests {
         );
 
         manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .unwrap();
 
@@ -8277,7 +8209,7 @@ mod tests {
         let requested_amount = usdc("1000");
 
         let received_amount = manager
-            .execute_usd_to_usdc_conversion(&id, requested_amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, requested_amount)
             .await
             .unwrap();
 
@@ -8331,9 +8263,7 @@ mod tests {
 
         assert!(
             matches!(
-                manager
-                    .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
-                    .await,
+                manager.execute_usd_to_usdc_conversion(&id, amount).await,
                 Err(UsdcTransferError::MissingFilledAveragePrice { .. })
             ),
             "Missing fill price should fail the conversion"
@@ -8401,9 +8331,7 @@ mod tests {
 
         assert!(
             matches!(
-                manager
-                    .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
-                    .await,
+                manager.execute_usd_to_usdc_conversion(&id, amount).await,
                 Err(UsdcTransferError::MissingFilledQuantity { .. })
             ),
             "Missing fill quantity should fail the conversion"
@@ -8980,7 +8908,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -9691,7 +9618,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -9764,7 +9690,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: requested,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -9834,7 +9759,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: usdc("9794.02"),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -9944,7 +9868,7 @@ mod tests {
         });
 
         let error = manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .unwrap_err();
 
@@ -9995,7 +9919,7 @@ mod tests {
         );
 
         let received = manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .expect("an exact-minimum conversion must not be refused");
 
@@ -10025,7 +9949,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -10132,7 +10055,7 @@ mod tests {
 
         let clock = tokio::spawn(skip_conversion_poll_deadlines());
         let error = manager
-            .execute_usd_to_usdc_conversion(&id, amount, U256::ZERO)
+            .execute_usd_to_usdc_conversion(&id, amount)
             .await
             .unwrap_err();
         clock.abort();
@@ -11360,7 +11283,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -12261,7 +12183,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -12873,11 +12794,8 @@ mod tests {
     }
 
     /// Deploys an Ethereum chain whose USDC token holds `balance` for the
-    /// market-maker wallet and builds a manager against it. The pre-flight
-    /// wallet-empty check reads this balance before any Alpaca call, so any
-    /// test that enters `execute_alpaca_to_base` needs real token code even
-    /// when the balance is zero (a codeless USDC address errors the read).
-    /// The chain rides along in the return value to keep its anvil alive.
+    /// market-maker wallet and builds a manager against it. The chain rides
+    /// along in the return value to keep its anvil alive.
     async fn build_manager_with_wallet_balance(
         server: &MockServer,
         market_maker_wallet: Address,
@@ -12934,12 +12852,12 @@ mod tests {
     }
 
     /// Stages the aggregate at `WithdrawalComplete` (AlpacaToBase direction)
-    /// with the supplied persisted Ethereum wallet baseline.
-    async fn advance_to_withdrawal_complete_alpaca_to_base_with_preflight(
+    /// confirmed with `withdrawal_tx`.
+    async fn advance_to_withdrawal_complete_alpaca_to_base_confirming(
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
         amount: Usdc,
-        preflight_balance: U256,
+        withdrawal_tx: Option<TxHash>,
     ) {
         use UsdcRebalanceCommand::*;
 
@@ -12949,7 +12867,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance,
             },
         )
         .await
@@ -12972,14 +12889,9 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(
-            id,
-            ConfirmWithdrawal {
-                withdrawal_tx: None,
-            },
-        )
-        .await
-        .unwrap();
+        cqrs.send(id, ConfirmWithdrawal { withdrawal_tx })
+            .await
+            .unwrap();
     }
 
     async fn advance_to_withdrawal_complete_alpaca_to_base(
@@ -12987,8 +12899,7 @@ mod tests {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
-        advance_to_withdrawal_complete_alpaca_to_base_with_preflight(cqrs, id, amount, U256::ZERO)
-            .await;
+        advance_to_withdrawal_complete_alpaca_to_base_confirming(cqrs, id, amount, None).await;
     }
 
     /// Hypothesis: when Alpaca deducts a withdrawal fee, the withdrawal tx pays
@@ -13494,13 +13405,11 @@ mod tests {
         whitelist_mock.assert();
     }
 
-    /// Hypothesis: a zero wallet balance satisfies the pre-flight
-    /// wallet-empty check and the flow proceeds into the conversion and
-    /// withdrawal legs. The downstream whitelist rejection proves the
-    /// pre-flight was passed: the conversion order was placed and the
-    /// withdrawal path was reached.
+    /// Hypothesis: with an empty wallet the flow proceeds into the conversion
+    /// and withdrawal legs. The downstream whitelist rejection proves the
+    /// conversion order was placed and the withdrawal path was reached.
     #[tokio::test]
-    async fn execute_alpaca_to_base_proceeds_past_preflight_when_wallet_empty() {
+    async fn execute_alpaca_to_base_starts_with_an_empty_wallet() {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
         let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
 
@@ -13536,59 +13445,8 @@ mod tests {
                 error,
                 UsdcTransferError::AlpacaWallet(AlpacaWalletError::AddressNotWhitelisted { .. })
             ),
-            "an empty wallet must pass pre-flight and fail downstream at the \
+            "an empty wallet must start the transfer and fail downstream at the \
              whitelist; got: {error:?}"
-        );
-        conversion_mock.assert();
-        whitelist_mock.assert();
-    }
-
-    /// Ambient USDC at exactly AMBIENT_DUST_THRESHOLD is accepted and recorded
-    /// as the settlement baseline. The flow proceeds into the conversion and
-    /// withdrawal legs, proven by the same downstream whitelist rejection as
-    /// the empty-wallet case. The threshold raises the cost of blocking the
-    /// pre-flight check; it does not prevent hostile transfers after the read.
-    #[tokio::test]
-    async fn execute_alpaca_to_base_tolerates_dust_at_threshold() {
-        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
-        let chain =
-            deploy_ethereum_usdc_chain_with_balance(AMBIENT_DUST_THRESHOLD, market_maker_wallet)
-                .await;
-
-        let server = MockServer::start();
-        let (manager, _cqrs) =
-            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
-
-        let conversion_mock =
-            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
-        let _get_order_mock = create_get_order_mock(
-            &server,
-            "61e7b016-9c91-4a97-b912-615c9d365c9d",
-            "filled",
-            "1000",
-        );
-        let whitelist_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([]));
-        });
-
-        let id = UsdcRebalanceId(Uuid::new_v4());
-
-        let error = manager
-            .execute_alpaca_to_base(&id, usdc("1000"))
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                UsdcTransferError::AlpacaWallet(AlpacaWalletError::AddressNotWhitelisted { .. })
-            ),
-            "dust at the threshold must pass pre-flight (not WalletUsdcAmbientPreflight) \
-             and fail downstream at the whitelist; got: {error:?}"
         );
         conversion_mock.assert();
         whitelist_mock.assert();
@@ -13623,45 +13481,13 @@ mod tests {
         amount: Usdc,
         withdrawal_tx: TxHash,
     ) {
-        use UsdcRebalanceCommand::*;
-
-        cqrs.send(
+        advance_to_withdrawal_complete_alpaca_to_base_confirming(
+            cqrs,
             id,
-            InitiateConversion {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount,
-                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
-            },
+            amount,
+            Some(withdrawal_tx),
         )
-        .await
-        .unwrap();
-        cqrs.send(
-            id,
-            ConfirmConversion {
-                conversion: par_conversion(amount),
-            },
-        )
-        .await
-        .unwrap();
-        cqrs.send(
-            id,
-            Initiate {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount,
-                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            },
-        )
-        .await
-        .unwrap();
-        cqrs.send(
-            id,
-            ConfirmWithdrawal {
-                withdrawal_tx: Some(withdrawal_tx),
-            },
-        )
-        .await
-        .unwrap();
+        .await;
     }
 
     /// The Ethereum wallet is shared, so USDC it holds beyond this withdrawal
@@ -13718,42 +13544,6 @@ mod tests {
         };
         assert_eq!(direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(burn_amount, Some(usdc("998")));
-    }
-
-    /// Hypothesis: when the pre-flight balance read itself fails (RPC down),
-    /// the transfer surfaces `PreflightBalanceUnavailable` and stays a true
-    /// no-op -- no Alpaca call, no aggregate event -- so the trigger can
-    /// simply retry on its next cycle.
-    #[tokio::test]
-    async fn execute_alpaca_to_base_returns_preflight_balance_unavailable_on_rpc_failure() {
-        let server = MockServer::start();
-        let (manager, cqrs) = build_manager_with_dead_rpc(&server).await;
-
-        let conversion_mock =
-            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
-
-        let id = UsdcRebalanceId(Uuid::new_v4());
-
-        let error = manager
-            .execute_alpaca_to_base(&id, usdc("1000"))
-            .await
-            .unwrap_err();
-
-        let UsdcTransferError::PreflightBalanceUnavailable { id: err_id, .. } = error else {
-            panic!(
-                "a pre-flight balance-read failure must surface \
-                 PreflightBalanceUnavailable; got: {error:?}"
-            );
-        };
-        assert_eq!(err_id, id);
-
-        conversion_mock.assert_calls(0);
-
-        let state = cqrs.load(&id).await.unwrap();
-        assert!(
-            state.is_none(),
-            "a pre-flight read failure must emit no aggregate event; got: {state:?}"
-        );
     }
 
     /// Hypothesis: a pre-commit burn failure (burn tx REVERTS on-chain) does NOT
@@ -13917,7 +13707,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14004,7 +13793,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14098,7 +13886,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14190,7 +13977,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14260,7 +14046,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14350,7 +14135,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14453,7 +14237,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14554,7 +14337,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14651,7 +14433,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14738,7 +14519,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -14872,7 +14652,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -15501,7 +15280,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await
@@ -19161,7 +18939,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: U256::ZERO,
             },
         )
         .await

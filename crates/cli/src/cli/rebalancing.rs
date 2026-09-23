@@ -662,7 +662,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
             source.backpressure().is_none()
         }
         // Terminal for this CLI invocation: deadlines elapsed, terminal
-        // aggregate states, pre-flight refusals, and genuine errors.
+        // aggregate states, and genuine errors.
         // Enumerated exhaustively so a new variant forces a conscious
         // classification here instead of silently defaulting to "do not hand
         // off" -- a new worker-redriven wait that lands in this arm by
@@ -705,9 +705,6 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::WithdrawalRefMustBeAlpacaId { .. }
         | UsdcTransferError::WithdrawalTxMissing { .. }
         | UsdcTransferError::WithdrawalCreditMismatch { .. }
-        | UsdcTransferError::WalletUsdcAmbientPreflight { .. }
-        | UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable { .. }
-        | UsdcTransferError::PreflightBalanceUnavailable { .. }
         | UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
         | UsdcTransferError::BurnRecordTaskFailed { .. }
         | UsdcTransferError::BurnRecordFailed { .. }
@@ -3114,7 +3111,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xB0B1)),
-                preflight_balance: U256::ZERO,
             },
             UsdcRebalanceCommand::ConfirmConversion {
                 conversion: ConversionAmounts::new(amount, amount),
@@ -4132,7 +4128,6 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                    preflight_balance: U256::ZERO,
                 },
             )
             .await
@@ -4879,7 +4874,6 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xC01D_0001)),
-                    preflight_balance: U256::ZERO,
                 },
             )
             .await

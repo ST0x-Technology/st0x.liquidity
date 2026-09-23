@@ -536,10 +536,6 @@ time. Who touches it, and when:
   reaches a clearable terminal. Guard-holding terminals (post-burn failures, any
   AlpacaToBase `BridgingFailed`, `DepositFailed`) keep it latched until
   `transfer reconcile` settles them.
-- **Clear (worker)**: exactly one worker path releases it -- a pre-flight
-  refusal (`WalletUsdcAmbientPreflight` / `PreflightBalanceUnavailable`) emits
-  no aggregate event, so the worker releases through a durable-checked handle
-  that keeps the latch whenever any persisted rebalance still holds the guard.
 - **Restart**: the atomic resets to false; `recover_usdc_guard` re-derives it
   from durable state (`holds_rebalance_guard`) and re-arms resumable jobs.
 - **Single-flight for manual commands**: the resume endpoint refuses while any
