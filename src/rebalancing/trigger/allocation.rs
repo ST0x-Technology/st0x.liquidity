@@ -22,7 +22,9 @@ use crate::inventory::VenueBalance;
 use crate::position::PriceObservation;
 
 /// One symbol's inventory and limits across every venue the caller could
-/// vouch for. A chain gets a slot only when it is hedged, polled and fresh;
+/// vouch for.
+///
+/// A chain gets a slot only when it is hedged, polled and fresh;
 /// the planner never guesses a missing venue, and a listing chain without a
 /// slot declines the symbol rather than sizing it against a partial total.
 #[derive(Debug, Clone)]
@@ -159,9 +161,10 @@ impl Candidate {
     }
 }
 
-/// Picks at most one operation for the symbol: the guards first, then the
-/// best-ranked candidate that survives the gas, cooldown, floor and minimum
-/// size checks. A missing or stale price declines the symbol before any
+/// Picks at most one operation for the symbol.
+///
+/// The guards run first, then the best-ranked candidate that survives the
+/// gas, cooldown, floor and minimum size checks wins. A missing or stale price declines the symbol before any
 /// candidate is tried; a per-chain drop on a higher-ranked candidate only
 /// outranks a later `FloorCapped`.
 pub fn plan_equity_operation(input: &EquityPlanInput) -> Result<EquityPlan, EquityPlanError> {
