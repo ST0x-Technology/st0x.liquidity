@@ -186,9 +186,7 @@ rebalancing = "disabled"
 # Robinhood equities, addresses from st0x.registry
 # token-lists/robinhood.json (tokenized_equity = unwrappedAddress,
 # tokenized_equity_derivative = the wt token). Their broker policy tables
-# [assets.equities.<SYM>] are shared with Base. PLBY and GRND already had
-# live orders and funded 0xfab vaults here; without these tables their fills
-# were recorded but never hedged.
+# [assets.equities.<SYM>] are shared with Base.
 
 [chains.robinhood.trading.assets.equities.DNUT]
 trading = "enabled"
