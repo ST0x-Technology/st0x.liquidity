@@ -29,6 +29,8 @@ use st0x_config::{BrokerCtx, ChainEquities, ChainEquityAsset, OperationMode};
 use st0x_event_sorcery::{DomainEvent, EventSourced};
 use st0x_evm::Chain;
 use st0x_execution::{AlpacaBrokerApiMode, Direction, FractionalShares, Positive, Symbol};
+#[cfg(test)]
+use st0x_execution::{CounterTradePreflight, CounterTradeReservation, MarketOrder};
 
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
 use crate::onchain::OnchainTrade;
@@ -174,6 +176,38 @@ pub fn try_rebalancing_enabled_equities(symbols: &[&str]) -> anyhow::Result<Chai
 #[cfg(test)]
 pub fn rebalancing_enabled_equities(symbols: &[&str]) -> ChainEquities {
     try_rebalancing_enabled_equities(symbols).expect("test symbols must be valid")
+}
+
+/// The preflight verdict a broker-backed `OrderPlacer` answers a counter trade
+/// with: a sell reserves equity inventory in the symbol it sells, a buy
+/// reserves cash buying power. The `OrderPlacer` default allows with no
+/// reservation at all, and every config resolves to
+/// `SupportedExecutor::AlpacaBrokerApi`, so a test placer that keeps the
+/// default is refused by the process-tx placement preflight as an unreserved
+/// Alpaca placement. Stand-in placers that are meant to reach the broker
+/// answer with this instead.
+///
+/// The reservation approves exactly the requested size, so a fixture's hedge
+/// is never clamped, and prices a buy at the 150 USDC per share the onchain
+/// trade fixtures fill at.
+#[cfg(test)]
+pub(crate) fn reserving_counter_trade_preflight(order: &MarketOrder) -> CounterTradePreflight {
+    let reservation = match order.direction {
+        Direction::Sell => CounterTradeReservation::Equity {
+            symbol: order.symbol.clone(),
+            required: order.shares,
+            available: order.shares.inner(),
+        },
+        Direction::Buy => CounterTradeReservation::BuyingPower {
+            required: order.shares,
+            estimated_cost_cents: 15_000,
+            available_buying_power_cents: 10_000_000,
+        },
+    };
+
+    CounterTradePreflight::Allowed {
+        reservation: Some(reservation),
+    }
 }
 
 /// Broker ctx whose Alpaca mode points at an in-process mock server (e.g.

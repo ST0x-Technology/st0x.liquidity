@@ -21,7 +21,7 @@ use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use st0x_config::{BrokerCtx, Ctx, HedgedChain, OpsApiConfig};
 use st0x_dto::{
@@ -2767,7 +2767,7 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
     let poll_status_queue = handle.poll_status_queue.clone();
     let poll_interval = handle.poll_interval;
     tokio::spawn(async move {
-        process_tx::process_tx(
+        let result = process_tx::process_tx(
             tx_hash,
             &ctx,
             &pool,
@@ -2777,7 +2777,15 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
             Some(&counter_trade_submission_lock),
             Some((&poll_status_queue, poll_interval)),
         )
-        .await
+        .await;
+        // The request future may already be gone (client disconnect drops the
+        // JoinHandle), so the outcome is recorded here rather than only where
+        // it is rendered into a response.
+        match &result {
+            Ok(report) => debug!(%tx_hash, outcome = ?report.outcome, "process-tx finished"),
+            Err(error) => error!(%tx_hash, %error, "process-tx failed"),
+        }
+        result
     })
     .await
     .map_err(|error| {
@@ -3229,7 +3237,8 @@ mod tests {
     use crate::rebalancing::equity::ChainServicesMissing;
     use crate::rebalancing::usdc::UsdcTransferError;
     use crate::test_utils::{
-        TEST_POLL_INTERVAL, get_test_order, seed_get_test_order_token_symbols, setup_test_pools,
+        TEST_POLL_INTERVAL, get_test_order, reserving_counter_trade_preflight,
+        seed_get_test_order_token_symbols, setup_test_pools,
     };
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef};
@@ -7755,6 +7764,14 @@ mod tests {
         ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
             panic!("process-tx placement must not cancel")
         }
+
+        async fn preflight_counter_trade_with_reserved_buying_power(
+            &self,
+            order: MarketOrder,
+            _reserved: BuyingPowerReservationCents,
+        ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(reserving_counter_trade_preflight(&order))
+        }
     }
 
     /// Aborting the HTTP request future after the broker placement has begun
@@ -7764,9 +7781,11 @@ mod tests {
     /// -- a mocked provider decodes a tradeable fill, and the published
     /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify` -- aborts
     /// the request once placement has begun, and asserts the placement still
-    /// finishes. Awaiting the workload inline instead of the detached
-    /// `tokio::spawn(...).await` would cancel the parked placement and
-    /// hang `finished`, which is the regression this test guards.
+    /// finishes and that the detached task records its own outcome. Awaiting
+    /// the workload inline instead of the detached `tokio::spawn(...).await`
+    /// would cancel the parked placement and hang `finished`, which is the
+    /// regression this test guards.
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn process_tx_task_survives_request_cancellation() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -7888,6 +7907,16 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), finished.notified())
             .await
             .expect("the detached broker placement must finish after request cancellation");
+
+        // The request future was aborted before the workload finished, so the
+        // detached task's own log is the only record of what it did.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !logs_contain("process-tx finished") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the detached run must record its outcome without a request awaiting it");
     }
 
     /// An operational failure from the process-tx workload maps to a 500 through

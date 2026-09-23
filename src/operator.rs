@@ -2969,8 +2969,9 @@ pub mod process_tx {
         };
         use crate::position::{AnchorDisposition, Position, PositionCommand, TradeId};
         use crate::test_utils::{
-            OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order, try_positive_shares,
-            try_setup_test_db, try_setup_test_pools,
+            OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_order,
+            reserving_counter_trade_preflight, try_positive_shares, try_setup_test_db,
+            try_setup_test_pools,
         };
         use crate::trading::onchain::inclusion::EmittedOnChain;
         use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -4184,6 +4185,15 @@ pub mod process_tx {
             ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
                 Err("broker rejected the cancellation".into())
             }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                order: MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(reserving_counter_trade_preflight(&order))
+            }
         }
 
         /// `OrderPlacer` that always returns a successful placement, used to drive
@@ -4225,6 +4235,15 @@ pub mod process_tx {
                 _executor_order_id: &ExecutorOrderId,
             ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
                 Err("unexpected cancellation from process-tx test order placer".into())
+            }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                order: MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(reserving_counter_trade_preflight(&order))
             }
         }
 
@@ -6160,6 +6179,15 @@ pub mod process_tx {
             ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
                 panic!("deferred admission must not cancel")
             }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                order: MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(reserving_counter_trade_preflight(&order))
+            }
         }
 
         /// Broker admission deferring a fresh placement must not collapse into a
@@ -6334,6 +6362,15 @@ pub mod process_tx {
             ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
                 panic!("a rejected admission must not cancel")
             }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                order: MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(reserving_counter_trade_preflight(&order))
+            }
         }
 
         /// A broker admission that errors (not a schedule deferral) leaves the
@@ -6501,6 +6538,15 @@ pub mod process_tx {
                 _executor_order_id: &ExecutorOrderId,
             ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
                 panic!("a rate limited placement must not cancel")
+            }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                order: MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(reserving_counter_trade_preflight(&order))
             }
         }
 
@@ -7304,6 +7350,15 @@ pub mod process_tx {
                 // preserved anchor has no broker order: the later placement
                 // releases the anchor and sizes a fresh hedge.
                 Ok(None)
+            }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                order: MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(reserving_counter_trade_preflight(&order))
             }
         }
 

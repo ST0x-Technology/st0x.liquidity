@@ -39,7 +39,7 @@ use crate::offchain::order::PollOrderStatus;
 use crate::offchain::order::{
     CounterTradeOrderKind, JobError, OffchainOrder, OffchainOrderFailureKind, OffchainOrderId,
     OffchainOrderPlacement, OrderPlacer, PendingRecoveryAction, PollOrderStatusJobQueue,
-    RetirePendingError, classify_pending_recovery, client_order_id_for_placement,
+    classify_pending_recovery, client_order_id_for_placement,
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
     push_poll_job_if_absent, retire_never_sent_pending,
 };
@@ -1246,15 +1246,7 @@ async fn recover_pending_poll_status(
                         &symbol,
                         pending_id,
                     )
-                    .await
-                    .map_err(|error| match error {
-                        RetirePendingError::OffchainOrder(source) => {
-                            TradeAccountingError::OffchainOrderCommand(source)
-                        }
-                        RetirePendingError::Position(source) => {
-                            TradeAccountingError::PositionCommand(source)
-                        }
-                    })?;
+                    .await?;
 
                     return Ok(ClaimOutcome::NothingClaimed);
                 }

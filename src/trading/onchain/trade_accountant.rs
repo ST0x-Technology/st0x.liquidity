@@ -33,7 +33,7 @@ use crate::conductor::job::{
 use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
-use crate::offchain::order::PlaceOffchainOrderError;
+use crate::offchain::order::{PlaceOffchainOrderError, RetirePendingError};
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
 use crate::vault_registry::VaultRegistry;
@@ -683,6 +683,18 @@ pub enum TradeAccountingError {
     },
     #[error("Broker idempotency anchor for {symbol} is extended-hours but has no limit price")]
     BrokerAnchorMissingLimitPrice { symbol: st0x_execution::Symbol },
+}
+
+/// Retiring a never sent `process-tx` intent fails through the same two
+/// aggregates the rest of this error already carries, so the recovery paths
+/// propagate it with `?` instead of restating the mapping at each call site.
+impl From<RetirePendingError> for TradeAccountingError {
+    fn from(error: RetirePendingError) -> Self {
+        match error {
+            RetirePendingError::OffchainOrder(source) => Self::OffchainOrderCommand(source),
+            RetirePendingError::Position(source) => Self::PositionCommand(source),
+        }
+    }
 }
 
 /// A failure re-deriving an order kind after the position is already claimed.

@@ -461,10 +461,11 @@ pub struct TradeProcessingCqrs {
     /// self-perpetuating chain.
     pub poll_interval: Duration,
     /// Test-only coordination hook: pauses the first placement between its
-    /// Position claim and the `OffchainOrder` creation, and signals when a
-    /// racer's reconciliation observes the pending pointer. Lets a test pin the
-    /// exact double-hedge window deterministically instead of relying on
-    /// scheduler timing. `None` in production and in tests that do not use it.
+    /// Position claim and the `OffchainOrder` creation, announces each tick
+    /// arriving at the submission lock, and signals when a racer's
+    /// reconciliation observes the pending pointer. Lets a test pin the exact
+    /// double-hedge window deterministically instead of relying on scheduler
+    /// timing. `None` in production and in tests that do not use it.
     #[cfg(any(test, feature = "test-support"))]
     pub placement_barrier: Option<Arc<PlacementBarrier>>,
 }
@@ -474,6 +475,10 @@ pub struct TradeProcessingCqrs {
 /// at [`Self::on_first_claim`] until [`Self::release`] is signalled, holding
 /// the window open so a concurrent reconciliation is guaranteed to observe the
 /// orphan pointer it would otherwise only see under an unlucky schedule.
+///
+/// A racer announces itself at [`Self::on_submission_lock`] before contending
+/// for the lock, so a test can wait for one named tick to arrive rather than
+/// guess how long its fill accounting takes.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct PlacementBarrier {
@@ -481,6 +486,8 @@ pub struct PlacementBarrier {
     claimed: tokio::sync::Notify,
     release: tokio::sync::Notify,
     saw_pending: tokio::sync::Notify,
+    submission_lock_arrivals: std::sync::Mutex<std::collections::HashSet<OnChainTradeId>>,
+    submission_lock_arrival: tokio::sync::Notify,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -506,6 +513,18 @@ impl PlacementBarrier {
         self.saw_pending.notify_one();
     }
 
+    /// Called by a tick that has finished accounting its fill and is about to
+    /// contend for `counter_trade_submission_lock`. Keyed by the fill so a
+    /// test waits for one specific racer rather than for whichever tick
+    /// reached the lock first.
+    fn on_submission_lock(&self, trade_id: &OnChainTradeId) {
+        self.submission_lock_arrivals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(trade_id.clone());
+        self.submission_lock_arrival.notify_waiters();
+    }
+
     /// Awaits the first claimer parking.
     pub async fn wait_claimed(&self) {
         self.claimed.notified().await;
@@ -514,6 +533,24 @@ impl PlacementBarrier {
     /// Awaits a racer observing the pending pointer.
     pub async fn wait_saw_pending(&self) {
         self.saw_pending.notified().await;
+    }
+
+    /// Awaits the tick hedging `trade_id` reaching the submission lock. The
+    /// arrival is recorded before the wait registers, so an arrival that has
+    /// already happened returns immediately instead of hanging.
+    pub async fn wait_submission_lock(&self, trade_id: &OnChainTradeId) {
+        loop {
+            let arrival = self.submission_lock_arrival.notified();
+            if self
+                .submission_lock_arrivals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(trade_id)
+            {
+                return;
+            }
+            arrival.await;
+        }
     }
 
     /// Releases the parked claimer.
@@ -4816,6 +4853,15 @@ where
 
     let configured_executor = executor.to_supported_executor();
 
+    // Test hook: announce that this fill has been accounted and is about to
+    // contend for the submission lock, so a race test can line its racers up
+    // at the lock instead of guessing how long accounting takes. No-op unless
+    // a test installs the barrier.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(barrier) = &cqrs.placement_barrier {
+        barrier.on_submission_lock(&trade_id);
+    }
+
     // Serialize the whole reconcile -> claim -> placement sequence against the
     // in-bot process-tx path (ADR 0014). Both sides hold this lock across
     // `Position::PlaceOffChainOrder` (the claim) and `OffchainOrder::Place`
@@ -5655,6 +5701,7 @@ async fn recover_claimed_offchain_order_for_symbol(
             shares,
             direction,
             executor,
+            provenance,
             ..
         }) => {
             if executor != configured_executor {
@@ -5675,6 +5722,52 @@ async fn recover_claimed_offchain_order_for_symbol(
                 .and_then(|position| position.last_failed_offchain_order_id);
             let client_order_id = client_order_id_for_placement(pending_id, anchor);
 
+            // A `process-tx` intent is recorded before broker admission, so it
+            // may be one the broker never received (ADR 0022). Reconcile it
+            // against the broker before replaying stale terms: an order under
+            // the same key is adopted by the re-drive below, a confirmed
+            // absence retires the intent so the standing position check
+            // re-hedges from a fresh preflight, and a lookup that cannot be
+            // answered leaves the claim for the next sweep.
+            match classify_pending_recovery(
+                cqrs.order_placer.as_ref(),
+                executor,
+                provenance,
+                &client_order_id,
+            )
+            .await
+            {
+                Ok(PendingRecoveryAction::Replay) => {}
+                Ok(PendingRecoveryAction::Retire) => {
+                    warn!(
+                        offchain_order_id = %pending_id,
+                        symbol = %position_symbol,
+                        "process-tx placement intent has no broker order under its client order \
+                         id -- retiring it so the position check re-hedges from a fresh preflight"
+                    );
+                    retire_never_sent_pending(
+                        &cqrs.offchain_order,
+                        &cqrs.position,
+                        position_symbol,
+                        pending_id,
+                    )
+                    .await?;
+
+                    return Ok(None);
+                }
+                Err(error) => {
+                    warn!(
+                        offchain_order_id = %pending_id,
+                        symbol = %position_symbol,
+                        %error,
+                        "Could not reconcile the process-tx placement intent against the broker; \
+                         leaving it claimed for the next recovery sweep"
+                    );
+
+                    return Ok(Some(pending_id));
+                }
+            }
+
             let placement_result = place_offchain_order_at_broker(
                 &cqrs.offchain_order,
                 cqrs.order_placer.as_ref(),
@@ -5685,7 +5778,8 @@ async fn recover_claimed_offchain_order_for_symbol(
                     direction,
                     executor,
                     client_order_id,
-                ),
+                )
+                .with_provenance(provenance),
             )
             .await;
             let placed = match placement_result {
@@ -10615,6 +10709,7 @@ mod tests {
         let event_b = make_trade_event(20);
         let fill_a = test_trade_with_amount(float!(1.5), 10);
         let fill_b = test_trade_with_amount(float!(1.5), 20);
+        let trade_id_b = OnChainTradeId::new(fill_b.chain, fill_b.tx_hash, fill_b.log_index);
 
         let tick = |event: EmittedOnChain<RaindexTradeEvent>, fill: OnchainTrade| {
             let cqrs = cqrs.clone();
@@ -10631,6 +10726,18 @@ mod tests {
         barrier.wait_claimed().await;
 
         let b = tick(event_b, fill_b);
+        // Line B up at the lock first: it accounts, acknowledges, and settles
+        // its own fill before contending, so without this checkpoint the
+        // bounded window below can elapse while B is still accounting and the
+        // assertion would hold without the race ever running. The checkpoint
+        // names B's fill, so A's earlier arrival cannot satisfy it.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            barrier.wait_submission_lock(&trade_id_b),
+        )
+        .await
+        .expect("the second tick must reach the submission lock");
+
         // Give the second tick a bounded chance to reconcile inside the pinned
         // window. Under the fix it is blocked on the lock and this elapses;
         // without the fix it reconciles and signals immediately.
@@ -15720,6 +15827,209 @@ mod tests {
             lookups.load(Ordering::SeqCst),
             0,
             "a live pipeline intent must not be reconciled against the broker"
+        );
+    }
+
+    /// Answers which executor the bot is configured for, and a closed market.
+    /// Nothing else is reached: the claim recovery runs before pricing or
+    /// placement, and the closed session ends the tick right after it.
+    struct AlpacaConfiguredExecutor;
+
+    #[derive(Clone)]
+    struct AlpacaConfiguredExecutorCtx;
+
+    #[async_trait::async_trait]
+    impl st0x_execution::TryIntoExecutor for AlpacaConfiguredExecutorCtx {
+        type Executor = AlpacaConfiguredExecutor;
+
+        async fn try_into_executor(
+            self,
+        ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
+            unreachable!("the configured-executor stub is constructed directly")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for AlpacaConfiguredExecutor {
+        type Error = st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
+        type OrderId = String;
+        type Ctx = AlpacaConfiguredExecutorCtx;
+
+        async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
+            unreachable!("the configured-executor stub is constructed directly")
+        }
+
+        /// Closed, so the retirement's released exposure is left to the
+        /// standing position check rather than re-hedged inline: the test then
+        /// observes the recovery decision alone.
+        async fn is_market_open(&self) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+
+        async fn place_market_order(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+            unreachable!("claim reconciliation must not place through the executor")
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: st0x_execution::LimitOrder,
+        ) -> Result<st0x_execution::OrderPlacement<Self::OrderId>, Self::Error> {
+            unreachable!("claim reconciliation must not place through the executor")
+        }
+
+        async fn cancel_order(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<st0x_execution::CancellationOutcome, Self::Error> {
+            unreachable!("claim reconciliation must not cancel")
+        }
+
+        async fn get_order_status(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<st0x_execution::OrderState, Self::Error> {
+            unreachable!("claim reconciliation must not poll order status")
+        }
+
+        fn to_supported_executor(&self) -> SupportedExecutor {
+            SupportedExecutor::AlpacaBrokerApi
+        }
+
+        fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
+            Ok(order_id_str.to_owned())
+        }
+
+        async fn get_inventory(&self) -> Result<st0x_execution::InventoryResult, Self::Error> {
+            unreachable!("claim reconciliation must not read inventory")
+        }
+
+        async fn preflight_counter_trade_at_price(
+            &self,
+            _order: MarketOrder,
+            _limit_price: Positive<Usd>,
+        ) -> Result<st0x_execution::CounterTradePreflight, Self::Error> {
+            unreachable!("claim reconciliation must not preflight")
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_claim_recovery_retires_a_process_tx_pending_the_broker_never_received() {
+        // The third recovery path: a fill for a symbol whose position is still
+        // claimed by a `process-tx` intent, reconciled under the schedule
+        // enabled close flatten branch. The broker holds nothing under the
+        // client order id, so the intent must be retired (ADR 0022) instead of
+        // replayed with its stale shares and reservation terms.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let config = toml::from_str(
+            r#"
+                mode = "enabled"
+                environment = "staging"
+                poll_interval_secs = 5
+                request_timeout_secs = 3
+                response_freshness_secs = 30
+                calendar_max_age_secs = 7200
+                evidence_clock_skew_secs = 2
+                emergency_buffer_secs = 900
+                [[scopes]]
+                id = "extended"
+                profile_revision = "v1"
+                extended_hours = true
+                assets = ["AAPL"]
+            "#,
+        )
+        .unwrap();
+        let schedule = crate::trading_schedule::TradingScheduleStore::load(config, pool.clone())
+            .await
+            .unwrap();
+        cqrs.close_flatten_policy = CloseFlattenPolicy::from_secs(900)
+            .unwrap()
+            .with_schedule(Some(Arc::new(schedule)));
+        assert!(
+            cqrs.close_flatten_policy.schedule_enabled(),
+            "the claim recovery branch under test only runs for a schedule-enabled policy"
+        );
+
+        let placements = Arc::new(AtomicUsize::new(0));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        cqrs.order_placer = Arc::new(RecoveryProbePlacer {
+            broker_order: None,
+            placements: placements.clone(),
+            lookups: lookups.clone(),
+        });
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let pending_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+        cqrs.offchain_order
+            .send(
+                &pending_id,
+                OffchainOrderCommand::PlaceReserved {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(pending_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                    buying_power_reservation: None,
+                    placed_at: None,
+                    provenance: PlacementProvenance::ProcessTx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let placed = process_queued_trade(
+            &AlpacaConfiguredExecutor,
+            &make_trade_event(91),
+            test_trade_with_amount(float!(1.5), 91),
+            &cqrs,
+            &assets,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            placed, None,
+            "retiring the claimed intent must not report a placed hedge"
+        );
+        assert_eq!(
+            placements.load(Ordering::SeqCst),
+            0,
+            "an intent the broker never received must not be sent to the broker"
+        );
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            1,
+            "the retirement decision must rest on exactly one broker lookup"
+        );
+
+        let OffchainOrder::Failed { kind, .. } = cqrs
+            .offchain_order
+            .load(&pending_id)
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("a process-tx intent the broker never received must be retired");
+        };
+        assert_eq!(kind, OffchainOrderFailureKind::Deferral);
+
+        let recovered_position = cqrs.position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(recovered_position.pending_offchain_order_id, None);
+        assert_eq!(
+            recovered_position.last_failed_offchain_order_id, None,
+            "an id the broker never saw must not be kept as the idempotency anchor"
         );
     }
 
