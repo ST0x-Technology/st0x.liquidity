@@ -163,6 +163,7 @@ pub fn try_rebalancing_enabled_equities(symbols: &[&str]) -> anyhow::Result<Chai
                         rebalancing: OperationMode::Enabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
+                        target_share: None,
                     },
                 ))
             })

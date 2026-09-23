@@ -126,6 +126,7 @@ impl<P> TestInfra<P> {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 };
                 let Ok(symbol_key) = Symbol::new(symbol.clone()) else {
                     panic!("Invalid test symbol: {symbol}");

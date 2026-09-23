@@ -33,7 +33,7 @@ pub enum InventoryError<T> {
 
 /// Balance at a single venue, tracking available and inflight amounts.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct VenueBalance<T> {
+pub struct VenueBalance<T> {
     /// Assets ready for use at this venue.
     available: T,
     /// Assets that have left this venue but haven't yet arrived at the
@@ -49,18 +49,18 @@ where
         + Copy
         + std::fmt::Display,
 {
-    pub(super) fn total(self) -> Result<T, FloatError> {
+    pub fn total(self) -> Result<T, FloatError> {
         self.available + self.inflight
     }
 
-    pub(super) fn new(available: T, inflight: T) -> Self {
+    pub fn new(available: T, inflight: T) -> Self {
         Self {
             available,
             inflight,
         }
     }
 
-    pub(super) fn available(self) -> T {
+    pub fn available(self) -> T {
         self.available
     }
 

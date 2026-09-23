@@ -1016,6 +1016,7 @@ mod tests {
             rebalancing: OperationMode::Enabled,
             wrapped_equity_recovery: recovery_mode,
             operational_limit: None,
+            target_share: None,
         };
         let mut equities = ChainEquities::default();
         equities

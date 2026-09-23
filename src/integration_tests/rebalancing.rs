@@ -224,6 +224,7 @@ fn test_trigger_config() -> RebalancingServiceConfig {
                         rebalancing: OperationMode::Enabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
+                        target_share: None,
                     },
                 )]),
             },

@@ -1343,6 +1343,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         let registry_id = crate::vault_registry::VaultRegistryId {
@@ -2021,6 +2022,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         ctx.chains.primary_mut().assets = ChainAssets {
@@ -2161,6 +2163,7 @@ mod tests {
                             rebalancing: OperationMode::Disabled,
                             wrapped_equity_recovery: OperationMode::Disabled,
                             operational_limit,
+                            target_share: None,
                         },
                     )]),
                 },
@@ -2388,6 +2391,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         ctx.chains.primary_mut().assets = ChainAssets {
@@ -2525,6 +2529,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         ctx.chains.primary_mut().assets = ChainAssets {

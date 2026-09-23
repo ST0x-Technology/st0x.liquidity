@@ -33,10 +33,11 @@ use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
-    AlertsConfig, AlertsCtx, BotGasValuationConfig, ChainConfig, ChainEquityAsset, ChainRegistry,
-    ChainSecrets, ExecutionThreshold, HedgingAssets, InvalidThresholdError, OperationMode,
-    OrchestratorConfig, PricingConfig, PricingCtx, PricingCtxError, RebalancingConfig,
-    RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx,
+    AlertsConfig, AlertsCtx, AllocationConfigError, BotGasValuationConfig, ChainConfig,
+    ChainEquityAsset, ChainRegistry, ChainSecrets, ExecutionThreshold, HedgingAssets,
+    InvalidThresholdError, OperationMode, OrchestratorConfig, PricingConfig, PricingCtx,
+    PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig,
+    TelemetryCtx,
 };
 
 /// Alpaca minimum execution threshold: $2.
@@ -1797,6 +1798,9 @@ fn validate_config(
             return Err(CtxError::MissingRebalancing);
         };
         RebalancingCtx::new(rebalancing)?;
+        if let Some(allocation) = &rebalancing.allocation {
+            allocation.validate(&config.chains)?;
+        }
 
         let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
 
@@ -1933,6 +1937,9 @@ fn parse_and_validate(
     };
 
     let rebalancing = Box::new(RebalancingCtx::new(&rebalancing_config)?);
+    if let Some(allocation) = &rebalancing_config.allocation {
+        allocation.validate(&config.chains)?;
+    }
 
     let log_format = config.log_format.unwrap_or(LogFormat::Text);
 
@@ -2508,6 +2515,8 @@ pub enum CtxError {
     TradingSchedule(#[from] crate::TradingScheduleConfigError),
     #[error(transparent)]
     Rebalancing(Box<RebalancingCtxError>),
+    #[error("[rebalancing.allocation]: {0}")]
+    Allocation(#[from] AllocationConfigError),
     #[error(transparent)]
     Pricing(#[from] PricingCtxError),
     #[error("log_query_url_template must contain the {{id}} placeholder")]
@@ -2785,6 +2794,7 @@ impl CtxError {
     fn kind(&self) -> &'static str {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
+            Self::Allocation(_) => "equity allocation configuration error",
             Self::Pricing(_) => "pricing configuration error",
             Self::TradingSchedule(_) => "trading schedule configuration error",
             Self::MissingRebalancing => "missing [rebalancing] config section",
@@ -2954,6 +2964,7 @@ pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
 
     let config = RebalancingConfig {
         equity,
+        allocation: None,
         usdc: crate::UsdcRebalancing::Disabled,
         inventory_staleness_bound_secs: 300,
         transfer_timeout_secs: 1800,
@@ -9043,6 +9054,42 @@ mod tests {
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
             "expected ConfigToml, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_file_accepts_the_allocation_section() {
+        let config_str = format!(
+            "{}\n[rebalancing.allocation]\ntargets = {{ base = 0.5 }}\nalpaca_floor = 0.1\n\
+             deviation = 0.2\nmin_operation_usd = 100\ncooldown_secs = 600\n",
+            std::fs::read_to_string(example_config_toml()).unwrap()
+        );
+        let config = toml_file(&config_str);
+
+        Ctx::validate_config_file(config.path()).unwrap();
+    }
+
+    /// The allocation targets are checked against the chain tables by the
+    /// secrets-free validator, so the config-drift gate catches them.
+    #[test]
+    fn validate_config_file_refuses_an_allocation_target_on_an_unhedged_chain() {
+        let config_str = format!(
+            "{}\n[rebalancing.allocation]\ntargets = {{ hyperevm = 0.5 }}\nalpaca_floor = 0.1\n\
+             deviation = 0.2\nmin_operation_usd = 100\ncooldown_secs = 600\n",
+            std::fs::read_to_string(example_config_toml()).unwrap()
+        );
+        let config = toml_file(&config_str);
+
+        let error = Ctx::validate_config_file(config.path()).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::Allocation(AllocationConfigError::TargetOnUnhedgedChain {
+                    chain: Chain::HyperEvm
+                })
+            ),
+            "expected TargetOnUnhedgedChain, got {error:?}"
         );
     }
 
