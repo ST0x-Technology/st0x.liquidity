@@ -5316,7 +5316,7 @@ mod tests {
     };
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{Evm, EvmError, IERC20, NoOpErrorRegistry, Wallet};
+    use st0x_evm::{AbiDecodedErrorType, Evm, EvmError, IERC20, NoOpErrorRegistry, Wallet};
     use st0x_execution::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig};
     use st0x_raindex::{RaindexContracts, RaindexService};
 
@@ -13141,10 +13141,19 @@ mod tests {
             "resume from Attested must NOT re-emit ReceiveAttestation (the aggregate \
              rejects it from Attested); got: {error:?}",
         );
+        let UsdcTransferError::Cctp(cctp_error) = &error else {
+            panic!("resume from Attested should reach the CCTP mint lookup; got: {error:?}");
+        };
         assert!(
-            matches!(error, UsdcTransferError::Cctp(_)),
-            "resume from Attested should proceed past the gate to the CCTP mint and \
-             fail with a Cctp error; got: {error:?}",
+            matches!(
+                **cctp_error,
+                CctpError::MessageDestinationDomainMismatch {
+                    expected: 6,
+                    actual: 0
+                }
+            ),
+            "the mint lookup must reject the Ethereum-domain fixture for a Base mint; \
+             got: {cctp_error:?}",
         );
         assert_eq!(
             attestation_mock.calls(),
@@ -18314,6 +18323,59 @@ mod tests {
         assert!(
             matches!(state, UsdcRebalance::Attested { .. }),
             "aggregate must remain at Attested (no FailBridging emitted); got: {state:?}"
+        );
+    }
+
+    /// `usedNonces` is a getter that cannot revert, so a revert-shaped lookup
+    /// error is a provider artifact: the resume redrives instead of failing the
+    /// already-burned transfer.
+    #[tokio::test]
+    async fn revert_shaped_attested_mint_lookup_error_redrives() {
+        let (error, id, initiated_at, state) =
+            resume_attested_with_failing_mint_lookup(RebalanceDirection::BaseToAlpaca, || {
+                CctpError::Evm(EvmError::DecodedRevert(AbiDecodedErrorType::Unknown(vec![
+                    0x12, 0x34, 0x56, 0x78,
+                ])))
+            })
+            .await;
+
+        let UsdcTransferError::MintRecoveryInconclusive {
+            id: err_id,
+            initiated_at: err_initiated_at,
+            source,
+        } = error
+        else {
+            panic!("a revert-shaped lookup error must redrive; got: {error:?}");
+        };
+        assert_eq!(err_id, id);
+        assert_eq!(err_initiated_at, initiated_at);
+        assert!(source.is_revert(), "got: {source:?}");
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "got: {state:?}"
+        );
+    }
+
+    /// A message that can never mint on this chain fails at once: every
+    /// redrive would read the same bytes.
+    #[tokio::test]
+    async fn placeholder_nonce_attested_mint_lookup_fails_at_once() {
+        let (error, _, _, state) =
+            resume_attested_with_failing_mint_lookup(RebalanceDirection::AlpacaToBase, || {
+                CctpError::PlaceholderNonce
+            })
+            .await;
+
+        let UsdcTransferError::Cctp(cctp_error) = error else {
+            panic!("a placeholder nonce must not redrive; got: {error:?}");
+        };
+        assert!(
+            matches!(*cctp_error, CctpError::PlaceholderNonce),
+            "got: {cctp_error:?}"
+        );
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "got: {state:?}"
         );
     }
 
