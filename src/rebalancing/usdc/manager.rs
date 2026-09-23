@@ -13194,6 +13194,58 @@ mod tests {
         assert_eq!(burn_amount, Some(usdc("998")));
     }
 
+    /// An undercredited withdrawal still bridges what it credited, but the
+    /// shortfall pages: nothing else accounts for the USDC that left Alpaca.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn undercredited_withdrawal_alerts_the_operator() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(
+            U256::from(998_000_000u64),
+            market_maker_wallet,
+        )
+        .await;
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider.anvil_mine(Some(3), None).await.unwrap();
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, revert_bytecode)
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let nominal = usdc("1000");
+        advance_to_withdrawal_complete_alpaca_to_base_with_tx(&cqrs, &id, nominal, chain.mint_tx)
+            .await;
+
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                nominal,
+                Some(chain.mint_tx),
+                Utc::now(),
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "an undercredited withdrawal must still proceed to the burn; got: {error:?}"
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain("credited=998"));
+        assert!(logs_contain("requested=1000"));
+        assert!(logs_contain("shortfall=2"));
+    }
+
     /// A withdrawal tx that paid the market-maker wallet nothing is not this
     /// withdrawal's delivery: fail for reconciliation, never burn.
     #[tokio::test]
