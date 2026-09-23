@@ -13444,74 +13444,54 @@ mod tests {
         );
     }
 
-    /// Hypothesis: `execute_alpaca_to_base` refuses BEFORE any
-    /// Alpaca call when the market-maker wallet already holds USDC. Enforcing
-    /// the wallet-empty invariant only at settlement time pulls cash out of
-    /// Alpaca first and then strands the withdrawn USDC on Ethereum (the
-    /// 2026-07-10 incident: four aborted attempts, 5,359.671063 USDC
-    /// stranded). The pre-flight refusal must be a true no-op: no conversion
-    /// order, no withdrawal request, and no aggregate event -- nothing to
-    /// resume or reconcile.
-    ///
-    /// The ambient balance (50 USDC) is far above AMBIENT_DUST_THRESHOLD and
-    /// below the nominal. The pre-flight rule refuses it before any Alpaca call;
-    /// otherwise it would become an unattributable settlement baseline.
+    /// The Ethereum wallet is shared, so USDC no transfer is credited with
+    /// (dust, an operator top-up, a late refund) must not stop an
+    /// Alpaca->Base transfer from starting. The downstream whitelist rejection
+    /// proves the conversion was placed and the withdrawal leg reached.
     #[tokio::test]
-    async fn execute_alpaca_to_base_refuses_ambient_wallet_balance_before_any_alpaca_call() {
+    async fn execute_alpaca_to_base_starts_while_the_wallet_holds_unattributed_usdc() {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
 
-        let ambient_balance = U256::from(50_000_000u64); // 50 USDC, 6 decimals
+        let unattributed = U256::from(50_000_000u64); // 50 USDC, 6 decimals
         let chain =
-            deploy_ethereum_usdc_chain_with_balance(ambient_balance, market_maker_wallet).await;
+            deploy_ethereum_usdc_chain_with_balance(unattributed, market_maker_wallet).await;
 
         let server = MockServer::start();
-        let (manager, cqrs) =
+        let (manager, _cqrs) =
             build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
 
-        // Register the endpoints the flow would hit next; their hit counts
-        // prove no Alpaca call was made before the refusal.
         let conversion_mock =
             create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
-        let withdrawal_mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+        let _get_order_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "1000",
+        );
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!({}));
+                .json_body(json!([]));
         });
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let nominal = usdc("1000");
 
         let error = manager
-            .execute_alpaca_to_base(&id, nominal)
+            .execute_alpaca_to_base(&id, usdc("1000"))
             .await
             .unwrap_err();
 
-        let UsdcTransferError::WalletUsdcAmbientPreflight {
-            id: err_id,
-            balance,
-            nominal: err_nominal,
-        } = error
-        else {
-            panic!(
-                "Expected WalletUsdcAmbientPreflight from the pre-flight check \
-                 (ambient USDC must refuse before any Alpaca call); got: {error:?}"
-            );
-        };
-        assert_eq!(err_id, id);
-        assert_eq!(err_nominal, nominal);
-        assert_eq!(balance, usdc("50"));
-
-        conversion_mock.assert_calls(0);
-        withdrawal_mock.assert_calls(0);
-
-        let state = cqrs.load(&id).await.unwrap();
         assert!(
-            state.is_none(),
-            "a pre-flight refusal must emit NO aggregate event (true no-op, \
-             nothing to resume or reconcile); got: {state:?}"
+            matches!(
+                error,
+                UsdcTransferError::AlpacaWallet(AlpacaWalletError::AddressNotWhitelisted { .. })
+            ),
+            "unattributed wallet USDC must not refuse the start; got: {error:?}"
         );
+        conversion_mock.assert();
+        whitelist_mock.assert();
     }
 
     /// Hypothesis: a zero wallet balance satisfies the pre-flight
