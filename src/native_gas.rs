@@ -202,7 +202,7 @@ impl GasReadiness {
         }
 
         let reads = Arc::new(AtomicUsize::new(0));
-        let ready = Self::always_ready_for_test();
+        let static_readiness = Self::always_ready_for_test();
         let equity = ChainGasReadiness {
             balance_reader: Arc::new(CountingBalance(Arc::clone(&reads))),
             wallet: Address::ZERO,
@@ -211,8 +211,8 @@ impl GasReadiness {
         };
         let readiness = Self::new(
             equity,
-            ready.base.clone(),
-            ready.ethereum.clone(),
+            static_readiness.base.clone(),
+            static_readiness.ethereum.clone(),
             Duration::from_secs(1),
         );
 
