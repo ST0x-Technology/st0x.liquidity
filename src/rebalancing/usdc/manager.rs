@@ -4960,7 +4960,7 @@ mod tests {
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::local::PrivateKeySigner;
-    use alloy::sol_types::SolEvent;
+    use alloy::sol_types::{self, SolEvent};
     use httpmock::prelude::*;
     use proptest::prelude::*;
     use reqwest::StatusCode;
@@ -5560,11 +5560,11 @@ mod tests {
         }
     }
 
-    /// A `Bridge` decorator whose `ethereum_usdc_credit` always fails,
-    /// forwarding everything else to a wrapped real bridge: a withdrawal tx
-    /// that confirms but whose receipt cannot be read.
+    /// A `Bridge` decorator whose `ethereum_usdc_credit` always fails with
+    /// `credit_error`, forwarding everything else to a wrapped real bridge.
     struct CreditReadErrorBridge<InnerBridge> {
         inner: InnerBridge,
+        credit_error: fn(TxHash) -> CctpError,
     }
 
     #[async_trait::async_trait]
@@ -5686,13 +5686,12 @@ mod tests {
             self.inner.ethereum_usdc_balance(holder).await
         }
 
-        // The method under test: the withdrawal tx receipt read fails.
         async fn ethereum_usdc_credit(
             &self,
             tx_hash: TxHash,
             _recipient: Address,
         ) -> Result<U256, CctpError> {
-            Err(CctpError::TxReceiptMissingBlock { tx_hash })
+            Err((self.credit_error)(tx_hash))
         }
 
         async fn send_usdc_on_ethereum(
@@ -13589,7 +13588,10 @@ mod tests {
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
             alpaca_wallet,
-            Arc::new(CreditReadErrorBridge { inner: cctp_bridge }),
+            Arc::new(CreditReadErrorBridge {
+                inner: cctp_bridge,
+                credit_error: |tx_hash| CctpError::TxReceiptMissingBlock { tx_hash },
+            }),
             Arc::new(vault_service),
             cqrs.clone(),
             MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
@@ -13633,6 +13635,95 @@ mod tests {
             "deadline-elapsed settlement must land at pre-burn BridgingFailed; \
              got: {state:?}"
         );
+    }
+
+    /// A withdrawal receipt whose USDC credit cannot be computed fails the
+    /// same way on every read, so it must fail the transfer at once, well
+    /// before the settlement deadline, instead of redriving as a transient.
+    #[tokio::test]
+    async fn undecodable_or_overflowing_credit_fails_bridging_before_the_deadline() {
+        let credit_errors: [fn(TxHash) -> CctpError; 2] = [
+            |tx_hash| CctpError::UsdcTransferLogDecode {
+                tx_hash,
+                source: sol_types::Error::Overrun,
+            },
+            |tx_hash| CctpError::UsdcCreditOverflow { tx_hash },
+        ];
+
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
+                .await;
+        ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap()
+            .anvil_mine(Some(3), None)
+            .await
+            .unwrap();
+
+        for credit_error in credit_errors {
+            let server = MockServer::start();
+            let alpaca_broker = InstrumentedAlpacaBroker::new(
+                create_test_broker_service(&server).await,
+                TelemetrySender::disabled(),
+            );
+            let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+            let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+            let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+            let cqrs = create_test_store_instance().await;
+            let manager = CrossVenueCashTransfer::new(
+                alpaca_broker,
+                alpaca_wallet,
+                Arc::new(CreditReadErrorBridge {
+                    inner: cctp_bridge,
+                    credit_error,
+                }),
+                Arc::new(vault_service),
+                cqrs.clone(),
+                MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+                &test_settlement_params(),
+                BotGasReceiptCostEnqueuer::Disabled,
+            );
+
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let amount = usdc("1");
+            advance_to_withdrawal_complete_alpaca_to_base_with_tx(
+                &cqrs,
+                &id,
+                amount,
+                chain.mint_tx,
+            )
+            .await;
+
+            let error = manager
+                .continue_alpaca_to_base_from_withdrawal_complete(
+                    &id,
+                    amount,
+                    Some(chain.mint_tx),
+                    Utc::now(),
+                    Utc::now(),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(
+                !matches!(error, UsdcTransferError::SettlementCheckTransient { .. }),
+                "a deterministic credit-read error must not redrive; got: {error:?}"
+            );
+            let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+            assert!(
+                matches!(
+                    state,
+                    UsdcRebalance::BridgingFailed {
+                        burn_tx_hash: None,
+                        ..
+                    }
+                ),
+                "a deterministic credit-read error must land at pre-burn BridgingFailed; \
+                 got: {state:?}"
+            );
+        }
     }
 
     /// The Ethereum wallet is shared, so USDC no transfer is credited with
