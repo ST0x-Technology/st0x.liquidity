@@ -7,9 +7,10 @@
 use alloy::primitives::{Address, B256, TxHash, U256};
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError};
@@ -294,6 +295,14 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
     /// the USDC-to-Alpaca wallet transfer succeed (ADR 0017).
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
+    credit_ledger: CreditLedger,
+}
+
+/// Where the Ethereum wallet credit ledger reads the open transfers from.
+enum CreditLedger {
+    /// No pool supplied, so the check is skipped.
+    Unwired,
+    Wired(SqlitePool),
 }
 
 enum AttestationPollOutcome {
@@ -407,7 +416,27 @@ impl<
             reserved_cash: settlement.reserved_cash,
             gas_readiness: ConfiguredGasReadiness::default(),
             bot_gas_enqueuer,
+            credit_ledger: CreditLedger::Unwired,
         }
+    }
+
+    /// Checks the Ethereum wallet against the credits of the open transfers in
+    /// `pool` before each burn or deposit send.
+    #[must_use]
+    pub fn with_credit_ledger(mut self, pool: SqlitePool) -> Self {
+        self.credit_ledger = CreditLedger::Wired(pool);
+        self
+    }
+
+    /// Compares the USDC credited to open transfers and not yet sent with the
+    /// Ethereum wallet balance. Pages on a shortfall; never fails a transfer.
+    pub(crate) async fn check_ethereum_credit_ledger(&self, id: &UsdcRebalanceId) {
+        let CreditLedger::Wired(pool) = &self.credit_ledger else {
+            debug!(target: "rebalance", %id, "Ethereum credit ledger not wired; skipping check");
+            return;
+        };
+
+        todo!("check the open Ethereum credits in {pool:?} against the wallet balance")
     }
 
     /// Uses the supplied native-gas readiness check before starting a transfer.
@@ -3539,6 +3568,8 @@ impl<
         let deposit_address = self.fetch_alpaca_deposit_address(id).await?;
         let amount_u256 = usdc_to_u256(amount_received)?;
 
+        self.check_ethereum_credit_ledger(id).await;
+
         let send_tx = self
             .cctp_bridge
             .send_usdc_on_ethereum(deposit_address, amount_u256)
@@ -3604,6 +3635,8 @@ impl<
             .await?;
             return Ok(existing_tx);
         }
+
+        self.check_ethereum_credit_ledger(id).await;
 
         let send_tx = self
             .cctp_bridge
@@ -3817,6 +3850,8 @@ impl<
                 },
             )
             .await?;
+
+        self.check_ethereum_credit_ledger(id).await;
 
         let burn_receipt = self
             .burn_recording_pending(
@@ -13450,6 +13485,46 @@ mod tests {
         );
         conversion_mock.assert();
         whitelist_mock.assert();
+    }
+
+    /// The ledger pages when the Ethereum wallet holds less USDC than the open
+    /// transfers are credited with and have not yet sent.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn credit_ledger_pages_when_the_wallet_is_short_of_open_credits() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(40_000_000u64), market_maker_wallet)
+                .await;
+
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let manager = CrossVenueCashTransfer::new(
+            InstrumentedAlpacaBroker::new(
+                create_test_broker_service(&server).await,
+                TelemetrySender::disabled(),
+            ),
+            Arc::new(create_test_wallet_service(&server)),
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        )
+        .with_credit_ledger(pool);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), chain.mint_tx).await;
+
+        manager.check_ethereum_credit_ledger(&id).await;
+
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain("shortfall=59.95"));
     }
 
     /// Mints `amount` USDC to `recipient` on `chain` in its own transaction:
