@@ -12706,25 +12706,37 @@ mod tests {
         (error, id, state)
     }
 
-    /// A legacy `Attested` transfer whose mint already landed must not latch
-    /// `BridgingFailed` when the Circle re-poll fails: its recorded nonce is
-    /// consumed on chain, so the resume redrives and adopts that mint once
-    /// Circle answers.
+    /// A legacy `Attested` transfer whose mint landed but whose Circle re-poll
+    /// fails the same way every time can never adopt that mint (adoption needs
+    /// the message), so it latches a reconcilable `BridgingFailed` and pages
+    /// instead of redriving forever in `Attested`, which no CLI command accepts.
+    #[tracing_test::traced_test]
     #[tokio::test]
-    async fn legacy_attested_repoll_failure_does_not_fail_a_landed_mint() {
+    async fn legacy_attested_repeating_repoll_failure_latches_a_landed_mint_for_reconciliation() {
         let (error, id, state) = Box::pin(legacy_attested_repoll_failure(true)).await;
 
+        let UsdcTransferError::Cctp(cctp_error) = error else {
+            panic!("a repeating re-poll failure must not redrive, got: {error:?}");
+        };
         assert!(
-            matches!(
-                &error,
-                UsdcTransferError::MintRecoveryInconclusive { id: error_id, .. } if *error_id == id
-            ),
-            "a failed re-poll for a landed mint must redrive, got: {error:?}",
+            matches!(*cctp_error, CctpError::MalformedAttestation { .. }),
+            "got: {cctp_error:?}"
         );
-        assert!(
-            matches!(state, UsdcRebalance::Attested { .. }),
-            "a landed mint must not latch BridgingFailed on a Circle failure, got: {state:?}",
-        );
+        let UsdcRebalance::BridgingFailed {
+            burn_tx_hash,
+            cctp_nonce,
+            ..
+        } = &state
+        else {
+            panic!("the transfer must latch BridgingFailed for reconciliation, got: {state:?}");
+        };
+        assert!(burn_tx_hash.is_some(), "got: {state:?}");
+        assert!(cctp_nonce.is_some(), "got: {state:?}");
+        assert!(state.is_reconcilable_failure(), "got: {state:?}");
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
     }
 
     /// With the recorded nonce still unused, a hard re-poll failure fails the
