@@ -225,8 +225,8 @@ pub enum UsdcTransferError {
     },
     #[error(
         "USDC rebalance {id} recorded cctp_nonce {recorded} does not match nonce \
-         {reconstructed} re-derived from the persisted message envelope; failed for \
-         operator reconciliation rather than minting against an unverifiable nonce"
+         {reconstructed} of the persisted message envelope or the Circle re-poll; failed \
+         for operator reconciliation rather than minting against an unverifiable nonce"
     )]
     AttestationNonceMismatch {
         id: UsdcRebalanceId,

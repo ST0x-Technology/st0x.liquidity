@@ -879,7 +879,8 @@ impl<
     /// `Attested` resume deterministic and offline-capable. Transfers whose
     /// `BridgeAttestationReceived` predates the envelope field carry no message,
     /// so they fall back to re-polling Circle (idempotent for a completed
-    /// attestation).
+    /// attestation). Either way the response's nonce must be the recorded
+    /// `cctp_nonce`, the one the mint lookup and the mint key on.
     async fn attested_attestation_response(
         &self,
         id: &UsdcRebalanceId,
@@ -895,15 +896,17 @@ impl<
                 %id,
                 "Attested transfer predates envelope persistence; re-polling Circle for the attestation"
             );
-            return match self
+            let response = match self
                 .poll_cctp_attestation(id, mint_direction, burn_tx)
                 .await?
             {
-                AttestationPollOutcome::Received(response) => Ok(response),
+                AttestationPollOutcome::Received(response) => response,
                 AttestationPollOutcome::TimedOut => {
-                    Err(UsdcTransferError::AttestationTimedOut { id: id.clone() })
+                    return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
                 }
             };
+
+            return self.require_recorded_nonce(id, response, cctp_nonce).await;
         };
 
         info!(
@@ -936,33 +939,45 @@ impl<
             }
         };
 
-        // The nonce is persisted twice: standalone (`cctp_nonce`) and embedded in
-        // the envelope. Both originate from the same attestation, so a mismatch
-        // means the persisted record is internally inconsistent (storage
-        // corruption or manual repair). Refuse to mint against an unverifiable
-        // nonce; the burn is durable, so surface a terminal failure for operator
-        // reconciliation.
+        self.require_recorded_nonce(id, response, cctp_nonce).await
+    }
+
+    /// Returns `response` only if its nonce is the recorded `cctp_nonce`.
+    ///
+    /// The recorded nonce comes from the attestation recorded on `Attested`.
+    /// A rebuilt envelope or a Circle re-poll carrying another nonce means the
+    /// record and the response disagree (storage corruption, manual repair, or
+    /// a different message for the burn tx). Refuse to look up or mint against
+    /// an unverifiable nonce; the burn is durable, so surface a terminal
+    /// failure for operator reconciliation.
+    async fn require_recorded_nonce(
+        &self,
+        id: &UsdcRebalanceId,
+        response: AttestationResponse,
+        cctp_nonce: B256,
+    ) -> Result<AttestationResponse, UsdcTransferError> {
         let reconstructed = response.nonce();
-        if reconstructed != cctp_nonce {
-            warn!(target: "rebalance", %id, %reconstructed, recorded = %cctp_nonce, "Reconstructed attestation nonce does not match the recorded cctp_nonce");
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::FailBridging {
-                        reason: format!(
-                            "attestation nonce mismatch: reconstructed {reconstructed}, recorded {cctp_nonce}"
-                        ),
-                    },
-                )
-                .await?;
-            return Err(UsdcTransferError::AttestationNonceMismatch {
-                id: id.clone(),
-                recorded: cctp_nonce,
-                reconstructed,
-            });
+        if reconstructed == cctp_nonce {
+            return Ok(response);
         }
 
-        Ok(response)
+        warn!(target: "rebalance", %id, %reconstructed, recorded = %cctp_nonce, "Attestation nonce does not match the recorded cctp_nonce");
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: format!(
+                        "attestation nonce mismatch: reconstructed {reconstructed}, recorded {cctp_nonce}"
+                    ),
+                },
+            )
+            .await?;
+
+        Err(UsdcTransferError::AttestationNonceMismatch {
+            id: id.clone(),
+            recorded: cctp_nonce,
+            reconstructed,
+        })
     }
 
     async fn fail_conversion(
