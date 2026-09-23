@@ -4169,7 +4169,11 @@ enum BridgeStage { Burn, Attestation, Mint }
   burned. Transfers whose `BridgeAttestationReceived` predates the `message`
   field carry `None` and fall back to re-polling Circle: the attestation is
   permanently retrievable, so a timeout there retries until success rather than
-  failing (bounding it would strand recoverable funds). The
+  failing (bounding it would strand recoverable funds). The re-polled nonce is
+  cross-checked against the recorded `cctp_nonce` the same way. A hard re-poll
+  error marks `BridgingFailed` only when the destination chain reads the
+  recorded nonce unused; when the nonce reads consumed (the mint landed) or the
+  read fails, the resume redrives so a later attempt adopts the mint. The
   `attestation_retry_deadline` bounds only the `AwaitingAttestation` wait (where
   the attestation may never arrive).
 - Bridge mint transaction requires valid attestation
