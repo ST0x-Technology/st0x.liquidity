@@ -817,30 +817,50 @@ impl<
                 );
                 Ok(AttestationPollOutcome::TimedOut)
             }
-            Err(error) => Err(self.fail_bridging_on_poll_error(id, error).await),
+            Err(error) => Err(self
+                .fail_bridging_on_poll_error(id, direction, burn_tx, error)
+                .await),
         }
     }
 
     /// Latches `BridgingFailed` for a hard (non-timeout) attestation poll
-    /// error and returns the error to surface.
+    /// error and returns the error to surface. An AlpacaToBase latch pages: its
+    /// retry finds the transfer failed and does not alert, while a BaseToAlpaca
+    /// retry re-polls through the post-burn `BridgingFailed` recovery.
     async fn fail_bridging_on_poll_error(
         &self,
         id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
         error: CctpError,
     ) -> UsdcTransferError {
         warn!(target: "rebalance", %id, ?error, "Attestation polling failed");
 
+        let reason = format!("attestation polling failed: {error}");
         if let Err(send_error) = self
             .cqrs
             .send(
                 id,
                 UsdcRebalanceCommand::FailBridging {
-                    reason: format!("attestation polling failed: {error}"),
+                    reason: reason.clone(),
                 },
             )
             .await
         {
             return send_error.into();
+        }
+
+        match direction {
+            BridgeDirection::EthereumToBase => error!(
+                target: "operational_alert",
+                alert = true,
+                %id,
+                %burn_tx,
+                "USDC transfer {id}: the burned USDC cannot be minted automatically ({reason}). \
+                 Bridge marked failed; get the Circle attestation for burn tx {burn_tx}, mint \
+                 it on Base, then settle it with `transfer reconcile --kind usdc`."
+            ),
+            BridgeDirection::BaseToEthereum => {}
         }
 
         UsdcTransferError::Cctp(Box::new(error))
@@ -881,7 +901,9 @@ impl<
             .mint_nonce_consumed(mint_direction, cctp_nonce)
             .await
         {
-            Ok(false) => Err(self.fail_bridging_on_poll_error(id, error).await),
+            Ok(false) => Err(self
+                .fail_bridging_on_poll_error(id, mint_direction, burn_tx, error)
+                .await),
             // Adoption needs the re-polled message, so a repeating failure
             // would redrive in `Attested` forever with no CLI exit.
             Ok(true) if cctp_failure_repeats(&error) => {

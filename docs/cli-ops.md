@@ -651,6 +651,11 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   whose nonce is used but whose Circle re-poll keeps failing the same way (for
   example a malformed complete answer) is marked `BridgingFailed` the same way.
   Both latches page with "the CCTP mint cannot be resolved automatically".
+- An `AlpacaToBase` transfer whose Circle attestation poll fails hard (or, for a
+  legacy `Attested` transfer, whose re-poll fails with the nonce unused) is
+  marked `BridgingFailed` and pages with "the burned USDC cannot be minted
+  automatically". Nothing was minted: get the attestation for the burn tx, mint
+  it on Base, then reconcile with `--kind usdc`.
 - `--kind mint` / `--kind redemption` mark an equity transfer stuck in `Failed`
   as terminal `Reconciled`. This is a pure bookkeeping transition: it emits no
   reactor effect and dispatches no inventory update. One nuance for redemptions

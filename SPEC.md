@@ -4156,11 +4156,14 @@ enum BridgeStage { Burn, Attestation, Mint }
   checked between polls, so it can overshoot by up to one poll window plus the
   redrive delay. Structural failures detected _after_ a `complete` attestation
   is fetched (e.g. an all-zero placeholder nonce) fail the bridge immediately.
-  Failures _within_ the poll loop (HTTP errors, a still-`pending` or malformed
-  `complete` response) are retried and, once the per-poll attempts exhaust,
-  surface as the same retryable timeout -- so a malformed response is bounded by
-  the deadline rather than failing fast. (Failing fast on a definitively
-  malformed `complete` response is a tracked follow-up.)
+  For AlpacaToBase, whose retry then finds the transfer failed and does not
+  alert, this latch (and a legacy re-poll failure with the nonce unused) pages
+  the operator with "the burned USDC cannot be minted automatically". Failures
+  _within_ the poll loop (HTTP errors, a still-`pending` or malformed `complete`
+  response) are retried and, once the per-poll attempts exhaust, surface as the
+  same retryable timeout -- so a malformed response is bounded by the deadline
+  rather than failing fast. (Failing fast on a definitively malformed `complete`
+  response is a tracked follow-up.)
 - **Attested resume reconstructs the mint offline (no Circle re-poll)**: the
   mint needs the full CCTP message envelope, which `BridgeAttestationReceived`
   persists (the `message` field) alongside the attestation. Resuming from
