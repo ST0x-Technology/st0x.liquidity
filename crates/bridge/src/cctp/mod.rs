@@ -1802,6 +1802,7 @@ mod tests {
         provider: FlakyGetLogsProvider<InnerWallet::Provider>,
         remaining_revert_failures: AtomicU32,
         remaining_call_failures: AtomicU32,
+        remaining_stale_unused_reads: AtomicU32,
         call_count: Arc<AtomicU32>,
     }
 
@@ -1839,6 +1840,7 @@ mod tests {
                 provider,
                 remaining_revert_failures: AtomicU32::new(0),
                 remaining_call_failures: AtomicU32::new(failures.call_failures),
+                remaining_stale_unused_reads: AtomicU32::new(0),
                 call_count,
             }
         }
@@ -1865,6 +1867,13 @@ mod tests {
         /// Reports the chain head `head_offset` blocks above the real one.
         fn with_reported_head_offset(mut self, head_offset: u64) -> Self {
             self.provider.head_offset = head_offset;
+            self
+        }
+
+        /// Answers the first `stale_unused_reads` `usedNonces()` calls with
+        /// zero (unused), as a node behind the block holding the mint would.
+        fn with_stale_unused_reads(mut self, stale_unused_reads: u32) -> Self {
+            self.remaining_stale_unused_reads = AtomicU32::new(stale_unused_reads);
             self
         }
 
@@ -1935,6 +1944,17 @@ mod tests {
                         data: None,
                     }),
                 )));
+            }
+
+            let should_answer_stale = self
+                .remaining_stale_unused_reads
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+
+            if should_answer_stale {
+                return Ok(Call::abi_decode_returns(&[0u8; 32]).unwrap());
             }
 
             self.inner.call::<Registry, Call>(contract, call).await
@@ -4621,6 +4641,81 @@ mod tests {
         };
         assert_eq!(error_nonce, nonce);
         assert_eq!(from_block, head - lookback);
+    }
+
+    /// One `usedNonces()` read can come from a node behind the block that holds
+    /// the mint, so a single "unused" answer must not decide the nonce is
+    /// unused: that answer latches `BridgingFailed` on funds already minted.
+    #[tokio::test]
+    async fn mint_nonce_consumed_reads_past_a_lagging_unused_answer() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_400_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&cctp.ethereum_endpoint)
+            .await
+            .unwrap();
+        let ethereum = CctpEndpoint::new(
+            cctp.ethereum.usdc,
+            cctp.ethereum.token_messenger,
+            cctp.ethereum.message_transmitter,
+            RawPrivateKeyWallet::new(&cctp.deployer_key, ethereum_provider, 1).unwrap(),
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let lagging_base = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            FlakyProbeWallet::new(
+                RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+                FlakyProbeFailures::default(),
+                Arc::new(AtomicU32::new(0)),
+            )
+            .with_stale_unused_reads(1),
+        )
+        .with_node_sync_poll_interval(Duration::ZERO)
+        .with_mint_recovery_config(MintRecoveryConfig {
+            probe_interval: Duration::from_millis(5),
+            probes: NonZeroU32::new(3).unwrap(),
+        });
+        let lagging_bridge = CctpBridge::new(ethereum, lagging_base).unwrap();
+
+        let nonce = extract_nonce_from_message(&message_with_nonce).unwrap();
+        let consumed = lagging_bridge
+            .mint_nonce_consumed(BridgeDirection::EthereumToBase, nonce)
+            .await
+            .unwrap();
+
+        assert!(
+            consumed,
+            "a lagging node's unused answer must not hide a landed mint"
+        );
     }
 
     /// A failed head read leaves the reconstruction scan without a floor, so
