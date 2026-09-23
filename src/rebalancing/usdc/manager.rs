@@ -10048,6 +10048,53 @@ mod tests {
         );
     }
 
+    /// A legacy `Attested` transfer (no persisted envelope) re-polls Circle.
+    /// The nonce Circle answers with must be the one recorded at attestation;
+    /// otherwise the resume would look up and mint a nonce that is not this
+    /// transfer's.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn attested_attestation_response_without_message_rejects_a_repolled_nonce_mismatch() {
+        let server = MockServer::start();
+        let attestation_mock = mock_complete_attestation(&server);
+
+        let (manager, cqrs, _anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let burn_tx = advance_to_attested_base_to_alpaca(&cqrs, &id, amount).await;
+
+        // Circle answers with nonce 1 (`mock_complete_attestation`).
+        let recorded = B256::left_padding_from(&999u64.to_be_bytes());
+        let error = manager
+            .attested_attestation_response(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                burn_tx,
+                vec![0x01],
+                recorded,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AttestationNonceMismatch { recorded: error_recorded, reconstructed, .. }
+                    if error_recorded == recorded && reconstructed == valid_message_nonce()
+            ),
+            "a re-polled nonce mismatch must surface AttestationNonceMismatch, got: {error:?}",
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "a re-polled nonce mismatch must fail the bridge, got: {state:?}",
+        );
+        assert_eq!(attestation_mock.calls(), 1);
+    }
+
     #[tokio::test]
     async fn resume_base_to_alpaca_from_pre_burn_failure_returns_previously_failed_error() {
         let server = MockServer::start();
