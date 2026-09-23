@@ -647,7 +647,10 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   its burn tx and nonce kept, so `--kind usdc` accepts it. Find the mint on
   chain (the `MessageReceived` log for the recorded nonce) before you reconcile.
   For BaseToAlpaca, a later resume still retries the mint through the post-burn
-  `BridgingFailed` recovery.
+  `BridgingFailed` recovery. A legacy `Attested` transfer (no persisted message)
+  whose nonce is used but whose Circle re-poll keeps failing the same way (for
+  example a malformed complete answer) is marked `BridgingFailed` the same way.
+  This latch pages with "the CCTP mint cannot be resolved automatically".
 - `--kind mint` / `--kind redemption` mark an equity transfer stuck in `Failed`
   as terminal `Reconciled`. This is a pure bookkeeping transition: it emits no
   reactor effect and dispatches no inventory update. One nuance for redemptions

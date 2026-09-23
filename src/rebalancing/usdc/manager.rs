@@ -386,14 +386,16 @@ impl std::fmt::Display for MintScanCallSite {
     }
 }
 
-/// Whether a `find_attested_mint` failure recurs on every retry: the message
-/// bytes can never mint on this chain, or the bounded scan already missed the
-/// consumed nonce's mint. Exhaustive so a new `CctpError` needs a decision.
-/// Variants the lookup never produces redrive, the conservative choice for
-/// burned USDC.
-fn mint_scan_failure_is_permanent(error: &CctpError) -> bool {
+/// Whether a `find_attested_mint` or Circle re-poll failure recurs on every
+/// retry: Circle's complete answer is malformed, the message bytes can never
+/// mint on this chain, or the bounded scan already missed the consumed nonce's
+/// mint. Exhaustive so a new `CctpError` needs a decision. The rest redrive,
+/// the conservative choice for burned USDC.
+fn cctp_failure_repeats(error: &CctpError) -> bool {
     match error {
         CctpError::PlaceholderNonce
+        | CctpError::MalformedAttestation { .. }
+        | CctpError::MessageTooShort { .. }
         | CctpError::MessageDestinationDomainMismatch { .. }
         | CctpError::MessageTooShortForRecovery { .. }
         | CctpError::MintNotFoundInScanWindow { .. } => true,
@@ -406,13 +408,11 @@ fn mint_scan_failure_is_permanent(error: &CctpError) -> bool {
         | CctpError::BurnTxPending { .. }
         | CctpError::Http(_)
         | CctpError::AttestationTimeout { .. }
-        | CctpError::MalformedAttestation { .. }
         | CctpError::MessageSentEventNotFound { .. }
         | CctpError::MintAndWithdrawEventNotFound
         | CctpError::TxReceiptMissingBlock { .. }
         | CctpError::UsdcCreditOverflow { .. }
         | CctpError::UsdcTransferLogDecode { .. }
-        | CctpError::MessageTooShort { .. }
         | CctpError::AlreadyMintedMessageNotFound { .. }
         | CctpError::RecoveredMintMessageMismatch { .. }
         | CctpError::RecoveredMintLogMissingTxHash { .. }
@@ -850,11 +850,11 @@ impl<
     /// persistence.
     ///
     /// A timeout retries (see [`Self::continue_from_attested`]). A hard error
-    /// latches `BridgingFailed` only once the destination chain reads the
-    /// recorded `cctp_nonce` unused across a probe window, so one lagging node
-    /// cannot fail a landed mint: when its mint has landed, or a read fails,
-    /// the resume redrives via `MintRecoveryInconclusive` so a later attempt
-    /// can adopt that mint.
+    /// latches `BridgingFailed` once the destination chain reads the recorded
+    /// `cctp_nonce` unused across a probe window, so one lagging node cannot
+    /// fail a landed mint. When the mint has landed, an error that repeats
+    /// latches a reconcilable `BridgingFailed` and pages; any other error, or a
+    /// failed nonce read, redrives via `MintRecoveryInconclusive`.
     async fn repoll_attested_attestation(
         &self,
         id: &UsdcRebalanceId,
@@ -882,6 +882,12 @@ impl<
             .await
         {
             Ok(false) => Err(self.fail_bridging_on_poll_error(id, error).await),
+            // Adoption needs the re-polled message, so a repeating failure
+            // would redrive in `Attested` forever with no CLI exit.
+            Ok(true) if cctp_failure_repeats(&error) => {
+                let reason = format!("Circle re-poll failed on a consumed nonce: {error}");
+                Err(self.latch_unresolvable_mint(id, reason, error).await)
+            }
             Ok(true) => {
                 warn!(
                     target: "rebalance",
@@ -2887,7 +2893,7 @@ impl<
         call_site: MintScanCallSite,
         initiated_at: DateTime<Utc>,
     ) -> UsdcTransferError {
-        if !mint_scan_failure_is_permanent(&error) {
+        if !cctp_failure_repeats(&error) {
             warn!(
                 target: "rebalance",
                 %id,
@@ -2921,6 +2927,40 @@ impl<
         {
             return send_error.into();
         }
+
+        UsdcTransferError::Cctp(Box::new(error))
+    }
+
+    /// Latches a post-burn `BridgingFailed` (burn and nonce kept, so
+    /// `transfer reconcile --kind usdc` accepts it) for a mint the bot cannot
+    /// resolve, and pages: the job does not alert on this latch.
+    async fn latch_unresolvable_mint(
+        &self,
+        id: &UsdcRebalanceId,
+        reason: String,
+        error: CctpError,
+    ) -> UsdcTransferError {
+        if let Err(send_error) = self
+            .cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: reason.clone(),
+                },
+            )
+            .await
+        {
+            return send_error.into();
+        }
+
+        error!(
+            target: "operational_alert",
+            alert = true,
+            %id,
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically ({reason}). \
+             Bridge marked failed; find the mint of the recorded nonce on chain, then \
+             settle it with `transfer reconcile --kind usdc`."
+        );
 
         UsdcTransferError::Cctp(Box::new(error))
     }
@@ -5368,6 +5408,7 @@ mod tests {
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{self, SolEvent};
+    use alloy::transports::TransportErrorKind;
     use httpmock::prelude::*;
     use proptest::prelude::*;
     use reqwest::StatusCode;
@@ -5468,6 +5509,9 @@ mod tests {
         send_usdc_tx: Option<TxHash>,
         ledger_probe: Option<LedgerBalanceProbe>,
         empty_burn_scan: bool,
+        // Opt-in failing Circle re-poll with the nonce read consumed; see
+        // `with_failing_repoll_on_consumed_nonce`.
+        repoll_error: Option<fn() -> CctpError>,
     }
 
     /// Answers the credit ledger's wallet balance read with `balance` and
@@ -5491,6 +5535,7 @@ mod tests {
                 send_usdc_tx: None,
                 ledger_probe: None,
                 empty_burn_scan: false,
+                repoll_error: None,
             }
         }
 
@@ -5520,6 +5565,14 @@ mod tests {
             };
 
             probe.seen.lock().unwrap().clone()
+        }
+
+        fn with_failing_repoll_on_consumed_nonce(
+            mut self,
+            repoll_error: fn() -> CctpError,
+        ) -> Self {
+            self.repoll_error = Some(repoll_error);
+            self
         }
 
         fn with_submit_delay(
@@ -5622,7 +5675,11 @@ mod tests {
             _direction: BridgeDirection,
             _burn_tx: TxHash,
         ) -> Result<AttestationResponse, CctpError> {
-            unimplemented!("MockBridge: poll_attestation not used in this test")
+            let Some(repoll_error) = self.repoll_error else {
+                unimplemented!("MockBridge: poll_attestation not used in this test")
+            };
+
+            Err(repoll_error())
         }
 
         async fn mint(
@@ -5669,7 +5726,11 @@ mod tests {
             _direction: BridgeDirection,
             _nonce: B256,
         ) -> Result<bool, CctpError> {
-            unimplemented!("MockBridge: mint_nonce_consumed not used in this test")
+            if self.repoll_error.is_none() {
+                unimplemented!("MockBridge: mint_nonce_consumed not used in this test")
+            }
+
+            Ok(true)
         }
 
         async fn destination_block(&self, _direction: BridgeDirection) -> Result<u64, CctpError> {
@@ -12737,6 +12798,49 @@ mod tests {
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
         )));
+    }
+
+    /// A re-poll error that may clear (an RPC transport failure) on a consumed
+    /// nonce keeps redriving in `Attested`, so a later attempt adopts the mint.
+    #[tokio::test]
+    async fn legacy_attested_transient_repoll_failure_redrives_a_landed_mint() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_attested_base_to_alpaca(&cqrs, &id, usdc("1")).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new().with_failing_repoll_on_consumed_nonce(|| {
+            CctpError::RpcTransport(TransportErrorKind::custom_str("connection reset"))
+        });
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
+
+        let error = manager
+            .repoll_attested_attestation(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                TxHash::from([7u8; 32]),
+                B256::repeat_byte(0x07),
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::MintRecoveryInconclusive { id: error_id, .. } if *error_id == id
+            ),
+            "a transient re-poll failure on a consumed nonce must redrive, got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "got: {state:?}"
+        );
     }
 
     /// With the recorded nonce still unused, a hard re-poll failure fails the
