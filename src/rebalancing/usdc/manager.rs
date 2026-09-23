@@ -12730,6 +12730,165 @@ mod tests {
         );
     }
 
+    /// A `BridgingFailed` latched on a nonce mismatch must stay failed: the
+    /// recovery re-polls Circle, and minting that answer would trust the very
+    /// response the recorded `cctp_nonce` check rejected.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_bridging_failed_refuses_a_nonce_mismatch() {
+        let chains = deploy_dual_chain_cctp().await;
+
+        let attestation = CctpAttestationMock::start().await;
+        let _watcher = attestation
+            .start_watcher(
+                ProviderBuilder::new()
+                    .connect(&chains.ethereum_endpoint)
+                    .await
+                    .unwrap(),
+                ProviderBuilder::new()
+                    .connect(&chains.base_endpoint)
+                    .await
+                    .unwrap(),
+                chains.attester_key,
+            )
+            .await
+            .unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: attestation.base_url(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap()
+            .with_fast_mint_recovery_policy(),
+        );
+
+        let market_maker_wallet = chains.bot_address;
+        let amount = usdc("100");
+        let burn_receipt = cctp_bridge
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                usdc_to_u256(amount).unwrap(),
+                market_maker_wallet,
+            )
+            .await
+            .unwrap();
+        let attestation_response = cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn_receipt.tx)
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        );
+
+        let recorded_nonce = B256::repeat_byte(0x42);
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_receipt.tx),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: burn_receipt.tx,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: attestation_response.as_bytes().to_vec(),
+                cctp_nonce: recorded_nonce,
+                message: attestation_response.message_bytes().to_vec(),
+                mint_scan_from_block: 0,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::FailBridging {
+                reason: "attestation nonce mismatch".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::AttestationNonceMismatch {
+            id: error_id,
+            recorded,
+            reconstructed,
+        } = error
+        else {
+            panic!("the recovery must refuse a mismatched nonce, got: {error:?}");
+        };
+        assert_eq!(error_id, id);
+        assert_eq!(recorded, recorded_nonce);
+        assert_eq!(reconstructed, attestation_response.nonce());
+
+        assert!(
+            !cctp_bridge
+                .mint_nonce_consumed(
+                    BridgeDirection::BaseToEthereum,
+                    attestation_response.nonce()
+                )
+                .await
+                .unwrap(),
+            "the recovery must not mint the mismatched message"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "got: {state:?}"
+        );
+    }
+
     /// The un-fail core: a post-burn `BridgingFailed` whose mint actually landed
     /// is un-failed and driven to terminal on resume. We mint for real, then fail
     /// the aggregate post-burn, then resume. `recover_from_bridging_failed`
