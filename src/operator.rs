@@ -1512,7 +1512,7 @@ pub mod process_tx {
         execute_settle_fill, is_expected_place_offchain_order_rejection,
     };
     use crate::offchain::order::{
-        OffchainOrder, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
+        OffchainOrder, OffchainOrderCommand, OffchainOrderId, OffchainOrderPlacement, OrderPlacer,
         PlaceOffchainOrderError, PollOrderStatusJobQueue, TerminalPositionFinalization,
         client_order_id_for_placement, place_offchain_order_at_broker,
         position_command_for_finalization, push_poll_job_if_absent, terminal_position_finalization,
@@ -1542,9 +1542,10 @@ pub mod process_tx {
         /// The order reached a terminal broker state and the position was
         /// finalized.
         Finalized,
-        /// A prior placement was deferred by broker admission and the order was
-        /// left Pending. Only the gate before placement returns this; the fill
-        /// is settled against the retained intent and reported as a deferral.
+        /// The live pipeline deferred its own placement and is holding the order
+        /// Pending with the claim set until admission permits its retry. Only the
+        /// gate before placement returns this; process-tx settles its fill against
+        /// that retained intent and reports the deferral without placing over it.
         Deferred,
     }
 
@@ -1626,10 +1627,12 @@ pub mod process_tx {
         /// position's pending marker was cleared for the normal pipeline to
         /// re-hedge. No hedge is in flight; the fill was still accounted.
         HedgePlacementCleared { symbol: Symbol },
-        /// Broker admission deferred the placement under its schedule aware
-        /// close flatten policy, so the pending offchain order intent is
-        /// retained for the normal pipeline to retry once admission permits.
-        /// The fill was settled without clearing the pending intent.
+        /// A placement was deferred by broker admission under the schedule aware
+        /// close flatten policy. The fill was settled and no hedge from this run
+        /// is in flight. Either process-tx deferred its own placement and cleared
+        /// the claim so the standing pipeline hedges again from scratch (ADR 0022),
+        /// or the live pipeline is already holding a deferred Pending order for
+        /// its own retry and process-tx placed no second hedge over it.
         HedgePlacementDeferred { symbol: Symbol },
     }
 
@@ -1975,16 +1978,18 @@ pub mod process_tx {
         {
             Ok(_) => {}
             // Broker admission deferred this attempt under the schedule aware
-            // close flatten policy. The pending offchain order intent is
-            // retained (Position::PlaceOffChainOrder and PlaceReserved already
-            // persisted it), so settle the fill and hand the Pending order back
-            // to the normal pipeline rather than clearing it or failing with a
-            // 500. Do NOT run the clearing that runs after placement: that would drop the
-            // pending intent the retry depends on.
+            // close flatten policy (ADR 0022). Option 2: do NOT retain the
+            // Pending intent. Fail the still Pending order and clear the position
+            // claim to the retry eligible state so the normal CheckPositions
+            // pipeline detects the unhedged exposure again and preflights a fresh
+            // hedge from scratch, replaying no stale shares or reservation terms.
             Err(PlaceOffchainOrderError::Deferred) => {
-                mark_and_settle_fill(
+                clear_deferred_placement(
                     onchain_trade_store,
                     position_store,
+                    offchain_order_store,
+                    &params.symbol,
+                    offchain_order_id,
                     &trade_id,
                     &onchain_trade,
                 )
@@ -2093,13 +2098,14 @@ pub mod process_tx {
                 return Ok(FillGate::Settled(ProcessTxOutcome::PendingHedgeInFlight));
             }
             Some((_, HedgeDisposition::Deferred)) => {
-                // A prior process-tx deferred its placement and left this order
-                // Pending (HedgePlacementDeferred). The later fill has already
-                // been applied to the position by account_for_onchain_fill;
-                // settle it against the retained intent and report the deferral
-                // rather than surfacing a rejection with partially applied
-                // accounting. The normal pipeline still owns retrying the
-                // retained Pending order once admission permits.
+                // The live pipeline deferred its own placement and is holding
+                // this order Pending with the claim set until admission permits
+                // its retry (process-tx no longer retains a Pending; ADR 0022).
+                // The later fill has already been applied to the position by
+                // account_for_onchain_fill; settle it against that retained
+                // intent and report the deferral rather than placing a second
+                // hedge over it. The live pipeline still owns retrying its
+                // Pending order once admission permits.
                 mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
                     .await?;
                 return Ok(FillGate::Settled(
@@ -2213,6 +2219,46 @@ pub mod process_tx {
     ) -> anyhow::Result<()> {
         execute_mark_acknowledged(onchain_trade_store, trade_id).await?;
         execute_settle_fill(position_store, onchain_trade).await?;
+        Ok(())
+    }
+
+    /// Retires a placement the broker deferred: fails the still Pending order and
+    /// clears the position claim to the retry eligible state (ADR 0022), then
+    /// settles the fill. Drives the aggregate to Failed before clearing the claim,
+    /// the order the failed placement path uses, and preserves the idempotency
+    /// anchor so no prior anchor is lost. The standing pipeline then hedges the
+    /// remaining exposure again from a fresh preflight.
+    async fn clear_deferred_placement(
+        onchain_trade_store: &Store<OnChainTrade>,
+        position_store: &Store<Position>,
+        offchain_order_store: &Store<OffchainOrder>,
+        symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
+        trade_id: &OnChainTradeId,
+        onchain_trade: &OnchainTrade,
+    ) -> Result<(), OperatorError> {
+        let reason = "process-tx placement deferred by broker admission";
+        offchain_order_store
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: reason.to_owned(),
+                },
+            )
+            .await
+            .map_err(|error| OperatorError::Operational(anyhow::Error::new(error)))?;
+        position_store
+            .send(
+                symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id,
+                    error: reason.to_owned(),
+                    anchor: AnchorDisposition::Preserve,
+                },
+            )
+            .await
+            .context("failed to clear the deferred offchain order from the position")?;
+        mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade).await?;
         Ok(())
     }
 
@@ -2484,12 +2530,13 @@ pub mod process_tx {
                 Ok(HedgeDisposition::ClearedForRetry)
             }
             Some(OffchainOrder::Pending { .. }) => match context {
-                // A retained Pending order before placement is the legitimate
-                // state a prior HedgePlacementDeferred leaves. Classify it as a
-                // deferral so the gate settles the later fill and reports the
-                // deferral instead of a rejection with partially applied
-                // accounting; the normal pipeline still owns retrying the
-                // retained intent once admission permits.
+                // A Pending order before placement is the legitimate state the
+                // live pipeline leaves when it defers its own placement and holds
+                // the order for its own retry (process-tx no longer retains a
+                // Pending; ADR 0022). Classify it as a deferral so the gate
+                // settles the later fill and reports the deferral instead of a
+                // rejection with partially applied accounting; the live pipeline
+                // still owns retrying the retained intent once admission permits.
                 PlacementContext::PrePlacement => Ok(HedgeDisposition::Deferred),
                 // After this run placed the order, a Pending state is not a
                 // legitimate resting state: the broker call returned without a
@@ -4389,9 +4436,10 @@ pub mod process_tx {
             );
         }
 
-        /// A retained Pending order before placement is the state a prior
-        /// deferral leaves; it must classify as a deferral and keep the claim so
-        /// the later fill can settle instead of surfacing a rejection.
+        /// A Pending order before placement is the state the live pipeline leaves
+        /// when it defers its own placement and holds the order for its own retry;
+        /// it must classify as a deferral and keep the claim so the later fill can
+        /// settle instead of surfacing a rejection or a second hedge over it.
         #[tokio::test]
         async fn retained_pending_order_before_placement_is_a_deferral() {
             let pool = setup_test_db().await;
@@ -5210,11 +5258,12 @@ pub mod process_tx {
         }
 
         /// Broker admission deferring a fresh placement must not collapse into a
-        /// 500 after the position claim and `PlaceReserved` have persisted: the
-        /// fill must be settled and the pending offchain order intent retained so
-        /// the normal pipeline retries the Pending order under its schedule.
+        /// 500 after the position claim and `PlaceReserved` have persisted. Under
+        /// Option 2 (ADR 0022) it must settle the fill, fail the still Pending
+        /// order, and clear the position claim so the standing pipeline re hedges
+        /// from scratch rather than replaying a stale retained intent.
         #[tokio::test]
-        async fn process_tx_deferred_broker_admission_retains_pending_intent() {
+        async fn process_tx_deferred_broker_admission_clears_pending_claim() {
             let pool = setup_test_db().await;
 
             let mut ctx = create_base_test_ctx();
@@ -5291,32 +5340,107 @@ pub mod process_tx {
                 "the deferred fill must be settled out of the pending acknowledgement set"
             );
 
-            // The pending intent is retained: the position still points at a
-            // Pending offchain order for the normal pipeline to retry.
-            let pending_order_id = position
-                .pending_offchain_order_id
-                .expect("the deferred placement must retain the pending offchain order id");
+            // The claim is cleared: the position no longer points at a pending
+            // offchain order, so the standing pipeline owns the next hedge.
+            assert_eq!(
+                position.pending_offchain_order_id, None,
+                "a deferred admission must clear the pending offchain order claim"
+            );
+
+            // The abandoned order is driven out of Pending to Failed and kept as
+            // the preserved idempotency anchor, so no stuck Pending order is left
+            // for a recovery path to replay.
+            let anchor = position
+                .last_failed_offchain_order_id
+                .expect("clearing on defer must preserve the failed order anchor");
             let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .build(noop_order_placer())
                 .await
                 .unwrap();
             let offchain_order = offchain_order_store
-                .load(&pending_order_id)
+                .load(&anchor)
                 .await
                 .unwrap()
-                .expect("the retained pending order must be persisted");
+                .expect("the anchored offchain order must be persisted");
             assert!(
-                matches!(offchain_order, OffchainOrder::Pending { .. }),
-                "the deferred placement must retain a Pending order, got: {offchain_order:?}"
+                matches!(offchain_order, OffchainOrder::Failed { .. }),
+                "the deferred order must be failed out of Pending, got: {offchain_order:?}"
             );
         }
 
-        /// A later process-tx for a symbol whose prior fill deferred placement
-        /// must settle its own fill against the retained Pending order and report
-        /// the deferral, rather than surfacing a rejection with the fill applied
-        /// to the position but never settled.
+        /// `OrderPlacer` that defers the first admission and admits every later
+        /// one, with a broker that accepts the placement. Stands in for a
+        /// schedule where the first process-tx attempt falls outside the regular
+        /// session and a later attempt lands inside it.
+        struct DeferThenPlaceOrderPlacer {
+            prepared: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl OrderPlacer for DeferThenPlaceOrderPlacer {
+            async fn prepare_placement(
+                &self,
+                _order: &MarketOrder,
+                _kind: &CounterTradeOrderKind,
+            ) -> Result<PlacementAdmission, Box<dyn std::error::Error + Send + Sync>> {
+                if self
+                    .prepared
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    Ok(PlacementAdmission::Deferred)
+                } else {
+                    Ok(PlacementAdmission::New)
+                }
+            }
+
+            async fn place_market_order(
+                &self,
+                order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-broker-order-id"),
+                    placed_shares: order.shares,
+                    placed_at: Utc::now(),
+                    is_extended_hours: false,
+                    limit_price: None,
+                })
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("the market placement path must not place a limit order")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                panic!("placement must not cancel")
+            }
+
+            async fn get_order_by_client_order_id(
+                &self,
+                _client_order_id: &ClientOrderId,
+            ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                // The deferred first attempt never reached the broker, so its
+                // preserved anchor has no broker order: the later placement
+                // releases the anchor and sizes a fresh hedge.
+                Ok(None)
+            }
+        }
+
+        /// After a process-tx admission deferral clears the claim (ADR 0022), a
+        /// later fill for the same symbol must run a fresh placement rather than
+        /// short circuiting on a retained Pending order. The first attempt defers
+        /// and clears; the second is admitted and places a fresh hedge.
         #[tokio::test]
-        async fn process_tx_second_fill_settles_against_retained_deferral() {
+        async fn process_tx_second_fill_after_defer_places_fresh_hedge() {
             let pool = setup_test_db().await;
 
             let mut ctx = create_base_test_ctx();
@@ -5333,7 +5457,9 @@ pub mod process_tx {
                 },
             );
 
-            let order_placer: Arc<dyn OrderPlacer> = Arc::new(DeferringOrderPlacer);
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(DeferThenPlaceOrderPlacer {
+                prepared: std::sync::atomic::AtomicUsize::new(0),
+            });
             let stores = stores_for(&pool, &order_placer).await;
 
             let first_fill = onchain_trade_builder()
@@ -5356,8 +5482,25 @@ pub mod process_tx {
                     first_outcome,
                     ProcessTxOutcome::HedgePlacementDeferred { .. }
                 ),
-                "the first fill must defer placement and leave a Pending order, got: {first_outcome:?}"
+                "the first fill must defer placement, got: {first_outcome:?}"
             );
+
+            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let after_first = position_store
+                .load(&Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("the position must exist after the first fill");
+            assert_eq!(
+                after_first.pending_offchain_order_id, None,
+                "the first defer must clear the pending claim"
+            );
+            let first_anchor = after_first
+                .last_failed_offchain_order_id
+                .expect("the first defer must preserve the failed order anchor");
 
             let second_fill = onchain_trade_builder()
                 .with_log_index(2)
@@ -5377,15 +5520,23 @@ pub mod process_tx {
                 process_found_trade(second_fill, &ctx, &pool, &stores, order_placer, None, None)
                     .await
                     .unwrap();
-            let ProcessTxOutcome::HedgePlacementDeferred { symbol } = &second_outcome else {
+            let ProcessTxOutcome::HedgePlaced {
+                offchain_order_id,
+                disposition: PlacedHedgeDisposition::InFlight,
+                ..
+            } = second_outcome
+            else {
                 panic!(
-                    "the later fill must settle against the retained deferral, got: {second_outcome:?}"
+                    "the later fill must place a fresh hedge, not short circuit on a retained \
+                     Pending, got: {second_outcome:?}"
                 );
             };
-            assert_eq!(symbol, &Symbol::new("AAPL").unwrap());
+            assert_ne!(
+                offchain_order_id, first_anchor,
+                "the later fill must place a fresh order, not replay the deferred one"
+            );
 
-            // The later fill is settled: acknowledged on the trade and dropped
-            // from the position's pending acknowledgement set.
+            // The later fill is settled.
             let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
                 .build(())
                 .await
@@ -5400,15 +5551,11 @@ pub mod process_tx {
                 "the later fill must be acknowledged"
             );
 
-            let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
-                .build(())
-                .await
-                .unwrap();
             let position = position_store
                 .load(&Symbol::new("AAPL").unwrap())
                 .await
                 .unwrap()
-                .expect("the position must exist after fill accounting");
+                .expect("the position must exist after the second fill");
             assert!(
                 !position
                     .pending_acknowledged_trade_ids
@@ -5416,22 +5563,35 @@ pub mod process_tx {
                 "the later fill must be settled out of the pending acknowledgement set"
             );
 
-            // The pending intent is still retained for the normal pipeline.
-            let pending_order_id = position
-                .pending_offchain_order_id
-                .expect("the retained deferral must keep the pending offchain order id");
+            // The fresh hedge is the live claim, in flight at the broker.
+            assert_eq!(
+                position.pending_offchain_order_id,
+                Some(offchain_order_id),
+                "the fresh hedge must become the live pending claim"
+            );
             let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .build(noop_order_placer())
                 .await
                 .unwrap();
-            let offchain_order = offchain_order_store
-                .load(&pending_order_id)
+            let fresh_order = offchain_order_store
+                .load(&offchain_order_id)
                 .await
                 .unwrap()
-                .expect("the retained pending order must be persisted");
+                .expect("the fresh hedge order must be persisted");
             assert!(
-                matches!(offchain_order, OffchainOrder::Pending { .. }),
-                "the retained order must still be Pending, got: {offchain_order:?}"
+                matches!(fresh_order, OffchainOrder::Submitted { .. }),
+                "the fresh hedge must be submitted to the broker, got: {fresh_order:?}"
+            );
+
+            // The deferred order stays terminal and is never replayed.
+            let deferred_order = offchain_order_store
+                .load(&first_anchor)
+                .await
+                .unwrap()
+                .expect("the deferred order must be persisted");
+            assert!(
+                matches!(deferred_order, OffchainOrder::Failed { .. }),
+                "the deferred order must remain failed, got: {deferred_order:?}"
             );
         }
 
