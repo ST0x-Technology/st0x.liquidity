@@ -18736,10 +18736,11 @@ mod tests {
     /// Resumes an `Attested` transfer in `direction` whose consumed nonce has
     /// no mint in the bounded scan, and asserts it fails at once into a state
     /// `transfer reconcile --kind usdc` accepts, keeping the burn and nonce.
+    /// Returns the transfer id so the caller can check the page.
     async fn assert_mint_outside_the_scan_window_latches_for_reconciliation(
         direction: RebalanceDirection,
-    ) {
-        let (error, _, _, state) = resume_attested_with_failing_mint_lookup(direction, || {
+    ) -> UsdcRebalanceId {
+        let (error, id, _, state) = resume_attested_with_failing_mint_lookup(direction, || {
             CctpError::MintNotFoundInScanWindow {
                 nonce: B256::repeat_byte(0x07),
                 from_block: 100,
@@ -18780,22 +18781,38 @@ mod tests {
             state.is_reconcilable_failure(),
             "`transfer reconcile --kind usdc` must accept the latched state, got: {state:?}"
         );
+
+        id
     }
 
+    /// The latch pages itself: the job does not alert on it (an Alpaca->Base
+    /// retry finds the aggregate failed and ends quietly).
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn attested_mint_outside_the_scan_window_latches_for_reconciliation_base_to_alpaca() {
-        assert_mint_outside_the_scan_window_latches_for_reconciliation(
+        let id = assert_mint_outside_the_scan_window_latches_for_reconciliation(
             RebalanceDirection::BaseToAlpaca,
         )
         .await;
+
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn attested_mint_outside_the_scan_window_latches_for_reconciliation_alpaca_to_base() {
-        assert_mint_outside_the_scan_window_latches_for_reconciliation(
+        let id = assert_mint_outside_the_scan_window_latches_for_reconciliation(
             RebalanceDirection::AlpacaToBase,
         )
         .await;
+
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
     }
 
     /// Builds a `CrossVenueCashTransfer` wired to a real (anvil-backed)
