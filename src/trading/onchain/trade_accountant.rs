@@ -915,7 +915,7 @@ mod tests {
         AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3, SignedContextV1,
         TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
     };
-    use crate::offchain::order::{OffchainOrder, noop_order_placer};
+    use crate::offchain::order::{OffchainOrder, PlacementProvenance, noop_order_placer};
     use crate::onchain::backfill::{BackfillRange, load_backfill_checkpoint};
     use crate::onchain::io::Usdc;
     use crate::onchain::trade::{INVENTORY_TOKEN_DECIMALS_MAX_RETRIES, InventoryTrade};
@@ -2861,6 +2861,7 @@ mod tests {
                     market_session: st0x_execution::MarketSession::Regular,
                     close_flatten: false,
                     buying_power_reservation: None,
+                    provenance: PlacementProvenance::LivePipeline,
                 },
             },
         ];

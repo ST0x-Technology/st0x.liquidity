@@ -38,9 +38,10 @@ use crate::conductor::job::{
 use crate::offchain::order::PollOrderStatus;
 use crate::offchain::order::{
     CounterTradeOrderKind, JobError, OffchainOrder, OffchainOrderFailureKind, OffchainOrderId,
-    OffchainOrderPlacement, OrderPlacer, PollOrderStatusJobQueue, client_order_id_for_placement,
+    OffchainOrderPlacement, OrderPlacer, PendingRecoveryAction, PollOrderStatusJobQueue,
+    RetirePendingError, classify_pending_recovery, client_order_id_for_placement,
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
-    push_poll_job_if_absent,
+    push_poll_job_if_absent, retire_never_sent_pending,
 };
 use crate::position::{AnchorDisposition, Position, PositionCommand, PositionError};
 use crate::position_check::{CheckPositions, CheckPositionsJobQueue};
@@ -1180,6 +1181,12 @@ enum ClaimOutcome {
 ///   reaches a submitted/terminal state instead of sitting `Pending` with a
 ///   live, unpolled broker order until the next bot restart. `Place` is a no-op
 ///   on the existing aggregate and the broker dedupes on `client_order_id`.
+///   A `Pending` recorded by `process-tx` is first reconciled against the
+///   broker by `client_order_id`, because that path records the intent before
+///   broker admission runs (ADR 0022): an order under that key is adopted by
+///   the re-drive, a confirmed absence retires the intent as a `Deferral` and
+///   clears the claim so the standing position check re-hedges from a fresh
+///   preflight.
 /// - terminal/absent: nothing to do.
 async fn recover_pending_poll_status(
     ctx: &HedgeCtx,
@@ -1200,8 +1207,71 @@ async fn recover_pending_poll_status(
             direction,
             executor,
             market_session,
+            provenance,
             ..
         }) => {
+            let anchor = ctx
+                .position
+                .load(&symbol)
+                .await?
+                .and_then(|position| position.last_failed_offchain_order_id);
+            let client_order_id = client_order_id_for_placement(pending_id, anchor);
+
+            // A `process-tx` intent is recorded before broker admission, so it
+            // may be one the broker never received (ADR 0022). Reconcile it
+            // against the broker before pricing or replaying stale terms: an
+            // order under the same key is adopted by the re-drive below, a
+            // confirmed absence retires the intent so the standing position
+            // check re-hedges from a fresh preflight.
+            match classify_pending_recovery(
+                ctx.order_placer.as_ref(),
+                executor,
+                provenance,
+                &client_order_id,
+            )
+            .await
+            {
+                Ok(PendingRecoveryAction::Replay) => {}
+                Ok(PendingRecoveryAction::Retire) => {
+                    warn!(
+                        target: "hedge",
+                        symbol = %symbol,
+                        %pending_id,
+                        "process-tx placement intent has no broker order under its client order \
+                         id -- retiring it so the position check re-hedges from a fresh preflight"
+                    );
+                    retire_never_sent_pending(
+                        &ctx.offchain_order,
+                        &ctx.position,
+                        &symbol,
+                        pending_id,
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        RetirePendingError::OffchainOrder(source) => {
+                            TradeAccountingError::OffchainOrderCommand(source)
+                        }
+                        RetirePendingError::Position(source) => {
+                            TradeAccountingError::PositionCommand(source)
+                        }
+                    })?;
+
+                    return Ok(ClaimOutcome::NothingClaimed);
+                }
+                Err(error) => {
+                    warn!(
+                        target: "hedge",
+                        symbol = %symbol,
+                        %pending_id,
+                        %error,
+                        "Could not reconcile the process-tx placement intent against the broker; \
+                         leaving it claimed for the next recovery sweep"
+                    );
+
+                    return Ok(ClaimOutcome::Deferred);
+                }
+            }
+
             let order_kind = if ctx.close_flatten_policy.schedule_enabled() {
                 // Pending lacks the original limit. Admission adopts the client ID
                 // first; an absent order can only be re-driven during Regular.
@@ -1230,13 +1300,6 @@ async fn recover_pending_poll_status(
                 order_kind
             };
 
-            let anchor = ctx
-                .position
-                .load(&symbol)
-                .await?
-                .and_then(|position| position.last_failed_offchain_order_id);
-            let client_order_id = client_order_id_for_placement(pending_id, anchor);
-
             let placement_result = place_offchain_order_at_broker(
                 &ctx.offchain_order,
                 ctx.order_placer.as_ref(),
@@ -1248,7 +1311,8 @@ async fn recover_pending_poll_status(
                     executor,
                     client_order_id,
                     order_kind,
-                ),
+                )
+                .with_provenance(provenance),
             )
             .await;
             let placed = match placement_result {
@@ -2273,7 +2337,7 @@ mod tests {
     use crate::conductor::job::Job;
     use crate::offchain::order::{
         BrokerOrderPlacement, ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand,
-        OffchainOrderFailureKind, OrderPlacementResult, OrderPlacer,
+        OffchainOrderFailureKind, OrderPlacementResult, OrderPlacer, PlacementProvenance,
     };
     use crate::position::{
         AnchorDisposition, EquityTransferReservationId, Position, PositionCommand, TradeId,
@@ -2433,6 +2497,66 @@ mod tests {
         }
 
         Arc::new(SucceedingPlacer)
+    }
+
+    /// Places successfully but reports that the broker holds nothing under any
+    /// client order id, and counts the placements it was asked to make, so a
+    /// recovery test can assert a retired intent was never re-sent.
+    fn absent_at_broker_order_placer(placements: Arc<AtomicUsize>) -> Arc<dyn OrderPlacer> {
+        struct AbsentAtBrokerPlacer {
+            placements: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for AbsentAtBrokerPlacer {
+            async fn place_market_order(
+                &self,
+                order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                self.placements.fetch_add(1, Ordering::SeqCst);
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-order-123"),
+                    placed_shares: order.shares,
+                    placed_at: Utc::now(),
+                    is_extended_hours: false,
+                    limit_price: None,
+                })
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                self.placements.fetch_add(1, Ordering::SeqCst);
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-limit-order-123"),
+                    placed_shares: order.shares,
+                    placed_at: Utc::now(),
+                    is_extended_hours: order.extended_hours,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
+            }
+
+            async fn get_order_by_client_order_id(
+                &self,
+                _client_order_id: &ClientOrderId,
+            ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(None)
+            }
+        }
+
+        Arc::new(AbsentAtBrokerPlacer { placements })
     }
 
     /// Succeeds like [`succeeding_order_placer`], but records every
@@ -2720,6 +2844,7 @@ mod tests {
                     kind: CounterTradeOrderKind::Market,
                     buying_power_reservation: Some(reservation),
                     placed_at: None,
+                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -3084,6 +3209,7 @@ mod tests {
                     },
                     buying_power_reservation: Some(reservation),
                     placed_at: Some("2026-09-17T15:00:00Z".parse().unwrap()),
+                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -3533,6 +3659,7 @@ mod tests {
                         BuyingPowerReservationCents::new(20_000).unwrap(),
                     ),
                     placed_at: None,
+                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -5585,6 +5712,7 @@ mod tests {
             market_session: MarketSession::Regular,
             close_flatten: false,
             buying_power_reservation: None,
+            provenance: PlacementProvenance::LivePipeline,
         };
 
         let error =
@@ -8875,6 +9003,82 @@ mod tests {
         assert_eq!(
             poll_jobs, 0,
             "A terminal pending order must not be re-polled by the recovery path"
+        );
+    }
+
+    /// The hedge-side twin of the conductor orphan sweep: a `process-tx`
+    /// intent recorded before broker admission, with no broker order under its
+    /// client order id, is retired instead of re-driven with its stale shares.
+    #[tokio::test]
+    async fn recover_pending_poll_status_retires_a_never_sent_process_tx_intent() {
+        let placements = Arc::new(AtomicUsize::new(0));
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx_for_executor(
+            absent_at_broker_order_placer(placements.clone()),
+            SupportedExecutor::AlpacaBrokerApi,
+        )
+        .await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1.0))).unwrap();
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(1.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let order_id = OffchainOrderId::new();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::PlaceReserved {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                    buying_power_reservation: None,
+                    placed_at: None,
+                    provenance: PlacementProvenance::ProcessTx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = recover_pending_poll_status(&ctx, order_id).await.unwrap();
+        assert!(matches!(outcome, ClaimOutcome::NothingClaimed));
+
+        let OffchainOrder::Failed { kind, .. } =
+            ctx.offchain_order.load(&order_id).await.unwrap().unwrap()
+        else {
+            panic!("a process-tx intent the broker never received must be retired");
+        };
+        assert_eq!(kind, OffchainOrderFailureKind::Deferral);
+        let recovered_position = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(recovered_position.pending_offchain_order_id, None);
+        assert_eq!(recovered_position.last_failed_offchain_order_id, None);
+        assert_eq!(
+            placements.load(Ordering::SeqCst),
+            0,
+            "retiring the intent must not place a fresh order at the broker"
         );
     }
 

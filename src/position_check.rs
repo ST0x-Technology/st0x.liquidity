@@ -1740,7 +1740,7 @@ mod tests {
     use crate::offchain::order::poll_status::PollOrderStatusCtx;
     use crate::offchain::order::{
         CounterTradeOrderKind, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
-        OffchainOrderFailureKind, OrderPlacementResult, PollOrderStatus,
+        OffchainOrderFailureKind, OrderPlacementResult, PlacementProvenance, PollOrderStatus,
         ReconcileOrderFillJobQueue,
     };
     use crate::position::{
@@ -2583,6 +2583,7 @@ mod tests {
                     kind: CounterTradeOrderKind::Market,
                     buying_power_reservation: None,
                     placed_at: None,
+                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await

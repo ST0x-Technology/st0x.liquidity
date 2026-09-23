@@ -82,10 +82,11 @@ use crate::mint_authorization::{
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderFailureKind, OffchainOrderId,
-    OffchainOrderPlacement, OrderPlacer, PollOrderStatus, PollOrderStatusJobQueue,
-    TerminalPositionFinalization, client_order_id_for_placement,
-    finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
-    position_command_for_finalization, push_poll_job_if_absent, terminal_position_finalization,
+    OffchainOrderPlacement, OrderPlacer, PendingRecoveryAction, PollOrderStatus,
+    PollOrderStatusJobQueue, TerminalPositionFinalization, classify_pending_recovery,
+    client_order_id_for_placement, finalize_cancelled_position_or_log_unpriced,
+    place_offchain_order_at_broker, position_command_for_finalization, push_poll_job_if_absent,
+    retire_never_sent_pending, terminal_position_finalization,
 };
 #[cfg(test)]
 use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
@@ -4021,6 +4022,14 @@ fn is_pre_wrap_held_for_recovery(
 ///   order un-driven. The broker placement is re-driven; the broker dedupes on
 ///   `client_order_id`, so an in-flight order is adopted rather than placed
 ///   twice.
+/// - **Still `Pending`, recorded by `process-tx`:** that path claims the
+///   position and records the intent before broker admission runs, so the
+///   intent may be one the broker never received (ADR 0022). It is reconciled
+///   against the broker by `client_order_id` first: an order under that key is
+///   adopted by the ordinary re-drive, while a confirmed absence retires the
+///   intent as a `Deferral` and clears the claim, leaving the standing position
+///   check to re-hedge from a fresh preflight instead of replaying stale shares
+///   and reservation terms.
 ///
 /// Called at startup (`Conductor::start`) and on every periodic `CheckPositions`
 /// scan. A re-drive that reaches `Submitted` does not enqueue a poll itself: at
@@ -4114,6 +4123,7 @@ async fn recover_single_orphaned_order(
             shares,
             direction,
             executor,
+            provenance,
             ..
         }) => {
             if executor != configured_executor {
@@ -4127,10 +4137,6 @@ async fn recover_single_orphaned_order(
                 return Ok(());
             }
 
-            warn!(
-                %symbol, %order_id,
-                "Offchain order still Pending on startup -- re-driving the broker placement"
-            );
             // A crash between `Place` (which now records intent and enters
             // Pending before the broker call) and the broker outcome leaves a
             // Pending orphan. Re-drive the durable placement: the pure `Place`
@@ -4148,6 +4154,36 @@ async fn recover_single_orphaned_order(
                 .and_then(|position| position.last_failed_offchain_order_id);
             let client_order_id = client_order_id_for_placement(order_id, anchor);
 
+            // A `process-tx` intent is recorded before broker admission, so it
+            // may be one the broker never received (ADR 0022). Reconcile it
+            // against the broker before replaying stale terms.
+            match classify_pending_recovery(order_placer, executor, provenance, &client_order_id)
+                .await
+            {
+                Ok(PendingRecoveryAction::Replay) => {}
+                Ok(PendingRecoveryAction::Retire) => {
+                    warn!(
+                        %symbol, %order_id,
+                        "process-tx placement intent has no broker order under its client order \
+                         id -- retiring it so the position check re-hedges from a fresh preflight"
+                    );
+                    retire_never_sent_pending(offchain_order, position, symbol, order_id).await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    warn!(
+                        %symbol, %order_id, %error,
+                        "Could not reconcile the process-tx placement intent against the broker; \
+                         leaving it claimed for the next recovery scan"
+                    );
+                    return Ok(());
+                }
+            }
+
+            warn!(
+                %symbol, %order_id,
+                "Offchain order still Pending on startup -- re-driving the broker placement"
+            );
             let recovery_result = place_offchain_order_at_broker(
                 offchain_order,
                 order_placer,
@@ -4158,7 +4194,8 @@ async fn recover_single_orphaned_order(
                     direction,
                     executor,
                     client_order_id,
-                ),
+                )
+                .with_provenance(provenance),
             )
             .await;
             let recovered = match recovery_result {
@@ -6126,8 +6163,8 @@ mod tests {
         MintAuthorizationError, MockMintAuthorizer, StubVaultModeReader, VaultModeCheckError,
     };
     use crate::offchain::order::{
-        CancellationReason, CounterTradeOrderKind, OffchainOrderFailureKind, OrderPlacementResult,
-        RetainedFill,
+        BrokerOrderPlacement, CancellationReason, CounterTradeOrderKind, OffchainOrderFailureKind,
+        OrderPlacementResult, PlacementProvenance, RetainedFill,
     };
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
     use crate::onchain::mock::MockRaindex;
@@ -10272,6 +10309,7 @@ mod tests {
                     kind: CounterTradeOrderKind::Market,
                     buying_power_reservation: None,
                     placed_at: None,
+                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -15371,6 +15409,320 @@ mod tests {
         );
     }
 
+    /// Reports whatever the broker holds under a client order id and counts
+    /// both the lookups and the placements it was asked to make, so a recovery
+    /// test can assert that a retired intent was never re-sent and that a live
+    /// pipeline intent was never looked up.
+    struct RecoveryProbePlacer {
+        broker_order: Option<BrokerOrderPlacement>,
+        placements: Arc<AtomicUsize>,
+        lookups: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl OrderPlacer for RecoveryProbePlacer {
+        async fn place_market_order(
+            &self,
+            order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            self.placements.fetch_add(1, Ordering::SeqCst);
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("recovery-probe"),
+                placed_shares: order.shares,
+                placed_at: Utc::now(),
+                is_extended_hours: false,
+                limit_price: None,
+            })
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: st0x_execution::LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            Err("recovery probe placer never places limit orders".into())
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(st0x_execution::CancellationOutcome::Requested)
+        }
+
+        async fn get_order_by_client_order_id(
+            &self,
+            _client_order_id: &ClientOrderId,
+        ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            Ok(self.broker_order.clone())
+        }
+    }
+
+    struct CrashedPendingFixture {
+        position: Arc<Store<Position>>,
+        position_projection: Arc<Projection<Position>>,
+        offchain_order: Arc<Store<OffchainOrder>>,
+        offchain_order_id: OffchainOrderId,
+        shares: Positive<FractionalShares>,
+    }
+
+    /// Seeds the exact durable state a crash between the position claim and
+    /// the broker outcome leaves: an unhedged position claiming an
+    /// `OffchainOrder` that is still `Pending` under `provenance`.
+    async fn seed_crashed_pending_order(
+        pool: &SqlitePool,
+        symbol: &Symbol,
+        provenance: PlacementProvenance,
+    ) -> CrashedPendingFixture {
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(noop_order_placer())
+                .await
+                .unwrap();
+
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(FractionalShares::new(float!(0.5))).unwrap();
+
+        position
+            .send(
+                symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000077"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(100),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::PlaceReserved {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                    buying_power_reservation: None,
+                    placed_at: None,
+                    provenance,
+                },
+            )
+            .await
+            .unwrap();
+
+        CrashedPendingFixture {
+            position,
+            position_projection,
+            offchain_order,
+            offchain_order_id,
+            shares,
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_retires_a_process_tx_pending_the_broker_never_received() {
+        // The crash window ADR 0022 leaves open: process-tx claimed the
+        // position and recorded the Pending intent, admission deferred the
+        // placement, and the process died before the retirement committed. The
+        // broker holds nothing under the client order id, so the intent must be
+        // retired rather than re-sent with its stale shares.
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("SGOV").unwrap();
+        let fixture =
+            seed_crashed_pending_order(&pool, &symbol, PlacementProvenance::ProcessTx).await;
+        let placements = Arc::new(AtomicUsize::new(0));
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(RecoveryProbePlacer {
+            broker_order: None,
+            placements: placements.clone(),
+            lookups: Arc::new(AtomicUsize::new(0)),
+        });
+
+        recover_orphaned_pending_offchain_orders(
+            &fixture.position,
+            &fixture.position_projection,
+            &fixture.offchain_order,
+            order_placer.as_ref(),
+            SupportedExecutor::AlpacaBrokerApi,
+        )
+        .await
+        .unwrap();
+
+        let OffchainOrder::Failed { kind, .. } = fixture
+            .offchain_order
+            .load(&fixture.offchain_order_id)
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("a process-tx intent the broker never received must be retired");
+        };
+        assert_eq!(kind, OffchainOrderFailureKind::Deferral);
+
+        let recovered_position = fixture
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_position.pending_offchain_order_id, None);
+        assert_eq!(
+            recovered_position.last_failed_offchain_order_id, None,
+            "an id the broker never saw must not be kept as the idempotency anchor"
+        );
+        assert_eq!(
+            placements.load(Ordering::SeqCst),
+            0,
+            "retiring the intent must not place a fresh order at the broker"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_adopts_a_process_tx_pending_the_broker_does_hold() {
+        // Same provenance, opposite broker evidence: the placement did reach
+        // the broker before the crash (e.g. a backpressure classification), so
+        // the re-drive adopts it under the same client order id instead of
+        // retiring a live order.
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("SGOV").unwrap();
+        let fixture =
+            seed_crashed_pending_order(&pool, &symbol, PlacementProvenance::ProcessTx).await;
+        let placements = Arc::new(AtomicUsize::new(0));
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(RecoveryProbePlacer {
+            broker_order: Some(BrokerOrderPlacement {
+                executor_order_id: ExecutorOrderId::new("broker-held"),
+                symbol: symbol.clone(),
+                shares: fixture.shares,
+                direction: Direction::Sell,
+                placed_at: Utc::now(),
+                is_extended_hours: Some(false),
+                limit_price: None,
+            }),
+            placements: placements.clone(),
+            lookups: Arc::new(AtomicUsize::new(0)),
+        });
+
+        recover_orphaned_pending_offchain_orders(
+            &fixture.position,
+            &fixture.position_projection,
+            &fixture.offchain_order,
+            order_placer.as_ref(),
+            SupportedExecutor::AlpacaBrokerApi,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            fixture
+                .offchain_order
+                .load(&fixture.offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Submitted { .. }
+        ));
+        assert_eq!(
+            fixture
+                .position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_offchain_order_id,
+            Some(fixture.offchain_order_id),
+            "an order the broker holds stays claimed while it is driven to a terminal state"
+        );
+        assert_eq!(placements.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_replays_a_live_pipeline_pending_without_consulting_the_broker() {
+        // The live pipeline holds its own deferred intents and retries them, so
+        // its Pending orders keep the unconditional re-drive: no broker lookup,
+        // no retirement.
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("SGOV").unwrap();
+        let fixture =
+            seed_crashed_pending_order(&pool, &symbol, PlacementProvenance::LivePipeline).await;
+        let placements = Arc::new(AtomicUsize::new(0));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(RecoveryProbePlacer {
+            broker_order: None,
+            placements: placements.clone(),
+            lookups: lookups.clone(),
+        });
+
+        recover_orphaned_pending_offchain_orders(
+            &fixture.position,
+            &fixture.position_projection,
+            &fixture.offchain_order,
+            order_placer.as_ref(),
+            SupportedExecutor::AlpacaBrokerApi,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            fixture
+                .offchain_order
+                .load(&fixture.offchain_order_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            OffchainOrder::Submitted { .. }
+        ));
+        assert_eq!(
+            fixture
+                .position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_offchain_order_id,
+            Some(fixture.offchain_order_id)
+        );
+        assert_eq!(placements.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            0,
+            "a live pipeline intent must not be reconciled against the broker"
+        );
+    }
+
     #[tokio::test]
     async fn recover_orphaned_pending_redrives_and_preserves_the_anchor_on_already_poll_failed_order()
      {
@@ -16546,6 +16898,7 @@ mod tests {
             market_session: st0x_execution::MarketSession::Regular,
             close_flatten: false,
             buying_power_reservation: None,
+            provenance: PlacementProvenance::LivePipeline,
         };
 
         let error =

@@ -128,6 +128,7 @@ pub struct OffchainOrderPlacement {
     kind: CounterTradeOrderKind,
     buying_power_reservation: Option<BuyingPowerReservationCents>,
     placed_at: Option<DateTime<Utc>>,
+    provenance: PlacementProvenance,
 }
 
 fn missing_pending_limit_price_failure(order_id: OffchainOrderId) -> OffchainOrderCommand {
@@ -172,6 +173,7 @@ impl OffchainOrderPlacement {
             kind,
             buying_power_reservation: None,
             placed_at: None,
+            provenance: PlacementProvenance::LivePipeline,
         }
     }
 
@@ -187,6 +189,14 @@ impl OffchainOrderPlacement {
     #[must_use]
     pub(crate) fn with_optional_placed_at(mut self, placed_at: Option<DateTime<Utc>>) -> Self {
         self.placed_at = placed_at;
+        self
+    }
+
+    /// Records which placement path owns this intent, so recovery can retire a
+    /// `process-tx` intent the broker never received instead of replaying it.
+    #[must_use]
+    pub(crate) fn with_provenance(mut self, provenance: PlacementProvenance) -> Self {
+        self.provenance = provenance;
         self
     }
 }
@@ -237,6 +247,7 @@ pub async fn place_offchain_order_at_broker(
         kind,
         buying_power_reservation,
         placed_at,
+        provenance,
     } = placement;
 
     // Admission gates this attempt's request (a Market recovery attempt must
@@ -262,6 +273,7 @@ pub async fn place_offchain_order_at_broker(
                 kind: kind.clone(),
                 buying_power_reservation,
                 placed_at,
+                provenance,
             },
         )
         .await?;
@@ -444,6 +456,100 @@ pub fn client_order_id_for_placement(
     ClientOrderId::from_uuid(idempotency_source.as_uuid())
 }
 
+/// What an orphan recovery path should do with a `Pending` placement intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingRecoveryAction {
+    /// Re-drive the durable placement. For an intent the broker already holds
+    /// under the same `client_order_id` this adopts the existing broker order
+    /// rather than creating a second one.
+    Replay,
+    /// Retire the intent without contacting the broker again: `process-tx`
+    /// recorded it before admission and the broker never received it.
+    Retire,
+}
+
+/// Classifies an orphaned `Pending` intent before a recovery path acts on it.
+///
+/// `process-tx` records the position claim and the `Pending` intent before
+/// broker admission runs, so a crash in that window leaves an intent the
+/// broker never saw. Replaying it would resend stale shares and reservation
+/// terms with no fresh preflight (ADR 0022), so such an intent is reconciled
+/// against the broker first: an order under the same `client_order_id` proves
+/// the placement did reach the broker and is adopted by the ordinary replay,
+/// while a confirmed absence retires it.
+///
+/// A live pipeline intent keeps the ordinary replay, as does any executor with
+/// no order lookup of its own -- the same executor gate
+/// `reconcile_failed_anchor` uses for the idempotency anchor.
+pub(crate) async fn classify_pending_recovery(
+    order_placer: &dyn OrderPlacer,
+    executor: SupportedExecutor,
+    provenance: PlacementProvenance,
+    client_order_id: &ClientOrderId,
+) -> Result<PendingRecoveryAction, Box<dyn std::error::Error + Send + Sync>> {
+    if provenance == PlacementProvenance::LivePipeline
+        || executor != SupportedExecutor::AlpacaBrokerApi
+    {
+        return Ok(PendingRecoveryAction::Replay);
+    }
+
+    match order_placer
+        .get_order_by_client_order_id(client_order_id)
+        .await?
+    {
+        Some(_) => Ok(PendingRecoveryAction::Replay),
+        None => Ok(PendingRecoveryAction::Retire),
+    }
+}
+
+/// The durable reason persisted on an intent retired by
+/// [`retire_never_sent_pending`].
+pub(crate) const NEVER_SENT_PROCESS_TX_REASON: &str =
+    "process-tx intent retired: the broker holds no order under its client order id";
+
+/// Failures from retiring a never sent `process-tx` placement intent.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RetirePendingError {
+    #[error("failed to retire the never sent offchain order: {0}")]
+    OffchainOrder(#[from] SendError<OffchainOrder>),
+    #[error("failed to clear the never sent offchain order from the position: {0}")]
+    Position(#[from] SendError<Position>),
+}
+
+/// Retires a `process-tx` placement intent the broker never received: drives
+/// the order to a `Deferral` terminal and clears the position claim, releasing
+/// the id rather than keeping it as an idempotency anchor for an order that was
+/// never created (ADR 0022). The standing `CheckPositions` pipeline then
+/// re-hedges the exposure from a fresh preflight.
+pub(crate) async fn retire_never_sent_pending(
+    offchain_order: &Store<OffchainOrder>,
+    position: &Store<Position>,
+    symbol: &Symbol,
+    offchain_order_id: OffchainOrderId,
+) -> Result<(), RetirePendingError> {
+    offchain_order
+        .send(
+            &offchain_order_id,
+            OffchainOrderCommand::MarkPlacementFailed {
+                error: NEVER_SENT_PROCESS_TX_REASON.to_owned(),
+                kind: OffchainOrderFailureKind::Deferral,
+            },
+        )
+        .await?;
+    position
+        .send(
+            symbol,
+            PositionCommand::FailOffChainOrder {
+                offchain_order_id,
+                error: NEVER_SENT_PROCESS_TX_REASON.to_owned(),
+                anchor: AnchorDisposition::Release,
+                kind: OffchainOrderFailureKind::Deferral,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RetainedFill {
     Priced {
@@ -507,22 +613,28 @@ fn market_session_from_extended(is_extended_hours: bool) -> MarketSession {
     }
 }
 
-fn placed_event(
-    symbol: Symbol,
-    shares: Positive<FractionalShares>,
-    direction: Direction,
-    executor: SupportedExecutor,
-    client_order_id: &ClientOrderId,
-    kind: &CounterTradeOrderKind,
-    buying_power_reservation: Option<BuyingPowerReservationCents>,
-    placed_at: DateTime<Utc>,
-) -> OffchainOrderEvent {
+/// Projects the terms of a placement intent onto the `Placed` event that
+/// records it. Every `initialize` arm funnels through here, so a placement
+/// recorded by the CLI, the live pipeline, or a fixture persists the same
+/// shape.
+fn placed_event(placement: OffchainOrderPlacement) -> OffchainOrderEvent {
+    let OffchainOrderPlacement {
+        symbol,
+        shares,
+        direction,
+        executor,
+        client_order_id,
+        kind,
+        buying_power_reservation,
+        placed_at,
+        provenance,
+    } = placement;
     let requested_market_session = kind.market_session();
     let (limit_price, close_flatten) = match kind {
         CounterTradeOrderKind::ExtendedHoursLimit {
             limit_price,
             close_flatten,
-        } => (Some(*limit_price), *close_flatten),
+        } => (Some(limit_price), close_flatten),
         CounterTradeOrderKind::Market => (None, false),
     };
 
@@ -531,12 +643,13 @@ fn placed_event(
         shares,
         direction,
         executor,
-        placed_at,
+        placed_at: placed_at.unwrap_or_else(Utc::now),
         is_extended_hours: requested_market_session == MarketSession::Extended,
         limit_price,
-        client_order_id: Some(client_order_id.clone()),
+        client_order_id: Some(client_order_id),
         close_flatten,
         buying_power_reservation,
+        provenance,
     }
 }
 
@@ -578,6 +691,10 @@ pub enum OffchainOrder {
         close_flatten: bool,
         #[serde(default)]
         buying_power_reservation: Option<BuyingPowerReservationCents>,
+        /// Which placement path recorded this intent. Drives whether recovery
+        /// replays the stored terms or retires an intent the broker never saw.
+        #[serde(default)]
+        provenance: PlacementProvenance,
     },
     /// `shares` carries the broker-accepted quantity for orders placed after the
     /// durable-job extraction (built from `OffchainOrderEvent::Accepted`'s
@@ -733,6 +850,7 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             client_order_id,
             close_flatten,
             buying_power_reservation,
+            provenance,
         } => Some(OffchainOrder::Pending {
             symbol: symbol.clone(),
             shares: *shares,
@@ -744,6 +862,7 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             market_session: market_session_from_extended(*is_extended_hours),
             close_flatten: *close_flatten,
             buying_power_reservation: *buying_power_reservation,
+            provenance: *provenance,
         }),
         _ => None,
     }
@@ -870,7 +989,7 @@ impl EventSourced for OffchainOrder {
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
     const PROJECTION: Table = Table("offchain_order_view");
-    const SCHEMA_VERSION: u64 = 7;
+    const SCHEMA_VERSION: u64 = 8;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         originate_offchain_order(event)
@@ -1018,16 +1137,14 @@ impl EventSourced for OffchainOrder {
                 executor,
                 client_order_id,
                 kind,
-            } => Ok(vec![placed_event(
+            } => Ok(vec![placed_event(OffchainOrderPlacement::with_kind(
                 symbol,
                 shares,
                 direction,
                 executor,
-                &client_order_id,
-                &kind,
-                None,
-                Utc::now(),
-            )]),
+                client_order_id,
+                kind,
+            ))]),
 
             PlaceReserved {
                 symbol,
@@ -1038,15 +1155,19 @@ impl EventSourced for OffchainOrder {
                 kind,
                 buying_power_reservation,
                 placed_at,
+                provenance,
             } => Ok(vec![placed_event(
-                symbol,
-                shares,
-                direction,
-                executor,
-                &client_order_id,
-                &kind,
-                buying_power_reservation,
-                placed_at.unwrap_or_else(Utc::now),
+                OffchainOrderPlacement::with_kind(
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    client_order_id,
+                    kind,
+                )
+                .with_buying_power_reservation(buying_power_reservation)
+                .with_optional_placed_at(placed_at)
+                .with_provenance(provenance),
             )]),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -1059,14 +1180,15 @@ impl EventSourced for OffchainOrder {
                 kind,
                 placed_at,
             } => Ok(vec![placed_event(
-                symbol,
-                shares,
-                direction,
-                executor,
-                &client_order_id,
-                &kind,
-                None,
-                placed_at,
+                OffchainOrderPlacement::with_kind(
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    client_order_id,
+                    kind,
+                )
+                .with_optional_placed_at(Some(placed_at)),
             )]),
 
             _ => Err(OffchainOrderError::NotPlaced),
@@ -1104,6 +1226,7 @@ impl EventSourced for OffchainOrder {
                 kind: _,
                 buying_power_reservation: _,
                 placed_at: _,
+                provenance: _,
             } => validate_place_replay(self, &symbol, direction, executor),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -3303,6 +3426,27 @@ pub enum OffchainOrderFailureKind {
     Failure,
 }
 
+/// Which placement path recorded a placement intent.
+///
+/// The `process-tx` verb writes the position claim and the `Pending` intent
+/// before broker admission runs (ADR 0022), so a crash after admission
+/// declined the placement -- and before the retirement commits -- leaves a
+/// durable `Pending` intent the broker never received. Recovery reads this
+/// field to retire such an intent rather than replay its stored shares and
+/// reservation terms without a fresh preflight.
+///
+/// Every live pipeline placement, and every event persisted before this field
+/// existed, reads back as `LivePipeline` and keeps the existing recovery
+/// behaviour.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PlacementProvenance {
+    /// Recorded by the standing pipeline, which owns its own retry.
+    #[default]
+    LivePipeline,
+    /// Recorded by the `process-tx` operator verb before broker admission.
+    ProcessTx,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OffchainOrderCommand {
     Place {
@@ -3328,6 +3472,9 @@ pub enum OffchainOrderCommand {
         /// idempotency key. Fresh placements stamp the command handling time.
         #[serde(default)]
         placed_at: Option<DateTime<Utc>>,
+        /// Which placement path recorded this intent.
+        #[serde(default)]
+        provenance: PlacementProvenance,
     },
     /// Test/fixture-only: identical to `Place` but takes `placed_at`
     /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
@@ -3454,6 +3601,12 @@ pub enum OffchainOrderEvent {
         /// the entity so replay and recovery preserve the original reservation.
         #[serde(default)]
         buying_power_reservation: Option<BuyingPowerReservationCents>,
+        /// Which placement path recorded this intent, so recovery can tell a
+        /// `process-tx` intent the broker may never have received from a live
+        /// pipeline one. Events predating this field read back as
+        /// `LivePipeline`.
+        #[serde(default)]
+        provenance: PlacementProvenance,
     },
     /// Legacy broker-acceptance event. Predates the durable-job extraction,
     /// where `Place` did the broker call inline and emitted this alongside
@@ -3980,6 +4133,7 @@ mod tests {
             client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
             close_flatten: true,
             buying_power_reservation: None,
+            provenance: PlacementProvenance::LivePipeline,
         };
 
         // The submitted terms are recorded on the event for audit.
@@ -4618,6 +4772,7 @@ mod tests {
             market_session: MarketSession::Extended,
             close_flatten: true,
             buying_power_reservation: None,
+            provenance: PlacementProvenance::LivePipeline,
         };
         let cancelling = OffchainOrder::Cancelling {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -5111,6 +5266,7 @@ mod tests {
                     },
                     buying_power_reservation: Some(durable_reservation),
                     placed_at: None,
+                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -5169,6 +5325,7 @@ mod tests {
                 client_order_id: Some(ClientOrderId::from_uuid(Uuid::new_v4())),
                 close_flatten: false,
                 buying_power_reservation: None,
+                provenance: PlacementProvenance::LivePipeline,
             }])
             .when(missing_pending_limit_price_failure(order_id))
             .await
@@ -6980,6 +7137,7 @@ mod tests {
             market_session: MarketSession::Regular,
             close_flatten: false,
             buying_power_reservation: None,
+            provenance: PlacementProvenance::LivePipeline,
         };
 
         let err = pending
@@ -7058,6 +7216,7 @@ mod tests {
             client_order_id: None,
             close_flatten: false,
             buying_power_reservation: None,
+            provenance: PlacementProvenance::LivePipeline,
         };
 
         // Strip the post-upgrade keys to reconstruct the exact payload shape
@@ -7150,6 +7309,7 @@ mod tests {
                 client_order_id: None,
                 close_flatten: false,
                 buying_power_reservation: None,
+                provenance: PlacementProvenance::LivePipeline,
             },
             OffchainOrderEvent::Submitted {
                 executor_order_id: ExecutorOrderId::new("broker-cancelled"),

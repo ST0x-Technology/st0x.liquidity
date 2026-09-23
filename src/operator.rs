@@ -1534,8 +1534,8 @@ pub mod process_tx {
     };
     use crate::offchain::order::{
         OffchainOrder, OffchainOrderCommand, OffchainOrderFailureKind, OffchainOrderId,
-        OffchainOrderPlacement, OrderPlacer, PlaceOffchainOrderError, PollOrderStatusJobQueue,
-        TerminalPositionFinalization, client_order_id_for_placement,
+        OffchainOrderPlacement, OrderPlacer, PlaceOffchainOrderError, PlacementProvenance,
+        PollOrderStatusJobQueue, TerminalPositionFinalization, client_order_id_for_placement,
         place_offchain_order_at_broker, position_command_for_finalization, push_poll_job_if_absent,
         terminal_position_finalization,
     };
@@ -2008,6 +2008,7 @@ pub mod process_tx {
             params.shares,
             params.direction,
             client_order_id.clone(),
+            params.executor,
         )
         .await?
         else {
@@ -2058,7 +2059,8 @@ pub mod process_tx {
                 params.executor,
                 client_order_id,
             )
-            .with_buying_power_reservation(buying_power_reservation),
+            .with_buying_power_reservation(buying_power_reservation)
+            .with_provenance(PlacementProvenance::ProcessTx),
         )
         .await
         {
@@ -2569,6 +2571,14 @@ pub mod process_tx {
              is refused rather than sold against another symbol's inventory"
         )]
         SellReservedOtherSymbol { symbol: Symbol, reserved: Symbol },
+        #[error(
+            "placement preflight for a {direction} of {symbol} returned no reservation, but the \
+             Alpaca executor always reserves; the hedge is refused rather than placed unreserved"
+        )]
+        AllowedWithoutReservation {
+            symbol: Symbol,
+            direction: Direction,
+        },
     }
 
     /// Runs the safety preflight at placement time for either direction, mirroring
@@ -2586,6 +2596,7 @@ pub mod process_tx {
         shares: Positive<FractionalShares>,
         direction: Direction,
         client_order_id: ClientOrderId,
+        executor: SupportedExecutor,
     ) -> Result<
         Option<(
             Positive<FractionalShares>,
@@ -2673,6 +2684,19 @@ pub mod process_tx {
             (Direction::Sell, Some(CounterTradeReservation::BuyingPower { .. })) => {
                 return Err(PreflightReservationMismatch::SellReservedBuyingPower {
                     symbol: symbol.clone(),
+                }
+                .into());
+            }
+            // An Alpaca placement always answers with a reservation or a skip,
+            // so a reservation-free allow contradicts the executor it was run
+            // for: refuse rather than place a hedge nothing reserved cash or
+            // inventory for.
+            (Direction::Buy | Direction::Sell, None)
+                if executor == SupportedExecutor::AlpacaBrokerApi =>
+            {
+                return Err(PreflightReservationMismatch::AllowedWithoutReservation {
+                    symbol: symbol.clone(),
+                    direction,
                 }
                 .into());
             }
@@ -2935,7 +2959,8 @@ pub mod process_tx {
             BrokerOrderPlacement, CancellationReason, CounterTradeOrderKind, ExecutorOrderPlacer,
             OffchainOrder, OffchainOrderCommand, OffchainOrderEvent, OffchainOrderFailureKind,
             OffchainOrderId, OrderPlacementResult, OrderPlacer, PlacementAdmission,
-            PollOrderStatus, PollOrderStatusJobQueue, RetainedFill, noop_order_placer,
+            PlacementProvenance, PollOrderStatus, PollOrderStatusJobQueue, RetainedFill,
+            noop_order_placer,
         };
         use crate::onchain::trade::RaindexTradeEvent;
         use crate::onchain_trade::{
@@ -3510,6 +3535,7 @@ pub mod process_tx {
                 positive_shares("1"),
                 Direction::Buy,
                 ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                SupportedExecutor::AlpacaBrokerApi,
             )
             .await
             .unwrap();
@@ -3538,6 +3564,7 @@ pub mod process_tx {
                 positive_shares("1"),
                 Direction::Buy,
                 ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                SupportedExecutor::AlpacaBrokerApi,
             )
             .await
             .unwrap()
@@ -3573,6 +3600,7 @@ pub mod process_tx {
                 positive_shares("1"),
                 Direction::Buy,
                 ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                SupportedExecutor::AlpacaBrokerApi,
             )
             .await
             .unwrap_err();
@@ -3612,6 +3640,7 @@ pub mod process_tx {
                 positive_shares("1"),
                 Direction::Sell,
                 ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                SupportedExecutor::AlpacaBrokerApi,
             )
             .await
             .unwrap_err();
@@ -3652,6 +3681,7 @@ pub mod process_tx {
                 positive_shares("1"),
                 Direction::Sell,
                 ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                SupportedExecutor::AlpacaBrokerApi,
             )
             .await
             .unwrap_err();
@@ -3668,6 +3698,72 @@ pub mod process_tx {
                 ),
                 "got: {mismatch}"
             );
+        }
+
+        /// Every Alpaca preflight answers a buy or a sell with a reservation or
+        /// a skip, so a reservation-free allow contradicts the executor it ran
+        /// for: defense in depth against an `OrderPlacer` implementation that
+        /// would otherwise place a hedge nothing reserved cash or inventory
+        /// for.
+        #[tokio::test]
+        async fn preflight_fails_closed_on_an_alpaca_allow_without_a_reservation() {
+            let pool = setup_test_db().await;
+            for direction in [Direction::Buy, Direction::Sell] {
+                let error = preflight_placement(
+                    &pool,
+                    &PreflightPlacer {
+                        verdict: CounterTradePreflight::Allowed { reservation: None },
+                        place: false,
+                        preflighted: Arc::default(),
+                    },
+                    &Symbol::new("AAPL").unwrap(),
+                    positive_shares("1"),
+                    direction,
+                    ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                    SupportedExecutor::AlpacaBrokerApi,
+                )
+                .await
+                .unwrap_err();
+
+                let OperatorError::PreflightReservationMismatch(mismatch) = &error else {
+                    panic!("an unreserved Alpaca allow must be a typed mismatch, got: {error}");
+                };
+                assert!(
+                    matches!(
+                        mismatch,
+                        PreflightReservationMismatch::AllowedWithoutReservation {
+                            symbol,
+                            direction: refused,
+                        } if symbol == &Symbol::new("AAPL").unwrap() && refused == &direction
+                    ),
+                    "got: {mismatch}"
+                );
+            }
+        }
+
+        /// The dry run executor has no inventory or cash to reserve against, so
+        /// its reservation-free allow still places the requested size.
+        #[tokio::test]
+        async fn preflight_allows_an_unreserved_dry_run_placement() {
+            let pool = setup_test_db().await;
+            let (shares, reservation) = preflight_placement(
+                &pool,
+                &PreflightPlacer {
+                    verdict: CounterTradePreflight::Allowed { reservation: None },
+                    place: false,
+                    preflighted: Arc::default(),
+                },
+                &Symbol::new("AAPL").unwrap(),
+                positive_shares("1"),
+                Direction::Buy,
+                ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                SupportedExecutor::DryRun,
+            )
+            .await
+            .unwrap()
+            .expect("a dry run allow must return a placement");
+            assert_eq!(shares, positive_shares("1"));
+            assert_eq!(reservation, None);
         }
 
         /// Insufficient offchain equity inventory must defer the sell hedge
@@ -3692,6 +3788,7 @@ pub mod process_tx {
                 positive_shares("1"),
                 Direction::Sell,
                 ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                SupportedExecutor::AlpacaBrokerApi,
             )
             .await
             .unwrap();
@@ -3722,6 +3819,7 @@ pub mod process_tx {
                 positive_shares("0.5"),
                 Direction::Sell,
                 ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                SupportedExecutor::AlpacaBrokerApi,
             )
             .await
             .unwrap();
@@ -5202,6 +5300,7 @@ pub mod process_tx {
                 market_session: st0x_execution::MarketSession::Regular,
                 close_flatten: false,
                 buying_power_reservation: None,
+                provenance: PlacementProvenance::LivePipeline,
             };
 
             let error = reconcile_offchain_order_state(
@@ -5266,6 +5365,7 @@ pub mod process_tx {
                 market_session: st0x_execution::MarketSession::Regular,
                 close_flatten: false,
                 buying_power_reservation: None,
+                provenance: PlacementProvenance::LivePipeline,
             };
 
             let disposition = reconcile_offchain_order_state(
@@ -6758,6 +6858,7 @@ pub mod process_tx {
                             kind: CounterTradeOrderKind::Market,
                             buying_power_reservation: None,
                             placed_at: None,
+                            provenance: PlacementProvenance::LivePipeline,
                         },
                     )
                     .await
@@ -6877,6 +6978,7 @@ pub mod process_tx {
                         kind: CounterTradeOrderKind::Market,
                         buying_power_reservation: None,
                         placed_at: None,
+                        provenance: PlacementProvenance::LivePipeline,
                     },
                 )
                 .await
@@ -7003,6 +7105,7 @@ pub mod process_tx {
                             kind: CounterTradeOrderKind::Market,
                             buying_power_reservation: None,
                             placed_at: None,
+                            provenance: PlacementProvenance::LivePipeline,
                         },
                     )
                     .await
