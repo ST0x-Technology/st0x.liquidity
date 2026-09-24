@@ -5062,6 +5062,7 @@ mod tests {
         // `with_send_usdc_tx`.
         send_usdc_tx: Option<TxHash>,
         ledger_probe: Option<LedgerBalanceProbe>,
+        empty_burn_scan: bool,
     }
 
     /// Answers the credit ledger's wallet balance read with `balance` and
@@ -5084,7 +5085,13 @@ mod tests {
                 burn_status: None,
                 send_usdc_tx: None,
                 ledger_probe: None,
+                empty_burn_scan: false,
             }
+        }
+
+        fn with_empty_burn_scan(mut self) -> Self {
+            self.empty_burn_scan = true;
+            self
         }
 
         fn with_ledger_probe(
@@ -5236,7 +5243,11 @@ mod tests {
             _recipient: Address,
             _from_block: u64,
         ) -> Result<Option<TxHash>, CctpError> {
-            unimplemented!("MockBridge: find_recent_burn not used in this test")
+            if !self.empty_burn_scan {
+                unimplemented!("MockBridge: find_recent_burn not used in this test")
+            }
+
+            Ok(None)
         }
 
         async fn find_recent_mint(
@@ -17323,6 +17334,61 @@ mod tests {
         assert!(
             matches!(seen[0], UsdcRebalance::WithdrawalComplete { .. }),
             "the ledger check must run before BeginBridging; got: {seen:?}"
+        );
+    }
+
+    /// The ledger check before a reburn runs while the reverted burn's hash is
+    /// still recorded: that hash is what lets a restart reburn safely instead
+    /// of failing closed.
+    #[tokio::test]
+    async fn reburn_checks_the_credit_ledger_with_the_reverted_burn_still_recorded() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let reverted_burn = TxHash::from([7u8; 32]);
+        advance_to_bridging_submitting_alpaca_to_base_with_burn_amount(
+            &cqrs, &id, amount, 1, amount,
+        )
+        .await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::RecordPendingBurn {
+                burn_tx: reverted_burn,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new()
+            .with_burn_status(st0x_bridge::BurnTxStatus::MinedReverted)
+            .with_empty_burn_scan()
+            .with_confirm_revert_count(0)
+            .with_ledger_probe(cqrs.clone(), id.clone(), amount_u256);
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+        let manager = manager.with_credit_ledger(pool);
+
+        manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, 1, Some(reverted_burn))
+            .await
+            .unwrap();
+
+        let seen = manager.cctp_bridge.states_seen_by_ledger();
+        assert_eq!(seen.len(), 1, "one ledger check per burn; got: {seen:?}");
+        assert!(
+            matches!(
+                seen[0],
+                UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: Some(burn_tx),
+                    ..
+                } if burn_tx == reverted_burn
+            ),
+            "the reverted burn hash must stay recorded during the check; got: {seen:?}"
         );
     }
 
