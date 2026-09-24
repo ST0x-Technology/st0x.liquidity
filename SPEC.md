@@ -3893,14 +3893,16 @@ already-submitted action instead of re-issuing it:
   same call) -- recording `ConfirmBridging` with that mint tx, amount, and fee
   -- before attempting a fresh mint. The match is by nonce, never by recipient
   or amount: other transfers mint to the same wallet, possibly the same amount.
-  The log scan is bounded: it starts at the destination head captured when the
-  attestation is recorded, or, for a transfer recorded before that head was
-  captured, a fixed lookback from the current head. A consumed nonce whose mint
-  is not found in that window, or a message that can never mint on the
-  destination chain, marks `BridgingFailed` (keeping the burn tx and nonce), so
-  `transfer reconcile --kind usdc` can settle it, and pages the operator at the
-  latch (an AlpacaToBase retry then finds the transfer failed and does not
-  alert); the bot never scans back to genesis. Other lookup failures redrive.
+  The log scan is bounded: it starts at the lower of the destination head
+  captured when the attestation is recorded and a fixed lookback from the
+  current head (a relayer can mint before that head is captured), or at the
+  fixed lookback alone for a transfer recorded before that head was captured. A
+  consumed nonce whose mint is not found in that window, or a message that can
+  never mint on the destination chain, marks `BridgingFailed` (keeping the burn
+  tx and nonce), so `transfer reconcile --kind usdc` can settle it, and pages
+  the operator at the latch (an AlpacaToBase retry then finds the transfer
+  failed and does not alert); the bot never scans back to genesis. Other lookup
+  failures redrive.
 
 ##### Commands
 
