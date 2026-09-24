@@ -19490,6 +19490,38 @@ mod tests {
         )));
     }
 
+    /// A scan floor mined before the transfer started covers every block its
+    /// mint can be in, so a used nonce with no visible log is index lag: the
+    /// resume redrives instead of latching and paging.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn attested_used_nonce_with_lagging_log_in_a_covering_scan_redrives() {
+        let (error, id, initiated_at, state) =
+            resume_attested_with_failing_mint_lookup(RebalanceDirection::BaseToAlpaca, || {
+                CctpError::MintNotFoundInScanWindow {
+                    nonce: B256::repeat_byte(0x07),
+                    from_block: 0,
+                }
+            })
+            .await;
+
+        let UsdcTransferError::MintRecoveryInconclusive {
+            id: err_id,
+            initiated_at: err_initiated_at,
+            ..
+        } = error
+        else {
+            panic!("a lagging log in a covering scan must redrive; got: {error:?}");
+        };
+        assert_eq!(err_id, id);
+        assert_eq!(err_initiated_at, initiated_at);
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "the transfer must stay Attested; got: {state:?}"
+        );
+        assert!(!logs_contain("operational_alert"));
+    }
+
     /// Builds a `CrossVenueCashTransfer` wired to a real (anvil-backed)
     /// `RaindexService` -- required for the `Signer` type parameter even
     /// though none of these bot-gas convergence tests call into it -- and an
