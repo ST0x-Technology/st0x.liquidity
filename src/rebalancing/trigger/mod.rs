@@ -73,7 +73,7 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::usdc::{
     TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
-    TransferUsdcToMarketMakingJobQueue, UsdcDriverGate,
+    TransferUsdcToMarketMakingJobQueue, UsdcDriverGate, UsdcDriverPause, usdc_driver_pause,
 };
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
@@ -257,14 +257,6 @@ impl ChainRebalancingConfig {
         }
     }
 }
-
-/// The USDC driver pause gate was attached more than once. Exactly one attach
-/// per boot is correct; a second is a conductor wiring bug that would leave two
-/// gates disagreeing about the pause, so startup must fail rather than silently
-/// ignore it.
-#[derive(Debug, thiserror::Error)]
-#[error("the USDC driver pause gate was already attached to the rebalancing service")]
-pub(crate) struct UsdcDriverGateAlreadyAttached;
 
 /// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
@@ -812,15 +804,13 @@ pub(crate) struct RebalancingService {
     /// [`Self::divergence_gate`].
     divergence_gate: Arc<InventoryDivergenceGate>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
-    /// Driver pause gate, attached exactly once by the conductor after it
-    /// builds the USDC workers (see [`Self::attach_usdc_driver_gate`], which
-    /// rejects a second attach). Reading it goes through
-    /// [`Self::usdc_driver_admission`], which fails closed in production so a
-    /// conductor that never attached it cannot move USDC without the operator
-    /// pause; tests that never wire a pause run unpaused. A queued check parks
-    /// behind a held pause; the inline sweep skips and relies on its next
-    /// caller.
-    usdc_driver_gate: std::sync::OnceLock<UsdcDriverGate>,
+    /// The USDC driver pause, built with the service so the trigger and every
+    /// USDC worker share one pause. The controller goes to the operator write
+    /// routes ([`Self::usdc_driver_pause`]) and each worker gets a gate clone
+    /// ([`Self::usdc_driver_gate`]). A queued check parks behind a held pause;
+    /// the inline sweep skips and relies on its next caller.
+    usdc_driver_pause: Arc<UsdcDriverPause>,
+    usdc_driver_gate: UsdcDriverGate,
     notifier: Arc<dyn crate::alerts::Notifier>,
     /// The ERC-4626 wrapper on each hedged chain: a symbol's derivative and
     /// its share ratio are that chain's, never another's.
@@ -902,19 +892,6 @@ pub(crate) struct RebalancingService {
     mint_store: RwLock<Option<Arc<Store<TokenizedEquityMint>>>>,
     redemption_store: RwLock<Option<Arc<Store<EquityRedemption>>>>,
     usdc_store: RwLock<Option<Arc<Store<UsdcRebalance>>>>,
-}
-
-/// Driver-gate admission for a fund-moving USDC path. Mirrors
-/// [`crate::native_gas::ConfiguredGasReadiness`]: an attached gate is used
-/// directly; a missing gate fails closed in production so a conductor that
-/// never attached it cannot move USDC without the operator pause, while tests
-/// that never wire a pause run unpaused.
-enum UsdcDriverAdmission<'gate> {
-    Attached(&'gate UsdcDriverGate),
-    #[cfg(not(test))]
-    FailClosed,
-    #[cfg(test)]
-    Unwired,
 }
 
 type EquityInventoryUpdate = Box<
@@ -1010,6 +987,7 @@ impl RebalancingService {
             transfer_equity_to_hedging: transfer_equity_to_hedging_queue,
             transfer_usdc_to_market_making: transfer_usdc_to_market_making_queue,
         } = schedulers;
+        let (usdc_driver_pause, usdc_driver_gate) = usdc_driver_pause();
         Self {
             config,
             vault_registry,
@@ -1023,7 +1001,8 @@ impl RebalancingService {
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             divergence_gate: Arc::default(),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
-            usdc_driver_gate: std::sync::OnceLock::new(),
+            usdc_driver_pause: Arc::new(usdc_driver_pause),
+            usdc_driver_gate,
             notifier,
             wrappers,
             equity_scheduler,
@@ -1708,27 +1687,12 @@ impl RebalancingService {
         // equity check, and inline on the snapshot reactor. Claim the driver
         // without parking so a pause waits for an active sweep and a held
         // pause skips the sweep; the next caller sweeps once it resumes.
-        let _in_flight = match self.usdc_driver_admission() {
-            UsdcDriverAdmission::Attached(gate) => {
-                let Some(in_flight) = gate.try_enter() else {
-                    debug!(
-                        target: "rebalance",
-                        "Skipping stuck USDC sweep: driver paused by an operator operation"
-                    );
-                    return Ok(());
-                };
-                Some(in_flight)
-            }
-            #[cfg(not(test))]
-            UsdcDriverAdmission::FailClosed => {
-                error!(
-                    target: "rebalance",
-                    "Skipping stuck USDC sweep: driver pause gate not wired; failing closed"
-                );
-                return Ok(());
-            }
-            #[cfg(test)]
-            UsdcDriverAdmission::Unwired => None,
+        let Some(_in_flight) = self.usdc_driver_gate.try_enter() else {
+            debug!(
+                target: "rebalance",
+                "Skipping stuck USDC sweep: driver paused by an operator operation"
+            );
+            return Ok(());
         };
 
         // Select ids to examine this tick. The selection is intentionally broad:
@@ -4041,32 +4005,16 @@ impl RebalancingService {
         usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
     }
 
-    /// Attaches the USDC driver pause gate once the conductor has built the
-    /// workers. Exactly one attach per boot is correct; a second is a wiring
-    /// bug that would leave two gates disagreeing about the pause, so it is a
-    /// hard error the caller propagates as a startup failure rather than
-    /// silently ignoring it.
-    pub(crate) fn attach_usdc_driver_gate(
-        &self,
-        gate: UsdcDriverGate,
-    ) -> Result<(), UsdcDriverGateAlreadyAttached> {
-        self.usdc_driver_gate
-            .set(gate)
-            .map_err(|_| UsdcDriverGateAlreadyAttached)
+    /// The controller of this service's USDC driver pause, for the operator
+    /// write routes that must quiesce the driver before mutating USDC state.
+    pub(crate) fn usdc_driver_pause(&self) -> Arc<UsdcDriverPause> {
+        Arc::clone(&self.usdc_driver_pause)
     }
 
-    /// Resolves the driver gate for a fund-moving USDC path, failing closed in
-    /// production when the conductor never attached it. See
-    /// [`UsdcDriverAdmission`].
-    fn usdc_driver_admission(&self) -> UsdcDriverAdmission<'_> {
-        #[cfg(not(test))]
-        let unwired = UsdcDriverAdmission::FailClosed;
-        #[cfg(test)]
-        let unwired = UsdcDriverAdmission::Unwired;
-
-        self.usdc_driver_gate
-            .get()
-            .map_or(unwired, UsdcDriverAdmission::Attached)
+    /// A driver side handle on this service's pause, for a USDC worker to hold
+    /// an in flight claim across each execution.
+    pub(crate) fn usdc_driver_gate(&self) -> UsdcDriverGate {
+        self.usdc_driver_gate.clone()
     }
 
     async fn load_mint_tracking(&self, id: &IssuerRequestId) -> Option<MintTracking> {
@@ -4674,19 +4622,7 @@ impl RebalancingService {
         // while the pause is held parks until the operator finishes instead of
         // dropping the imbalance that caused it; unlike the inline sweep, this
         // apalis worker has its own execution budget and can safely wait.
-        let _in_flight = match self.usdc_driver_admission() {
-            UsdcDriverAdmission::Attached(gate) => Some(gate.enter().await),
-            #[cfg(not(test))]
-            UsdcDriverAdmission::FailClosed => {
-                error!(
-                    target: "rebalance",
-                    "Skipping USDC trigger: driver pause gate not wired; failing closed"
-                );
-                return;
-            }
-            #[cfg(test)]
-            UsdcDriverAdmission::Unwired => None,
-        };
+        let _in_flight = self.usdc_driver_gate.enter().await;
 
         self.expire_stuck_operations_with_logging().await;
 
@@ -7891,7 +7827,6 @@ mod tests {
         MintError, MintTransferError, ResumeEquityToMarketMaking, TransferEquityToMarketMakingCtx,
         TransferEquityToMarketMakingJobError,
     };
-    use crate::rebalancing::usdc::usdc_driver_pause;
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
@@ -15961,9 +15896,7 @@ mod tests {
     async fn usdc_check_waits_for_operator_pause_then_processes_imbalance() {
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
         let trigger = make_trigger_with_inventory(inventory).await;
-        let (pause, gate) = usdc_driver_pause();
-        trigger.attach_usdc_driver_gate(gate).unwrap();
-        let pause_guard = pause.pause().await.unwrap();
+        let pause_guard = trigger.usdc_driver_pause().pause().await.unwrap();
 
         let check_trigger = Arc::clone(&trigger);
         let mut check = tokio::spawn(async move { check_trigger.check_and_trigger_usdc().await });
@@ -22974,9 +22907,7 @@ mod tests {
         };
         seed_tracking().await;
 
-        let (pause, gate) = usdc_driver_pause();
-        trigger.attach_usdc_driver_gate(gate).unwrap();
-        let pause_guard = pause.pause().await.unwrap();
+        let pause_guard = trigger.usdc_driver_pause().pause().await.unwrap();
 
         trigger.expire_stuck_usdc_rebalances(now).await.unwrap();
 
