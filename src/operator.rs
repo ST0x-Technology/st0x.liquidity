@@ -1534,9 +1534,10 @@ pub mod process_tx {
     };
     use crate::offchain::order::{
         OffchainOrder, OffchainOrderCommand, OffchainOrderFailureKind, OffchainOrderId,
-        OffchainOrderPlacement, OrderPlacer, PlaceOffchainOrderError, PlacementProvenance,
-        PollOrderStatusJobQueue, TerminalPositionFinalization, client_order_id_for_placement,
-        place_offchain_order_at_broker, position_command_for_finalization, push_poll_job_if_absent,
+        OffchainOrderPlacement, OrderPlacer, PendingRecoveryAction, PlaceOffchainOrderError,
+        PlacementProvenance, PollOrderStatusJobQueue, TerminalPositionFinalization,
+        classify_pending_recovery, client_order_id_for_placement, place_offchain_order_at_broker,
+        position_command_for_finalization, push_poll_job_if_absent, retire_unconfirmed_pending,
         terminal_position_finalization,
     };
     use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
@@ -1919,6 +1920,7 @@ pub mod process_tx {
         let params = match gate_fill_for_placement(
             ctx,
             stores,
+            order_placer.as_ref(),
             trading_chain,
             &onchain_trade,
             &trade_id,
@@ -2221,6 +2223,7 @@ pub mod process_tx {
     async fn gate_fill_for_placement(
         ctx: &Ctx,
         stores: &ProcessTxStores,
+        order_placer: &dyn OrderPlacer,
         trading_chain: &HedgedChain,
         onchain_trade: &OnchainTrade,
         trade_id: &OnChainTradeId,
@@ -2235,8 +2238,13 @@ pub mod process_tx {
             schedule_enabled,
         } = stores;
 
-        match reconcile_existing_pending_order(offchain_order_store, position_store, base_symbol)
-            .await?
+        match reconcile_existing_pending_order(
+            offchain_order_store,
+            position_store,
+            base_symbol,
+            order_placer,
+        )
+        .await?
         {
             None | Some((_, HedgeDisposition::ClearedForRetry | HedgeDisposition::Finalized)) => {}
             Some((pending_offchain_order_id, HedgeDisposition::InFlight)) => {
@@ -2719,6 +2727,7 @@ pub mod process_tx {
         offchain_order_store: &Store<OffchainOrder>,
         position_store: &Store<Position>,
         symbol: &Symbol,
+        order_placer: &dyn OrderPlacer,
     ) -> Result<Option<(OffchainOrderId, HedgeDisposition)>, OperatorError> {
         let Some(position) = position_store
             .load(symbol)
@@ -2742,6 +2751,54 @@ pub mod process_tx {
                 );
             })
             .context("failed to load existing pending offchain order")?;
+
+        // A `Pending` left by an earlier `process-tx` run is a crash orphan, not
+        // a live pipeline deferral: that run recorded the intent before broker
+        // admission, so the broker may or may not hold it. Reconcile it by
+        // `client_order_id` exactly as the other recovery paths do (ADR 0022)
+        // rather than reporting it as a deferral the live pipeline owns.
+        if let Some(OffchainOrder::Pending {
+            provenance: PlacementProvenance::ProcessTx,
+            executor,
+            ..
+        }) = &loaded_order
+        {
+            let client_order_id = client_order_id_for_placement(
+                offchain_order_id,
+                position.last_failed_offchain_order_id,
+            );
+            let action = classify_pending_recovery(
+                order_placer,
+                *executor,
+                PlacementProvenance::ProcessTx,
+                &client_order_id,
+            )
+            .await
+            .map_err(anyhow::Error::from_boxed)
+            .context(
+                "broker lookup for the pending process-tx intent could not be answered; \
+                 leaving the claim for a retry",
+            )?;
+            let disposition = match action {
+                // The broker holds an order under the key (or the executor has
+                // no lookup): the recovery paths own adopting or replaying it,
+                // so treat it as in flight and place no second hedge over it.
+                PendingRecoveryAction::Replay => HedgeDisposition::InFlight,
+                PendingRecoveryAction::Retire => {
+                    retire_unconfirmed_pending(
+                        offchain_order_store,
+                        position_store,
+                        symbol,
+                        offchain_order_id,
+                    )
+                    .await
+                    .context("failed to retire the pending process-tx intent")?;
+                    HedgeDisposition::ClearedForRetry
+                }
+            };
+            return Ok(Some((offchain_order_id, disposition)));
+        }
+
         reconcile_offchain_order_state(
             loaded_order,
             position_store,
@@ -2805,11 +2862,12 @@ pub mod process_tx {
         context: PlacementContext,
     ) -> Result<HedgeDisposition, OperatorError> {
         match loaded_order {
-            Some(OffchainOrder::Failed { error, .. }) => {
+            Some(OffchainOrder::Failed { error, kind, .. }) => {
                 // Broker placement failed: clear pending_offchain_order_id so the
                 // position is not permanently stuck and the normal pipeline can
                 // retry. No broker terminality classification available here;
-                // fail-safe preserves.
+                // fail-safe preserves. The persisted kind carries through, so a
+                // half retired `Deferral` is not recorded as a hedge failure.
                 position_store
                     .send(
                         symbol,
@@ -2817,7 +2875,7 @@ pub mod process_tx {
                             offchain_order_id,
                             error,
                             anchor: AnchorDisposition::Preserve,
-                            kind: OffchainOrderFailureKind::Failure,
+                            kind,
                         },
                     )
                     .await
@@ -6994,6 +7052,223 @@ pub mod process_tx {
             }
         }
 
+        /// How the broker answers the lookup for a `process-tx` intent's key.
+        #[derive(Clone, Copy, Debug)]
+        enum BrokerLookup {
+            Missing,
+            Found,
+            Unanswered,
+        }
+
+        /// `OrderPlacer` answering the pending intent lookup as configured and
+        /// counting the market orders a run places.
+        struct ProcessTxOrphanPlacer {
+            lookup: BrokerLookup,
+            placements: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl OrderPlacer for ProcessTxOrphanPlacer {
+            async fn place_market_order(
+                &self,
+                order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                self.placements
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("fresh-hedge"),
+                    placed_shares: order.shares,
+                    placed_at: Utc::now(),
+                    is_extended_hours: false,
+                    limit_price: None,
+                })
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                panic!("process-tx places a market hedge")
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &ExecutorOrderId,
+            ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+                panic!("process-tx must not cancel")
+            }
+
+            async fn get_order_by_client_order_id(
+                &self,
+                _client_order_id: &ClientOrderId,
+            ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                match self.lookup {
+                    BrokerLookup::Missing => Ok(None),
+                    BrokerLookup::Found => Ok(Some(BrokerOrderPlacement {
+                        executor_order_id: ExecutorOrderId::new("orphan-at-broker"),
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        shares: positive_shares("1"),
+                        direction: Direction::Sell,
+                        placed_at: Utc::now(),
+                        is_extended_hours: Some(false),
+                        limit_price: None,
+                    })),
+                    BrokerLookup::Unanswered => Err("broker lookup unavailable".into()),
+                }
+            }
+
+            async fn preflight_counter_trade_with_reserved_buying_power(
+                &self,
+                order: MarketOrder,
+                _reserved: BuyingPowerReservationCents,
+            ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(reserving_counter_trade_preflight(&order))
+            }
+        }
+
+        /// A pre-placement `Pending` left by an earlier `process-tx` run is a
+        /// crash orphan, so the gate reconciles it against the broker (ADR 0022)
+        /// instead of reporting a live pipeline deferral or refusing the run.
+        /// A lookup miss retires it and hedges this run regardless of the
+        /// schedule; an order at the broker is in flight, so no second hedge is
+        /// placed over it; an unanswered lookup keeps the claim and leaves the
+        /// fill unsettled for a retry.
+        #[tokio::test]
+        async fn process_tx_reconciles_an_orphaned_process_tx_pending_before_placing() {
+            for (lookup, schedule_enabled) in [
+                (BrokerLookup::Missing, false),
+                (BrokerLookup::Missing, true),
+                (BrokerLookup::Found, true),
+                (BrokerLookup::Unanswered, true),
+            ] {
+                let pool = setup_test_db().await;
+                let symbol = Symbol::new("AAPL").unwrap();
+                let mut ctx = create_base_test_ctx();
+                ctx.chains.primary_mut().assets.equities.symbols.insert(
+                    symbol.clone(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_ids: vec![],
+                        trading: OperationMode::Enabled,
+                        rebalancing: OperationMode::Disabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                        target_share: None,
+                    },
+                );
+
+                let pending_id = OffchainOrderId::new();
+                let position_store =
+                    seed_position_with_pending_order(&pool, &symbol, pending_id, Utc::now()).await;
+                let (offchain_order_store, _) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+                    .build(noop_order_placer())
+                    .await
+                    .unwrap();
+                offchain_order_store
+                    .send(
+                        &pending_id,
+                        OffchainOrderCommand::PlaceReserved {
+                            symbol: symbol.clone(),
+                            shares: positive_shares("1"),
+                            direction: Direction::Sell,
+                            executor: SupportedExecutor::AlpacaBrokerApi,
+                            client_order_id: ClientOrderId::from_uuid(pending_id.as_uuid()),
+                            kind: CounterTradeOrderKind::Market,
+                            buying_power_reservation: None,
+                            placed_at: None,
+                            provenance: PlacementProvenance::ProcessTx,
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                let later_fill = onchain_trade_builder()
+                    .with_log_index(9)
+                    .with_block_number(43)
+                    .build();
+                let later_trade_id =
+                    OnChainTradeId::new(later_fill.chain, later_fill.tx_hash, later_fill.log_index);
+
+                let placements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let order_placer: Arc<dyn OrderPlacer> = Arc::new(ProcessTxOrphanPlacer {
+                    lookup,
+                    placements: placements.clone(),
+                });
+                let mut stores = stores_for(&pool, &order_placer).await;
+                stores.schedule_enabled = schedule_enabled;
+
+                let result =
+                    process_found_trade(later_fill, &ctx, &pool, &stores, order_placer, None, None)
+                        .await;
+
+                let orphan = offchain_order_store
+                    .load(&pending_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let position = position_store.load(&symbol).await.unwrap().unwrap();
+                let (onchain_trade_store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                    .build(())
+                    .await
+                    .unwrap();
+                let fill_settled = onchain_trade_store
+                    .load(&later_trade_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|trade| trade.is_acknowledged());
+                let placed = placements.load(std::sync::atomic::Ordering::SeqCst);
+                let case = format!("{lookup:?}, schedule_enabled={schedule_enabled}");
+
+                match lookup {
+                    BrokerLookup::Missing => {
+                        let outcome = result.unwrap_or_else(|error| {
+                            panic!("a retired orphan must not refuse the run ({case}): {error}")
+                        });
+                        assert!(
+                            matches!(outcome, ProcessTxOutcome::HedgePlaced { .. }),
+                            "a retired orphan must let this run hedge ({case}), got: {outcome:?}"
+                        );
+                        assert!(
+                            matches!(
+                                orphan,
+                                OffchainOrder::Failed {
+                                    kind: OffchainOrderFailureKind::Deferral,
+                                    ..
+                                }
+                            ),
+                            "the orphan must be retired as a deferral ({case}), got: {orphan:?}"
+                        );
+                        assert_eq!(placed, 1, "exactly one fresh hedge ({case})");
+                    }
+                    BrokerLookup::Found => {
+                        let outcome =
+                            result.expect("an order at the broker must not refuse the run");
+                        assert!(
+                            matches!(outcome, ProcessTxOutcome::PendingHedgeInFlight),
+                            "an order at the broker is in flight, got: {outcome:?}"
+                        );
+                        assert_eq!(position.pending_offchain_order_id, Some(pending_id));
+                        assert!(fill_settled, "the later fill must be settled");
+                        assert_eq!(placed, 0, "no second hedge over an order the broker holds");
+                    }
+                    BrokerLookup::Unanswered => {
+                        assert!(
+                            matches!(result, Err(OperatorError::Operational(_))),
+                            "an unanswered lookup must be a retryable failure, got: {result:?}"
+                        );
+                        assert_eq!(position.pending_offchain_order_id, Some(pending_id));
+                        assert!(!fill_settled, "the fill must stay unsettled for the retry");
+                        assert_eq!(placed, 0);
+                    }
+                }
+            }
+        }
+
         /// The schedule-disabled refusal carries the same obligation as every
         /// other gate exit: the fill has to be durably settled first. When the
         /// settle cannot be written the gate must surface a retryable
@@ -7070,6 +7345,7 @@ pub mod process_tx {
             let Err(error) = gate_fill_for_placement(
                 &ctx,
                 &stores,
+                noop_order_placer().as_ref(),
                 ctx.chains.primary(),
                 &later_fill,
                 &later_trade_id,
