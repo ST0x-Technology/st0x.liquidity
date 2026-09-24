@@ -91,14 +91,14 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 ///
 /// [`CctpEndpoint::find_existing_mint`] does not rely on this recency
 /// argument: it floors its scan at the destination head captured before the
-/// mint, or at [`LEGACY_MINT_SCAN_LOOKBACK_CHUNKS`] for transfers without one.
+/// mint, lowered to at least [`MINT_SCAN_LOOKBACK_CHUNKS`] below the head.
 const RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS: u64 = 3;
 
-/// Chunks [`CctpEndpoint::find_existing_mint`] looks back from the head when
-/// the transfer has no captured scan floor (its attestation was recorded
-/// before the floor existed). A mint older than this is left to the operator
-/// rather than found by a scan to genesis on every resume.
-const LEGACY_MINT_SCAN_LOOKBACK_CHUNKS: u64 = 3;
+/// Chunks [`CctpEndpoint::find_existing_mint`] always looks back from the
+/// head, below a captured scan floor too: that floor is read after Circle
+/// attests, so a relayer's mint can predate it. A mint older than both is left
+/// to the operator rather than found by a scan to genesis on every resume.
+const MINT_SCAN_LOOKBACK_CHUNKS: u64 = 3;
 
 /// Delay between the `usedNonces()` probes that
 /// [`CctpEvm::recover_already_minted`] runs after a failed `receiveMessage`.
@@ -936,8 +936,8 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// [`recover_already_minted`](Self::recover_already_minted) does not call
     /// this directly -- see its own doc for why.
     ///
-    /// The log scan for a consumed nonce is floored at `scan_from_block`, or
-    /// [`LEGACY_MINT_SCAN_LOOKBACK_CHUNKS`] below the head when it is `None`.
+    /// The log scan for a consumed nonce is floored at the lower of
+    /// `scan_from_block` and [`MINT_SCAN_LOOKBACK_CHUNKS`] below the head.
     /// A log still missing after the lag retries is
     /// [`CctpError::MintNotFoundInScanWindow`]: every resume would otherwise
     /// repeat a walk to genesis.
@@ -958,12 +958,16 @@ impl<W: Wallet> CctpEndpoint<W> {
             return Ok(None);
         }
 
-        let from_block = match scan_from_block {
-            Some(block) => block,
-            None => self.current_block().await?.saturating_sub(
-                CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(LEGACY_MINT_SCAN_LOOKBACK_CHUNKS),
-            ),
-        };
+        let lookback_floor = self.current_block().await?.saturating_sub(
+            CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(MINT_SCAN_LOOKBACK_CHUNKS),
+        );
+
+        // A relayer can mint before the floor was captured (burns name no
+        // destination caller), so a captured floor never scans less than the
+        // bounded lookback. Matching is by nonce, so a lower floor cannot adopt
+        // another mint.
+        let from_block =
+            scan_from_block.map_or(lookback_floor, |captured| captured.min(lookback_floor));
 
         match self
             .locate_mint_receipt_with_lag_retries(&received_message, from_block)
@@ -1332,8 +1336,8 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// correlate the right `MintAndWithdraw` within a multicall transaction).
     ///
     /// `min_block` floors how far back the scan walks:
-    /// [`find_existing_mint`](Self::find_existing_mint)'s captured or legacy
-    /// floor, or [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`] below the head for
+    /// [`find_existing_mint`](Self::find_existing_mint)'s floor, or
+    /// [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`] below the head for
     /// the reconstruction that just saw the nonce become consumed.
     async fn find_received_message_tx(
         &self,
