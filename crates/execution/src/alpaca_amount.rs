@@ -38,7 +38,13 @@ impl TryFrom<Float> for AlpacaAmount {
 
     fn try_from(amount: Float) -> Result<Self, Self::Error> {
         let raw = Usdc::new(amount);
-        let normalized = raw.floor_to_6_decimals()?;
+        if raw.is_negative()? {
+            return Err(UsdcConversionError::NegativeValue(amount));
+        }
+        // Rounding through the fixed-point form also rejects amounts that do
+        // not fit the U256 range of an on-chain USDC value.
+        let (fixed, _lossless) = amount.to_fixed_decimal_lossy(6)?;
+        let normalized = Usdc::new(Float::from_fixed_decimal(fixed, 6)?);
 
         Ok(Self { raw, normalized })
     }
@@ -73,12 +79,15 @@ impl Display for AlpacaAmount {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::U256;
+    use proptest::prelude::*;
+    use rain_math_float::Float;
     use serde_json::json;
 
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
 
-    use super::AlpacaAmount;
+    use super::{AlpacaAmount, UsdcConversionError};
 
     #[test]
     fn string_amount_is_floored_to_six_decimals() {
@@ -115,6 +124,15 @@ mod tests {
     }
 
     #[test]
+    fn amount_beyond_the_onchain_usdc_range_is_rejected() {
+        let amount = Float::parse("1e80".to_owned()).unwrap();
+
+        let error = AlpacaAmount::try_from(amount).unwrap_err();
+
+        assert!(matches!(error, UsdcConversionError::Float(_)), "{error:?}");
+    }
+
+    #[test]
     fn cash_valuation_preserves_the_raw_broker_amount() {
         let amount: AlpacaAmount = serde_json::from_value(json!("9.794019706")).unwrap();
 
@@ -122,5 +140,31 @@ mod tests {
             amount.cash_value_at(float!(1.00101001)).unwrap(),
             Usdc::new(float!(9.80391176384325706))
         );
+    }
+
+    proptest! {
+        /// Normalizing a nonnegative 9-decimal broker amount never increases
+        /// it, always lands on the 6-decimal USDC grid, and is idempotent.
+        #[test]
+        fn normalization_is_sound_for_nonnegative_amounts(raw in 0u64..=u64::MAX) {
+            let amount = Float::from_fixed_decimal(U256::from(raw), 9).unwrap();
+            let normalized = AlpacaAmount::try_from(amount).unwrap();
+            let normalized_usdc = Usdc::new(normalized.into_normalized());
+
+            prop_assert!(normalized_usdc <= Usdc::new(amount));
+            let fixed = normalized_usdc.to_u256_6_decimals().unwrap();
+            prop_assert_eq!(fixed, U256::from(raw / 1_000));
+            prop_assert_eq!(
+                Usdc::new(Float::from_fixed_decimal(fixed, 6).unwrap()),
+                normalized_usdc
+            );
+            prop_assert!(
+                AlpacaAmount::try_from(normalized.into_normalized())
+                    .unwrap()
+                    .into_normalized()
+                    .eq(normalized.into_normalized())
+                    .unwrap()
+            );
+        }
     }
 }
