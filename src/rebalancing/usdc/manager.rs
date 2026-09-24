@@ -13078,6 +13078,56 @@ mod tests {
         assert!(!logs_contain("operational_alert"), "{id} must not page");
     }
 
+    /// An Alpaca->Base retry finds the latched transfer failed and does not
+    /// alert, so a repeating re-poll failure on a consumed nonce pages itself.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn alpaca_to_base_legacy_repeating_repoll_failure_pages_the_operator() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_attested_alpaca_to_base(&cqrs, &id, usdc("1")).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge =
+            MockBridge::new().with_failing_repoll_on_consumed_nonce(|| CctpError::PlaceholderNonce);
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
+
+        let error = manager
+            .repoll_attested_attestation(
+                &id,
+                BridgeDirection::EthereumToBase,
+                TxHash::from([7u8; 32]),
+                B256::repeat_byte(0x07),
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UsdcTransferError::Cctp(cctp_error)
+                if matches!(**cctp_error, CctpError::PlaceholderNonce)),
+            "a repeating re-poll failure must not redrive, got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "got: {state:?}"
+        );
+        assert!(state.is_reconcilable_failure(), "got: {state:?}");
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically \
+             (Circle re-poll failed on a consumed nonce: {}). Bridge marked failed; find \
+             the mint of the recorded nonce on chain, then settle it with \
+             `transfer reconcile --kind usdc`.",
+            CctpError::PlaceholderNonce
+        )));
+    }
+
     /// A re-poll error that may clear (an RPC transport failure) on a consumed
     /// nonce keeps redriving in `Attested`, so a later attempt adopts the mint.
     #[tokio::test]
