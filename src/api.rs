@@ -2499,11 +2499,21 @@ async fn fail_pre_burn_usdc_transfer(
         .await
         .map_err(ops_command_error)?;
 
-    let guard_held = store
-        .load(id)
-        .await
-        .map_err(ops_store_error)?
-        .is_some_and(|failed| failed.holds_rebalance_guard());
+    // The send succeeded, so the aggregate exists; a missing reload is a store
+    // inconsistency, not a cleared guard, and must not be reported as one.
+    let Some(failed) = store.load(id).await.map_err(ops_store_error)? else {
+        error!(%id, "USDC transfer could not be reloaded after FailBridging was recorded");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!(
+                    "USDC transfer {id} was failed but could not be reloaded to report its \
+                     guard state"
+                ),
+            }),
+        ));
+    };
+    let guard_held = failed.holds_rebalance_guard();
 
     info!(%id, %reason, guard_held, "Pre-burn USDC transfer failed via API");
     Ok(FailUsdcTransferResponse {
@@ -7621,6 +7631,118 @@ mod tests {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    fn fail_usdc_request() -> Json<FailUsdcTransferRequest> {
+        Json(FailUsdcTransferRequest {
+            reason: "audit: pre-burn crash".to_string(),
+        })
+    }
+
+    /// The route's resume lock is what keeps a concurrent resume or recheck
+    /// from adopting a burn under the failure. Held, the route must refuse with
+    /// 409 before quiescing the driver or touching the aggregate. Removing the
+    /// lock lets the failure through, failing both assertions.
+    #[tokio::test]
+    async fn fail_usdc_transfer_route_returns_409_while_the_resume_lock_is_held() {
+        let (state, _gate) = recovery_state_with_driver_pause().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&state.pool, &id, false).await;
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        let Err((status, _)) = fail_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            fail_usdc_request(),
+        )
+        .await
+        else {
+            panic!("the route must refuse while the resume lock is held");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            matches!(
+                load_usdc_rebalance(&state.pool, &id).await,
+                UsdcRebalance::BridgingSubmitting { .. }
+            ),
+            "a refused request must not touch the aggregate",
+        );
+    }
+
+    /// The driver pause is what stops a worker advancing the transfer past the
+    /// preflight. With an execution in flight the route must refuse with 503
+    /// and leave the aggregate as it was. Removing the quiesce call lets the
+    /// failure through, failing both assertions.
+    #[tokio::test]
+    async fn fail_usdc_transfer_route_returns_503_while_a_transfer_is_executing() {
+        let (state, gate) = recovery_state_with_driver_pause().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&state.pool, &id, false).await;
+        let executing = gate.enter().await;
+        // Pause the clock only for the quiesce window, so its 5-second timer
+        // auto-advances; resume it before touching the database again.
+        tokio::time::pause();
+
+        let result = fail_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            fail_usdc_request(),
+        )
+        .await;
+        tokio::time::resume();
+        drop(executing);
+
+        let Err((status, Json(body))) = result else {
+            panic!("the route must refuse while a transfer is executing");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "A USDC transfer is executing; retry once it is not in flight"
+        );
+        assert!(
+            matches!(
+                load_usdc_rebalance(&state.pool, &id).await,
+                UsdcRebalance::BridgingSubmitting { .. }
+            ),
+            "a refused request must not touch the aggregate",
+        );
+    }
+
+    /// A successful failure releases both gates on the way out: the driver
+    /// resumes and the resume lock is free for the next operator request.
+    #[tokio::test]
+    async fn fail_usdc_transfer_route_releases_the_driver_and_the_lock_after_success() {
+        let (state, gate) = recovery_state_with_driver_pause().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&state.pool, &id, false).await;
+
+        let Json(body) = fail_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            fail_usdc_request(),
+        )
+        .await
+        .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert!(!body.guard_held);
+        assert!(matches!(
+            load_usdc_rebalance(&state.pool, &id).await,
+            UsdcRebalance::BridgingFailed {
+                burn_tx_hash: None,
+                ..
+            }
+        ));
+        assert!(
+            gate.try_enter().is_some(),
+            "the driver must resume once the route returns"
+        );
+        assert!(
+            state.resume_lock.0.try_lock().is_ok(),
+            "the resume lock must be free once the route returns"
+        );
     }
 
     #[tokio::test]
