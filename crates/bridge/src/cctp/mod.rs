@@ -4658,6 +4658,57 @@ mod tests {
         assert_eq!(from_block, head - lookback);
     }
 
+    /// Burns name no destination caller, so a relayer can mint between Circle
+    /// completing the attestation and the bot capturing its scan floor.
+    #[tokio::test]
+    async fn find_existing_mint_finds_a_mint_that_landed_below_the_captured_floor() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_700_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        let mint_receipt = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        base_provider.anvil_mine(Some(5), None).await.unwrap();
+        let floor_above_mint = bridge.base.current_block().await.unwrap();
+
+        let recovered = bridge
+            .base
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(floor_above_mint),
+            )
+            .await
+            .unwrap()
+            .expect("a consumed nonce minted just below the floor must be found");
+
+        assert_eq!(recovered.tx, mint_receipt.tx);
+        assert_eq!(recovered.amount, mint_receipt.amount);
+    }
+
     /// One `usedNonces()` read can come from a node behind the block that holds
     /// the mint, so a single "unused" answer must not decide the nonce is
     /// unused: that answer latches `BridgingFailed` on funds already minted.
