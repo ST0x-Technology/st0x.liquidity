@@ -3800,8 +3800,9 @@ enum UsdcRebalance {
         // AttestationResponse and mints without re-polling Circle. None for
         // transfers whose BridgeAttestationReceived predates this field.
         message: Option<Vec<u8>>,
-        // Destination chain head captured before the mint: the floor of the
-        // resume lookup for this nonce's mint. None for transfers whose
+        // Destination chain head captured before the mint: the resume lookup
+        // for this nonce's mint starts at the lower of it and a fixed lookback
+        // from the head. None for transfers whose
         // BridgeAttestationReceived predates this field.
         mint_scan_from_block: Option<u64>,
         initiated_at: DateTime<Utc>,
@@ -4247,7 +4248,10 @@ enum BridgeStage { Burn, Attestation, Mint }
   before minting again; or `BridgingFailed` when recovering an already-failed
   post-burn transfer, whose next redrive re-attempts the mint directly instead
   (idempotency there comes from CCTP's nonce being authoritative, not from that
-  bounded scan).
+  bounded scan). The exception is a `BaseToAlpaca` `BridgingFailed` recovery
+  that reads the nonce used but finds no `MessageReceived` log in its scan: no
+  redrive scans wider, so it pages "the CCTP mint cannot be resolved
+  automatically" and parks the transfer for reconciliation.
 - **Inconclusive mint recovery: redrive and operator alert**: the job layer
   schedules an unbounded delayed redrive (like the settlement-phase
   RPC-transient case above) rather than consuming the apalis retry budget, since

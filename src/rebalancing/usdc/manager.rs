@@ -479,6 +479,48 @@ fn repeating_mint_failure(error: &CctpError) -> Option<RepeatingMintFailure> {
     }
 }
 
+/// Whether an inconclusive mint recovery read the nonce used but found no
+/// `MessageReceived` log in its bounded scan. No retry scans wider, so the
+/// caller parks; every other cause may clear on a redrive. Exhaustive so a
+/// new `CctpError` needs a decision.
+fn recovery_mint_outside_scan(recovery_error: &CctpError) -> bool {
+    match recovery_error {
+        CctpError::AlreadyMintedMessageNotFound { .. } => true,
+
+        CctpError::Evm(_)
+        | CctpError::Contract(_)
+        | CctpError::RpcTransport(_)
+        | CctpError::SolType(_)
+        | CctpError::ScanInconclusive { .. }
+        | CctpError::BurnTxPending { .. }
+        | CctpError::Http(_)
+        | CctpError::AttestationTimeout { .. }
+        | CctpError::PlaceholderNonce
+        | CctpError::MalformedAttestation { .. }
+        | CctpError::MessageTooShort { .. }
+        | CctpError::MessageDestinationDomainMismatch { .. }
+        | CctpError::MessageTooShortForRecovery { .. }
+        | CctpError::MintNotFoundInScanWindow { .. }
+        | CctpError::MessageSentEventNotFound { .. }
+        | CctpError::MintAndWithdrawEventNotFound
+        | CctpError::TxReceiptMissingBlock { .. }
+        | CctpError::UsdcCreditOverflow { .. }
+        | CctpError::UsdcTransferLogDecode { .. }
+        | CctpError::RecoveredMintMessageMismatch { .. }
+        | CctpError::RecoveredMintLogMissingTxHash { .. }
+        | CctpError::RecoveredMintReceiptReverted { .. }
+        | CctpError::RecoveredMintAndWithdrawEventNotFound { .. }
+        | CctpError::MintRecoveryInconclusive { .. }
+        | CctpError::FeeCalculationOverflow
+        | CctpError::Float(_)
+        | CctpError::AmountConversion(_)
+        | CctpError::FastTransferFeeNotAvailable { .. }
+        | CctpError::AmountBelowFastTransferFee { .. }
+        | CctpError::HexDecode(_)
+        | CctpError::FeeValueParse(_) => false,
+    }
+}
+
 /// The settlement-phase observation that kept an AlpacaToBase transfer from
 /// settling, interpolated into the deadline terminal's `FailBridging` reason
 /// and log line by `check_settlement_deadline`. An enum rather than a free
@@ -1046,7 +1088,8 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         // Capture the destination head before minting: the resume lookup for
         // the mint of this nonce starts at the lower of it and a fixed lookback,
-        // so a crash before `ConfirmBridging` never scans back to genesis. A lookup failure here is transient (a destination RPC/read hiccup):
+        // so a crash before `ConfirmBridging` never scans back to genesis. A
+        // lookup failure here is transient (a destination RPC/read hiccup):
         // the aggregate is still in `Bridging`/`AwaitingAttestation` with no
         // attestation recorded yet, and both directions have resume entry points
         // for those states that re-poll the attestation idempotently. So
@@ -2979,7 +3022,10 @@ impl<
     /// only when the nonce state itself is unknown. Both cases redrive into
     /// the same resume path (`continue_from_attested` /
     /// `recover_from_bridging_failed`'s own next attempt), which again adopts
-    /// only the mint of this transfer's own nonce.
+    /// only the mint of this transfer's own nonce. The exception is
+    /// `recover_from_bridging_failed` finding no `MessageReceived` log for a
+    /// used nonce: no retry scans wider, so it pages and parks instead of
+    /// calling this.
     ///
     /// BOUNDED BY A DEADLINE, mirroring `WithdrawalPollInconclusive`: every call
     /// site redrives via `UsdcTransferError::MintRecoveryInconclusive` for as
@@ -3872,36 +3918,34 @@ impl<
             // The nonce is used but its mint is not in the scan after the lag
             // retries: the Attested resume's out-of-window case. No retry
             // scans wider, so page once per run and park instead of redriving.
-            Err(error)
-                if matches!(
-                    &error,
-                    CctpError::MintRecoveryInconclusive { recovery_error }
-                        if matches!(**recovery_error, CctpError::AlreadyMintedMessageNotFound { .. })
-                ) =>
-            {
-                warn!(target: "rebalance", %id, "Mint of the used nonce is outside the recovery scan; parking for operator reconciliation: {error}");
-                alert_unresolvable_mint(
-                    id,
-                    &format!("nonce used, mint outside the recovery scan: {error}"),
-                );
-                return Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() });
-            }
-            // Mirrors the same arm in `execute_cctp_mint`/
-            // `execute_cctp_mint_on_ethereum`: whether/how the mint landed is
-            // UNKNOWN or already-landed-but-unconfirmed, not "definitely not
-            // minted". Blanket-mapping this to `UsdcTransferError::Cctp` would
-            // land in the job's generic terminal arm, alerting and opening
-            // the circuit on a transfer whose USDC already burned -- exactly
-            // the multi-hour stranding this recovery path exists to fix.
-            // Redriving is safe: the aggregate stays `BridgingFailed` (already
-            // terminal), and the next redrive re-polls the attestation and
-            // re-attempts the mint. Idempotency comes from CCTP's nonce
-            // being authoritative (`receiveMessage`
-            // reverts on an already-consumed nonce) plus
+            //
+            // Any other inconclusive recovery mirrors the same arm in
+            // `execute_cctp_mint`/`execute_cctp_mint_on_ethereum`: whether/how
+            // the mint landed is UNKNOWN or already-landed-but-unconfirmed, not
+            // "definitely not minted". Blanket-mapping it to
+            // `UsdcTransferError::Cctp` would land in the job's generic
+            // terminal arm, alerting and opening the circuit on a transfer
+            // whose USDC already burned -- exactly the multi-hour stranding
+            // this recovery path exists to fix. Redriving is safe: the
+            // aggregate stays `BridgingFailed` (already terminal), and the next
+            // redrive re-polls the attestation and re-attempts the mint.
+            // Idempotency comes from CCTP's nonce being authoritative
+            // (`receiveMessage` reverts on an already-consumed nonce) plus
             // `recover_already_minted`'s own reconstruction, whose backward
-            // scan is bounded (not unbounded) by
-            // `RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS` on the bridge side.
-            Err(error @ CctpError::MintRecoveryInconclusive { .. }) => {
+            // scan is bounded by `RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS` on the
+            // bridge side.
+            Err(CctpError::MintRecoveryInconclusive { recovery_error }) => {
+                let outside_scan = recovery_mint_outside_scan(&recovery_error);
+                let error = CctpError::MintRecoveryInconclusive { recovery_error };
+                if outside_scan {
+                    warn!(target: "rebalance", %id, "Mint of the used nonce is outside the recovery scan; parking for operator reconciliation: {error}");
+                    alert_unresolvable_mint(
+                        id,
+                        &format!("nonce used, mint outside the recovery scan: {error}"),
+                    );
+                    return Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() });
+                }
+
                 return Err(Self::redrive_on_mint_recovery_inconclusive(
                     id,
                     error,
@@ -6024,12 +6068,13 @@ mod tests {
     }
 
     /// A `Bridge` decorator whose `mint()` always returns
-    /// `CctpError::MintRecoveryInconclusive` wrapping `recovery_error()`, forwarding every other `Bridge`
-    /// and `UsdcBridgeHelper` method to a wrapped real bridge. Used to test
-    /// that `execute_cctp_mint`/`execute_cctp_mint_on_ethereum`/
-    /// `recover_from_bridging_failed` redrive via
-    /// `UsdcTransferError::MintRecoveryInconclusive` instead of declaring
-    /// `FailBridging` on that error class.
+    /// `CctpError::MintRecoveryInconclusive` wrapping `recovery_error()`,
+    /// forwarding every other `Bridge` and `UsdcBridgeHelper` method to a
+    /// wrapped real bridge. Used to test that `execute_cctp_mint`/
+    /// `execute_cctp_mint_on_ethereum`/`recover_from_bridging_failed` do not
+    /// declare `FailBridging` on that error class: the wrapped cause picks a
+    /// redrive (e.g. `ScanInconclusive`) or, in `recover_from_bridging_failed`,
+    /// a page and park (`AlreadyMintedMessageNotFound`).
     ///
     /// Generic over `InnerBridge` (rather than a unit struct with
     /// `unimplemented!()` methods) because `recover_from_bridging_failed`
