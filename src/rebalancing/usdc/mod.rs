@@ -472,6 +472,53 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         burn_tx: TxHash,
     },
+    /// A Base->Alpaca deposit send cannot be resolved automatically, and a
+    /// resend could move the minted USDC twice. `FailDeposit` is already
+    /// committed; the job pages and does not retry.
+    #[error(
+        "USDC rebalance {id}: {cause}; deposit marked failed for operator \
+         reconciliation (`transfer recheck` if Alpaca credited it, else \
+         `transfer reconcile --kind usdc`)"
+    )]
+    DepositSendUnresolved {
+        id: UsdcRebalanceId,
+        cause: UnresolvedDepositSend,
+    },
+    /// The Base->Alpaca deposit send may be broadcast, but its tx is not
+    /// recorded: every `RecordPendingDeposit` attempt failed (`send_tx` is in
+    /// the logs), or the task that broadcasts and records it panicked. The
+    /// aggregate stays `Bridged`; the job pages and does not retry, because a
+    /// retry cannot see an unmined send and could send again.
+    #[error(
+        "USDC rebalance {id}: deposit send may be broadcast but its tx was not \
+         recorded (send tx {send_tx:?}); verify on chain before any resend"
+    )]
+    DepositSendRecordFailed {
+        id: UsdcRebalanceId,
+        send_tx: Option<TxHash>,
+    },
+}
+
+/// Why a Base->Alpaca deposit send cannot be resolved automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum UnresolvedDepositSend {
+    /// No send was recorded, yet a send of the same amount from the wallet
+    /// to the deposit address landed after the mint. It can be another
+    /// transfer's send through the shared wallet, so it is never adopted.
+    #[error(
+        "no deposit send was recorded, but send {tx} of the same amount to the \
+         Alpaca deposit address landed after the mint and may belong to another transfer"
+    )]
+    UnrecordedSend { tx: TxHash },
+    /// The broadcast timed out or failed after the request was sent, so the
+    /// send may be on chain.
+    #[error("the deposit send broadcast failed or timed out and may still be on chain")]
+    SubmitInconclusive,
+    #[error("the recorded deposit send {tx} was mined reverted")]
+    RecordedSendReverted { tx: TxHash },
+    /// Dropped from the mempool, but a dropped tx can still be rebroadcast.
+    #[error("the recorded deposit send {tx} was dropped from the mempool")]
+    RecordedSendDropped { tx: TxHash },
 }
 
 impl UsdcTransferError {
@@ -524,7 +571,9 @@ impl UsdcTransferError {
             | Self::BurnRecordTaskFailed { .. }
             | Self::BurnRecordFailed { .. }
             | Self::BurnSubmitInconclusive { .. }
-            | Self::BurnTxDropped { .. } => None,
+            | Self::BurnTxDropped { .. }
+            | Self::DepositSendUnresolved { .. }
+            | Self::DepositSendRecordFailed { .. } => None,
         }
     }
 }
@@ -579,7 +628,9 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::BurnRecordTaskFailed { .. }
             | Self::BurnRecordFailed { .. }
             | Self::BurnSubmitInconclusive { .. }
-            | Self::BurnTxDropped { .. } => false,
+            | Self::BurnTxDropped { .. }
+            | Self::DepositSendUnresolved { .. }
+            | Self::DepositSendRecordFailed { .. } => false,
         }
     }
 }

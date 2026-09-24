@@ -2018,6 +2018,7 @@ mod tests {
     use super::*;
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::native_gas::GasReadinessFailure;
+    use crate::rebalancing::usdc::UnresolvedDepositSend;
     use crate::test_utils::setup_test_apalis_pool;
 
     /// Builds a `QueuePushError` without touching a pool. The classification
@@ -2284,6 +2285,10 @@ mod tests {
         /// Deterministic across retries -- the converted amount cannot grow --
         /// and the withdrawal it blocks needs an operator, not a retry.
         ConversionBelowWithdrawalMinimum,
+        /// `FailDeposit` is committed; a retry has nothing left to do.
+        DepositSendUnresolved,
+        /// A deposit send may be in flight unrecorded: a retry could send again.
+        DepositSendRecordFailed,
     }
 
     impl TerminalOutcome {
@@ -2350,6 +2355,16 @@ mod tests {
                         minimum: *st0x_config::ALPACA_MINIMUM_WITHDRAWAL,
                     }
                 }
+                Self::DepositSendUnresolved => UsdcTransferError::DepositSendUnresolved {
+                    id: id.clone(),
+                    cause: UnresolvedDepositSend::UnrecordedSend {
+                        tx: TxHash::from([0xDA; 32]),
+                    },
+                },
+                Self::DepositSendRecordFailed => UsdcTransferError::DepositSendRecordFailed {
+                    id: id.clone(),
+                    send_tx: Some(TxHash::from([0xDB; 32])),
+                },
             }
         }
     }
@@ -4198,6 +4213,26 @@ mod tests {
             TerminalOutcome::BurnTxDropped,
             "BurnTxDropped (hedging)",
             Some(TxHash::from([0xAB; 32])),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hedging_job_fails_closed_on_deposit_send_unresolved() {
+        assert_hedging_fail_closed(
+            TerminalOutcome::DepositSendUnresolved,
+            "DepositSendUnresolved (hedging)",
+            Some(TxHash::from([0xDA; 32])),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hedging_job_fails_closed_on_deposit_send_record_failed() {
+        assert_hedging_fail_closed(
+            TerminalOutcome::DepositSendRecordFailed,
+            "DepositSendRecordFailed (hedging)",
+            Some(TxHash::from([0xDB; 32])),
         )
         .await;
     }
