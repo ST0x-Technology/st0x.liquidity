@@ -141,6 +141,18 @@ pub(crate) enum Debug {
         #[arg(long, value_parser = nonblank_reason)]
         reason: String,
     },
+    /// Force fail a stuck equity mint or redemption so its transfer guard
+    /// can be released.
+    FailEquityTransfer {
+        /// Transfer kind.
+        #[arg(value_enum)]
+        kind: EquityTransferKind,
+        /// Aggregate id.
+        id: String,
+        /// Free text audit reason, persisted on the event.
+        #[arg(long, value_parser = nonblank_reason)]
+        reason: String,
+    },
     /// Recover stuck position state.
     #[command(subcommand)]
     Position(Position),
@@ -151,7 +163,32 @@ pub(crate) enum Debug {
     ProcessTx {
         /// Transaction hash of the onchain fill.
         tx_hash: String,
+        /// Hedged chain the fill happened on; omitted means the bot's primary
+        /// chain.
+        #[arg(long, value_enum)]
+        chain: Option<HedgedChain>,
     },
+}
+
+/// A hedged chain, spelled as the bot's `chain` query value (the `Chain` wire
+/// names in `st0x-evm`).
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum HedgedChain {
+    Base,
+    Ethereum,
+    Hyperevm,
+    Robinhood,
+}
+
+impl HedgedChain {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Ethereum => "ethereum",
+            Self::Hyperevm => "hyperevm",
+            Self::Robinhood => "robinhood",
+        }
+    }
 }
 
 /// USDC rebalance direction, spelled as the bot's path segment.
@@ -366,6 +403,7 @@ mod tests {
             &["reconcile-equity", "mint", "abc", "--reason"],
             &["clear-pending-burn", "abc", "--reason"],
             &["fail-usdc-transfer", "abc", "--reason"],
+            &["fail-equity-transfer", "redemption", "abc", "--reason"],
             &["position", "set", "AAPL", "--target-net", "1", "--reason"],
             &[
                 "position",
@@ -436,6 +474,14 @@ mod tests {
         assert!(matches!(
             debug(&["fail-usdc-transfer", "abc", "--reason", "pre-burn crash"]).unwrap(),
             Debug::FailUsdcTransfer { id, reason } if id == "abc" && reason == "pre-burn crash"
+        ));
+        assert!(matches!(
+            debug(&["fail-equity-transfer", "mint", "abc", "--reason", "stuck"]).unwrap(),
+            Debug::FailEquityTransfer {
+                kind: EquityTransferKind::Mint,
+                id,
+                reason,
+            } if id == "abc" && reason == "stuck"
         ));
 
         for verb in ["reconcile-usdc", "clear-pending-burn", "fail-usdc-transfer"] {
@@ -509,8 +555,23 @@ mod tests {
     fn parses_process_tx() {
         assert!(matches!(
             debug(&["process-tx", "0xabc"]).unwrap(),
-            Debug::ProcessTx { tx_hash } if tx_hash == "0xabc"
+            Debug::ProcessTx { tx_hash, chain: None } if tx_hash == "0xabc"
         ));
+        for (spelling, expected) in [
+            ("base", "base"),
+            ("ethereum", "ethereum"),
+            ("hyperevm", "hyperevm"),
+            ("robinhood", "robinhood"),
+        ] {
+            let Debug::ProcessTx {
+                chain: Some(chain), ..
+            } = debug(&["process-tx", "0xabc", "--chain", spelling]).unwrap()
+            else {
+                panic!("--chain {spelling} must parse");
+            };
+            assert_eq!(chain.wire_name(), expected);
+        }
+        assert!(debug(&["process-tx", "0xabc", "--chain", "solana"]).is_err());
     }
 
     /// The nested groups: every flag on `position set` / `release-hedge` and

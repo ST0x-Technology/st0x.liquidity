@@ -34,6 +34,13 @@ pub(crate) struct ClearPendingBurnRequest {
     pub(crate) reason: String,
 }
 
+/// Body of `POST /transfers/fail/{kind}/{id}` for an equity mint or
+/// redemption.
+#[derive(Serialize)]
+pub(crate) struct FailEquityTransferRequest {
+    pub(crate) reason: String,
+}
+
 /// Body of `POST /transfers/usdc/{id}/fail`.
 #[derive(Serialize)]
 pub(crate) struct FailUsdcTransferRequest {
