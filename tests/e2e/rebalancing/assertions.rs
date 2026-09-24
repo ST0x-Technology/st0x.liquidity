@@ -998,6 +998,7 @@ fn usdc_rebalance_expectations(
                 "UsdcRebalanceEvent::BridgingInitiated",
                 "UsdcRebalanceEvent::BridgeAttestationReceived",
                 "UsdcRebalanceEvent::Bridged",
+                "UsdcRebalanceEvent::DepositSendSubmitting",
                 "UsdcRebalanceEvent::PendingDepositRecorded",
                 "UsdcRebalanceEvent::DepositInitiated",
                 "UsdcRebalanceEvent::DepositConfirmed",
