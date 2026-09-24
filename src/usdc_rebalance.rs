@@ -1297,8 +1297,9 @@ impl UsdcRebalance {
     /// USDC this transfer was credited with that may still sit in the shared
     /// Ethereum wallet: credited from its delivering tx and not yet sent on.
     /// A BaseToAlpaca credit leaves with the Alpaca deposit send: in flight
-    /// once its hash is recorded, gone at `DepositInitiated`. An AlpacaToBase credit arrives with the withdrawal
-    /// tx Alpaca reported and leaves with the burn, and
+    /// once its hash is recorded, gone at `DepositInitiated`. An AlpacaToBase
+    /// credit arrives with the withdrawal tx Alpaca reported and leaves with
+    /// the burn, and
     /// `BridgingSubmitting` cannot tell whether it has: a recorded burn may
     /// be unmined, and with no recorded hash the burn may be unsent or
     /// broadcast with its hash lost (`BurnRecordFailed`, an inconclusive
