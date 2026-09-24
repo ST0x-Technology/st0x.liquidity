@@ -437,6 +437,10 @@ pub enum CctpError {
     BurnTxPending { burn_tx: TxHash },
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+    /// A single attestation fetch found the burn not attested yet, or hit a
+    /// transient transport error. Retryable: nothing was submitted.
+    #[error("attestation not ready: {source}")]
+    AttestationNotReady { source: AttestationError },
     #[error("Attestation timeout after {attempts} attempts: {source}")]
     AttestationTimeout {
         attempts: usize,
@@ -575,6 +579,7 @@ impl CctpError {
             | Self::ScanInconclusive { .. }
             | Self::BurnTxPending { .. }
             | Self::Http(_)
+            | Self::AttestationNotReady { .. }
             | Self::AttestationTimeout { .. }
             | Self::MalformedAttestation { .. }
             | Self::MessageSentEventNotFound { .. }
@@ -602,6 +607,10 @@ impl CctpError {
         }
     }
 }
+
+/// How many times [`CctpBridge::poll_attestation`] retries, 5 seconds apart,
+/// while a burn is not attested yet.
+const ATTESTATION_POLL_RETRIES: usize = 60;
 
 /// Errors specific to attestation polling from Circle's API.
 #[derive(Debug, thiserror::Error)]
@@ -812,13 +821,35 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         Ok(max_fee)
     }
 
-    /// Polls for attestation using CCTP V2 API.
+    /// Polls for attestation using CCTP V2 API, retrying up to
+    /// [`ATTESTATION_POLL_RETRIES`] times while the burn is not attested yet.
     async fn poll_attestation_internal(
         &self,
         direction: BridgeDirection,
         tx_hash: TxHash,
     ) -> Result<AttestationResponse, CctpError> {
-        const MAX_ATTEMPTS: usize = 60;
+        self.attestation_with_retries(direction, tx_hash, ATTESTATION_POLL_RETRIES)
+            .await
+    }
+
+    /// Fetches the attestation with exactly one request. A burn not attested
+    /// yet, or a transient transport error, is [`CctpError::AttestationNotReady`];
+    /// a complete but malformed response is still
+    /// [`CctpError::MalformedAttestation`].
+    async fn fetch_attestation_internal(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<AttestationResponse, CctpError> {
+        self.attestation_with_retries(direction, tx_hash, 0).await
+    }
+
+    async fn attestation_with_retries(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+        max_retries: usize,
+    ) -> Result<AttestationResponse, CctpError> {
         const RETRY_INTERVAL_SECS: u64 = 5;
 
         let url = format!(
@@ -831,7 +862,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
         let backoff = backon::ConstantBuilder::default()
             .with_delay(std::time::Duration::from_secs(RETRY_INTERVAL_SECS))
-            .with_max_times(MAX_ATTEMPTS);
+            .with_max_times(max_retries);
 
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
@@ -911,7 +942,13 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
                 err => warn!(target: "bridge", ?err, ?dur, "Attestation error, retrying"),
             })
             .await
-            .map_err(|err| err.into_terminal(MAX_ATTEMPTS))
+            .map_err(|err| {
+                if max_retries == 0 && err.is_retryable() {
+                    CctpError::AttestationNotReady { source: err }
+                } else {
+                    err.into_terminal(max_retries)
+                }
+            })
             // The `.when` short-circuit returns without invoking `.notify`, so the
             // bridge layer is otherwise silent on a fast-fail. Log it here so a
             // terminal malformed-attestation failure is traceable at the bridge
@@ -1310,6 +1347,14 @@ where
         burn_tx: TxHash,
     ) -> Result<Self::Attestation, Self::Error> {
         self.poll_attestation_internal(direction, burn_tx).await
+    }
+
+    async fn fetch_attestation(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+    ) -> Result<Self::Attestation, Self::Error> {
+        self.fetch_attestation_internal(direction, burn_tx).await
     }
 
     async fn mint(
@@ -2194,6 +2239,53 @@ mod tests {
             mock.calls(),
             1,
             "a malformed complete response must fail fast, not retry to the timeout"
+        );
+    }
+
+    /// A single fetch never waits out the poll loop: a burn Circle has not
+    /// attested yet costs one request and comes back retryable.
+    #[tokio::test]
+    async fn fetch_attestation_makes_one_request_for_a_pending_burn() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{ "status": "pending_confirmations" }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+        let error = bridge
+            .fetch_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::AttestationNotReady {
+                    source: AttestationError::Pending { .. }
+                }
+            ),
+            "a pending burn must be a retryable not ready error, got: {error:?}"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "a single fetch must make exactly one request"
         );
     }
 

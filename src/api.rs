@@ -1330,8 +1330,8 @@ pub(crate) struct RecoveryHandle {
     /// Runs in the bot process, so the recovery events reach the live
     /// trigger reactor and clear the in-progress guard without a restart.
     pub(crate) usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
-    /// Operator `cctp complete-mint` entry point: polls the attestation for a
-    /// burn and submits the destination mint through the bot's own bridge and
+    /// Operator `cctp complete-mint` entry point: fetches the attestation for a
+    /// burn once and submits the destination mint through the bot's own bridge and
     /// wallet, under the driver pause so no worker drives the same mint.
     pub(crate) cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     /// Pause control for the USDC rebalancing driver. A write route that must
@@ -2723,12 +2723,14 @@ struct CompleteCctpMintResponse {
 /// lands, bring the stuck `UsdcRebalance` back in sync with `resume-usdc`
 /// (non-terminal: adopts the mint) or `reconcile-usdc` (post-burn terminal).
 ///
-/// The attestation poll (bounded to 60 attempts, 5s apart) runs before the
-/// resume lock and the driver pause are taken, since it is read only and can
-/// take minutes: a burn Circle has not attested yet must not park unrelated
-/// USDC work. The resume lock and the driver pause are held only around the
-/// mint submission, which spends the wallet and races the driver. A burn not
-/// attested yet is reported as 502 and is retryable.
+/// The attestation is fetched once, before the resume lock and the driver pause
+/// are taken. A burn Circle has not attested yet is a retryable 502 at once
+/// rather than a wait inside the request, so the route never keeps working, or
+/// submits a mint, long after the client or IAP timed out. The resume lock and
+/// the driver pause are held only around the mint submission, which spends the
+/// wallet and races the driver. Rerunning after any outcome is safe: a consumed
+/// CCTP nonce cannot be minted twice, and a rerun whose mint already landed
+/// adopts the existing mint instead of failing.
 ///
 /// Mirrors `stox cctp complete-mint`.
 async fn complete_cctp_mint(
@@ -2776,11 +2778,9 @@ fn cctp_recovery_failure(
     (status, Json(ErrorResponse { error: message }))
 }
 
-/// The lock-ordered half of [`complete_cctp_mint`]. Polls Circle for the burn's
-/// attestation WITHOUT the resume lock or the driver pause, then takes both only
-/// around the mint submission and the post-mint gas handling. Keeping the poll
-/// lock free is the point: it is read only and can take minutes, so a burn that
-/// Circle has not attested yet must not park unrelated USDC work.
+/// The lock-ordered half of [`complete_cctp_mint`]. Fetches the burn's
+/// attestation once WITHOUT the resume lock or the driver pause, then takes both
+/// only around the mint submission and the post-mint gas handling.
 async fn complete_cctp_mint_recovery(
     recovery: &dyn RecoverCctpMint,
     resume_lock: &ResumeLock,
@@ -2789,7 +2789,7 @@ async fn complete_cctp_mint_recovery(
     burn_tx: TxHash,
 ) -> Result<Json<CompleteCctpMintResponse>, (StatusCode, Json<ErrorResponse>)> {
     let attestation = recovery
-        .poll_recovery_attestation(direction, burn_tx)
+        .fetch_recovery_attestation(direction, burn_tx)
         .await
         .map_err(|error| cctp_recovery_failure(&error, burn_tx, direction))?;
 
@@ -8670,7 +8670,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RecoverCctpMint for PollProbe {
-        async fn poll_recovery_attestation(
+        async fn fetch_recovery_attestation(
             &self,
             _direction: BridgeDirection,
             burn_tx: TxHash,
@@ -8788,7 +8788,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RecoverCctpMint for InconclusiveMint {
-        async fn poll_recovery_attestation(
+        async fn fetch_recovery_attestation(
             &self,
             _direction: BridgeDirection,
             _burn_tx: TxHash,

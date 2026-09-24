@@ -240,6 +240,8 @@ pub(crate) enum RebuildableView {
 #[derive(Subcommand)]
 pub(crate) enum Cctp {
     /// Complete the destination mint of a CCTP burn whose mint never landed.
+    /// A burn Circle has not attested yet fails at once as retryable; rerun it
+    /// later. Rerunning is always safe: a mint that already landed is adopted.
     /// Afterwards bring the stuck rebalance back in sync with resume-usdc or
     /// reconcile-usdc.
     CompleteMint {

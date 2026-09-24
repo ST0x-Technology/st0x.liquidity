@@ -5264,8 +5264,8 @@ pub(crate) struct RecoveredMintAmounts {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CctpMintRecoveryError {
-    /// Circle has not attested the burn within the polling window, or the
-    /// attestation call failed; retryable once the attestation is complete.
+    /// Circle has not attested the burn yet, or the attestation call failed;
+    /// retryable once the attestation is complete.
     #[error("attestation not available for burn {burn_tx}: {source}")]
     Attestation {
         burn_tx: TxHash,
@@ -5315,16 +5315,17 @@ impl CctpMintRecoveryError {
 /// Two-phase entry point for the operator `cctp complete-mint` recovery of a
 /// burn whose destination mint never completed.
 ///
-/// [`Self::poll_recovery_attestation`] polls Circle for the burn's attestation. It
-/// is read only, touches no aggregate and no wallet, and is bounded but can take
-/// minutes, so the caller runs it without the resume lock or the driver pause: a
-/// burn Circle has not attested yet must not park unrelated USDC work.
+/// [`Self::fetch_recovery_attestation`] fetches the burn's attestation from
+/// Circle with a single request: a burn not attested yet is a retryable error
+/// rather than a wait, so the HTTP route never keeps working after its caller
+/// timed out. It is read only and touches no aggregate or wallet, so the caller
+/// runs it without the resume lock or the driver pause.
 /// [`Self::submit_recovered_cctp_mint`] submits `receiveMessage` and records the
 /// mint gas; it spends the wallet and can race the driver, so the caller holds
 /// the resume lock and quiesces the USDC driver across it only.
 #[async_trait::async_trait]
 pub(crate) trait RecoverCctpMint: Send + Sync + 'static {
-    async fn poll_recovery_attestation(
+    async fn fetch_recovery_attestation(
         &self,
         direction: BridgeDirection,
         burn_tx: TxHash,
@@ -5344,13 +5345,13 @@ where
     Signer: Wallet + Send + Sync + 'static,
     B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
 {
-    async fn poll_recovery_attestation(
+    async fn fetch_recovery_attestation(
         &self,
         direction: BridgeDirection,
         burn_tx: TxHash,
     ) -> Result<AttestationResponse, CctpMintRecoveryError> {
         self.cctp_bridge
-            .poll_attestation(direction, burn_tx)
+            .fetch_attestation(direction, burn_tx)
             .await
             .map_err(|source| CctpMintRecoveryError::Attestation { burn_tx, source })
     }
@@ -5701,6 +5702,14 @@ mod tests {
             Ok(status)
         }
 
+        async fn fetch_attestation(
+            &self,
+            direction: BridgeDirection,
+            burn_tx: TxHash,
+        ) -> Result<AttestationResponse, CctpError> {
+            self.poll_attestation(direction, burn_tx).await
+        }
+
         async fn poll_attestation(
             &self,
             _direction: BridgeDirection,
@@ -5896,6 +5905,14 @@ mod tests {
             self.inner.poll_attestation(direction, burn_tx).await
         }
 
+        async fn fetch_attestation(
+            &self,
+            direction: BridgeDirection,
+            burn_tx: TxHash,
+        ) -> Result<AttestationResponse, CctpError> {
+            self.inner.fetch_attestation(direction, burn_tx).await
+        }
+
         async fn mint(
             &self,
             _direction: BridgeDirection,
@@ -6056,6 +6073,14 @@ mod tests {
             burn_tx: TxHash,
         ) -> Result<AttestationResponse, CctpError> {
             self.inner.poll_attestation(direction, burn_tx).await
+        }
+
+        async fn fetch_attestation(
+            &self,
+            direction: BridgeDirection,
+            burn_tx: TxHash,
+        ) -> Result<AttestationResponse, CctpError> {
+            self.inner.fetch_attestation(direction, burn_tx).await
         }
 
         async fn mint(
@@ -18904,7 +18929,7 @@ mod tests {
         .await;
 
         let attestation = manager
-            .poll_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
+            .fetch_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
             .await
             .unwrap();
         let recovered = manager
@@ -18962,7 +18987,7 @@ mod tests {
         apalis_pool.close().await;
 
         let attestation = manager
-            .poll_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
+            .fetch_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
             .await
             .unwrap();
         let recovered = manager
