@@ -1457,6 +1457,11 @@ pub struct ResumeResponse {
 async fn resume_transfers(
     State(state): State<AppState>,
 ) -> Result<Json<ResumeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Admit the projection write before taking the recovery lock: a request
+    // parked behind a view rebuild must not hold the exclusive lock through
+    // the replay and refuse unrelated recovery requests with 409.
+    let _projection_write = state.projection_maintenance.enter().await;
+
     let _guard = state.resume_lock.0.try_lock().map_err(|_| {
         (
             StatusCode::CONFLICT,
@@ -1498,7 +1503,6 @@ async fn resume_transfers(
                 }),
             )
         })?;
-    let _projection_write = state.projection_maintenance.enter().await;
 
     let mints_attempted = mints.len();
     let redemptions_attempted = redemptions.len();
@@ -1584,6 +1588,11 @@ async fn fail_transfer(
         }
     };
 
+    // Admit the projection write before taking the recovery lock: a request
+    // parked behind a view rebuild must not hold the exclusive lock through
+    // the replay and refuse unrelated recovery requests with 409.
+    let _projection_write = state.projection_maintenance.enter().await;
+
     let _guard = state.resume_lock.0.try_lock().map_err(|_| {
         (
             StatusCode::CONFLICT,
@@ -1601,7 +1610,6 @@ async fn fail_transfer(
             }),
         )
     })?;
-    let _projection_write = state.projection_maintenance.enter().await;
 
     crate::operator::equity_transfer::fail_transfer_in_process(
         &handle.mint_store,
@@ -1695,6 +1703,11 @@ async fn recheck_transfer(
         )
     })?;
 
+    // Admit the projection write before taking the recovery lock: a request
+    // parked behind a view rebuild must not hold the exclusive lock through
+    // the replay and refuse unrelated recovery requests with 409.
+    let _projection_write = state.projection_maintenance.enter().await;
+
     let _guard = state.resume_lock.0.try_lock().map_err(|_| {
         (
             StatusCode::CONFLICT,
@@ -1712,7 +1725,6 @@ async fn recheck_transfer(
             }),
         )
     })?;
-    let _projection_write = state.projection_maintenance.enter().await;
 
     let outcome = match kind {
         TransferKind::EquityMint => {
@@ -2430,6 +2442,11 @@ async fn fail_usdc_transfer(
         ));
     }
 
+    // Admit the projection write before taking the recovery lock: a request
+    // parked behind a view rebuild must not hold the exclusive lock through
+    // the replay and refuse unrelated recovery requests with 409.
+    let _projection_write = state.projection_maintenance.enter().await;
+
     let _guard = state.resume_lock.0.try_lock().map_err(|_| {
         (
             StatusCode::CONFLICT,
@@ -2447,7 +2464,6 @@ async fn fail_usdc_transfer(
             }),
         )
     })?;
-    let _projection_write = state.projection_maintenance.enter().await;
 
     let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, Some(&id), None).await?;
 
@@ -2693,9 +2709,11 @@ struct CompleteCctpMintResponse {
     /// amounts could not be decoded; the mint is still final.
     amount_received: Option<String>,
     fee_collected: Option<String>,
-    /// Whether the bot-gas cost was recorded. `false` means the mint landed but
-    /// the gas enqueue failed and must be re-recorded out of band.
-    gas_recorded: bool,
+    /// Whether the bot-gas cost job was enqueued. `true` means only that it is
+    /// queued: the worker records the ledger entry later and can still fail.
+    /// `false` means the mint landed but the enqueue failed and the gas must be
+    /// re-recorded out of band.
+    gas_enqueued: bool,
 }
 
 /// Completes the destination mint of a CCTP burn whose mint never landed
@@ -2798,7 +2816,7 @@ async fn complete_cctp_mint_recovery(
         %burn_tx,
         ?direction,
         mint_tx = %recovered.mint_tx,
-        gas_recorded = recovered.gas_recorded,
+        gas_enqueued = recovered.gas_enqueued,
         "CCTP mint recovered via API"
     );
     Ok(Json(CompleteCctpMintResponse {
@@ -2811,7 +2829,7 @@ async fn complete_cctp_mint_recovery(
             .amounts
             .as_ref()
             .map(|amounts| amounts.fee_collected.to_string()),
-        gas_recorded: recovered.gas_recorded,
+        gas_enqueued: recovered.gas_enqueued,
     }))
 }
 
@@ -9335,6 +9353,63 @@ mod tests {
                     error.error
                 )
             }
+        }
+    }
+
+    /// Runs one of the recovery routes that both take the resume lock and write
+    /// projections, reducing its outcome to a status.
+    async fn run_recovery_route(state: AppState, route: &'static str) -> Result<(), StatusCode> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let outcome = match route {
+            "resume" => resume_transfers(State(state)).await.map(|_| ()),
+            "fail" => fail_transfer(
+                State(state),
+                Path(("equity_mint".to_string(), id)),
+                Json(FailTransferRequest {
+                    reason: "audit".to_string(),
+                }),
+            )
+            .await
+            .map(|_| ()),
+            "recheck" => recheck_transfer(State(state), Path(("usdc_bridge".to_string(), id)))
+                .await
+                .map(|_| ()),
+            "fail-usdc" => fail_usdc_transfer(State(state), Path(id), fail_usdc_request())
+                .await
+                .map(|_| ()),
+            other => panic!("unknown recovery route {other}"),
+        };
+        outcome.map_err(|(status, _)| status)
+    }
+
+    /// Lock order: a recovery route parked behind a view rebuild must wait at
+    /// the projection gate without holding the exclusive recovery lock, so an
+    /// unrelated recovery request (like a CCTP mint completion) is not refused
+    /// with 409 for the whole replay. Taking the lock first fails this test.
+    #[tokio::test]
+    async fn recovery_routes_wait_for_a_rebuild_without_holding_the_resume_lock() {
+        for route in ["resume", "fail", "recheck", "fail-usdc"] {
+            let (state, _gate) = recovery_state_with_driver_pause().await;
+            let rebuild = state.projection_maintenance.pause().await.unwrap();
+
+            let mut request = tokio::spawn(run_recovery_route(state.clone(), route));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut request)
+                    .await
+                    .is_err(),
+                "{route} must park while the rebuild holds the projection gate"
+            );
+            assert!(
+                state.resume_lock.0.try_lock().is_ok(),
+                "{route} must not hold the resume lock while parked behind the rebuild"
+            );
+
+            drop(rebuild);
+            tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .unwrap_or_else(|_| panic!("{route} must finish once the rebuild ends"))
+                .unwrap_or_else(|error| panic!("{route} task panicked: {error}"))
+                .ok();
         }
     }
 

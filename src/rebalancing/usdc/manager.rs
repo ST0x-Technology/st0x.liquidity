@@ -5244,12 +5244,14 @@ pub(crate) struct RecoveredCctpMint {
     /// Minted amount and fee, `None` only if the on-chain `U256` values could
     /// not be decoded. The mint is final regardless; `mint_tx` is authoritative.
     pub(crate) amounts: Option<RecoveredMintAmounts>,
-    /// Whether the bot-gas cost was enqueued for ADR 0017 accounting. `false`
+    /// Whether the bot-gas cost job was enqueued for ADR 0017 accounting. The
+    /// worker records the ledger entry asynchronously, so `true` is not proof
+    /// the entry exists. `false`
     /// means the mint landed but the enqueue failed; the failure is logged with
     /// the mint tx and chain so it can be re-recorded out of band. A
     /// re-`complete-mint` is unnecessary and unsafe for this: the nonce is
     /// already consumed.
-    pub(crate) gas_recorded: bool,
+    pub(crate) gas_enqueued: bool,
 }
 
 /// The decoded amounts of a recovered mint, present together or not at all.
@@ -5375,8 +5377,8 @@ where
         // Record the mint's gas for ADR 0017 accounting, as every other CCTP
         // mint site does. A failed enqueue does not undo the mint, so log it with
         // the tx and chain for out-of-band re-recording and report it as not
-        // recorded rather than failing the whole recovery.
-        let gas_recorded = match self
+        // enqueued rather than failing the whole recovery.
+        let gas_enqueued = match self
             .enqueue_bot_gas_cost(mint_chain, receipt.tx, BotGasOperationCategory::CctpMint)
             .await
         {
@@ -5413,7 +5415,7 @@ where
         Ok(RecoveredCctpMint {
             mint_tx: receipt.tx,
             amounts,
-            gas_recorded,
+            gas_enqueued,
         })
     }
 }
@@ -18914,7 +18916,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovered.mint_tx, mint_tx);
-        assert!(recovered.gas_recorded, "the enqueue succeeded");
+        assert!(recovered.gas_enqueued, "the enqueue succeeded");
         let amounts = recovered.amounts.expect("amounts decode from the receipt");
         assert_eq!(amounts.amount_received, usdc("100"));
         assert_eq!(amounts.fee_collected, usdc("1"));
@@ -18977,8 +18979,8 @@ mod tests {
             "the final mint hash must be preserved"
         );
         assert!(
-            !recovered.gas_recorded,
-            "the enqueue failed, so gas is reported as not recorded"
+            !recovered.gas_enqueued,
+            "the enqueue failed, so gas is reported as not enqueued"
         );
         let amounts = recovered
             .amounts
