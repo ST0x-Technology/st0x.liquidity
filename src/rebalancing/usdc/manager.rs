@@ -1055,7 +1055,9 @@ impl<
                 .repoll_attested_attestation(id, mint_direction, burn_tx, cctp_nonce, initiated_at)
                 .await?;
 
-            return self.require_recorded_nonce(id, response, cctp_nonce).await;
+            return self
+                .require_recorded_nonce(id, mint_direction, burn_tx, response, cctp_nonce)
+                .await;
         };
 
         info!(
@@ -1088,7 +1090,8 @@ impl<
             }
         };
 
-        self.require_recorded_nonce(id, response, cctp_nonce).await
+        self.require_recorded_nonce(id, mint_direction, burn_tx, response, cctp_nonce)
+            .await
     }
 
     /// Returns `response` only if its nonce is the recorded `cctp_nonce`.
@@ -1098,10 +1101,13 @@ impl<
     /// record and the response disagree (storage corruption, manual repair, or
     /// a different message for the burn tx). Refuse to look up or mint against
     /// an unverifiable nonce; the burn is durable, so surface a terminal
-    /// failure for operator reconciliation.
+    /// failure for operator reconciliation. An AlpacaToBase latch pages: its
+    /// retry finds the transfer failed and does not alert.
     async fn require_recorded_nonce(
         &self,
         id: &UsdcRebalanceId,
+        mint_direction: BridgeDirection,
+        burn_tx: TxHash,
         response: AttestationResponse,
         cctp_nonce: B256,
     ) -> Result<AttestationResponse, UsdcTransferError> {
@@ -1121,6 +1127,20 @@ impl<
                 },
             )
             .await?;
+
+        match mint_direction {
+            BridgeDirection::EthereumToBase => error!(
+                target: "operational_alert",
+                alert = true,
+                %id,
+                %burn_tx,
+                "USDC transfer {id}: the attested CCTP message does not match the recorded nonce \
+                 (attested {reconstructed}, recorded {cctp_nonce}). Bridge marked failed; check \
+                 which message burn tx {burn_tx} produced and whether its nonce was minted on \
+                 Base, then settle it with `transfer reconcile --kind usdc`."
+            ),
+            BridgeDirection::BaseToEthereum => {}
+        }
 
         Err(UsdcTransferError::AttestationNonceMismatch {
             id: id.clone(),
@@ -2963,6 +2983,8 @@ impl<
             return send_error.into();
         }
 
+        // A crash between the committed FailBridging and this page leaves the
+        // latch unpaged; paging first could page for a latch that never landed.
         error!(
             target: "operational_alert",
             alert = true,
