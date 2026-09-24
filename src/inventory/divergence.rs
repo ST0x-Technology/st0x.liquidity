@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -23,10 +23,12 @@ use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Usdc;
 
-use super::BroadcastingInventory;
+use super::{BroadcastingInventory, InventoryScope};
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct ReconciliationGeneration(u64);
+
 impl ReconciliationGeneration {
     #[cfg(test)]
     pub(crate) const fn for_test(value: u64) -> Self {
@@ -41,19 +43,26 @@ struct ReconciliationRequest {
     minimum_block: Option<u64>,
 }
 
-/// Symbols with a detected but unresolved offchain snapshot divergence.
+/// Inventory scopes with a detected but unresolved snapshot
+/// divergence.
 ///
-/// The inventory poller writes: it engages a symbol on the first confirmed
-/// divergence and releases it when a poll matches again or an escalation
-/// verifiably healed the view. The equity rebalancing trigger reads: it
-/// skips firing mints and redemptions for engaged symbols. Gating starts
-/// at the first diverging poll because a transfer sized off a diverged
-/// balance fails at the broker and marks the symbol busy, which freezes
-/// the divergence counter. The cost on a transient mismatch is at most
-/// one poll interval of delayed rebalancing.
+/// The inventory poller writes: it engages a symbol at a scope on the first
+/// confirmed divergence there and releases it when a poll matches again or
+/// an escalation verifiably healed the view. MarketMaking scopes include
+/// their chain, so one chain healing cannot release another. Gating starts
+/// at the first diverging poll because a transfer sized off a
+/// diverged balance fails and marks the symbol busy, which freezes the
+/// divergence counter. The cost on a transient mismatch is at most one
+/// poll interval of delayed rebalancing.
+///
+/// The rebalancing trigger reads venue-agnostically: a mint, redemption or
+/// bridge moves the balance at *both* venues, so a divergence at either
+/// one makes the transfer unsafe to size. Detection stays scope-keyed
+/// because the scopes diverge and heal independently -- a matching poll at
+/// one scope must not lift suppression another venue or chain still needs.
 #[derive(Debug, Default)]
 pub(crate) struct InventoryDivergenceGate {
-    symbols: RwLock<HashSet<Symbol>>,
+    symbols: RwLock<HashMap<Symbol, HashSet<InventoryScope>>>,
     /// Explicit venue snapshots required after inventory bookkeeping was
     /// deferred. These are separate from broker-divergence detection so a
     /// matching offchain poll cannot accidentally clear an onchain repair.
@@ -61,23 +70,40 @@ pub(crate) struct InventoryDivergenceGate {
     pending_onchain_equity: RwLock<HashMap<(Chain, Symbol), ReconciliationRequest>>,
     pending_onchain_cash: RwLock<HashMap<Chain, ReconciliationRequest>>,
     next_reconciliation_generation: AtomicU64,
-    /// Venue-level flag for a detected but unresolved `OffchainUsd`
-    /// divergence. One flag, not a set: the Hedging cash balance is one
-    /// number.
-    cash: AtomicBool,
+    /// Scopes with a detected but unresolved cash divergence. A set of
+    /// scopes, not symbols: each scope's cash balance is one number.
+    /// While any scope is engaged, the USDC rebalancing trigger skips
+    /// dispatch -- a bridge sized off a diverged cash balance moves the
+    /// wrong amount and marks the venue busy, freezing the very counter
+    /// that resolves the divergence.
+    cash: RwLock<HashSet<InventoryScope>>,
 }
 
 impl InventoryDivergenceGate {
-    pub(crate) fn engage(&self, symbol: &Symbol) {
-        self.write_symbols().insert(symbol.clone());
+    pub(crate) fn engage(&self, scope: InventoryScope, symbol: &Symbol) {
+        write_recovering(&self.symbols)
+            .entry(symbol.clone())
+            .or_default()
+            .insert(scope);
     }
 
-    pub(crate) fn release(&self, symbol: &Symbol) {
-        self.write_symbols().remove(symbol);
+    pub(crate) fn release(&self, scope: InventoryScope, symbol: &Symbol) {
+        let mut symbols = write_recovering(&self.symbols);
+        let Some(scopes) = symbols.get_mut(symbol) else {
+            return;
+        };
+
+        scopes.remove(&scope);
+        if scopes.is_empty() {
+            symbols.remove(symbol);
+        }
     }
 
+    /// Whether any scope holds an unresolved equity divergence for `symbol`.
+    /// A symbol is present only while at least one scope is engaged, so
+    /// membership is one lookup.
     pub(crate) fn is_engaged(&self, symbol: &Symbol) -> bool {
-        self.read_symbols().contains(symbol)
+        read_recovering(&self.symbols).contains_key(symbol)
             || self.read_pending_offchain_equity().contains_key(symbol)
             || self
                 .read_pending_onchain_equity()
@@ -85,16 +111,17 @@ impl InventoryDivergenceGate {
                 .any(|(_, pending_symbol)| pending_symbol == symbol)
     }
 
-    pub(crate) fn engage_cash(&self) {
-        self.cash.store(true, Ordering::SeqCst);
+    pub(crate) fn engage_cash(&self, scope: InventoryScope) {
+        write_recovering(&self.cash).insert(scope);
     }
 
-    pub(crate) fn release_cash(&self) {
-        self.cash.store(false, Ordering::SeqCst);
+    pub(crate) fn release_cash(&self, scope: InventoryScope) {
+        write_recovering(&self.cash).remove(&scope);
     }
 
+    /// Whether any scope holds an unresolved cash divergence.
     pub(crate) fn is_cash_engaged(&self) -> bool {
-        self.cash.load(Ordering::SeqCst) || !self.read_pending_onchain_cash().is_empty()
+        !read_recovering(&self.cash).is_empty() || !self.read_pending_onchain_cash().is_empty()
     }
 
     pub(crate) fn request_offchain_equity_reconcile(
@@ -330,26 +357,6 @@ impl InventoryDivergenceGate {
         )
     }
 
-    fn read_symbols(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Symbol>> {
-        self.symbols.read().unwrap_or_else(|poisoned| {
-            warn!(
-                target: "inventory",
-                "Divergence gate lock was poisoned; recovering state"
-            );
-            poisoned.into_inner()
-        })
-    }
-
-    fn write_symbols(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<Symbol>> {
-        self.symbols.write().unwrap_or_else(|poisoned| {
-            warn!(
-                target: "inventory",
-                "Divergence gate lock was poisoned; recovering state"
-            );
-            poisoned.into_inner()
-        })
-    }
-
     fn read_pending_offchain_equity(
         &self,
     ) -> std::sync::RwLockReadGuard<'_, HashMap<Symbol, ReconciliationRequest>> {
@@ -472,5 +479,121 @@ impl std::fmt::Debug for PersistentBrokerCashDivergence {
             .field("broker_usd_cents", broker_usd_cents)
             .field("polls", polls)
             .finish()
+    }
+}
+
+/// Read a gate set, recovering the contents a panicking writer poisoned.
+/// Suppression must stay readable: the sets are plain memberships that a
+/// panic cannot leave half-written, and refusing to read them would let
+/// dispatch fire against a balance known to be diverged.
+fn read_recovering<Contents>(lock: &RwLock<Contents>) -> std::sync::RwLockReadGuard<'_, Contents> {
+    lock.read().unwrap_or_else(|poisoned| {
+        warn!(
+            target: "inventory",
+            "Divergence gate lock was poisoned; recovering state"
+        );
+        poisoned.into_inner()
+    })
+}
+
+/// The write twin of [`read_recovering`], recovering for the same reason.
+fn write_recovering<Contents>(
+    lock: &RwLock<Contents>,
+) -> std::sync::RwLockWriteGuard<'_, Contents> {
+    lock.write().unwrap_or_else(|poisoned| {
+        warn!(
+            target: "inventory",
+            "Divergence gate lock was poisoned; recovering state"
+        );
+        poisoned.into_inner()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use st0x_evm::Chain;
+
+    use super::*;
+
+    /// Inventory scopes diverge and heal independently, so one release must
+    /// not lift suppression another venue or chain still needs.
+    #[test]
+    fn onchain_and_offchain_divergence_gates_release_independently() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let gate = InventoryDivergenceGate::default();
+
+        gate.engage(InventoryScope::Hedging, &spym);
+        gate.engage(InventoryScope::MarketMaking(Chain::Base), &spym);
+        gate.engage(InventoryScope::MarketMaking(Chain::Robinhood), &spym);
+        assert!(gate.is_engaged(&spym));
+
+        gate.release(InventoryScope::Hedging, &spym);
+        assert!(
+            gate.is_engaged(&spym),
+            "the still-diverging MarketMaking venue must keep dispatch suppressed"
+        );
+
+        gate.release(InventoryScope::MarketMaking(Chain::Base), &spym);
+        assert!(
+            gate.is_engaged(&spym),
+            "releasing Base must not release Robinhood's equity divergence"
+        );
+
+        gate.release(InventoryScope::MarketMaking(Chain::Robinhood), &spym);
+        assert!(
+            !gate.is_engaged(&spym),
+            "releasing the last engaged venue lifts suppression"
+        );
+
+        gate.engage_cash(InventoryScope::Hedging);
+        gate.engage_cash(InventoryScope::MarketMaking(Chain::Base));
+        gate.engage_cash(InventoryScope::MarketMaking(Chain::Robinhood));
+        gate.release_cash(InventoryScope::Hedging);
+        assert!(
+            gate.is_cash_engaged(),
+            "the still-diverging MarketMaking cash balance must keep dispatch suppressed"
+        );
+
+        gate.release_cash(InventoryScope::MarketMaking(Chain::Base));
+        assert!(
+            gate.is_cash_engaged(),
+            "releasing Base must not release Robinhood's cash divergence"
+        );
+
+        gate.release_cash(InventoryScope::MarketMaking(Chain::Robinhood));
+        assert!(
+            !gate.is_cash_engaged(),
+            "releasing the last engaged venue lifts cash suppression"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn engaged_symbol_remains_readable_after_writer_panic() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let gate = InventoryDivergenceGate::default();
+        gate.engage(InventoryScope::Hedging, &spym);
+
+        std::thread::scope(|scope| {
+            let panic_payload = scope
+                .spawn(|| {
+                    let _guard = gate.symbols.write().unwrap();
+                    panic!("poison divergence gate for test");
+                })
+                .join()
+                .expect_err("the test writer must poison the divergence gate");
+            assert_eq!(
+                panic_payload.downcast_ref::<&str>().copied(),
+                Some("poison divergence gate for test")
+            );
+        });
+
+        assert!(
+            gate.is_engaged(&spym),
+            "poison recovery must preserve the suppression membership"
+        );
+        assert!(logs_contain(
+            "Divergence gate lock was poisoned; recovering state"
+        ));
     }
 }

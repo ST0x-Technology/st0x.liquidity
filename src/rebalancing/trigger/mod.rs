@@ -57,7 +57,7 @@ use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryDivergenceGate, InventoryError,
-    InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
+    InventoryScope, InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
     PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
     Venue,
 };
@@ -2473,7 +2473,7 @@ impl RebalancingService {
                 OffchainEquityReconciled {
                     symbol, fetched_at, ..
                 } => inventory
-                    .equity_reconciliation_busy(symbol, *fetched_at)?
+                    .equity_reconciliation_busy(symbol, InventoryScope::Hedging, *fetched_at)?
                     .is_none(),
                 _ => false,
             };
@@ -2509,8 +2509,10 @@ impl RebalancingService {
                 &protected_onchain_equity_symbols,
             ),
 
-            OnchainUsdc { .. } | OnchainUsdcReconciled { .. } if protect_onchain_cash => {
-                Ok(inventory.clone())
+            OnchainUsdc { chain, .. } | OnchainUsdcReconciled { chain, .. }
+                if protect_onchain_cash =>
+            {
+                Ok(inventory.clone().note_onchain_usdc_snapshot_skip(*chain))
             }
 
             OnchainUsdcReconciled {
@@ -4178,6 +4180,7 @@ impl RebalancingService {
         &self,
         id: &IssuerRequestId,
         symbol: &Symbol,
+        chain: Chain,
         event: &TokenizedEquityMintEvent,
     ) {
         let mut inventory = self.inventory.write().await;
@@ -4186,7 +4189,7 @@ impl RebalancingService {
         } else {
             inventory
                 .clone()
-                .set_active_mint(symbol.clone(), id.clone())
+                .set_active_mint(symbol.clone(), chain, id.clone())
         };
     }
 
@@ -4196,6 +4199,7 @@ impl RebalancingService {
         &self,
         id: &RedemptionAggregateId,
         symbol: &Symbol,
+        chain: Chain,
         event: &EquityRedemptionEvent,
     ) {
         let mut inventory = self.inventory.write().await;
@@ -4204,7 +4208,7 @@ impl RebalancingService {
         } else {
             inventory
                 .clone()
-                .set_active_redemption(symbol.clone(), id.clone())
+                .set_active_redemption(symbol.clone(), chain, id.clone())
         };
     }
 
@@ -6703,7 +6707,7 @@ impl RebalancingService {
                         Utc::now(),
                     )?;
                 }
-                *inventory = updated.set_active_mint(symbol.clone(), id.clone());
+                *inventory = updated.set_active_mint(symbol.clone(), entity.chain(), id.clone());
             }
             DepositedIntoRaindex { .. } | Failed { .. } | Reconciled { .. } => {}
         }
@@ -7290,7 +7294,8 @@ impl RebalancingService {
                     Inventory::set_inflight(Venue::MarketMaking, quantity),
                     Utc::now(),
                 )?;
-                *inventory = updated.set_active_redemption(symbol.clone(), id.clone());
+                *inventory =
+                    updated.set_active_redemption(symbol.clone(), entity.chain(), id.clone());
             }
             Completed { .. } | Failed { .. } | Reconciled { .. } => {}
         }
@@ -7401,7 +7406,8 @@ impl RebalancingService {
                 .clear_previous_inflight_mint_marker(&symbol);
         }
 
-        self.update_active_mint(&id, &symbol, &event).await;
+        self.update_active_mint(&id, &symbol, tracking.chain, &event)
+            .await;
 
         let is_terminal = if Self::is_terminal_mint_event(&event) {
             self.mint_tracking.write().await.remove(&id);
@@ -7554,7 +7560,8 @@ impl RebalancingService {
                 .clear_previous_inflight_redemption_marker(&symbol);
         }
 
-        self.update_active_redemption(&id, &symbol, &event).await;
+        self.update_active_redemption(&id, &symbol, tracking.chain, &event)
+            .await;
 
         let is_terminal = if Self::is_terminal_redemption_event(&event) {
             self.redemption_tracking.write().await.remove(&id);
@@ -8737,7 +8744,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_redemption(symbol.clone(), id.clone());
+            .set_active_redemption(symbol.clone(), Chain::Base, id.clone());
         trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
@@ -8828,7 +8835,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_mint(symbol.clone(), mint_id.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
         trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
         trigger.mint_tracking.write().await.insert(
             mint_id.clone(),
@@ -9221,7 +9228,7 @@ mod tests {
         // other mint's in-flight stays intact and recovery installs no tracking.
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(100))
-            .set_active_mint(symbol.clone(), other.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, other.clone());
 
         let failed = TokenizedEquityMint::Failed {
             chain: Chain::Base,
@@ -9268,7 +9275,7 @@ mod tests {
         // a conflict; recovery is what reconciles it.
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(100))
-            .set_active_mint(symbol.clone(), recovering.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, recovering.clone());
         trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
         let guard_before = trigger
             .equity_in_progress
@@ -9326,7 +9333,7 @@ mod tests {
         // the in-flight, consuming the tombstone, or touching the guard.
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(90))
-            .set_active_redemption(symbol.clone(), other.clone());
+            .set_active_redemption(symbol.clone(), Chain::Base, other.clone());
         trigger.timed_out_mints.write().await.insert(
             recovering.clone(),
             TimeoutTombstone {
@@ -9436,7 +9443,7 @@ mod tests {
         // must refuse without restoring the in-flight or consuming the tombstone.
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(90), shares(0))
-            .set_active_redemption(symbol.clone(), other.clone());
+            .set_active_redemption(symbol.clone(), Chain::Base, other.clone());
         trigger.timed_out_redemptions.write().await.insert(
             recovering.clone(),
             TimeoutTombstone {
@@ -9505,7 +9512,7 @@ mod tests {
 
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(90), shares(0))
-            .set_active_mint(symbol.clone(), other.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, other.clone());
         trigger.timed_out_redemptions.write().await.insert(
             recovering.clone(),
             TimeoutTombstone {
@@ -9673,7 +9680,7 @@ mod tests {
 
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(90), shares(0))
-            .set_active_redemption(symbol.clone(), recovering.clone());
+            .set_active_redemption(symbol.clone(), Chain::Base, recovering.clone());
         trigger.timed_out_redemptions.write().await.insert(
             recovering.clone(),
             TimeoutTombstone {
@@ -9739,7 +9746,7 @@ mod tests {
         // a slot it does not own.
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(100))
-            .set_active_mint(symbol.clone(), other_id.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, other_id.clone());
 
         trigger
             .abandon_mint_recovery_guard(&recovering_id, &symbol)
@@ -10450,7 +10457,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_redemption(symbol.clone(), redemption_id.clone());
+            .set_active_redemption(symbol.clone(), Chain::Base, redemption_id.clone());
 
         let failed = EquityRedemption::Failed {
             chain: Chain::Base,
@@ -10521,9 +10528,11 @@ mod tests {
         // ownership re-check must leave that claim intact.
         {
             let mut inventory = trigger.inventory.write().await;
-            *inventory = inventory
-                .clone()
-                .set_active_redemption(symbol.clone(), other_id.clone());
+            *inventory = inventory.clone().set_active_redemption(
+                symbol.clone(),
+                Chain::Base,
+                other_id.clone(),
+            );
         }
 
         trigger
@@ -15110,6 +15119,39 @@ mod tests {
             !trigger.divergence_gate().is_cash_engaged(),
             "the cash gate clears only after authoritative onchain reconciliation"
         );
+    }
+
+    /// An ordinary cash read that a pending reconciliation protects never
+    /// reaches the view, so it must still count as a skip: a request that is
+    /// never satisfied would otherwise starve the vault balance silently.
+    #[tokio::test]
+    async fn protected_onchain_cash_snapshot_counts_as_skip() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default()
+                .with_equity(symbol.clone(), shares(50), shares(50))
+                .with_usdc(usdc(100), usdc(10000)),
+            &symbol,
+        )
+        .await;
+
+        trigger
+            .divergence_gate()
+            .request_onchain_cash_reconcile(Chain::Base, Some(101));
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(5),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            })
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await.clone();
+        assert_eq!(view.usdc_available(Venue::MarketMaking), Some(usdc(100)));
+        assert_eq!(view.onchain_usdc_snapshot_skip_streak(Chain::Base), Some(1));
     }
 
     #[tokio::test]
@@ -29219,7 +29261,7 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_mint(symbol.clone(), id.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, id.clone());
         let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
@@ -29389,7 +29431,7 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_redemption(symbol.clone(), id.clone());
+            .set_active_redemption(symbol.clone(), Chain::Base, id.clone());
         let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
@@ -29450,7 +29492,7 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_redemption(symbol.clone(), id.clone());
+            .set_active_redemption(symbol.clone(), Chain::Base, id.clone());
         let reactor = make_trigger_with_inventory_and_registry_config(
             inventory,
             &symbol,
@@ -30183,7 +30225,9 @@ mod tests {
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
-        trigger.divergence_gate().engage(&symbol);
+        trigger
+            .divergence_gate()
+            .engage(InventoryScope::Hedging, &symbol);
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -30197,7 +30241,9 @@ mod tests {
             "a gated symbol must not dispatch an equity transfer"
         );
 
-        trigger.divergence_gate().release(&symbol);
+        trigger
+            .divergence_gate()
+            .release(InventoryScope::Hedging, &symbol);
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -30311,6 +30357,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(0), shares(136))
             .set_active_mint(
                 symbol.clone(),
+                Chain::Base,
                 st0x_tokenization::issuer_request_id("recovery-mint"),
             );
 
@@ -30337,7 +30384,7 @@ mod tests {
             let view = trigger.inventory.read().await;
             (
                 view.equity_available(&symbol, Venue::Hedging),
-                view.equity_reconciliation_busy(&symbol, Utc::now())
+                view.equity_reconciliation_busy(&symbol, InventoryScope::Hedging, Utc::now())
                     .unwrap(),
             )
         };
@@ -30427,7 +30474,9 @@ mod tests {
         let reactor = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
 
-        trigger.divergence_gate().engage_cash();
+        trigger
+            .divergence_gate()
+            .engage_cash(InventoryScope::Hedging);
 
         trigger.check_and_trigger_usdc().await;
         assert_eq!(
@@ -30436,7 +30485,9 @@ mod tests {
             "an engaged cash gate must not dispatch a USDC transfer"
         );
 
-        trigger.divergence_gate().release_cash();
+        trigger
+            .divergence_gate()
+            .release_cash(InventoryScope::Hedging);
 
         trigger.check_and_trigger_usdc().await;
         assert_eq!(
@@ -30613,7 +30664,8 @@ mod tests {
             let view = trigger.inventory.read().await;
             (
                 view.usdc_available(Venue::Hedging),
-                view.cash_reconciliation_busy(Utc::now()).unwrap(),
+                view.cash_reconciliation_busy(InventoryScope::Hedging, Utc::now())
+                    .unwrap(),
             )
         };
         assert_eq!(
@@ -33677,7 +33729,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_mint(symbol.clone(), id.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, id.clone());
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 

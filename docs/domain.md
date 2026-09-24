@@ -282,6 +282,14 @@ ratios between onchain and offchain holdings. Two dimensions:
 Rebalancing is only available with Alpaca Broker API (requires account-level
 access for mint/redeem operations).
 
+### Inventory Scope
+
+One balance owner that divergence suppression and snapshot-skip tracking key
+separately: `Hedging` (the chainless broker account) or `MarketMaking(chain)`
+(the vaults on one chain). The type is `InventoryScope`. Wallet transit
+locations are `PortfolioLocation` reporting rows, not scopes: they hold no
+balance a transfer is sized from.
+
 ### Target Share
 
 The fraction of a symbol's total inventory (broker shares plus every chain's

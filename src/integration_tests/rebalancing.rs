@@ -3851,7 +3851,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
             now,
             now,
         )
-        .set_active_mint(symbol.clone(), mint_id.clone());
+        .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
 
     let (sender, _receiver) = broadcast::channel(16);
     let inventory = Arc::new(BroadcastingInventory::new(view, sender));
