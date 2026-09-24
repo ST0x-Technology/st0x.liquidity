@@ -161,7 +161,7 @@ impl RaindexError {
     /// than a finite worker retry budget. Deterministic RPC failures are
     /// terminal: a formal JSON-RPC rejection, an encoding or decoding error,
     /// or a local usage error fails identically on every redrive, so repeating
-    /// it cannot improve visibility (see [`is_transient_rpc`]).
+    /// it cannot improve visibility (see `is_transient_rpc`).
     pub fn is_reconciliation_pending(&self) -> bool {
         match self {
             Self::ScanInconclusive { .. } => true,
