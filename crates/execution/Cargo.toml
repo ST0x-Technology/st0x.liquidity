@@ -6,34 +6,16 @@ edition = "2024"
 [features]
 default = []
 # Enable mock mode for testing from downstream crates
-mock = ["test-support", "dep:anyhow", "dep:bon", "dep:httpmock"]
+mock = ["test-support", "st0x-alpaca/mock"]
 # Expose test-only constructors
-test-support = []
+test-support = ["st0x-alpaca/test-support"]
 
 [dependencies]
-aes-gcm.workspace = true
 alloy.workspace = true
-alloy-primitives.workspace = true
-anyhow = { workspace = true, optional = true }
 async-trait.workspace = true
-backon.workspace = true
-base64.workspace = true
-bon = { workspace = true, optional = true }
 chrono.workspace = true
-chrono-tz.workspace = true
-cqrs-es.workspace = true
-flate2.workspace = true
-httpmock = { workspace = true, optional = true }
-num-traits.workspace = true
 rain-math-float.workspace = true
-rand.workspace = true
-p256 = { version = "0.13", default-features = false, features = [
-  "ecdsa",
-  "pem",
-  "pkcs8",
-] }
 reqwest.workspace = true
-sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -41,19 +23,26 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
-urlencoding.workspace = true
 uuid.workspace = true
 
 st0x-dto = { version = "0.1.0", path = "../dto" }
 st0x-finance.workspace = true
 st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true
+st0x-alpaca = { workspace = true, features = ["broker", "wallet"] }
+alloy-primitives.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
 serial_test.workspace = true
+st0x-alpaca = { workspace = true, features = [
+  "broker",
+  "wallet",
+  "mock",
+  "test-support",
+] }
 tracing-test.workspace = true
 
 [lints]

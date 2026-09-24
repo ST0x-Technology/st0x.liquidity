@@ -1591,6 +1591,10 @@ impl CrossVenueEquityTransfer {
                     TokenizerError::Alpaca(other) => DetectionFailure::ApiError {
                         status_code: other.status_code().map(|status| status.as_u16()),
                     },
+                    TokenizerError::Evm(_) | TokenizerError::MissingRedemptionWallet => {
+                        warn!(target: "rebalance", %tx_hash, "Unexpected onchain error during redemption detection");
+                        DetectionFailure::ApiError { status_code: None }
+                    }
                     TokenizerError::MintVerification(verification_error) => {
                         warn!(target: "rebalance",
                             %verification_error,

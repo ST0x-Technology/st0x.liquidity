@@ -1,35 +1,10 @@
-use std::str::FromStr;
-
+use serde::Deserialize;
 use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use super::TimeInForce;
 use crate::HedgeFloor;
 
-/// Strongly typed Alpaca account identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AlpacaAccountId(Uuid);
-
-impl AlpacaAccountId {
-    pub const fn new(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-}
-
-impl std::fmt::Display for AlpacaAccountId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl FromStr for AlpacaAccountId {
-    type Err = uuid::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Uuid::from_str(value).map(Self)
-    }
-}
+pub use st0x_alpaca::broker::AlpacaAccountId;
 
 /// Mode for Alpaca Broker API
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,93 +105,11 @@ impl AlpacaBrokerApiMode {
             Self::Mock(url) => url,
         }
     }
-
-    /// Sandbox keys authenticate only against the sandbox market-data host
-    /// (the production host answers 401 for them; verified empirically
-    /// 2026-08-25), so the data host splits by mode exactly like the broker
-    /// host.
-    pub(super) fn market_data_base_url(&self) -> &str {
-        match self {
-            Self::Sandbox => "https://data.sandbox.alpaca.markets",
-            Self::Production => "https://data.alpaca.markets",
-            #[cfg(any(test, feature = "mock"))]
-            Self::Mock(url) => url,
-        }
-    }
-
-    /// The authx token endpoint JWT-variant credentials mint at,
-    /// split by mode like every other Alpaca host.
-    pub(super) fn token_url(&self) -> String {
-        match self {
-            Self::Sandbox => super::kms_jwt::ALPACA_SANDBOX_TOKEN_URL.to_string(),
-            Self::Production => super::kms_jwt::ALPACA_TOKEN_URL.to_string(),
-            #[cfg(any(test, feature = "mock"))]
-            Self::Mock(url) => format!("{url}/v1/oauth2/token"),
-        }
-    }
 }
 
-/// How the broker (and market-data) clients authenticate to Alpaca.
-///
-/// `Basic` is the legacy stored key/secret pair. `KmsJwt` is keyless:
-/// bearer tokens bought with client assertions signed by a
-/// non-extractable Cloud KMS key (see [`crate::AuthRuntime`]). Untagged so
-/// the flattened `[broker]` TOML stays field-shaped: the field names
-/// alone pick the variant.
-#[derive(Clone, Deserialize)]
-#[serde(untagged)]
-pub enum AlpacaBrokerAuth {
-    Basic {
-        api_key: String,
-        api_secret: String,
-    },
-    KmsJwt {
-        /// BrokerDash credential client id (not a secret; the private
-        /// half is the KMS key below).
-        client_id: String,
-        /// Full Cloud KMS key-version resource name
-        /// (`projects/.../cryptoKeyVersions/N`).
-        kms_key_version: String,
-    },
-    /// The same RFC 7523 client-assertion flow as `KmsJwt`, but signed
-    /// with a locally held EC P-256 private key — the BrokerDash
-    /// `private_key_jwt` export. For operator/CLI use (e.g. the sandbox
-    /// demo) where no KMS key or IAM grant exists; the deployed bot
-    /// stays keyless on `KmsJwt`.
-    PrivateKeyJwt {
-        /// BrokerDash credential client id (not a secret).
-        client_id: String,
-        /// The credential's EC P-256 private key, PEM-encoded. SEC1
-        /// (`BEGIN EC PRIVATE KEY`) and PKCS#8 (`BEGIN PRIVATE KEY`)
-        /// are both accepted.
-        private_key_pem: String,
-    },
-}
-
-impl std::fmt::Debug for AlpacaBrokerAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Basic { .. } => f
-                .debug_struct("Basic")
-                .field("api_key", &"[REDACTED]")
-                .field("api_secret", &"[REDACTED]")
-                .finish(),
-            Self::KmsJwt {
-                client_id,
-                kms_key_version,
-            } => f
-                .debug_struct("KmsJwt")
-                .field("client_id", client_id)
-                .field("kms_key_version", kms_key_version)
-                .finish(),
-            Self::PrivateKeyJwt { client_id, .. } => f
-                .debug_struct("PrivateKeyJwt")
-                .field("client_id", client_id)
-                .field("private_key_pem", &"[REDACTED]")
-                .finish(),
-        }
-    }
-}
+/// The shared authentication modes keep the flattened broker configuration and
+/// credential redaction contract.
+pub use st0x_alpaca::AlpacaAuth as AlpacaBrokerAuth;
 
 #[derive(Clone, Deserialize)]
 pub struct AlpacaBrokerApiCtx {
@@ -286,29 +179,6 @@ impl std::fmt::Debug for AlpacaBrokerApiCtx {
     }
 }
 
-/// Account status from Alpaca Broker API
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AccountStatus {
-    Onboarding,
-    SubmissionFailed,
-    Submitted,
-    AccountUpdated,
-    ApprovalPending,
-    Active,
-    Rejected,
-    Disabled,
-    DisableRequested,
-    AccountClosed,
-}
-
-/// Response from the account verification endpoint
-#[derive(Debug, Deserialize)]
-pub(crate) struct AccountResponse {
-    pub id: Uuid,
-    pub status: AccountStatus,
-}
-
 #[cfg(test)]
 mod tests {
     use uuid::uuid;
@@ -342,20 +212,6 @@ mod tests {
         assert_eq!(
             AlpacaBrokerApiMode::Production.base_url(),
             "https://broker-api.alpaca.markets"
-        );
-    }
-
-    #[test]
-    fn test_market_data_base_url_splits_by_mode() {
-        // Sandbox keys 401 against the production data host, so the data
-        // host must follow the mode exactly like the broker host.
-        assert_eq!(
-            AlpacaBrokerApiMode::Sandbox.market_data_base_url(),
-            "https://data.sandbox.alpaca.markets"
-        );
-        assert_eq!(
-            AlpacaBrokerApiMode::Production.market_data_base_url(),
-            "https://data.alpaca.markets"
         );
     }
 
@@ -509,22 +365,6 @@ mod tests {
         assert!(debug_output.contains("CKLOCAL"));
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("supersecret"));
-    }
-
-    #[test]
-    fn token_url_splits_by_mode() {
-        assert_eq!(
-            AlpacaBrokerApiMode::Production.token_url(),
-            "https://authx.alpaca.markets/v1/oauth2/token"
-        );
-        assert_eq!(
-            AlpacaBrokerApiMode::Sandbox.token_url(),
-            "https://authx.sandbox.alpaca.markets/v1/oauth2/token"
-        );
-        assert_eq!(
-            AlpacaBrokerApiMode::Mock("http://127.0.0.1:9".to_string()).token_url(),
-            "http://127.0.0.1:9/v1/oauth2/token"
-        );
     }
 
     #[test]

@@ -545,10 +545,11 @@ Workspace crates:
   crates
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
-- **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
-  abstraction with Alpaca Broker API and mock implementations
-- **`st0x-tokenization`** (`crates/tokenization/`) - Standalone `Tokenizer`
-  trait abstraction with Alpaca tokenization API and mock implementations
+- **`st0x-execution`** (`crates/execution/`) - `Executor` trait and
+  Liquidity-specific hedge policy over the released `st0x-alpaca` broker and
+  wallet clients
+- **`st0x-tokenization`** (`crates/tokenization/`) - `Tokenizer` trait and
+  onchain mint/redemption handling over the released `st0x-alpaca` client
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
   CCTP implementation
 - **`st0x-raindex`** (`crates/raindex/`) - `Raindex` trait and shared domain
