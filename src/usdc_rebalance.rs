@@ -1943,6 +1943,29 @@ pub(crate) async fn open_ethereum_credits(
     Ok(credits)
 }
 
+/// Another `UsdcRebalance` whose `WithdrawalConfirmed` already recorded
+/// `withdrawal_tx`, as its persisted aggregate id. A withdrawal tx pays one
+/// transfer, so a second transfer must not be credited from it.
+pub(crate) async fn withdrawal_tx_recorded_elsewhere(
+    pool: &SqlitePool,
+    id: &UsdcRebalanceId,
+    withdrawal_tx: TxHash,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT aggregate_id FROM events \
+         WHERE aggregate_type = 'UsdcRebalance' \
+           AND event_type = 'UsdcRebalanceEvent::WithdrawalConfirmed' \
+           AND aggregate_id != ? \
+           AND json_extract(payload, '$.WithdrawalConfirmed.withdrawal_tx') = ? \
+         ORDER BY rowid \
+         LIMIT 1",
+    )
+    .bind(id.to_string())
+    .bind(format!("{withdrawal_tx:#x}"))
+    .fetch_optional(pool)
+    .await
+}
+
 /// The `UsdcRebalance` aggregates whose latest event leaves them in a state
 /// that can hold Ethereum wallet credit (`WithdrawalComplete`,
 /// `BridgingSubmitting`, `Bridged`), so the credit ledger does not replay
