@@ -46,6 +46,21 @@ pub use bindings::IERC20;
 mod chain;
 pub use chain::{Chain, ParseChainError, SettlementStable};
 
+/// `true` only for RPC failures that may clear on a later redrive.
+///
+/// Those are a transport-level failure (the backend becomes reachable again)
+/// or a null response (the awaited value becomes visible on another node).
+/// Every other `RpcError` is deterministic and fails identically on every
+/// redrive, so a caller must surface it for operator action instead of
+/// redriving forever: a formal `ErrorResp` rejection, a serialization or
+/// deserialization failure, a local usage error, or an unsupported feature.
+pub fn is_transient_rpc(
+    error: &alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
+) -> bool {
+    use alloy::transports::RpcError;
+    matches!(error, RpcError::Transport(_) | RpcError::NullResp)
+}
+
 mod tokens;
 pub use tokens::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, USDC_HYPEREVM, USDG_ROBINHOOD};
 
@@ -357,11 +372,11 @@ impl EvmError {
     /// retry budget.
     pub fn is_confirmation_pending(&self) -> bool {
         match self {
-            // A transport failure carrying no formal JSON-RPC error response
-            // (connection reset, timeout) may still have reached the network or
-            // may confirm once RPC visibility catches up; a formal error
-            // response is the node's terminal rejection.
-            Self::Transport(error) => error.as_error_resp().is_none(),
+            // Only a transport-level failure (connection reset, timeout) or a
+            // null response may still reach the network or confirm once RPC
+            // visibility catches up. Every deterministic RPC error, a formal
+            // rejection included, is terminal.
+            Self::Transport(error) => is_transient_rpc(error),
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReceiptTimeout { .. } => true,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -1586,6 +1601,24 @@ mod tests {
         let signature = Signature::new(U256::from(1), U256::from(2), false);
         let envelope = TxEnvelope::from(transaction.into_signed(signature));
         Bytes::from(envelope.encoded_2718())
+    }
+
+    #[test]
+    fn is_confirmation_pending_only_for_transient_rpc_failures() {
+        use alloy::transports::{RpcError, TransportErrorKind};
+        assert!(
+            !EvmError::Transport(RpcError::UnsupportedFeature("deterministic"))
+                .is_confirmation_pending(),
+            "a deterministic RPC error must be terminal rather than an uncapped redrive"
+        );
+        assert!(
+            EvmError::Transport(RpcError::NullResp).is_confirmation_pending(),
+            "a null response may resolve once RPC visibility catches up"
+        );
+        assert!(
+            EvmError::Transport(TransportErrorKind::backend_gone()).is_confirmation_pending(),
+            "a transport failure may recover once a backend becomes visible"
+        );
     }
 
     #[test]

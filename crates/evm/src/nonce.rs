@@ -147,7 +147,14 @@ impl ResettableNonceManager {
         let slot = self.slot(address);
         let mut cached = slot.lock().await;
         if self.release_occupied_nonce(address, nonce) {
-            *cached = Some(cached.map_or(nonce, |current| current.min(nonce)));
+            // Only lower a warm cache; never seed a cold one. Seeding could pin
+            // allocation below the chain's mined count, the same hazard the
+            // prepared reservation path avoids. A genuinely free nonce is still
+            // refilled because a cold fetch of `latest` already returns a value
+            // at or below it.
+            if let Some(current) = *cached {
+                *cached = Some(current.min(nonce));
+            }
         }
     }
 
@@ -155,7 +162,7 @@ impl ResettableNonceManager {
     /// transaction. Allocation skips it, exactly like a prepared reservation:
     /// a fresh send here would overwrite bytes that must be rebroadcast
     /// verbatim.
-    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     pub(crate) fn reserve_durable_nonce(&self, address: Address, nonce: u64) {
         self.hold_nonce(address, nonce, NonceHold::Reserved);
     }
@@ -165,7 +172,7 @@ impl ResettableNonceManager {
     /// under-gassed transaction at this nonce must remain reachable so
     /// `submit::send_with_recovery` can land back on it and fee-bump it,
     /// instead of queuing the next send behind it.
-    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     pub(crate) fn occupy_in_flight_nonce(&self, address: Address, nonce: u64) {
         self.hold_nonce(address, nonce, NonceHold::Replaceable);
     }
@@ -281,6 +288,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
 
     use super::*;
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use crate::inflight_nonces::InFlightNonces;
 
     #[tokio::test]
@@ -410,6 +418,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     #[tokio::test]
     async fn filling_released_gap_reallocates_generic_in_flight_nonce() {
         let manager = ResettableNonceManager::default();
@@ -439,6 +448,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     #[tokio::test]
     async fn invalidation_reallocates_generic_in_flight_nonce_for_replacement() {
         // Regression: a generic broadcast-but-unconfirmed nonce must remain
@@ -469,6 +479,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     #[tokio::test]
     async fn final_generic_drop_rewinds_cached_allocation_to_the_released_nonce() {
         let manager = ResettableNonceManager::default();
@@ -489,6 +500,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     #[tokio::test]
     async fn durable_drop_retains_ownership_and_skips_the_prepared_nonce() {
         let manager = ResettableNonceManager::default();

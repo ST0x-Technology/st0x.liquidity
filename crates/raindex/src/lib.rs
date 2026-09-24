@@ -12,7 +12,7 @@ use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 
-use st0x_evm::{EvmError, PreparedTransaction};
+use st0x_evm::{EvmError, PreparedTransaction, is_transient_rpc};
 
 #[cfg(feature = "rain")]
 mod service;
@@ -185,17 +185,6 @@ impl RaindexError {
             | Self::MissingOperatorRole { .. } => false,
         }
     }
-}
-
-/// `true` only for RPC failures that can clear once the backend becomes
-/// reachable again or the awaited value becomes visible on another node.
-/// Every other `RpcError` is deterministic and fails identically on every
-/// redrive: a formal `ErrorResp` rejection, a serialization or deserialization
-/// failure, a local usage error, or an unsupported feature. Classifying any of
-/// them pending would loop the uncapped reconciliation redrive forever without
-/// ever surfacing for operator action.
-fn is_transient_rpc(error: &RpcError<TransportErrorKind>) -> bool {
-    matches!(error, RpcError::Transport(_) | RpcError::NullResp)
 }
 
 /// Abstraction for Raindex (Rain OrderBook) operations.
@@ -372,6 +361,33 @@ mod tests {
             "a deserialization failure is deterministic: the response has the \
              wrong shape on every redrive, so uncapped reconciliation can never \
              make it succeed"
+        );
+    }
+
+    #[test]
+    fn evm_transport_deser_error_is_not_reconciliation_pending() {
+        let deser = serde_json::from_str::<u64>("\"not a number\"").unwrap_err();
+        let error = RaindexError::Evm(EvmError::Transport(RpcError::DeserError {
+            err: deser,
+            text: "\"not a number\"".to_string(),
+        }));
+
+        assert!(
+            !error.is_reconciliation_pending(),
+            "the withdrawal path surfaces failures as `Evm(Transport(..))`; a \
+             deterministic deserialization failure there must be terminal rather \
+             than an uncapped redrive"
+        );
+    }
+
+    #[test]
+    fn evm_transport_backend_gone_is_reconciliation_pending() {
+        let error = RaindexError::Evm(EvmError::Transport(TransportErrorKind::backend_gone()));
+
+        assert!(
+            error.is_reconciliation_pending(),
+            "a transport failure on the wallet path may recover once a backend \
+             becomes visible, so it stays reconciliation pending"
         );
     }
 }
