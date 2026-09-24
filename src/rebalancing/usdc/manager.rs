@@ -229,6 +229,22 @@ fn classify_vault_withdrawal_error(error: RaindexError) -> UsdcTransferError {
     }
 }
 
+fn classify_vault_withdrawal_scan_error(
+    id: &UsdcRebalanceId,
+    initiated_at: DateTime<Utc>,
+    error: RaindexError,
+) -> UsdcTransferError {
+    if error.is_reconciliation_pending() {
+        UsdcTransferError::WithdrawalScanTransient {
+            id: id.clone(),
+            initiated_at,
+            source: Box::new(error),
+        }
+    } else {
+        UsdcTransferError::Vault(error)
+    }
+}
+
 /// The two durable timestamps carried by `AwaitingAttestation`: when the
 /// attestation retry gives up, and when the transfer originally started.
 /// Both are `DateTime<Utc>`, so passing them as adjacent positional
@@ -3178,8 +3194,14 @@ impl<
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
                 let amount_u256 = usdc_to_u256(amount)?;
-                self.resume_withdrawal_submitting(id, amount, amount_u256, from_block)
-                    .await?;
+                self.resume_withdrawal_submitting(
+                    id,
+                    amount,
+                    amount_u256,
+                    from_block,
+                    initiated_at,
+                )
+                .await?;
                 self.continue_from_withdrawal_complete(id, amount, initiated_at)
                     .await
             }
@@ -4053,53 +4075,40 @@ impl<
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
     }
 
-    /// Resumes a transfer stalled at `WithdrawalSubmitting`: scans the chain for
-    /// an already-submitted withdrawal (adopting it to avoid a double-withdraw)
-    /// and otherwise issues the withdrawal, then records and confirms it.
+    /// Resumes a transfer stalled at `WithdrawalSubmitting` by adopting the
+    /// already-mined withdrawal and recording it.
     ///
-    /// The scan is finality-gated: it returns `Ok(None)` (safe to issue the
-    /// withdrawal) only when the queried node is confirmations-deep past
-    /// `from_block`; otherwise it yields a retryable error and this resume re-runs
-    /// rather than risking a double-withdraw off a stale empty `eth_getLogs`.
+    /// Absence from mined logs is never permission to issue another withdrawal:
+    /// the original transaction may still be pending, or a load-balanced RPC
+    /// backend may not have observed it. [`Raindex::find_recent_withdrawal`]
+    /// therefore fails inconclusively instead of returning absence.
     async fn resume_withdrawal_submitting(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
         amount_u256: U256,
         from_block: u64,
+        initiated_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
-        if let Some((existing_tx, withdrawn)) = self
+        let (existing_tx, withdrawn) = self
             .raindex
             .find_recent_withdrawal(USDC_BASE, self.vault_id, from_block)
-            .await?
-        {
-            // The withdrawal for this transfer already landed on-chain; adopt it
-            // instead of re-withdrawing. If it realized a different amount than
-            // requested (vault under-funded -> partial fill), fail fast for
-            // operator reconciliation -- never burn more on Base than was actually
-            // withdrawn.
-            if withdrawn != amount_u256 {
-                return self
-                    .fail_adopted_withdrawal_mismatch(
-                        id,
-                        amount,
-                        amount_u256,
-                        existing_tx,
-                        withdrawn,
-                    )
-                    .await;
-            }
+            .await
+            .map_err(|error| classify_vault_withdrawal_scan_error(id, initiated_at, error))?;
 
-            info!(target: "rebalance", %existing_tx, "Adopting already-submitted vault withdrawal on resume");
-            return self.record_vault_withdrawal(id, amount, existing_tx).await;
+        // The withdrawal for this transfer already landed on-chain; adopt it
+        // instead of re-withdrawing. If it realized a different amount than
+        // requested (vault under-funded -> partial fill), fail fast for
+        // operator reconciliation -- never burn more on Base than was actually
+        // withdrawn.
+        if withdrawn != amount_u256 {
+            return self
+                .fail_adopted_withdrawal_mismatch(id, amount, amount_u256, existing_tx, withdrawn)
+                .await;
         }
 
-        let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
-            Ok(tx) => tx,
-            Err(error) => return Err(classify_vault_withdrawal_error(error)),
-        };
-
-        self.record_vault_withdrawal(id, amount, withdraw_tx).await
+        info!(target: "rebalance", %existing_tx, "Adopting already-submitted vault withdrawal on resume");
+        self.record_vault_withdrawal(id, amount, existing_tx).await
     }
 
     /// Handles an adopted withdrawal that realized a different amount than
@@ -5259,6 +5268,47 @@ mod tests {
         RebalanceDirection, ReconcileReason, TransferRef, UsdcRebalanceError, UsdcRebalanceEvent,
     };
     use st0x_finance::UsdcConversionError;
+
+    #[test]
+    fn withdrawal_scan_inconclusive_classifies_for_delayed_redrive() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = classify_vault_withdrawal_scan_error(
+            &id,
+            chrono::Utc::now(),
+            RaindexError::ScanInconclusive { from_block: 42 },
+        );
+
+        assert!(matches!(
+            error,
+            UsdcTransferError::WithdrawalScanTransient {
+                id: error_id,
+                source,
+                ..
+            } if error_id == id
+                && matches!(*source, RaindexError::ScanInconclusive { from_block: 42 })
+        ));
+    }
+
+    #[test]
+    fn deterministic_withdrawal_scan_failure_preserves_vault_error_path() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = classify_vault_withdrawal_scan_error(
+            &id,
+            chrono::Utc::now(),
+            RaindexError::ScanAnomalousLog {
+                reason: st0x_raindex::ScanAnomaly::MissingTransactionHash,
+            },
+        );
+
+        assert!(matches!(
+            error,
+            UsdcTransferError::Vault(RaindexError::ScanAnomalousLog {
+                reason: st0x_raindex::ScanAnomaly::MissingTransactionHash,
+            })
+        ));
+    }
 
     /// A minimal bridge double for tests that exercise `burn_recording_pending`.
     ///

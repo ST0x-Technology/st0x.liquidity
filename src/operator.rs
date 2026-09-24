@@ -225,6 +225,12 @@ pub mod equity_transfer {
         RedemptionAlreadyFailed(RedemptionAggregateId),
         #[error("redemption {0} already reconciled")]
         RedemptionAlreadyReconciled(RedemptionAggregateId),
+        #[error(
+            "redemption {0} has an unresolved vault withdrawal submission; force-fail is \
+             refused because the withdrawal may already have landed -- verify it on-chain, \
+             then reconcile it (`stox transfer reconcile --kind redemption`) to resolve it"
+        )]
+        RedemptionSubmissionUnresolved(RedemptionAggregateId),
         #[error("mint store operation failed")]
         MintStore(#[source] Box<SendError<TokenizedEquityMint>>),
         #[error("redemption store operation failed")]
@@ -314,6 +320,9 @@ pub mod equity_transfer {
         reason: &str,
     ) -> Result<EquityRedemptionCommand, FailTransferError> {
         match entity {
+            EquityRedemption::VaultWithdrawSubmitting { .. } => Err(
+                FailTransferError::RedemptionSubmissionUnresolved(id.clone()),
+            ),
             EquityRedemption::VaultWithdrawPending { .. }
             | EquityRedemption::VaultWithdrawSubmitted { .. }
             | EquityRedemption::WithdrawnFromRaindex { .. }

@@ -502,6 +502,7 @@ impl MintTracking {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedemptionTrackingStage {
     VaultWithdrawPending,
+    VaultWithdrawSubmitting,
     VaultWithdrawSubmitted,
     WithdrawnFromRaindex,
     UnwrapPending,
@@ -516,6 +517,7 @@ impl std::fmt::Display for RedemptionTrackingStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::VaultWithdrawPending => write!(formatter, "VaultWithdrawPending"),
+            Self::VaultWithdrawSubmitting => write!(formatter, "VaultWithdrawSubmitting"),
             Self::VaultWithdrawSubmitted => write!(formatter, "VaultWithdrawSubmitted"),
             Self::WithdrawnFromRaindex => write!(formatter, "WithdrawnFromRaindex"),
             Self::UnwrapPending => write!(formatter, "UnwrapPending"),
@@ -559,6 +561,21 @@ impl RedemptionTracking {
                 stage: RedemptionTrackingStage::VaultWithdrawPending,
                 last_progress_at: *pending_at,
             }),
+            EquityRedemptionEvent::VaultWithdrawSubmitting {
+                symbol,
+                chain,
+                quantity,
+                submitting_at,
+                ..
+            } => Some(Self {
+                symbol: symbol.clone(),
+                chain: *chain,
+                quantity: FractionalShares::new(*quantity),
+                tokenization_request_id: None,
+                redemption_tx: None,
+                stage: RedemptionTrackingStage::VaultWithdrawSubmitting,
+                last_progress_at: *submitting_at,
+            }),
             EquityRedemptionEvent::VaultWithdrawSubmitted {
                 symbol,
                 quantity,
@@ -599,10 +616,9 @@ impl RedemptionTracking {
         }
     }
 
-    /// Only `VaultWithdrawPending` records the chain. Tracking built from a
-    /// later event is right for a pre-multichain stream, but a live redemption
-    /// on another chain whose tracking went missing would land on the legacy
-    /// chain with no other signal, so the default is logged loudly.
+    /// Withdrawal genesis events record the chain. Tracking rebuilt from a
+    /// later, chainless legacy event defaults loudly because a live redemption
+    /// on another chain would otherwise debit the wrong inventory slot.
     fn default_chain_for_chainless_genesis(
         symbol: &Symbol,
         stage: RedemptionTrackingStage,
@@ -676,6 +692,7 @@ impl RedemptionTracking {
                 self.last_progress_at = *detected_at;
             }
             EquityRedemptionEvent::VaultWithdrawPending { .. }
+            | EquityRedemptionEvent::VaultWithdrawSubmitting { .. }
             | EquityRedemptionEvent::TransferFailed { .. }
             | EquityRedemptionEvent::DetectionFailed { .. }
             | EquityRedemptionEvent::RedemptionRejected { .. }
@@ -921,6 +938,23 @@ enum UsdcTimeoutCleanup {
         tracking: usdc::UsdcRebalanceTracking,
         elapsed: Duration,
         amount: Usdc,
+    },
+}
+
+/// Outcome of examining a tracked redemption during the timeout sweep.
+#[derive(Debug)]
+enum RedemptionTimeoutCleanup {
+    /// The durable aggregate is `Reconciled`: an operator's `transfer reconcile`
+    /// (a separate-process CLI, or the in-process API via bare `send_command`)
+    /// wrote `OperatorReconciled` to the store, but the live reactor never
+    /// observed it. The sweep applies the reactor's terminal reconcile cleanup
+    /// so the guard, inflight, and reservation clear without a restart.
+    Reconciled { tracking: RedemptionTracking },
+    /// The transfer genuinely timed out at a non-submission stage and must be
+    /// force-resolved.
+    TimedOut {
+        tracking: RedemptionTracking,
+        elapsed: Duration,
     },
 }
 
@@ -1585,80 +1619,110 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
-        let timed_out_ids = {
+        let candidates = {
             let tracking = self.redemption_tracking.read().await;
             tracking
                 .iter()
                 .filter_map(|(id, tracking)| {
+                    // Withdrawal-submission stages are ALWAYS selected so the
+                    // durable `Reconciled` check runs every tick regardless of
+                    // elapsed time; they are never force-failed on timeout
+                    // because their withdrawal may have landed. Every other stage
+                    // is selected only once it exceeds `transfer_timeout`.
+                    if matches!(
+                        tracking.stage,
+                        RedemptionTrackingStage::VaultWithdrawPending
+                            | RedemptionTrackingStage::VaultWithdrawSubmitting
+                            | RedemptionTrackingStage::VaultWithdrawSubmitted
+                    ) {
+                        return Some(id.clone());
+                    }
+
                     let elapsed =
                         Self::elapsed_since_timeout_start(tracking.last_progress_at, now)?;
-
-                    if elapsed >= self.config.transfer_timeout {
-                        Some(id.clone())
-                    } else {
-                        None
-                    }
+                    (elapsed >= self.config.transfer_timeout).then(|| id.clone())
                 })
                 .collect::<Vec<_>>()
         };
 
-        for id in timed_out_ids {
-            let Some((tracking, elapsed)) = self.cleanup_timed_out_redemption(&id, now).await?
-            else {
+        for id in candidates {
+            let Some(cleanup) = self.cleanup_timed_out_redemption(&id, now).await? else {
                 continue;
             };
 
-            let elapsed_secs = elapsed.as_secs();
-            error!(
-                target: "rebalance",
-                aggregate_id = %id,
-                symbol = %tracking.symbol,
-                stage = %tracking.stage,
-                elapsed_secs,
-                outcome = "timeout",
-                "Redemption transfer timed out; clearing trigger guard and inventory inflight"
-            );
+            match cleanup {
+                RedemptionTimeoutCleanup::Reconciled { tracking } => {
+                    error!(
+                        target: "rebalance",
+                        aggregate_id = %id,
+                        symbol = %tracking.symbol,
+                        stage = %tracking.stage,
+                        outcome = "reconciled",
+                        "Operator reconciled a stuck redemption; clearing trigger \
+                         guard and inventory inflight without a restart"
+                    );
+                    self.clear_equity_in_progress(&tracking.symbol);
+                    self.queue_terminal_redemption_reservation_release(&id, &tracking.symbol)
+                        .await;
+                }
+                RedemptionTimeoutCleanup::TimedOut { tracking, elapsed } => {
+                    let elapsed_secs = elapsed.as_secs();
+                    error!(
+                        target: "rebalance",
+                        aggregate_id = %id,
+                        symbol = %tracking.symbol,
+                        stage = %tracking.stage,
+                        elapsed_secs,
+                        outcome = "timeout",
+                        "Redemption transfer timed out; clearing trigger guard and inventory inflight"
+                    );
 
-            self.clear_equity_in_progress(&tracking.symbol);
+                    self.clear_equity_in_progress(&tracking.symbol);
 
-            if let Some(store) = self.redemption_store.read().await.as_ref() {
-                let reason = format!(
-                    "Transfer timed out after {elapsed_secs}s at stage {}",
-                    tracking.stage
-                );
+                    if let Some(store) = self.redemption_store.read().await.as_ref() {
+                        let reason = format!(
+                            "Transfer timed out after {elapsed_secs}s at stage {}",
+                            tracking.stage
+                        );
 
-                let command = match tracking.stage {
-                    RedemptionTrackingStage::VaultWithdrawPending
-                    | RedemptionTrackingStage::VaultWithdrawSubmitted
-                    | RedemptionTrackingStage::WithdrawnFromRaindex
-                    | RedemptionTrackingStage::UnwrapPending
-                    | RedemptionTrackingStage::UnwrapSubmitted
-                    | RedemptionTrackingStage::TokensUnwrapped
-                    | RedemptionTrackingStage::SendPending => {
-                        Some(EquityRedemptionCommand::FailTransfer { reason })
-                    }
-                    RedemptionTrackingStage::TokensSent => {
-                        Some(EquityRedemptionCommand::FailDetection {
-                            failure: crate::equity_redemption::DetectionFailure::Timeout,
-                        })
-                    }
-                    RedemptionTrackingStage::Detected => {
-                        Some(EquityRedemptionCommand::RejectRedemption { reason })
-                    }
-                };
+                        let command = match tracking.stage {
+                            RedemptionTrackingStage::VaultWithdrawPending
+                            | RedemptionTrackingStage::VaultWithdrawSubmitting
+                            | RedemptionTrackingStage::VaultWithdrawSubmitted => None,
+                            RedemptionTrackingStage::WithdrawnFromRaindex
+                            | RedemptionTrackingStage::UnwrapPending
+                            | RedemptionTrackingStage::UnwrapSubmitted
+                            | RedemptionTrackingStage::TokensUnwrapped
+                            | RedemptionTrackingStage::SendPending => {
+                                Some(EquityRedemptionCommand::FailTransfer { reason })
+                            }
+                            RedemptionTrackingStage::TokensSent => {
+                                Some(EquityRedemptionCommand::FailDetection {
+                                    failure: crate::equity_redemption::DetectionFailure::Timeout,
+                                })
+                            }
+                            RedemptionTrackingStage::Detected => {
+                                Some(EquityRedemptionCommand::RejectRedemption { reason })
+                            }
+                        };
 
-                if let Some(command) = command {
-                    match store.send(&id, command).await {
-                        Ok(()) => {
-                            self.release_timed_out_redemption_reservation(&id, &tracking.symbol)
-                                .await;
-                        }
-                        Err(error) => {
-                            warn!(
-                                target: "rebalance",
-                                %id, %error,
-                                "Failed to emit timeout failure event for redemption"
-                            );
+                        if let Some(command) = command {
+                            match store.send(&id, command).await {
+                                Ok(()) => {
+                                    self.release_timed_out_redemption_reservation(
+                                        &id,
+                                        &tracking.symbol,
+                                    )
+                                    .await;
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        target: "rebalance",
+                                        %id, %error,
+                                        "Failed to emit timeout failure event for redemption"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -2043,12 +2107,88 @@ impl RebalancingService {
         &self,
         id: &RedemptionAggregateId,
         now: DateTime<Utc>,
-    ) -> Result<Option<(RedemptionTracking, Duration)>, RebalancingServiceError> {
+    ) -> Result<Option<RedemptionTimeoutCleanup>, RebalancingServiceError> {
         let _event_sync_guard = self.redemption_event_sync.lock().await;
         let mut tracking_guard = self.redemption_tracking.write().await;
         let Some(tracking) = tracking_guard.get(id).cloned() else {
             return Ok(None);
         };
+
+        // Withdrawal-submission stages are never force-failed on timeout, but
+        // they are checked for a durable `Reconciled` on every tick. An
+        // operator's reconcile writes `OperatorReconciled` through bare
+        // `send_command`, which dispatches no reactor, so the live bot would
+        // otherwise never clear the guard, inflight, and reservation until a
+        // restart. Mirror `on_redemption`'s terminal reconcile cleanup here.
+        if matches!(
+            tracking.stage,
+            RedemptionTrackingStage::VaultWithdrawPending
+                | RedemptionTrackingStage::VaultWithdrawSubmitting
+                | RedemptionTrackingStage::VaultWithdrawSubmitted
+        ) {
+            let store = self.redemption_store.read().await.as_ref().map(Arc::clone);
+            let Some(store) = store else {
+                return Ok(None);
+            };
+            match store.load(id).await {
+                Ok(Some(EquityRedemption::Reconciled { .. })) => {
+                    // Cancel the MarketMaking inflight (the shares never left the
+                    // vault, per the operator's verified-dead reconcile) and clear
+                    // the active redemption, exactly like `on_redemption`'s
+                    // `OperatorReconciled` terminal path. Drop tracking first, then
+                    // apply; re-insert on error so the next tick retries rather
+                    // than latching the guard with no entry to re-select.
+                    tracking_guard.remove(id);
+                    drop(tracking_guard);
+
+                    if let Err(error) = self
+                        .apply_equity_update_or_defer(
+                            &tracking.symbol,
+                            tracking.chain,
+                            Venue::MarketMaking,
+                            Self::cancel_equity_transfer_update(
+                                Venue::MarketMaking,
+                                tracking.quantity,
+                            ),
+                        )
+                        .await
+                    {
+                        self.redemption_tracking
+                            .write()
+                            .await
+                            .insert(id.clone(), tracking);
+                        return Err(error);
+                    }
+                    {
+                        let mut inventory = self.inventory.write().await;
+                        *inventory = inventory.clone().clear_active_redemption(&tracking.symbol);
+                    }
+
+                    // Tombstone so a late reactor `OperatorReconciled` (should the
+                    // in-process path ever route through the store) is ignored
+                    // instead of cancelling the inflight a second time.
+                    self.timed_out_redemptions.write().await.insert(
+                        id.clone(),
+                        TimeoutTombstone {
+                            symbol: tracking.symbol.clone(),
+                            timed_out_at: now,
+                        },
+                    );
+                    return Ok(Some(RedemptionTimeoutCleanup::Reconciled { tracking }));
+                }
+                Ok(Some(_) | None) => return Ok(None),
+                Err(load_error) => {
+                    warn!(
+                        target: "rebalance",
+                        id = %id,
+                        ?load_error,
+                        "Failed to load EquityRedemption during reconcile sweep; \
+                         preserving guard"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
 
         let Some(elapsed) = Self::elapsed_since_timeout_start(tracking.last_progress_at, now)
         else {
@@ -2080,7 +2220,10 @@ impl RebalancingService {
         tracking_guard.remove(id);
         drop(tracking_guard);
 
-        Ok(Some((tracking, elapsed)))
+        Ok(Some(RedemptionTimeoutCleanup::TimedOut {
+            tracking,
+            elapsed,
+        }))
     }
 
     async fn cleanup_timed_out_usdc_rebalance(
@@ -4231,17 +4374,22 @@ impl RebalancingService {
         use EquityRedemptionEvent::*;
 
         match event {
-            VaultWithdrawPending { .. } => Some(Self::start_equity_transfer_update(
-                Venue::MarketMaking,
-                quantity,
-            )),
+            VaultWithdrawPending { .. } | VaultWithdrawSubmitting { .. } => Some(
+                Self::start_equity_transfer_update(Venue::MarketMaking, quantity),
+            ),
             Completed { .. } | ProviderCompletionRecovered { .. } => Some(
                 Self::complete_equity_transfer_update(Venue::MarketMaking, quantity),
             ),
-            TransferFailed { .. } => Some(Self::cancel_equity_transfer_update(
-                Venue::MarketMaking,
-                quantity,
-            )),
+            // `TransferFailed` cancels the inflight the withdraw opened, returning
+            // the shares to available. A redemption reconciled directly from
+            // `VaultWithdrawSubmitting` never withdrew from the vault either, so it
+            // cancels identically. `OperatorReconciled` only reaches this fold for
+            // the submitting origin: reconcile from `Failed` has its tracking removed
+            // by `TransferFailed`, so `on_redemption` early-returns before calling
+            // `redemption_inventory_update`.
+            TransferFailed { .. } | OperatorReconciled { .. } => Some(
+                Self::cancel_equity_transfer_update(Venue::MarketMaking, quantity),
+            ),
             VaultWithdrawSubmitted { .. }
             | WithdrawnFromRaindex { .. }
             | UnwrapPending { .. }
@@ -4251,9 +4399,6 @@ impl RebalancingService {
             | TokensSent { .. }
             | DetectionFailed { .. }
             | Detected { .. }
-            // Reconciliation is a pure bookkeeping terminal transition from
-            // `Failed`: the failure already settled inventory, so nothing to do.
-            | OperatorReconciled { .. }
             | RedemptionRejected { .. } => None,
         }
     }
@@ -4281,6 +4426,7 @@ impl RebalancingService {
 
         match entity {
             VaultWithdrawPending { quantity, .. }
+            | VaultWithdrawSubmitting { quantity, .. }
             | VaultWithdrawSubmitted { quantity, .. }
             | WithdrawnFromRaindex { quantity, .. }
             | UnwrapPending { quantity, .. }
@@ -5996,6 +6142,12 @@ impl RebalancingService {
         self.equity_cooldowns.write().await.clear();
     }
 
+    /// The operator alert channel, exposed so startup recovery can page when it
+    /// skips a step it must not block on.
+    pub(crate) fn notifier(&self) -> &Arc<dyn crate::alerts::Notifier> {
+        &self.notifier
+    }
+
     /// Clears the in-progress flag for an equity symbol.
     ///
     /// Removes the entry regardless of its current `GuardState`. Called by
@@ -7196,6 +7348,7 @@ impl RebalancingService {
 
         match entity {
             VaultWithdrawPending { symbol, .. }
+            | VaultWithdrawSubmitting { symbol, .. }
             | VaultWithdrawSubmitted { symbol, .. }
             | WithdrawnFromRaindex { symbol, .. }
             | UnwrapPending { symbol, .. }
@@ -7210,6 +7363,12 @@ impl RebalancingService {
                     VaultWithdrawPending { pending_at, .. } => (
                         RedemptionTrackingStage::VaultWithdrawPending,
                         *pending_at,
+                        None,
+                        None,
+                    ),
+                    VaultWithdrawSubmitting { submitting_at, .. } => (
+                        RedemptionTrackingStage::VaultWithdrawSubmitting,
+                        *submitting_at,
                         None,
                         None,
                     ),
@@ -7553,7 +7712,11 @@ impl RebalancingService {
         // When a new redemption transfer starts, clear the previous poll
         // marker so the next inflight poll won't incorrectly zero the new
         // inflight if Alpaca hasn't reflected the request yet.
-        if matches!(event, EquityRedemptionEvent::VaultWithdrawPending { .. }) {
+        if matches!(
+            event,
+            EquityRedemptionEvent::VaultWithdrawPending { .. }
+                | EquityRedemptionEvent::VaultWithdrawSubmitting { .. }
+        ) {
             let mut inventory = self.inventory.write().await;
             *inventory = inventory
                 .clone()
@@ -7675,6 +7838,7 @@ impl RebalancingService {
             | OperatorReconciled { .. } => true,
 
             VaultWithdrawPending { .. }
+            | VaultWithdrawSubmitting { .. }
             | VaultWithdrawSubmitted { .. }
             | WithdrawnFromRaindex { .. }
             | UnwrapPending { .. }
@@ -18097,6 +18261,105 @@ mod tests {
         }
     }
 
+    fn make_vault_withdraw_submitting(symbol: &Symbol, quantity: Float) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::VaultWithdrawSubmitting {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            quantity,
+            token: Address::random(),
+            vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+            wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            from_block: 0,
+            prepared: None,
+            submitting_at: Utc::now(),
+        }
+    }
+
+    fn make_operator_reconciled() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::OperatorReconciled {
+            reason: "withdrawal never broadcast; verified on-chain".to_string(),
+            reconciled_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_submitting_cancels_marketmaking_inflight_and_restores_available() {
+        // Regression: reconciling a redemption wedged in `VaultWithdrawSubmitting`
+        // must cancel the MarketMaking inflight its submit opened, returning the
+        // shares to available (the withdrawal never left the vault). The `Failed`
+        // origin's `TransferFailed` already cancelled that inflight; submitting ->
+        // `OperatorReconciled` emits no cancel, so without the fold's cancel arm the
+        // inflight leaks a phantom redemption that skews rebalancing.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = redemption_aggregate_id("redemption-reconcile-from-submitting");
+
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                make_vault_withdraw_submitting(&symbol, float!("10")),
+            )
+            .await
+            .unwrap();
+        let (inflight, available) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_inflight(&symbol, Venue::MarketMaking),
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(
+            inflight,
+            Some(shares(10)),
+            "submit must open the MarketMaking inflight"
+        );
+        assert_eq!(
+            available,
+            Some(shares(70)),
+            "submit reserves the shares from available"
+        );
+
+        harness
+            .receive::<EquityRedemption>(id.clone(), make_operator_reconciled())
+            .await
+            .unwrap();
+
+        let (inflight, available) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_inflight(&symbol, Venue::MarketMaking),
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(
+            inflight,
+            Some(shares(0)),
+            "reconcile-from-submitting must cancel the phantom MarketMaking inflight"
+        );
+        assert_eq!(
+            available,
+            Some(shares(80)),
+            "cancelling returns the never-withdrawn shares to available"
+        );
+    }
+
     #[tokio::test]
     async fn redemption_event_updates_inventory() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -18254,6 +18517,7 @@ mod tests {
                     token: Address::random(),
                     wrapped_amount: U256::from(10_000_000_000_000_000_000_u128),
                     tx_hash: TxHash::random(),
+                    prepared: None,
                     submitted_at: Utc::now(),
                 },
             )
@@ -20849,9 +21113,8 @@ mod tests {
 
     /// Drives an `EquityRedemption` aggregate to `Failed` state (terminal).
     ///
-    /// `Redeem` emits `VaultWithdrawPending` without calling any service.
-    /// `FailTransfer` from `VaultWithdrawPending` also calls no service. Both
-    /// are safe with panicking services.
+    /// `Redeem`, `RecordWithdrawSubmission`, and `FailTransfer` call no
+    /// services, so they are safe with panicking services.
     async fn seed_terminal_redemption_aggregate(
         pool: &SqlitePool,
         redemption_id: &RedemptionAggregateId,
@@ -20866,7 +21129,19 @@ mod tests {
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::ZERO,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                redemption_id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: TxHash::ZERO,
                 },
             )
             .await
@@ -20882,8 +21157,8 @@ mod tests {
             .unwrap();
     }
 
-    /// Drives an `EquityRedemption` aggregate to `VaultWithdrawPending` state
-    /// (non-terminal). `Redeem` calls no services so panicking services are safe.
+    /// Drives an `EquityRedemption` aggregate to `VaultWithdrawSubmitting`
+    /// (non-terminal). `Redeem` calls no services, so panicking services are safe.
     async fn seed_nonterminal_redemption_aggregate(
         pool: &SqlitePool,
         redemption_id: &RedemptionAggregateId,
@@ -20898,7 +21173,10 @@ mod tests {
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::ZERO,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -21503,9 +21781,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redemption_timeout_retries_failed_transfer_reservation_release() {
+    async fn unresolved_withdrawal_intent_does_not_time_out_or_release_reservation() {
         let symbol = Symbol::new("tAAPL").unwrap();
-        let id = redemption_aggregate_id("timed-out-redemption-release");
+        let id = redemption_aggregate_id("unresolved-withdrawal-intent");
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
@@ -21525,54 +21803,247 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: float!(1),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::ZERO,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
             .unwrap();
         let reservation_id = EquityTransferReservationId::from_uuid(id.0);
         seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
-        let (position_store, position_projection) = install_closed_position_store(&service).await;
+
+        service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::hours(24))
+            .await
+            .unwrap();
+        let position_projection = service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation
+                .unwrap()
+                .status,
+            EquityTransferReservationStatus::Confirmed
+        );
+
+        assert!(service.redemption_tracking.read().await.contains_key(&id));
+        assert!(
+            service
+                .pending_timed_out_redemption_reservation_releases
+                .read()
+                .await
+                .is_empty()
+        );
+        assert!(matches!(
+            redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitting { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn submitted_redemption_is_not_force_failed_on_timeout() {
+        // A broadcast withdrawal (`VaultWithdrawSubmitted`) may still land
+        // on-chain, so the timeout sweep must never force-fail it. Its
+        // resolution belongs to the idempotent confirm redrive and the durable
+        // reconciliation deadline, not to the 30 minute transfer timeout.
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = redemption_aggregate_id("timed-out-submitted-preserved");
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let service = make_trigger_with_inventory(inventory).await;
+        let (_, redemption_store) = attach_live_equity_stores(&service).await;
+
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::ZERO,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+                },
+            )
+            .await
+            .unwrap();
+        let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        seed_confirmed_transfer_reservation(&service, &symbol, reservation_id).await;
+        let (_position_store, position_projection) = install_closed_position_store(&service).await;
 
         service
             .expire_stuck_redemptions(Utc::now() + ChronoDuration::hours(24))
             .await
             .unwrap();
 
+        // Everything is preserved: the reservation stays Confirmed, no release is
+        // queued, and the tracking entry with its in-progress guard survives.
         let position = position_projection.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
             position.equity_transfer_reservation.unwrap().status,
             EquityTransferReservationStatus::Confirmed
         );
         assert!(
-            service
-                .pending_timed_out_redemption_reservation_releases
-                .read()
-                .await
-                .contains_key(&id)
-        );
-        assert!(!service.redemption_tracking.read().await.contains_key(&id));
-
-        service
-            .set_position_authority(
-                position_store,
-                position_projection.clone(),
-                ExecutionThreshold::whole_share(),
-            )
-            .await;
-        service
-            .expire_stuck_operations(Utc::now() + ChronoDuration::hours(25))
-            .await
-            .unwrap();
-
-        let position = position_projection.load(&symbol).await.unwrap().unwrap();
-        assert_eq!(position.equity_transfer_reservation, None);
-        assert!(
             !service
                 .pending_timed_out_redemption_reservation_releases
                 .read()
                 .await
                 .contains_key(&id)
+        );
+        assert!(service.redemption_tracking.read().await.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn sweep_observes_durable_reconcile_of_submitting_redemption() {
+        // An operator's `transfer reconcile` writes `OperatorReconciled` through
+        // bare `send_command`, which the live reactor never observes. The timeout
+        // sweep must detect the durable `Reconciled` state and clear the guard,
+        // inflight, and tracking without a restart.
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = redemption_aggregate_id("swept-reconcile-submitting");
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let service = make_trigger_with_inventory(inventory).await;
+
+        let equity_services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(MockRaindex::new()),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let pool = crate::test_utils::setup_test_db().await;
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(equity_services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(equity_services.clone())
+            .await
+            .unwrap();
+        service
+            .set_stores(
+                mint_store,
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+            )
+            .await;
+
+        // Redeem via the reactor-wired store: opens the MarketMaking inflight and
+        // sets tracking at `VaultWithdrawSubmitting`.
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::ZERO,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        // The trigger holds the guard for the symbol while its transfer is live.
+        service.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer {
+                generation: equity::GuardGeneration::default(),
+            },
+        );
+        assert!(service.redemption_tracking.read().await.contains_key(&id));
+
+        // Operator reconcile in a separate process: bare `send_command`, no reactor.
+        st0x_event_sorcery::send_command::<EquityRedemption>(
+            &pool,
+            &id,
+            EquityRedemptionCommand::Reconcile {
+                reason: "withdrawal verified dead onchain".to_string(),
+            },
+            equity_services,
+        )
+        .await
+        .unwrap();
+
+        service.expire_stuck_redemptions(Utc::now()).await.unwrap();
+
+        assert!(
+            service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .get(&symbol)
+                .is_none(),
+            "the sweep must clear the guard after observing the durable reconcile"
+        );
+        assert!(
+            !service.redemption_tracking.read().await.contains_key(&id),
+            "the sweep must drop tracking after the durable reconcile"
+        );
+        let (inflight, available) = {
+            let inv = service.inventory.read().await;
+            (
+                inv.equity_inflight(&symbol, Venue::MarketMaking),
+                inv.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(
+            inflight,
+            Some(shares(0)),
+            "reconcile cancels the phantom MarketMaking inflight"
+        );
+        assert_eq!(
+            available,
+            Some(shares(100)),
+            "reconcile restores the never-withdrawn shares to available"
         );
     }
 

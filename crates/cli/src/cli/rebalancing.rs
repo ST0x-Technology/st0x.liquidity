@@ -644,7 +644,8 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// Whether a manual-transfer outcome is a retryable wait the BOT's worker
 /// should drive, not the CLI. The set mirrors the apalis worker's own
 /// delayed-redrive outcomes: `AttestationTimedOut`, the settlement-wait
-/// errors (`WithdrawalTxUnderconfirmed`, `SettlementCheckTransient`), a non-backpressure
+/// errors (`WithdrawalTxUnderconfirmed`, `WithdrawalScanTransient`,
+/// `SettlementCheckTransient`), a non-backpressure
 /// `WithdrawalPollInconclusive` (Alpaca unreachable), and
 /// `MintRecoveryInconclusive`. The CLI must NOT keep redriving these itself:
 /// its process would race the bot's worker on the same aggregate (the
@@ -656,6 +657,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
     match error {
         UsdcTransferError::AttestationTimedOut { .. }
         | UsdcTransferError::WithdrawalTxUnderconfirmed { .. }
+        | UsdcTransferError::WithdrawalScanTransient { .. }
         | UsdcTransferError::SettlementCheckTransient { .. }
         | UsdcTransferError::MintRecoveryInconclusive { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
@@ -1962,11 +1964,11 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Redemption aggregate not found: {id}"))?;
 
-            if !matches!(entity, EquityRedemption::Failed { .. }) {
+            if !entity.is_operator_reconcilable() {
                 anyhow::bail!(
-                    "transfer reconcile: redemption {id} is not in the Failed state. Refusing to \
-                     act -- reconcile only resolves a transfer stuck in the Failed terminal; \
-                     check its current state on the dashboard."
+                    "transfer reconcile: redemption {id} is not reconcilable (must be Failed \
+                     or an unresolved vault-withdrawal submission). Refusing to act -- check \
+                     its current state on the dashboard."
                 );
             }
 
@@ -2106,6 +2108,7 @@ mod tests {
     };
     use st0x_config::{HedgedChain, InventoryMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError};
+    use st0x_evm::PreparedTransaction;
     #[cfg(feature = "test-support")]
     use st0x_evm::StubWallet;
     use st0x_execution::{
@@ -2384,6 +2387,11 @@ mod tests {
             UsdcTransferError::SettlementCheckTransient {
                 id: id.clone(),
                 source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
+            },
+            UsdcTransferError::WithdrawalScanTransient {
+                id: id.clone(),
+                initiated_at: Utc::now(),
+                source: Box::new(st0x_raindex::RaindexError::ScanInconclusive { from_block: 99 }),
             },
             UsdcTransferError::MintRecoveryInconclusive {
                 id: id.clone(),
@@ -3835,13 +3843,21 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(1),
                     token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: PreparedTransaction::for_test(alloy::primitives::TxHash::ZERO, 0),
                 },
             )
             .await
             .unwrap();
         store
-            .send(&id, EquityRedemptionCommand::SubmitWithdraw)
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
             .await
             .unwrap();
 
@@ -5324,14 +5340,48 @@ mod tests {
         }
     }
 
+    /// Seeds a redemption into the `VaultWithdrawSubmitting` origin: the exact
+    /// withdrawal is signed and persisted, but never confirmably broadcast.
+    async fn seed_redemption_to_submitting(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(50.25),
+                    token: Address::random(),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: PreparedTransaction::for_test(alloy::primitives::TxHash::ZERO, 0),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     /// Drives a redemption through the real CQRS command flow until the vault
     /// withdrawal is confirmed (`WithdrawnFromRaindex`) -- stuck before the
     /// tokens leave the bot's custody.
     async fn seed_redemption_to_withdrawn(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        let token = Address::random();
+        let amount = U256::from(50_250_000_000_000_000_000_u128);
+        let mut services = redemption_services();
+        services
+            .chains
+            .get_mut(&Chain::Base)
+            .expect("redemption test services must include Base")
+            .raindex = Arc::new(MockRaindex::new().with_withdraw_transfer(token, amount));
+
         use EquityRedemptionCommand::*;
 
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(redemption_services())
+            .build(services)
             .await
             .unwrap();
 
@@ -5342,13 +5392,24 @@ mod tests {
                     chain: Chain::Base,
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(50.25),
-                    token: Address::random(),
-                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                    token,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount,
+                    from_block: 0,
+                    prepared: PreparedTransaction::for_test(alloy::primitives::TxHash::ZERO, 0),
                 },
             )
             .await
             .unwrap();
-        store.send(id, SubmitWithdraw).await.unwrap();
+        store
+            .send(
+                id,
+                RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
         store.send(id, ConfirmWithdraw).await.unwrap();
     }
 
@@ -5912,8 +5973,37 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("not in the Failed state"),
+            err_msg.contains("not reconcilable"),
             "reconcile of a non-failed redemption must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_redemption_succeeds_from_submitting() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-from-submitting");
+        seed_redemption_to_submitting(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "withdrawal never broadcast; verified on-chain"
+                .parse()
+                .unwrap(),
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "a stuck submitting redemption must reconcile, got: {entity:?}"
         );
     }
 
@@ -5979,7 +6069,7 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("not in the Failed state"),
+            err_msg.contains("not reconcilable"),
             "a second reconcile of an already-reconciled redemption must refuse; got: {err_msg}"
         );
     }

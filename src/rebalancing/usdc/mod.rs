@@ -74,6 +74,27 @@ pub enum UsdcTransferError {
     BurnRevert(Box<CctpError>),
     #[error("Vault error: {0}")]
     Vault(#[from] RaindexError),
+    /// A fail-closed lookup for a durably recorded `WithdrawalSubmitting`
+    /// transfer could not determine whether the withdrawal mined. Transient
+    /// transport failures and inconclusive scans delayed-redrive without
+    /// consuming the Apalis retry budget; formal RPC rejections and other
+    /// deterministic failures remain [`Self::Vault`].
+    ///
+    /// `initiated_at` is the durable `WithdrawalSubmitting.initiated_at`
+    /// timestamp, threaded here so the job handler computes a durable deadline:
+    /// before the deadline the redrive is silent; at or after it the operator is
+    /// paged (guard held, redrive continues at a slower cadence) so an
+    /// indefinitely-inconclusive scan cannot redrive forever unnoticed.
+    #[error(
+        "USDC rebalance {id}: vault withdrawal scan inconclusive or failed \
+         transiently; will retry after delay"
+    )]
+    WithdrawalScanTransient {
+        id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
+        #[source]
+        source: Box<RaindexError>,
+    },
     /// The shared inventory reverted a `withdraw4` because the vault could not
     /// cover the requested amount (a concurrent clear drained it). Distinct from
     /// the opaque `Vault` wrap so it is not redriven blindly: retrying the same
@@ -504,6 +525,7 @@ impl UsdcTransferError {
             | Self::WithdrawalCreditMismatch { .. }
             | Self::WithdrawalCreditUnreadable { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
+            | Self::WithdrawalScanTransient { .. }
             | Self::SettlementCheckTransient { .. }
             | Self::MintRecoveryInconclusive { .. }
             | Self::BurnRecordTaskFailed { .. }
@@ -559,6 +581,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::WithdrawalCreditUnreadable { .. }
             | Self::SettlementRetryDeadlineElapsed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
+            | Self::WithdrawalScanTransient { .. }
             | Self::SettlementCheckTransient { .. }
             | Self::MintRecoveryInconclusive { .. }
             | Self::BurnRecordTaskFailed { .. }

@@ -11,6 +11,7 @@ rain = ["dep:st0x-execution", "dep:st0x-finance", "dep:tokio", "dep:tracing"]
 alloy.workspace = true
 async-trait.workspace = true
 rain-math-float.workspace = true
+serde.workspace = true
 st0x-evm.workspace = true
 thiserror.workspace = true
 
