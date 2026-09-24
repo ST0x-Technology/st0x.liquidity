@@ -5952,7 +5952,7 @@ mod tests {
     }
 
     /// A `Bridge` decorator whose `mint()` always returns
-    /// `CctpError::MintRecoveryInconclusive`, forwarding every other `Bridge`
+    /// `CctpError::MintRecoveryInconclusive` wrapping `recovery_error()`, forwarding every other `Bridge`
     /// and `UsdcBridgeHelper` method to a wrapped real bridge. Used to test
     /// that `execute_cctp_mint`/`execute_cctp_mint_on_ethereum`/
     /// `recover_from_bridging_failed` redrive via
@@ -5968,6 +5968,7 @@ mod tests {
     /// bridge's `Bridge::reconstruct_attestation`/`poll_attestation`.
     struct MintErrorBridge<InnerBridge> {
         inner: InnerBridge,
+        recovery_error: fn() -> CctpError,
     }
 
     #[async_trait::async_trait]
@@ -6027,7 +6028,7 @@ mod tests {
             _attestation: &AttestationResponse,
         ) -> Result<st0x_bridge::MintReceipt, CctpError> {
             Err(CctpError::MintRecoveryInconclusive {
-                recovery_error: Box::new(CctpError::ScanInconclusive { from_block: 0 }),
+                recovery_error: Box::new((self.recovery_error)()),
             })
         }
 
@@ -18608,6 +18609,7 @@ mod tests {
             alpaca_wallet,
             Arc::new(MintErrorBridge {
                 inner: real_cctp_bridge,
+                recovery_error: || CctpError::ScanInconclusive { from_block: 0 },
             }),
             Arc::new(vault_service),
             cqrs.clone(),
@@ -18691,6 +18693,7 @@ mod tests {
             alpaca_wallet,
             Arc::new(MintErrorBridge {
                 inner: real_cctp_bridge,
+                recovery_error: || CctpError::ScanInconclusive { from_block: 0 },
             }),
             Arc::new(vault_service),
             cqrs.clone(),
@@ -18810,6 +18813,7 @@ mod tests {
             alpaca_wallet,
             Arc::new(MintErrorBridge {
                 inner: real_cctp_bridge,
+                recovery_error: || CctpError::ScanInconclusive { from_block: 0 },
             }),
             Arc::new(vault_service),
             cqrs.clone(),
@@ -18858,6 +18862,109 @@ mod tests {
             matches!(state, UsdcRebalance::BridgingFailed { .. }),
             "aggregate must remain BridgingFailed (no re-fail, no false recovery); got: {state:?}"
         );
+    }
+
+    /// A consumed nonce whose mint the recovery scan cannot find (the lag
+    /// retries are spent) is the Attested resume's out-of-window case: no
+    /// retry scans wider, so the recovery pages the operator and parks the
+    /// transfer instead of redriving forever.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn recover_from_bridging_failed_parks_a_mint_outside_the_recovery_scan() {
+        let server = MockServer::start();
+        let _attestation_mock = mock_complete_attestation(&server);
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (real_cctp_bridge, vault_service) =
+            create_test_onchain_services_with_circle_api(wallet, server.base_url());
+
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+
+        let cqrs = create_test_store_instance().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let burn_tx =
+            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000003");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::FailBridging {
+                reason: "attested mint lookup failed: mint outside the scan window".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(MintErrorBridge {
+                inner: real_cctp_bridge,
+                recovery_error: || CctpError::AlreadyMintedMessageNotFound {
+                    nonce: B256::repeat_byte(0x07),
+                },
+            }),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(
+                address!("0x2222222222222222222222222222222222222222"),
+                TEST_VAULT_ID,
+            ),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        );
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::PreviouslyFailedAggregate { id: failed_id } if *failed_id == id
+            ),
+            "a mint no retry can find must park, not redrive; got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "the transfer must stay BridgingFailed for reconciliation; got: {state:?}"
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
+        assert!(logs_contain(
+            "find the mint of the recorded nonce on chain, then settle it with \
+             `transfer reconcile --kind usdc`"
+        ));
     }
 
     /// Resumes an `Attested` transfer in `direction` whose pre-mint
