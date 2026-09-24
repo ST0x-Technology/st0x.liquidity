@@ -142,11 +142,6 @@ jobs:
             # so it is a workspace member we do not own; exclude it rather than
             # gate CI on its rustdoc warnings.
             cargo doc --workspace --no-deps --all-features --exclude rain-math-float
-            # compile_fail_tests (trybuild) shells out to cargo at run time, so
-            # run it here where the workspace build cache is warm. The archive
-            # partitions only carry prebuilt binaries and would compile it cold.
-            cargo nextest run --workspace --all-features --profile ci \
-              -E 'test(compile_fail_tests)'
           "
 
       # Blacksmith transparently redirects the native Actions cache to
@@ -222,7 +217,6 @@ jobs:
             set -euxo pipefail
             cargo nextest run --archive-file \"\$RUNNER_TEMP/nextest-archive.tar.zst\" \
               --workspace-remap . --profile ci \
-              -E 'not test(compile_fail_tests)' \
               --partition hash:${{ matrix.partition }}/4
           "
 

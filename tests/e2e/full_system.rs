@@ -39,7 +39,7 @@ use st0x_config::{BrokerCtx, Ctx, FileLogging, LogLevel, configure_sqlite_pool};
 use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
 use st0x_dto::Statement;
 use st0x_event_sorcery::Projection;
-use st0x_evm::Wallet;
+use st0x_evm::{Chain, Wallet};
 use st0x_execution::alpaca_broker_api::{
     AlpacaBrokerMock, TEST_ACCOUNT_ID, TEST_API_KEY, TEST_API_SECRET,
 };
@@ -53,10 +53,10 @@ use st0x_hedge::mock_api::{
     REDEMPTION_WALLET, RedemptionOutcome, TokenizationRequestType, TokenizationStatus,
 };
 use st0x_hedge::{
-    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, ImbalanceThreshold,
-    OperationMode, Position, RebalancingCtx, UsdcRebalancing,
-    seed_simulated_equity_redemption_history, seed_simulated_hedge_latency_history,
-    seed_simulated_mint_history, seed_simulated_usdc_rebalance_history,
+    AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
+    Position, RebalancingCtx, UsdcRebalancing, seed_simulated_equity_redemption_history,
+    seed_simulated_hedge_latency_history, seed_simulated_mint_history,
+    seed_simulated_usdc_rebalance_history,
 };
 
 use crate::assert::ExpectedPosition;
@@ -116,6 +116,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             ))
         })
@@ -131,7 +132,11 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
     )?);
 
     let rebalancing_ctx = RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(float!(0.5), float!(0.1))?)
+        .allocation(AllocationCtx::single_chain_test(
+            Chain::Base,
+            float!(0.5),
+            float!(0.1),
+        )?)
         .usdc(UsdcRebalancing::Enabled {
             target: float!(0.5),
             deviation: float!(0.1),
@@ -601,7 +606,7 @@ transfer_attempt_timeout_secs = 3600
 attestation_retry_deadline_secs = 86400
 settlement_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
-equity = {{ target = 0.5, deviation = 0.1 }}
+allocation = {{ targets = {{ base = 0.5 }}, alpaca_floor = 0, deviation = 0.1, min_operation_usd = 1, cooldown_secs = 1 }}
 usdc = {{ mode = "enabled", target = 0.5, deviation = 0.1 }}
 
 [chains.base.trading.assets.equities.AAPL]

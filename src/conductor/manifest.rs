@@ -175,7 +175,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use st0x_config::ChainEquities;
-    use st0x_config::{ChainAssets, ExecutionThreshold};
+    use st0x_config::{AllocationCtx, ChainAssets, ExecutionThreshold};
     use st0x_dto::Statement;
     use st0x_event_sorcery::test_store;
     use st0x_evm::Chain;
@@ -198,7 +198,8 @@ mod tests {
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::TransferEquityToMarketMaking;
     use crate::rebalancing::{
-        RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
+        ChainRebalancingConfig, RebalancingSchedulers, RebalancingService,
+        RebalancingServiceConfig, drain_pending_jobs,
     };
     use crate::test_utils::{rebalancing_enabled_equities, setup_test_pools};
     use crate::vault_lookup::MockVaultLookup;
@@ -211,19 +212,19 @@ mod tests {
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
-            equity: ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
-            },
+            allocation: AllocationCtx::base_test(),
             usdc: Some(ImbalanceThreshold {
                 target: float!(0.6),
                 deviation: float!(0.15),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: ChainAssets {
-                equities: rebalancing_enabled_equities(&["AAPL"]),
-                cash: None,
-            },
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities: rebalancing_enabled_equities(&["AAPL"]),
+                    cash: None,
+                }),
+            )]),
         }
     }
 
@@ -539,6 +540,9 @@ mod tests {
                 Arc::clone(&built.position_projection),
                 ExecutionThreshold::whole_share(),
             )
+            .await;
+        rebalancing_service
+            .set_last_price_reader(built.position_projection.clone())
             .await;
 
         built

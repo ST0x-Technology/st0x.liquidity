@@ -1034,7 +1034,7 @@ mod tests {
                 now,
                 now,
             )
-            .set_active_mint(symbol.clone(), mint_id.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
 
         let (sender, _receiver) = broadcast::channel(16);
         let inventory = Arc::new(BroadcastingInventory::new(view, sender));
@@ -1142,7 +1142,8 @@ mod tests {
             "no active transfers should resolve to the orphan path",
         );
 
-        let mint_only = InventoryView::default().set_active_mint(symbol.clone(), mint_id.clone());
+        let mint_only =
+            InventoryView::default().set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
         assert!(
             matches!(
                 decide_dispatch(&mint_only, &symbol),
@@ -1151,8 +1152,11 @@ mod tests {
             "an active mint alone should resolve to ActiveMint",
         );
 
-        let redemption_only =
-            InventoryView::default().set_active_redemption(symbol.clone(), redemption_id.clone());
+        let redemption_only = InventoryView::default().set_active_redemption(
+            symbol.clone(),
+            Chain::Base,
+            redemption_id.clone(),
+        );
         assert!(
             matches!(
                 decide_dispatch(&redemption_only, &symbol),
@@ -1162,8 +1166,8 @@ mod tests {
         );
 
         let conflict = InventoryView::default()
-            .set_active_mint(symbol.clone(), mint_id.clone())
-            .set_active_redemption(symbol.clone(), redemption_id.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone())
+            .set_active_redemption(symbol.clone(), Chain::Base, redemption_id.clone());
         assert!(
             matches!(
                 decide_dispatch(&conflict, &symbol),
@@ -1424,7 +1428,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("missing-mint");
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
-            .set_active_mint(symbol.clone(), mint_id);
+            .set_active_mint(symbol.clone(), Chain::Base, mint_id);
         let ctx = test_ctx(view, HashMap::new()).await;
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
@@ -1594,8 +1598,8 @@ mod tests {
         let mint_id = issuer_request_id("ISS001");
         let redemption_id = redemption_aggregate_id("RED001");
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
-            .set_active_mint(symbol.clone(), mint_id.clone())
-            .set_active_redemption(symbol.clone(), redemption_id.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone())
+            .set_active_redemption(symbol.clone(), Chain::Base, redemption_id.clone());
         let ctx = test_ctx(view, HashMap::new()).await;
         let job = UnwrappedEquityRecoveryJob {
             symbol: symbol.clone(),
@@ -1745,7 +1749,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("ISS001");
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
-            .set_active_mint(symbol.clone(), mint_id.clone());
+            .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
         let ctx = test_ctx(view, HashMap::new()).await;
 
         // Seed the mint to `TokensWrapped` so `resume_mint` runs to completion
@@ -1840,7 +1844,7 @@ mod tests {
             .to_u256_18_decimals()
             .unwrap();
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
-            .set_active_redemption(symbol.clone(), redemption_id.clone());
+            .set_active_redemption(symbol.clone(), Chain::Base, redemption_id.clone());
         let tokenizer = Arc::new(
             MockTokenizer::new()
                 .with_detection_outcome(MockDetectionOutcome::Detected)

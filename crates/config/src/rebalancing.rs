@@ -7,13 +7,16 @@ use std::time::Duration;
 
 use rain_math_float::Float;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use st0x_bridge::cctp::{CctpCorridor, CorridorStableNotUsdc};
 #[cfg(any(test, feature = "test-support"))]
 use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
 
-use crate::{ImbalanceThreshold, OperationMode};
+use crate::{
+    AllocationConfig, AllocationConfigError, AllocationCtx, ImbalanceThreshold, OperationMode,
+};
 
 /// Minimum USDC amount for Alpaca withdrawals.
 ///
@@ -55,6 +58,19 @@ pub enum RebalancingCtxError {
     ZeroMaxBurnRevertRedrives,
     #[error("[rebalancing] cash corridor: {0}")]
     CctpCorridor(#[from] CorridorStableNotUsdc),
+    #[error(
+        "[rebalancing.equity] was replaced by [rebalancing.allocation]: move target to \
+         targets.<chain> and deviation to deviation, and add alpaca_floor, \
+         min_operation_usd and cooldown_secs"
+    )]
+    RetiredEquityThreshold,
+    #[error(
+        "[rebalancing.allocation] is required: set targets, alpaca_floor, deviation, \
+         min_operation_usd and cooldown_secs"
+    )]
+    MissingAllocation,
+    #[error("[rebalancing.allocation]: {0}")]
+    Allocation(#[from] AllocationConfigError),
     #[error("invalid wallet config: {0}")]
     WalletConfig(#[from] toml::de::Error),
     #[error(transparent)]
@@ -77,7 +93,15 @@ pub enum UsdcRebalancing {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RebalancingConfig {
-    pub equity: ImbalanceThreshold,
+    /// The threshold `allocation` replaced. Parsed only so the old key is
+    /// refused with its replacement named, never read.
+    #[serde(default)]
+    pub(crate) equity: Option<IgnoredAny>,
+    /// Per-chain equity allocation for the planner, validated against the
+    /// hedged chains at load. Required, but optional at parse time so a
+    /// stale config is refused by [`Self::allocation`] with the retired key
+    /// named instead of a bare missing field.
+    pub(crate) allocation: Option<AllocationConfig>,
     pub usdc: UsdcRebalancing,
     pub transfer_timeout_secs: u64,
     /// Per-attempt wall-clock bound for a single Base->Alpaca transfer job
@@ -144,6 +168,20 @@ pub struct RebalancingConfig {
     pub freeze_check: OperationMode,
 }
 
+impl RebalancingConfig {
+    /// The allocation table, refusing the retired `[rebalancing.equity]`
+    /// by name before a missing `[rebalancing.allocation]`.
+    pub(crate) fn allocation(&self) -> Result<&AllocationConfig, RebalancingCtxError> {
+        if self.equity.is_some() {
+            return Err(RebalancingCtxError::RetiredEquityThreshold);
+        }
+
+        self.allocation
+            .as_ref()
+            .ok_or(RebalancingCtxError::MissingAllocation)
+    }
+}
+
 fn default_inventory_staleness_bound_secs() -> u64 {
     300
 }
@@ -159,7 +197,8 @@ fn default_settlement_retry_deadline_secs() -> u64 {
 /// holds only the rebalancing-specific trigger thresholds.
 #[derive(Clone)]
 pub struct RebalancingCtx {
-    pub equity: ImbalanceThreshold,
+    /// The validated `[rebalancing.allocation]` section.
+    pub allocation: AllocationCtx,
     pub usdc: Option<ImbalanceThreshold>,
     pub transfer_timeout: Duration,
     /// Staleness bound for per-chain inventory snapshots. See
@@ -198,6 +237,7 @@ impl RebalancingCtx {
     /// Construct from config. Validates only rebalancing-specific
     /// trigger thresholds; wallet construction lives elsewhere.
     pub fn new(config: &RebalancingConfig) -> Result<Self, RebalancingCtxError> {
+        let allocation = config.allocation()?;
         if config.transfer_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferTimeout);
         }
@@ -227,7 +267,7 @@ impl RebalancingCtx {
         }
 
         Ok(Self {
-            equity: config.equity,
+            allocation: AllocationCtx::new(allocation)?,
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
             inventory_staleness_bound: Duration::from_secs(config.inventory_staleness_bound_secs),
@@ -256,7 +296,7 @@ impl RebalancingCtx {
     /// transactions through the rebalancing wallet.
     #[builder]
     pub fn stub(
-        equity: ImbalanceThreshold,
+        #[builder(default = AllocationCtx::base_test())] allocation: AllocationCtx,
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
@@ -268,7 +308,7 @@ impl RebalancingCtx {
         #[builder(default = OperationMode::Enabled)] freeze_check: OperationMode,
     ) -> Self {
         Self {
-            equity,
+            allocation,
             usdc,
             transfer_timeout,
             inventory_staleness_bound,
@@ -295,7 +335,7 @@ impl RebalancingCtx {
     /// that need real onchain interaction (e.g. with Anvil forks).
     #[builder]
     pub fn with_wallets(
-        equity: ImbalanceThreshold,
+        #[builder(default = AllocationCtx::base_test())] allocation: AllocationCtx,
         usdc: UsdcRebalancing,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
@@ -314,7 +354,7 @@ impl RebalancingCtx {
         };
 
         Self {
-            equity,
+            allocation,
             usdc,
             transfer_timeout,
             inventory_staleness_bound,
@@ -355,7 +395,7 @@ impl RebalancingCtx {
 impl std::fmt::Debug for RebalancingCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebalancingCtx")
-            .field("equity", &self.equity)
+            .field("allocation", &self.allocation)
             .field("usdc", &self.usdc)
             .field("inventory_staleness_bound", &self.inventory_staleness_bound)
             .field("freeze_check", &self.freeze_check)
@@ -365,10 +405,11 @@ impl std::fmt::Debug for RebalancingCtx {
 
 #[cfg(test)]
 mod tests {
-    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
+    use st0x_evm::{Chain, USDC_BASE, USDC_ETHEREUM};
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::AllocationConfigError;
 
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
@@ -380,9 +421,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -407,8 +451,21 @@ mod tests {
     fn deserialize_config_succeeds() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
-        assert!(config.equity.target.eq(float!(0.5)).unwrap());
-        assert!(config.equity.deviation.eq(float!(0.2)).unwrap());
+        assert!(
+            config.allocation().unwrap().targets[&Chain::Base]
+                .inner()
+                .eq(float!(0.5))
+                .unwrap()
+        );
+        assert!(
+            config
+                .allocation()
+                .unwrap()
+                .deviation
+                .inner()
+                .eq(float!(0.2))
+                .unwrap()
+        );
 
         let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
             panic!("expected UsdcRebalancing::Enabled");
@@ -434,9 +491,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "disabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "disabled"
@@ -462,9 +522,12 @@ mod tests {
             settlement_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -491,9 +554,12 @@ mod tests {
             max_burn_revert_redrives = 3
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.6"
-            deviation = "0.1"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -502,9 +568,6 @@ mod tests {
         "#,
         )
         .unwrap();
-
-        assert!(config.equity.target.eq(float!(0.6)).unwrap());
-        assert!(config.equity.deviation.eq(float!(0.1)).unwrap());
 
         let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
             panic!("expected UsdcRebalancing::Enabled");
@@ -524,9 +587,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -551,9 +617,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -576,9 +645,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "disabled"
@@ -601,9 +673,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -630,9 +705,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -658,9 +736,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -684,9 +765,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -715,9 +799,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -732,30 +819,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_equity_fails() {
-        let toml_str = r#"
-            transfer_timeout_secs = 1800
-            inventory_staleness_bound_secs = 300
-            transfer_attempt_timeout_secs = 3600
-            attestation_retry_deadline_secs = 86400
-            settlement_retry_deadline_secs = 86400
-            max_burn_revert_redrives = 5
-            freeze_check = "enabled"
-
-            [usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("equity"),
-            "Expected missing equity error, got: {error}"
-        );
-    }
-
-    #[test]
     fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
@@ -766,9 +829,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
@@ -788,9 +854,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -817,9 +886,12 @@ mod tests {
             max_burn_revert_redrives = 5
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -848,9 +920,12 @@ mod tests {
             max_burn_revert_redrives = 0
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -879,9 +954,12 @@ mod tests {
             max_burn_revert_redrives = 0
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "disabled"
@@ -903,9 +981,12 @@ mod tests {
             settlement_retry_deadline_secs = 86400
             freeze_check = "enabled"
 
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
 
             [usdc]
             mode = "enabled"
@@ -917,6 +998,268 @@ mod tests {
         assert!(
             error.message().contains("max_burn_revert_redrives"),
             "Expected missing max_burn_revert_redrives error, got: {error}"
+        );
+    }
+
+    /// The valid config with its `[allocation]` table swapped for `allocation`.
+    fn allocation_toml(allocation: &str) -> String {
+        let (head, tail) = valid_rebalancing_config_toml()
+            .split_once("[allocation]")
+            .unwrap();
+        let (_, tail) = tail.split_once("[usdc]").unwrap();
+
+        format!("{head}[allocation]\n{allocation}\n[usdc]{tail}")
+    }
+
+    #[test]
+    fn allocation_section_parses() {
+        let config: RebalancingConfig = toml::from_str(&allocation_toml(
+            r#"
+            targets = { base = "0.6", ethereum = 0.1 }
+            alpaca_floor = "0.1"
+            deviation = 0.05
+            min_operation_usd = 100
+            cooldown_secs = 600
+            "#,
+        ))
+        .unwrap();
+
+        let allocation = config.allocation().unwrap();
+        assert_eq!(allocation.targets.len(), 2);
+        assert!(
+            allocation.targets[&Chain::Base]
+                .inner()
+                .eq(float!(0.6))
+                .unwrap()
+        );
+        assert!(
+            allocation.targets[&Chain::Ethereum]
+                .inner()
+                .eq(float!(0.1))
+                .unwrap()
+        );
+        assert!(allocation.alpaca_floor.inner().eq(float!(0.1)).unwrap());
+        assert!(allocation.deviation.inner().eq(float!(0.05)).unwrap());
+        assert!(
+            allocation
+                .min_operation_usd
+                .inner()
+                .eq(&Usdc::new(float!(100)))
+                .unwrap()
+        );
+        assert_eq!(allocation.cooldown_secs, 600);
+
+        let ctx = RebalancingCtx::new(&config).unwrap();
+        let allocation = ctx.allocation;
+        assert_eq!(allocation.cooldown, Duration::from_secs(600));
+        assert!(
+            allocation.targets[&Chain::Base]
+                .inner()
+                .eq(float!(0.6))
+                .unwrap()
+        );
+        assert!(allocation.alpaca_floor.inner().eq(float!(0.1)).unwrap());
+        assert!(allocation.deviation.inner().eq(float!(0.05)).unwrap());
+        assert!(
+            allocation
+                .min_operation_usd
+                .inner()
+                .eq(&Usdc::new(float!(100)))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn allocation_target_share_above_one_is_refused() {
+        let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
+            r"
+            targets = { base = 1.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 100
+            cooldown_secs = 600
+            ",
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("target share"),
+            "expected a target share range error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn allocation_negative_deviation_is_refused() {
+        let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
+            r"
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = -0.05
+            min_operation_usd = 100
+            cooldown_secs = 600
+            ",
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("deviation band"),
+            "expected a deviation band error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn allocation_zero_minimum_operation_is_refused() {
+        let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
+            r"
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 0
+            cooldown_secs = 600
+            ",
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("positive"),
+            "expected a positive minimum error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn allocation_unknown_key_is_refused() {
+        let error = toml::from_str::<RebalancingConfig>(&allocation_toml(
+            r"
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 100
+            cooldown_secs = 600
+            hysteresis = 0.01
+            ",
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("hysteresis"),
+            "expected an unknown field error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn zero_allocation_cooldown_fails_validation() {
+        let config: RebalancingConfig = toml::from_str(&allocation_toml(
+            r"
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 100
+            cooldown_secs = 0
+            ",
+        ))
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            RebalancingCtxError::Allocation(AllocationConfigError::ZeroCooldown)
+        ));
+    }
+
+    /// The threshold `[rebalancing.allocation]` replaced is refused with its
+    /// replacement spelled out, not as an anonymous unknown key.
+    #[test]
+    fn retired_equity_threshold_is_refused_by_name() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [equity]
+            target = 0.5
+            deviation = 0.2
+
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.05
+            min_operation_usd = 10
+            cooldown_secs = 300
+
+            [usdc]
+            mode = "disabled"
+            "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+
+        assert!(
+            matches!(error, RebalancingCtxError::RetiredEquityThreshold),
+            "expected the retired key refused by name, got {error:?}"
+        );
+    }
+
+    /// The likeliest stale config carries only the old table; it is refused
+    /// by name, not as a missing `allocation` field.
+    #[test]
+    fn retired_equity_threshold_without_allocation_is_refused_by_name() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [equity]
+            target = 0.5
+            deviation = 0.2
+
+            [usdc]
+            mode = "disabled"
+            "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+
+        assert!(
+            matches!(error, RebalancingCtxError::RetiredEquityThreshold),
+            "expected the retired key refused by name, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn allocation_section_is_required() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [usdc]
+            mode = "disabled"
+            "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+
+        assert!(
+            matches!(error, RebalancingCtxError::MissingAllocation),
+            "expected the missing allocation section named, got {error:?}"
         );
     }
 }

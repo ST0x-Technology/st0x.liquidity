@@ -326,7 +326,7 @@ pub fn check_enablement(
 
 /// Returns the lexicographically first matching symbol so startup errors do
 /// not depend on `HashMap` iteration order.
-fn first_equity_matching(
+pub(crate) fn first_equity_matching(
     assets: &ChainAssets,
     predicate: impl Fn(&ChainEquityAsset) -> bool,
 ) -> Option<&Symbol> {
@@ -446,6 +446,7 @@ mod tests {
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         assets.cash = Some(crate::ChainCashAsset {
@@ -497,6 +498,7 @@ mod tests {
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         let error = check_enablement(Chain::Ethereum, ChainLifecycle::Active, true, Some(&assets))
@@ -527,6 +529,7 @@ mod tests {
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
 
@@ -565,6 +568,7 @@ mod tests {
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
+                    target_share: None,
                 },
             );
         }
@@ -598,6 +602,7 @@ mod tests {
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
 
@@ -678,6 +683,7 @@ mod tests {
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
+                target_share: None,
             },
         );
         assets.cash = Some(crate::ChainCashAsset {

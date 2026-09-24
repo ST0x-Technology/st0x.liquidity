@@ -183,6 +183,41 @@ impl GasReadiness {
     pub(crate) fn always_ready_for_test() -> Arc<Self> {
         Self::for_test(U256::MAX, U256::from(1_u64), U256::MAX, U256::from(1_u64))
     }
+
+    /// Always ready; the counter tallies the equity wallet's balance reads.
+    #[cfg(test)]
+    pub(crate) fn counting_for_test() -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingBalance(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl BalanceReader for CountingBalance {
+            async fn native_balance(&self, _: Address) -> Result<U256, BalanceReadError> {
+                let Self(reads) = self;
+                reads.fetch_add(1, Ordering::SeqCst);
+
+                Ok(U256::MAX)
+            }
+        }
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let static_readiness = Self::always_ready_for_test();
+        let equity = ChainGasReadiness {
+            balance_reader: Arc::new(CountingBalance(Arc::clone(&reads))),
+            wallet: Address::ZERO,
+            chain: Chain::Base,
+            threshold: U256::from(1_u64),
+        };
+        let readiness = Self::new(
+            equity,
+            static_readiness.base.clone(),
+            static_readiness.ethereum.clone(),
+            Duration::from_secs(1),
+        );
+
+        (Arc::new(readiness), reads)
+    }
 }
 
 /// Gas-readiness capability at transfer construction sites.

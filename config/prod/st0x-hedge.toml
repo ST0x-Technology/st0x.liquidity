@@ -183,10 +183,10 @@ primary = false
 vault_id = "0xfab"
 rebalancing = "disabled"
 
-# The two launch equities, addresses from st0x.registry
+# Robinhood equities, addresses from st0x.registry
 # token-lists/robinhood.json (tokenized_equity = unwrappedAddress,
 # tokenized_equity_derivative = the wt token). Their broker policy tables
-# [assets.equities.DNUT] / [assets.equities.FGI] are shared with Base.
+# [assets.equities.<SYM>] are shared with Base.
 
 [chains.robinhood.trading.assets.equities.DNUT]
 trading = "enabled"
@@ -203,6 +203,22 @@ wrapped_equity_recovery = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0xfEa217600e2b00bBB2172a99345016a0cEb7d29f"
 tokenized_equity_derivative = "0x685DFd386968B58D895F934485820C479C79a8bB"
+
+[chains.robinhood.trading.assets.equities.PLBY]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x4a18036Dce22168D8891919a1c75aC2CAf9a08AB"
+tokenized_equity_derivative = "0xBe127eeD812DC1F622227FAdc8639d4138B47b2e"
+
+[chains.robinhood.trading.assets.equities.GRND]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0xdca06fddf5320870C8E9D0534aa102677C36bCc4"
+tokenized_equity_derivative = "0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"
 
 [wallet]
 # Keyless Turnkey auth: the API key lives in Cloud KMS; the secrets file
@@ -246,9 +262,21 @@ mode = "enabled"
 target = 0.6
 deviation = 0.05
 
-[rebalancing.equity]
-target = 0.5
+# Equity allocation across the hedged chains (st0x.liquidity RAI-2082). Base
+# keeps the 50% target and 5% band the retired [rebalancing.equity] table
+# carried; Robinhood is hedge-only and Ethereum runs no orderbook, so neither
+# gets a target and the broker holds the other 50%. alpaca_floor keeps a
+# tenth of every equity's total at the broker as the hedging reserve (inert
+# beside a 50% target: a mint stops there anyway). min_operation_usd sits two
+# orders of magnitude above a Base mint's gas while still letting the cheapest
+# listings rebalance; cooldown_secs matches the inventory staleness bound, so
+# a limit-truncated transfer re-fires once per poll window, not every tick.
+[rebalancing.allocation]
+targets = { base = 0.5 }
+alpaca_floor = 0.1
 deviation = 0.05
+min_operation_usd = 10
+cooldown_secs = 300
 
 [rest_api]
 url = "https://api.st0x.io"

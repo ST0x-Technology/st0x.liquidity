@@ -21,9 +21,9 @@ pub(crate) use polling::{
     PendingRequestOwnership, PendingRequestOwnershipSnapshot, Poller, WalletPollingCtx,
 };
 pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};
-pub(crate) use venue_balance::InventoryError;
+pub(crate) use venue_balance::{InventoryError, VenueBalance};
 pub(crate) use view::{
-    EquityImbalanceError, Imbalance, Inventory, InventoryView, InventoryViewError, Operator,
-    TransferOp, Venue,
+    EquityVenuesError, Imbalance, Inventory, InventoryScope, InventoryView, InventoryViewError,
+    Operator, TransferOp, Venue,
 };
 pub use view::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};

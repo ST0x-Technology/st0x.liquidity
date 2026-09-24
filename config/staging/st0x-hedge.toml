@@ -377,7 +377,10 @@ inventory_staleness_bound_secs = 300
 # the status cannot be confirmed. Set to "disabled" to fail open during an
 # issuance outage (issuance secrets stay required, so re-enabling is config-only).
 freeze_check = "disabled"
-equity = { target = 0.5, deviation = 0.2 }
+# Equity allocation across the hedged chains: Base keeps the 50% target and
+# 20% band the retired `equity` table carried; the broker holds the rest, a
+# tenth of it as the hedging reserve. See config/prod for the reasoning.
+allocation = { targets = { base = 0.5 }, alpaca_floor = 0.1, deviation = 0.2, min_operation_usd = 10, cooldown_secs = 300 }
 usdc = { mode = "disabled" }
 
 [rest_api]

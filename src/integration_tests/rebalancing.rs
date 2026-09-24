@@ -21,17 +21,18 @@ use uuid::Uuid;
 
 use rain_math_float::Float;
 use st0x_config::{
-    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode,
+    AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, DeviationBand,
+    ExecutionThreshold, OperationMode, TargetShare,
 };
 use st0x_dto::Statement;
-use st0x_event_sorcery::{Store, StoreBuilder, test_store};
+use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
 use st0x_evm::{Chain, IERC20};
 use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexVaultId};
 use st0x_tokenization::mock::MockTokenizer;
-use st0x_tokenization::{Tokenizer, issuer_request_id};
+use st0x_tokenization::{Tokenizer, issuer_request_id, tokenization_request_id};
 use st0x_wrapper::{MockWrapper, Wrapper};
 
 use super::{
@@ -45,14 +46,15 @@ use crate::bindings::TestERC20;
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::conductor::job::{BackpressureStreak, Job};
 use crate::equity_redemption::{
-    EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
+    EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId, redemption_aggregate_id,
 };
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, InventoryView, PollFreshness, Venue,
+    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Operator, PollFreshness,
+    Venue,
 };
 use crate::mint_authorization::ConfiguredMintAuthorizer;
-use crate::native_gas::ConfiguredGasReadiness;
+use crate::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{
@@ -64,7 +66,8 @@ use crate::rebalancing::equity::{
 use crate::rebalancing::trigger::GuardState;
 use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
 use crate::rebalancing::{
-    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
+    ChainRebalancingConfig, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
+    drain_pending_jobs,
 };
 use crate::test_utils::setup_test_pools;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
@@ -90,12 +93,12 @@ const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000
 
 /// Seeds the VaultRegistry with the given token address and a deterministic
 /// vault ID derived from the symbol.
-async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address) {
+async fn seed_vault_registry(pool: &SqlitePool, chain: Chain, symbol: &Symbol, token: Address) {
     let vault_id = B256::from(keccak256(symbol.to_string().as_bytes()));
 
     let cqrs = test_store::<VaultRegistry>(pool.clone(), ());
     let id = VaultRegistryId {
-        chain: st0x_evm::Chain::Base,
+        chain,
         orderbook: TEST_ORDERBOOK,
         owner: TEST_ORDER_OWNER,
     };
@@ -196,51 +199,103 @@ async fn discover_deterministic_tx_hash(
     tx_hash
 }
 
+/// An allocation with one target per listed chain, no minimum to speak of
+/// and a one-minute cooldown.
+fn allocation(targets: &[(Chain, &str)], alpaca_floor: &str, band: &str) -> AllocationCtx {
+    let share = |value: &str| TargetShare::new(float!(value)).unwrap();
+
+    AllocationCtx {
+        targets: targets
+            .iter()
+            .map(|(chain, target)| (*chain, share(target)))
+            .collect(),
+        alpaca_floor: share(alpaca_floor),
+        deviation: DeviationBand::new(float!(band)).unwrap(),
+        min_operation_usd: Positive::new(Usdc::new(float!(1))).unwrap(),
+        cooldown: Duration::from_secs(60),
+    }
+}
+
+/// AAPL listed for rebalancing, optionally capped per operation.
+fn aapl_equities(operational_limit: Option<&str>) -> ChainEquities {
+    ChainEquities {
+        operational_limit: None,
+        symbols: HashMap::from([(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: operational_limit
+                    .map(|limit| Positive::new(FractionalShares::new(float!(limit))).unwrap()),
+                target_share: None,
+            },
+        )]),
+    }
+}
+
+fn chain_config(equities: ChainEquities, cash: Option<ChainCashAsset>) -> ChainRebalancingConfig {
+    ChainRebalancingConfig {
+        assets: ChainAssets { equities, cash },
+        min_operation_usd: Positive::new(Usdc::new(float!(1))).unwrap(),
+    }
+}
+
+fn rebalancing_enabled_cash() -> ChainCashAsset {
+    ChainCashAsset {
+        vault_ids: Vec::new(),
+        rebalancing: OperationMode::Enabled,
+        operational_limit: None,
+    }
+}
+
 fn test_trigger_config() -> RebalancingServiceConfig {
     RebalancingServiceConfig {
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
-        equity: ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        },
+        allocation: allocation(&[(Chain::Base, "0.5")], "0", "0.2"),
         usdc: Some(ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
-        assets: ChainAssets {
-            equities: ChainEquities {
-                operational_limit: None,
-                symbols: HashMap::from([(
-                    Symbol::new("AAPL").unwrap(),
-                    ChainEquityAsset {
-                        tokenized_equity: Address::ZERO,
-                        tokenized_equity_derivative: Address::ZERO,
-                        vault_ids: Vec::new(),
-                        trading: OperationMode::Disabled,
-                        rebalancing: OperationMode::Enabled,
-                        wrapped_equity_recovery: OperationMode::Disabled,
-                        operational_limit: None,
-                    },
-                )]),
-            },
-            cash: Some(ChainCashAsset {
-                vault_ids: Vec::new(),
-                rebalancing: OperationMode::Enabled,
-                operational_limit: None,
-            }),
-        },
+        chains: BTreeMap::from([(
+            Chain::Base,
+            chain_config(aapl_equities(None), Some(rebalancing_enabled_cash())),
+        )]),
+    }
+}
+
+/// Base targets 30% of AAPL and HyperEVM 40%, both inside a 5% band, so
+/// the planner has two chains to rank against each other.
+fn two_chain_trigger_config() -> RebalancingServiceConfig {
+    RebalancingServiceConfig {
+        allocation: allocation(
+            &[(Chain::Base, "0.3"), (Chain::HyperEvm, "0.4")],
+            "0",
+            "0.05",
+        ),
+        chains: BTreeMap::from([
+            (
+                Chain::Base,
+                chain_config(aapl_equities(None), Some(rebalancing_enabled_cash())),
+            ),
+            (Chain::HyperEvm, chain_config(aapl_equities(None), None)),
+        ]),
+        ..test_trigger_config()
     }
 }
 
 /// Mirrors the conductor's Position CQRS wiring
 /// (`PositionAndRebalancing::setup`), attaching the `RebalancingService` as a
-/// Position CQRS query processor so
-/// that position events flow through it into inventory bookkeeping +
-/// follow-up check enqueueing.
+/// Position CQRS query processor so that position events flow through it
+/// into inventory bookkeeping + follow-up check enqueueing, and handing the
+/// service the position projection it values minimum operation sizes with.
 async fn build_position_cqrs_with_service(
     pool: &SqlitePool,
     service: &Arc<RebalancingService>,
@@ -250,6 +305,7 @@ async fn build_position_cqrs_with_service(
         .build(())
         .await
         .unwrap();
+    service.set_last_price_reader(projection.clone()).await;
 
     service
         .set_position_authority(
@@ -260,6 +316,45 @@ async fn build_position_cqrs_with_service(
         .await;
 
     store
+}
+
+/// A trigger service over `config`, with a vault registry id and a
+/// permissive wrapper for every chain the config lists.
+fn build_trigger_service(
+    pool: &SqlitePool,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    inventory: &Arc<BroadcastingInventory>,
+    config: RebalancingServiceConfig,
+) -> Arc<RebalancingService> {
+    let registry_ids = config
+        .chains
+        .keys()
+        .map(|chain| {
+            (
+                *chain,
+                VaultRegistryId {
+                    chain: *chain,
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+            )
+        })
+        .collect();
+    let wrappers = config
+        .chains
+        .keys()
+        .map(|chain| (*chain, Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>))
+        .collect();
+
+    Arc::new(RebalancingService::new(
+        config,
+        Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+        registry_ids,
+        Arc::clone(inventory),
+        wrappers,
+        RebalancingSchedulers::new(apalis_pool),
+        Arc::new(crate::alerts::LogNotifier),
+    ))
 }
 
 /// Shared state for equity rebalancing tests (mint and redemption) that
@@ -276,6 +371,12 @@ struct EquityTriggerFixture {
 }
 
 async fn setup_equity_trigger() -> EquityTriggerFixture {
+    setup_equity_trigger_with_config(test_trigger_config()).await
+}
+
+async fn setup_equity_trigger_with_config(
+    config: RebalancingServiceConfig,
+) -> EquityTriggerFixture {
     let (pool, apalis_pool) = setup_test_pools().await;
     let symbol = Symbol::new("AAPL").unwrap();
     let aggregate_id = symbol.to_string();
@@ -292,26 +393,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         event_sender,
     ));
 
-    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
-
-    let wrapper = Arc::new(MockWrapper::new());
-
-    let service = Arc::new(RebalancingService::new(
-        test_trigger_config(),
-        vault_registry,
-        BTreeMap::from([(
-            Chain::Base,
-            VaultRegistryId {
-                chain: st0x_evm::Chain::Base,
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
-        )]),
-        Arc::clone(&inventory),
-        BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
-        RebalancingSchedulers::new(&apalis_pool),
-        Arc::new(crate::alerts::LogNotifier),
-    ));
+    let service = build_trigger_service(&pool, &apalis_pool, &inventory, config);
 
     let position_cqrs = build_position_cqrs_with_service(&pool, &service).await;
 
@@ -427,7 +509,9 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
                             Positive::new(FractionalShares::new(float!(1000))).unwrap(),
                         ),
                         expected_net: Some(FractionalShares::ZERO),
-                        price_usdc: None,
+                        // The planner values its minimum operation size at
+                        // the symbol's last price, so the fixture seeds one.
+                        price_usdc: Some(float!(150)),
                     },
                 )
                 .await
@@ -605,7 +689,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let mint_tx_hash = mint_receipt.transaction_hash;
 
     // Seed VaultRegistry so the next Position event triggers a real Mint.
-    seed_vault_registry(&pool, &symbol, token_address).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, token_address).await;
 
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
@@ -721,6 +805,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             ExecutionThreshold::whole_share(),
         )),
         transfer_services: EquityTransferServices::panicking(),
+        primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -920,7 +1005,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         offchain: float!(20),
     })
     .await;
-    seed_vault_registry(&pool, &symbol, token_address).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, token_address).await;
 
     position_cqrs
         .send(
@@ -1129,6 +1214,469 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         pending_equity_mint_job_count(&apalis_pool).await,
         0,
         "No mint job should have been enqueued"
+    );
+}
+
+/// Seeds a chain's market-making slot for `symbol` the way that chain's
+/// first vault poll would, so the planner can see the chain.
+async fn seed_onchain_slot(
+    inventory: &Arc<BroadcastingInventory>,
+    symbol: &Symbol,
+    chain: Chain,
+    available: Float,
+) {
+    let mut guard = inventory.write().await;
+    *guard = guard
+        .clone()
+        .update_equity_at(
+            symbol,
+            chain,
+            Inventory::available(
+                Venue::MarketMaking,
+                Operator::Add,
+                FractionalShares::new(available),
+            ),
+            Utc::now(),
+        )
+        .unwrap();
+}
+
+/// Marks every pending equity transfer job Done, as the worker that ran it
+/// to completion would have.
+async fn mark_pending_equity_transfer_jobs_done(apalis_pool: &apalis_sqlite::SqlitePool) {
+    sqlx_apalis::query(
+        "UPDATE Jobs SET status = 'Done' WHERE status = 'Pending' AND job_type IN (?, ?)",
+    )
+    .bind(std::any::type_name::<TransferEquityToHedging>())
+    .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+    .execute(apalis_pool)
+    .await
+    .unwrap();
+}
+
+/// Drives the dispatched redemption `id` to `Completed` through the service's
+/// reactor, then waits for the detached post-commit release of the Position
+/// reservation the job owns, so the next tick can reserve the symbol again.
+async fn complete_redemption_through_the_reactor(
+    pool: &SqlitePool,
+    service: &Arc<RebalancingService>,
+    id: &RedemptionAggregateId,
+    chain: Chain,
+    symbol: &Symbol,
+    token: Address,
+    quantity: u64,
+) {
+    let services = EquityTransferServices {
+        chains: BTreeMap::from([(
+            chain,
+            ChainEquityServices {
+                wallet: Address::ZERO,
+                raindex: Arc::new(MockRaindex::new().with_withdraw_transfer(
+                    token,
+                    U256::from(quantity) * U256::from(10_u128.pow(18)),
+                )),
+                vault_lookup: mock_vault_lookup_for_symbol(symbol, token),
+                tokenizer: Arc::new(MockTokenizer::new()),
+                wrapper: Arc::new(MockWrapper::new()),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: ChainEquities::default(),
+            },
+        )]),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+    };
+    let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        .with(Arc::clone(service))
+        .build(services)
+        .await
+        .unwrap();
+
+    store
+        .send(
+            id,
+            EquityRedemptionCommand::Redeem {
+                chain,
+                symbol: symbol.clone(),
+                quantity: float!(&quantity.to_string()),
+                token,
+                vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                amount: U256::from(quantity) * U256::from(10_u128.pow(18)),
+                from_block: 0,
+                prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+            },
+        )
+        .await
+        .unwrap();
+
+    for command in [
+        EquityRedemptionCommand::RecordWithdrawSubmission {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+        },
+        EquityRedemptionCommand::ConfirmWithdraw,
+        EquityRedemptionCommand::UnwrapTokens,
+        EquityRedemptionCommand::SubmitUnwrap,
+        EquityRedemptionCommand::ConfirmUnwrap,
+        EquityRedemptionCommand::PrepareSend,
+        EquityRedemptionCommand::SendTokens,
+        EquityRedemptionCommand::Detect {
+            tokenization_request_id: tokenization_request_id("planned-redemption"),
+        },
+        EquityRedemptionCommand::Complete,
+    ] {
+        store.send(id, command).await.unwrap();
+    }
+
+    let projection = Projection::<Position>::sqlite(pool.clone());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let released = projection
+                .load(symbol)
+                .await
+                .unwrap()
+                .is_some_and(|position| position.equity_transfer_reservation.is_none());
+            if released {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the completed redemption must release its Position reservation");
+}
+
+/// Base holds 60 of AAPL's 100 shares against a 30% target while HyperEVM
+/// holds none against 40%: the planner redeems Base's 30-share excess
+/// first, and only once that redemption completes does the next tick mint
+/// HyperEVM's 40-share shortfall.
+#[tokio::test]
+async fn over_target_chain_redeems_before_the_under_target_chain_mints() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(two_chain_trigger_config()).await;
+    let token = Address::random();
+    seed_vault_registry(&pool, Chain::Base, &symbol, token).await;
+    seed_vault_registry(&pool, Chain::HyperEvm, &symbol, token).await;
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(60),
+        offchain: float!(40),
+    })
+    .await;
+    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(0)).await;
+    drain_pending_jobs(&service).await.unwrap();
+
+    let redemption = fetch_pending_equity_redemption_job(&apalis_pool).await;
+    assert_eq!(redemption.chain, Chain::Base);
+    assert_eq!(redemption.quantity, FractionalShares::new(float!(30)));
+    assert_eq!(
+        pending_equity_mint_job_count(&apalis_pool).await,
+        0,
+        "the HyperEVM mint waits until the Base redemption has completed"
+    );
+
+    mark_pending_equity_transfer_jobs_done(&apalis_pool).await;
+    complete_redemption_through_the_reactor(
+        &pool,
+        &service,
+        &redemption.aggregate_id,
+        Chain::Base,
+        &symbol,
+        token,
+        30,
+    )
+    .await;
+    // The terminal event re-arms only a USDC check; the next equity tick is
+    // the next snapshot poll's, driven here by hand.
+    service.check_and_trigger_equity(&symbol).await.unwrap();
+
+    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(mint.chain, Chain::HyperEvm);
+    assert_eq!(mint.quantity, FractionalShares::new(float!(40)));
+    assert_eq!(
+        pending_equity_redemption_job_count(&apalis_pool).await,
+        0,
+        "Base sits on its target after the redemption"
+    );
+}
+
+/// Base holds 20 of AAPL's 100 shares against a 30% target while HyperEVM's
+/// 44 sit inside the 5% band around its 40%, so the planner mints for Base.
+/// Its 10-share shortfall would take the broker's 36 under the 30% Alpaca
+/// floor of 30, so the mint is capped to the 6 shares above the floor.
+#[tokio::test]
+async fn mint_is_capped_to_keep_the_alpaca_floor() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(RebalancingServiceConfig {
+        allocation: allocation(
+            &[(Chain::Base, "0.3"), (Chain::HyperEvm, "0.4")],
+            "0.3",
+            "0.05",
+        ),
+        ..two_chain_trigger_config()
+    })
+    .await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, Address::random()).await;
+
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(20),
+        offchain: float!(36),
+    })
+    .await;
+    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(44)).await;
+    drain_pending_jobs(&service).await.unwrap();
+
+    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(mint.chain, Chain::Base);
+    assert_eq!(mint.quantity, FractionalShares::new(float!(6)));
+    assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
+}
+
+/// Base's 60 of AAPL's 120 shares rank its 24-share redemption first, but
+/// Base's vault registry does not know the token, so the planner moves on
+/// to HyperEVM's 48-share shortfall instead of declining the symbol.
+#[tokio::test]
+async fn chain_missing_from_its_registry_yields_to_the_next_candidate() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(two_chain_trigger_config()).await;
+    let other = Symbol::new("MSFT").unwrap();
+    seed_vault_registry(&pool, Chain::Base, &other, Address::random()).await;
+    seed_vault_registry(&pool, Chain::HyperEvm, &symbol, Address::random()).await;
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(60),
+        offchain: float!(60),
+    })
+    .await;
+    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(0)).await;
+    service.check_and_trigger_equity(&symbol).await.unwrap();
+
+    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(mint.chain, Chain::HyperEvm);
+    assert_eq!(mint.quantity, FractionalShares::new(float!(48)));
+    assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
+}
+
+/// HyperEVM holds 60 of AAPL's 120 shares, 12 over its 40% target, so its
+/// redemption would rank first. Wallet recovery runs on the primary chain
+/// (Base) only, and a failed HyperEVM redemption would strand its tokens,
+/// so the planner skips it and mints Base's 16-share shortfall.
+#[tokio::test]
+async fn secondary_chain_redemption_yields_to_a_primary_chain_mint() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(two_chain_trigger_config()).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, Address::random()).await;
+    seed_vault_registry(&pool, Chain::HyperEvm, &symbol, Address::random()).await;
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(20),
+        offchain: float!(40),
+    })
+    .await;
+    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(60)).await;
+    service.check_and_trigger_equity(&symbol).await.unwrap();
+
+    assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
+    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(mint.chain, Chain::Base);
+    assert_eq!(mint.quantity, FractionalShares::new(float!(16)));
+}
+
+/// Base's 24-share redemption outranks HyperEVM's 48-share mint, but
+/// Base's wallet is dry, so the trigger re-plans without Base and the mint
+/// lands on HyperEVM.
+#[tokio::test]
+async fn dry_top_ranked_chain_yields_to_the_funded_next_candidate() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(two_chain_trigger_config()).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, Address::random()).await;
+    seed_vault_registry(&pool, Chain::HyperEvm, &symbol, Address::random()).await;
+    service
+        .set_equity_gas_readiness(BTreeMap::from([
+            (
+                Chain::Base,
+                ConfiguredGasReadiness::Wired(GasReadiness::for_test(
+                    U256::ZERO,
+                    U256::from(1_u64),
+                    U256::MAX,
+                    U256::from(1_u64),
+                )),
+            ),
+            (
+                Chain::HyperEvm,
+                ConfiguredGasReadiness::Wired(GasReadiness::always_ready_for_test()),
+            ),
+        ]))
+        .await;
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(60),
+        offchain: float!(60),
+    })
+    .await;
+    seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(0)).await;
+    service.check_and_trigger_equity(&symbol).await.unwrap();
+
+    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
+    assert_eq!(mint.chain, Chain::HyperEvm);
+    assert_eq!(mint.quantity, FractionalShares::new(float!(48)));
+    assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
+}
+
+/// Base holds 80 of AAPL's 100 shares against a 50% target but may move
+/// only 10 per operation: the first tick redeems 10, and while that leaves
+/// Base over target, the next tick declines it as cooling down instead of
+/// re-firing.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn capped_chain_cools_down_before_it_is_replanned() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(RebalancingServiceConfig {
+        allocation: allocation(&[(Chain::Base, "0.5")], "0", "0.05"),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            chain_config(aapl_equities(Some("10")), Some(rebalancing_enabled_cash())),
+        )]),
+        ..test_trigger_config()
+    })
+    .await;
+    let token = Address::random();
+    seed_vault_registry(&pool, Chain::Base, &symbol, token).await;
+
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(80),
+        offchain: float!(20),
+    })
+    .await;
+    drain_pending_jobs(&service).await.unwrap();
+
+    let redemption = fetch_pending_equity_redemption_job(&apalis_pool).await;
+    assert_eq!(redemption.quantity, FractionalShares::new(float!(10)));
+
+    mark_pending_equity_transfer_jobs_done(&apalis_pool).await;
+    complete_redemption_through_the_reactor(
+        &pool,
+        &service,
+        &redemption.aggregate_id,
+        Chain::Base,
+        &symbol,
+        token,
+        10,
+    )
+    .await;
+    service.check_and_trigger_equity(&symbol).await.unwrap();
+
+    assert_eq!(
+        pending_equity_redemption_job_count(&apalis_pool).await,
+        0,
+        "the remaining excess waits out the cooldown"
+    );
+    assert!(
+        logs_contain("cooling_down"),
+        "the decline must name its reason"
+    );
+}
+
+/// A restart between the mint job's push and its genesis event leaves a
+/// pending job row and no in-memory guard: the restarted service must find
+/// the row and not dispatch a second mint.
+#[tokio::test]
+async fn restart_between_push_and_genesis_event_does_not_double_dispatch() {
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger().await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, Address::random()).await;
+
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(20),
+        offchain: float!(80),
+    })
+    .await;
+    drain_pending_jobs(&service).await.unwrap();
+    assert_eq!(pending_equity_mint_job_count(&apalis_pool).await, 1);
+
+    let restarted = build_trigger_service(&pool, &apalis_pool, &inventory, test_trigger_config());
+    let (position_store, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+        .build(())
+        .await
+        .unwrap();
+    restarted
+        .set_position_authority(
+            position_store,
+            Arc::clone(&position_projection),
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+    restarted.set_last_price_reader(position_projection).await;
+    restarted.check_and_trigger_equity(&symbol).await.unwrap();
+
+    assert_eq!(
+        pending_equity_mint_job_count(&apalis_pool).await,
+        1,
+        "the pending job row is the reservation a restart must honour"
     );
 }
 
@@ -1688,7 +2236,7 @@ async fn mint_api_failure_preserves_requested_intent() {
     .await;
 
     let token = Address::from_slice(&keccak256(symbol.to_string().as_bytes())[..20]);
-    seed_vault_registry(&pool, &symbol, token).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, token).await;
 
     let server = MockServer::start();
     let (_anvil, endpoint, key) = anvil::setup_anvil();
@@ -1762,6 +2310,7 @@ async fn mint_api_failure_preserves_requested_intent() {
             ExecutionThreshold::whole_share(),
         )),
         transfer_services: EquityTransferServices::panicking(),
+        primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -1875,16 +2424,13 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
-        equity: ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        },
+        allocation: test_trigger_config().allocation,
         usdc: Some(ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
-        assets,
+        chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
     };
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
@@ -2012,16 +2558,13 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
-        equity: ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        },
+        allocation: test_trigger_config().allocation,
         usdc: Some(ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
-        assets,
+        chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
     };
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
@@ -2113,23 +2656,23 @@ async fn threshold_config_controls_trigger_sensitivity() {
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
-            equity: ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.4),
-            },
+            allocation: test_trigger_config().allocation,
             usdc: Some(ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.4),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: ChainAssets {
-                equities: ChainEquities::default(),
-                cash: Some(ChainCashAsset {
-                    vault_ids: Vec::new(),
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: None,
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash: Some(ChainCashAsset {
+                        vault_ids: Vec::new(),
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
                 }),
-            },
+            )]),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
@@ -2181,23 +2724,23 @@ async fn threshold_config_controls_trigger_sensitivity() {
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
-            equity: ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.1),
-            },
+            allocation: test_trigger_config().allocation,
             usdc: Some(ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.1),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
-            assets: ChainAssets {
-                equities: ChainEquities::default(),
-                cash: Some(ChainCashAsset {
-                    vault_ids: Vec::new(),
-                    rebalancing: OperationMode::Enabled,
-                    operational_limit: None,
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainRebalancingConfig::for_test(ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash: Some(ChainCashAsset {
+                        vault_ids: Vec::new(),
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
                 }),
-            },
+            )]),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
@@ -2289,7 +2832,7 @@ async fn mint_accepted_sets_offchain_inflight() {
     let token_contract = TestERC20::deploy(&provider).await.unwrap();
     let token_address = *token_contract.address();
 
-    seed_vault_registry(&pool, &symbol, token_address).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, token_address).await;
 
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
@@ -2404,6 +2947,7 @@ async fn mint_accepted_sets_offchain_inflight() {
                     ExecutionThreshold::whole_share(),
                 )),
                 transfer_services: EquityTransferServices::panicking(),
+                primary_chain: Chain::Base,
                 job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
             };
             let _ = Job::perform(&job, &ctx).await;
@@ -2516,7 +3060,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         .unwrap();
     let mint_tx_hash = mint_receipt.transaction_hash;
 
-    seed_vault_registry(&pool, &symbol, token_address).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, token_address).await;
 
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
@@ -2636,6 +3180,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
             ExecutionThreshold::whole_share(),
         )),
         transfer_services: EquityTransferServices::panicking(),
+        primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -2696,7 +3241,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
     .await;
 
     let token_address = Address::random();
-    seed_vault_registry(&pool, &symbol, token_address).await;
+    seed_vault_registry(&pool, Chain::Base, &symbol, token_address).await;
 
     // Build a redemption store wired to the trigger so events flow through
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new().with_send_failure());
@@ -3326,7 +3871,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
             now,
             now,
         )
-        .set_active_mint(symbol.clone(), mint_id.clone());
+        .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
 
     let (sender, _receiver) = broadcast::channel(16);
     let inventory = Arc::new(BroadcastingInventory::new(view, sender));

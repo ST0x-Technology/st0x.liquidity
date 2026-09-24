@@ -13,10 +13,13 @@ use thiserror::Error;
 use url::Url;
 
 use st0x_evm::Chain;
-use st0x_execution::Symbol;
+use st0x_execution::{Positive, Symbol};
+use st0x_finance::Usdc;
 
 use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode};
-use crate::enablement::{ChainEnablementError, ChainLifecycle, check_enablement};
+use crate::enablement::{
+    ChainEnablementError, ChainLifecycle, check_enablement, first_equity_matching,
+};
 
 /// Which block tag to use as the fill-ingestion cutoff.
 ///
@@ -275,6 +278,9 @@ pub struct TradingConfig {
     /// go here. Per chain because a redemption delivers tokens that exist on
     /// one chain, so sending to another chain's issuer address burns them.
     pub redemption_wallet: Option<Address>,
+    /// Overrides `[rebalancing.allocation].min_operation_usd` here: the
+    /// smallest equity transfer worth this chain's gas.
+    pub min_operation_usd: Option<Positive<Usdc>>,
     /// The equities and cash the bot holds on this chain.
     ///
     /// Defaulted rather than required: an absent table and an empty one mean
@@ -392,6 +398,8 @@ pub struct HedgedChain {
     /// Seconds between fill-watch poll cycles on this chain.
     pub order_fill_poll_interval: std::time::Duration,
     pub redemption_wallet: Option<Address>,
+    /// See [`TradingConfig::min_operation_usd`].
+    pub min_operation_usd: Option<Positive<Usdc>>,
     pub assets: ChainAssets,
 }
 
@@ -421,6 +429,7 @@ impl HedgedChain {
         #[builder(default = std::time::Duration::from_secs(1))]
         order_fill_poll_interval: std::time::Duration,
         redemption_wallet: Option<Address>,
+        min_operation_usd: Option<Positive<Usdc>>,
         #[builder(default)] assets: ChainAssets,
     ) -> Self {
         Self {
@@ -435,6 +444,7 @@ impl HedgedChain {
             ingestion_cutoff,
             order_fill_poll_interval,
             redemption_wallet,
+            min_operation_usd,
             assets,
         }
     }
@@ -454,6 +464,7 @@ impl std::fmt::Debug for HedgedChain {
             .field("ingestion_cutoff", &self.ingestion_cutoff)
             .field("order_fill_poll_interval", &self.order_fill_poll_interval)
             .field("redemption_wallet", &self.redemption_wallet)
+            .field("min_operation_usd", &self.min_operation_usd)
             .field("assets", &self.assets)
             .finish()
     }
@@ -486,6 +497,7 @@ impl HedgedChain {
                 trading.order_fill_poll_interval_secs,
             ),
             redemption_wallet: trading.redemption_wallet,
+            min_operation_usd: trading.min_operation_usd,
             assets: trading.assets.clone(),
         })
     }
@@ -572,6 +584,15 @@ pub enum ChainRegistryError {
         chains.iter().map(|chain| chain.as_str()).collect::<Vec<_>>().join(", ")
     )]
     MultiplePrimaryChains { chains: Vec<Chain> },
+    #[error(
+        "[chains.{chain}.trading.assets.equities.{symbol}] sets wrapped_equity_recovery = \
+         \"enabled\", but wrapped-equity recovery runs only on the primary chain ({primary_chain})"
+    )]
+    WrappedEquityRecoveryOnSecondary {
+        chain: Chain,
+        symbol: Symbol,
+        primary_chain: Chain,
+    },
     #[error(transparent)]
     Entry(#[from] ChainConfigError),
     #[error(transparent)]
@@ -670,6 +691,23 @@ fn enabled_chains(
             config.trading.is_some(),
             config.trading.as_ref().map(|trading| &trading.assets),
         )?;
+    }
+
+    // Recovery is wired for the primary chain only; a secondary listing that
+    // enables it would strand a failed mint's tokens with no signal.
+    for (chain, _, trading) in &hedged_chains {
+        if *chain == primary_chain {
+            continue;
+        }
+        if let Some(symbol) = first_equity_matching(&trading.assets, |equity| {
+            equity.wrapped_equity_recovery == OperationMode::Enabled
+        }) {
+            return Err(ChainRegistryError::WrappedEquityRecoveryOnSecondary {
+                chain: *chain,
+                symbol: symbol.clone(),
+                primary_chain,
+            });
+        }
     }
 
     Ok(EnabledChains {
@@ -919,6 +957,8 @@ mod tests {
     use std::collections::HashMap;
 
     use st0x_execution::Symbol;
+    use st0x_finance::Usdc;
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::assets::ChainEquities;
@@ -945,6 +985,7 @@ mod tests {
                         rebalancing: OperationMode::Enabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
+                        target_share: None,
                     },
                 )]),
                 operational_limit: None,
@@ -970,6 +1011,7 @@ mod tests {
             rebalancing,
             wrapped_equity_recovery: OperationMode::Disabled,
             operational_limit: None,
+            target_share: None,
         };
         let assets = ChainAssets {
             equities: ChainEquities {
@@ -1519,6 +1561,40 @@ mod tests {
         );
     }
 
+    /// Wrapped-equity recovery runs only on the primary chain, so a
+    /// secondary listing that enables it is refused at load rather than
+    /// silently left without recovery.
+    #[test]
+    fn registry_rejects_wrapped_equity_recovery_on_a_secondary_chain() {
+        let mut ethereum = primary_trading_config_toml(false);
+        ethereum.assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+        let configs = BTreeMap::from([
+            (Chain::Base, chain_config(Some(trading_config_toml()))),
+            (Chain::Ethereum, chain_config(Some(ethereum))),
+        ]);
+
+        let error =
+            ChainRegistry::new(&configs, secrets_for(&[Chain::Base, Chain::Ethereum])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "[chains.ethereum.trading.assets.equities.AAPL] sets wrapped_equity_recovery = \
+             \"enabled\", but wrapped-equity recovery runs only on the primary chain (base)"
+        );
+    }
+
     #[test]
     fn registry_rejects_a_non_active_primary_chain() {
         for lifecycle in [ChainLifecycle::ObserveOnly, ChainLifecycle::Prefunded] {
@@ -1835,6 +1911,49 @@ mod tests {
         assert!(
             error.to_string().contains("ingestion_cutoff"),
             "expected missing-field error for ingestion_cutoff, got: {error}"
+        );
+    }
+
+    /// A per-chain `min_operation_usd` overrides the global allocation
+    /// minimum and travels to the hedged chain. Optional, so a trading table
+    /// without one keeps parsing.
+    #[test]
+    fn trading_min_operation_usd_override_reaches_the_hedged_chain() {
+        let trading = |extra: &str| -> TradingConfig {
+            toml::from_str(&format!(
+                "orderbook = \"0x1111111111111111111111111111111111111111\"\n\
+                 inventory_mode = \"legacy\"\n\
+                 inventory_adapters = []\n\
+                 vault_owner = \"0x3333333333333333333333333333333333333333\"\n\
+                 deployment_block = 1\n\
+                 order_fill_poll_interval_secs = 1\n\
+                 primary = true\n\
+                 ingestion_cutoff = \"safe\"\n\
+                 {extra}"
+            ))
+            .unwrap()
+        };
+
+        assert!(trading("").min_operation_usd.is_none());
+
+        let config = trading("min_operation_usd = 250");
+        assert!(
+            config
+                .min_operation_usd
+                .unwrap()
+                .inner()
+                .eq(&Usdc::new(float!(250)))
+                .unwrap()
+        );
+
+        let ctx =
+            HedgedChain::new(Chain::Base, &base_chain_config(), &config, dummy_rpc_url()).unwrap();
+        assert!(
+            ctx.min_operation_usd
+                .unwrap()
+                .inner()
+                .eq(&Usdc::new(float!(250)))
+                .unwrap()
         );
     }
 }

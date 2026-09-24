@@ -37,7 +37,7 @@ pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
 pub(crate) use st0x_hedge::mock_api::{RedemptionOutcome, TokenizationRequestType};
 use st0x_hedge::{
-    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, ImbalanceThreshold, OperationMode,
+    AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
 };
 
 pub(crate) use crate::assert::{ExpectedPosition, assert_event_subsequence};
@@ -117,12 +117,12 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     usdc_rebalancing: UsdcRebalancing,
     cash_rebalancing: OperationMode,
     wrapped_equity_recovery: OperationMode,
-    // Equity imbalance threshold. Defaults to the standard (0.5 target, 0.1
-    // deviation). Recovery tests pass a huge deviation to suppress equity
-    // rebalancing transfers (which would churn the wallet/vault and starve a
-    // second recovery) while keeping `rebalancing: Enabled` so the wallet
-    // poller still emits the events that dispatch recovery jobs.
-    equity_imbalance: Option<ImbalanceThreshold>,
+    // Deviation band around Base's 50% equity target. Defaults to 0.1.
+    // Recovery tests pass a huge band to suppress equity rebalancing
+    // transfers (which would churn the wallet/vault and starve a second
+    // recovery) while keeping `rebalancing: Enabled` so the wallet poller
+    // still emits the events that dispatch recovery jobs.
+    equity_band: Option<Float>,
     redemption_wallet: Address,
     /// Base URL of the mock issuance service (`TestInfra::issuance_base_url`) so
     /// the rebalancing freeze guard reaches a reachable, not-frozen endpoint.
@@ -159,6 +159,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
+                    target_share: None,
                 },
             ))
         })
@@ -167,13 +168,14 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> =
         Arc::new(test_wallet(&chain.owner_key, chain.endpoint().parse()?, 1)?);
 
-    let equity_threshold = match equity_imbalance {
-        Some(threshold) => threshold,
-        None => ImbalanceThreshold::new(float!(0.5), float!(0.1))?,
-    };
+    let equity_band = equity_band.unwrap_or_else(|| float!(0.1));
 
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
-        .equity(equity_threshold)
+        .allocation(AllocationCtx::single_chain_test(
+            Chain::Base,
+            float!(0.5),
+            equity_band,
+        )?)
         .usdc(usdc_rebalancing)
         .call();
 
@@ -261,6 +263,7 @@ where
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
+                    target_share: None,
                 },
             ))
         })
@@ -277,7 +280,11 @@ where
     );
 
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(float!(0.5), float!(100))?)
+        .allocation(AllocationCtx::single_chain_test(
+            Chain::Base,
+            float!(0.5),
+            float!(100),
+        )?)
         .usdc(UsdcRebalancing::Enabled {
             target: float!(0.5),
             deviation: float!(0.1),

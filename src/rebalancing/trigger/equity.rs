@@ -6,51 +6,82 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-use alloy::primitives::Address;
-use rain_math_float::{Float, FloatError};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use st0x_event_sorcery::SendError;
-use tracing::{debug, trace, warn};
+use tracing::warn;
 
-use st0x_execution::{FractionalShares, Positive, Symbol};
-use st0x_float_macro::float;
-use st0x_wrapper::{UnderlyingPerWrapped, WrapperError};
+use st0x_event_sorcery::{Projection, ProjectionError, SendError};
+use st0x_execution::Symbol;
+use st0x_wrapper::WrapperError;
 
-use super::{RebalancingService, TokenAddressError, TriggeredOperation};
+use super::allocation::EquityPlanError;
+use super::{RebalancingService, TokenAddressError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
-use crate::inventory::{
-    BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold, Venue,
-};
-use crate::position::Position;
-
-/// Maximum decimal places for Alpaca tokenization API quantities.
-const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
-
-/// Smallest mint worth dispatching. A floored sell leaves the broker book at
-/// exactly the floor and positions carry nine-decimal residue, so anything
-/// smaller than this above the floor is dust, not an imbalance.
-static MINIMUM_MINT_SHARES: LazyLock<FractionalShares> =
-    LazyLock::new(|| FractionalShares::new(float!(0.01)));
+use crate::inventory::EquityVenuesError;
+use crate::position::{Position, PriceObservation};
 
 /// Why an equity trigger failed.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EquityTriggerError {
-    #[error("token not in vault registry: {0}")]
-    TokenNotInRegistry(Symbol),
     #[error("no wrapper is wired for {chain}, so its equity ratios cannot be read")]
     UnwiredWrapper { chain: st0x_evm::Chain },
     #[error(transparent)]
-    Imbalance(#[from] EquityImbalanceError),
+    Venues(#[from] EquityVenuesError),
     #[error(transparent)]
     TokenAddress(#[from] TokenAddressError),
     #[error(transparent)]
     Wrapper(#[from] WrapperError),
-    #[error("Float arithmetic error during truncation: {0}")]
-    Float(#[from] FloatError),
+    #[error(transparent)]
+    Plan(#[from] EquityPlanError),
     #[error("position authority is not wired")]
     PositionAuthorityNotWired,
     #[error(transparent)]
     PositionReservation(#[from] SendError<Position>),
+    #[error("failed to read the symbol's last price: {0}")]
+    LastPrice(#[from] ProjectionError<Position>),
+}
+
+/// Reads a symbol's last onchain fill price, block-timestamped, so the
+/// planner can value the minimum operation size.
+#[async_trait]
+pub(crate) trait LastPriceReader: Send + Sync {
+    async fn last_price(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<PriceObservation>, ProjectionError<Position>>;
+}
+
+#[async_trait]
+impl LastPriceReader for Projection<Position> {
+    async fn last_price(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<PriceObservation>, ProjectionError<Position>> {
+        Ok(self
+            .load(symbol)
+            .await?
+            .and_then(|position| position.last_price))
+    }
+}
+
+/// Test double: every symbol was last priced at the given price just now.
+#[cfg(test)]
+pub(crate) struct StubLastPrice(pub(crate) rain_math_float::Float);
+
+#[cfg(test)]
+#[async_trait]
+impl LastPriceReader for StubLastPrice {
+    async fn last_price(
+        &self,
+        _: &Symbol,
+    ) -> Result<Option<PriceObservation>, ProjectionError<Position>> {
+        let Self(price) = self;
+
+        Ok(Some(PriceObservation {
+            price: *price,
+            observed_at: chrono::Utc::now(),
+        }))
+    }
 }
 
 /// Discriminates why the equity in-progress slot is held.
@@ -436,176 +467,6 @@ pub(crate) fn claim_guard_for_recovery_or_orphan(
     })
 }
 
-/// Checks inventory for equity imbalance and returns the appropriate rebalancing operation.
-///
-/// Returns `Mint` if there's too much offchain equity that needs to be tokenized,
-/// or `Redemption` if there's too much onchain equity that needs to be redeemed.
-///
-/// The onchain (wrapped) amounts are converted to unwrapped-equivalent using
-/// the vault_ratio for accurate imbalance detection.
-pub(super) async fn check_imbalance_and_build_operation(
-    symbol: &Symbol,
-    threshold: &ImbalanceThreshold,
-    inventory: &Arc<BroadcastingInventory>,
-    wrapped_token: Address,
-    unwrapped_token: Address,
-    vault_ratio: &UnderlyingPerWrapped,
-    shares_limit: Option<Positive<FractionalShares>>,
-    hedge_floor: FractionalShares,
-) -> Result<Option<TriggeredOperation>, EquityTriggerError> {
-    // One read for both figures, so the floor is applied to the same
-    // snapshot the imbalance was computed from.
-    let (imbalance, offchain_available) = {
-        let inventory = inventory.read().await;
-        (
-            inventory.check_equity_imbalance(
-                symbol,
-                inventory.primary_chain(),
-                threshold,
-                vault_ratio,
-            )?,
-            inventory.equity_available(symbol, Venue::Hedging),
-        )
-    };
-
-    let Some(imbalance) = imbalance else {
-        trace!(target: "rebalance", %symbol, "No equity imbalance detected (balanced, partial data, or inflight)");
-        return Ok(None);
-    };
-
-    Ok(Some(match imbalance {
-        Imbalance::TooMuchOffchain { excess } => {
-            let Some(offchain_available) = offchain_available else {
-                warn!(
-                    target: "rebalance",
-                    %symbol,
-                    "Skipping mint: imbalance detected but the broker venue is missing from the view"
-                );
-                return Ok(None);
-            };
-            let Some(mintable) =
-                mintable_above_floor(symbol, excess, offchain_available, hedge_floor)?
-            else {
-                return Ok(None);
-            };
-            let quantity = truncate_for_alpaca(symbol, cap_shares(symbol, mintable, shares_limit))?;
-            if quantity.inner().lt(MINIMUM_MINT_SHARES.inner())? {
-                trace!(
-                    target: "rebalance",
-                    %symbol,
-                    %quantity,
-                    "Skipping mint: capped quantity is below the minimum mint size"
-                );
-                return Ok(None);
-            }
-            TriggeredOperation::Mint {
-                symbol: symbol.clone(),
-                quantity,
-            }
-        }
-        Imbalance::TooMuchOnchain { excess } => {
-            let quantity = truncate_for_alpaca(symbol, cap_shares(symbol, excess, shares_limit))?;
-            TriggeredOperation::Redemption {
-                symbol: symbol.clone(),
-                quantity,
-                wrapped_token,
-                unwrapped_token,
-            }
-        }
-    }))
-}
-
-/// Caps a mint so the broker keeps `hedge_floor` shares of the symbol, the
-/// same residual a sell hedge leaves. `None` when the book is the floor or
-/// less: balanced enough, decided here rather than inside the imbalance
-/// ratio so a floor-only book never reads as an imbalance.
-fn mintable_above_floor(
-    symbol: &Symbol,
-    excess: FractionalShares,
-    offchain_available: FractionalShares,
-    hedge_floor: FractionalShares,
-) -> Result<Option<FractionalShares>, FloatError> {
-    let above_floor = (offchain_available - hedge_floor)?;
-
-    if above_floor.inner().lt(MINIMUM_MINT_SHARES.inner())? {
-        trace!(
-            target: "rebalance",
-            %symbol,
-            offchain = %offchain_available,
-            floor = %hedge_floor,
-            "Skipping mint: broker book is at the hedge floor"
-        );
-        return Ok(None);
-    }
-
-    if excess.inner().gt(above_floor.inner())? {
-        debug!(
-            target: "rebalance",
-            %symbol,
-            computed = %excess,
-            floor = %hedge_floor,
-            capped = %above_floor,
-            "Equity mint capped to keep the hedge floor"
-        );
-        return Ok(Some(above_floor));
-    }
-
-    Ok(Some(excess))
-}
-
-fn cap_shares(
-    symbol: &Symbol,
-    quantity: FractionalShares,
-    shares_limit: Option<Positive<FractionalShares>>,
-) -> FractionalShares {
-    let Some(cap) = shares_limit else {
-        return quantity;
-    };
-
-    let cap_value = cap.inner();
-
-    if quantity > cap_value {
-        debug!(
-            target: "rebalance",
-            %symbol,
-            computed = %quantity,
-            limit = %cap_value,
-            "Equity rebalancing shares capped by operational limit"
-        );
-        cap_value
-    } else {
-        quantity
-    }
-}
-
-/// Truncates to the Alpaca API decimal limit, logging a warning when
-/// sub-nanoshare digits are dropped.
-fn truncate_for_alpaca(
-    symbol: &Symbol,
-    quantity: FractionalShares,
-) -> Result<FractionalShares, FloatError> {
-    // Truncate by converting to fixed-point with the target scale,
-    // then back. This drops any digits beyond the scale limit.
-    let (fixed, _lossless) = quantity
-        .inner()
-        .to_fixed_decimal_lossy(ALPACA_QUANTITY_MAX_DECIMAL_PLACES)?;
-    let truncated_value = Float::from_fixed_decimal(fixed, ALPACA_QUANTITY_MAX_DECIMAL_PLACES)?;
-    let truncated = FractionalShares::new(truncated_value);
-
-    if truncated != quantity {
-        debug!(
-            target: "rebalance",
-            %symbol,
-            original = %quantity,
-            truncated = %truncated,
-            "Truncated quantity to {} decimal places for Alpaca API",
-            ALPACA_QUANTITY_MAX_DECIMAL_PLACES
-        );
-    }
-
-    Ok(truncated)
-}
-
 /// Per-symbol equity rebalancing check.
 ///
 /// Carries the symbol to evaluate as the payload; every other
@@ -730,21 +591,9 @@ pub(crate) async fn drain_pending_equity_jobs(
 mod tests {
     use std::num::NonZeroU32;
 
-    use alloy::primitives::{U256, address};
-    use chrono::Utc;
-    use rain_math_float::Float;
-    use tokio::sync::broadcast;
     use tracing_test::traced_test;
 
-    use st0x_dto::Statement;
-    use st0x_evm::Chain;
-    use st0x_execution::FractionalShares;
-    use st0x_float_macro::float;
-    use st0x_wrapper::RATIO_ONE;
-
     use super::*;
-    use crate::inventory::view::Operator;
-    use crate::inventory::{Inventory, InventoryView, TransferOp};
 
     fn make_in_progress() -> Arc<std::sync::RwLock<HashMap<Symbol, GuardState>>> {
         Arc::new(std::sync::RwLock::new(HashMap::new()))
@@ -878,38 +727,6 @@ mod tests {
             map.read().unwrap().get(&symbol),
             Some(&GuardState::HeldForRecovery)
         );
-    }
-
-    fn one_to_one_ratio() -> UnderlyingPerWrapped {
-        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
-    }
-
-    fn shares(quantity: i64) -> FractionalShares {
-        FractionalShares::new(float!(&quantity.to_string()))
-    }
-
-    fn make_imbalanced_view(
-        symbol: &Symbol,
-        onchain: i64,
-        offchain: i64,
-    ) -> Arc<BroadcastingInventory> {
-        let view = InventoryView::default()
-            .with_equity(symbol.clone(), shares(0), shares(0))
-            .update_equity(
-                symbol,
-                Inventory::available(Venue::MarketMaking, Operator::Add, shares(onchain)),
-                Utc::now(),
-            )
-            .unwrap()
-            .update_equity(
-                symbol,
-                Inventory::available(Venue::Hedging, Operator::Add, shares(offchain)),
-                Utc::now(),
-            )
-            .unwrap();
-
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        Arc::new(BroadcastingInventory::new(view, event_sender))
     }
 
     #[test]
@@ -1151,601 +968,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_balanced_inventory_returns_no_imbalance() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let view = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(view, event_sender));
-        let threshold = ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        };
-        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-
-        let result = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            None,
-            FractionalShares::ZERO,
-        )
-        .await;
-
-        assert_eq!(result.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn test_too_much_offchain_returns_mint() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = make_imbalanced_view(&symbol, 20, 80);
-        let threshold = ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        };
-        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-
-        let result = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            None,
-            FractionalShares::ZERO,
-        )
-        .await;
-
-        assert!(matches!(result, Ok(Some(TriggeredOperation::Mint { .. }))));
-    }
-
-    fn fractional_view(
-        symbol: &Symbol,
-        onchain: &str,
-        offchain: &str,
-    ) -> Arc<BroadcastingInventory> {
-        let parse = |value: &str| FractionalShares::new(Float::parse(value.to_string()).unwrap());
-        let view = InventoryView::default()
-            .with_equity(symbol.clone(), shares(0), shares(0))
-            .update_equity(
-                symbol,
-                Inventory::available(Venue::MarketMaking, Operator::Add, parse(onchain)),
-                Utc::now(),
-            )
-            .unwrap()
-            .update_equity(
-                symbol,
-                Inventory::available(Venue::Hedging, Operator::Add, parse(offchain)),
-                Utc::now(),
-            )
-            .unwrap();
-
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        Arc::new(BroadcastingInventory::new(view, event_sender))
-    }
-
-    /// Everything offchain and a target of 95% onchain asks to mint 9.975 of
-    /// 10.5 shares; a one-share floor caps the mint at 9.5.
-    #[tokio::test]
-    async fn mint_stops_at_the_hedge_floor() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = fractional_view(&symbol, "0", "10.5");
-        let threshold = ImbalanceThreshold {
-            target: float!(0.95),
-            deviation: float!(0.01),
-        };
-        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-
-        let result = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            None,
-            FractionalShares::new(float!(1)),
-        )
-        .await
-        .unwrap();
-
-        let Some(TriggeredOperation::Mint { quantity, .. }) = result else {
-            panic!("expected a floored mint, got {result:?}");
-        };
-        assert_eq!(quantity, FractionalShares::new(float!(9.5)));
-    }
-
-    /// A floored sell leaves the book at exactly the floor, and broker
-    /// positions carry nine-decimal residue, so `floor + dust` is the steady
-    /// state. That must not become a dust mint every cycle.
-    #[tokio::test]
-    async fn mint_is_skipped_when_only_dust_sits_above_the_floor() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = fractional_view(&symbol, "0", "1.000000001");
-        let threshold = ImbalanceThreshold {
-            target: float!(0.95),
-            deviation: float!(0.01),
-        };
-        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-
-        let result = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            None,
-            FractionalShares::new(float!(1)),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result, None);
-    }
-
-    /// An operational limit below the minimum mint size must not turn a
-    /// legitimate excess into a dust mint either.
-    #[tokio::test]
-    async fn mint_is_skipped_when_the_operational_limit_leaves_only_dust() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = fractional_view(&symbol, "0", "10.5");
-        let threshold = ImbalanceThreshold {
-            target: float!(0.95),
-            deviation: float!(0.01),
-        };
-        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-        let limit = Positive::new(FractionalShares::new(float!(0.001))).unwrap();
-
-        let result = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            Some(limit),
-            FractionalShares::new(float!(1)),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result, None);
-    }
-
-    /// A book that is nothing but the floor has nothing to mint.
-    #[tokio::test]
-    async fn mint_is_skipped_when_the_book_is_only_the_floor() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = fractional_view(&symbol, "0", "1");
-        let threshold = ImbalanceThreshold {
-            target: float!(0.95),
-            deviation: float!(0.01),
-        };
-        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-
-        let result = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            None,
-            FractionalShares::new(float!(1)),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn test_too_much_onchain_returns_redemption_with_tokens() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wrapped_addr = address!("0x1234567890123456789012345678901234567890");
-        let unwrapped_addr = address!("0xabcdef0123456789abcdef0123456789abcdef01");
-        let inventory = make_imbalanced_view(&symbol, 80, 20);
-        let threshold = ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        };
-        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-
-        let result = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            wrapped_addr,
-            unwrapped_addr,
-            &ratio,
-            None,
-            FractionalShares::ZERO,
-        )
-        .await;
-
-        let Ok(Some(TriggeredOperation::Redemption {
-            wrapped_token,
-            unwrapped_token,
-            ..
-        })) = result
-        else {
-            panic!("Expected Redemption, got {result:?}");
-        };
-        assert_eq!(wrapped_token, wrapped_addr);
-        assert_eq!(unwrapped_token, unwrapped_addr);
-    }
-
-    #[tokio::test]
-    async fn test_high_ratio_triggers_redemption_that_would_be_balanced_at_1_to_1() {
-        // With 65 onchain, 35 offchain at 1:1 ratio:
-        //   65/100 = 65% onchain, within 30%-70% threshold -> balanced
-        //
-        // With 1.5 ratio (vault appreciated 50%):
-        //   65 wrapped = 97.5 underlying-equivalent
-        //   97.5/(97.5+35) = 97.5/132.5 = 73.6% onchain, above 70% -> too much onchain
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = make_imbalanced_view(&symbol, 65, 35);
-        let threshold = ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        };
-
-        // At 1:1 ratio, this is balanced
-        let ratio_1_to_1 = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-        let result_1_to_1 = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio_1_to_1,
-            None,
-            FractionalShares::ZERO,
-        )
-        .await;
-        assert_eq!(result_1_to_1.unwrap(), None);
-
-        // At 1.5 ratio, this triggers redemption
-        let ratio_1_5 =
-            UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
-        let result_1_5 = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio_1_5,
-            None,
-            FractionalShares::ZERO,
-        )
-        .await;
-        assert!(
-            matches!(result_1_5, Ok(Some(TriggeredOperation::Redemption { .. }))),
-            "Expected redemption with 1.5 ratio, got {result_1_5:?}"
-        );
-    }
-
-    fn precise_shares(s: &str) -> FractionalShares {
-        FractionalShares::new(float!(s))
-    }
-
-    fn make_precise_imbalanced_view(
-        symbol: &Symbol,
-        onchain: &str,
-        offchain: &str,
-    ) -> Arc<BroadcastingInventory> {
-        let view = InventoryView::default()
-            .with_equity(symbol.clone(), shares(0), shares(0))
-            .update_equity(
-                symbol,
-                Inventory::available(Venue::MarketMaking, Operator::Add, precise_shares(onchain)),
-                Utc::now(),
-            )
-            .unwrap()
-            .update_equity(
-                symbol,
-                Inventory::available(Venue::Hedging, Operator::Add, precise_shares(offchain)),
-                Utc::now(),
-            )
-            .unwrap();
-
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        Arc::new(BroadcastingInventory::new(view, event_sender))
-    }
-
-    /// Verifies that quantity truncation doesn't lose the truncated portion from inventory.
-    ///
-    /// When we truncate the excess to 9 decimal places for Alpaca,
-    /// the sub-nanoshare digits must remain in inventory and accumulate.
-    #[tokio::test]
-    async fn truncation_preserves_leftover_in_inventory() {
-        let symbol = Symbol::new("RKLB").unwrap();
-
-        // Set up inventory where excess calculation produces high-precision result.
-        // With ~20% onchain, ~80% offchain and 50% target:
-        //
-        // onchain = 6.352444469719724764
-        // offchain = 25.409777878878899058
-        // total = 31.762222348598623822
-        // target_onchain = 31.762222348598623822 * 0.5 = 15.881111174299311911
-        // excess = 15.881111174299311911 - 6.352444469719724764
-        //        = 9.528666704579587147
-        let onchain = "6.352444469719724764";
-        let offchain = "25.409777878878899058";
-
-        let inventory = make_precise_imbalanced_view(&symbol, onchain, offchain);
-        let threshold = ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.1),
-        };
-
-        // Trigger rebalancing - should return Mint with truncated quantity
-        let vault_ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-        let result = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &vault_ratio,
-            None,
-            FractionalShares::ZERO,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        let TriggeredOperation::Mint { quantity, .. } = result else {
-            panic!("Expected Mint, got {result:?}");
-        };
-
-        // Verify the quantity was truncated to 9 decimal places
-        let expected_truncated = precise_shares("9.528666704");
-        assert_eq!(
-            quantity, expected_truncated,
-            "Quantity should be truncated to 9 decimal places"
-        );
-
-        // The original excess had more precision - verify truncation occurred
-        let full_excess = precise_shares("9.528666704579587147");
-        assert_ne!(
-            quantity, full_excess,
-            "Quantity should differ from full-precision excess"
-        );
-
-        // Now simulate the mint completing with the TRUNCATED quantity.
-        // The inventory should be updated with only the truncated amount.
-        let mut view = inventory.write().await;
-
-        // MintAccepted: move truncated quantity from offchain.available to offchain.inflight
-        *view = view
-            .clone()
-            .update_equity(
-                &symbol,
-                Inventory::transfer(Venue::Hedging, TransferOp::Start, quantity),
-                Utc::now(),
-            )
-            .unwrap();
-
-        // TokensReceived: move from offchain.inflight to onchain.available
-        *view = view
-            .clone()
-            .update_equity(
-                &symbol,
-                Inventory::transfer(Venue::Hedging, TransferOp::Complete, quantity),
-                Utc::now(),
-            )
-            .unwrap();
-
-        drop(view);
-
-        // After the mint, check the remaining imbalance.
-        // The leftover (0.000000000579587147) should still be there.
-        let remaining_imbalance = {
-            let view = inventory.read().await;
-            view.check_equity_imbalance(&symbol, Chain::Base, &threshold, &one_to_one_ratio())
-        };
-
-        // The leftover is tiny, so it won't exceed the deviation threshold alone.
-        // But it IS still there in the inventory - not lost.
-        // With target 50% and deviation 10%, the bounds are 40%-60%.
-        // After minting 9.528666704:
-        // - new onchain = 6.352444469719724764 + 9.528666704 = 15.881111173719724764
-        // - new offchain = 25.409777878878899058 - 9.528666704 = 15.881111174878899058
-        // - new total = 31.762222348598623822
-        // - new ratio = 15.881111173719724764 / 31.762222348598623822 ~= 0.49999999998...
-        //
-        // This is within the 40%-60% threshold, so no imbalance is detected.
-        // But the LEFTOVER (the sub-9-decimal precision) is preserved in the totals.
-        assert!(
-            remaining_imbalance.unwrap().is_none(),
-            "After minting truncated amount, small leftover shouldn't trigger (within threshold)"
-        );
-    }
-
-    /// Verifies that truncated leftovers accumulate and eventually get included.
-    #[tokio::test]
-    async fn truncated_leftovers_accumulate_over_multiple_operations() {
-        let symbol = Symbol::new("RKLB").unwrap();
-
-        // Start with an imbalance that produces a high-precision excess
-        let inventory = make_precise_imbalanced_view(
-            &symbol,
-            "10.123456789123456789", // onchain
-            "89.876543210876543211", // offchain (much more)
-        );
-
-        // Target 50%, deviation 10% -> triggers when outside 40%-60%
-        // Current ratio = 10.12... / 100 = ~10.12%, well below 40%
-        let threshold = ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.1),
-        };
-        let vault_ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
-
-        // First trigger
-        let result1 = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &vault_ratio,
-            None,
-            FractionalShares::ZERO,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        let TriggeredOperation::Mint { quantity: qty1, .. } = result1 else {
-            panic!("Expected Mint");
-        };
-
-        // Verify it's truncated to at most 9 decimal places.
-        // A lossless roundtrip through to_fixed_decimal(9) confirms no excess precision.
-        let (fixed, lossless) = qty1.inner().to_fixed_decimal_lossy(9).unwrap();
-        assert!(
-            lossless,
-            "First mint quantity should have at most 9 decimal places after truncation, \
-             but to_fixed_decimal(9) was lossy for {qty1}"
-        );
-        let roundtripped = Float::from_fixed_decimal(fixed, 9).unwrap();
-        assert!(
-            qty1.inner().eq(roundtripped).unwrap(),
-            "First mint quantity should survive 9-dp roundtrip"
-        );
-
-        // Simulate mint completing
-        {
-            let mut view = inventory.write().await;
-            *view = view
-                .clone()
-                .update_equity(
-                    &symbol,
-                    Inventory::transfer(Venue::Hedging, TransferOp::Start, qty1),
-                    Utc::now(),
-                )
-                .unwrap();
-            *view = view
-                .clone()
-                .update_equity(
-                    &symbol,
-                    Inventory::transfer(Venue::Hedging, TransferOp::Complete, qty1),
-                    Utc::now(),
-                )
-                .unwrap();
-        }
-
-        // Add more offchain shares to create another imbalance.
-        // Need to add enough to push ratio outside 40%-60% threshold.
-        // After first mint, ratio is ~50%. Adding 100 more offchain shares
-        // changes total to ~200, with offchain ~150, onchain ~50, ratio ~25%.
-        {
-            let mut view = inventory.write().await;
-            *view = view
-                .clone()
-                .update_equity(
-                    &symbol,
-                    Inventory::available(
-                        Venue::Hedging,
-                        Operator::Add,
-                        precise_shares("100.0000000001"),
-                    ),
-                    Utc::now(),
-                )
-                .unwrap();
-        }
-
-        // Second trigger - the leftover from first truncation plus new imbalance
-        let result2 = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &vault_ratio,
-            None,
-            FractionalShares::ZERO,
-        )
-        .await;
-
-        // Should trigger again (we added significant new imbalance)
-        let TriggeredOperation::Mint { quantity: qty2, .. } = result2.unwrap().unwrap() else {
-            panic!("Expected Mint after adding more offchain shares");
-        };
-
-        // The second quantity includes accumulated leftovers from previous truncation
-        // plus the new imbalance. We can't easily calculate the exact expected value,
-        // but we verify the system continues to work and produce truncated quantities.
-        assert!(
-            qty2.inner().gt(Float::zero().unwrap()).unwrap(),
-            "Second mint should have positive quantity"
-        );
-        let (_fixed2, lossless2) = qty2.inner().to_fixed_decimal_lossy(9).unwrap();
-        assert!(
-            lossless2,
-            "Second mint quantity should be truncated to at most 9 decimal places"
-        );
-    }
-
-    #[test]
-    fn truncate_for_alpaca_truncates_excess_precision() {
-        let symbol = Symbol::new("TEST").unwrap();
-        let original = precise_shares("1.12345678901234567890");
-        let truncated = truncate_for_alpaca(&symbol, original).unwrap();
-
-        assert!(truncated.inner().eq(float!(1.123456789)).unwrap());
-    }
-
-    #[test]
-    fn truncate_for_alpaca_preserves_value_within_limit() {
-        let symbol = Symbol::new("TEST").unwrap();
-        let original = precise_shares("1.123");
-        let result = truncate_for_alpaca(&symbol, original).unwrap();
-
-        assert_eq!(result, original);
-    }
-
-    #[test]
-    fn cap_shares_returns_input_when_no_limit() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let amount = shares(123);
-        assert_eq!(cap_shares(&symbol, amount, None), amount);
-    }
-
-    #[test]
-    fn cap_shares_returns_input_when_below_limit() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let amount = shares(10);
-        let limit = Some(Positive::new(shares(50)).unwrap());
-        assert_eq!(cap_shares(&symbol, amount, limit), amount);
-    }
-
-    #[test]
-    fn cap_shares_returns_input_when_equal_to_limit() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let amount = shares(50);
-        let limit = Some(Positive::new(shares(50)).unwrap());
-        assert_eq!(cap_shares(&symbol, amount, limit), amount);
-    }
-
-    #[test]
-    fn cap_shares_returns_limit_when_above_limit() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let amount = shares(100);
-        let limit_value = shares(50);
-        assert_eq!(
-            cap_shares(&symbol, amount, Some(Positive::new(limit_value).unwrap())),
-            limit_value
-        );
-    }
-
     #[test]
     fn equity_rebalancing_check_label_includes_symbol() {
         let job = EquityRebalancingCheck {
@@ -1805,120 +1027,5 @@ mod tests {
         scheduler.enqueue_check(symbol).await;
 
         assert_eq!(count_pending_equity_check_jobs(&apalis_pool).await, 1);
-    }
-
-    #[tokio::test]
-    async fn operational_limits_cap_equity_shares() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = make_imbalanced_view(&symbol, 80, 20);
-        let threshold = ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        };
-        let ratio = one_to_one_ratio();
-        let shares_limit = Some(Positive::new(FractionalShares::new(float!(10))).unwrap());
-
-        let result = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            shares_limit,
-            FractionalShares::ZERO,
-        )
-        .await;
-
-        let Ok(Some(TriggeredOperation::Redemption { quantity, .. })) = result else {
-            panic!("Expected Redemption, got {result:?}");
-        };
-        assert_eq!(
-            quantity,
-            FractionalShares::new(float!(10)),
-            "Operational limit should cap redemption to 10 shares, got {quantity}"
-        );
-    }
-
-    #[tokio::test]
-    async fn capped_equity_rebalancing_leaves_remaining_imbalance_triggerable() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let threshold = ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        };
-        let ratio = one_to_one_ratio();
-        let shares_limit = Some(Positive::new(FractionalShares::new(float!(10))).unwrap());
-
-        // 80 onchain / 20 offchain -> 80% onchain, above 70% -> excess ~30
-        let inventory = make_imbalanced_view(&symbol, 80, 20);
-
-        let first = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            shares_limit,
-            FractionalShares::ZERO,
-        )
-        .await;
-
-        let Ok(Some(TriggeredOperation::Redemption {
-            quantity: first_qty,
-            ..
-        })) = first
-        else {
-            panic!("Expected first Redemption, got {first:?}");
-        };
-        assert_eq!(first_qty, FractionalShares::new(float!(10)));
-
-        // After redeeming 10: 70 onchain / 30 offchain -> 70% onchain, still at boundary
-        let inventory_after = make_imbalanced_view(&symbol, 70, 30);
-
-        let second = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &inventory_after,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            shares_limit,
-            FractionalShares::ZERO,
-        )
-        .await;
-
-        // 70% is right at the boundary (target 50% + deviation 20% = 70%)
-        // so no further trigger expected
-        assert_eq!(second.unwrap(), None, "At boundary, no further trigger");
-
-        // But if we only redeemed 5 (69 onchain / 31 offchain), still above
-        let still_imbalanced = make_imbalanced_view(&symbol, 75, 25);
-
-        let third = check_imbalance_and_build_operation(
-            &symbol,
-            &threshold,
-            &still_imbalanced,
-            Address::ZERO,
-            Address::ZERO,
-            &ratio,
-            shares_limit,
-            FractionalShares::ZERO,
-        )
-        .await;
-
-        let Ok(Some(TriggeredOperation::Redemption {
-            quantity: third_qty,
-            ..
-        })) = third
-        else {
-            panic!("Expected third Redemption, got {third:?}");
-        };
-        assert_eq!(
-            third_qty,
-            FractionalShares::new(float!(10)),
-            "Remaining imbalance triggers another capped operation"
-        );
     }
 }

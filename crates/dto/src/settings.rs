@@ -9,7 +9,9 @@ use st0x_finance::{Symbol, Usd};
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
-    pub equity_target: f64,
+    /// The primary chain's chain-level default target share; absent when
+    /// only per-symbol overrides are configured.
+    pub equity_target: Option<f64>,
     pub equity_deviation: f64,
     pub usdc_target: Option<f64>,
     pub usdc_deviation: Option<f64>,

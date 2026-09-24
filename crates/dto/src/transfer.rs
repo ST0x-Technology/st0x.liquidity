@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn transfer_operation_equity_mint_serializes_with_kind_tag() {
         let operation = TransferOperation::EquityMint(EquityMintOperation {
-            id: Id::new("mint-001"),
+            id: Id::new("mint-001").unwrap(),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             status: EquityMintStatus::Minting,
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn transfer_operation_usdc_bridge_serializes_with_kind_tag() {
         let operation = TransferOperation::UsdcBridge(UsdcBridgeOperation {
-            id: Id::new("bridge-001"),
+            id: Id::new("bridge-001").unwrap(),
             direction: UsdcBridgeDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             status: UsdcBridgeStatus::Completed {
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn usdc_bridge_failed_serializes_post_burn_flag() {
         let post_burn = TransferOperation::UsdcBridge(UsdcBridgeOperation {
-            id: Id::new("bridge-001"),
+            id: Id::new("bridge-001").unwrap(),
             direction: UsdcBridgeDirection::BaseToAlpaca,
             amount: Usdc::new(float!(1000)),
             status: UsdcBridgeStatus::Failed {
@@ -340,7 +340,7 @@ mod tests {
         assert!(serialized["status"]["failedAt"].is_string());
 
         let pre_burn = TransferOperation::UsdcBridge(UsdcBridgeOperation {
-            id: Id::new("bridge-002"),
+            id: Id::new("bridge-002").unwrap(),
             direction: UsdcBridgeDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             status: UsdcBridgeStatus::Failed {
@@ -359,7 +359,7 @@ mod tests {
 
     fn mint_operation(status: EquityMintStatus, updated_at: DateTime<Utc>) -> TransferOperation {
         TransferOperation::EquityMint(EquityMintOperation {
-            id: Id::new("mint-001"),
+            id: Id::new("mint-001").unwrap(),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             status,
@@ -373,7 +373,7 @@ mod tests {
         updated_at: DateTime<Utc>,
     ) -> TransferOperation {
         TransferOperation::EquityRedemption(EquityRedemptionOperation {
-            id: Id::new("redeem-001"),
+            id: Id::new("redeem-001").unwrap(),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             status,
@@ -384,7 +384,7 @@ mod tests {
 
     fn bridge_operation(status: UsdcBridgeStatus, updated_at: DateTime<Utc>) -> TransferOperation {
         TransferOperation::UsdcBridge(UsdcBridgeOperation {
-            id: Id::new("bridge-001"),
+            id: Id::new("bridge-001").unwrap(),
             direction: UsdcBridgeDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             status,
@@ -503,7 +503,7 @@ mod tests {
     fn equity_mint_reconciled_serializes_correctly() {
         let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let operation = TransferOperation::EquityMint(EquityMintOperation {
-            id: Id::new("mint-001"),
+            id: Id::new("mint-001").unwrap(),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
             status: EquityMintStatus::Reconciled {
@@ -532,7 +532,7 @@ mod tests {
     fn equity_redemption_reconciled_serializes_correctly() {
         let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let operation = TransferOperation::EquityRedemption(EquityRedemptionOperation {
-            id: Id::new("redeem-001"),
+            id: Id::new("redeem-001").unwrap(),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(50)),
             status: EquityRedemptionStatus::Reconciled {
@@ -561,7 +561,7 @@ mod tests {
     fn usdc_bridge_reconciled_serializes_correctly() {
         let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let operation = TransferOperation::UsdcBridge(UsdcBridgeOperation {
-            id: Id::new("bridge-001"),
+            id: Id::new("bridge-001").unwrap(),
             direction: UsdcBridgeDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             status: UsdcBridgeStatus::Reconciled {
@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn transfer_warning_lifecycle_failure_serializes_with_kind_and_id() {
         let warning = TransferWarning::MintLifecycleFailed {
-            id: Id::new("mint-001"),
+            id: Id::new("mint-001").unwrap(),
         };
 
         let serialized = serde_json::to_value(&warning).expect("serialization should succeed");
