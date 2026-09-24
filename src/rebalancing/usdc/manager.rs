@@ -6836,6 +6836,8 @@ mod tests {
     use serde_json::json;
     use sqlx::SqlitePool;
     use std::str::FromStr;
+    #[cfg(feature = "test-support")]
+    use std::sync::LazyLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;
@@ -8015,7 +8017,7 @@ mod tests {
             ethereum_required_confirmations: Some(3),
             reserved_cash: None,
             #[cfg(feature = "test-support")]
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            circle_api_base: test_circle_fee_api_base(),
             #[cfg(feature = "test-support")]
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             #[cfg(feature = "test-support")]
@@ -8383,6 +8385,23 @@ mod tests {
         RawPrivateKeyWallet::new(private_key, base_provider, 1).unwrap()
     }
 
+    #[cfg(feature = "test-support")]
+    fn test_circle_fee_api_base() -> String {
+        static SERVER: LazyLock<MockServer> = LazyLock::new(|| {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(GET).path_includes("/v2/burn/USDC/fees/");
+                then.status(200).json_body(json!([
+                    {"finalityThreshold": 1000, "minimumFee": 1},
+                    {"finalityThreshold": 2000, "minimumFee": 0}
+                ]));
+            });
+            server
+        });
+
+        SERVER.base_url()
+    }
+
     fn create_test_onchain_services<Signer: Wallet + Clone>(
         wallet: Signer,
     ) -> (CctpBridge<Signer, Signer>, RaindexService<Signer>) {
@@ -8391,7 +8410,7 @@ mod tests {
             ethereum_wallet: wallet.clone(),
             base_wallet: wallet.clone(),
             #[cfg(feature = "test-support")]
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+            circle_api_base: test_circle_fee_api_base(),
             #[cfg(feature = "test-support")]
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             #[cfg(feature = "test-support")]
@@ -22219,7 +22238,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -24642,7 +24661,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -25032,7 +25051,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -25165,7 +25184,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -25407,7 +25426,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -25615,7 +25634,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -25863,7 +25882,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -26002,7 +26021,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -26168,7 +26187,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })
@@ -26380,7 +26399,7 @@ mod tests {
                 corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
                 ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
                 base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                circle_api_base: test_circle_fee_api_base(),
                 token_messenger: chains.token_messenger,
                 message_transmitter: chains.message_transmitter,
             })

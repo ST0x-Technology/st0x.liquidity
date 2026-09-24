@@ -985,7 +985,7 @@ mod tests {
             .run()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn non_essential_supervisor_keeps_restarting_after_panics() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let supervisor = non_escalating_supervisor_builder()
@@ -1002,7 +1002,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while attempts.load(Ordering::SeqCst) < 7 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await

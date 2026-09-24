@@ -9,17 +9,15 @@ mod alpaca;
 mod bindings;
 
 #[cfg(feature = "mock")]
-pub mod mock_api;
+pub mod mock_api {
+    pub use st0x_alpaca::tokenization_mock::*;
+}
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use std::fmt::Display;
-use std::str::FromStr;
-use uuid::Uuid;
 
 use st0x_evm::EvmError;
 use st0x_execution::{Backpressure, FractionalShares, Symbol};
@@ -30,183 +28,23 @@ pub use alpaca::{
     TokenizationRequestStatus, TokenizationRequestType,
 };
 
-/// Our internal tracking id for a tokenized equity mint, chosen at enqueue time.
-///
-/// A UUID so invalid ids are unrepresentable and apalis/CLI retries always
-/// target the same aggregate.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct IssuerRequestId(pub Uuid);
+pub use st0x_alpaca::tokenization::{
+    ClientRequestId, ClientRequestIdError, IssuerRequestId, TokenizationRequestId,
+    TokenizationRequestIdError,
+};
 
-impl IssuerRequestId {
-    pub fn generate() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Display for IssuerRequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl FromStr for IssuerRequestId {
-    type Err = uuid::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(value)?))
-    }
-}
-
-/// Client-supplied correlation label returned by the tokenization provider.
-///
-/// This wire type is intentionally wider than our UUID-backed
-/// [`IssuerRequestId`], because provider history can contain labels created by
-/// other clients.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
-#[serde(transparent)]
-pub struct ClientRequestId(String);
-
-/// Error parsing a [`ClientRequestId`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ClientRequestIdError {
-    #[error("client request id must be non-empty")]
-    Empty,
-    #[error("client request id exceeds 128 characters")]
-    TooLong,
-    #[error("client request id must contain only printable ASCII characters")]
-    NonPrintableAscii,
-    #[error("client request id must not have leading or trailing whitespace")]
-    SurroundingWhitespace,
-}
-
-impl ClientRequestId {
-    pub fn try_new(value: impl AsRef<str>) -> Result<Self, ClientRequestIdError> {
-        let value = value.as_ref();
-        if value.is_empty() {
-            return Err(ClientRequestIdError::Empty);
-        }
-        if value.len() > 128 {
-            return Err(ClientRequestIdError::TooLong);
-        }
-        if !value.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
-            return Err(ClientRequestIdError::NonPrintableAscii);
-        }
-        if value.starts_with(char::is_whitespace) || value.ends_with(char::is_whitespace) {
-            return Err(ClientRequestIdError::SurroundingWhitespace);
-        }
-
-        Ok(Self(value.to_owned()))
-    }
-}
-
-impl From<&IssuerRequestId> for ClientRequestId {
-    fn from(value: &IssuerRequestId) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl AsRef<str> for ClientRequestId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Display for ClientRequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ClientRequestId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::try_new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Deterministic issuer request id for tests. Maps a human-readable label to a
-/// UUID v5 so test aggregate ids stay valid [`IssuerRequestId`] values.
 #[cfg(any(test, feature = "test-support"))]
-pub fn issuer_request_id(label: &str) -> IssuerRequestId {
-    IssuerRequestId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
-}
-
-/// Alpaca tokenization request identifier used to track the mint operation through their API.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
-#[serde(transparent)]
-pub struct TokenizationRequestId(String);
-
-/// Error parsing a [`TokenizationRequestId`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum TokenizationRequestIdError {
-    #[error("tokenization request id must be non-empty")]
-    Empty,
-}
-
-impl TokenizationRequestId {
-    /// Parses a provider-issued tokenization request id.
-    pub fn try_new(value: impl AsRef<str>) -> Result<Self, TokenizationRequestIdError> {
-        let value = value.as_ref();
-        if value.is_empty() {
-            return Err(TokenizationRequestIdError::Empty);
-        }
-        Ok(Self(value.to_owned()))
-    }
-}
-
-impl TryFrom<String> for TokenizationRequestId {
-    type Error = TokenizationRequestIdError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::try_new(value)
-    }
-}
-
-impl FromStr for TokenizationRequestId {
-    type Err = TokenizationRequestIdError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::try_new(value)
-    }
-}
-
-impl std::fmt::Display for TokenizationRequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl AsRef<str> for TokenizationRequestId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for TokenizationRequestId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::try_new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Deterministic tokenization request id for tests.
-#[cfg(any(test, feature = "test-support"))]
-pub fn tokenization_request_id(label: &str) -> TokenizationRequestId {
-    TokenizationRequestId::try_new(label)
-        .unwrap_or_else(|_| unreachable!("test tokenization request id must be non-empty"))
-}
+pub use st0x_alpaca::tokenization::{issuer_request_id, tokenization_request_id};
 
 /// Error type for Tokenizer operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TokenizerError {
     #[error(transparent)]
     Alpaca(#[from] AlpacaTokenizationError),
+    #[error("EVM error: {0}")]
+    Evm(#[from] EvmError),
+    #[error("Redemption wallet not configured -- required for redemption operations")]
+    MissingRedemptionWallet,
     #[error(transparent)]
     MintVerification(#[from] MintVerificationError),
 }
@@ -218,7 +56,7 @@ impl TokenizerError {
     pub fn is_definitive_mint_rejection(&self) -> bool {
         match self {
             Self::Alpaca(source) => source.is_definitive_mint_rejection(),
-            Self::MintVerification(_) => false,
+            Self::Evm(_) | Self::MissingRedemptionWallet | Self::MintVerification(_) => false,
         }
     }
 
@@ -237,7 +75,7 @@ impl TokenizerError {
     pub fn backpressure(&self) -> Option<Backpressure> {
         match self {
             Self::Alpaca(source) => source.backpressure(),
-            Self::MintVerification(_) => None,
+            Self::Evm(_) | Self::MissingRedemptionWallet | Self::MintVerification(_) => None,
         }
     }
 }
