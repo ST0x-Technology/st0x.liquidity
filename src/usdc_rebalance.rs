@@ -2502,6 +2502,8 @@ impl EventSourced for UsdcRebalance {
                 retry_deadline_at: *retry_deadline_at,
             },
 
+            // A fresh mint, or a deposit send cleared after failing before
+            // broadcast: `Bridged` with no send started.
             (
                 Bridged {
                     mint_tx_hash,
@@ -2514,6 +2516,20 @@ impl EventSourced for UsdcRebalance {
                     amount,
                     burn_tx_hash,
                     initiated_at,
+                    ..
+                },
+            )
+            | (
+                DepositSendAborted { .. },
+                Self::Bridged {
+                    direction,
+                    amount,
+                    amount_received,
+                    fee_collected,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    minted_at,
                     ..
                 },
             ) => Self::Bridged {
@@ -2655,31 +2671,6 @@ impl EventSourced for UsdcRebalance {
                 initiated_at: *initiated_at,
                 minted_at: *minted_at,
                 deposit_send: DepositSend::Recorded { send_tx: *send_tx },
-            },
-
-            (
-                DepositSendAborted { .. },
-                Self::Bridged {
-                    direction,
-                    amount,
-                    amount_received,
-                    fee_collected,
-                    burn_tx_hash,
-                    mint_tx_hash,
-                    initiated_at,
-                    minted_at,
-                    ..
-                },
-            ) => Self::Bridged {
-                direction: *direction,
-                amount: *amount,
-                amount_received: *amount_received,
-                fee_collected: *fee_collected,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
-                initiated_at: *initiated_at,
-                minted_at: *minted_at,
-                deposit_send: DepositSend::NotStarted,
             },
 
             (

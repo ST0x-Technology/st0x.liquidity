@@ -975,11 +975,11 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
         | UsdcRebalanceEvent::BridgingFailed { failed_at, .. }
         | UsdcRebalanceEvent::DepositFailed { failed_at, .. } => *failed_at,
         UsdcRebalanceEvent::WithdrawalSubmitting { submitting_at, .. }
-        | UsdcRebalanceEvent::BridgingSubmitting { submitting_at, .. } => *submitting_at,
+        | UsdcRebalanceEvent::BridgingSubmitting { submitting_at, .. }
+        | UsdcRebalanceEvent::DepositSendSubmitting { submitting_at } => *submitting_at,
         UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at, .. } => *confirmed_at,
         UsdcRebalanceEvent::PendingBurnRecorded { recorded_at, .. }
         | UsdcRebalanceEvent::PendingDepositRecorded { recorded_at, .. } => *recorded_at,
-        UsdcRebalanceEvent::DepositSendSubmitting { submitting_at } => *submitting_at,
         UsdcRebalanceEvent::DepositSendAborted { aborted_at } => *aborted_at,
         UsdcRebalanceEvent::DepositSendAttached { attached_at, .. } => *attached_at,
         UsdcRebalanceEvent::PendingBurnCleared { cleared_at } => *cleared_at,
