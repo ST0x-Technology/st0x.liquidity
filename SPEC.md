@@ -4305,11 +4305,15 @@ Alpaca to Base:
      hash: Complete without a hash is treated like an inconclusive poll (stays
      `Withdrawing`, delayed redrive, the same 4-hour operator alert). The wait
      is bounded by the settlement retry deadline, counted from
-     `Withdrawing.initiated_at`. Past it, the bot confirms the withdrawal with
-     no hash and emits `FailBridging` (a pre-burn `BridgingFailed` that
-     `transfer reconcile` settles, since the funds left Alpaca). This stops the
-     redrive and pages the operator (`WithdrawalTxMissing`); the guard is
-     released when `transfer reconcile --kind usdc` settles the transfer.
+     `Withdrawing.initiated_at`. A Complete without a hash seen past the
+     deadline (for example, Alpaca held the withdrawal Pending that long) first
+     gets a grace: the bot re-reads the transfer for the hash for one Alpaca
+     polling timeout (30 minutes). If the hash is still missing, the bot
+     confirms the withdrawal with no hash and emits `FailBridging` (a pre-burn
+     `BridgingFailed` that `transfer reconcile` settles, since the funds left
+     Alpaca). This stops the redrive and pages the operator
+     (`WithdrawalTxMissing`); the guard is released when
+     `transfer reconcile --kind usdc` settles the transfer.
    - **Settlement gate (before proceeding):** wait for the withdrawal tx to
      reach the required confirmations on Ethereum. Alpaca marks a withdrawal
      "Complete" before the on-chain tx is settled network-wide on load-balanced

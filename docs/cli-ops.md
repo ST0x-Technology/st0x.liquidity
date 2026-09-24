@@ -512,12 +512,13 @@ the guard remains held. The `--direction` must be `to-raindex` for AlpacaToBase.
 delivered its USDC, so a Complete withdrawal whose `tx_hash` is still null is
 also inconclusive and re-polled (same 4-hour alert). The wait is bounded by
 `[rebalancing] settlement_retry_deadline_secs`, counted from
-`Withdrawing.initiated_at`. Past it, the bot fails the bridge (`BridgingFailed`,
-no burn), stops re-polling, and pages with "has no recorded withdrawal tx hash".
-The USDC is then in the Ethereum wallet but not credited to any transfer. Like
-every AlpacaToBase `BridgingFailed`, the guard stays held until
-`transfer reconcile --kind usdc` settles the transfer (see "Reconciling Stuck
-Failed Transfers" below): find the withdrawal tx on Etherscan (the Alpaca
+`Withdrawing.initiated_at`. Past it, the bot re-reads the transfer for the hash
+for up to 30 minutes (the Alpaca polling timeout), then fails the bridge
+(`BridgingFailed`, no burn), stops re-polling, and pages with "has no recorded
+withdrawal tx hash". The USDC is then in the Ethereum wallet but not credited to
+any transfer. Like every AlpacaToBase `BridgingFailed`, the guard stays held
+until `transfer reconcile --kind usdc` settles the transfer (see "Reconciling
+Stuck Failed Transfers" below): find the withdrawal tx on Etherscan (the Alpaca
 transfer UUID is in the log), move the funds by hand, then reconcile.
 
 **Known limitation -- permanent `TransferNotFound`**: if `transfer resume`

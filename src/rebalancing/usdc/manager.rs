@@ -2469,29 +2469,12 @@ impl<
         // re-poll the same transfer id until the hash is present, but only up
         // to the settlement deadline: a hash that never arrives would hold the
         // cash guard forever.
-        let Some(withdrawal_tx) = transfer.tx else {
-            let deadline_elapsed = (Utc::now() - initiated_at)
-                .to_std()
-                .is_ok_and(|elapsed| elapsed >= self.settlement_retry_deadline);
-            if deadline_elapsed {
-                return self
-                    .fail_completed_withdrawal_without_tx(id, transfer_id, initiated_at)
-                    .await;
+        let withdrawal_tx = match transfer.tx {
+            Some(withdrawal_tx) => withdrawal_tx,
+            None => {
+                self.await_completed_withdrawal_tx(id, transfer_id, initiated_at)
+                    .await?
             }
-
-            warn!(
-                target: "rebalance",
-                %id, %transfer_id,
-                "Alpaca withdrawal is complete but reports no tx hash yet; keeping \
-                 Withdrawing state for delayed redrive"
-            );
-            return Err(UsdcTransferError::WithdrawalPollInconclusive {
-                id: id.clone(),
-                initiated_at,
-                source: AlpacaWalletError::CompletedTransferMissingTx {
-                    transfer_id: *transfer_id,
-                },
-            });
         };
 
         // Advance the aggregate to WithdrawalComplete NOW, before the on-chain
@@ -2573,6 +2556,57 @@ impl<
         }
 
         Ok(withdrawal_tx)
+    }
+
+    /// Alpaca reported the withdrawal Complete with no tx hash. Before the
+    /// settlement deadline this is inconclusive (delayed redrive). The
+    /// deadline counts from `initiated_at`, so a withdrawal Alpaca held
+    /// Pending past it can be first seen Complete after it: the hash then gets
+    /// one Alpaca polling timeout of grace before the transfer fails.
+    async fn await_completed_withdrawal_tx(
+        &self,
+        id: &UsdcRebalanceId,
+        transfer_id: &AlpacaTransferId,
+        initiated_at: DateTime<Utc>,
+    ) -> Result<TxHash, UsdcTransferError> {
+        let deadline_elapsed = (Utc::now() - initiated_at)
+            .to_std()
+            .is_ok_and(|elapsed| elapsed >= self.settlement_retry_deadline);
+
+        if !deadline_elapsed {
+            warn!(
+                target: "rebalance",
+                %id, %transfer_id,
+                "Alpaca withdrawal is complete but reports no tx hash yet; keeping \
+                 Withdrawing state for delayed redrive"
+            );
+            return Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id: id.clone(),
+                initiated_at,
+                source: AlpacaWalletError::CompletedTransferMissingTx {
+                    transfer_id: *transfer_id,
+                },
+            });
+        }
+
+        warn!(
+            target: "rebalance",
+            %id, %transfer_id,
+            "Alpaca withdrawal is complete with no tx hash past the settlement deadline; \
+             waiting a grace for the hash before failing"
+        );
+        match self.alpaca_wallet.poll_transfer_tx_hash(transfer_id).await {
+            Ok(withdrawal_tx) => Ok(withdrawal_tx),
+            Err(AlpacaWalletError::TransferTimeout { .. }) => {
+                self.fail_completed_withdrawal_without_tx(id, transfer_id, initiated_at)
+                    .await
+            }
+            Err(error) => Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id: id.clone(),
+                initiated_at,
+                source: error,
+            }),
+        }
     }
 
     /// Alpaca reported the withdrawal Complete but never its tx hash within
@@ -15351,8 +15385,13 @@ mod tests {
         let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
 
         let server = MockServer::start();
-        let (manager, cqrs) =
-            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+        let (manager, cqrs) = build_manager_with_ethereum_chain_and_alpaca_wallet(
+            &chain,
+            &server,
+            market_maker_wallet,
+            create_short_poll_wallet_service(&server),
+        )
+        .await;
 
         let transfer_uuid = Uuid::new_v4();
         let _transfer_mock = mock_complete_withdrawal_with_tx(&server, transfer_uuid, None);
