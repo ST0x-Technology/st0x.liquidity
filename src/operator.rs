@@ -180,8 +180,9 @@ pub mod bot_gas {
 
 pub mod conductor {
     pub use crate::conductor::{
-        FillAccountingOutcome, account_for_onchain_fill, configured_equity_symbols,
-        execute_mark_acknowledged, execute_settle_fill, is_expected_place_offchain_order_rejection,
+        ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
+        account_for_onchain_fill, configured_equity_symbols, execute_mark_acknowledged,
+        execute_settle_fill, is_expected_place_offchain_order_rejection,
     };
 
     #[cfg(feature = "test-support")]
@@ -273,6 +274,12 @@ pub mod equity_transfer {
         RedemptionAlreadyFailed(RedemptionAggregateId),
         #[error("redemption {0} already reconciled")]
         RedemptionAlreadyReconciled(RedemptionAggregateId),
+        #[error(
+            "redemption {0} has an unresolved vault withdrawal submission; force-fail is \
+             refused because the withdrawal may already have landed -- verify it on-chain, \
+             then reconcile it (`stox transfer reconcile --kind redemption`) to resolve it"
+        )]
+        RedemptionSubmissionUnresolved(RedemptionAggregateId),
         #[error("mint store operation failed")]
         MintStore(#[source] Box<SendError<TokenizedEquityMint>>),
         #[error("redemption store operation failed")]
@@ -362,6 +369,9 @@ pub mod equity_transfer {
         reason: &str,
     ) -> Result<EquityRedemptionCommand, FailTransferError> {
         match entity {
+            EquityRedemption::VaultWithdrawSubmitting { .. } => Err(
+                FailTransferError::RedemptionSubmissionUnresolved(id.clone()),
+            ),
             EquityRedemption::VaultWithdrawPending { .. }
             | EquityRedemption::VaultWithdrawSubmitted { .. }
             | EquityRedemption::WithdrawnFromRaindex { .. }
@@ -1528,8 +1538,9 @@ pub mod process_tx {
     use st0x_registry::SymbolCache;
 
     use crate::conductor::{
-        FillAccountingOutcome, account_for_onchain_fill, execute_mark_acknowledged,
-        execute_settle_fill, is_expected_place_offchain_order_rejection,
+        ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
+        account_for_onchain_fill, execute_mark_acknowledged, execute_settle_fill,
+        is_expected_place_offchain_order_rejection,
     };
     use crate::offchain::order::{
         CounterTradeOrderKind, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
@@ -1626,9 +1637,20 @@ pub mod process_tx {
         /// The fill was accounted but net exposure is below the execution
         /// threshold, so no hedge was placed yet.
         BelowExecutionThreshold,
-        /// Trading is disabled by configuration for the symbol; the fill was
-        /// settled without placing a hedge.
-        TradingDisabled { symbol: Symbol },
+        /// Trading is disabled for the symbol on the fill's chain, so this run
+        /// kept the fill out of the hedged position and recorded it in
+        /// `skipped_fills`. The pipeline will not hedge it; `detail` states the
+        /// delta and the side an operator covers it with.
+        ExcludedFromHedging {
+            symbol: Symbol,
+            chain: Chain,
+            detail: String,
+        },
+        /// An earlier run already excluded the fill from hedging while trading
+        /// was disabled, and it stays excluded even if trading is enabled
+        /// since. The pipeline will not hedge it; `detail` is the recorded
+        /// delta and cover side.
+        AlreadyExcluded { detail: String },
         /// A concurrent placement already claimed the position, so the fill was
         /// settled without placing a hedge.
         PlacementRejected { symbol: Symbol },
@@ -1876,7 +1898,37 @@ pub mod process_tx {
             return Err(RejectionReason::FillMissingBlockNumber { trade_id }.into());
         };
 
-        let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
+        let base_symbol = onchain_trade.symbol();
+
+        // Same rule as the bot: `Position` is one net per symbol across every
+        // hedged chain, so a fill on an asset disabled on its own chain stays
+        // out of it, or the periodic scan hedges it for whichever chain
+        // enables the symbol.
+        if !trading_chain.assets.is_trading_enabled(base_symbol) {
+            let outcome = account_for_fill_excluded_from_hedging(
+                pool,
+                onchain_trade_store,
+                position_store,
+                &onchain_trade,
+                block_number,
+                "process-tx",
+            )
+            .await
+            .context("failed to exclude the onchain fill from hedging")?;
+            return Ok(match outcome {
+                ExcludedFillOutcome::Excluded { detail } => ProcessTxOutcome::ExcludedFromHedging {
+                    symbol: base_symbol.clone(),
+                    chain: onchain_trade.chain,
+                    detail,
+                },
+                ExcludedFillOutcome::AlreadyExcluded { detail } => {
+                    ProcessTxOutcome::AlreadyExcluded { detail }
+                }
+                ExcludedFillOutcome::AlreadyAcknowledged => ProcessTxOutcome::AlreadyAccounted,
+            });
+        }
+
+        let trade_id = match account_for_onchain_fill(
             pool,
             onchain_trade_store,
             position_store,
@@ -1886,11 +1938,17 @@ pub mod process_tx {
         )
         .await
         .context("failed to account for the onchain fill")?
-        else {
-            return Ok(ProcessTxOutcome::AlreadyAccounted);
+        {
+            FillAccountingOutcome::Accounted { trade_id } => trade_id,
+            FillAccountingOutcome::AlreadyAcknowledged => {
+                return Ok(ProcessTxOutcome::AlreadyAccounted);
+            }
+            // Excluded while trading was disabled: the fill is not in the
+            // position, so it must not be reported as one the pipeline hedges.
+            FillAccountingOutcome::ExcludedFromHedging { detail } => {
+                return Ok(ProcessTxOutcome::AlreadyExcluded { detail });
+            }
         };
-
-        let base_symbol = onchain_trade.symbol();
 
         // Serialize against the live trading loop (ADR 0014) from here on.
         // The lock must cover the pending-hedge inspection below, not just
@@ -2328,16 +2386,6 @@ pub mod process_tx {
             }
         }
 
-        let trading_enabled = trading_chain.assets.is_trading_enabled(base_symbol);
-
-        if !trading_enabled {
-            mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
-                .await?;
-            return Ok(FillGate::Settled(ProcessTxOutcome::TradingDisabled {
-                symbol: base_symbol.clone(),
-            }));
-        }
-
         let executor_type = ctx.broker.to_supported_executor();
         // process-tx is a manual recovery verb: a `MockExecutor` forces the
         // readiness check to treat the market as open so the operator can place
@@ -2350,7 +2398,6 @@ pub mod process_tx {
             executor_type,
             &trading_chain.assets,
             &ctx.assets,
-            trading_enabled,
         )
         .await
         .context("failed to check execution readiness")?
@@ -4522,7 +4569,7 @@ pub mod process_tx {
         #[tokio::test]
         async fn process_tx_resumes_witnessed_but_unacknowledged_fill() {
             let pool = setup_test_db().await;
-            let ctx = create_base_test_ctx();
+            let ctx = aapl_accounting_ctx();
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
                 executor: MockExecutor::new(),
                 close_flatten_policy: None,
@@ -4600,7 +4647,7 @@ pub mod process_tx {
         #[tokio::test]
         async fn process_tx_witnesses_and_acknowledges_new_fill() {
             let pool = setup_test_db().await;
-            let ctx = create_base_test_ctx();
+            let ctx = aapl_accounting_ctx();
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
                 executor: MockExecutor::new(),
                 close_flatten_policy: None,
@@ -4652,6 +4699,140 @@ pub mod process_tx {
             );
         }
 
+        /// `process-tx` follows the bot's rule for a fill on an asset whose
+        /// trading is disabled on the fill's chain: it is witnessed and
+        /// acknowledged but kept out of the hedged position, which the periodic
+        /// scan would otherwise hedge, and recorded in `skipped_fills`. A rerun
+        /// while trading is still disabled repeats the cover detail rather than
+        /// reporting the fill as accounted.
+        #[tokio::test]
+        async fn process_tx_keeps_fill_on_trading_disabled_asset_out_of_the_position() {
+            let pool = setup_test_db().await;
+            let ctx = create_base_test_ctx();
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
+            let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            let trade_id =
+                OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+
+            let first = process_found_trade(
+                onchain_trade.clone(),
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let ProcessTxOutcome::ExcludedFromHedging { symbol, detail, .. } = first else {
+                panic!("a fill on a trading disabled asset must be excluded, got: {first:?}");
+            };
+            assert_eq!(symbol, Symbol::new("AAPL").unwrap());
+            // The fixture is an onchain buy, so the operator covers with a sell.
+            assert!(detail.contains("cover by SELL"), "{detail}");
+
+            let rerun = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(&rerun, ProcessTxOutcome::AlreadyExcluded { detail } if detail.contains("cover by SELL")),
+                "a rerun on an excluded fill must repeat the cover side, got: {rerun:?}"
+            );
+
+            let (store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+            let state = store
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .expect("the fill must still be witnessed");
+            assert!(state.is_acknowledged());
+
+            let (fill_count,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                    .bind("PositionEvent::OnChainOrderFilled")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                fill_count, 0,
+                "a fill on a trading disabled asset must not reach the position"
+            );
+
+            let reasons: Vec<(String,)> = sqlx::query_as("SELECT reason FROM skipped_fills")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(reasons, vec![("trading_disabled".to_string(),)]);
+        }
+
+        /// Running `process-tx` again on an excluded fill after trading is
+        /// enabled must keep it excluded and say so: the fill is not in the
+        /// position, so reporting it as accounted (which promises the pipeline
+        /// hedges it) would leave its delta uncovered.
+        #[tokio::test]
+        async fn process_tx_after_enabling_keeps_an_excluded_fill_excluded() {
+            let pool = setup_test_db().await;
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
+            let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+
+            process_found_trade(
+                onchain_trade.clone(),
+                &create_base_test_ctx(),
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let outcome = process_found_trade(
+                onchain_trade,
+                &aapl_accounting_ctx(),
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(&outcome, ProcessTxOutcome::AlreadyExcluded { detail } if detail.contains("cover by SELL")),
+                "an excluded fill must stay excluded after trading is enabled, got: {outcome:?}"
+            );
+
+            let (fill_count,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                    .bind("PositionEvent::OnChainOrderFilled")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                fill_count, 0,
+                "the excluded fill must stay out of the position"
+            );
+        }
+
         /// After process-tx applies a fill via `process_found_trade`, the normal
         /// pipeline re-detecting the same fill (via `process_queued_trade`) must
         /// return `Ok(None)` -- skipping cleanly -- and must NOT emit a second
@@ -4659,7 +4840,7 @@ pub mod process_tx {
         #[tokio::test]
         async fn process_tx_then_normal_path_does_not_double_count() {
             let (pool, apalis_pool) = try_setup_test_pools().await.unwrap();
-            let ctx = create_base_test_ctx();
+            let ctx = aapl_accounting_ctx();
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
                 executor: MockExecutor::new(),
                 close_flatten_policy: None,
@@ -4749,7 +4930,6 @@ pub mod process_tx {
                 onchain_trade,
                 &cqrs,
                 &ChainAssets::default(),
-                true,
             )
             .await
             .unwrap();
@@ -5600,7 +5780,7 @@ pub mod process_tx {
         #[tokio::test]
         async fn process_tx_concurrent_witness_resumes_acknowledge() {
             let pool = setup_test_db().await;
-            let ctx = create_base_test_ctx();
+            let ctx = aapl_accounting_ctx();
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
                 executor: MockExecutor::new(),
                 close_flatten_policy: None,
@@ -5816,7 +5996,7 @@ pub mod process_tx {
         #[tokio::test]
         async fn process_tx_does_not_double_count_witnessed_fill_after_newer_fill_acknowledged() {
             let pool = setup_test_db().await;
-            let ctx = create_base_test_ctx();
+            let ctx = aapl_accounting_ctx();
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
                 executor: MockExecutor::new(),
                 close_flatten_policy: None,
@@ -5913,7 +6093,7 @@ pub mod process_tx {
             // re-apply it: last_slot (B) != A, so DuplicateTrade does NOT fire.
 
             // Step 4: Retry process-tx for fill A (crash-recovery scenario).
-            process_found_trade(
+            let outcome = process_found_trade(
                 fill_a,
                 &ctx,
                 &pool,
@@ -5924,6 +6104,10 @@ pub mod process_tx {
             )
             .await
             .unwrap();
+            assert!(
+                matches!(outcome, ProcessTxOutcome::BelowExecutionThreshold),
+                "the retry must run the hedged accounting path, got: {outcome:?}"
+            );
 
             // Assertion 1: OnChainTrade A must now be acknowledged.
             let state_a = onchain_store
@@ -5968,7 +6152,7 @@ pub mod process_tx {
         #[tokio::test]
         async fn process_tx_none_path_does_not_recount_legacy_position_fill() {
             let pool = setup_test_db().await;
-            let ctx = create_base_test_ctx();
+            let ctx = aapl_accounting_ctx();
             let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
                 executor: MockExecutor::new(),
                 close_flatten_policy: None,
@@ -6043,7 +6227,7 @@ pub mod process_tx {
             // Step 3: Run process_found_trade for fill A. It takes the None branch
             // (no OnChainTrade record), witnesses A, then the authoritative guard must
             // detect A already in Position and skip the re-apply.
-            process_found_trade(
+            let outcome = process_found_trade(
                 fill_a,
                 &ctx,
                 &pool,
@@ -6054,6 +6238,10 @@ pub mod process_tx {
             )
             .await
             .unwrap();
+            assert!(
+                matches!(outcome, ProcessTxOutcome::BelowExecutionThreshold),
+                "the None path must run the hedged accounting path, got: {outcome:?}"
+            );
 
             // Assertion 1: OnChainTrade A must be acknowledged (witness + mark ran).
             let state_a = onchain_store
@@ -6326,6 +6514,17 @@ pub mod process_tx {
             {
                 Ok(reserving_counter_trade_preflight(&order))
             }
+        }
+
+        /// `aapl_trading_ctx` with the threshold far above the one share
+        /// fixture fill: a process-tx fill is accounted into the position (not
+        /// excluded as a disabled asset fill) and never goes on to hedge.
+        fn aapl_accounting_ctx() -> Ctx {
+            let mut ctx = aapl_trading_ctx();
+            ctx.execution_threshold = st0x_config::ExecutionThreshold::shares(
+                Positive::new(FractionalShares::new(st0x_float_macro::float!(100))).unwrap(),
+            );
+            ctx
         }
 
         fn aapl_trading_ctx() -> Ctx {

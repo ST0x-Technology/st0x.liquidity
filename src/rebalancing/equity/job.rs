@@ -37,7 +37,16 @@ use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
-use super::{CrossVenueEquityTransfer, EquityTransferServices, MintTransferError, RedemptionError};
+use super::{
+    CrossVenueEquityTransfer, EquityTransferServices, MintTransferError, RedemptionError,
+    withdrawal_reconciliation_redrive_delay,
+};
+#[cfg(test)]
+use super::{
+    WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE,
+    WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY, WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+};
+use crate::alerts::Notifier;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -710,6 +719,11 @@ pub(crate) struct TransferEquityToHedgingCtx {
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget.
     pub(crate) job_queue: TransferEquityToHedgingJobQueue,
+    /// Operational-alert channel. A stuck prepared withdrawal the market
+    /// out-fees can never confirm and is never fee-bumped; once its durable
+    /// deadline elapses the reconciliation redrive pages the operator through
+    /// this notifier instead of stalling silently forever.
+    pub(crate) notifier: Arc<dyn Notifier>,
 }
 
 /// Errors emitted by [`TransferEquityToHedging::perform`].
@@ -789,6 +803,37 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
     }
 
     async fn perform(&self, ctx: &TransferEquityToHedgingCtx) -> Result<Self::Output, Self::Error> {
+        // A terminal redemption (Failed/Completed/Reconciled) has nothing left to
+        // transfer. Terminate instead of deferring on reservation restoration: a
+        // deferring job row stays non-terminal, and `in_flight_equity_transfer`
+        // treats it as an in-flight transfer that suppresses a legitimately needed
+        // new redemption for the same symbol (the reject path reproduces this: the
+        // rejected redemption's aggregate is terminal, but a pending counter-hedge
+        // blocks reservation restoration, so the job would otherwise reschedule
+        // itself forever). Release the reservation defensively (idempotent; the
+        // terminal-event reactor also releases it).
+        if ctx
+            .redemption_store
+            .load(&self.aggregate_id)
+            .await
+            .map_err(|error| Box::new(RedemptionError::from(error)))?
+            .is_some_and(|aggregate| aggregate.is_terminal())
+        {
+            if let Some((position_store, _)) = &ctx.position_authority {
+                position_store
+                    .send(
+                        &self.symbol,
+                        PositionCommand::ReleaseEquityTransfer {
+                            reservation_id: EquityTransferReservationId::from_uuid(
+                                self.aggregate_id.0,
+                            ),
+                        },
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+
         if let Some((position_store, position_threshold)) = &ctx.position_authority
             && !restore_position_reservation(
                 position_store,
@@ -835,6 +880,24 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             }
             return Ok(());
         };
+        if error.is_reconciliation_pending() {
+            let delay = withdrawal_reconciliation_redrive_delay(
+                &ctx.redemption_store,
+                &self.aggregate_id,
+                &ctx.notifier,
+            )
+            .await;
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                aggregate_id = %self.aggregate_id,
+                ?delay,
+                "Withdrawal reconciliation remains inconclusive; scheduling a durable fresh-transfer redrive"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(self.clone(), delay).await?;
+            return Ok(());
+        }
 
         if let Some(delay) = error.gas_readiness_retry_interval() {
             if let Some((position_store, _)) = &ctx.position_authority {
@@ -885,6 +948,46 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         if let Some(aggregate) = ctx.redemption_store.load(&self.aggregate_id).await?
             && !aggregate.is_terminal()
         {
+            // A submission-state redemption whose transfer job budget is now
+            // exhausted has an unresolved onchain withdrawal. With no live sibling
+            // to drive it, nothing exits it automatically: the sweep never
+            // force-fails a submission state and the deadline redrive only pages
+            // while a resume keeps running. Page the operator once so it is not
+            // silently wedged until someone restarts the bot.
+            let unresolved_submission = matches!(
+                aggregate,
+                EquityRedemption::VaultWithdrawPending { .. }
+                    | EquityRedemption::VaultWithdrawSubmitting { .. }
+                    | EquityRedemption::VaultWithdrawSubmitted { .. }
+            );
+            if unresolved_submission
+                && !has_live_sibling_equity_transfer::<Self>(
+                    ctx.job_queue.pool(),
+                    task_identity,
+                    |sibling| {
+                        sibling.aggregate_id == self.aggregate_id
+                            && sibling.generation == self.generation
+                    },
+                )
+                .await?
+            {
+                let message = format!(
+                    "Equity redemption {} ({}) exhausted its transfer job budget while its \
+                     Raindex vault withdrawal is unresolved, and no live job remains to drive \
+                     it. Verify the withdrawal onchain; if it can never confirm, reconcile it \
+                     (`stox transfer reconcile --kind redemption --id {}`) and restart the bot \
+                     to clear the stuck wallet nonce.",
+                    self.aggregate_id, self.symbol, self.aggregate_id,
+                );
+                if let Err(alert_error) = ctx.notifier.notify(&message).await {
+                    warn!(
+                        target: "rebalance",
+                        aggregate_id = %self.aggregate_id,
+                        %alert_error,
+                        "Failed to deliver wedged-withdrawal give-up alert"
+                    );
+                }
+            }
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
@@ -1562,6 +1665,90 @@ mod tests {
         assert!(
             run_at >= scheduled_after + 8,
             "the fourth reservation retry must use the shared 8-second backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_redemption_transfer_terminates_instead_of_deferring() {
+        // Regression: a rejected (terminal `Failed`) redemption whose reservation
+        // restoration is blocked by a pending hedge must terminate, not reschedule.
+        // A deferred redrive row stays non-terminal, and `in_flight_equity_transfer`
+        // then suppresses the next genuinely-needed redemption for the symbol
+        // forever -- the flaky reject-path e2e.
+        let (position_store, symbol) = pending_hedge_position().await;
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let stub = Arc::new(RecordingRedemptionResume {
+            fail: false,
+            captured: Mutex::new(None),
+        });
+        let mut ctx = redemption_test_ctx(
+            stub.clone(),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        let aggregate_id = redemption_aggregate_id("terminal-redemption-no-defer");
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: symbol.clone(),
+                    chain: Chain::Base,
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::from(1_u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "test: forced terminal state".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
+
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id,
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 3,
+        };
+
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert!(
+            stub.captured.lock().unwrap().is_none(),
+            "a terminal redemption has nothing to transfer"
+        );
+        let pending: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending, 0,
+            "a terminal redemption must terminate, never enqueue a zombie redrive"
         );
     }
 
@@ -2555,6 +2742,29 @@ mod tests {
             ))
         }
     }
+    struct ReconciliationPendingRedemptionResume;
+
+    #[async_trait]
+    impl ResumeEquityToHedging for ReconciliationPendingRedemptionResume {
+        async fn resume_equity_to_hedging(
+            &self,
+            _aggregate_id: &RedemptionAggregateId,
+            _symbol: &Symbol,
+            _chain: Chain,
+            _quantity: FractionalShares,
+        ) -> Result<(), RedemptionError> {
+            Err(RedemptionError::Send(AggregateError::UserError(
+                LifecycleError::Apply(
+                    EquityRedemptionError::RaindexWithdrawReconciliationPending {
+                        token: Address::random(),
+                        amount: U256::from(1),
+                        error_message: "prepared transaction visibility is inconclusive"
+                            .to_string(),
+                    },
+                ),
+            )))
+        }
+    }
 
     #[tokio::test]
     async fn redemption_gas_readiness_failure_releases_reservation_before_delayed_redrive() {
@@ -2617,6 +2827,197 @@ mod tests {
                 && run_at <= after + i64::try_from(retry_interval.as_secs()).unwrap() + 5
         );
     }
+    #[tokio::test]
+    async fn fresh_redemption_reconciliation_pending_enqueues_uncapped_delayed_redrive() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let ctx = redemption_test_ctx(
+            Arc::new(ReconciliationPendingRedemptionResume),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: redemption_aggregate_id("fresh-reconciliation-pending"),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak(3),
+            position_reservation_retry_attempts: 2,
+        };
+
+        let before = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("reconciliation-pending must redrive without consuming worker retries");
+        let after = chrono::Utc::now().timestamp();
+
+        let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let redriven: TransferEquityToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(redriven.aggregate_id, job.aggregate_id);
+        assert_eq!(redriven.symbol, job.symbol);
+        assert_eq!(redriven.generation, job.generation);
+        assert_eq!(redriven.backpressure_streak, job.backpressure_streak);
+        assert_eq!(
+            redriven.position_reservation_retry_attempts,
+            job.position_reservation_retry_attempts
+        );
+        let delay = i64::try_from(WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY.as_secs()).unwrap();
+        assert!(
+            run_at >= before + delay - 5 && run_at <= after + delay + 5,
+            "redrive must be delayed by ~{WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY:?}"
+        );
+    }
+
+    /// Seeds a redemption into `VaultWithdrawSubmitted` with an explicit
+    /// `submitted_at`, the durable anchor the reconciliation deadline reads.
+    async fn seed_submitted_withdrawal(
+        redemption_store: &Store<EquityRedemption>,
+        aggregate_id: &RedemptionAggregateId,
+        submitted_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        redemption_store
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
+                    quantity: float!(10),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::from(1_u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::RecordWithdrawSubmissionAt {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                    submitted_at,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_pending_before_deadline_stays_silent_at_fast_cadence() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let mut ctx = redemption_test_ctx(
+            Arc::new(ReconciliationPendingRedemptionResume),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        ctx.notifier = notifier.clone();
+
+        let aggregate_id = redemption_aggregate_id("reconciliation-before-deadline");
+        seed_submitted_withdrawal(
+            &ctx.redemption_store,
+            &aggregate_id,
+            chrono::Utc::now() - chrono::Duration::minutes(1),
+        )
+        .await;
+
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: aggregate_id.clone(),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        let before = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+        let after = chrono::Utc::now().timestamp();
+
+        assert!(
+            notifier.messages().is_empty(),
+            "a withdrawal within its deadline must not page the operator"
+        );
+        let run_at: i64 = sqlx_apalis::query_scalar(
+            "SELECT run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let delay = i64::try_from(WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY.as_secs()).unwrap();
+        assert!(
+            run_at >= before + delay - 5 && run_at <= after + delay + 5,
+            "before the deadline the redrive stays at the fast \
+             ~{WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY:?} cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_pending_after_deadline_pages_operator_and_slows_cadence() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
+        let mut ctx = redemption_test_ctx(
+            Arc::new(ReconciliationPendingRedemptionResume),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        ctx.notifier = notifier.clone();
+
+        let aggregate_id = redemption_aggregate_id("reconciliation-past-deadline");
+        let submitted_at = chrono::Utc::now()
+            - chrono::Duration::from_std(WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE).unwrap()
+            - chrono::Duration::minutes(1);
+        seed_submitted_withdrawal(&ctx.redemption_store, &aggregate_id, submitted_at).await;
+
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: aggregate_id.clone(),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        let before = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+        let after = chrono::Utc::now().timestamp();
+
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "a past-deadline stall must page the operator once"
+        );
+        assert!(
+            messages[0].contains(&aggregate_id.to_string()) && messages[0].contains("unconfirmed"),
+            "the page must name the stuck redemption, got: {}",
+            messages[0]
+        );
+        let run_at: i64 = sqlx_apalis::query_scalar(
+            "SELECT run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_one(&apalis_pool)
+        .await
+        .unwrap();
+        let delay =
+            i64::try_from(WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY.as_secs()).unwrap();
+        assert!(
+            run_at >= before + delay - 5 && run_at <= after + delay + 5,
+            "past-deadline redrive must slow to \
+             ~{WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY:?}"
+        );
+    }
 
     #[async_trait]
     impl ResumeEquityToHedging for RecordingRedemptionResume {
@@ -2676,6 +3077,7 @@ mod tests {
             redemption_store: Arc::new(test_store(pool, services)),
             position_authority: None,
             job_queue,
+            notifier: Arc::new(crate::alerts::LogNotifier),
         }
     }
 
@@ -3277,7 +3679,10 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(1),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -3334,7 +3739,19 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(1),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1_u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.redemption_store
+            .send(
+                &aggregate_id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await

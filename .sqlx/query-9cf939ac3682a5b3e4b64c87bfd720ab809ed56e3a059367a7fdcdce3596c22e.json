@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO skipped_fills (chain, tx_hash, log_index, event_type, reason, detail, skipped_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (chain, tx_hash, log_index) DO UPDATE SET event_type = excluded.event_type, reason = excluded.reason, detail = excluded.detail || ' (earlier skipped as ' || skipped_fills.reason || ' on ' || skipped_fills.event_type || ' at ' || skipped_fills.skipped_at || ': ' || skipped_fills.detail || ')', skipped_at = excluded.skipped_at WHERE skipped_fills.reason <> excluded.reason",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "9cf939ac3682a5b3e4b64c87bfd720ab809ed56e3a059367a7fdcdce3596c22e"
+}

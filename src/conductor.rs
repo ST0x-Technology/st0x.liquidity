@@ -124,9 +124,8 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
-    DurableCheckedGuardRelease, PreflightAlertGate, RecheckUsdcDeposit, TransferUsdcToHedging,
-    TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    UsdcSettlementParams,
+    RecheckUsdcDeposit, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
+    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -146,6 +145,9 @@ use crate::trading::offchain::hedge::{
     resolve_extended_hours_reference_price,
 };
 use crate::trading::onchain::inclusion::EmittedOnChain;
+use crate::trading::onchain::skipped_fill::{
+    SkipReason, record_skipped_fill, trading_disabled_detail,
+};
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
 use crate::unwrapped_equity_recovery::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
@@ -1279,6 +1281,7 @@ impl Conductor {
             transfer: recovery_transfer.clone(),
             position_authority: (resume_position_store, ctx.execution_threshold),
             job_queue: resume_tokenization_queue.clone(),
+            notifier: notifier.clone(),
         });
 
         let conductor = builder::spawn()
@@ -3302,6 +3305,9 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
 /// chain's [`ChainTokenization`] until chain selection moves into the global
 /// rebalancer; the other hedged chains' services are built and preflighted
 /// so that move is a lookup, not a rewire.
+// Wiring builder: extraction would scatter the wiring across helpers without
+// reducing complexity (see `builder::spawn`'s identical rationale).
+#[allow(clippy::too_many_lines)]
 fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     tokenizations: BTreeMap<Chain, ChainTokenization<Signer>>,
@@ -3466,11 +3472,11 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
 
-        let usdc_store = built.usdc.clone();
         let usdc_handles = services.into_usdc_transfer_handles(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
             built.usdc,
+            deps.pool.clone(),
             bot_gas_enqueuer.clone(),
             gas_readiness,
         );
@@ -3487,12 +3493,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             job_queue: deps.schedulers.transfer_usdc_to_market_making.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
-            usdc_guard: Arc::new(DurableCheckedGuardRelease {
-                pool: deps.pool.clone(),
-                store: usdc_store,
-                usdc_in_progress: rebalancing_service.usdc_in_progress.clone(),
-            }),
-            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         });
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
@@ -3519,6 +3519,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             redemption_store: built.redemption.clone(),
             position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
             job_queue: deps.schedulers.transfer_equity_to_hedging.clone(),
+            notifier: deps.notifier.clone(),
         });
 
         Ok(RebalancingInfrastructure {
@@ -3669,6 +3670,46 @@ struct TransferStrandedByChainServices {
     symbol: Symbol,
 }
 
+/// Restores a submitted withdrawal's nonce ownership, retrying a transient
+/// transport failure a few times. A hash the node reports as absent
+/// (`PreparedTransactionReconciliationPending`) returns immediately: retrying
+/// cannot make a dropped, never mined withdrawal reappear.
+async fn restore_submitted_withdrawal_with_retry(
+    raindex: &dyn st0x_raindex::Raindex,
+    tx_hash: alloy::primitives::TxHash,
+    prepared: Option<&st0x_evm::PreparedTransaction>,
+) -> Result<(), st0x_raindex::RaindexError> {
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    loop {
+        match raindex
+            .restore_submitted_withdrawal(tx_hash, prepared)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if is_prepared_withdrawal_absent(&error) => return Err(error),
+            Err(error) => {
+                attempt += 1;
+                if attempt >= ATTEMPTS {
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// Whether the node reports the withdrawal's transaction as absent, which no
+/// retry can change, as distinct from a transport failure that may clear.
+fn is_prepared_withdrawal_absent(error: &st0x_raindex::RaindexError) -> bool {
+    matches!(
+        error,
+        st0x_raindex::RaindexError::Evm(
+            st0x_evm::EvmError::PreparedTransactionReconciliationPending { .. }
+        )
+    )
+}
+
 /// Queues one resume job per interrupted mint and redemption. A transfer
 /// whose recorded chain lost its equity services refuses startup instead:
 /// queueing a resume that can only fail would strand it silently.
@@ -3806,6 +3847,73 @@ async fn recover_interrupted_tokenization_aggregates(
                 symbol: redemption.symbol().clone(),
             }
             .into());
+        }
+
+        let restore_outcome = match &redemption {
+            EquityRedemption::VaultWithdrawSubmitting { prepared, .. } => Some(
+                restore_submitted_withdrawal_with_retry(
+                    equity_services
+                        .for_chain(redemption.chain())?
+                        .raindex
+                        .as_ref(),
+                    prepared.tx_hash(),
+                    Some(prepared),
+                )
+                .await,
+            ),
+            EquityRedemption::VaultWithdrawSubmitted {
+                tx_hash, prepared, ..
+            } => Some(
+                restore_submitted_withdrawal_with_retry(
+                    equity_services
+                        .for_chain(redemption.chain())?
+                        .raindex
+                        .as_ref(),
+                    *tx_hash,
+                    prepared.as_ref(),
+                )
+                .await,
+            ),
+            _ => None,
+        };
+        match restore_outcome {
+            // The node reports the withdrawal's hash as absent: a dropped, never
+            // mined legacy withdrawal that returns the same on every restart. It
+            // holds no nonce reservation in this fresh process, so skip the
+            // restore, page the operator, and let the resume job drive it to the
+            // reconciliation deadline rather than crash looping the whole bot.
+            Some(Err(error)) if is_prepared_withdrawal_absent(&error) => {
+                warn!(
+                    target: "rebalance",
+                    %redemption_id,
+                    %error,
+                    "Submitted withdrawal hash is absent at startup; skipping the \
+                     nonce restore and deferring to the resume job"
+                );
+                if let Err(alert_error) = rebalancing_service
+                    .notifier()
+                    .notify(&format!(
+                        "Equity redemption {redemption_id} has a submitted vault withdrawal whose \
+                         hash the node cannot return at startup ({error}). Monitoring started \
+                         without it; the resume job will drive it to the reconciliation deadline. \
+                         Verify the withdrawal onchain and reconcile if it will never confirm."
+                    ))
+                    .await
+                {
+                    warn!(
+                        target: "rebalance",
+                        %redemption_id,
+                        %alert_error,
+                        "Failed to deliver startup withdrawal restore alert"
+                    );
+                }
+            }
+            // A transport failure that outlasted the retries is a real RPC fault,
+            // not a gone hash. Do not skip: the withdrawal may still be pending
+            // and must keep its nonce reserved, or a later generic send collides
+            // with it. Fail startup so a healthy RPC is required before running.
+            Some(Err(error)) => return Err(error.into()),
+            Some(Ok(())) | None => {}
         }
 
         rebalancing_service
@@ -4749,17 +4857,55 @@ pub(crate) async fn position_fill_already_recorded(
 
 pub enum FillAccountingOutcome {
     AlreadyAcknowledged,
-    Accounted { trade_id: OnChainTradeId },
+    /// Recorded in `skipped_fills` because trading was disabled on its chain
+    /// when it was accounted. Never hedged: an operator covers its delta by
+    /// hand, even after trading is enabled again. `detail` is the recorded
+    /// fill and cover side.
+    ExcludedFromHedging {
+        detail: String,
+    },
+    Accounted {
+        trade_id: OnChainTradeId,
+    },
 }
 
-pub async fn account_for_onchain_fill(
+/// The recorded detail when `trade` is excluded because trading was disabled
+/// on its chain.
+async fn recorded_trading_disabled_detail(
     pool: &SqlitePool,
+    trade: &OnchainTrade,
+) -> Result<Option<String>, TradeAccountingError> {
+    trading_disabled_detail(pool, trade.chain, trade.tx_hash, trade.log_index)
+        .await
+        .map_err(|error| TradeAccountingError::ExcludedFillRecord {
+            trade_id: OnChainTradeId {
+                chain: trade.chain,
+                tx_hash: trade.tx_hash,
+                log_index: trade.log_index,
+            },
+            source: Box::new(error),
+        })
+}
+
+/// Where a fill stands once it is witnessed into its `OnChainTrade` log.
+enum WitnessedFill {
+    /// An earlier attempt already acknowledged it.
+    AlreadyAcknowledged,
+    /// Witnessed but not acknowledged yet: this attempt finishes it.
+    Pending {
+        trade_id: OnChainTradeId,
+        block_timestamp: DateTime<Utc>,
+    },
+}
+
+/// Witnesses `trade` into its `OnChainTrade` log, the step every fill takes
+/// whether or not it is hedged. The acknowledged marker it reads back is the
+/// dedupe guard that makes a redrive do nothing.
+async fn witness_onchain_fill(
     onchain_trade: &Store<OnChainTrade>,
-    position: &Store<Position>,
     trade: &OnchainTrade,
     block_number: u64,
-    threshold: ExecutionThreshold,
-) -> Result<FillAccountingOutcome, TradeAccountingError> {
+) -> Result<WitnessedFill, TradeAccountingError> {
     let trade_id = OnChainTradeId {
         chain: trade.chain,
         tx_hash: trade.tx_hash,
@@ -4793,12 +4939,7 @@ pub async fn account_for_onchain_fill(
                     symbol = %trade.symbol,
                     "Trade already processed (duplicate event), skipping"
                 );
-                // Self-heal a marker-without-settle leak (ADR 0010): a crash
-                // between MARK and SETTLE leaves the trade marked but still in
-                // the pending set. The marker is durable, so prune it now. A
-                // no-op when already pruned.
-                execute_settle_fill(position, trade).await?;
-                return Ok(FillAccountingOutcome::AlreadyAcknowledged);
+                return Ok(WitnessedFill::AlreadyAcknowledged);
             }
 
             info!(
@@ -4814,8 +4955,7 @@ pub async fn account_for_onchain_fill(
             if !witnessed {
                 match onchain_trade.load(&trade_id).await? {
                     Some(reloaded) if reloaded.is_acknowledged() => {
-                        execute_settle_fill(position, trade).await?;
-                        return Ok(FillAccountingOutcome::AlreadyAcknowledged);
+                        return Ok(WitnessedFill::AlreadyAcknowledged);
                     }
                     Some(_) => {
                         info!(
@@ -4835,24 +4975,179 @@ pub async fn account_for_onchain_fill(
         Err(error) => return Err(error.into()),
     }
 
-    // The durable check and the acknowledge are separate transactions, and the
-    // `Position` guard only rejects a fill still pending or last acknowledged.
-    // Without one guard across both, a second actor on this fill could pass the
-    // check, then apply the fill after it settled and a newer fill displaced it,
-    // counting it twice. The file lock spans the REST route, the accounting job,
-    // and a standalone CLI process attached to the same database.
-    {
-        let _accounting_guard = acquire_database_file_lock(pool, DatabaseFileLock::FillAccounting)
-            .await
-            .map_err(TradeAccountingError::FillAccountingLock)?;
-        if !position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
-            execute_acknowledge_fill(position, trade, threshold, block_timestamp).await?;
+    Ok(WitnessedFill::Pending {
+        trade_id,
+        block_timestamp,
+    })
+}
+
+pub async fn account_for_onchain_fill(
+    pool: &SqlitePool,
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    trade: &OnchainTrade,
+    block_number: u64,
+    threshold: ExecutionThreshold,
+) -> Result<FillAccountingOutcome, TradeAccountingError> {
+    let WitnessedFill::Pending {
+        trade_id,
+        block_timestamp,
+    } = witness_onchain_fill(onchain_trade, trade, block_number).await?
+    else {
+        // Self-heal a marker-without-settle leak (ADR 0010): a crash between
+        // MARK and SETTLE leaves the trade marked but still in the pending
+        // set. The marker is durable, so prune it now. A no-op when already
+        // pruned.
+        execute_settle_fill(position, trade).await?;
+        // A fill excluded while trading was disabled is also acknowledged;
+        // report it as excluded so no caller promises the pipeline hedges it.
+        if let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? {
+            return Ok(FillAccountingOutcome::ExcludedFromHedging { detail });
         }
+        return Ok(FillAccountingOutcome::AlreadyAcknowledged);
+    };
+
+    // Held from the exclusion check through the acknowledge, and taken by
+    // `account_for_fill_excluded_from_hedging` across its own check and record.
+    // The durable checks and the writes are separate transactions, and the
+    // `Position` guard only rejects a fill still pending or last acknowledged.
+    // Without one guard across them, a second actor on this fill could pass
+    // the check, then apply the fill after it settled and a newer fill
+    // displaced it (counting it twice), or record it as excluded while this
+    // path counts it. The file lock spans the REST route, the accounting job,
+    // and a standalone CLI process attached to the same database.
+    let _accounting_guard = acquire_database_file_lock(pool, DatabaseFileLock::FillAccounting)
+        .await
+        .map_err(TradeAccountingError::FillAccountingLock)?;
+
+    // Excluded while trading was disabled, then interrupted before its
+    // marker: the `skipped_fills` record already tells the operator to cover
+    // the delta by hand, so finish the exclusion instead of hedging it too.
+    if let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? {
+        execute_mark_acknowledged(onchain_trade, &trade_id).await?;
+        warn!(
+            ?trade_id,
+            symbol = %trade.symbol,
+            "Fill recorded as trading disabled stays excluded from hedging; \
+             finished its interrupted exclusion"
+        );
+        return Ok(FillAccountingOutcome::ExcludedFromHedging { detail });
+    }
+
+    if !position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
+        execute_acknowledge_fill(position, trade, threshold, block_timestamp).await?;
     }
 
     Ok(FillAccountingOutcome::Accounted { trade_id })
 }
 
+pub enum ExcludedFillOutcome {
+    /// An earlier attempt already accounted this fill into the position,
+    /// before trading was disabled.
+    AlreadyAcknowledged,
+    /// An earlier attempt already excluded this fill. `detail` is the
+    /// recorded fill and cover side.
+    AlreadyExcluded { detail: String },
+    /// This attempt recorded the fill as excluded from hedging. `detail`
+    /// states the uncovered delta (direction, amount, symbol, price, chain).
+    Excluded { detail: String },
+}
+
+/// Accounts a fill on an asset whose trading is disabled on the fill's own
+/// chain, keeping it out of the hedged `Position`.
+///
+/// `Position` holds one net per symbol across every hedged chain, and the
+/// periodic scan hedges that net whenever any hedged chain enables the
+/// symbol, so such a fill must never reach it. The fill is witnessed and
+/// acknowledged on its `OnChainTrade`, which makes a redrive do nothing, and
+/// its delta is recorded in `skipped_fills` for an operator to cover by hand.
+///
+/// `event_type` names what surfaced the fill, for the skipped fill record.
+pub async fn account_for_fill_excluded_from_hedging(
+    pool: &SqlitePool,
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    trade: &OnchainTrade,
+    block_number: u64,
+    event_type: &str,
+) -> Result<ExcludedFillOutcome, TradeAccountingError> {
+    let WitnessedFill::Pending { trade_id, .. } =
+        witness_onchain_fill(onchain_trade, trade, block_number).await?
+    else {
+        // Same self heal as `account_for_onchain_fill`, for a fill accounted
+        // into the position before trading was disabled. Does nothing otherwise.
+        execute_settle_fill(position, trade).await?;
+        if let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? {
+            return Ok(ExcludedFillOutcome::AlreadyExcluded { detail });
+        }
+        return Ok(ExcludedFillOutcome::AlreadyAcknowledged);
+    };
+
+    // Serialized with `account_for_onchain_fill` from this check through the
+    // exclusion record, so a concurrent hedged accounting of the same fill
+    // cannot count it in the position while this path records it as excluded.
+    let _accounting_guard = acquire_database_file_lock(pool, DatabaseFileLock::FillAccounting)
+        .await
+        .map_err(TradeAccountingError::FillAccountingLock)?;
+
+    // Applied to the position before trading was disabled and interrupted
+    // before its marker: finish that accounting (ADR 0010) instead of
+    // recording a delta the position already holds.
+    if position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
+        execute_mark_acknowledged(onchain_trade, &trade_id).await?;
+        execute_settle_fill(position, trade).await?;
+        return Ok(ExcludedFillOutcome::AlreadyAcknowledged);
+    }
+
+    // The cover is the opposite side of the onchain fill: an onchain sell
+    // leaves the book short, which a broker buy covers.
+    let cover = match trade.direction {
+        Direction::Buy => Direction::Sell,
+        Direction::Sell => Direction::Buy,
+    };
+    let detail = format!(
+        "onchain fill {direction} {amount} {symbol} at {price} USDC on {chain}, \
+         cover by {cover} {amount} {symbol} at the broker: trading is disabled \
+         for {symbol} on {chain}, so the fill is not counter traded",
+        direction = trade.direction,
+        amount = trade.amount,
+        symbol = trade.symbol.base(),
+        price = trade.price,
+        chain = trade.chain,
+    );
+    // Recorded before the marker: a crash in between redrives this step,
+    // and the record is idempotent on the fill identity. A redrive after
+    // trading was enabled again takes the hedged path, which finds this
+    // record and finishes the exclusion instead of hedging the fill.
+    record_skipped_fill(
+        pool,
+        trade.chain,
+        trade.tx_hash,
+        trade.log_index,
+        event_type,
+        SkipReason::TradingDisabled,
+        &detail,
+    )
+    .await
+    .map_err(|error| TradeAccountingError::ExcludedFillRecord {
+        trade_id: trade_id.clone(),
+        source: Box::new(error),
+    })?;
+    execute_mark_acknowledged(onchain_trade, &trade_id).await?;
+
+    warn!(
+        ?trade_id,
+        symbol = %trade.symbol,
+        %detail,
+        "Fill on a trading disabled asset excluded from the hedged position"
+    );
+
+    Ok(ExcludedFillOutcome::Excluded { detail })
+}
+
+/// Accounts and hedges a fill on an asset whose trading is enabled on the
+/// fill's own chain. Fills on a disabled asset never reach here: they go
+/// through [`account_for_fill_excluded_from_hedging`].
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub async fn process_queued_trade<E: Executor>(
     executor: &E,
@@ -4860,7 +5155,6 @@ pub async fn process_queued_trade<E: Executor>(
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     assets: &ChainAssets,
-    asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError>
 where
     TradeAccountingError: From<E::Error>,
@@ -4938,7 +5232,6 @@ where
         configured_executor,
         assets,
         &cqrs.hedging,
-        asset_enabled,
     )
     .await?
     else {
@@ -7727,14 +8020,16 @@ mod tests {
         mint_id: st0x_tokenization::IssuerRequestId,
         redemption_id: crate::equity_redemption::RedemptionAggregateId,
         tokenizer: Arc<st0x_tokenization::mock::MockTokenizer>,
+        raindex: Arc<MockRaindex>,
         rebalancing_service: RebalancingService,
         inventory: Arc<BroadcastingInventory>,
         resume_queue: crate::rebalancing::equity::ResumeTokenizationJobQueue,
+        notifier: Arc<crate::alerts::CapturingNotifier>,
     }
 
     /// Shared setup for the three `recover_interrupted_tokenization_aggregates`
     /// tests. Seeds one mint (`MintRequested`) and one redemption
-    /// (VaultWithdrawPending state) into an in-memory database, then builds the
+    /// (`VaultWithdrawSubmitting`) into an in-memory database, then builds the
     /// `RebalancingService` and `ResumeTokenizationJobQueue` that the recovery
     /// function requires.
     async fn seed_interrupted_aggregates_and_build_service(
@@ -7742,12 +8037,31 @@ mod tests {
         mint_label: &str,
         redemption_label: &str,
     ) -> InterruptedAggregateFixture {
+        seed_interrupted_aggregates_and_build_service_with(
+            wallet_byte,
+            mint_label,
+            redemption_label,
+            false,
+        )
+        .await
+    }
+
+    async fn seed_interrupted_aggregates_and_build_service_with(
+        wallet_byte: u8,
+        mint_label: &str,
+        redemption_label: &str,
+        fail_restore: bool,
+    ) -> InterruptedAggregateFixture {
         let (pool, apalis_pool) = setup_test_pools().await;
 
         let mint_id = issuer_request_id(mint_label);
         let redemption_id = redemption_aggregate_id(redemption_label);
 
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let raindex = Arc::new(if fail_restore {
+            MockRaindex::new().with_failing_restore()
+        } else {
+            MockRaindex::new()
+        });
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let tokenizer = Arc::new(MockTokenizer::new());
 
@@ -7784,7 +8098,10 @@ mod tests {
                     symbol: st0x_execution::Symbol::new("TSLA").unwrap(),
                     quantity: st0x_float_macro::float!(5.0),
                     token: alloy::primitives::Address::from([wallet_byte; 20]),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: alloy::primitives::U256::from(5_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -7796,6 +8113,7 @@ mod tests {
             event_sender,
         ));
         let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
                 poll_freshness: PollFreshness::always_fresh(),
@@ -7828,7 +8146,7 @@ mod tests {
                 Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
             )]),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
+            notifier.clone(),
         );
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -7851,9 +8169,11 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer,
+            raindex,
             rebalancing_service,
             inventory,
             resume_queue,
+            notifier,
         }
     }
 
@@ -7921,6 +8241,160 @@ mod tests {
         }
     }
 
+    /// Companion to `issuer_down_does_not_block_tokenization_resume` covering the
+    /// second arm of the recovery `match`: a redemption interrupted at
+    /// `VaultWithdrawSubmitted` (the legacy hash-only recovery path) must have
+    /// its nonce ownership restored synchronously with the exact adopted tx hash
+    /// and its retained prepared transaction before workers run.
+    #[tokio::test]
+    async fn startup_restores_submitted_withdrawal_nonce_ownership() {
+        let InterruptedAggregateFixture {
+            pool,
+            services,
+            redemption_id,
+            raindex,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+            ..
+        } = seed_interrupted_aggregates_and_build_service(
+            2,
+            "submitted-mint",
+            "submitted-redemption",
+        )
+        .await;
+
+        // The fixture seeds the redemption at `VaultWithdrawSubmitting`; advance
+        // it to `VaultWithdrawSubmitted` so recovery takes the second match arm.
+        let withdraw_tx = crate::equity_redemption::prepared_withdrawal_for_test().tx_hash();
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+        redemption_store
+            .send(
+                &redemption_id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: withdraw_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            mint_store,
+            redemption_store,
+            &services,
+            &mut resume_queue,
+        )
+        .await
+        .expect("recover_interrupted_tokenization_aggregates must succeed");
+
+        assert_eq!(
+            raindex.restore_submitted_withdrawal_calls(),
+            vec![(withdraw_tx, true)],
+            "startup must restore the persisted VaultWithdrawSubmitted \
+             transaction's nonce ownership with its exact tx hash and retained \
+             prepared transaction before workers run"
+        );
+    }
+
+    /// A submitted withdrawal whose restore fails on every restart (a legacy
+    /// hash-only record the RPC can no longer return) must not abort startup and
+    /// crash-loop the bot. Recovery skips the restore, pages, and keeps going.
+    #[tokio::test]
+    async fn startup_survives_a_failed_withdrawal_restore() {
+        let InterruptedAggregateFixture {
+            pool,
+            apalis_pool,
+            services,
+            redemption_id,
+            raindex,
+            rebalancing_service,
+            inventory,
+            notifier,
+            mut resume_queue,
+            ..
+        } = seed_interrupted_aggregates_and_build_service_with(
+            3,
+            "resilient-mint",
+            "resilient-redemption",
+            true,
+        )
+        .await;
+
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            mint_store,
+            redemption_store,
+            &services,
+            &mut resume_queue,
+        )
+        .await
+        .expect("startup recovery must not abort when a withdrawal restore fails");
+
+        assert!(
+            !raindex.restore_submitted_withdrawal_calls().is_empty(),
+            "the failing restore path must have been exercised"
+        );
+
+        // Skipping the dead restore must not drop the redemption: its resume job
+        // is still enqueued so the aggregate is driven to the reconciliation
+        // deadline rather than silently abandoned.
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_all(&apalis_pool)
+        .await
+        .unwrap();
+        let targets: Vec<ResumeTokenizationTarget> = payloads
+            .iter()
+            .map(|job| {
+                serde_json::from_slice::<ResumeTokenizationAggregate>(job)
+                    .expect("queued resume job must deserialize")
+                    .target
+            })
+            .collect();
+        assert!(
+            targets.contains(&ResumeTokenizationTarget::Redemption(redemption_id.clone())),
+            "the redemption whose restore was skipped must still enqueue a resume job, \
+             got {targets:?}"
+        );
+
+        // The skipped restore must page the operator, naming the affected
+        // redemption, so the dropped nonce reservation is never silent.
+        let redemption_ref = redemption_id.to_string();
+        let messages = notifier.messages();
+        assert!(
+            messages.iter().any(|message| {
+                message.contains(redemption_ref.as_str())
+                    && message.contains("reconciliation deadline")
+            }),
+            "a failed withdrawal restore must page the operator about redemption \
+             {redemption_id}, got {messages:?}"
+        );
+    }
+
     /// Regression: `recover_interrupted_tokenization_aggregates` must enqueue
     /// a `ResumeTokenizationAggregate` job for each interrupted aggregate and
     /// return immediately without calling any issuer (tokenizer) method.
@@ -7937,9 +8411,11 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer,
+            raindex,
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             1,
             "test-interrupted-mint",
@@ -7983,6 +8459,12 @@ mod tests {
             tokenizer.call_count(),
             calls_before,
             "recover_interrupted_tokenization_aggregates must not call the issuer"
+        );
+        assert_eq!(
+            raindex.restored_prepared_withdrawals(),
+            1,
+            "startup must synchronously restore nonce ownership for the \
+             persisted VaultWithdrawSubmitting transaction before workers run"
         );
 
         // Both interrupted aggregates must be enqueued -- assert the payloads
@@ -8064,9 +8546,11 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             2,
             "dup-test-mint",
@@ -8134,9 +8618,11 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             9,
             "live-owner-mint",
@@ -8236,9 +8722,11 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             4,
             "transfer-owned-mint",
@@ -8322,9 +8810,11 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             6,
             "guardless-row-existing-mint",
@@ -8408,9 +8898,11 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service: _,
             inventory: _,
             resume_queue: _,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             8,
             "pre-wrap-owner-existing-mint",
@@ -8483,9 +8975,11 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service: _,
             inventory: _,
             resume_queue: _,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             10,
             "terminal-handoff-existing-mint",
@@ -8582,9 +9076,11 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service: _,
             inventory: _,
             resume_queue: _,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             11,
             "redrive-existing-mint",
@@ -8651,9 +9147,11 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             7,
             "terminal-row-existing-mint",
@@ -8738,9 +9236,11 @@ mod tests {
             mint_id,
             redemption_id,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             5,
             "dead-lettered-mint",
@@ -8938,7 +9438,10 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(3),
                     token: Address::from([7; 20]),
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(3_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
             )
             .await
@@ -8989,9 +9492,11 @@ mod tests {
             mint_id: _,
             redemption_id: _,
             tokenizer: _,
+            raindex: _,
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             3,
             "running-orphan-mint",
@@ -10534,15 +11039,8 @@ mod tests {
         let trade_event = make_trade_event(10);
         let trade = test_trade_with_amount(float!(0.5), 10);
 
-        let result = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await;
+        let result =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets).await;
 
         assert_eq!(
             result.unwrap(),
@@ -10581,15 +11079,8 @@ mod tests {
         let trade_event = make_trade_event(20);
         let trade = test_trade_with_amount(float!(1.5), 20);
 
-        let result = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await;
+        let result =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets).await;
 
         let offchain_order_id = result
             .unwrap()
@@ -10702,7 +11193,7 @@ mod tests {
             let assets = assets.clone();
             tokio::spawn(async move {
                 let executor = MockExecutor::new();
-                process_queued_trade(&executor, &event, fill, &cqrs, &assets, true).await
+                process_queued_trade(&executor, &event, fill, &cqrs, &assets).await
             })
         };
 
@@ -10892,7 +11383,7 @@ mod tests {
             let cqrs = cqrs.clone();
             async move {
                 let executor = MockExecutor::new();
-                process_queued_trade(&executor, &tick_event, tick_fill, &cqrs, &assets, true).await
+                process_queued_trade(&executor, &tick_event, tick_fill, &cqrs, &assets).await
             }
         });
         barrier.wait_claimed().await;
@@ -11003,7 +11494,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 40),
             &cqrs,
             &assets,
-            true,
         )
         .await;
 
@@ -11023,7 +11513,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 40),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -11096,7 +11585,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 41),
             &cqrs,
             &assets,
-            true,
         )
         .await;
         assert!(
@@ -11161,7 +11649,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -11257,7 +11744,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11325,16 +11811,9 @@ mod tests {
             .expect("witnessed aggregate exists");
         assert!(witnessed_state.enrichment.is_none());
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+            .await
+            .unwrap();
 
         let recovered = cqrs
             .onchain_trade
@@ -11423,7 +11902,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -11569,7 +12047,6 @@ mod tests {
             test_trade_with_amount(float!(1.0), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11581,7 +12058,6 @@ mod tests {
             test_trade_with_amount(float!(2.0), 61),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11606,7 +12082,6 @@ mod tests {
             test_trade_with_amount(float!(1.0), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11680,7 +12155,6 @@ mod tests {
             test_trade_with_amount(float!(2.0), 61),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11702,7 +12176,6 @@ mod tests {
             test_trade_with_amount(float!(1.0), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11768,6 +12241,200 @@ mod tests {
         assert!(
             position.net.inner().eq(float!(1.5)).unwrap(),
             "the re-drive must not double-count the fill"
+        );
+    }
+
+    /// A fill applied to the position before trading was disabled, then
+    /// interrupted before its marker, must be finished rather than excluded
+    /// when it is redriven after the flag flips: the position already holds
+    /// its delta, so recording it in `skipped_fills` would ask the operator to
+    /// cover a delta the hedge already covers.
+    #[tokio::test]
+    async fn excluded_path_finishes_fill_already_applied_to_position() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trade_event = make_trade_event(60);
+        let trade = test_trade_with_amount(float!(1.5), 60);
+        let block_timestamp = trade
+            .block_timestamp
+            .expect("test trade carries a block timestamp");
+        let onchain_trade_id = OnChainTradeId {
+            chain: Chain::Base,
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+        let position_trade_id = TradeId {
+            chain: Chain::Base,
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+
+        execute_witness_trade(
+            &cqrs.onchain_trade,
+            &trade,
+            trade_event.block_number,
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+        execute_acknowledge_fill(
+            &cqrs.position,
+            &trade,
+            cqrs.execution_threshold,
+            block_timestamp,
+        )
+        .await
+        .expect("premise: the position write must land before the crash");
+        let crashed = cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("premise: the position exists");
+        assert!(
+            crashed
+                .pending_acknowledged_trade_ids
+                .contains(&position_trade_id),
+            "premise: the fill is pending acknowledgement"
+        );
+
+        let outcome = account_for_fill_excluded_from_hedging(
+            &pool,
+            &cqrs.onchain_trade,
+            &cqrs.position,
+            &trade,
+            trade_event.block_number,
+            "InventoryTrade",
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ExcludedFillOutcome::AlreadyAcknowledged),
+            "a fill the position already holds is finished, not excluded"
+        );
+
+        let marked = cqrs
+            .onchain_trade
+            .load(&onchain_trade_id)
+            .await
+            .unwrap()
+            .expect("the trade is witnessed");
+        assert!(
+            marked.is_acknowledged(),
+            "the excluded path must complete the acknowledgement marker"
+        );
+
+        let (skipped,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM skipped_fills")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            skipped, 0,
+            "a delta the position already holds must not be recorded for a manual cover"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("the position still exists");
+        assert!(
+            position.net.inner().eq(float!(1.5)).unwrap(),
+            "the position net must be unchanged"
+        );
+        assert!(
+            !position
+                .pending_acknowledged_trade_ids
+                .contains(&position_trade_id),
+            "the fill must be settled out of the pending set"
+        );
+    }
+
+    /// A fill recorded in `skipped_fills` as trading disabled, then
+    /// interrupted before its marker, must stay excluded when it is redriven
+    /// through the hedged path after trading is enabled again: the record
+    /// already tells the operator to cover it by hand, so hedging it as well
+    /// would cover the delta twice.
+    #[tokio::test]
+    async fn hedged_path_finishes_fill_already_recorded_as_trading_disabled() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let trade_event = make_trade_event(60);
+        let trade = test_trade_with_amount(float!(1.5), 60);
+        let block_timestamp = trade
+            .block_timestamp
+            .expect("test trade carries a block timestamp");
+        let onchain_trade_id = OnChainTradeId {
+            chain: Chain::Base,
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+
+        execute_witness_trade(
+            &cqrs.onchain_trade,
+            &trade,
+            trade_event.block_number,
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+        record_skipped_fill(
+            &pool,
+            trade.chain,
+            trade.tx_hash,
+            trade.log_index,
+            "InventoryTrade",
+            SkipReason::TradingDisabled,
+            "onchain fill BUY 1.5 AAPL",
+        )
+        .await
+        .expect("premise: the exclusion record lands before the crash");
+
+        let outcome = account_for_onchain_fill(
+            &pool,
+            &cqrs.onchain_trade,
+            &cqrs.position,
+            &trade,
+            trade_event.block_number,
+            cqrs.execution_threshold,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, FillAccountingOutcome::ExcludedFromHedging { .. }),
+            "a fill recorded as trading disabled must not be accounted for hedging"
+        );
+
+        let (filled,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+            .bind(PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(filled, 0, "the fill must not reach the hedged position");
+
+        let marked = cqrs
+            .onchain_trade
+            .load(&onchain_trade_id)
+            .await
+            .unwrap()
+            .expect("the trade is witnessed");
+        assert!(
+            marked.is_acknowledged(),
+            "the hedged path must complete the exclusion's marker"
         );
     }
 
@@ -11841,16 +12508,9 @@ mod tests {
         let mut trade = test_trade_with_amount(float!(1.5), 60);
         trade.block_timestamp = None;
 
-        let error = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap_err();
+        let error = process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, TradeAccountingError::MissingBlockTimestamp { .. }),
             "a fill without a block timestamp must fail loudly, not drop silently; got {error:?}"
@@ -11886,7 +12546,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 50),
             &cqrs,
             &assets,
-            true,
         )
         .await;
         assert!(
@@ -11900,7 +12559,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 50),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11986,7 +12644,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 30),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11999,7 +12656,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 30),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -12073,7 +12729,7 @@ mod tests {
             cash_withdrawable_cents: None,
         });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12129,7 +12785,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12508,7 +13164,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12622,7 +13278,6 @@ mod tests {
             test_trade_with_amount_and_direction(float!(5), 78, Direction::Buy),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -12701,7 +13356,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12772,7 +13427,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .expect("closed apalis pool should defer to the CheckPositions backstop");
         assert_eq!(
@@ -12836,7 +13491,7 @@ mod tests {
         });
 
         let offchain_order_id =
-            process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+            process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
                 .await
                 .unwrap()
                 .expect("Should place a partial hedge order, not skip entirely");
@@ -12899,7 +13554,7 @@ mod tests {
             cash_withdrawable_cents: None,
         });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12956,7 +13611,7 @@ mod tests {
             })
             .with_preflight_price(float!(100));
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12992,7 +13647,6 @@ mod tests {
             trade_1,
             &cqrs,
             &assets,
-            true,
         )
         .await;
 
@@ -13011,7 +13665,6 @@ mod tests {
             trade_2,
             &cqrs,
             &assets,
-            true,
         )
         .await;
 
@@ -13051,7 +13704,6 @@ mod tests {
             trade_1,
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -13066,7 +13718,6 @@ mod tests {
             trade_2,
             &cqrs,
             &assets,
-            true,
         )
         .await;
 
@@ -13122,7 +13773,6 @@ mod tests {
             trade_1,
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -13138,16 +13788,9 @@ mod tests {
             let trade_event = make_trade_event(log_index);
             let trade = test_trade_with_amount(float!(0.1), log_index);
 
-            process_queued_trade(
-                &MockExecutor::new(),
-                &trade_event,
-                trade,
-                &cqrs,
-                &assets,
-                true,
-            )
-            .await
-            .unwrap();
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+                .await
+                .unwrap();
         }
 
         assert_eq!(
@@ -13179,7 +13822,6 @@ mod tests {
             trade_1,
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -13195,7 +13837,6 @@ mod tests {
             trade_2,
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -14526,16 +15167,9 @@ mod tests {
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+            .await
+            .unwrap();
 
         let position = cqrs
             .position_projection
@@ -14697,17 +15331,11 @@ mod tests {
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
 
-        let offchain_order_id = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap()
-        .expect("a failed placement still reports the order id");
+        let offchain_order_id =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+                .await
+                .unwrap()
+                .expect("a failed placement still reports the order id");
 
         let position = cqrs
             .position_projection
@@ -14856,16 +15484,9 @@ mod tests {
 
         let trade = test_trade_with_amount(float!("1.5"), 60);
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+            .await
+            .unwrap();
 
         let trade_id = OnChainTradeId {
             chain: Chain::Base,
@@ -16671,7 +17292,6 @@ mod tests {
                         test_trade_with_amount(float!(1.5), index),
                         &cqrs,
                         &assets,
-                        true,
                     )
                     .await
                     .unwrap(),
@@ -16784,7 +17404,6 @@ mod tests {
                 test_trade_with_amount(float!(1.5), 90),
                 &cqrs,
                 &assets,
-                true,
             ),
         )
         .await

@@ -8,12 +8,10 @@
 mod job;
 mod manager;
 
-#[cfg(test)]
-pub(crate) use job::UsdcGuardRelease;
 pub(crate) use job::{
-    DurableCheckedGuardRelease, PreflightAlertGate, ResumeAlpacaToBase, ResumeBaseToAlpaca,
-    TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToHedgingJobQueue,
-    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, TransferUsdcToMarketMakingJobQueue,
+    ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
+    TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
+    TransferUsdcToMarketMakingJobQueue,
 };
 pub use manager::{CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams};
 pub(crate) use manager::{RecheckUsdcDeposit, UsdcRecheckError, u256_to_usdc};
@@ -76,6 +74,27 @@ pub enum UsdcTransferError {
     BurnRevert(Box<CctpError>),
     #[error("Vault error: {0}")]
     Vault(#[from] RaindexError),
+    /// A fail-closed lookup for a durably recorded `WithdrawalSubmitting`
+    /// transfer could not determine whether the withdrawal mined. Transient
+    /// transport failures and inconclusive scans delayed-redrive without
+    /// consuming the Apalis retry budget; formal RPC rejections and other
+    /// deterministic failures remain [`Self::Vault`].
+    ///
+    /// `initiated_at` is the durable `WithdrawalSubmitting.initiated_at`
+    /// timestamp, threaded here so the job handler computes a durable deadline:
+    /// before the deadline the redrive is silent; at or after it the operator is
+    /// paged (guard held, redrive continues at a slower cadence) so an
+    /// indefinitely-inconclusive scan cannot redrive forever unnoticed.
+    #[error(
+        "USDC rebalance {id}: vault withdrawal scan inconclusive or failed \
+         transiently; will retry after delay"
+    )]
+    WithdrawalScanTransient {
+        id: UsdcRebalanceId,
+        initiated_at: DateTime<Utc>,
+        #[source]
+        source: Box<RaindexError>,
+    },
     /// The shared inventory reverted a `withdraw4` because the vault could not
     /// cover the requested amount (a concurrent clear drained it). Distinct from
     /// the opaque `Vault` wrap so it is not redriven blindly: retrying the same
@@ -305,101 +324,42 @@ pub enum UsdcTransferError {
     WithdrawalRefMustBeAlpacaId {
         id: crate::usdc_rebalance::UsdcRebalanceId,
     },
+    /// An AlpacaToBase withdrawal has no tx hash to credit the delivered USDC
+    /// from: a legacy aggregate, or Alpaca never reported the hash before the
+    /// settlement deadline. The manager moves the aggregate to `BridgingFailed`.
     #[error(
-        "USDC rebalance {id}: market-maker Ethereum wallet balance {current} \
-         has not increased above preflight baseline {baseline} \
-         (nominal amount: {nominal}); waiting for withdrawal to settle on-chain"
+        "USDC rebalance {id}: no recorded withdrawal tx hash; cannot credit \
+         Ethereum USDC to the Alpaca withdrawal"
     )]
-    WalletUsdcInsufficient {
-        id: UsdcRebalanceId,
-        nominal: Usdc,
-        current: U256,
-        baseline: U256,
-    },
-    /// A legacy AlpacaToBase aggregate reached settlement without the exact
-    /// preflight Ethereum wallet balance. Any current balance may include
-    /// tolerated ambient dust, so no amount can be safely attributed to the
-    /// withdrawal. The manager moves the aggregate to `BridgingFailed`.
-    #[error(
-        "USDC rebalance {id}: persisted preflight wallet balance is missing; \
-         cannot attribute Ethereum USDC to the Alpaca withdrawal"
-    )]
-    MissingPreflightBalance { id: UsdcRebalanceId },
-    /// The Ethereum wallet balance increased by more than the nominal
-    /// withdrawal after the persisted preflight baseline. USDC arriving after
-    /// preflight cannot be distinguished from this withdrawal's funds. The
+    WithdrawalTxMissing { id: UsdcRebalanceId },
+    /// The withdrawal tx paid the market-maker wallet nothing, or more than
+    /// the nominal withdrawal, so it is not this withdrawal's delivery. The
     /// aggregate is moved to `BridgingFailed` for operator reconciliation; no
     /// burn is attempted.
     #[error(
-        "USDC rebalance {id}: market-maker wallet holds {balance} USDC and its \
-         increase from the preflight baseline exceeds nominal {nominal}; \
-         ambient/residual USDC detected; failed for operator reconciliation"
+        "USDC rebalance {id}: withdrawal tx {tx} credited {credited} base units to \
+         the market-maker wallet against nominal {nominal}; failed for operator \
+         reconciliation"
     )]
-    WalletUsdcAmbientBalance {
+    WithdrawalCreditMismatch {
         id: UsdcRebalanceId,
-        balance: Usdc,
+        tx: TxHash,
+        credited: U256,
         nominal: Usdc,
     },
-    /// The market-maker wallet holds more than the tolerated 0.01 USDC dust
-    /// ceiling before the Alpaca leg starts, so the transfer refuses before
-    /// conversion. No cash leaves Alpaca and no aggregate event is emitted.
-    /// Unlike [`Self::WalletUsdcAmbientBalance`] (settlement time, aggregate
-    /// moved to `BridgingFailed`, guard cleared by the terminal event), this
-    /// refusal has no aggregate, so the job layer must release the in-progress
-    /// guard itself and alert the operator to sweep the wallet.
-    ///
-    /// A balance at or below 0.01 USDC is accepted and persisted as the exact
-    /// settlement baseline. Settlement burns only the later wallet increase,
-    /// leaving the baseline untouched. The threshold raises the cost of
-    /// pre-flight nuisance dusting; it does not prevent hostile transfers after
-    /// the baseline read.
+    /// The withdrawal tx receipt was read, but its USDC credit cannot be
+    /// computed (an undecodable Transfer log, or a sum that overflows). A reread
+    /// cannot change the receipt, so the aggregate is moved to `BridgingFailed`
+    /// for operator reconciliation; no burn is attempted.
     #[error(
-        "cannot start Alpaca->Base rebalance {id}: market-maker wallet \
-         already holds {balance} USDC before the withdrawal (nominal \
-         {nominal}), exceeding the 0.01 USDC dust ceiling; sweep the wallet, \
-         the transfer was refused before any Alpaca call"
+        "USDC rebalance {id}: USDC credit of withdrawal tx {tx} cannot be computed; \
+         failed for operator reconciliation"
     )]
-    WalletUsdcAmbientPreflight {
+    WithdrawalCreditUnreadable {
         id: UsdcRebalanceId,
-        balance: Usdc,
-        nominal: Usdc,
-    },
-    /// [`Self::WalletUsdcAmbientPreflight`]'s sibling for a non-zero balance
-    /// so extreme it cannot be represented as [`Usdc`]: the wallet provably
-    /// holds ambient USDC (the established fact), so this stays an ambient
-    /// REFUSAL -- page the operator, release the guard, never redrive --
-    /// rather than rerouting to the warn-only
-    /// [`Self::PreflightBalanceUnavailable`] ("could not be determined",
-    /// which would be false) just because the display conversion failed.
-    /// Near-impossible to hit; when it fires, the strongest evidence of the
-    /// invariant break must get the loudest response.
-    #[error(
-        "cannot start Alpaca->Base rebalance {id}: market-maker wallet \
-         already holds ambient USDC (raw balance {raw}) too large to \
-         represent for display; wallet-empty invariant cannot hold at burn \
-         time -- sweep the wallet, the transfer was refused before any \
-         Alpaca call"
-    )]
-    WalletUsdcAmbientPreflightUnrepresentable {
-        id: UsdcRebalanceId,
-        raw: U256,
-        source: Box<Self>,
-    },
-    /// The pre-flight wallet balance could not be determined (RPC read
-    /// failed, or the returned balance did not decode) before the transfer
-    /// started: no Alpaca call was made and no aggregate exists. Distinct
-    /// from [`Self::SettlementCheckTransient`], whose contract assumes a
-    /// durable post-withdrawal aggregate to redrive against; here there is
-    /// nothing to redrive, so the worker releases the guard (durable-state
-    /// checked) and the trigger re-attempts on its next cycle.
-    #[error(
-        "cannot start Alpaca->Base rebalance {id}: pre-flight wallet balance \
-         could not be determined before any Alpaca call; the trigger retries \
-         on its next cycle"
-    )]
-    PreflightBalanceUnavailable {
-        id: UsdcRebalanceId,
-        source: Box<Self>,
+        tx: TxHash,
+        #[source]
+        source: Box<CctpError>,
     },
     /// The retryable settlement wait outlived the configured settlement
     /// retry deadline (anchored on the durable `WithdrawalComplete`
@@ -561,13 +521,11 @@ impl UsdcTransferError {
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
-            | Self::WalletUsdcInsufficient { .. }
-            | Self::MissingPreflightBalance { .. }
-            | Self::WalletUsdcAmbientBalance { .. }
-            | Self::WalletUsdcAmbientPreflight { .. }
-            | Self::WalletUsdcAmbientPreflightUnrepresentable { .. }
-            | Self::PreflightBalanceUnavailable { .. }
+            | Self::WithdrawalTxMissing { .. }
+            | Self::WithdrawalCreditMismatch { .. }
+            | Self::WithdrawalCreditUnreadable { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
+            | Self::WithdrawalScanTransient { .. }
             | Self::SettlementCheckTransient { .. }
             | Self::MintRecoveryInconclusive { .. }
             | Self::BurnRecordTaskFailed { .. }
@@ -618,14 +576,12 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }
             | Self::WithdrawalRefMustBeAlpacaId { .. }
-            | Self::WalletUsdcInsufficient { .. }
-            | Self::MissingPreflightBalance { .. }
-            | Self::WalletUsdcAmbientBalance { .. }
-            | Self::WalletUsdcAmbientPreflight { .. }
-            | Self::WalletUsdcAmbientPreflightUnrepresentable { .. }
-            | Self::PreflightBalanceUnavailable { .. }
+            | Self::WithdrawalTxMissing { .. }
+            | Self::WithdrawalCreditMismatch { .. }
+            | Self::WithdrawalCreditUnreadable { .. }
             | Self::SettlementRetryDeadlineElapsed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
+            | Self::WithdrawalScanTransient { .. }
             | Self::SettlementCheckTransient { .. }
             | Self::MintRecoveryInconclusive { .. }
             | Self::BurnRecordTaskFailed { .. }

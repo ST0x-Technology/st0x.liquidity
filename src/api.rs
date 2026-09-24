@@ -1062,7 +1062,9 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
         };
 
         match event {
-            VaultWithdrawPending { quantity, .. } | VaultWithdrawSubmitted { quantity, .. } => {
+            VaultWithdrawPending { quantity, .. }
+            | VaultWithdrawSubmitting { quantity, .. }
+            | VaultWithdrawSubmitted { quantity, .. } => {
                 requested_quantity = requested_quantity
                     .or_else(|| Some(FractionalShares::new(quantity).to_string()));
             }
@@ -1575,6 +1577,7 @@ fn fail_transfer_error_response(error: &FailTransferError) -> (StatusCode, Strin
         InvalidMintId, InvalidReason, InvalidRedemptionId, MintAlreadyCompleted, MintAlreadyFailed,
         MintAlreadyReconciled, MintNotFound, MintStore, RedemptionAlreadyCompleted,
         RedemptionAlreadyFailed, RedemptionAlreadyReconciled, RedemptionNotFound, RedemptionStore,
+        RedemptionSubmissionUnresolved,
     };
 
     match error {
@@ -1587,7 +1590,10 @@ fn fail_transfer_error_response(error: &FailTransferError) -> (StatusCode, Strin
         | MintAlreadyReconciled(_)
         | RedemptionAlreadyCompleted(_)
         | RedemptionAlreadyFailed(_)
-        | RedemptionAlreadyReconciled(_) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        | RedemptionAlreadyReconciled(_)
+        | RedemptionSubmissionUnresolved(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
         MintStore(source) if is_failure_command_refusal(source) => {
             (StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
         }
@@ -2373,13 +2379,13 @@ async fn reconcile_equity_transfer(
                         }),
                     )
                 })?;
-            if !entity.is_failed() {
+            if !entity.is_operator_reconcilable() {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
                         error: format!(
-                            "Redemption {id} is not in the Failed state; reconcile only resolves \
-                             a Failed terminal."
+                            "Redemption {id} is not reconcilable; reconcile resolves a \
+                             Failed terminal or an unresolved vault-withdrawal submission."
                         ),
                     }),
                 ));
@@ -2625,8 +2631,13 @@ enum ProcessTxOutcomeResponse {
     AlreadyAccounted,
     PendingHedgeInFlight,
     BelowExecutionThreshold,
-    TradingDisabled {
+    ExcludedFromHedging {
         symbol: String,
+        chain: String,
+        detail: String,
+    },
+    AlreadyExcluded {
+        detail: String,
     },
     PlacementRejected {
         symbol: String,
@@ -2664,9 +2675,16 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
             ProcessTxOutcome::AlreadyAccounted => Self::AlreadyAccounted,
             ProcessTxOutcome::PendingHedgeInFlight => Self::PendingHedgeInFlight,
             ProcessTxOutcome::BelowExecutionThreshold => Self::BelowExecutionThreshold,
-            ProcessTxOutcome::TradingDisabled { symbol } => Self::TradingDisabled {
+            ProcessTxOutcome::ExcludedFromHedging {
+                symbol,
+                chain,
+                detail,
+            } => Self::ExcludedFromHedging {
                 symbol: symbol.to_string(),
+                chain: chain.to_string(),
+                detail,
             },
+            ProcessTxOutcome::AlreadyExcluded { detail } => Self::AlreadyExcluded { detail },
             ProcessTxOutcome::PlacementRejected { symbol } => Self::PlacementRejected {
                 symbol: symbol.to_string(),
             },
@@ -6775,7 +6793,7 @@ mod tests {
     }
 
     /// Seeds an `EquityRedemption` into the terminal `Failed` state via
-    /// `Redeem` then `FailTransfer`.
+    /// `Redeem`, `RecordWithdrawSubmission`, then `FailTransfer`.
     async fn seed_redemption_failed(pool: &SqlitePool, id: &RedemptionAggregateId) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
@@ -6789,7 +6807,19 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(10),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1000u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
@@ -6805,9 +6835,9 @@ mod tests {
             .unwrap();
     }
 
-    /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawPending`
-    /// state (redeem requested but not failed).
-    async fn seed_redemption_pending(pool: &SqlitePool, id: &RedemptionAggregateId) {
+    /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawSubmitting`
+    /// origin (exact withdrawal signed and persisted, not yet broadcast).
+    async fn seed_redemption_submitting(pool: &SqlitePool, id: &RedemptionAggregateId) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
             .await
@@ -6820,7 +6850,29 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(10),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1000u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seeds an `EquityRedemption` into the non-terminal, non-reconcilable
+    /// `VaultWithdrawSubmitted` state (withdrawal broadcast, awaiting confirmation).
+    async fn seed_redemption_submitted(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        seed_redemption_submitting(pool, id).await;
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
@@ -7072,25 +7124,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_equity_transfer_rejects_a_non_failed_redemption() {
+    async fn reconcile_equity_transfer_reconciles_a_submitting_redemption() {
+        // The one in-flight state with no automatic exit: an operator who
+        // verified the withdrawal's on-chain fate reconciles it out-of-band.
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
-        let id = redemption_aggregate_id("api-redemption-non-failed");
-        seed_redemption_pending(&state.pool, &id).await;
+        let id = redemption_aggregate_id("api-redemption-submitting");
+        seed_redemption_submitting(&state.pool, &id).await;
 
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
-                reason: "handled out-of-band".to_string(),
+                reason: "withdrawal never broadcast; verified on-chain".to_string(),
             }),
         )
         .await;
 
-        let Err((status, _)) = resp else {
-            panic!("expected an error response");
+        let Ok(Json(_)) = resp else {
+            panic!("a stuck submitting redemption must reconcile");
         };
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "the redemption must land in the Reconciled terminal, got {entity:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_reconciles_a_submitted_redemption() {
+        // A broadcast withdrawal (`VaultWithdrawSubmitted`) may still be live
+        // onchain and is never failed automatically, so an operator who verified
+        // it will never land reconciles it out of band, like the submitting origin.
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = redemption_aggregate_id("api-redemption-submitted-reconcile");
+        seed_redemption_submitted(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "withdrawal outrun by fees; verified dead onchain".to_string(),
+            }),
+        )
+        .await;
+
+        let Ok(Json(_)) = resp else {
+            panic!("a stuck submitted redemption must reconcile");
+        };
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "the redemption must land in the Reconciled terminal, got {entity:?}",
+        );
     }
 
     #[tokio::test]
@@ -7491,6 +7584,49 @@ mod tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
+    /// A fill kept out of hedging must reach the operator with its cover
+    /// detail, whether this run excluded it or an earlier one did.
+    #[test]
+    fn process_tx_response_serializes_the_exclusion_outcomes() {
+        let cases = [
+            (
+                ProcessTxOutcome::ExcludedFromHedging {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
+                    detail: "cover by SELL".to_string(),
+                },
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "excluded_from_hedging",
+                    "symbol": "AAPL",
+                    "chain": "base",
+                    "detail": "cover by SELL",
+                }),
+            ),
+            (
+                ProcessTxOutcome::AlreadyExcluded {
+                    detail: "cover by SELL".to_string(),
+                },
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "already_excluded",
+                    "detail": "cover by SELL",
+                }),
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            let report = ProcessTxReport {
+                fill: None,
+                outcome,
+            };
+            assert_eq!(
+                serde_json::to_value(ProcessTxResponse::try_from(report).unwrap()).unwrap(),
+                expected,
+            );
+        }
+    }
+
     /// Every domain report must retain its fill identity and outcome across the API boundary.
     #[test]
     fn process_tx_response_serializes_each_mapped_outcome() {
@@ -7565,19 +7701,6 @@ mod tests {
                 serde_json::json!({
                     "fill": fill_json,
                     "outcome": "below_execution_threshold",
-                }),
-            ),
-            (
-                ProcessTxReport {
-                    fill: Some(fill()),
-                    outcome: ProcessTxOutcome::TradingDisabled {
-                        symbol: Symbol::new("AAPL").unwrap(),
-                    },
-                },
-                serde_json::json!({
-                    "fill": fill_json,
-                    "outcome": "trading_disabled",
-                    "symbol": "AAPL",
                 }),
             ),
             (
