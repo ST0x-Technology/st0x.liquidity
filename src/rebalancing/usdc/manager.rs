@@ -6,6 +6,7 @@
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use chrono::{DateTime, Utc};
+use itertools::Itertools;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use crate::rebalancing::equity::RecheckOutcome;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, EthereumWalletCredit, RebalanceDirection, TransferRef, UsdcRebalance,
-    UsdcRebalanceCommand, UsdcRebalanceId, open_ethereum_credits,
+    UsdcRebalanceCommand, UsdcRebalanceId, open_ethereum_credits, withdrawal_tx_recorded_elsewhere,
 };
 
 /// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
@@ -416,6 +417,33 @@ impl std::fmt::Display for MintScanCallSite {
     }
 }
 
+/// Pages when open transfers recorded the same withdrawal tx: it paid only one
+/// of them. Two transfers confirming it at the same moment can both pass the
+/// check at `ConfirmWithdrawal`.
+fn page_shared_withdrawal_txs(credits: &[(UsdcRebalanceId, EthereumWalletCredit)]) {
+    let transfers_by_tx = credits
+        .iter()
+        .filter_map(|(credit_id, credit)| match credit {
+            EthereumWalletCredit::Delivering { withdrawal_tx, .. } => {
+                Some((*withdrawal_tx, credit_id))
+            }
+            EthereumWalletCredit::Held(_) | EthereumWalletCredit::InFlight(_) => None,
+        })
+        .into_group_map();
+
+    for (withdrawal_tx, transfers) in transfers_by_tx {
+        if transfers.len() > 1 {
+            error!(
+                target: "operational_alert",
+                alert = true,
+                %withdrawal_tx,
+                ?transfers,
+                "Open USDC transfers share one Alpaca withdrawal tx; it paid only one of them"
+            );
+        }
+    }
+}
+
 /// Pages the operator about a latched `BridgingFailed` whose consumed nonce's
 /// mint the bot cannot find.
 fn alert_unresolvable_mint(id: &UsdcRebalanceId, reason: &str) {
@@ -663,6 +691,8 @@ impl<
                 return CreditLedgerCheck::Unavailable;
             }
         };
+
+        page_shared_withdrawal_txs(&credits);
 
         // Read before the balance, so a withdrawal counted as held is in it.
         let mut resolved = Vec::with_capacity(credits.len());
@@ -2872,6 +2902,9 @@ impl<
             }
         };
 
+        self.refuse_withdrawal_tx_recorded_elsewhere(id, withdrawal_tx)
+            .await?;
+
         // Advance the aggregate to WithdrawalComplete NOW, before the on-chain
         // confirmation-depth check below. This is intentional: if the confirmation
         // wait returns early (tx not yet mined or under-confirmed), the aggregate is
@@ -2951,6 +2984,66 @@ impl<
         }
 
         Ok(withdrawal_tx)
+    }
+
+    /// Fails the transfer for reconciliation when another transfer already
+    /// recorded `withdrawal_tx`: it cannot be this withdrawal's delivery. The
+    /// tx is not recorded on this transfer. Skipped when the ledger pool is
+    /// not wired.
+    async fn refuse_withdrawal_tx_recorded_elsewhere(
+        &self,
+        id: &UsdcRebalanceId,
+        withdrawal_tx: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        let CreditLedger::Wired(pool) = &self.credit_ledger else {
+            debug!(target: "rebalance", %id, "Event store not wired; skipping the withdrawal tx uniqueness check");
+            return Ok(());
+        };
+
+        let Some(recorded_by) = withdrawal_tx_recorded_elsewhere(pool, id, withdrawal_tx)
+            .await
+            .map_err(|source| UsdcTransferError::WithdrawalTxLookupFailed {
+                id: id.clone(),
+                source,
+            })?
+        else {
+            return Ok(());
+        };
+
+        error!(
+            target: "rebalance",
+            %id,
+            %withdrawal_tx,
+            %recorded_by,
+            "Alpaca withdrawal tx is already recorded by another USDC transfer; failing for \
+             operator reconciliation"
+        );
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: format!(
+                        "withdrawal tx {withdrawal_tx} is already recorded by USDC rebalance \
+                         {recorded_by}; settle the withdrawn funds with \
+                         `transfer reconcile --kind usdc`"
+                    ),
+                },
+            )
+            .await?;
+
+        Err(UsdcTransferError::WithdrawalTxAlreadyRecorded {
+            id: id.clone(),
+            tx: withdrawal_tx,
+            recorded_by,
+        })
     }
 
     /// Alpaca reported the withdrawal Complete with no tx hash. Before the

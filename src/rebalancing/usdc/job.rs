@@ -1553,6 +1553,23 @@ impl TransferUsdcToMarketMaking {
                 );
                 deliver_market_making_alert(&ctx.notifier, &message, "withdrawal-credit").await;
             }
+            // Another transfer recorded this withdrawal tx. The aggregate has
+            // already moved to BridgingFailed via FailBridging.
+            Err(error @ UsdcTransferError::WithdrawalTxAlreadyRecorded { .. }) => {
+                error!(
+                    target: "rebalance",
+                    id = %self.id,
+                    %error,
+                    "Alpaca->Base USDC transfer failed: withdrawal tx already recorded by \
+                     another transfer; bridge marked failed for operator reconciliation"
+                );
+                let message = format!(
+                    "{error}. Bridge marked failed; settle the withdrawn funds with \
+                     `transfer reconcile --kind usdc`."
+                );
+                deliver_market_making_alert(&ctx.notifier, &message, "duplicate-withdrawal-tx")
+                    .await;
+            }
             Err(UsdcTransferError::WithdrawalTxMissing { id }) => {
                 error!(
                     target: "rebalance",

@@ -354,6 +354,17 @@ pub enum UsdcTransferError {
         /// The other aggregate's id as persisted in the event store.
         recorded_by: String,
     },
+    /// The event store could not be read to check that no other transfer
+    /// recorded the withdrawal tx. The aggregate stays `Withdrawing`, so a
+    /// retry re-polls the same Alpaca transfer.
+    #[error(
+        "USDC rebalance {id}: could not check whether another transfer recorded its withdrawal tx"
+    )]
+    WithdrawalTxLookupFailed {
+        id: UsdcRebalanceId,
+        #[source]
+        source: sqlx::Error,
+    },
     /// The withdrawal tx receipt was read, but its USDC credit cannot be
     /// computed (an undecodable Transfer log, or a sum that overflows). A reread
     /// cannot change the receipt, so the aggregate is moved to `BridgingFailed`
@@ -578,6 +589,7 @@ impl UsdcTransferError {
             | Self::WithdrawalCreditMismatch { .. }
             | Self::WithdrawalCreditUnreadable { .. }
             | Self::WithdrawalTxAlreadyRecorded { .. }
+            | Self::WithdrawalTxLookupFailed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::WithdrawalScanTransient { .. }
             | Self::SettlementCheckTransient { .. }
@@ -635,6 +647,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::WithdrawalCreditMismatch { .. }
             | Self::WithdrawalCreditUnreadable { .. }
             | Self::WithdrawalTxAlreadyRecorded { .. }
+            | Self::WithdrawalTxLookupFailed { .. }
             | Self::SettlementRetryDeadlineElapsed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::WithdrawalScanTransient { .. }
