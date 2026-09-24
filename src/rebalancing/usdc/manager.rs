@@ -12704,11 +12704,17 @@ mod tests {
     /// Drives a real BaseToAlpaca transfer to `Attested`, minting it on chain
     /// when `mint_landed`, then rebuilds its attestation as a legacy transfer
     /// (no persisted envelope) while Circle answers the re-poll with a
-    /// malformed response. Returns the rebuild error, the aggregate id, and the
-    /// state the aggregate is left in.
+    /// malformed response. Returns the rebuild error, the aggregate id, the
+    /// state the aggregate is left in, and the transfer's burn tx and nonce.
     async fn legacy_attested_repoll_failure(
         mint_landed: bool,
-    ) -> (UsdcTransferError, UsdcRebalanceId, UsdcRebalance) {
+    ) -> (
+        UsdcTransferError,
+        UsdcRebalanceId,
+        UsdcRebalance,
+        TxHash,
+        B256,
+    ) {
         let chains = deploy_dual_chain_cctp().await;
 
         let attestation = CctpAttestationMock::start().await;
@@ -12847,7 +12853,7 @@ mod tests {
 
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
 
-        (error, id, state)
+        (error, id, state, burn.tx, attestation_response.nonce())
     }
 
     /// A legacy `Attested` transfer whose mint landed but whose Circle re-poll
@@ -12857,7 +12863,8 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn legacy_attested_repeating_repoll_failure_latches_a_landed_mint_for_reconciliation() {
-        let (error, id, state) = Box::pin(legacy_attested_repoll_failure(true)).await;
+        let (error, id, state, burn_tx, nonce) =
+            Box::pin(legacy_attested_repoll_failure(true)).await;
 
         let UsdcTransferError::Cctp(cctp_error) = error else {
             panic!("a repeating re-poll failure must not redrive, got: {error:?}");
@@ -12874,8 +12881,8 @@ mod tests {
         else {
             panic!("the transfer must latch BridgingFailed for reconciliation, got: {state:?}");
         };
-        assert!(burn_tx_hash.is_some(), "got: {state:?}");
-        assert!(cctp_nonce.is_some(), "got: {state:?}");
+        assert_eq!(*burn_tx_hash, Some(burn_tx), "got: {state:?}");
+        assert_eq!(*cctp_nonce, Some(nonce), "got: {state:?}");
         assert!(state.is_reconcilable_failure(), "got: {state:?}");
         assert!(logs_contain("operational_alert"));
         assert!(logs_contain(&format!(
@@ -12930,7 +12937,7 @@ mod tests {
     /// bridge as before: nothing was minted.
     #[tokio::test]
     async fn legacy_attested_repoll_failure_fails_the_bridge_while_the_nonce_is_unused() {
-        let (error, _, state) = Box::pin(legacy_attested_repoll_failure(false)).await;
+        let (error, _, state, _, _) = Box::pin(legacy_attested_repoll_failure(false)).await;
 
         let UsdcTransferError::Cctp(cctp_error) = error else {
             panic!("a failed re-poll with an unused nonce must fail the bridge, got: {error:?}");
@@ -18900,12 +18907,17 @@ mod tests {
             panic!("the transfer must latch BridgingFailed for reconciliation, got: {state:?}");
         };
         assert_eq!(*failed_direction, direction);
-        assert!(
-            burn_tx_hash.is_some(),
+        // Both staging helpers record this burn tx and `valid_message_nonce()`.
+        assert_eq!(
+            *burn_tx_hash,
+            Some(fixed_bytes!(
+                "0xaaaa000000000000000000000000000000000000000000000000000000000001"
+            )),
             "the burn must be kept, got: {state:?}"
         );
-        assert!(
-            cctp_nonce.is_some(),
+        assert_eq!(
+            *cctp_nonce,
+            Some(valid_message_nonce()),
             "the nonce must be kept, got: {state:?}"
         );
         assert!(
