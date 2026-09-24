@@ -1080,20 +1080,57 @@ impl<
             Ok(response) => response,
             Err(error) => {
                 warn!(target: "rebalance", %id, ?error, "Reconstructing attestation from the persisted envelope failed");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("attestation reconstruction failed: {error}"),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcTransferError::Cctp(Box::new(error)));
+                let reason = format!("attestation reconstruction failed: {error}");
+                return Err(self
+                    .latch_unmintable_message(id, mint_direction, burn_tx, reason, error)
+                    .await);
             }
         };
 
         self.require_recorded_nonce(id, mint_direction, burn_tx, response, cctp_nonce)
             .await
+    }
+
+    /// Latches a post-burn `BridgingFailed` for a recorded CCTP message that
+    /// cannot mint, so the nonce state is unread. An AlpacaToBase latch pages:
+    /// its retry finds the transfer failed and does not alert. A BaseToAlpaca
+    /// retry re-polls Circle through the post-burn `BridgingFailed` recovery.
+    async fn latch_unmintable_message(
+        &self,
+        id: &UsdcRebalanceId,
+        mint_direction: BridgeDirection,
+        burn_tx: TxHash,
+        reason: String,
+        error: CctpError,
+    ) -> UsdcTransferError {
+        if let Err(send_error) = self
+            .cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: reason.clone(),
+                },
+            )
+            .await
+        {
+            return send_error.into();
+        }
+
+        match mint_direction {
+            BridgeDirection::EthereumToBase => error!(
+                target: "operational_alert",
+                alert = true,
+                %id,
+                %burn_tx,
+                "USDC transfer {id}: the recorded CCTP message cannot mint on Base ({reason}). \
+                 Bridge marked failed; get the Circle attestation for burn tx {burn_tx} and \
+                 mint it on Base (if its nonce is already used, find that mint instead), then \
+                 settle it with `transfer reconcile --kind usdc`."
+            ),
+            BridgeDirection::BaseToEthereum => {}
+        }
+
+        UsdcTransferError::Cctp(Box::new(error))
     }
 
     /// Returns `response` only if its nonce is the recorded `cctp_nonce`.
