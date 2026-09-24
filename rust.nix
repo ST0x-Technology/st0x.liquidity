@@ -66,6 +66,8 @@ let
         "sha256-1YaWG9nrjIZq2zbA6vsTlriABrvKAavJLKaekGE1fQs=";
       "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.3.0#563f82511309dc30910ea40da1975edd0ef37736" =
         "sha256-DN/5I45GOMobUSAvBwJPGCWD1LuEQdIWJnNZQ/D6GKk=";
+      "git+https://github.com/ST0x-Technology/st0x.alpaca?tag=v0.1.0#c44f6e726486c1b6ab6c63330013f42e7fb2b13c" =
+        "sha256-qyFnW76Sq4Fgw7g0M3oDkVBkUKmjM5osUURxiPRqgEQ=";
     };
 
     # st0x.issuance is a Solidity repo with a deep git submodule tree

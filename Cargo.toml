@@ -68,7 +68,6 @@ bon = "3.9.1"
 chrono = { version = "0.4.38", features = ["serde"] }
 chrono-tz = "0.10.4"
 clap = { version = "4.5.40", features = ["derive", "env"] }
-cqrs-es = "0.4"
 flate2 = "1.0"
 futures-util = "0.3.31"
 httpmock = "0.8"
@@ -101,6 +100,7 @@ sqlx = { version = "0.9.0", features = [
   "runtime-tokio",
   "tls-rustls",
 ] }
+st0x-alpaca = { git = "https://github.com/ST0x-Technology/st0x.alpaca", tag = "v0.1.0", version = "0.1.0", default-features = false }
 st0x-bridge = { path = "crates/bridge" }
 st0x-config = { path = "crates/config" }
 st0x-dto = { path = "crates/dto" }
@@ -285,6 +285,12 @@ p256 = { version = "0.13", default-features = false, features = [
 proptest.workspace = true
 rain-math-float.workspace = true
 regex = "1.12.3"
+reqwest_alpaca = { version = "0.13", package = "reqwest", default-features = false, features = [
+  "rustls",
+  "json",
+  "query",
+  "form",
+] }
 rsa.workspace = true
 serial_test.workspace = true
 st0x-bridge = { workspace = true, features = ["mock"] }

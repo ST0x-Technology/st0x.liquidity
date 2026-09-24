@@ -1,246 +1,79 @@
 use chrono::{NaiveDate, NaiveTime};
 use rain_math_float::Float;
 use rain_math_float::FloatError;
-use serde::Deserialize;
+use st0x_alpaca::broker::AlpacaMarketDataError;
 use st0x_finance::UsdcConversionError;
 use st0x_float_serde::format_float_with_fallback;
-use std::fmt;
-use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::alpaca_market_data::AlpacaMarketDataError;
 use crate::{
     AlpacaAmount, Backpressure, ClientOrderId, CounterTradeCostError, ExecutorOrderId,
-    FractionalShares, OrderFailureTerminality, Permanence, Positive, Symbol, Usd,
+    FractionalShares, Permanence, Positive, Symbol, Usd,
 };
-
-/// Time-in-force specifies how long an order remains active before it expires.
-///
-/// This is specific to Alpaca Broker API and configurable at the executor level.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TimeInForce {
-    /// Day order - expires at the end of the regular trading day
-    #[default]
-    Day,
-    /// Market-on-close - executes at or near the market close price.
-    /// Orders placed between 3:50pm-7:00pm ET are rejected.
-    /// Orders after 7pm ET are queued for the next trading day.
-    MarketOnClose,
-}
-
-mod activity;
 mod auth;
-mod client;
-mod executor;
-mod journal;
-pub(crate) mod kms_jwt;
-mod market_hours;
+mod shared_executor;
+
+pub use auth::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth};
+pub use shared_executor::AlpacaBrokerApi;
 #[cfg(feature = "mock")]
-mod mock_api;
-#[cfg(feature = "mock")]
-pub use mock_api::{
+pub use st0x_alpaca::broker::mock::{
     AlpacaBrokerMock, MockMode, MockOrderSnapshot, MockPosition, MockPositionSnapshot,
     MockWalletTransferSnapshot, OrderSide, OrderStatus, TEST_ACCOUNT_ID, TEST_API_KEY,
     TEST_API_SECRET, TransferDirection, TransferFlow, TransferStatus, WhitelistStatus,
 };
-mod order;
-mod positions;
-
-/// Asset status from Alpaca Broker API (public because it's exposed in error types)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AssetStatus {
-    Active,
-    Inactive,
-}
-
-pub use activity::{AccountActivitiesQuery, AccountActivity};
-pub use auth::{
-    AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaBrokerAuth,
+pub use st0x_alpaca::broker::{
+    AccountActivitiesQuery, AccountActivity, AccountStatus, AssetDetails, AssetStatus,
+    ConversionDirection, ConversionOrder, CryptoOrderFailureReason, CryptoOrderOutcome,
+    CryptoOrderResponse, DeadlineCancel, HTTP_REQUEST_TIMEOUT, JournalResponse, JournalStatus,
+    MissingOrderField, ParseTimeInForceError, TimeInForce,
 };
-// Exposed as the single source of truth for the broker HTTP request timeout so
-// timing-sensitive integration tests derive their boundaries from it.
-pub use client::HTTP_REQUEST_TIMEOUT;
+pub use st0x_alpaca::broker::{AlpacaLimitPrice, ParseAlpacaLimitPriceError};
+pub use st0x_alpaca::{ALPACA_TOKEN_URL, KmsJwtError};
 
-// Crate-visible so the market-data module can build authenticated
-// requests through the client instead of reaching for raw reqwest.
-pub(crate) use client::AlpacaBrokerApiClient;
+#[derive(Debug, Clone)]
+pub struct AlpacaLimitOrder {
+    pub symbol: Symbol,
+    pub shares: Positive<FractionalShares>,
+    pub direction: crate::Direction,
+    pub limit_price: AlpacaLimitPrice,
+    pub extended_hours: bool,
+    pub client_order_id: ClientOrderId,
+}
 
-// `AssetDetails` is the CLI's overnight/fractional asset-inspection surface.
-pub use executor::{AlpacaBrokerApi, AssetDetails};
-pub use journal::{JournalResponse, JournalStatus};
-pub use kms_jwt::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
-pub use order::{
-    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, ConversionOrder, CryptoOrderOutcome,
-    CryptoOrderResponse, ParseAlpacaLimitPriceError,
-};
+impl AlpacaBrokerApiCtx {
+    pub(crate) fn to_shared(&self) -> st0x_alpaca::broker::AlpacaBrokerApiCtx {
+        let mode = self.mode.clone().map(|mode| match mode {
+            AlpacaBrokerApiMode::Sandbox => st0x_alpaca::broker::AlpacaBrokerApiMode::Sandbox,
+            AlpacaBrokerApiMode::Production => st0x_alpaca::broker::AlpacaBrokerApiMode::Production,
+            #[cfg(any(test, feature = "mock"))]
+            AlpacaBrokerApiMode::Mock(url) => st0x_alpaca::broker::AlpacaBrokerApiMode::Mock(url),
+        });
 
-impl fmt::Display for CryptoOrderFailureReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Canceled => formatter.write_str("Canceled"),
-            Self::Expired => formatter.write_str("Expired"),
-            Self::Rejected => formatter.write_str("Rejected"),
-            Self::DoneForDay => formatter.write_str("DoneForDay"),
-            Self::Replaced => formatter.write_str("Replaced"),
-            Self::Suspended => formatter.write_str("Suspended"),
-            Self::Calculated => formatter.write_str("Calculated"),
+        st0x_alpaca::broker::AlpacaBrokerApiCtx {
+            auth: self.auth.clone(),
+            account_id: self.account_id,
+            mode,
+            asset_cache_ttl: self.asset_cache_ttl,
+            time_in_force: self.time_in_force,
         }
     }
-}
 
-impl fmt::Display for TimeInForce {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Day => write!(f, "day"),
-            Self::MarketOnClose => write!(f, "market-on-close"),
-        }
+    pub async fn fetch_account_activities(
+        &self,
+        query: &AccountActivitiesQuery,
+    ) -> Result<Vec<AccountActivity>, AlpacaBrokerApiError> {
+        Ok(self.to_shared().fetch_account_activities(query).await?)
     }
-}
-
-#[derive(Debug, Error)]
-#[error("invalid time-in-force: {time_in_force_provided}")]
-pub struct ParseTimeInForceError {
-    time_in_force_provided: String,
-}
-
-impl FromStr for TimeInForce {
-    type Err = ParseTimeInForceError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "day" => Ok(Self::Day),
-            "market-on-close" | "market_on_close" | "cls" => Ok(Self::MarketOnClose),
-            _ => Err(ParseTimeInForceError {
-                time_in_force_provided: value.to_string(),
-            }),
-        }
-    }
-}
-
-impl TimeInForce {
-    /// Returns the API string representation for this time-in-force value.
-    pub(crate) fn as_api_str(self) -> &'static str {
-        match self {
-            Self::Day => "day",
-            Self::MarketOnClose => "cls",
-        }
-    }
-}
-
-/// Terminal failure states for crypto orders.
-///
-/// Every non-fill terminal `BrokerOrderStatus` maps to one of these so the
-/// conversion resume path never treats an unexpected terminal status as
-/// still-pending (which would retry forever).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CryptoOrderFailureReason {
-    Canceled,
-    Expired,
-    Rejected,
-    DoneForDay,
-    Replaced,
-    Suspended,
-    Calculated,
-}
-
-impl CryptoOrderFailureReason {
-    /// Whether the order can still resume or fill after reporting this
-    /// failure, per Alpaca's order lifecycle
-    /// (https://docs.alpaca.markets/docs/orders-at-alpaca).
-    ///
-    /// The single source for both terminality decisions in this crate: whether
-    /// a caller may release its idempotency key (`classify_broker_status`) and
-    /// whether a conversion poll may stop waiting. Deriving both from here is
-    /// what keeps them from drifting apart -- a `Replaced`/`Suspended`/
-    /// `Calculated` order that is treated as terminal is a rebalance recorded
-    /// as failed while the broker may still move real money.
-    ///
-    /// `DoneForDay` is terminal because every equity order this bot places is
-    /// Day time-in-force, so it cannot resume in a later session. That
-    /// precondition does not hold for the `gtc` conversion order, and Alpaca
-    /// documents no meaning for the status on a 24/7 crypto pair, so the
-    /// conversion poll overrides it (`CryptoOrderOutcome::terminal`) rather
-    /// than declare an order dead that may still fill.
-    fn terminality(self) -> OrderFailureTerminality {
-        match self {
-            Self::Canceled | Self::Expired | Self::Rejected | Self::DoneForDay => {
-                OrderFailureTerminality::Terminal
-            }
-            Self::Replaced | Self::Suspended | Self::Calculated => {
-                OrderFailureTerminality::NotTerminal
-            }
-        }
-    }
-}
-
-/// A field absent from a broker order response that the reported order
-/// status requires.
-///
-/// A closed enum (not a string) so call sites and tests cannot drift on
-/// spelling and new fields force exhaustive handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MissingOrderField {
-    ExtendedHours,
-    FilledQty,
-    Price,
-    PlacedAt,
-    FilledAt,
-    CanceledAt,
-    FailureTerminality,
-}
-
-/// How the broker answered the cancel issued when a conversion order stalls
-/// past its deadline.
-///
-/// Carried into [`AlpacaBrokerApiError::ConversionCancelNotSettled`] so the
-/// persisted failure reason states what actually happened to the remainder. A
-/// cancel that was never accepted leaves it live, which is a materially
-/// different reconciliation than one the broker took and simply never
-/// reported settled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeadlineCancel {
-    /// The broker accepted the cancel request.
-    Accepted,
-    /// The broker declined it as no longer cancelable (422), so no cancel took
-    /// effect and the order was already leaving the cancelable states.
-    Declined,
-    /// Every cancel request failed, so the remainder was never cancelled.
-    Failed,
-}
-
-impl DeadlineCancel {
-    /// The clause naming what became of the remainder, so a failure message
-    /// never claims a cancellation the broker did not accept.
-    fn clause(self) -> &'static str {
-        match self {
-            Self::Accepted => "its remainder was cancelled",
-            Self::Declined => "the broker declined to cancel its remainder as no longer cancelable",
-            Self::Failed => "its remainder was never successfully cancelled",
-        }
-    }
-}
-
-/// The real Alpaca 422 body for a re-used `client_order_id`: a numeric
-/// `code` alongside the message. Shared by `order.rs`'s unit tests and the
-/// `mock_api` E2E mock so both speak this exact shape instead of two
-/// fixtures drifting apart (a code-less mock would let an `alpaca_code`
-/// parsing regression pass unnoticed). `#[cfg(any(test, feature = "mock"))]`
-/// covers both consumers: `order.rs`'s tests compile under plain `cfg(test)`,
-/// `mock_api` only under the `mock` feature.
-#[cfg(any(test, feature = "mock"))]
-pub(crate) fn duplicate_client_order_id_body() -> serde_json::Value {
-    serde_json::json!({
-        "code": 40_010_001,
-        "message": "client_order_id must be unique",
-    })
 }
 
 #[derive(Debug, Error)]
 pub enum AlpacaBrokerApiError {
+    #[error(transparent)]
+    Shared(#[from] Box<st0x_alpaca::broker::AlpacaBrokerApiError>),
+    #[error(transparent)]
+    QuoteInvariant(#[from] crate::LatestQuoteError),
     #[error("HTTP client error: {0}")]
     HttpClient(#[from] reqwest::Error),
 
@@ -260,7 +93,7 @@ pub enum AlpacaBrokerApiError {
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
 
     #[error("keyless Alpaca auth failed: {0}")]
-    KmsJwt(#[from] kms_jwt::KmsJwtError),
+    KmsJwt(#[from] KmsJwtError),
 
     #[error("{}", format_api_error(*status, alpaca_code.as_ref(), message))]
     ApiError {
@@ -333,7 +166,11 @@ pub enum AlpacaBrokerApiError {
         "Conversion order {order_id} never reported a terminal state and may still be live \
          at the broker: {}, with {} filled when last observed -- manual reconciliation \
          required",
-        .cancel.clause(),
+        match .cancel {
+            DeadlineCancel::Accepted => "its remainder was cancelled",
+            DeadlineCancel::Declined => "the broker declined to cancel its remainder as no longer cancelable",
+            DeadlineCancel::Failed => "its remainder was never successfully cancelled",
+        },
         .filled_quantity
             .as_ref()
             .map_or_else(|| "an unreported quantity".to_string(), ToString::to_string)
@@ -473,6 +310,144 @@ pub enum AlpacaBrokerApiError {
     CounterTradeCost(#[from] CounterTradeCostError),
 }
 
+impl From<st0x_alpaca::broker::AlpacaBrokerApiError> for AlpacaBrokerApiError {
+    fn from(source: st0x_alpaca::broker::AlpacaBrokerApiError) -> Self {
+        use st0x_alpaca::broker::AlpacaBrokerApiError as Shared;
+
+        match source {
+            Shared::JsonParse(source) => Self::JsonParse(source),
+            Shared::AlpacaAmount(source) => Self::AlpacaAmount(source),
+            Shared::PositionSymbolMismatch {
+                requested,
+                returned,
+            } => Self::PositionSymbolMismatch {
+                requested,
+                returned,
+            },
+            Shared::InvalidHeader(source) => Self::InvalidHeader(source),
+            Shared::KmsJwt(source) => Self::KmsJwt(source),
+            Shared::ApiError {
+                status,
+                alpaca_code,
+                message,
+                retry_after,
+            } => Self::ApiError {
+                status,
+                alpaca_code,
+                message,
+                retry_after,
+            },
+            Shared::UsdConversionInsufficientBalance { source } => {
+                Self::UsdConversionInsufficientBalance {
+                    source: Box::new(Self::from(*source)),
+                }
+            }
+            Shared::InvalidOrderId(source) => Self::InvalidOrderId(source),
+            Shared::CryptoOrderFailed { order_id, reason } => {
+                Self::CryptoOrderFailed { order_id, reason }
+            }
+            Shared::IncompleteOrder { order_id, field } => Self::IncompleteOrder {
+                order_id: ExecutorOrderId::new(order_id.as_ref()),
+                field,
+            },
+            Shared::FilledQuantityMismatch {
+                order_id,
+                ordered,
+                filled,
+            } => Self::FilledQuantityMismatch {
+                order_id: ExecutorOrderId::new(order_id.as_ref()),
+                ordered,
+                filled,
+            },
+            Shared::AccountNotActive { account_id, status } => {
+                Self::AccountNotActive { account_id, status }
+            }
+            Shared::DuplicateOrderNotFound { client_order_id } => {
+                let client_order_id = match client_order_id {
+                    st0x_alpaca::broker::ClientOrderId::Automated(id) => {
+                        ClientOrderId::Automated(id)
+                    }
+                    st0x_alpaca::broker::ClientOrderId::Cli(id) => ClientOrderId::Cli(id),
+                };
+                Self::DuplicateOrderNotFound { client_order_id }
+            }
+            Shared::CalendarIterationInvariantViolation => {
+                Self::CalendarIterationInvariantViolation
+            }
+            Shared::CalendarDateMismatch { queried, returned } => {
+                Self::CalendarDateMismatch { queried, returned }
+            }
+            Shared::CalendarLocalTimeUnresolvable { date, time } => {
+                Self::CalendarLocalTimeUnresolvable { date, time }
+            }
+            Shared::InvalidAccountActivitiesUrl { url, source } => {
+                Self::InvalidAccountActivitiesUrl { url, source }
+            }
+            Shared::AccountActivitiesPaginationInvariantViolation => {
+                Self::AccountActivitiesPaginationInvariantViolation
+            }
+            Shared::AccountActivitiesPageLimitExceeded { pages } => {
+                Self::AccountActivitiesPageLimitExceeded { pages }
+            }
+            Shared::UsdBalanceConversion(value) => Self::UsdBalanceConversion(value),
+            Shared::FractionalCents(value) => Self::FractionalCents(value),
+            Shared::MissingPositionQuantity => Self::MissingPositionQuantity,
+            Shared::InvalidSymbol(source) => Self::InvalidSymbol(source),
+            Shared::NotPositive(source) => Self::NotPositive(source),
+            Shared::NotPositiveLimitPrice(source) => Self::NotPositiveLimitPrice(source),
+            Shared::FloatConversion(source) => Self::FloatConversion(source),
+            Shared::ConversionCancelNotSettled {
+                order_id,
+                cancel,
+                filled_quantity,
+            } => Self::ConversionCancelNotSettled {
+                order_id,
+                cancel,
+                filled_quantity,
+            },
+            Shared::ConversionOrderNotFound { order_id } => {
+                Self::ConversionOrderNotFound { order_id }
+            }
+            Shared::ConversionTimedOut { order_id } => Self::ConversionTimedOut { order_id },
+            Shared::AssetNotActive { symbol, status } => Self::AssetNotActive { symbol, status },
+            Shared::AssetNotTradable { symbol } => Self::AssetNotTradable { symbol },
+            Shared::InvalidLimitPricePrecision {
+                limit_price,
+                max_decimals,
+            } => Self::InvalidLimitPricePrecision {
+                limit_price,
+                max_decimals,
+            },
+            Shared::BelowPrecision {
+                shares,
+                max_decimals,
+            } => Self::BelowPrecision {
+                shares,
+                max_decimals,
+            },
+            Shared::UsdcBelowPrecision {
+                amount,
+                max_decimals,
+            } => Self::UsdcBelowPrecision {
+                amount,
+                max_decimals,
+            },
+            Shared::UsdcPrecisionExceeded {
+                amount,
+                max_decimals,
+            } => Self::UsdcPrecisionExceeded {
+                amount,
+                max_decimals,
+            },
+            Shared::LatestTrade(source) => Self::LatestTrade(source),
+            Shared::LatestQuote(source) => Self::LatestQuote(source),
+            error @ (Shared::HttpClient(_) | Shared::InvalidEndpoint(_)) => {
+                Self::Shared(Box::new(error))
+            }
+        }
+    }
+}
+
 fn format_api_error(
     status: reqwest::StatusCode,
     alpaca_code: Option<&u64>,
@@ -501,6 +476,7 @@ impl AlpacaBrokerApiError {
     /// the header even when present.
     pub fn backpressure(&self) -> Option<Backpressure> {
         match self {
+            Self::Shared(source) => source.backpressure(),
             Self::ApiError {
                 status,
                 retry_after,
@@ -515,7 +491,8 @@ impl AlpacaBrokerApiError {
                 retry_after: error.retry_after(),
             }),
 
-            Self::ApiError { .. }
+            Self::QuoteInvariant(_)
+            | Self::ApiError { .. }
             | Self::UsdConversionInsufficientBalance { .. }
             | Self::HttpClient(_)
             | Self::KmsJwt(_)
@@ -573,6 +550,10 @@ impl AlpacaBrokerApiError {
     /// [`Self::backpressure`] does.
     pub fn permanence(&self) -> Permanence {
         match self {
+            Self::Shared(source) => match source.permanence() {
+                st0x_alpaca::Permanence::Permanent => Permanence::Permanent,
+                st0x_alpaca::Permanence::Transient => Permanence::Transient,
+            },
             Self::ApiError { status, .. } => crate::status_permanence(*status),
 
             // Request-builder failures are deterministic for the same inputs.
@@ -595,7 +576,8 @@ impl AlpacaBrokerApiError {
             // Everything else is decided locally -- from a response that
             // already arrived, from configuration, or from arithmetic on
             // values in hand -- so the same inputs fail the same way.
-            Self::JsonParse(_)
+            Self::QuoteInvariant(_)
+            | Self::JsonParse(_)
             | Self::AlpacaAmount(_)
             | Self::UsdConversionInsufficientBalance { .. }
             | Self::InvalidHeader(_)
@@ -637,14 +619,173 @@ impl AlpacaBrokerApiError {
             | Self::ConversionCancelNotSettled { .. }
             | Self::ConversionOrderNotFound { .. } => Permanence::Permanent,
 
-            Self::LatestTrade(source) | Self::LatestQuote(source) => source.permanence(),
+            Self::LatestTrade(source) | Self::LatestQuote(source) => market_data_permanence(source),
         }
+    }
+}
+
+fn market_data_permanence(error: &AlpacaMarketDataError) -> Permanence {
+    match error {
+        AlpacaMarketDataError::ApiError { status, .. }
+            if status.is_server_error() || *status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+        {
+            Permanence::Transient
+        }
+        AlpacaMarketDataError::Http(_)
+        | AlpacaMarketDataError::LatestQuoteSymbolMismatch { .. }
+        | AlpacaMarketDataError::MissingQuote { .. }
+        | AlpacaMarketDataError::MissingBid { .. }
+        | AlpacaMarketDataError::MissingAsk { .. }
+        | AlpacaMarketDataError::MissingQuoteTimestamp { .. }
+        | AlpacaMarketDataError::NonPositiveBid { .. }
+        | AlpacaMarketDataError::NonPositiveAsk { .. }
+        | AlpacaMarketDataError::InvalidQuote { .. } => Permanence::Transient,
+        AlpacaMarketDataError::Auth(error) if !error.is_deterministic() => Permanence::Transient,
+        AlpacaMarketDataError::ApiError { .. }
+        | AlpacaMarketDataError::Auth(_)
+        | AlpacaMarketDataError::JsonParse(_)
+        | AlpacaMarketDataError::LatestQuoteJsonParse(_)
+        | AlpacaMarketDataError::Entitlement { .. }
+        | AlpacaMarketDataError::MissingPrice { .. }
+        | AlpacaMarketDataError::NonPositivePrice { .. } => Permanence::Permanent,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use st0x_float_macro::float;
+
     use super::*;
+
+    #[test]
+    fn shared_duplicate_order_error_keeps_local_client_id() {
+        let id = Uuid::new_v4();
+        let error = AlpacaBrokerApiError::from(
+            st0x_alpaca::broker::AlpacaBrokerApiError::DuplicateOrderNotFound {
+                client_order_id: st0x_alpaca::broker::ClientOrderId::cli(id),
+            },
+        );
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::DuplicateOrderNotFound {
+                client_order_id: ClientOrderId::Cli(found)
+            } if found == id
+        ));
+    }
+
+    #[test]
+    fn shared_account_and_calendar_errors_keep_local_variants() {
+        let account_id = Uuid::new_v4();
+        let error = AlpacaBrokerApiError::from(
+            st0x_alpaca::broker::AlpacaBrokerApiError::AccountNotActive {
+                account_id,
+                status: AccountStatus::Disabled,
+            },
+        );
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::AccountNotActive { account_id: found, .. } if found == account_id
+        ));
+        let error = AlpacaBrokerApiError::from(
+            st0x_alpaca::broker::AlpacaBrokerApiError::CalendarIterationInvariantViolation,
+        );
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::CalendarIterationInvariantViolation
+        ));
+    }
+
+    #[test]
+    fn shared_activity_pagination_error_keeps_local_variant() {
+        let error = AlpacaBrokerApiError::from(
+            st0x_alpaca::broker::AlpacaBrokerApiError::AccountActivitiesPageLimitExceeded {
+                pages: 101,
+            },
+        );
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::AccountActivitiesPageLimitExceeded { pages: 101 }
+        ));
+    }
+
+    #[test]
+    fn shared_calendar_and_activity_details_keep_local_payloads() {
+        let queried = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
+        let returned = NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
+        let error = AlpacaBrokerApiError::from(
+            st0x_alpaca::broker::AlpacaBrokerApiError::CalendarDateMismatch { queried, returned },
+        );
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::CalendarDateMismatch {
+                queried: found_queried,
+                returned: found_returned
+            } if found_queried == queried && found_returned == returned
+        ));
+        let error = AlpacaBrokerApiError::from(
+            st0x_alpaca::broker::AlpacaBrokerApiError::AccountActivitiesPaginationInvariantViolation,
+        );
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::AccountActivitiesPaginationInvariantViolation
+        ));
+    }
+
+    #[test]
+    fn shared_value_errors_keep_local_variants() {
+        use st0x_alpaca::broker::AlpacaBrokerApiError as Shared;
+
+        let error = AlpacaBrokerApiError::from(Shared::UsdBalanceConversion(float!(1.001)));
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::UsdBalanceConversion(_)
+        ));
+        let error = AlpacaBrokerApiError::from(Shared::FractionalCents(float!(1.001)));
+        assert!(matches!(error, AlpacaBrokerApiError::FractionalCents(_)));
+        let error = AlpacaBrokerApiError::from(Shared::MissingPositionQuantity);
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::MissingPositionQuantity
+        ));
+    }
+
+    #[test]
+    fn shared_rate_limit_keeps_local_api_error_and_retry_hint() {
+        let error =
+            AlpacaBrokerApiError::from(st0x_alpaca::broker::AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                alpaca_code: Some(42),
+                message: "rate limited".to_string(),
+                retry_after: Some(Duration::from_secs(7)),
+            });
+
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::ApiError {
+                alpaca_code: Some(42),
+                ..
+            }
+        ));
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(7))
+            })
+        );
+    }
+
+    #[test]
+    fn shared_uncertain_conversion_keeps_recovery_variant() {
+        let order_id = Uuid::new_v4();
+        let error = AlpacaBrokerApiError::from(
+            st0x_alpaca::broker::AlpacaBrokerApiError::ConversionOrderNotFound { order_id },
+        );
+
+        assert!(
+            matches!(error, AlpacaBrokerApiError::ConversionOrderNotFound { order_id: found } if found == order_id)
+        );
+        assert_eq!(error.permanence(), Permanence::Permanent);
+    }
 
     #[test]
     fn backpressure_some_for_429_with_retry_after() {
