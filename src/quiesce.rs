@@ -191,6 +191,20 @@ pub(crate) struct InFlight {
     in_flight: watch::Sender<usize>,
 }
 
+impl InFlight {
+    /// Claims another slot for work that continues this admitted execution,
+    /// such as a task it spawns and awaits, without checking the pause flag.
+    /// Parking there would deadlock: a pause waits for this execution to drain,
+    /// and this execution waits for the continuation. The continuation keeps a
+    /// pause waiting until it finishes, even if this token drops first.
+    pub(crate) fn continuation(&self) -> Self {
+        self.in_flight.send_modify(|count| *count += 1);
+        Self {
+            in_flight: self.in_flight.clone(),
+        }
+    }
+}
+
 impl Drop for InFlight {
     fn drop(&mut self) {
         self.in_flight.send_modify(|count| *count -= 1);

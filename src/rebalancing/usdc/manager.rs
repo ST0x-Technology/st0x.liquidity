@@ -4464,10 +4464,14 @@ impl<
         let cctp_bridge = Arc::clone(&self.cctp_bridge);
         let cqrs = Arc::clone(&self.cqrs);
         let task_id = id.clone();
+        // Taken here, in the calling task, so inside a job this continues the
+        // job's admitted slot instead of making a second, parking claim the
+        // job would be left awaiting behind a pause.
+        let projection_slot =
+            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
 
         tokio::spawn(async move {
-            let _projection_slot =
-                crate::conductor::projection_pause::enter_projection_gate().await;
+            let _projection_slot = projection_slot;
 
             // Clear any stale recorded burn hash BEFORE broadcasting, so that if recording THIS
             // burn's hash fails, the resume path sees `pending_burn_tx: None` and fails closed
@@ -17348,6 +17352,98 @@ mod tests {
             manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
             0,
             "recovery must not submit a replacement burn after enqueue failure"
+        );
+    }
+
+    /// The interleaving that deadlocked a rebuild: a job holds its projection
+    /// slot and awaits the detached burn, and a rebuild raises the pause before
+    /// the burn task starts. The burn must continue the job's slot rather than
+    /// park behind a pause that is itself waiting for the job; the rebuild is
+    /// granted once the job and its burn finish.
+    #[tokio::test]
+    async fn burn_inside_a_job_continues_its_slot_while_a_rebuild_waits() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+
+        let server = MockServer::start();
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let vault_service = RaindexService::new(
+            wallet,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            recipient,
+        );
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(MockBridge::new()),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(recipient, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        );
+
+        let (control, gate) = crate::conductor::projection_pause::projection_gate_for_test();
+        let job_slot = gate.enter().await;
+        let burn_tx =
+            crate::conductor::projection_pause::in_projection_slot(Some(job_slot), async {
+                let rebuild = tokio::spawn(control.pause());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !gate.is_paused() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the rebuild must raise the pause while the job holds its slot");
+
+                let burn_tx = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    manager.submit_and_record_burn(
+                        &id,
+                        BridgeDirection::EthereumToBase,
+                        amount_u256,
+                        recipient,
+                    ),
+                )
+                .await
+                .expect("the burn must continue the job's slot, not park behind the pause")
+                .unwrap();
+                (burn_tx, rebuild)
+            })
+            .await;
+        let (burn_tx, rebuild) = burn_tx;
+
+        let rebuild_guard = tokio::time::timeout(Duration::from_secs(5), rebuild)
+            .await
+            .expect("the rebuild must be granted once the job and its burn finish")
+            .unwrap()
+            .expect("the rebuild must quiesce once the job's slot is released");
+        drop(rebuild_guard);
+        assert!(
+            matches!(
+                cqrs.load(&id).await.unwrap().unwrap(),
+                UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: Some(recorded_tx),
+                    ..
+                } if recorded_tx == burn_tx
+            ),
+            "the burn must record its hash while the rebuild waits"
         );
     }
 
