@@ -5685,6 +5685,7 @@ mod tests {
         // Opt-in failing Circle re-poll with the nonce read consumed; see
         // `with_failing_repoll_on_consumed_nonce`.
         repoll_error: Option<fn() -> CctpError>,
+        mint_error: Option<fn() -> CctpError>,
     }
 
     /// Answers the credit ledger's wallet balance read with `balance` and
@@ -5709,6 +5710,7 @@ mod tests {
                 ledger_probe: None,
                 empty_burn_scan: false,
                 repoll_error: None,
+                mint_error: None,
             }
         }
 
@@ -5745,6 +5747,11 @@ mod tests {
             repoll_error: fn() -> CctpError,
         ) -> Self {
             self.repoll_error = Some(repoll_error);
+            self
+        }
+
+        fn with_failing_mint(mut self, mint_error: fn() -> CctpError) -> Self {
+            self.mint_error = Some(mint_error);
             self
         }
 
@@ -5860,7 +5867,11 @@ mod tests {
             _direction: BridgeDirection,
             _attestation: &AttestationResponse,
         ) -> Result<st0x_bridge::MintReceipt, CctpError> {
-            unimplemented!("MockBridge: mint not used in this test")
+            let Some(mint_error) = self.mint_error else {
+                unimplemented!("MockBridge: mint not used in this test")
+            };
+
+            Err(mint_error())
         }
 
         fn reconstruct_attestation(
@@ -13125,6 +13136,61 @@ mod tests {
              the mint of the recorded nonce on chain, then settle it with \
              `transfer reconcile --kind usdc`.",
             CctpError::PlaceholderNonce
+        )));
+    }
+
+    /// A hard Alpaca->Base mint failure latches `BridgingFailed`, and the job
+    /// retry then ends without an alert, so the latch pages itself.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn alpaca_to_base_hard_mint_failure_pages_the_operator() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_attested_alpaca_to_base(&cqrs, &id, usdc("1")).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (real_cctp_bridge, _vault_service) = create_test_onchain_services(wallet.clone());
+        let attestation_response = real_cctp_bridge
+            .reconstruct_attestation(valid_cctp_message(), vec![0x01])
+            .unwrap();
+        let bridge = MockBridge::new().with_failing_mint(|| {
+            CctpError::Evm(EvmError::Reverted {
+                tx_hash: TxHash::from([9u8; 32]),
+            })
+        });
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
+
+        let error = manager
+            .execute_cctp_mint(&id, attestation_response, Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UsdcTransferError::Cctp(cctp_error)
+                if matches!(**cctp_error, CctpError::Evm(EvmError::Reverted { .. }))),
+            "a hard mint failure must not redrive, got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "got: {state:?}"
+        );
+        assert!(state.is_reconcilable_failure(), "got: {state:?}");
+        let burn_tx =
+            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000001");
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint on Base did not complete (Mint failed: {}). \
+             Bridge marked failed; if the recorded nonce is used on Base, find its mint; if \
+             not, get the Circle attestation for burn tx {burn_tx} and mint it on Base. Then \
+             settle it with `transfer reconcile --kind usdc`.",
+            CctpError::Evm(EvmError::Reverted {
+                tx_hash: TxHash::from([9u8; 32]),
+            })
         )));
     }
 
