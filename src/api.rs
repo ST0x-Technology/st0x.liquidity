@@ -1783,14 +1783,13 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
             StatusCode::BAD_GATEWAY,
             "Ethereum RPC unavailable; retry later".to_string(),
         ),
-        DepositTxUnchecked(_) | DepositTxLookup { .. } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to recheck transfer".to_string(),
-        ),
         // A parse failure is deterministic -- the same payload fails
         // identically on every retry -- so "retry later" would misguide;
         // only the transport/API failures are transient and keep the 502.
-        Alpaca(AlpacaWalletError::ParseError(_)) | Transfer(_) => (
+        Alpaca(AlpacaWalletError::ParseError(_))
+        | Transfer(_)
+        | DepositTxUnchecked(_)
+        | DepositTxLookup { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to recheck transfer".to_string(),
         ),
