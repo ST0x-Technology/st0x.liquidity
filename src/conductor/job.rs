@@ -1164,19 +1164,21 @@ where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
 {
-    // Same projection gate as the production handler, so tests run jobs
-    // through the gate a view rebuild pauses.
-    let _projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
-    injector
-        .perform(
+    // Same projection gate and slot scope as the production handler, so tests
+    // run jobs through the gate a view rebuild pauses.
+    let projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
+    crate::conductor::projection_pause::in_projection_slot(
+        projection_slot,
+        injector.perform(
             *kind,
             &job,
             &ctx,
             attempt.current(),
             TaskIdentity::from(&task_id),
             is_durably_terminal(&attempt, &sql_context),
-        )
-        .await
+        ),
+    )
+    .await
 }
 
 /// Generic apalis handler -- production build.
@@ -1197,14 +1199,19 @@ where
     // Gate every projection write this job commits (event-sorcery folds
     // projections synchronously inside `Store::send`) so a materialized-view
     // rebuild can quiesce the workers first. Held for the whole job; released on
-    // return. Ungated until a conductor calls `init_projection_gate`.
-    let _projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
-    perform_bounded::<Ctx, J>(
-        &job,
-        &ctx,
-        label,
-        TaskIdentity::from(&task_id),
-        is_durably_terminal(&attempt, &sql_context),
+    // return, and scoped so work the job spawns and awaits continues this slot
+    // instead of claiming a second one. Ungated until a conductor calls
+    // `init_projection_gate`.
+    let projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
+    crate::conductor::projection_pause::in_projection_slot(
+        projection_slot,
+        perform_bounded::<Ctx, J>(
+            &job,
+            &ctx,
+            label,
+            TaskIdentity::from(&task_id),
+            is_durably_terminal(&attempt, &sql_context),
+        ),
     )
     .await
 }
