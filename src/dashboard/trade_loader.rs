@@ -4,7 +4,8 @@
 //! terminal trades straight out of `onchain_trade_view` and
 //! `offchain_order_view` -- the projections the event-sourcing framework keeps
 //! current -- so a request costs a bounded index range per venue side for the
-//! page, plus an index-only count, instead of replaying every aggregate.
+//! page, plus a count that walks the same terminal row index and reads only
+//! stored key columns, never the payload, instead of replaying every aggregate.
 //!
 //! Rows carry the serialized aggregate, not a serialized [`Trade`], and
 //! `try_into_trade` converts only the page being returned. The generated
@@ -206,11 +207,13 @@ fn side_filter(query: &TradeQuery, side: Side) -> Option<Filter> {
         // `OffchainOrder::try_into_trade` yields nothing for it. Left in the
         // result set it would inflate `total` and consume a slot under
         // LIMIT/OFFSET while returning no trade, so it is excluded here rather
-        // than after the page is cut. `IS NOT` is SQLite's NULL-safe
-        // comparison: `Filled`/`Cancelled` rows have no `kind` key at all, and
-        // neither do failures persisted before the discriminator existed --
-        // both extract to NULL and must still match.
-        filter.push_predicate("json_extract(payload, '$.Live.Failed.kind') IS NOT 'Deferral'");
+        // than after the page is cut. It reads the stored `failure_kind` key
+        // rather than parsing `payload`, which the count would otherwise do for
+        // every terminal row. `IS NOT` is SQLite's NULL safe comparison:
+        // `Filled`/`Cancelled` rows have no `kind` key at all, and neither do
+        // failures persisted before the discriminator existed -- both leave the
+        // column NULL and must still match.
+        filter.push_predicate("failure_kind IS NOT 'Deferral'");
 
         // The leading `+` strips the term's index affinity without changing
         // its meaning. Without it SQLite drives the scan from
