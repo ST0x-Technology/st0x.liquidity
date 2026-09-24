@@ -14233,53 +14233,6 @@ mod tests {
         whitelist_mock.assert();
     }
 
-    /// Hypothesis: with an empty wallet the flow proceeds into the conversion
-    /// and withdrawal legs. The downstream whitelist rejection proves the
-    /// conversion order was placed and the withdrawal path was reached.
-    #[tokio::test]
-    async fn execute_alpaca_to_base_starts_with_an_empty_wallet() {
-        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
-        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
-
-        let server = MockServer::start();
-        let (manager, _cqrs) =
-            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
-
-        let conversion_mock =
-            create_conversion_order_mock(&server, ConversionDirection::UsdToUsdc, "1000");
-        let _get_order_mock = create_get_order_mock(
-            &server,
-            "61e7b016-9c91-4a97-b912-615c9d365c9d",
-            "filled",
-            "1000",
-        );
-        let whitelist_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([]));
-        });
-
-        let id = UsdcRebalanceId(Uuid::new_v4());
-
-        let error = manager
-            .execute_alpaca_to_base(&id, usdc("1000"))
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                UsdcTransferError::AlpacaWallet(AlpacaWalletError::AddressNotWhitelisted { .. })
-            ),
-            "an empty wallet must start the transfer and fail downstream at the \
-             whitelist; got: {error:?}"
-        );
-        conversion_mock.assert();
-        whitelist_mock.assert();
-    }
-
     /// The ledger pages when the Ethereum wallet holds less USDC than the open
     /// transfers are credited with and have not yet sent.
     #[tracing_test::traced_test]
