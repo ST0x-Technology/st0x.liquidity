@@ -122,9 +122,8 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
-    DurableCheckedGuardRelease, PreflightAlertGate, RecheckUsdcDeposit, TransferUsdcToHedging,
-    TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    UsdcSettlementParams,
+    RecheckUsdcDeposit, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
+    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -3283,11 +3282,11 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
 
-        let usdc_store = built.usdc.clone();
         let usdc_handles = services.into_usdc_transfer_handles(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
             built.usdc,
+            deps.pool.clone(),
             bot_gas_enqueuer.clone(),
             gas_readiness,
         );
@@ -3304,12 +3303,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             job_queue: deps.schedulers.transfer_usdc_to_market_making.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
-            usdc_guard: Arc::new(DurableCheckedGuardRelease {
-                pool: deps.pool.clone(),
-                store: usdc_store,
-                usdc_in_progress: rebalancing_service.usdc_in_progress.clone(),
-            }),
-            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         });
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
