@@ -711,6 +711,60 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   amount until then). Valid only from `Failed`; a transfer in any other state is
   rejected. The `--reason` is free text.
 
+### Base->Alpaca deposit send pages
+
+The bot marks the Alpaca deposit send started (`DepositSendSubmitting`) before
+it broadcasts it and records the send tx (`PendingDepositRecorded`) right after.
+It never sends a second time for the same transfer. When it cannot tell what
+happened to a send, it pages and stops.
+
+- **"deposit marked failed for operator reconciliation"**
+  (`DepositSendUnresolved`): the transfer is `DepositFailed`, holds the guard,
+  and the job does not retry. The page names the cause and the step:
+  - "the recorded deposit send <tx> was mined reverted": the send moved nothing.
+    The minted USDC is still in the Ethereum wallet. Move it by hand, then
+    `transfer reconcile --kind usdc`.
+  - "the recorded deposit send <tx> was dropped from the mempool": check `<tx>`
+    on chain. If it was mined and Alpaca credited it,
+    `stox transfer recheck --kind usdc --id <id>` (the tx is the transfer's
+    `deposit_ref`). Otherwise move the USDC by hand and
+    `transfer reconcile --kind usdc`.
+  - "no deposit send was recorded, but send <tx> of the same amount ...", "the
+    deposit send broadcast failed or timed out and may still be on chain", or "a
+    deposit send was started but its tx was not recorded; it may be on chain":
+    the transfer has no `deposit_ref`. Find this transfer's own send on chain
+    (from the bot wallet to Alpaca's deposit address, `amount_received`, after
+    the mint; the logs carry the hash when one was returned). A same-amount send
+    can belong to another open transfer: check that no other transfer recorded
+    it. If Alpaca credited it, run
+    `stox transfer recheck --kind usdc --id <id> --deposit-tx <hash>`. The bot
+    attaches the tx only if it moved exactly the transfer's amount from the bot
+    wallet to the deposit address, is confirmed, and no other transfer recorded
+    it; then it confirms the deposit and runs the USDC->USD conversion. If no
+    send landed, move the USDC by hand and `transfer reconcile --kind usdc`
+    (reconcile does not convert USDC to USD).
+- **"deposit send may be broadcast but its tx was not recorded"**
+  (`DepositSendRecordFailed`): the send tx (or "unknown" if the task panicked)
+  is in the page. The transfer stays `Bridged` with the send started and holds
+  the guard. A restart does not re-arm a `Bridged` transfer. Check the tx on
+  chain, then run
+  `stox transfer resume --kind usdc --id <id> --direction to-alpaca`: it fails
+  the deposit for reconciliation without sending (the page above, "a deposit
+  send was started ..."). Then follow that entry.
+- **"withdrawal tx <tx> is already recorded by USDC rebalance <other>"**
+  (`WithdrawalTxAlreadyRecorded`, Alpaca->Base): Alpaca reported a withdrawal tx
+  that another transfer already recorded, so it did not pay this one. The
+  transfer is marked `BridgingFailed` with no burn and the job stops. Find where
+  this withdrawal's USDC went (Alpaca's transfer record, the Ethereum wallet),
+  settle it by hand, then `transfer reconcile --kind usdc`.
+- **"Open USDC transfers share one Alpaca withdrawal tx; it paid only one of
+  them"** (credit ledger `operational_alert`): two open Alpaca->Base transfers
+  recorded the same withdrawal tx, which can happen only when both confirmed at
+  the same moment. Find which withdrawal the tx paid at Alpaca. The other
+  transfer was credited from a tx that did not pay it, so its burn can spend
+  another transfer's USDC: find where its withdrawal went, settle it by hand,
+  and reconcile it with `--kind usdc`.
+
 ### Clearing a dropped pending burn (`BridgingSubmitting` latch)
 
 A burn that the resume path classifies `Dropped` (broadcast, then absent from

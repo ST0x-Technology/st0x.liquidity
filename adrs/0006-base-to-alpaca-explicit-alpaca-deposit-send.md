@@ -87,31 +87,45 @@ The guarantee is adopt-or-error, never a blind re-send:
   a prior rebalance. Bounding by the mint block excludes everything before this
   transfer's mint.
 
-## Amendment (2026-09-24): record the send hash at broadcast
+## Amendment (2026-09-24): mark the send started, record its hash at broadcast
 
 The crash-safety argument above relies on one USDC rebalance in flight. With one
 cash guard per corridor (RAI-2083), transfers of different corridors share the
 Ethereum wallet and send to the same Alpaca deposit address, so a same-amount
 send after this transfer's mint can be another transfer's. Adopting it would
-credit this transfer with another transfer's deposit.
+credit this transfer with another transfer's deposit. The scan also sees only
+mined sends, so a job timeout that abandons a broadcast in progress would let
+the redrive send a second time.
 
-The send now works like the CCTP burn:
+The send now works like the CCTP burn (`BridgingSubmitting` +
+`PendingBurnRecorded`):
 
-1. The send is broadcast without awaiting its receipt, and its hash is recorded
-   on `Bridged` (`RecordPendingDeposit` -> `PendingDepositRecorded`) before the
-   receipt is awaited. Broadcast and record run on a detached task.
-2. Resume with a recorded hash checks that exact tx: confirmed -> adopt;
+1. `BeginDepositSend` -> `DepositSendSubmitting` marks the send started on
+   `Bridged` before the broadcast (refused if a send was already started).
+2. The send is broadcast without awaiting its receipt, and its hash is recorded
+   (`RecordPendingDeposit` -> `PendingDepositRecorded`, never replacing a
+   recorded hash) before the receipt is awaited. Marker, broadcast and record
+   run on a detached task.
+3. A failure before any signed transaction reached the RPC (nonce, gas, fee,
+   signing; the wallet reports it as `BroadcastError::NotBroadcast`) clears the
+   marker (`AbortDepositSend` -> `DepositSendAborted`) and retries. A failure
+   after it may be on chain: `FailDeposit`, paged.
+4. Resume with a recorded hash checks that exact tx: confirmed -> adopt;
    reverted or dropped -> `FailDeposit` for reconciliation; pending -> redrive.
-3. Resume with no recorded hash still scans from the mint block, but a match is
-   never adopted: it fails the transfer (`FailDeposit`, paged) for operator
-   reconciliation. An empty scan sends.
+   Resume with the marker and no hash -> `FailDeposit` for reconciliation, never
+   a send. Resume with no marker still scans from the mint block (for transfers
+   that reached `Bridged` before this change), but a match is never adopted: it
+   fails the transfer for reconciliation. An empty scan sends.
 
 `FailDeposit` is now also valid from a BaseToAlpaca `Bridged`, so the failure is
-a reconcilable, guard-holding `DepositFailed`. The credit ledger counts a
-`Bridged` credit as held until the send hash is recorded, then as in flight.
+a reconcilable, guard-holding `DepositFailed`. When no send was recorded, the
+operator can attach this transfer's own send with
+`transfer recheck --kind usdc --deposit-tx <hash>`; the bot checks sender,
+recipient, amount, confirmations and that no other transfer recorded it. The
+credit ledger counts a `Bridged` credit as held until the send is started, then
+as in flight.
 
-The rejected "dedicated `DepositSendSubmitting` state" alternative stays
-rejected: the recorded hash on `Bridged` is the anchor, and the no-hash case
-needs no marker because it never adopts. The remaining gap is a send broadcast
-just before a crash and still unmined when the resume scan runs; that window is
-the time between the broadcast and the record, not the receipt wait.
+This reverses the rejected "dedicated `DepositSendSubmitting` state" alternative
+above, as a marker on `Bridged` rather than a separate state: the mint block
+still bounds the legacy scan, but only a marker committed before the broadcast
+closes the redrive and failed-write windows.
