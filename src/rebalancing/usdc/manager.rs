@@ -14871,11 +14871,11 @@ mod tests {
         assert_eq!(TxHash::from_str(&recorded).unwrap(), deposit_ref_tx(&state));
     }
 
-    /// A broadcast that fails without a revert may have reached the network,
-    /// so the fresh send fails the deposit for reconciliation instead of
-    /// letting a retry send again.
+    /// With the chain unreachable the send fails at its nonce read, before
+    /// anything is signed or sent. The transfer stays `Bridged` with its
+    /// credit held, so a retry sends normally.
     #[tokio::test]
-    async fn fresh_deposit_send_that_fails_to_broadcast_fails_for_reconciliation() {
+    async fn fresh_deposit_send_refused_before_broadcast_stays_bridged_for_retry() {
         let chain = deploy_ethereum_usdc_chain_head_at_mint().await;
         let server = MockServer::start();
         let _address_mock = mock_alpaca_deposit_address(&server);
@@ -14895,20 +14895,15 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(
-                error,
-                UsdcTransferError::DepositSendUnresolved {
-                    cause: UnresolvedDepositSend::SubmitInconclusive,
-                    ..
-                }
-            ),
-            "a failed broadcast must fail the deposit, got: {error:?}",
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "a send refused before broadcast is retried, got: {error:?}",
         );
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
-        let UsdcRebalance::DepositFailed { deposit_ref, .. } = state else {
-            panic!("expected DepositFailed, got: {state:?}");
-        };
-        assert_eq!(deposit_ref, None);
+        assert_eq!(
+            state.ethereum_wallet_credit(),
+            Some(EthereumWalletCredit::Held(amount_received)),
+            "nothing was sent, so the transfer stays Bridged with its credit held, got: {state:?}",
+        );
     }
 
     const MOCK_DEPOSIT_SEND_TX: TxHash =
