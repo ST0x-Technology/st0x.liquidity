@@ -6566,16 +6566,18 @@ mod tests {
             RebalancingServiceConfig {
                 poll_freshness: crate::inventory::PollFreshness::always_fresh(),
                 inventory_staleness_bound: std::time::Duration::from_secs(300),
-                equity: crate::inventory::ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: st0x_config::AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: std::time::Duration::from_secs(60),
-                assets: st0x_config::ChainAssets {
-                    equities: crate::test_utils::rebalancing_enabled_equities(&["AAPL"]),
-                    cash: None,
-                },
+                chains: std::collections::BTreeMap::from([(
+                    Chain::Base,
+                    crate::rebalancing::ChainRebalancingConfig::for_test(
+                        st0x_config::ChainAssets {
+                            equities: crate::test_utils::rebalancing_enabled_equities(&["AAPL"]),
+                            cash: None,
+                        },
+                    ),
+                )]),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
             },
