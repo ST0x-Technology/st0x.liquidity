@@ -399,6 +399,30 @@ fn alert_unresolvable_mint(id: &UsdcRebalanceId, reason: &str) {
     );
 }
 
+/// Pages a hard Alpaca->Base mint failure. The failed call may still have
+/// used the nonce (a mint whose receipt lacks its event), so both outcomes are
+/// named.
+fn alert_failed_mint(id: &UsdcRebalanceId, burn_tx: TxHash, reason: &str) {
+    error!(
+        target: "operational_alert",
+        alert = true,
+        %id,
+        %burn_tx,
+        "USDC transfer {id}: the CCTP mint on Base did not complete ({reason}). \
+         Bridge marked failed; if the recorded nonce is used on Base, find its mint; if \
+         not, get the Circle attestation for burn tx {burn_tx} and mint it on Base. Then \
+         settle it with `transfer reconcile --kind usdc`."
+    );
+}
+
+/// Why a post-burn mint was latched `BridgingFailed`; picks the page text.
+enum UnresolvedMint {
+    /// The recorded nonce is used, but its mint cannot be adopted.
+    NonceConsumed,
+    /// The mint call itself failed.
+    MintFailed { burn_tx: TxHash },
+}
+
 /// A `find_attested_mint` or Circle re-poll failure that recurs on every
 /// retry.
 enum RepeatingMintFailure {
@@ -935,7 +959,13 @@ impl<
             Ok(true) if repeating_mint_failure(&error).is_some() => {
                 let reason = format!("Circle re-poll failed on a consumed nonce: {error}");
                 Err(self
-                    .latch_unresolvable_mint(id, mint_direction, reason, error)
+                    .latch_unresolvable_mint(
+                        id,
+                        mint_direction,
+                        UnresolvedMint::NonceConsumed,
+                        reason,
+                        error,
+                    )
                     .await)
             }
             Ok(true) => {
@@ -2382,7 +2412,7 @@ impl<
         };
 
         let mint_receipt = self
-            .execute_cctp_mint(id, attestation_response, initiated_at)
+            .execute_cctp_mint(id, attestation_response, burn_receipt.tx, initiated_at)
             .await?;
 
         self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
@@ -2428,7 +2458,7 @@ impl<
         };
 
         let mint_receipt = self
-            .execute_cctp_mint(id, attestation_response, initiated_at)
+            .execute_cctp_mint(id, attestation_response, burn_receipt.tx, initiated_at)
             .await?;
 
         self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
@@ -2483,7 +2513,7 @@ impl<
             Some(mint_receipt) => mint_receipt,
             // `execute_cctp_mint` emits `ConfirmBridging`, advancing to `Bridged`.
             None => {
-                self.execute_cctp_mint(id, attestation_response, initiated_at)
+                self.execute_cctp_mint(id, attestation_response, burn_tx_hash, initiated_at)
                     .await?
             }
         };
@@ -3049,8 +3079,9 @@ impl<
 
     /// Latches a post-burn `BridgingFailed` (burn and nonce kept, so
     /// `transfer reconcile --kind usdc` accepts it) for a legacy re-poll that
-    /// keeps failing on a consumed nonce. An AlpacaToBase latch pages: its
-    /// retry finds the transfer failed and does not alert. A BaseToAlpaca retry
+    /// keeps failing on a consumed nonce, or a hard AlpacaToBase mint failure.
+    /// An AlpacaToBase latch pages: its retry finds the transfer failed and
+    /// does not alert. A BaseToAlpaca retry
     /// re-polls Circle through the post-burn `BridgingFailed` recovery, which
     /// may still adopt the mint, and the job's dead-letter alert covers a
     /// give-up.
@@ -3058,6 +3089,7 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         mint_direction: BridgeDirection,
+        unresolved: UnresolvedMint,
         reason: String,
         error: CctpError,
     ) -> UsdcTransferError {
@@ -3076,9 +3108,17 @@ impl<
 
         // A crash between the committed FailBridging and this page leaves the
         // latch unpaged; paging first could page for a latch that never landed.
-        match mint_direction {
-            BridgeDirection::EthereumToBase => alert_unresolvable_mint(id, &reason),
-            BridgeDirection::BaseToEthereum => {}
+        match (mint_direction, unresolved) {
+            (BridgeDirection::EthereumToBase, UnresolvedMint::NonceConsumed) => {
+                alert_unresolvable_mint(id, &reason);
+            }
+            (BridgeDirection::EthereumToBase, UnresolvedMint::MintFailed { burn_tx }) => {
+                alert_failed_mint(id, burn_tx, &reason);
+            }
+            (
+                BridgeDirection::BaseToEthereum,
+                UnresolvedMint::NonceConsumed | UnresolvedMint::MintFailed { .. },
+            ) => {}
         }
 
         UsdcTransferError::Cctp(Box::new(error))
@@ -3124,6 +3164,7 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
+        burn_tx: TxHash,
         initiated_at: DateTime<Utc>,
     ) -> Result<MintReceipt, UsdcTransferError> {
         let mint_receipt = match self
@@ -3155,17 +3196,19 @@ impl<
                     initiated_at,
                 ));
             }
+            // The job retry finds the latch and ends without an alert, so the
+            // latch pages.
             Err(error) => {
                 warn!(target: "rebalance", "CCTP mint failed: {error}");
-                self.cqrs
-                    .send(
+                return Err(self
+                    .latch_unresolvable_mint(
                         id,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("Mint failed: {error}"),
-                        },
+                        BridgeDirection::EthereumToBase,
+                        UnresolvedMint::MintFailed { burn_tx },
+                        format!("Mint failed: {error}"),
+                        error,
                     )
-                    .await?;
-                return Err(UsdcTransferError::Cctp(Box::new(error)));
+                    .await);
             }
         };
 
@@ -13163,9 +13206,11 @@ mod tests {
         });
         let (manager, _apalis_pool, _server) =
             manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
+        let burn_tx =
+            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000001");
 
         let error = manager
-            .execute_cctp_mint(&id, attestation_response, Utc::now())
+            .execute_cctp_mint(&id, attestation_response, burn_tx, Utc::now())
             .await
             .unwrap_err();
 
@@ -13180,8 +13225,6 @@ mod tests {
             "got: {state:?}"
         );
         assert!(state.is_reconcilable_failure(), "got: {state:?}");
-        let burn_tx =
-            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000001");
         assert!(logs_contain("operational_alert"));
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint on Base did not complete (Mint failed: {}). \
@@ -18757,7 +18800,7 @@ mod tests {
 
         let initiated_at = Utc::now() - chrono::Duration::minutes(30);
         let error = manager
-            .execute_cctp_mint(&id, attestation_response, initiated_at)
+            .execute_cctp_mint(&id, attestation_response, TxHash::ZERO, initiated_at)
             .await
             .unwrap_err();
 
