@@ -6142,6 +6142,12 @@ impl RebalancingService {
         self.equity_cooldowns.write().await.clear();
     }
 
+    /// The operator alert channel, exposed so startup recovery can page when it
+    /// skips a step it must not block on.
+    pub(crate) fn notifier(&self) -> &Arc<dyn crate::alerts::Notifier> {
+        &self.notifier
+    }
+
     /// Clears the in-progress flag for an equity symbol.
     ///
     /// Removes the entry regardless of its current `GuardState`. Called by

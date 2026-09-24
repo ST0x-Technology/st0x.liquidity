@@ -89,6 +89,7 @@ pub struct MockRaindex {
     withdraw_submissions: AtomicUsize,
     restored_prepared_withdrawals: AtomicUsize,
     restore_submitted_withdrawal_calls: Mutex<Vec<(TxHash, bool)>>,
+    fail_restore: bool,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -157,7 +158,16 @@ impl MockRaindex {
             withdraw_submissions: AtomicUsize::new(0),
             restored_prepared_withdrawals: AtomicUsize::new(0),
             restore_submitted_withdrawal_calls: Mutex::new(Vec::new()),
+            fail_restore: false,
         }
+    }
+
+    /// Makes `restore_submitted_withdrawal` fail, mimicking a legacy hash-only
+    /// withdrawal whose transaction the RPC can no longer return.
+    #[cfg(test)]
+    pub(crate) fn with_failing_restore(mut self) -> Self {
+        self.fail_restore = true;
+        self
     }
 
     /// Configures how `submit_deposit` behaves; combinable with the
@@ -377,6 +387,10 @@ impl Raindex for MockRaindex {
             panic!("mock restore-submitted-withdrawal mutex poisoned");
         };
         calls.push((tx_hash, prepared.is_some()));
+        drop(calls);
+        if self.fail_restore {
+            return Err(RaindexError::ScanInconclusive { from_block: 0 });
+        }
         Ok(())
     }
 

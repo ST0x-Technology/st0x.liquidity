@@ -3630,24 +3630,51 @@ async fn recover_interrupted_tokenization_aggregates(
             .into());
         }
 
-        match &redemption {
-            EquityRedemption::VaultWithdrawSubmitting { prepared, .. } => {
+        let restore_outcome = match &redemption {
+            EquityRedemption::VaultWithdrawSubmitting { prepared, .. } => Some(
                 equity_services
                     .for_chain(redemption.chain())?
                     .raindex
                     .restore_submitted_withdrawal(prepared.tx_hash(), Some(prepared))
-                    .await?;
-            }
+                    .await,
+            ),
             EquityRedemption::VaultWithdrawSubmitted {
                 tx_hash, prepared, ..
-            } => {
+            } => Some(
                 equity_services
                     .for_chain(redemption.chain())?
                     .raindex
                     .restore_submitted_withdrawal(*tx_hash, prepared.as_ref())
-                    .await?;
-            }
-            _ => {}
+                    .await,
+            ),
+            _ => None,
+        };
+        // Startup recovery must never gate on a slow or absent RPC (see this
+        // function's contract). A legacy `VaultWithdrawSubmitted` with no
+        // persisted prepared bytes recovers by an onchain hash lookup, which
+        // returns pending or absent for a dropped, never mined withdrawal on
+        // every restart. Such an aggregate holds no nonce reservation in this
+        // fresh process, so skip the restore, page the operator, and let the
+        // resume job drive it to the reconciliation deadline and a reconcile
+        // rather than crash looping the whole bot.
+        if let Some(Err(error)) = restore_outcome {
+            warn!(
+                target: "rebalance",
+                %redemption_id,
+                %error,
+                "Could not restore submitted withdrawal at startup; skipping the \
+                 nonce restore and deferring to the resume job"
+            );
+            rebalancing_service
+                .notifier()
+                .notify(&format!(
+                    "Equity redemption {redemption_id} could not restore its submitted vault \
+                     withdrawal at startup ({error}). Monitoring started without it; the resume \
+                     job will drive it to the reconciliation deadline. Verify the withdrawal \
+                     onchain and reconcile if it will never confirm."
+                ))
+                .await
+                .ok();
         }
 
         rebalancing_service
@@ -7521,12 +7548,31 @@ mod tests {
         mint_label: &str,
         redemption_label: &str,
     ) -> InterruptedAggregateFixture {
+        seed_interrupted_aggregates_and_build_service_with(
+            wallet_byte,
+            mint_label,
+            redemption_label,
+            false,
+        )
+        .await
+    }
+
+    async fn seed_interrupted_aggregates_and_build_service_with(
+        wallet_byte: u8,
+        mint_label: &str,
+        redemption_label: &str,
+        fail_restore: bool,
+    ) -> InterruptedAggregateFixture {
         let (pool, apalis_pool) = setup_test_pools().await;
 
         let mint_id = issuer_request_id(mint_label);
         let redemption_id = redemption_aggregate_id(redemption_label);
 
-        let raindex = Arc::new(MockRaindex::new());
+        let raindex = Arc::new(if fail_restore {
+            MockRaindex::new().with_failing_restore()
+        } else {
+            MockRaindex::new()
+        });
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let tokenizer = Arc::new(MockTokenizer::new());
 
@@ -7767,6 +7813,54 @@ mod tests {
             "startup must restore the persisted VaultWithdrawSubmitted \
              transaction's nonce ownership with its exact tx hash and retained \
              prepared transaction before workers run"
+        );
+    }
+
+    /// A submitted withdrawal whose restore fails on every restart (a legacy
+    /// hash-only record the RPC can no longer return) must not abort startup and
+    /// crash-loop the bot. Recovery skips the restore, pages, and keeps going.
+    #[tokio::test]
+    async fn startup_survives_a_failed_withdrawal_restore() {
+        let InterruptedAggregateFixture {
+            pool,
+            services,
+            raindex,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+            ..
+        } = seed_interrupted_aggregates_and_build_service_with(
+            3,
+            "resilient-mint",
+            "resilient-redemption",
+            true,
+        )
+        .await;
+
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+
+        recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            mint_store,
+            redemption_store,
+            &services,
+            &mut resume_queue,
+        )
+        .await
+        .expect("startup recovery must not abort when a withdrawal restore fails");
+
+        assert!(
+            !raindex.restore_submitted_withdrawal_calls().is_empty(),
+            "the failing restore path must have been exercised"
         );
     }
 
