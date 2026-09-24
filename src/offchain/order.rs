@@ -2384,9 +2384,12 @@ pub enum NoFillOutcome {
         cancelled_at: DateTime<Utc>,
     },
     /// Broker rejection/failure: issue `PositionCommand::FailOffChainOrder`.
+    /// `kind` is the order's persisted failure kind, so a `Deferral` terminal
+    /// is finalized as the deferral it was rather than as a hedge failure.
     Failed {
         error: String,
         anchor: AnchorDisposition,
+        kind: OffchainOrderFailureKind,
     },
 }
 
@@ -2423,14 +2426,16 @@ pub fn position_command_for_finalization(
             reason,
             cancelled_at,
         }),
-        TerminalPositionFinalization::NoFill(NoFillOutcome::Failed { error, anchor }) => {
-            Some(PositionCommand::FailOffChainOrder {
-                offchain_order_id,
-                error,
-                anchor,
-                kind: OffchainOrderFailureKind::Failure,
-            })
-        }
+        TerminalPositionFinalization::NoFill(NoFillOutcome::Failed {
+            error,
+            anchor,
+            kind,
+        }) => Some(PositionCommand::FailOffChainOrder {
+            offchain_order_id,
+            error,
+            anchor,
+            kind,
+        }),
         TerminalPositionFinalization::UnpricedFill { .. } => None,
     }
 }
@@ -2506,6 +2511,7 @@ pub fn terminal_position_finalization(
             direction,
             executor_order_id: Some(executor_order_id),
             error,
+            kind,
             ..
         } => Some(classify_terminal_fill(
             *retained_fill,
@@ -2517,14 +2523,22 @@ pub fn terminal_position_finalization(
             NoFillOutcome::Failed {
                 error: error.clone(),
                 anchor: AnchorDisposition::Preserve,
+                kind: *kind,
             },
         )),
 
         // Failed with no recorded fill (or no executor id) -- nothing to apply.
-        OffchainOrder::Failed { error, .. } => Some(TerminalPositionFinalization::NoFill(
+        // A `Deferral` terminal preserves the anchor too: finalization cannot
+        // tell a recovery retirement after a broker lookup miss, which keeps
+        // the id because a miss is not proof of absence (ADR 0022), from a
+        // deferral whose broker call never ran. Preserving costs at most one
+        // anchor reconciliation cycle; releasing could let a second order
+        // through under a fresh client order id.
+        OffchainOrder::Failed { error, kind, .. } => Some(TerminalPositionFinalization::NoFill(
             NoFillOutcome::Failed {
                 error: error.clone(),
                 anchor: AnchorDisposition::Preserve,
+                kind: *kind,
             },
         )),
 
@@ -4288,6 +4302,7 @@ mod tests {
             TerminalPositionFinalization::NoFill(NoFillOutcome::Failed {
                 error: "expired".to_string(),
                 anchor: AnchorDisposition::Preserve,
+                kind: OffchainOrderFailureKind::Failure,
             })
         );
     }
@@ -4319,6 +4334,7 @@ mod tests {
             TerminalPositionFinalization::NoFill(NoFillOutcome::Failed {
                 error: "broker unreachable".to_string(),
                 anchor: AnchorDisposition::Preserve,
+                kind: OffchainOrderFailureKind::Failure,
             })
         );
     }

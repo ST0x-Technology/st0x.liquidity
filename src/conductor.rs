@@ -15780,6 +15780,72 @@ mod tests {
         );
     }
 
+    /// The crash boundary inside `retire_unconfirmed_pending`: the order reached
+    /// its `Deferral` terminal, but the process died before the position claim
+    /// was cleared. The next sweep finalizes the claim from the terminal order
+    /// and must record it as the deferral it was, not as a hedge failure,
+    /// keeping the id as the anchor exactly as the completed retirement does.
+    #[tokio::test]
+    async fn recovery_finalizes_a_half_retired_process_tx_intent_as_a_deferral() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("SGOV").unwrap();
+        let fixture =
+            seed_crashed_pending_order(&pool, &symbol, PlacementProvenance::ProcessTx).await;
+        fixture
+            .offchain_order
+            .send(
+                &fixture.offchain_order_id,
+                OffchainOrderCommand::MarkPlacementFailed {
+                    error: "process-tx intent retired".to_string(),
+                    kind: OffchainOrderFailureKind::Deferral,
+                },
+            )
+            .await
+            .unwrap();
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(RecoveryProbePlacer {
+            broker_order: None,
+            placements: Arc::new(AtomicUsize::new(0)),
+            lookups: Arc::new(AtomicUsize::new(0)),
+        });
+
+        recover_orphaned_pending_offchain_orders(
+            &fixture.position,
+            &fixture.position_projection,
+            &fixture.offchain_order,
+            order_placer.as_ref(),
+            SupportedExecutor::AlpacaBrokerApi,
+        )
+        .await
+        .unwrap();
+
+        let recovered_position = fixture
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_position.pending_offchain_order_id, None);
+        assert_eq!(
+            recovered_position.last_failed_offchain_order_id,
+            Some(fixture.offchain_order_id),
+            "finishing a half retired intent must keep the id as the anchor, as the \
+             completed retirement does"
+        );
+        let (kind,): (Option<String>,) = sqlx::query_as(
+            "SELECT json_extract(payload, '$.OffChainOrderFailed.kind') FROM events \
+             WHERE event_type = 'PositionEvent::OffChainOrderFailed' AND aggregate_id = ?",
+        )
+        .bind(symbol.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            kind.as_deref(),
+            Some("Deferral"),
+            "the finalized claim must be recorded as a deferral, not a hedge failure"
+        );
+    }
+
     #[tokio::test]
     async fn recovery_adopts_a_process_tx_pending_the_broker_does_hold() {
         // Same provenance, opposite broker evidence: the placement did reach
