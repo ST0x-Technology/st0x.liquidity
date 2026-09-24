@@ -18802,6 +18802,7 @@ mod tests {
         async fn recheck_deposit(
             &self,
             _id: &UsdcRebalanceId,
+            _operator_deposit_tx: Option<TxHash>,
         ) -> Result<RecheckOutcome, UsdcRecheckError> {
             Ok(RecheckOutcome::LeftUnchanged)
         }

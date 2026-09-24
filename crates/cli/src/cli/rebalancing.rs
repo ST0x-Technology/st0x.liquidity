@@ -1,6 +1,6 @@
 //! Transfer equity and USDC rebalancing CLI commands.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::RootProvider;
 use anyhow::Context;
 use sqlx::SqlitePool;
@@ -2007,8 +2007,13 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
     stdout: &mut W,
     transfer_type: RecheckTransferType,
     id: &str,
+    deposit_tx: Option<TxHash>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    if deposit_tx.is_some() && !matches!(transfer_type, RecheckTransferType::Usdc) {
+        anyhow::bail!("--deposit-tx applies only to `transfer recheck --kind usdc`");
+    }
+
     let transfer_kind = match transfer_type {
         RecheckTransferType::Mint => st0x_hedge::operator::equity_transfer::RecheckKind::Mint,
         RecheckTransferType::Redemption => {
@@ -2016,7 +2021,8 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
         }
         RecheckTransferType::Usdc => st0x_hedge::operator::equity_transfer::RecheckKind::Usdc,
     };
-    let url = st0x_hedge::operator::equity_transfer::recheck_url(ctx, transfer_kind, id);
+    let url =
+        st0x_hedge::operator::equity_transfer::recheck_url(ctx, transfer_kind, id, deposit_tx);
     writeln!(stdout, "Re-checking {transfer_type:?} {id} via {url}")?;
 
     // The outcome name is the operator-facing value documented in
@@ -2625,7 +2631,7 @@ mod tests {
             ctx.server_port = server.port();
 
             let mut stdout = Vec::new();
-            recheck_transfer_command(&mut stdout, transfer_type, "some-id", &ctx)
+            recheck_transfer_command(&mut stdout, transfer_type, "some-id", None, &ctx)
                 .await
                 .unwrap();
 
@@ -2637,6 +2643,56 @@ mod tests {
                 "unexpected output for {kind}: {output}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn usdc_recheck_passes_the_operator_deposit_tx_to_the_bot() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/transfers/recheck/usdc_bridge/some-id")
+                    .query_param(
+                        "deposit_tx",
+                        "0x00000000000000000000000000000000000000000000000000000000000000cc",
+                    );
+                then.status(200).body(r#"{"outcome":"recovered"}"#);
+            })
+            .await;
+        let mut ctx = create_base_test_ctx();
+        ctx.server_port = server.port();
+
+        recheck_transfer_command(
+            &mut Vec::new(),
+            RecheckTransferType::Usdc,
+            "some-id",
+            Some(TxHash::with_last_byte(0xcc)),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn equity_recheck_refuses_a_deposit_tx() {
+        let ctx = create_base_test_ctx();
+
+        let error = recheck_transfer_command(
+            &mut Vec::new(),
+            RecheckTransferType::Mint,
+            "some-id",
+            Some(TxHash::with_last_byte(0xcc)),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--deposit-tx applies only to `transfer recheck --kind usdc`"
+        );
     }
 
     /// `transfer resume --kind equity` against a mocked bot endpoint: the

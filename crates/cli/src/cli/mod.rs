@@ -985,6 +985,12 @@ pub enum TransferCommand {
         /// redemption, rebalance ID for usdc)
         #[arg(short = 'i', long = "id")]
         id: String,
+        /// usdc only: the Alpaca deposit send found on chain for a deposit
+        /// that failed with no send recorded. The bot checks it (bot wallet
+        /// to the Alpaca deposit address, the transfer's amount, confirmed,
+        /// not recorded by another transfer) before attaching it.
+        #[arg(long = "deposit-tx")]
+        deposit_tx: Option<TxHash>,
     },
 }
 
@@ -1206,6 +1212,7 @@ enum TransferRecoveryCommand {
     RecheckTransfer {
         transfer_type: RecheckTransferType,
         id: String,
+        deposit_tx: Option<TxHash>,
     },
     ResumeInterruptedTransfers,
     ReconcileUsdcTransfer {
@@ -1618,14 +1625,17 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                     },
                 })
             }
-            TransferCommand::Recheck { kind, id } => {
-                CommandRoute::Simple(SimpleCommand::Transfer {
-                    command: TransferRecoveryCommand::RecheckTransfer {
-                        transfer_type: kind,
-                        id,
-                    },
-                })
-            }
+            TransferCommand::Recheck {
+                kind,
+                id,
+                deposit_tx,
+            } => CommandRoute::Simple(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::RecheckTransfer {
+                    transfer_type: kind,
+                    id,
+                    deposit_tx,
+                },
+            }),
         },
         Commands::View { command } => match command {
             ViewCommand::Rebuild { aggregate, id, all } => {
@@ -1852,9 +1862,14 @@ async fn run_transfer_command<W: Write>(
                 rebalancing::fail_transfer_command(stdout, ctx, transfer_type, &id, &reason).await;
             finish_with_log_query_url(stdout, ctx, &id, result)
         }
-        TransferRecoveryCommand::RecheckTransfer { transfer_type, id } => {
+        TransferRecoveryCommand::RecheckTransfer {
+            transfer_type,
+            id,
+            deposit_tx,
+        } => {
             let result =
-                rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await;
+                rebalancing::recheck_transfer_command(stdout, transfer_type, &id, deposit_tx, ctx)
+                    .await;
             finish_with_log_query_url(stdout, ctx, &id, result)
         }
         TransferRecoveryCommand::ResumeInterruptedTransfers => {
@@ -4065,6 +4080,30 @@ mod tests {
     }
 
     #[test]
+    fn transfer_recheck_carries_an_operator_deposit_tx() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "recheck",
+            "--kind",
+            "usdc",
+            "--id",
+            "4efa80fb-a9c9-44dd-87bc-a726fee6fa88",
+            "--deposit-tx",
+            "0x00000000000000000000000000000000000000000000000000000000000000cc",
+        ])
+        .unwrap();
+
+        let Ok(SimpleCommand::Transfer {
+            command: TransferRecoveryCommand::RecheckTransfer { deposit_tx, .. },
+        }) = classified_route(cli.command)
+        else {
+            panic!("expected transfer recheck simple command");
+        };
+        assert_eq!(deposit_tx, Some(TxHash::with_last_byte(0xcc)));
+    }
+
+    #[test]
     fn transfer_recheck_parses_and_classifies_as_simple() {
         let cli = Cli::try_parse_from([
             "st0x-cli",
@@ -4079,7 +4118,12 @@ mod tests {
 
         match classified_route(cli.command) {
             Ok(SimpleCommand::Transfer {
-                command: TransferRecoveryCommand::RecheckTransfer { transfer_type, id },
+                command:
+                    TransferRecoveryCommand::RecheckTransfer {
+                        transfer_type,
+                        id,
+                        deposit_tx: None,
+                    },
             }) => {
                 assert!(matches!(transfer_type, RecheckTransferType::Redemption));
                 assert_eq!(id, "redemption-1");
@@ -4405,7 +4449,12 @@ mod tests {
         .unwrap();
         match classified_route(cli.command) {
             Ok(SimpleCommand::Transfer {
-                command: TransferRecoveryCommand::RecheckTransfer { transfer_type, id },
+                command:
+                    TransferRecoveryCommand::RecheckTransfer {
+                        transfer_type,
+                        id,
+                        deposit_tx: None,
+                    },
             }) => {
                 assert!(matches!(transfer_type, RecheckTransferType::Usdc));
                 assert_eq!(id, "4efa80fb-a9c9-44dd-87bc-a726fee6fa88");

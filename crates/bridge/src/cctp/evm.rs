@@ -797,7 +797,20 @@ impl<W: Wallet> CctpEndpoint<W> {
     ) -> Result<U256, CctpError> {
         let receipt = self.wallet.await_receipt(tx_hash).await?;
 
-        usdc_credit_in_receipt(&receipt, self.usdc_address, recipient)
+        usdc_credit_in_receipt(&receipt, self.usdc_address, None, recipient)
+    }
+
+    /// Like [`usdc_credited_in_tx`](Self::usdc_credited_in_tx), counting only
+    /// the `Transfer` logs from `sender`.
+    pub(super) async fn usdc_sent_in_tx(
+        &self,
+        tx_hash: TxHash,
+        sender: Address,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        let receipt = self.wallet.await_receipt(tx_hash).await?;
+
+        usdc_credit_in_receipt(&receipt, self.usdc_address, Some(sender), recipient)
     }
 
     /// Broadcasts a transfer of `amount` of this endpoint's USDC from the
@@ -1642,12 +1655,14 @@ fn validate_message_shape(
     Ok(received_message)
 }
 
-/// Sums the `usdc` `Transfer` logs in `receipt` that pay `recipient`. A log
-/// carrying the `Transfer` topic that does not decode fails the read: skipping
-/// it would undercredit the transfer silently.
+/// Sums the `usdc` `Transfer` logs in `receipt` that pay `recipient`, from
+/// `sender` only when one is given. A log carrying the `Transfer` topic that
+/// does not decode fails the read: skipping it would undercredit the
+/// transfer silently.
 fn usdc_credit_in_receipt(
     receipt: &TransactionReceipt,
     usdc: Address,
+    sender: Option<Address>,
     recipient: Address,
 ) -> Result<U256, CctpError> {
     let tx_hash = receipt.transaction_hash;
@@ -1665,7 +1680,7 @@ fn usdc_credit_in_receipt(
         })
         .try_fold(U256::ZERO, |credited, transfer| {
             let transfer = transfer?;
-            if transfer.to != recipient {
+            if transfer.to != recipient || sender.is_some_and(|sender| transfer.from != sender) {
                 return Ok(credited);
             }
 
@@ -1879,7 +1894,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap(),
+            usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
             U256::from(1_000_000u64)
         );
     }
@@ -1896,7 +1911,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap(),
+            usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
             U256::from(1_000_000u64)
         );
     }
@@ -1908,7 +1923,7 @@ mod tests {
             transfer_log(USDC, WALLET, U256::from(1u64)),
         ]);
 
-        let error = usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap_err();
+        let error = usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
 
         assert!(
             matches!(error, CctpError::UsdcCreditOverflow { tx_hash } if tx_hash == TxHash::ZERO),
@@ -1938,7 +1953,7 @@ mod tests {
             malformed,
         ]);
 
-        let error = usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap_err();
+        let error = usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
 
         assert!(
             matches!(error, CctpError::UsdcTransferLogDecode { tx_hash, .. } if tx_hash == TxHash::ZERO),
