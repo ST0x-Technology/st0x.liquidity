@@ -482,10 +482,23 @@ impl<
             }
         };
 
-        let credits: Vec<_> = credits
-            .into_iter()
-            .filter(|(credit_id, _)| credit_id != id)
-            .collect();
+        // Read before the balance, so a withdrawal counted as held is in it.
+        let mut resolved = Vec::with_capacity(credits.len());
+        for (credit_id, credit) in credits {
+            if &credit_id == id {
+                continue;
+            }
+
+            let credit = match credit {
+                EthereumWalletCredit::Delivering { withdrawal_tx, .. } => self
+                    .confirmed_withdrawal_credit(&credit_id, withdrawal_tx)
+                    .await
+                    .map_or(credit, EthereumWalletCredit::Held),
+                EthereumWalletCredit::Held(_) | EthereumWalletCredit::InFlight(_) => credit,
+            };
+            resolved.push((credit_id, credit));
+        }
+        let credits = resolved;
 
         // An in-flight send may or may not have left the wallet, so it only
         // widens the range: it never pages a shortfall.
@@ -521,7 +534,9 @@ impl<
                 .iter()
                 .filter_map(|(credit_id, credit)| match credit {
                     EthereumWalletCredit::Held(_) => Some(credit_id),
-                    EthereumWalletCredit::InFlight(_) => None,
+                    EthereumWalletCredit::InFlight(_) | EthereumWalletCredit::Delivering { .. } => {
+                        None
+                    }
                 })
                 .collect();
             error!(
@@ -556,6 +571,42 @@ impl<
             in_flight,
             balance,
         }
+    }
+
+    /// The credit of another transfer's withdrawal tx once it is confirmed to
+    /// the required depth, or `None` while it may still land or cannot be read.
+    async fn confirmed_withdrawal_credit(
+        &self,
+        credit_id: &UsdcRebalanceId,
+        withdrawal_tx: TxHash,
+    ) -> Option<Usdc> {
+        match self
+            .cctp_bridge
+            .ethereum_tx_confirmations(withdrawal_tx)
+            .await
+        {
+            Ok(Some(confirmations)) if confirmations >= self.required_confirmations => {}
+            Ok(_) => return None,
+            Err(error) => {
+                warn!(target: "rebalance", %credit_id, %withdrawal_tx, %error, "Could not read the withdrawal tx confirmations for the credit ledger");
+                return None;
+            }
+        }
+
+        let credited = self
+            .cctp_bridge
+            .ethereum_usdc_credit(withdrawal_tx, self.market_maker_wallet)
+            .await
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %credit_id, %withdrawal_tx, %error, "Could not read the withdrawal tx credit for the credit ledger");
+            })
+            .ok()?;
+
+        u256_to_usdc(credited)
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %credit_id, %withdrawal_tx, %error, "Could not convert the withdrawal tx credit for the credit ledger");
+            })
+            .ok()
     }
 
     /// Uses the supplied native-gas readiness check before starting a transfer.
@@ -4896,7 +4947,8 @@ impl<
 ///
 /// Delegates to [`Usdc::to_u256_6_decimals`].
 /// Totals the ledger as `(held, held + in flight)` in USDC base units, `held`
-/// starting from the sending transfer's own credit.
+/// starting from the sending transfer's own credit. A delivery not yet read
+/// counts as in flight up to its nominal amount.
 fn total_credits(
     own_credit: Usdc,
     credits: &[(UsdcRebalanceId, EthereumWalletCredit)],
@@ -4906,7 +4958,10 @@ fn total_credits(
         |(held, in_flight), (_, credit)| -> Result<_, UsdcTransferError> {
             match credit {
                 EthereumWalletCredit::Held(amount) => Ok(((held + *amount)?, in_flight)),
-                EthereumWalletCredit::InFlight(amount) => Ok((held, (in_flight + *amount)?)),
+                EthereumWalletCredit::InFlight(amount)
+                | EthereumWalletCredit::Delivering {
+                    nominal: amount, ..
+                } => Ok((held, (in_flight + *amount)?)),
             }
         },
     )?;
@@ -14064,9 +14119,14 @@ mod tests {
             .check_ethereum_credit_ledger(&UsdcRebalanceId(Uuid::new_v4()), usdc("100"))
             .await;
 
-        assert!(
-            matches!(result, CreditLedgerCheck::Shortfall { .. }),
-            "the paid withdrawal's credit must count as held; got: {result:?}"
+        assert_eq!(
+            result,
+            CreditLedgerCheck::Shortfall {
+                outstanding: U256::from(200_000_000u64),
+                in_flight: U256::ZERO,
+                balance: U256::from(100_000_000u64),
+            },
+            "the paid withdrawal's credit must count as held"
         );
         assert!(logs_contain("operational_alert"));
     }

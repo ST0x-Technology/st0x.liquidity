@@ -1273,13 +1273,23 @@ impl UsdcRebalance {
     /// USDC this transfer was credited with that may still sit in the shared
     /// Ethereum wallet: credited from its delivering tx and not yet sent on.
     /// A BaseToAlpaca credit leaves with the Alpaca deposit send
-    /// (`DepositInitiated`). An AlpacaToBase credit leaves with the burn, and
+    /// (`DepositInitiated`). An AlpacaToBase credit arrives with the withdrawal
+    /// tx Alpaca reported and leaves with the burn, and
     /// `BridgingSubmitting` cannot tell whether it has: a recorded burn may
     /// be unmined, and with no recorded hash the burn may be unsent or
     /// broadcast with its hash lost (`BurnRecordFailed`, an inconclusive
     /// submit).
     pub(crate) fn ethereum_wallet_credit(&self) -> Option<EthereumWalletCredit> {
         match self {
+            Self::WithdrawalComplete {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal_tx: Some(withdrawal_tx),
+                ..
+            } => Some(EthereumWalletCredit::Delivering {
+                withdrawal_tx: *withdrawal_tx,
+                nominal: *amount,
+            }),
             Self::BridgingSubmitting {
                 direction: RebalanceDirection::AlpacaToBase,
                 burn_amount,
@@ -1840,6 +1850,12 @@ pub(crate) enum EthereumWalletCredit {
     Held(Usdc),
     /// Being sent: up to this amount may still be in the wallet.
     InFlight(Usdc),
+    /// Credited by `withdrawal_tx`, which may not be mined yet: up to
+    /// `nominal` may be in the wallet until the receipt is read.
+    Delivering {
+        withdrawal_tx: TxHash,
+        nominal: Usdc,
+    },
 }
 
 /// Why the Ethereum wallet credit ledger could not be derived.
@@ -10069,8 +10085,9 @@ mod tests {
 
     /// A transfer's Ethereum wallet credit is outstanding only between the
     /// credit and the send: a BaseToAlpaca mint not yet forwarded to Alpaca is
-    /// held, and an AlpacaToBase burn intent is in flight whether or not a
-    /// burn hash is recorded.
+    /// held, an AlpacaToBase withdrawal with its tx is delivering, and an
+    /// AlpacaToBase burn intent is in flight whether or not a burn hash is
+    /// recorded.
     #[test]
     fn ethereum_wallet_credit_covers_only_credited_unsent_usdc() {
         use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
@@ -10115,6 +10132,21 @@ mod tests {
             Some(EthereumWalletCredit::Held(credited))
         );
         assert_eq!(minted(AlpacaToBase).ethereum_wallet_credit(), None);
+        let withdrawn = |withdrawal_tx| WithdrawalComplete {
+            direction: AlpacaToBase,
+            amount,
+            initiated_at: now,
+            confirmed_at: now,
+            withdrawal_tx,
+        };
+        assert_eq!(
+            withdrawn(Some(MINT_TX)).ethereum_wallet_credit(),
+            Some(EthereumWalletCredit::Delivering {
+                withdrawal_tx: MINT_TX,
+                nominal: amount,
+            })
+        );
+        assert_eq!(withdrawn(None).ethereum_wallet_credit(), None);
         assert_eq!(
             DepositInitiated {
                 direction: BaseToAlpaca,

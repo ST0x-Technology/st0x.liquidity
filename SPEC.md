@@ -4398,7 +4398,10 @@ Base to Alpaca:
 
 The ledger is derived from open `UsdcRebalance` aggregates, never stored
 separately. A transfer is credited-not-yet-sent (held) while its credited USDC
-sits in the Ethereum wallet: a BaseToAlpaca `Bridged`. An AlpacaToBase
+sits in the Ethereum wallet: a BaseToAlpaca `Bridged`, or an AlpacaToBase
+`WithdrawalComplete` whose withdrawal tx has reached the required confirmations
+(its credit is read from the receipt before the balance; until then, or if the
+read fails, it is in flight up to the nominal amount). An AlpacaToBase
 `BridgingSubmitting` with a `burn_amount` is in flight: its burn may be unsent,
 unmined, or broadcast with its hash lost (`BurnRecordFailed`, an inconclusive
 submit), and the state cannot tell these apart. In-flight credit never pages a
