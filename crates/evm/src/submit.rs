@@ -1786,7 +1786,9 @@ mod tests {
         assert_eq!(result, tx_hash);
         assert_eq!(
             nonce_manager.peek_next_nonce(WALLET).await,
-            Some(STUCK_NONCE + 1)
+            None,
+            "a nonce too low response proves the chain has passed STUCK_NONCE, \
+             so the cold cache stays unseeded and the next send fetches latest again"
         );
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),

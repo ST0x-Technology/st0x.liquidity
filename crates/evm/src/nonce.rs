@@ -111,15 +111,23 @@ impl ResettableNonceManager {
         *slot.lock().await = Some(nonce);
     }
 
-    /// Reserves a prepared transaction's nonce and raises the cache past it
-    /// without lowering an already-higher allocation.
+    /// Reserves a prepared transaction's nonce and raises an already warm
+    /// cache past it, without lowering a higher allocation.
+    ///
+    /// A cold cache is deliberately left unseeded: `get_next_nonce` then
+    /// fetches the chain's mined `latest` again and skips this reservation.
+    /// Seeding `nonce + 1` here would pin allocation below the mined count
+    /// whenever earlier sends from the wallet mined before the restart, so
+    /// every following prepare would sign at a nonce the chain has already
+    /// passed and could never land.
     #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
     pub(crate) async fn reserve_prepared_nonce(&self, address: Address, nonce: u64) {
         let slot = self.slot(address);
         let mut cached = slot.lock().await;
         self.hold_nonce(address, nonce, NonceHold::Reserved);
-        let next = nonce.saturating_add(1);
-        *cached = Some(cached.map_or(next, |current| current.max(next)));
+        if let Some(current) = *cached {
+            *cached = Some(current.max(nonce.saturating_add(1)));
+        }
     }
 
     /// Releases a prepared nonce that will never be broadcast. The cache is
