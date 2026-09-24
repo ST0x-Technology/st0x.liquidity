@@ -14185,6 +14185,59 @@ mod tests {
         assert!(logs_contain("poisoned-rebalance-id"));
     }
 
+    /// A finished transfer holds no credit, so the ledger never loads it: even
+    /// one it could not read leaves the shortfall check on.
+    #[tokio::test]
+    async fn credit_ledger_skips_finished_transfers() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(40_000_000u64), market_maker_wallet)
+                .await;
+
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let manager = CrossVenueCashTransfer::new(
+            InstrumentedAlpacaBroker::new(
+                create_test_broker_service(&server).await,
+                TelemetrySender::disabled(),
+            ),
+            Arc::new(create_test_wallet_service(&server)),
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        )
+        .with_credit_ledger(pool.clone());
+
+        persist_event::<UsdcRebalance>(
+            &pool,
+            "finished-rebalance-id",
+            1,
+            &UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                deposit_confirmed_at: Utc::now(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            manager
+                .check_ethereum_credit_ledger(&UsdcRebalanceId(Uuid::new_v4()), usdc("0"))
+                .await,
+            CreditLedgerCheck::Covered {
+                outstanding: U256::ZERO,
+                in_flight: U256::ZERO,
+                balance: U256::from(40_000_000u64),
+            }
+        );
+    }
+
     /// The ledger sums the credits of every open transfer in the shared
     /// wallet, whatever its direction, and reports the rest as unattributed.
     #[tracing_test::traced_test]
