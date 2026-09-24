@@ -18,7 +18,9 @@
 
 use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::eips::BlockId;
-use alloy::eips::eip2718::{Decodable2718, Eip2718Error, Encodable2718};
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+use alloy::eips::eip2718::Encodable2718;
+use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
@@ -37,7 +39,9 @@ pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorReg
 use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
 pub use rain_error_decoding::AbiDecodedErrorType;
 
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
 pub mod nonce;
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
 pub use nonce::ResettableNonceManager;
 
 mod bindings;
@@ -679,9 +683,9 @@ impl PreparedTransaction {
 
     /// Builds a prepared transaction from an envelope already decoded by the
     /// signing path, avoiding a redundant decode.
-    // Reached only from the feature-gated signing path
-    // (`submit::prepare_with_nonce`), so a no-feature build sees it as unused.
-    #[allow(dead_code)]
+    // Reached only from the feature-gated signing path, so it is compiled under
+    // the same features rather than carried as dead code elsewhere.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     pub(crate) fn from_envelope(envelope: &TxEnvelope) -> Self {
         let raw = Bytes::from(envelope.encoded_2718());
         Self {

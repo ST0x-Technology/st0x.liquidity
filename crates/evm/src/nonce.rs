@@ -67,10 +67,6 @@ pub struct ResettableNonceManager {
 /// Why a nonce is currently held, which decides whether allocation may land
 /// back on it after a cache seed or invalidation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// Only the wallet features construct these (see the cfg-gated occupy/reserve
-// methods); the always-compiled `occupied` field type and `is_reserved` still
-// need the enum, so a no-feature build sees the variants as never constructed.
-#[allow(dead_code)]
 enum NonceHold {
     /// A prepared (not-yet-broadcast) reservation or a durable prepared
     /// transaction retained for exact rebroadcast. Allocation skips it: a
@@ -169,11 +165,17 @@ impl ResettableNonceManager {
         let slot = self.slot(address);
         let mut cached = slot.lock().await;
 
-        // `pending` counts this wallet's own unmined sends the cache may have
-        // dropped; it is the floor for a fixed prepared nonce that a live
-        // generic send must never share.
+        // Floor the candidate at the higher of the wallet's `pending` count and
+        // the chain's mined `latest`. `pending` counts this wallet's own unmined
+        // sends the cache may have dropped, but a lagging node behind a load
+        // balancer can serve a `pending` below the true mined count; flooring at
+        // `latest` as well stops a fixed prepared nonce from being signed at a
+        // nonce the chain has already used, which a prepared withdrawal cannot
+        // recover from the way a generic send does.
         let pending = provider.get_transaction_count(address).pending().await?;
-        let mut candidate = cached.map_or(pending, |current| current.max(pending));
+        let latest = provider.get_transaction_count(address).latest().await?;
+        let floor = pending.max(latest);
+        let mut candidate = cached.map_or(floor, |current| current.max(floor));
         while self.is_held(address, candidate) {
             let advanced = candidate.saturating_add(1);
             if advanced == candidate {
