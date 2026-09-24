@@ -7867,40 +7867,21 @@ mod tests {
         }
     }
 
-    /// Aborting the HTTP request future after the broker placement has begun
-    /// must NOT cancel that placement: `process_transaction` runs the process-tx
-    /// workload on a detached task, so a live broker order completes even when
-    /// nobody awaits the response. This drives the real handler path
-    /// -- a mocked provider decodes a tradeable fill, and the published
-    /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify` -- aborts
-    /// the request once placement has begun, and asserts the placement still
-    /// finishes and that the detached task records its own outcome. Awaiting
-    /// the workload inline instead of the detached `tokio::spawn(...).await`
-    /// would cancel the parked placement and hang `finished`, which is the
-    /// regression this test guards.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn process_tx_task_survives_request_cancellation() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let finished = Arc::new(Notify::new());
-        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ParkedOrderPlacer {
-            started: Arc::clone(&started),
-            release: Arc::clone(&release),
-            finished: Arc::clone(&finished),
-        });
-
-        // A `TakeOrderV3` fill against the bot's own order (`get_test_order`),
-        // with the equity token on the input leg and USDC on the output leg, so
-        // the decoder classifies a 1-share on-chain BUY at 150 USDC. The
-        // opposite hedge is a market SELL, which reaches the parked placer
-        // without a buy preflight.
+    /// A `TakeOrderV3` fill in `tx_hash` against the bot's own order
+    /// (`get_test_order`), with the equity token on the input leg and USDC on
+    /// the output leg, so the decoder classifies a 1 share onchain BUY of AAPL at
+    /// 150 USDC; the opposite hedge is a market SELL. Returns a provider mocked
+    /// to answer the transaction receipt, a symbol cache seeded for the order's
+    /// tokens, and a context whose primary chain points at the fill's orderbook
+    /// and enables AAPL for trading.
+    fn aapl_buy_fill_fixture(
+        tx_hash: TxHash,
+    ) -> (
+        impl alloy::providers::Provider + Clone + 'static,
+        SymbolCache,
+        Ctx,
+    ) {
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let order_owner = get_test_order().owner;
-        let tx_hash =
-            fixed_bytes!("0x4545454545454545454545454545454545454545454545454545454545454545");
         let take_order = TakeOrderV3 {
             sender: address!("0x2222222222222222222222222222222222222222"),
             config: TakeOrderConfigV4 {
@@ -7957,7 +7938,7 @@ mod tests {
         let cache = SymbolCache::default();
         seed_get_test_order_token_symbols(&cache);
 
-        let mut ctx = create_test_ctx_with_order_owner(order_owner);
+        let mut ctx = create_test_ctx_with_order_owner(get_test_order().owner);
         ctx.chains.primary_mut().orderbook = orderbook;
         ctx.chains.primary_mut().assets.equities.symbols.insert(
             Symbol::new("AAPL").unwrap(),
@@ -7972,6 +7953,40 @@ mod tests {
                 target_share: None,
             },
         );
+
+        (provider, cache, ctx)
+    }
+
+    /// Aborting the HTTP request future after the broker placement has begun
+    /// must NOT cancel that placement: `process_transaction` runs the process-tx
+    /// workload on a detached task, so a live broker order completes even when
+    /// nobody awaits the response. This drives the real handler path
+    /// -- a mocked provider decodes a tradeable fill, and the published
+    /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify` -- aborts
+    /// the request once placement has begun, and asserts the placement still
+    /// finishes and that the detached task records its own outcome. Awaiting
+    /// the workload inline instead of the detached `tokio::spawn(...).await`
+    /// would cancel the parked placement and hang `finished`, which is the
+    /// regression this test guards.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn process_tx_task_survives_request_cancellation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ParkedOrderPlacer {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            finished: Arc::clone(&finished),
+        });
+
+        // The fixture's opposite hedge is a market SELL, which reaches the
+        // parked placer without a buy preflight.
+        let tx_hash =
+            fixed_bytes!("0x4545454545454545454545454545454545454545454545454545454545454545");
+        let (provider, cache, ctx) = aapl_buy_fill_fixture(tx_hash);
         let trading_chain = ctx.chains.primary().clone();
 
         let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
@@ -8084,84 +8099,9 @@ mod tests {
         .await
         .unwrap();
 
-        // A `TakeOrderV3` fill against the bot's own order, decoding a 1-share
-        // on-chain BUY of AAPL (opposite hedge is a market SELL), mirroring the
-        // cancellation test's fixture.
-        let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let order_owner = get_test_order().owner;
         let tx_hash =
             fixed_bytes!("0x4646464646464646464646464646464646464646464646464646464646464646");
-        let take_order = TakeOrderV3 {
-            sender: address!("0x2222222222222222222222222222222222222222"),
-            config: TakeOrderConfigV4 {
-                order: get_test_order(),
-                inputIOIndex: U256::from(1),
-                outputIOIndex: U256::from(0),
-                signedContext: vec![SignedContextV1 {
-                    signer: Address::ZERO,
-                    signature: Vec::new().into(),
-                    context: Vec::new(),
-                }],
-            },
-            input: Float::from_fixed_decimal_lossy(uint!(150_U256), 0)
-                .unwrap()
-                .0
-                .get_inner(),
-            output: Float::from_fixed_decimal_lossy(uint!(1_U256), 0)
-                .unwrap()
-                .0
-                .get_inner(),
-        };
-        let orderbook_log = Log {
-            inner: alloy::primitives::Log {
-                address: orderbook,
-                data: take_order.to_log_data(),
-            },
-            block_hash: None,
-            block_number: None,
-            block_timestamp: Some(1_700_000_000),
-            transaction_hash: Some(tx_hash),
-            transaction_index: None,
-            log_index: Some(7),
-            removed: false,
-        };
-        let receipt = serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x2a",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": orderbook,
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": format!("0x{}", "0".repeat(512)),
-            "logs": [orderbook_log]
-        });
-        let asserter = Asserter::new();
-        asserter.push_success(&receipt);
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let cache = SymbolCache::default();
-        seed_get_test_order_token_symbols(&cache);
-
-        let mut ctx = create_test_ctx_with_order_owner(order_owner);
-        ctx.chains.primary_mut().orderbook = orderbook;
-        ctx.chains.primary_mut().assets.equities.symbols.insert(
-            symbol.clone(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
+        let (provider, cache, ctx) = aapl_buy_fill_fixture(tx_hash);
         let trading_chain = ctx.chains.primary().clone();
 
         let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
@@ -8249,85 +8189,12 @@ mod tests {
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(MismatchOrderPlacer);
 
-        // A `TakeOrderV3` fill against the bot's own order decoding a 1-share
-        // on-chain BUY of AAPL, whose opposite hedge is a market SELL. The
-        // placer answers that sell's preflight with a buying power reservation,
-        // the reservation a buy would earn, so the sell fails closed.
-        let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let order_owner = get_test_order().owner;
+        // The fixture's opposite hedge is a market SELL. The placer answers
+        // that sell's preflight with a buying power reservation, the
+        // reservation a buy would earn, so the sell fails closed.
         let tx_hash =
             fixed_bytes!("0x4747474747474747474747474747474747474747474747474747474747474747");
-        let take_order = TakeOrderV3 {
-            sender: address!("0x2222222222222222222222222222222222222222"),
-            config: TakeOrderConfigV4 {
-                order: get_test_order(),
-                inputIOIndex: U256::from(1),
-                outputIOIndex: U256::from(0),
-                signedContext: vec![SignedContextV1 {
-                    signer: Address::ZERO,
-                    signature: Vec::new().into(),
-                    context: Vec::new(),
-                }],
-            },
-            input: Float::from_fixed_decimal_lossy(uint!(150_U256), 0)
-                .unwrap()
-                .0
-                .get_inner(),
-            output: Float::from_fixed_decimal_lossy(uint!(1_U256), 0)
-                .unwrap()
-                .0
-                .get_inner(),
-        };
-        let orderbook_log = Log {
-            inner: alloy::primitives::Log {
-                address: orderbook,
-                data: take_order.to_log_data(),
-            },
-            block_hash: None,
-            block_number: None,
-            block_timestamp: Some(1_700_000_000),
-            transaction_hash: Some(tx_hash),
-            transaction_index: None,
-            log_index: Some(7),
-            removed: false,
-        };
-        let receipt = serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x2a",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": orderbook,
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": format!("0x{}", "0".repeat(512)),
-            "logs": [orderbook_log]
-        });
-        let asserter = Asserter::new();
-        asserter.push_success(&receipt);
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let cache = SymbolCache::default();
-        seed_get_test_order_token_symbols(&cache);
-
-        let mut ctx = create_test_ctx_with_order_owner(order_owner);
-        ctx.chains.primary_mut().orderbook = orderbook;
-        ctx.chains.primary_mut().assets.equities.symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
+        let (provider, cache, ctx) = aapl_buy_fill_fixture(tx_hash);
         let trading_chain = ctx.chains.primary().clone();
 
         let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
