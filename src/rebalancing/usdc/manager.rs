@@ -10309,6 +10309,54 @@ mod tests {
         );
     }
 
+    /// An AlpacaToBase retry finds the latched `BridgingFailed` and does not
+    /// alert, so an unusable persisted envelope must page at the latch.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn alpaca_to_base_corrupt_envelope_pages_the_operator() {
+        let server = MockServer::start();
+        let attestation_mock = mock_complete_attestation(&server);
+
+        let (manager, cqrs, _anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_attested_alpaca_to_base(&cqrs, &id, usdc("100")).await;
+        let burn_tx =
+            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000001");
+
+        let error = manager
+            .attested_attestation_response(
+                &id,
+                BridgeDirection::EthereumToBase,
+                burn_tx,
+                vec![0x01],
+                valid_message_nonce(),
+                Some(vec![0u8; 10]),
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "got: {state:?}",
+        );
+        assert_eq!(attestation_mock.calls(), 0);
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the recorded CCTP message cannot mint on Base"
+        )));
+        assert!(logs_contain(&format!(
+            "get the Circle attestation for burn tx {burn_tx}"
+        )));
+    }
+
     #[cfg(feature = "test-support")]
     #[tokio::test]
     async fn attested_attestation_response_with_mismatched_nonce_fails_bridging() {
