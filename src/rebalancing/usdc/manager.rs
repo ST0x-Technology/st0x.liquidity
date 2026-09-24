@@ -6057,6 +6057,12 @@ mod tests {
         // `send_alpaca_deposit_enqueues_wallet_transfer_bot_gas_job` opts in via
         // `with_send_usdc_tx`.
         send_usdc_tx: Option<TxHash>,
+        usdc_submit_calls: AtomicUsize,
+        usdc_submit_delay: Duration,
+        usdc_submit_error: Option<fn() -> BroadcastError>,
+        // Opt-in: the mint block lookup and the pre-send scan find nothing,
+        // as a scan of mined logs does while a send is still unmined.
+        empty_usdc_scan: bool,
         ledger_probe: Option<LedgerBalanceProbe>,
         empty_burn_scan: bool,
         // Opt-in failing Circle re-poll with the nonce read consumed; see
@@ -6084,6 +6090,10 @@ mod tests {
                 confirm_revert_count: 1,
                 burn_status: None,
                 send_usdc_tx: None,
+                usdc_submit_calls: AtomicUsize::new(0),
+                usdc_submit_delay: Duration::ZERO,
+                usdc_submit_error: None,
+                empty_usdc_scan: false,
                 ledger_probe: None,
                 empty_burn_scan: false,
                 repoll_error: None,
@@ -6155,6 +6165,20 @@ mod tests {
         fn with_send_usdc_tx(mut self, tx_hash: TxHash) -> Self {
             self.send_usdc_tx = Some(tx_hash);
             self
+        }
+
+        fn with_usdc_submit_delay(mut self, delay: Duration) -> Self {
+            self.usdc_submit_delay = delay;
+            self
+        }
+
+        fn with_empty_usdc_scan(mut self) -> Self {
+            self.empty_usdc_scan = true;
+            self
+        }
+
+        fn usdc_submit_calls(&self) -> usize {
+            self.usdc_submit_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -6313,6 +6337,10 @@ mod tests {
         }
 
         async fn ethereum_tx_block(&self, _tx_hash: TxHash) -> Result<u64, CctpError> {
+            if self.empty_usdc_scan {
+                return Ok(0);
+            }
+
             unimplemented!("MockBridge: ethereum_tx_block not used in this test")
         }
 
@@ -6339,6 +6367,13 @@ mod tests {
             _to: Address,
             _amount: U256,
         ) -> Result<TxHash, BroadcastError> {
+            self.usdc_submit_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.usdc_submit_delay).await;
+
+            if let Some(error) = self.usdc_submit_error {
+                return Err(error());
+            }
+
             let Some(tx_hash) = self.send_usdc_tx else {
                 unimplemented!("MockBridge: submit_usdc_on_ethereum not used in this test")
             };
@@ -6365,6 +6400,10 @@ mod tests {
             _amount: U256,
             _from_block: u64,
         ) -> Result<Option<TxHash>, CctpError> {
+            if self.empty_usdc_scan {
+                return Ok(None);
+            }
+
             unimplemented!("MockBridge: find_recent_usdc_transfer not used in this test")
         }
     }
@@ -14870,6 +14909,93 @@ mod tests {
             panic!("expected DepositFailed, got: {state:?}");
         };
         assert_eq!(deposit_ref, None);
+    }
+
+    const MOCK_DEPOSIT_SEND_TX: TxHash =
+        fixed_bytes!("0xdddd0000000000000000000000000000000000000000000000000000000000aa");
+
+    /// A manager over `bridge` whose Alpaca mock serves the deposit address
+    /// and polls deposits briefly. The anvil only backs the unused vault.
+    async fn deposit_send_manager(
+        cqrs: Arc<Store<UsdcRebalance>>,
+        bridge: Arc<MockBridge>,
+    ) -> (
+        CrossVenueCashTransfer<
+            RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>,
+            MockBridge,
+        >,
+        MockServer,
+        TestAnvilInstance,
+    ) {
+        let (anvil, endpoint, private_key) = setup_anvil();
+        let server = MockServer::start();
+        mock_alpaca_deposit_address(&server);
+
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let vault_service = RaindexService::new(
+            wallet,
+            RaindexContracts {
+                inventory: ORDERBOOK_ADDRESS,
+                orderbook: ORDERBOOK_ADDRESS,
+            },
+            recipient,
+        );
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            bridge,
+            Arc::new(vault_service),
+            cqrs,
+            MarketMakingUsdcEndpoints::new(recipient, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        );
+
+        (manager, server, anvil)
+    }
+
+    /// A job attempt timeout drops the resume while its detached task is still
+    /// broadcasting the deposit send; the task keeps running. The redrive that
+    /// follows must not broadcast a second send of the minted USDC.
+    #[tokio::test]
+    async fn deposit_send_redriven_while_broadcasting_is_sent_once() {
+        let bridge = Arc::new(
+            MockBridge::new()
+                .with_send_usdc_tx(MOCK_DEPOSIT_SEND_TX)
+                .with_usdc_submit_delay(Duration::from_millis(500))
+                .with_empty_usdc_scan(),
+        );
+        let cqrs = create_test_store_instance().await;
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        stage_bridged_with_mint_tx(&cqrs, &id, amount, usdc("99.99"), TxHash::ZERO).await;
+
+        let Err(_elapsed) = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.resume_base_to_alpaca(&id, amount),
+        )
+        .await
+        else {
+            panic!("the attempt must time out while the send is broadcasting");
+        };
+
+        let _redrive = manager.resume_base_to_alpaca(&id, amount).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        assert_eq!(
+            bridge.usdc_submit_calls(),
+            1,
+            "the redrive must not broadcast a second deposit send"
+        );
     }
 
     /// Sends `amount` USDC from the bot wallet to the Alpaca deposit address.
