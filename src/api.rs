@@ -1369,10 +1369,6 @@ pub(crate) struct ProcessTxHandle {
 /// duplicate or conflicting mint/redemption flows.
 pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
 
-/// Quiesces the USDC rebalancing driver for the caller's mutation window:
-/// returns once no worker execution is in flight and none can start, or 503
-/// when a transfer is executing and the driver cannot be paused within the
-/// quiesce window. The guard resumes the driver when dropped.
 /// The operator request asking to pause the USDC driver, logged when the pause
 /// is refused so the refusal is traceable to that request.
 #[derive(Debug, Clone, Copy)]
@@ -1389,6 +1385,10 @@ enum UsdcDriverPauseRequest<'a> {
     },
 }
 
+/// Quiesces the USDC rebalancing driver for the caller's mutation window:
+/// returns once no worker execution is in flight and none can start, or 503
+/// when a transfer is executing and the driver cannot be paused within the
+/// quiesce window. The guard resumes the driver when dropped.
 async fn quiesce_usdc_driver(
     pause: &UsdcDriverPause,
     request: UsdcDriverPauseRequest<'_>,
@@ -2800,8 +2800,8 @@ impl From<RecoveredMintAmounts> for CompleteCctpMintAmounts {
 }
 
 /// Completes the destination mint of a CCTP burn whose mint never landed
-/// (attestation polling interrupted, bot crashed after the burn). Polls
-/// Circle for the attestation and submits `receiveMessage` through the bot's
+/// (attestation polling interrupted, bot crashed after the burn). Fetches the
+/// attestation from Circle and submits `receiveMessage` through the bot's
 /// own bridge and wallet. Live RPC only; touches no aggregate. After the mint
 /// lands, bring the stuck `UsdcRebalance` back in sync with `resume-usdc`
 /// (non-terminal: adopts the mint) or `reconcile-usdc` (post-burn terminal).
