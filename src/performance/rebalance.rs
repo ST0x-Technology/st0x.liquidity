@@ -681,11 +681,14 @@ impl StoredOperation {
             //   `BridgingSubmitting`.
             // - `AttestationTimedOut`: a recoverable stall; the Attestation stage
             //   stays open until `BridgeAttestationReceived` or `BridgingFailed`.
-            // - `PendingDepositRecorded`: the deposit send stays in `Bridged`;
+            // - `DepositSendSubmitting`, `PendingDepositRecorded`,
+            //   `DepositSendAborted`: the deposit send stays in `Bridged`;
             //   the Deposit stage opens at `DepositInitiated`.
             UsdcRebalanceEvent::PendingBurnRecorded { .. }
             | UsdcRebalanceEvent::PendingBurnCleared { .. }
+            | UsdcRebalanceEvent::DepositSendSubmitting { .. }
             | UsdcRebalanceEvent::PendingDepositRecorded { .. }
+            | UsdcRebalanceEvent::DepositSendAborted { .. }
             | UsdcRebalanceEvent::AttestationTimedOut { .. } => {}
             UsdcRebalanceEvent::Bridged { minted_at, .. } => {
                 self.close(
@@ -974,6 +977,8 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
         UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at, .. } => *confirmed_at,
         UsdcRebalanceEvent::PendingBurnRecorded { recorded_at, .. }
         | UsdcRebalanceEvent::PendingDepositRecorded { recorded_at, .. } => *recorded_at,
+        UsdcRebalanceEvent::DepositSendSubmitting { submitting_at } => *submitting_at,
+        UsdcRebalanceEvent::DepositSendAborted { aborted_at } => *aborted_at,
         UsdcRebalanceEvent::PendingBurnCleared { cleared_at } => *cleared_at,
         UsdcRebalanceEvent::BridgingInitiated { burned_at, .. } => *burned_at,
         UsdcRebalanceEvent::BridgeAttestationReceived { attested_at, .. } => *attested_at,

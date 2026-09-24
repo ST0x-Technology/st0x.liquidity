@@ -275,6 +275,16 @@ pub enum UsdcRebalanceError {
     /// Bridging has not been completed yet
     #[error("Bridging has not been completed")]
     BridgingNotCompleted,
+    /// A deposit send was already started for this transfer; another one
+    /// could send the minted USDC twice.
+    #[error("a deposit send was already started for this transfer")]
+    DepositSendAlreadyStarted,
+    /// No deposit send was started, so there is no send to record.
+    #[error("no deposit send was started for this transfer")]
+    DepositSendNotStarted,
+    /// The deposit send tx is already recorded and is never replaced.
+    #[error("deposit send {recorded} is already recorded for this transfer")]
+    DepositSendAlreadyRecorded { recorded: TxHash },
     /// Deposit has not been initiated yet
     #[error("Deposit has not been initiated")]
     DepositNotInitiated,
@@ -479,10 +489,17 @@ pub enum UsdcRebalanceCommand {
         fee_collected: Usdc,
         minted_at: DateTime<Utc>,
     },
+    /// Mark a BaseToAlpaca deposit send as started, before it is broadcast.
+    /// Valid only from a BaseToAlpaca `Bridged` with no send started.
+    BeginDepositSend,
     /// Record the broadcast BaseToAlpaca deposit send tx before its receipt
     /// is awaited, so resume checks that exact tx instead of adopting any
-    /// same-amount send. Valid only from a BaseToAlpaca `Bridged`.
+    /// same-amount send. Valid only while the send is `Submitting`; a
+    /// recorded tx is never replaced.
     RecordPendingDeposit { send_tx: TxHash },
+    /// Clear a started deposit send that failed before broadcast, so a
+    /// retry can send. Valid only while the send is `Submitting`.
+    AbortDepositSend,
     /// Start deposit to destination. Valid only from `Bridged` state.
     InitiateDeposit { deposit: TransferRef },
     /// Test/fixture-only: identical to `InitiateDeposit` but takes
@@ -655,12 +672,17 @@ pub enum UsdcRebalanceEvent {
         fee_collected: Usdc,
         minted_at: DateTime<Utc>,
     },
+    /// A BaseToAlpaca deposit send was started while in `Bridged`, before
+    /// its broadcast.
+    DepositSendSubmitting { submitting_at: DateTime<Utc> },
     /// The BaseToAlpaca deposit send was broadcast and its tx recorded while
     /// still in `Bridged`, before its receipt was awaited.
     PendingDepositRecorded {
         send_tx: TxHash,
         recorded_at: DateTime<Utc>,
     },
+    /// The started deposit send failed before broadcast and was cleared.
+    DepositSendAborted { aborted_at: DateTime<Utc> },
     /// Bridging failed. Preserves burn data when available for debugging.
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
@@ -739,7 +761,9 @@ impl DomainEvent for UsdcRebalanceEvent {
             }
             Self::AttestationTimedOut { .. } => "UsdcRebalanceEvent::AttestationTimedOut",
             Self::Bridged { .. } => "UsdcRebalanceEvent::Bridged",
+            Self::DepositSendSubmitting { .. } => "UsdcRebalanceEvent::DepositSendSubmitting",
             Self::PendingDepositRecorded { .. } => "UsdcRebalanceEvent::PendingDepositRecorded",
+            Self::DepositSendAborted { .. } => "UsdcRebalanceEvent::DepositSendAborted",
             Self::BridgingFailed { .. } => "UsdcRebalanceEvent::BridgingFailed",
             Self::BridgingCompletionRecovered { .. } => {
                 "UsdcRebalanceEvent::BridgingCompletionRecovered"
@@ -758,6 +782,21 @@ impl DomainEvent for UsdcRebalanceEvent {
     fn event_version(&self) -> String {
         "2.0".to_string()
     }
+}
+
+/// Progress of a BaseToAlpaca deposit send while the transfer is `Bridged`.
+///
+/// `Submitting` is committed before the broadcast, so a crash, timeout or
+/// failed write after it can never lead to a second send.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DepositSend {
+    /// No send was started.
+    #[default]
+    NotStarted,
+    /// A send was started and may be on chain, but its tx is not recorded.
+    Submitting { submitting_at: DateTime<Utc> },
+    /// The send was broadcast and its tx recorded.
+    Recorded { send_tx: TxHash },
 }
 
 /// USDC rebalance aggregate state machine.
@@ -905,11 +944,10 @@ pub enum UsdcRebalance {
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
-        /// BaseToAlpaca deposit send tx recorded at broadcast by
-        /// `RecordPendingDeposit`. `None` until the send is broadcast, and for
+        /// Progress of the BaseToAlpaca deposit send. `NotStarted` for
         /// snapshots from before this field existed.
         #[serde(default)]
-        pending_deposit_tx: Option<TxHash>,
+        deposit_send: DepositSend,
     },
     /// Bridging has failed (terminal state)
     BridgingFailed {
@@ -1323,12 +1361,14 @@ impl UsdcRebalance {
             Self::Bridged {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount_received,
-                pending_deposit_tx,
+                deposit_send,
                 ..
-            } => Some(match pending_deposit_tx {
-                None => EthereumWalletCredit::Held(*amount_received),
-                // The recorded send may be mined or not yet.
-                Some(_) => EthereumWalletCredit::InFlight(*amount_received),
+            } => Some(match deposit_send {
+                DepositSend::NotStarted => EthereumWalletCredit::Held(*amount_received),
+                // A started send may be on chain, mined or not yet.
+                DepositSend::Submitting { .. } | DepositSend::Recorded { .. } => {
+                    EthereumWalletCredit::InFlight(*amount_received)
+                }
             }),
             Self::BridgingSubmitting { .. }
             | Self::Bridged { .. }
@@ -1778,7 +1818,9 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::BridgeAttestationReceived', \
                'UsdcRebalanceEvent::AttestationTimedOut', \
                'UsdcRebalanceEvent::Bridged', \
+               'UsdcRebalanceEvent::DepositSendSubmitting', \
                'UsdcRebalanceEvent::PendingDepositRecorded', \
+               'UsdcRebalanceEvent::DepositSendAborted', \
                'UsdcRebalanceEvent::BridgingFailed', \
                'UsdcRebalanceEvent::BridgingCompletionRecovered', \
                'UsdcRebalanceEvent::DepositInitiated', \
@@ -1991,7 +2033,9 @@ async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>,
                'UsdcRebalanceEvent::PendingBurnRecorded', \
                'UsdcRebalanceEvent::PendingBurnCleared', \
                'UsdcRebalanceEvent::Bridged', \
+               'UsdcRebalanceEvent::DepositSendSubmitting', \
                'UsdcRebalanceEvent::PendingDepositRecorded', \
+               'UsdcRebalanceEvent::DepositSendAborted', \
                'UsdcRebalanceEvent::BridgingCompletionRecovered' \
            ) \
          ORDER BY latest.aggregate_id",
@@ -2059,9 +2103,10 @@ impl EventSourced for UsdcRebalance {
     // the command, event and states; serde ignores it in legacy payloads.
     // `WithdrawalComplete` also carries `withdrawal_ref` now, so the reported
     // withdrawal fees can be read again.
-    // v11: `Bridged` carries `pending_deposit_tx`, the BaseToAlpaca deposit
-    // send recorded at broadcast by the new `PendingDepositRecorded` event.
-    // Legacy events and snapshots default it to `None`.
+    // v11: `Bridged` carries `deposit_send`, the BaseToAlpaca deposit send
+    // progress set by the new `DepositSendSubmitting`, `PendingDepositRecorded`
+    // and `DepositSendAborted` events. Legacy events and snapshots default it
+    // to `NotStarted`.
     const SCHEMA_VERSION: u64 = 11;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -2437,7 +2482,7 @@ impl EventSourced for UsdcRebalance {
                 mint_tx_hash: *mint_tx_hash,
                 initiated_at: *initiated_at,
                 minted_at: *minted_at,
-                pending_deposit_tx: None,
+                deposit_send: DepositSend::NotStarted,
             },
 
             // Un-fail a post-burn `BridgingFailed` whose mint landed on-chain.
@@ -2467,7 +2512,7 @@ impl EventSourced for UsdcRebalance {
                 mint_tx_hash: *mint_tx_hash,
                 initiated_at: *initiated_at,
                 minted_at: *recovered_at,
-                pending_deposit_tx: None,
+                deposit_send: DepositSend::NotStarted,
             },
 
             (
@@ -2518,6 +2563,33 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
+                DepositSendSubmitting { submitting_at },
+                Self::Bridged {
+                    direction,
+                    amount,
+                    amount_received,
+                    fee_collected,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    minted_at,
+                    ..
+                },
+            ) => Self::Bridged {
+                direction: *direction,
+                amount: *amount,
+                amount_received: *amount_received,
+                fee_collected: *fee_collected,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                minted_at: *minted_at,
+                deposit_send: DepositSend::Submitting {
+                    submitting_at: *submitting_at,
+                },
+            },
+
+            (
                 PendingDepositRecorded { send_tx, .. },
                 Self::Bridged {
                     direction,
@@ -2539,7 +2611,32 @@ impl EventSourced for UsdcRebalance {
                 mint_tx_hash: *mint_tx_hash,
                 initiated_at: *initiated_at,
                 minted_at: *minted_at,
-                pending_deposit_tx: Some(*send_tx),
+                deposit_send: DepositSend::Recorded { send_tx: *send_tx },
+            },
+
+            (
+                DepositSendAborted { .. },
+                Self::Bridged {
+                    direction,
+                    amount,
+                    amount_received,
+                    fee_collected,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    minted_at,
+                    ..
+                },
+            ) => Self::Bridged {
+                direction: *direction,
+                amount: *amount,
+                amount_received: *amount_received,
+                fee_collected: *fee_collected,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                minted_at: *minted_at,
+                deposit_send: DepositSend::NotStarted,
             },
 
             (
@@ -2834,9 +2931,10 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             ConfirmBridgingAt { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
 
-            InitiateDeposit { .. } | RecordPendingDeposit { .. } => {
-                Err(UsdcRebalanceError::BridgingNotCompleted)
-            }
+            InitiateDeposit { .. }
+            | BeginDepositSend
+            | RecordPendingDeposit { .. }
+            | AbortDepositSend => Err(UsdcRebalanceError::BridgingNotCompleted),
             #[cfg(any(test, feature = "test-support"))]
             InitiateDepositAt { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
@@ -2940,7 +3038,9 @@ impl EventSourced for UsdcRebalance {
             }
 
             RecordPendingBurn { burn_tx } => self.transition_record_pending_burn(burn_tx),
+            BeginDepositSend => self.transition_begin_deposit_send(),
             RecordPendingDeposit { send_tx } => self.transition_record_pending_deposit(send_tx),
+            AbortDepositSend => self.transition_abort_deposit_send(),
             ClearPendingBurn => self.transition_clear_pending_burn(),
 
             ReceiveAttestation {
@@ -3660,20 +3760,66 @@ impl UsdcRebalance {
         }
     }
 
-    /// Records the broadcast BaseToAlpaca deposit send tx on `Bridged`.
+    /// Marks the BaseToAlpaca deposit send as started, before its broadcast.
+    fn transition_begin_deposit_send(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self.base_to_alpaca_deposit_send("BeginDepositSend")? {
+            DepositSend::NotStarted => Ok(vec![DepositSendSubmitting {
+                submitting_at: Utc::now(),
+            }]),
+            DepositSend::Submitting { .. } | DepositSend::Recorded { .. } => {
+                Err(UsdcRebalanceError::DepositSendAlreadyStarted)
+            }
+        }
+    }
+
+    /// Records the broadcast BaseToAlpaca deposit send tx. Recording the same
+    /// tx again is a no-op; a different tx is refused.
     fn transition_record_pending_deposit(
         &self,
         send_tx: TxHash,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
-        match self {
-            Self::Bridged {
-                direction: RebalanceDirection::BaseToAlpaca,
-                ..
-            } => Ok(vec![PendingDepositRecorded {
+        match self.base_to_alpaca_deposit_send("RecordPendingDeposit")? {
+            DepositSend::Submitting { .. } => Ok(vec![PendingDepositRecorded {
                 send_tx,
                 recorded_at: Utc::now(),
             }]),
+            DepositSend::Recorded { send_tx: recorded } if recorded == send_tx => Ok(vec![]),
+            DepositSend::Recorded { send_tx: recorded } => {
+                Err(UsdcRebalanceError::DepositSendAlreadyRecorded { recorded })
+            }
+            DepositSend::NotStarted => Err(UsdcRebalanceError::DepositSendNotStarted),
+        }
+    }
+
+    /// Clears a started deposit send that failed before broadcast. A no-op
+    /// when none was started; a recorded send is never cleared.
+    fn transition_abort_deposit_send(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self.base_to_alpaca_deposit_send("AbortDepositSend")? {
+            DepositSend::Submitting { .. } => Ok(vec![DepositSendAborted {
+                aborted_at: Utc::now(),
+            }]),
+            DepositSend::NotStarted => Ok(vec![]),
+            DepositSend::Recorded { send_tx } => {
+                Err(UsdcRebalanceError::DepositSendAlreadyRecorded { recorded: send_tx })
+            }
+        }
+    }
+
+    /// The deposit send of a BaseToAlpaca `Bridged`, or the error `command`
+    /// gets from any other state.
+    fn base_to_alpaca_deposit_send(
+        &self,
+        command: &str,
+    ) -> Result<DepositSend, UsdcRebalanceError> {
+        match self {
+            Self::Bridged {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_send,
+                ..
+            } => Ok(*deposit_send),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -3696,7 +3842,7 @@ impl UsdcRebalance {
             | Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. }
             | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
-                command: "RecordPendingDeposit".to_string(),
+                command: command.to_string(),
                 state: format!("{self:?}"),
             }),
         }
@@ -3794,10 +3940,13 @@ impl UsdcRebalance {
             // reconciliation, keeping the recorded send if there is one.
             Self::Bridged {
                 direction: RebalanceDirection::BaseToAlpaca,
-                pending_deposit_tx,
+                deposit_send,
                 ..
             } => Ok(vec![DepositFailed {
-                deposit_ref: pending_deposit_tx.map(TransferRef::OnchainTx),
+                deposit_ref: match deposit_send {
+                    DepositSend::Recorded { send_tx } => Some(TransferRef::OnchainTx(*send_tx)),
+                    DepositSend::NotStarted | DepositSend::Submitting { .. } => None,
+                },
                 reason,
                 failed_at: Utc::now(),
             }]),
@@ -5655,7 +5804,7 @@ mod tests {
             mint_tx_hash: burn_tx,
             initiated_at: now,
             minted_at: now,
-            pending_deposit_tx: None,
+            deposit_send: DepositSend::NotStarted,
         };
         assert_eq!(
             bridged.resumable_post_burn_transfer(),
@@ -5778,7 +5927,7 @@ mod tests {
             mint_tx_hash: burn_tx,
             initiated_at: now,
             minted_at: now,
-            pending_deposit_tx: None,
+            deposit_send: DepositSend::NotStarted,
         };
         assert_eq!(bridged.direction(), RebalanceDirection::AlpacaToBase);
 
@@ -5826,7 +5975,7 @@ mod tests {
             mint_tx_hash: burn_tx,
             initiated_at: now,
             minted_at: now,
-            pending_deposit_tx: None,
+            deposit_send: DepositSend::NotStarted,
         };
         assert_eq!(
             bridged.amount(),
@@ -10226,7 +10375,7 @@ mod tests {
             mint_tx_hash: mint_tx,
             initiated_at,
             minted_at,
-            pending_deposit_tx: None,
+            deposit_send: DepositSend::NotStarted,
         };
 
         let dto = state.to_dto(&id);
@@ -10313,7 +10462,7 @@ mod tests {
             mint_tx_hash: MINT_TX,
             initiated_at: now,
             minted_at: now,
-            pending_deposit_tx: None,
+            deposit_send: DepositSend::NotStarted,
         };
 
         assert_eq!(
@@ -10333,20 +10482,24 @@ mod tests {
             Some(EthereumWalletCredit::Held(credited))
         );
         assert_eq!(minted(AlpacaToBase).ethereum_wallet_credit(), None);
-        // A recorded deposit send may already have left the wallet.
+        // A started or recorded deposit send may already have left the wallet.
+        let sending = |deposit_send| Bridged {
+            direction: BaseToAlpaca,
+            amount,
+            amount_received: credited,
+            fee_collected: Usdc::new(float!(0.01)),
+            burn_tx_hash: BURN_TX,
+            mint_tx_hash: MINT_TX,
+            initiated_at: now,
+            minted_at: now,
+            deposit_send,
+        };
         assert_eq!(
-            Bridged {
-                direction: BaseToAlpaca,
-                amount,
-                amount_received: credited,
-                fee_collected: Usdc::new(float!(0.01)),
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
-                initiated_at: now,
-                minted_at: now,
-                pending_deposit_tx: Some(BURN_TX),
-            }
-            .ethereum_wallet_credit(),
+            sending(DepositSend::Submitting { submitting_at: now }).ethereum_wallet_credit(),
+            Some(EthereumWalletCredit::InFlight(credited))
+        );
+        assert_eq!(
+            sending(DepositSend::Recorded { send_tx: BURN_TX }).ethereum_wallet_credit(),
             Some(EthereumWalletCredit::InFlight(credited))
         );
         let withdrawn = |withdrawal_tx| WithdrawalComplete {
@@ -10465,7 +10618,7 @@ mod tests {
                 mint_tx_hash: MINT_TX,
                 initiated_at: now,
                 minted_at: now,
-                pending_deposit_tx: None,
+                deposit_send: DepositSend::NotStarted,
             }
             .holds_rebalance_guard()
         );
@@ -10783,7 +10936,7 @@ mod tests {
                 mint_tx_hash: MINT_TX,
                 initiated_at: now,
                 minted_at: now,
-                pending_deposit_tx: None,
+                deposit_send: DepositSend::NotStarted,
             }
             .guard_recovery_tracking_data(),
             None,
@@ -12049,9 +12202,174 @@ mod tests {
         ]
     }
 
+    fn deposit_send_started() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositSendSubmitting {
+            submitting_at: Utc::now(),
+        }
+    }
+
+    fn deposit_send_recorded(send_tx: TxHash) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::PendingDepositRecorded {
+            send_tx,
+            recorded_at: Utc::now(),
+        }
+    }
+
+    fn bridged_with(extra: Vec<UsdcRebalanceEvent>) -> Vec<UsdcRebalanceEvent> {
+        [bridged_events(RebalanceDirection::BaseToAlpaca), extra].concat()
+    }
+
+    #[tokio::test]
+    async fn begin_deposit_send_marks_the_send_started_before_broadcast() {
+        let staged = bridged_events(RebalanceDirection::BaseToAlpaca);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::BeginDepositSend)
+            .await
+            .events();
+
+        let [UsdcRebalanceEvent::DepositSendSubmitting { submitting_at }] = events.as_slice()
+        else {
+            panic!("Expected one DepositSendSubmitting event, got {events:?}");
+        };
+        let state = replay::<UsdcRebalance>([staged, events.clone()].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::Bridged { deposit_send, .. } = state else {
+            panic!("Expected Bridged, got {state:?}");
+        };
+        assert_eq!(
+            deposit_send,
+            DepositSend::Submitting {
+                submitting_at: *submitting_at
+            }
+        );
+    }
+
+    /// Only one deposit send per transfer: a second could move the minted
+    /// USDC twice.
+    #[tokio::test]
+    async fn begin_deposit_send_refuses_a_second_send() {
+        for started in [
+            vec![deposit_send_started()],
+            vec![
+                deposit_send_started(),
+                deposit_send_recorded(DEPOSIT_SEND_TX),
+            ],
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(bridged_with(started))
+                .when(UsdcRebalanceCommand::BeginDepositSend)
+                .await
+                .then_expect_error();
+
+            assert!(matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::DepositSendAlreadyStarted)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn record_pending_deposit_refuses_a_send_that_was_not_started() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_events(RebalanceDirection::BaseToAlpaca))
+            .when(UsdcRebalanceCommand::RecordPendingDeposit {
+                send_tx: DEPOSIT_SEND_TX,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositSendNotStarted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_pending_deposit_never_replaces_a_recorded_send() {
+        let other_send =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000dd");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![
+                deposit_send_started(),
+                deposit_send_recorded(DEPOSIT_SEND_TX),
+            ]))
+            .when(UsdcRebalanceCommand::RecordPendingDeposit {
+                send_tx: other_send,
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(UsdcRebalanceError::DepositSendAlreadyRecorded { recorded }) =
+            error
+        else {
+            panic!("Expected DepositSendAlreadyRecorded, got {error:?}");
+        };
+        assert_eq!(recorded, DEPOSIT_SEND_TX);
+    }
+
+    #[tokio::test]
+    async fn record_pending_deposit_of_the_recorded_send_is_a_no_op() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![
+                deposit_send_started(),
+                deposit_send_recorded(DEPOSIT_SEND_TX),
+            ]))
+            .when(UsdcRebalanceCommand::RecordPendingDeposit {
+                send_tx: DEPOSIT_SEND_TX,
+            })
+            .await
+            .events();
+
+        assert_eq!(events, vec![]);
+    }
+
+    /// A send refused before broadcast is cleared, so a retry can send.
+    #[tokio::test]
+    async fn abort_deposit_send_clears_a_started_send() {
+        let staged = bridged_with(vec![deposit_send_started()]);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::AbortDepositSend)
+            .await
+            .events();
+
+        let [UsdcRebalanceEvent::DepositSendAborted { .. }] = events.as_slice() else {
+            panic!("Expected one DepositSendAborted event, got {events:?}");
+        };
+        let state = replay::<UsdcRebalance>([staged, events].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::Bridged { deposit_send, .. } = state else {
+            panic!("Expected Bridged, got {state:?}");
+        };
+        assert_eq!(deposit_send, DepositSend::NotStarted);
+    }
+
+    #[tokio::test]
+    async fn abort_deposit_send_never_clears_a_recorded_send() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![
+                deposit_send_started(),
+                deposit_send_recorded(DEPOSIT_SEND_TX),
+            ]))
+            .when(UsdcRebalanceCommand::AbortDepositSend)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositSendAlreadyRecorded { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn record_pending_deposit_keeps_the_send_tx_on_bridged() {
-        let staged = bridged_events(RebalanceDirection::BaseToAlpaca);
+        let staged = bridged_with(vec![deposit_send_started()]);
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(staged.clone())
@@ -12068,14 +12386,19 @@ mod tests {
 
         let state = replay::<UsdcRebalance>([staged, events].concat()).unwrap();
         let Some(UsdcRebalance::Bridged {
-            pending_deposit_tx,
+            deposit_send,
             amount_received,
             ..
         }) = state
         else {
             panic!("Expected Bridged, got {state:?}");
         };
-        assert_eq!(pending_deposit_tx, Some(DEPOSIT_SEND_TX));
+        assert_eq!(
+            deposit_send,
+            DepositSend::Recorded {
+                send_tx: DEPOSIT_SEND_TX
+            }
+        );
         assert_eq!(amount_received, Usdc::new(float!(99.99)));
     }
 
@@ -12100,11 +12423,10 @@ mod tests {
     /// the recorded send, so `transfer recheck` can poll Alpaca by it.
     #[tokio::test]
     async fn fail_deposit_from_bridged_keeps_the_recorded_send() {
-        let mut staged = bridged_events(RebalanceDirection::BaseToAlpaca);
-        staged.push(UsdcRebalanceEvent::PendingDepositRecorded {
-            send_tx: DEPOSIT_SEND_TX,
-            recorded_at: Utc::now(),
-        });
+        let staged = bridged_with(vec![
+            deposit_send_started(),
+            deposit_send_recorded(DEPOSIT_SEND_TX),
+        ]);
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(staged.clone())
@@ -12138,18 +12460,20 @@ mod tests {
 
     #[tokio::test]
     async fn fail_deposit_from_bridged_without_a_recorded_send_has_no_deposit_ref() {
-        let events = TestHarness::<UsdcRebalance>::with(())
-            .given(bridged_events(RebalanceDirection::BaseToAlpaca))
-            .when(UsdcRebalanceCommand::FailDeposit {
-                reason: "unrecorded send found".to_string(),
-            })
-            .await
-            .events();
+        for started in [vec![], vec![deposit_send_started()]] {
+            let events = TestHarness::<UsdcRebalance>::with(())
+                .given(bridged_with(started))
+                .when(UsdcRebalanceCommand::FailDeposit {
+                    reason: "no recorded send".to_string(),
+                })
+                .await
+                .events();
 
-        let [UsdcRebalanceEvent::DepositFailed { deposit_ref, .. }] = events.as_slice() else {
-            panic!("Expected one DepositFailed event, got {events:?}");
-        };
-        assert_eq!(*deposit_ref, None);
+            let [UsdcRebalanceEvent::DepositFailed { deposit_ref, .. }] = events.as_slice() else {
+                panic!("Expected one DepositFailed event, got {events:?}");
+            };
+            assert_eq!(*deposit_ref, None);
+        }
     }
 
     #[tokio::test]
@@ -12169,7 +12493,7 @@ mod tests {
     }
 
     #[test]
-    fn bridged_snapshot_without_pending_deposit_tx_deserializes_to_none() {
+    fn bridged_snapshot_without_deposit_send_deserializes_to_not_started() {
         let now = Utc::now();
         let mut snapshot = to_value(UsdcRebalance::Bridged {
             direction: RebalanceDirection::BaseToAlpaca,
@@ -12180,21 +12504,22 @@ mod tests {
             mint_tx_hash: MINT_TX,
             initiated_at: now,
             minted_at: now,
-            pending_deposit_tx: Some(DEPOSIT_SEND_TX),
+            deposit_send: DepositSend::Recorded {
+                send_tx: DEPOSIT_SEND_TX,
+            },
         })
         .unwrap();
         snapshot
             .get_mut("Bridged")
             .and_then(|value| value.as_object_mut())
             .unwrap()
-            .remove("pending_deposit_tx");
+            .remove("deposit_send");
 
-        let UsdcRebalance::Bridged {
-            pending_deposit_tx, ..
-        } = from_value::<UsdcRebalance>(snapshot).unwrap()
+        let UsdcRebalance::Bridged { deposit_send, .. } =
+            from_value::<UsdcRebalance>(snapshot).unwrap()
         else {
             panic!("expected Bridged");
         };
-        assert_eq!(pending_deposit_tx, None);
+        assert_eq!(deposit_send, DepositSend::NotStarted);
     }
 }

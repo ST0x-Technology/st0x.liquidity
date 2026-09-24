@@ -219,7 +219,9 @@ impl UsdcRebalanceStage {
             | BridgingSubmitting { .. }
             | PendingBurnRecorded { .. }
             | PendingBurnCleared { .. }
+            | DepositSendSubmitting { .. }
             | PendingDepositRecorded { .. }
+            | DepositSendAborted { .. }
             | AttestationTimedOut { .. }
             | ConversionConfirmed { .. }
             | ConversionFailed { .. }
@@ -882,13 +884,15 @@ impl RebalancingService {
             // `PendingBurnRecorded` records the broadcast burn tx hash while still
             // in `BridgingSubmitting`, and `PendingBurnCleared` resets it before a
             // (re)broadcast; both stay in `BridgingSubmitting` and advance no
-            // tracking stage. `PendingDepositRecorded` likewise stays in
+            // tracking stage. The deposit send events likewise stay in
             // `Bridged` until `DepositInitiated`.
             WithdrawalSubmitting { .. }
             | BridgingSubmitting { .. }
             | PendingBurnRecorded { .. }
             | PendingBurnCleared { .. }
+            | DepositSendSubmitting { .. }
             | PendingDepositRecorded { .. }
+            | DepositSendAborted { .. }
             | AttestationTimedOut { .. } => UsdcSettlementOutcome::Reconciled,
             // Withdrawal failure is always pre-burn -> reconcile to source.
             WithdrawalFailed { .. } => self.cancel_tracked_usdc_rebalance(id).await?,
