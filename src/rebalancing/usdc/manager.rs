@@ -19008,10 +19008,11 @@ mod tests {
     /// Resumes an `Attested` transfer in `direction` whose consumed nonce has
     /// no mint in the bounded scan, and asserts it fails at once into a state
     /// `transfer reconcile --kind usdc` accepts, keeping the burn and nonce.
-    /// Returns the transfer id so the caller can check the page.
+    /// Returns the resume error and the transfer id so the caller can check
+    /// the page.
     async fn assert_mint_outside_the_scan_window_latches_for_reconciliation(
         direction: RebalanceDirection,
-    ) -> UsdcRebalanceId {
+    ) -> (UsdcTransferError, UsdcRebalanceId) {
         let (error, id, _, state) = resume_attested_with_failing_mint_lookup(direction, || {
             CctpError::MintNotFoundInScanWindow {
                 nonce: B256::repeat_byte(0x07),
@@ -19020,17 +19021,6 @@ mod tests {
         })
         .await;
 
-        let UsdcTransferError::Cctp(cctp_error) = error else {
-            panic!("a mint outside the scan window must not redrive; got: {error:?}");
-        };
-        assert!(
-            matches!(
-                *cctp_error,
-                CctpError::MintNotFoundInScanWindow { nonce, from_block: 100 }
-                    if nonce == B256::repeat_byte(0x07)
-            ),
-            "got: {cctp_error:?}"
-        );
         let UsdcRebalance::BridgingFailed {
             direction: failed_direction,
             burn_tx_hash,
@@ -19059,21 +19049,35 @@ mod tests {
             "`transfer reconcile --kind usdc` must accept the latched state, got: {state:?}"
         );
 
-        id
+        (error, id)
     }
 
-    /// A Base->Alpaca retry keeps recovering the mint and may still send the
-    /// deposit, so the latch must not page an operator into moving the funds;
-    /// the job's dead-letter alert covers a give-up.
+    /// The `BridgingFailed` recovery scans no wider than this lookup, so it
+    /// could never adopt the mint: the latch pages the operator and ends the
+    /// job instead of handing it to a recovery that would redrive forever.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn attested_mint_outside_the_scan_window_latches_for_reconciliation_base_to_alpaca() {
-        assert_mint_outside_the_scan_window_latches_for_reconciliation(
+        let (error, id) = assert_mint_outside_the_scan_window_latches_for_reconciliation(
             RebalanceDirection::BaseToAlpaca,
         )
         .await;
 
-        assert!(!logs_contain("operational_alert"));
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::PreviouslyFailedAggregate { id: failed_id } if *failed_id == id
+            ),
+            "the job must end, not retry into the BridgingFailed recovery; got: {error:?}"
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
+        assert!(logs_contain(
+            "find the mint of the recorded nonce on chain, then settle it with \
+             `transfer reconcile --kind usdc`"
+        ));
     }
 
     /// The latch pages itself: the job does not alert on it (an Alpaca->Base
@@ -19081,11 +19085,22 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn attested_mint_outside_the_scan_window_latches_for_reconciliation_alpaca_to_base() {
-        let id = assert_mint_outside_the_scan_window_latches_for_reconciliation(
+        let (error, id) = assert_mint_outside_the_scan_window_latches_for_reconciliation(
             RebalanceDirection::AlpacaToBase,
         )
         .await;
 
+        let UsdcTransferError::Cctp(cctp_error) = error else {
+            panic!("a mint outside the scan window must not redrive; got: {error:?}");
+        };
+        assert!(
+            matches!(
+                *cctp_error,
+                CctpError::MintNotFoundInScanWindow { nonce, from_block: 100 }
+                    if nonce == B256::repeat_byte(0x07)
+            ),
+            "got: {cctp_error:?}"
+        );
         assert!(logs_contain("operational_alert"));
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
