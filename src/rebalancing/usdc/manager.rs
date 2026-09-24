@@ -17389,6 +17389,53 @@ mod tests {
         );
     }
 
+    /// The in-process reburn after a burn reverted on confirm is a burn too,
+    /// so the ledger check runs before it, with the reverted hash recorded.
+    #[tokio::test]
+    async fn in_process_reburn_checks_the_credit_ledger() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        advance_to_bridging_submitting_alpaca_to_base_with_burn_amount(
+            &cqrs, &id, amount, 1, amount,
+        )
+        .await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new().with_ledger_probe(cqrs.clone(), id.clone(), amount_u256);
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+        let manager = manager.with_credit_ledger(pool);
+
+        manager
+            .burn_recording_pending(&id, BridgeDirection::EthereumToBase, amount_u256, recipient)
+            .await
+            .unwrap();
+
+        let reverted_burn = TxHash::from([1u8; 32]);
+        let seen = manager.cctp_bridge.states_seen_by_ledger();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the reburn must check the ledger once; got: {seen:?}"
+        );
+        assert!(
+            matches!(
+                seen[0],
+                UsdcRebalance::BridgingSubmitting {
+                    pending_burn_tx: Some(burn_tx),
+                    ..
+                } if burn_tx == reverted_burn
+            ),
+            "the reverted burn hash must stay recorded during the check; got: {seen:?}"
+        );
+    }
+
     async fn manager_with_bot_gas_queue<Signer: Wallet + Clone>(
         cqrs: Arc<Store<UsdcRebalance>>,
         wallet: Signer,
