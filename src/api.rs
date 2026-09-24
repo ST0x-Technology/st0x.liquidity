@@ -76,8 +76,8 @@ use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
 };
 use crate::rebalancing::usdc::{
-    CctpMintRecoveryError, DriverNotQuiesced, RecheckUsdcDeposit, RecoverCctpMint, UsdcDriverPause,
-    UsdcDriverPauseGuard, UsdcRecheckError,
+    CctpMintRecoveryError, DriverNotQuiesced, RecheckUsdcDeposit, RecoverCctpMint,
+    RecoveredMintAmounts, UsdcDriverPause, UsdcDriverPauseGuard, UsdcRecheckError,
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
@@ -1373,18 +1373,39 @@ pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
 /// returns once no worker execution is in flight and none can start, or 503
 /// when a transfer is executing and the driver cannot be paused within the
 /// quiesce window. The guard resumes the driver when dropped.
+/// The operator request asking to pause the USDC driver, logged when the pause
+/// is refused so the refusal is traceable to that request.
+#[derive(Debug, Clone, Copy)]
+enum UsdcDriverPauseRequest<'a> {
+    /// A route acting on one USDC rebalance.
+    Rebalance {
+        id: &'a UsdcRebalanceId,
+        direction: Option<RebalanceDirection>,
+    },
+    /// `cctp complete-mint`, which acts on a burn rather than a rebalance.
+    CctpMint {
+        burn_tx: TxHash,
+        direction: BridgeDirection,
+    },
+}
+
 async fn quiesce_usdc_driver(
     pause: &UsdcDriverPause,
-    rebalance_id: Option<&UsdcRebalanceId>,
-    resume_direction: Option<RebalanceDirection>,
+    request: UsdcDriverPauseRequest<'_>,
 ) -> Result<UsdcDriverPauseGuard, (StatusCode, Json<ErrorResponse>)> {
     pause.pause().await.map_err(|DriverNotQuiesced| {
-        let rebalance_id = rebalance_id.map(ToString::to_string);
-        warn!(
-            rebalance_id = %rebalance_id.as_deref().unwrap_or("unavailable"),
-            ?resume_direction,
-            "USDC driver did not quiesce for an operator write; refusing"
-        );
+        match request {
+            UsdcDriverPauseRequest::Rebalance { id, direction } => warn!(
+                rebalance_id = %id,
+                ?direction,
+                "USDC driver did not quiesce for an operator write; refusing"
+            ),
+            UsdcDriverPauseRequest::CctpMint { burn_tx, direction } => warn!(
+                %burn_tx,
+                ?direction,
+                "USDC driver did not quiesce for a CCTP mint recovery; refusing"
+            ),
+        }
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -1774,8 +1795,14 @@ async fn recheck_transfer(
             // and hold them parked for the whole recheck. Not bounded here:
             // dropping the recheck mid step could strand the aggregate, and each
             // call inside it is already transport bounded.
-            let _driver_paused =
-                quiesce_usdc_driver(&handle.usdc_driver_pause, Some(&rebalance_id), None).await?;
+            let _driver_paused = quiesce_usdc_driver(
+                &handle.usdc_driver_pause,
+                UsdcDriverPauseRequest::Rebalance {
+                    id: &rebalance_id,
+                    direction: None,
+                },
+            )
+            .await?;
 
             let outcome = handle
                 .usdc_recheck
@@ -1928,8 +1955,10 @@ async fn resume_usdc_transfer(
     // flight for the same aggregate.
     let _driver_paused = quiesce_usdc_driver(
         &handle.usdc_driver_pause,
-        Some(&rebalance_id),
-        Some(direction),
+        UsdcDriverPauseRequest::Rebalance {
+            id: &rebalance_id,
+            direction: Some(direction),
+        },
     )
     .await?;
 
@@ -2465,7 +2494,14 @@ async fn fail_usdc_transfer(
         )
     })?;
 
-    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, Some(&id), None).await?;
+    let _driver_paused = quiesce_usdc_driver(
+        &handle.usdc_driver_pause,
+        UsdcDriverPauseRequest::Rebalance {
+            id: &id,
+            direction: None,
+        },
+    )
+    .await?;
 
     let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
     Ok(Json(response))
@@ -2578,6 +2614,9 @@ struct RebuildViewResponse {
     id: Option<String>,
     /// Events replayed; reported by the read models only.
     replayed: Option<u64>,
+    /// Aggregate ids whose event stream folds to a failed lifecycle. Their rows
+    /// were rebuilt as failed, so loading them still errors.
+    failed: Vec<String>,
 }
 
 fn view_rebuild_error_response(error: ViewRebuildError) -> (StatusCode, Json<ErrorResponse>) {
@@ -2665,11 +2704,18 @@ async fn rebuild_materialized_view(
         RebuildScope::Id(id) => Some(id),
         RebuildScope::All => None,
     };
-    info!(view = %rebuilt.view, ?id, replayed = ?rebuilt.replayed, "View rebuilt via API");
+    info!(
+        view = %rebuilt.view,
+        ?id,
+        replayed = ?rebuilt.replayed,
+        failed = ?rebuilt.failed,
+        "View rebuilt via API"
+    );
     Ok(Json(RebuildViewResponse {
         view: rebuilt.view.name(),
         id,
         replayed: rebuilt.replayed,
+        failed: rebuilt.failed,
     }))
 }
 
@@ -2705,15 +2751,52 @@ impl CctpSourceChain {
 #[serde(rename_all = "camelCase")]
 struct CompleteCctpMintResponse {
     mint_tx: String,
-    /// USDC minted to the recipient, net of the fee. `null` if the on-chain
-    /// amounts could not be decoded; the mint is still final.
-    amount_received: Option<String>,
-    fee_collected: Option<String>,
+    amounts: CompleteCctpMintAmounts,
     /// Whether the bot-gas cost job was enqueued. `true` means only that it is
     /// queued: the worker records the ledger entry later and can still fail.
     /// `false` means the mint landed but the enqueue failed and the gas must be
     /// re-recorded out of band.
     gas_enqueued: bool,
+}
+
+/// The minted amounts of a recovered CCTP mint. An `undecodable` result is a
+/// degraded success: the mint is final, but its onchain values did not convert
+/// to USDC, so the raw values and the conversion error are reported instead.
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+enum CompleteCctpMintAmounts {
+    #[serde(rename_all = "camelCase")]
+    Decoded {
+        /// USDC minted to the recipient, net of the fee.
+        amount_received: String,
+        fee_collected: String,
+    },
+    Undecodable {
+        /// Raw onchain minted amount, in USDC base units.
+        amount: String,
+        /// Raw onchain fee, in USDC base units.
+        fee: String,
+        error: String,
+    },
+}
+
+impl From<RecoveredMintAmounts> for CompleteCctpMintAmounts {
+    fn from(amounts: RecoveredMintAmounts) -> Self {
+        match amounts {
+            RecoveredMintAmounts::Decoded {
+                amount_received,
+                fee_collected,
+            } => Self::Decoded {
+                amount_received: amount_received.to_string(),
+                fee_collected: fee_collected.to_string(),
+            },
+            RecoveredMintAmounts::Undecodable { amount, fee, error } => Self::Undecodable {
+                amount: amount.to_string(),
+                fee: fee.to_string(),
+                error: error.to_string(),
+            },
+        }
+    }
 }
 
 /// Completes the destination mint of a CCTP burn whose mint never landed
@@ -2801,11 +2884,11 @@ async fn complete_cctp_mint_recovery(
             }),
         )
     })?;
-    let resume_direction = match direction {
-        BridgeDirection::EthereumToBase => RebalanceDirection::AlpacaToBase,
-        BridgeDirection::BaseToEthereum => RebalanceDirection::BaseToAlpaca,
-    };
-    let _driver_paused = quiesce_usdc_driver(driver_pause, None, Some(resume_direction)).await?;
+    let _driver_paused = quiesce_usdc_driver(
+        driver_pause,
+        UsdcDriverPauseRequest::CctpMint { burn_tx, direction },
+    )
+    .await?;
 
     let recovered = recovery
         .submit_recovered_cctp_mint(direction, burn_tx, attestation)
@@ -2821,14 +2904,7 @@ async fn complete_cctp_mint_recovery(
     );
     Ok(Json(CompleteCctpMintResponse {
         mint_tx: recovered.mint_tx.to_string(),
-        amount_received: recovered
-            .amounts
-            .as_ref()
-            .map(|amounts| amounts.amount_received.to_string()),
-        fee_collected: recovered
-            .amounts
-            .as_ref()
-            .map(|amounts| amounts.fee_collected.to_string()),
+        amounts: recovered.amounts.into(),
         gas_enqueued: recovered.gas_enqueued,
     }))
 }
@@ -3854,7 +3930,7 @@ mod tests {
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
     use crate::rebalancing::usdc::{
-        RecoveredCctpMint, UsdcDriverGate, UsdcTransferError, usdc_driver_pause,
+        RecoveredCctpMint, UsdcDriverGate, UsdcTransferError, u256_to_usdc, usdc_driver_pause,
     };
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::test_utils::{
@@ -8441,7 +8517,12 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&body).unwrap(),
-            serde_json::json!({ "view": "position", "id": "AAPL", "replayed": null }),
+            serde_json::json!({
+                "view": "position",
+                "id": "AAPL",
+                "replayed": null,
+                "failed": [],
+            }),
         );
         let (payload,): (String,) =
             sqlx::query_as("SELECT payload FROM position_view WHERE view_id = ?1")
@@ -8473,7 +8554,12 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&body).unwrap(),
-            serde_json::json!({ "view": "rebalance-timing", "id": null, "replayed": 0 }),
+            serde_json::json!({
+                "view": "rebalance-timing",
+                "id": null,
+                "replayed": 0,
+                "failed": [],
+            }),
         );
     }
 
@@ -8845,6 +8931,72 @@ mod tests {
             "{}",
             body.error,
         );
+    }
+
+    /// A `RecoverCctpMint` whose mint lands but whose onchain amount does not
+    /// convert to USDC.
+    struct UndecodableMint;
+
+    #[async_trait::async_trait]
+    impl RecoverCctpMint for UndecodableMint {
+        async fn fetch_recovery_attestation(
+            &self,
+            direction: BridgeDirection,
+            burn_tx: TxHash,
+        ) -> Result<st0x_bridge::cctp::AttestationResponse, CctpMintRecoveryError> {
+            InconclusiveMint
+                .fetch_recovery_attestation(direction, burn_tx)
+                .await
+        }
+
+        async fn submit_recovered_cctp_mint(
+            &self,
+            _direction: BridgeDirection,
+            _burn_tx: TxHash,
+            _attestation: st0x_bridge::cctp::AttestationResponse,
+        ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
+            Ok(RecoveredCctpMint {
+                mint_tx: TxHash::repeat_byte(0xee),
+                amounts: RecoveredMintAmounts::Undecodable {
+                    amount: U256::MAX,
+                    fee: U256::from(1_u64),
+                    error: u256_to_usdc(U256::MAX).unwrap_err(),
+                },
+                gas_enqueued: true,
+            })
+        }
+    }
+
+    /// A final mint whose amounts do not decode is a degraded success: the
+    /// route answers 200 with the mint hash, marks the amounts undecodable, and
+    /// reports the raw values and the conversion error rather than nulls.
+    #[tokio::test]
+    async fn complete_cctp_mint_reports_undecodable_amounts_with_the_error() {
+        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let (pause, _gate) = usdc_driver_pause();
+
+        let Ok(Json(body)) = complete_cctp_mint_recovery(
+            &UndecodableMint,
+            &resume_lock,
+            &pause,
+            BridgeDirection::BaseToEthereum,
+            TxHash::repeat_byte(0x11),
+        )
+        .await
+        else {
+            panic!("a final mint must be reported as a success");
+        };
+
+        let body = serde_json::to_value(&body).unwrap();
+        assert_eq!(body["mintTx"], TxHash::repeat_byte(0xee).to_string());
+        assert_eq!(body["amounts"]["status"], "undecodable");
+        assert_eq!(body["amounts"]["amount"], U256::MAX.to_string());
+        assert_eq!(body["amounts"]["fee"], "1");
+        assert_eq!(
+            body["amounts"]["error"],
+            u256_to_usdc(U256::MAX).unwrap_err().to_string()
+        );
+        assert!(body["amounts"].get("amountReceived").is_none());
     }
 
     #[tokio::test]
@@ -10286,8 +10438,14 @@ mod tests {
         let direction = RebalanceDirection::BaseToAlpaca;
         let _executing = gate.enter().await;
 
-        let Err((status, Json(body))) =
-            quiesce_usdc_driver(&control, Some(&rebalance_id), Some(direction)).await
+        let Err((status, Json(body))) = quiesce_usdc_driver(
+            &control,
+            UsdcDriverPauseRequest::Rebalance {
+                id: &rebalance_id,
+                direction: Some(direction),
+            },
+        )
+        .await
         else {
             panic!("a quiesce with an execution in flight must be refused");
         };
@@ -10302,7 +10460,33 @@ mod tests {
             "a refused quiesce must not leave the driver paused"
         );
         assert!(logs_contain(&format!("rebalance_id={rebalance_id}")));
-        assert!(logs_contain("resume_direction=Some(BaseToAlpaca)"));
+        assert!(logs_contain("direction=Some(BaseToAlpaca)"));
+    }
+
+    /// A refused CCTP mint recovery has no rebalance id, so its refusal must
+    /// log the burn the operator asked about instead.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn quiesce_usdc_driver_logs_the_burn_for_a_refused_cctp_mint() {
+        let (control, gate) = usdc_driver_pause();
+        let burn_tx = TxHash::repeat_byte(0x42);
+        let _executing = gate.enter().await;
+
+        let Err((status, _)) = quiesce_usdc_driver(
+            &control,
+            UsdcDriverPauseRequest::CctpMint {
+                burn_tx,
+                direction: BridgeDirection::EthereumToBase,
+            },
+        )
+        .await
+        else {
+            panic!("a quiesce with an execution in flight must be refused");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(logs_contain(&format!("burn_tx={burn_tx}")));
+        assert!(logs_contain("direction=EthereumToBase"));
     }
 
     /// With no execution in flight the route gets its guard at once, the
@@ -10312,7 +10496,16 @@ mod tests {
     async fn quiesce_usdc_driver_parks_the_driver_until_the_guard_drops() {
         let (control, gate) = usdc_driver_pause();
 
-        let guard = quiesce_usdc_driver(&control, None, None).await.unwrap();
+        let rebalance_id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let guard = quiesce_usdc_driver(
+            &control,
+            UsdcDriverPauseRequest::Rebalance {
+                id: &rebalance_id,
+                direction: None,
+            },
+        )
+        .await
+        .unwrap();
         assert!(gate.is_paused());
 
         drop(guard);

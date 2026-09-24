@@ -11,9 +11,10 @@
 //! maintenance; direct database callers, including the legacy `st0x-cli`, must
 //! run only while the bot is stopped.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sqlx::{AssertSqlSafe, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
+use tracing::warn;
 
 use st0x_event_sorcery::{EventSourced, LifecycleError, ProjectionError, Table};
 use st0x_execution::{EmptySymbolError, Symbol};
@@ -28,8 +29,7 @@ use crate::vault_registry::{ParseVaultRegistryIdError, VaultRegistry, VaultRegis
 
 /// A view or read model an operator may rebuild. Kebab-cased for both the
 /// CLI value and the wire (`position`, `offchain-order`, ...).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum RebuildableView {
     /// Position aggregate (position_view)
     Position,
@@ -103,6 +103,10 @@ pub struct ViewRebuilt {
     /// Events replayed, reported by the read models; the per-aggregate views
     /// do not count.
     pub replayed: Option<u64>,
+    /// Aggregate ids whose event stream folds to a failed lifecycle. Their
+    /// view rows are rebuilt as failed, so loading them still errors: the
+    /// rebuild did not repair them.
+    pub failed: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -220,13 +224,23 @@ where
     }
 }
 
+/// How one aggregate's event stream replayed into its view row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Replay {
+    /// No events exist for the aggregate, so no row was written.
+    NoEventStream,
+    /// The stream folded to a live entity.
+    Live,
+    /// The stream folded to a failed lifecycle; the row records the failure.
+    Failed,
+}
+
 /// Rebuilds one aggregate projection inside a caller-owned transaction so row
-/// deletion and replay remain atomic. Returns `false` when no event stream
-/// exists.
+/// deletion and replay remain atomic.
 async fn rebuild_projection_in<Entity>(
     transaction: &mut Transaction<'_, Sqlite>,
     id: &Entity::Id,
-) -> Result<bool, ProjectionError<Entity>>
+) -> Result<Replay, ProjectionError<Entity>>
 where
     Entity: EventSourced<Materialized = Table>,
 {
@@ -244,9 +258,10 @@ where
 }
 
 /// Rebuilds every aggregate projection inside one caller-owned transaction.
+/// Returns the aggregate ids whose streams fold to a failed lifecycle.
 async fn rebuild_all_projections_in<Entity>(
     transaction: &mut Transaction<'_, Sqlite>,
-) -> Result<(), ProjectionError<Entity>>
+) -> Result<Vec<String>, ProjectionError<Entity>>
 where
     Entity: EventSourced<Materialized = Table>,
 {
@@ -263,22 +278,27 @@ where
         .execute(&mut **transaction)
         .await?;
 
+    let mut failed = Vec::new();
     for aggregate_id in aggregate_ids {
-        let rebuilt = replay_projection::<Entity>(transaction, table, &aggregate_id).await?;
-        debug_assert!(
-            rebuilt,
+        let replay = replay_projection::<Entity>(transaction, table, &aggregate_id).await?;
+        debug_assert_ne!(
+            replay,
+            Replay::NoEventStream,
             "an aggregate id selected from events must be replayable"
         );
+        if replay == Replay::Failed {
+            failed.push(aggregate_id);
+        }
     }
 
-    Ok(())
+    Ok(failed)
 }
 
 async fn replay_projection<Entity>(
     transaction: &mut Transaction<'_, Sqlite>,
     table: &str,
     aggregate_id: &str,
-) -> Result<bool, ProjectionError<Entity>>
+) -> Result<Replay, ProjectionError<Entity>>
 where
     Entity: EventSourced<Materialized = Table>,
 {
@@ -293,7 +313,7 @@ where
     .await?;
 
     let Some((max_sequence, _)) = events.last() else {
-        return Ok(false);
+        return Ok(Replay::NoEventStream);
     };
     let max_sequence = *max_sequence;
     let mut lifecycle = RebuiltLifecycle::<Entity>::default();
@@ -306,6 +326,19 @@ where
             })?;
         lifecycle.apply(event);
     }
+
+    let replay = if let RebuiltLifecycle::Failed { error, .. } = &lifecycle {
+        warn!(
+            aggregate_type = Entity::AGGREGATE_TYPE,
+            aggregate_id,
+            %error,
+            "View rebuild replayed a stream that folds to a failed lifecycle; \
+             the rebuilt row records the failure and loading it still errors"
+        );
+        Replay::Failed
+    } else {
+        Replay::Live
+    };
 
     let payload = serde_json::to_string(&lifecycle).map_err(|source| ProjectionError::Serde {
         aggregate_id: aggregate_id.to_owned(),
@@ -321,34 +354,36 @@ where
     .execute(&mut **transaction)
     .await?;
 
-    Ok(true)
+    Ok(replay)
 }
 
 async fn rebuild_projection<Entity>(
     pool: &SqlitePool,
     id: &Entity::Id,
-) -> Result<bool, ProjectionError<Entity>>
+) -> Result<Replay, ProjectionError<Entity>>
 where
     Entity: EventSourced<Materialized = Table>,
 {
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let rebuilt = rebuild_projection_in::<Entity>(&mut transaction, id).await?;
-    if !rebuilt {
+    let replay = rebuild_projection_in::<Entity>(&mut transaction, id).await?;
+    if replay == Replay::NoEventStream {
         transaction.rollback().await?;
-        return Ok(false);
+    } else {
+        transaction.commit().await?;
     }
-    transaction.commit().await?;
-    Ok(true)
+    Ok(replay)
 }
 
-async fn rebuild_all_projections<Entity>(pool: &SqlitePool) -> Result<(), ProjectionError<Entity>>
+async fn rebuild_all_projections<Entity>(
+    pool: &SqlitePool,
+) -> Result<Vec<String>, ProjectionError<Entity>>
 where
     Entity: EventSourced<Materialized = Table>,
 {
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
-    rebuild_all_projections_in::<Entity>(&mut transaction).await?;
+    let failed = rebuild_all_projections_in::<Entity>(&mut transaction).await?;
     transaction.commit().await?;
-    Ok(())
+    Ok(failed)
 }
 
 async fn event_stream_exists<Entity>(
@@ -484,108 +519,112 @@ pub async fn execute_rebuild_view(
     pool: &SqlitePool,
     scope: ParsedRebuildScope,
 ) -> Result<ViewRebuilt, ViewRebuildError> {
-    let (view, scope, replayed) = match scope {
+    match scope {
         ParsedRebuildScope::Position { requested_id, id } => {
-            let rebuilt = rebuild_projection::<Position>(pool, &id)
+            let replay = rebuild_projection::<Position>(pool, &id)
                 .await
                 .map_err(ViewRebuildError::Position)?;
-            if !rebuilt {
-                return Err(ViewRebuildError::NoEventStream {
-                    view: RebuildableView::Position,
-                    id: requested_id,
-                });
-            }
-            (
-                RebuildableView::Position,
-                RebuildScope::Id(requested_id),
-                None,
-            )
+            single_aggregate_rebuilt(RebuildableView::Position, requested_id, replay)
         }
         ParsedRebuildScope::OffchainOrder { requested_id, id } => {
-            let rebuilt = rebuild_projection::<OffchainOrder>(pool, &id)
+            let replay = rebuild_projection::<OffchainOrder>(pool, &id)
                 .await
                 .map_err(ViewRebuildError::OffchainOrder)?;
-            if !rebuilt {
-                return Err(ViewRebuildError::NoEventStream {
-                    view: RebuildableView::OffchainOrder,
-                    id: requested_id,
-                });
-            }
-            (
-                RebuildableView::OffchainOrder,
-                RebuildScope::Id(requested_id),
-                None,
-            )
+            single_aggregate_rebuilt(RebuildableView::OffchainOrder, requested_id, replay)
         }
         ParsedRebuildScope::VaultRegistry { requested_id, id } => {
-            let rebuilt = rebuild_projection::<VaultRegistry>(pool, &id)
+            let replay = rebuild_projection::<VaultRegistry>(pool, &id)
                 .await
                 .map_err(ViewRebuildError::VaultRegistry)?;
-            if !rebuilt {
-                return Err(ViewRebuildError::NoEventStream {
-                    view: RebuildableView::VaultRegistry,
-                    id: requested_id,
-                });
-            }
-            (
-                RebuildableView::VaultRegistry,
-                RebuildScope::Id(requested_id),
-                None,
-            )
+            single_aggregate_rebuilt(RebuildableView::VaultRegistry, requested_id, replay)
         }
         ParsedRebuildScope::All(view) => {
-            let replayed = match view {
-                RebuildableView::Position => {
+            let (replayed, failed) = match view {
+                RebuildableView::Position => (
+                    None,
                     rebuild_all_projections::<Position>(pool)
                         .await
-                        .map_err(ViewRebuildError::Position)?;
-                    None
-                }
-                RebuildableView::OffchainOrder => {
+                        .map_err(ViewRebuildError::Position)?,
+                ),
+                RebuildableView::OffchainOrder => (
+                    None,
                     rebuild_all_projections::<OffchainOrder>(pool)
                         .await
-                        .map_err(ViewRebuildError::OffchainOrder)?;
-                    None
-                }
-                RebuildableView::VaultRegistry => {
+                        .map_err(ViewRebuildError::OffchainOrder)?,
+                ),
+                RebuildableView::VaultRegistry => (
+                    None,
                     rebuild_all_projections::<VaultRegistry>(pool)
                         .await
-                        .map_err(ViewRebuildError::VaultRegistry)?;
-                    None
-                }
-                RebuildableView::RebalanceTiming => Some(
-                    RebalanceTimingProjection::new(pool.clone())
-                        .rebuild_all()
-                        .await
-                        .map_err(ViewRebuildError::RebalanceTiming)?,
+                        .map_err(ViewRebuildError::VaultRegistry)?,
                 ),
-                RebuildableView::EquityTiming => Some(
-                    EquityTimingProjection::new(pool.clone())
-                        .rebuild_all()
-                        .await
-                        .map_err(ViewRebuildError::EquityTiming)?,
+                RebuildableView::RebalanceTiming => (
+                    Some(
+                        RebalanceTimingProjection::new(pool.clone())
+                            .rebuild_all()
+                            .await
+                            .map_err(ViewRebuildError::RebalanceTiming)?,
+                    ),
+                    Vec::new(),
                 ),
-                RebuildableView::LifecycleFailure => Some(
-                    LifecycleFailureProjection::new(pool.clone())
-                        .rebuild_all()
-                        .await
-                        .map_err(ViewRebuildError::LifecycleFailure)?,
+                RebuildableView::EquityTiming => (
+                    Some(
+                        EquityTimingProjection::new(pool.clone())
+                            .rebuild_all()
+                            .await
+                            .map_err(ViewRebuildError::EquityTiming)?,
+                    ),
+                    Vec::new(),
                 ),
-                RebuildableView::PortfolioSnapshot => Some(
-                    PortfolioSnapshotProjection::new(pool.clone())
-                        .rebuild_all()
-                        .await
-                        .map_err(ViewRebuildError::PortfolioSnapshot)?,
+                RebuildableView::LifecycleFailure => (
+                    Some(
+                        LifecycleFailureProjection::new(pool.clone())
+                            .rebuild_all()
+                            .await
+                            .map_err(ViewRebuildError::LifecycleFailure)?,
+                    ),
+                    Vec::new(),
+                ),
+                RebuildableView::PortfolioSnapshot => (
+                    Some(
+                        PortfolioSnapshotProjection::new(pool.clone())
+                            .rebuild_all()
+                            .await
+                            .map_err(ViewRebuildError::PortfolioSnapshot)?,
+                    ),
+                    Vec::new(),
                 ),
             };
-            (view, RebuildScope::All, replayed)
+            Ok(ViewRebuilt {
+                view,
+                scope: RebuildScope::All,
+                replayed,
+                failed,
+            })
         }
-    };
+    }
+}
 
+fn single_aggregate_rebuilt(
+    view: RebuildableView,
+    requested_id: String,
+    replay: Replay,
+) -> Result<ViewRebuilt, ViewRebuildError> {
+    let failed = match replay {
+        Replay::NoEventStream => {
+            return Err(ViewRebuildError::NoEventStream {
+                view,
+                id: requested_id,
+            });
+        }
+        Replay::Live => Vec::new(),
+        Replay::Failed => vec![requested_id.clone()],
+    };
     Ok(ViewRebuilt {
         view,
-        scope,
-        replayed,
+        scope: RebuildScope::Id(requested_id),
+        replayed: None,
+        failed,
     })
 }
 
@@ -801,6 +840,35 @@ mod tests {
         }
     }
 
+    /// A stream that folds to a failed lifecycle rebuilds a failed row, which
+    /// is not a repair: the rebuild must report the aggregate as failed and
+    /// log it rather than answer as if the view were healthy.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_stream_that_folds_to_failed_is_reported_and_logged() {
+        let pool = setup_test_db().await;
+        persist_event::<Position>(
+            &pool,
+            "AAPL",
+            1,
+            &PositionEvent::ThresholdUpdated {
+                old_threshold: ExecutionThreshold::whole_share(),
+                new_threshold: ExecutionThreshold::whole_share(),
+                updated_at: Utc::now(),
+            },
+        )
+        .await;
+
+        for scope in [RebuildScope::Id("AAPL".to_owned()), RebuildScope::All] {
+            let rebuilt = rebuild_view(&pool, RebuildableView::Position, scope.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{scope:?}: {error}"));
+            assert_eq!(rebuilt.failed, vec!["AAPL".to_owned()], "{scope:?}");
+        }
+        assert!(logs_contain("aggregate_id=\"AAPL\""));
+        assert!(logs_contain("folds to a failed lifecycle"));
+    }
+
     #[tokio::test]
     async fn an_empty_store_rebuilds_every_view_to_nothing() {
         let pool = setup_test_db().await;
@@ -818,6 +886,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{view}: {error}"));
             assert_eq!(rebuilt.view, view);
             assert_eq!(rebuilt.scope, RebuildScope::All);
+            assert!(rebuilt.failed.is_empty(), "{view}");
             assert_eq!(
                 rebuilt.replayed,
                 (!view.supports_single_id()).then_some(0),

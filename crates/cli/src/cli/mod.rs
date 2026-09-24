@@ -1927,6 +1927,12 @@ async fn rebuild_view<W: Write>(
             "Rebuilt {label} read model ({replayed} events replayed)"
         )?,
     }
+    for id in &rebuilt.failed {
+        writeln!(
+            stdout,
+            "Warning: {id} folds to a failed lifecycle; its rebuilt {label} view still errors"
+        )?;
+    }
 
     Ok(())
 }

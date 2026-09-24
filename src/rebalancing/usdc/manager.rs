@@ -5238,12 +5238,12 @@ where
 /// this exists, so `mint_tx` is always present; the post-mint bookkeeping is
 /// best effort and degrades into the remaining fields rather than discarding the
 /// hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct RecoveredCctpMint {
     pub(crate) mint_tx: TxHash,
-    /// Minted amount and fee, `None` only if the on-chain `U256` values could
-    /// not be decoded. The mint is final regardless; `mint_tx` is authoritative.
-    pub(crate) amounts: Option<RecoveredMintAmounts>,
+    /// Minted amount and fee, or why they could not be decoded. The mint is
+    /// final either way; `mint_tx` is authoritative.
+    pub(crate) amounts: RecoveredMintAmounts,
     /// Whether the bot-gas cost job was enqueued for ADR 0017 accounting. The
     /// worker records the ledger entry asynchronously, so `true` is not proof
     /// the entry exists. `false`
@@ -5254,12 +5254,22 @@ pub(crate) struct RecoveredCctpMint {
     pub(crate) gas_enqueued: bool,
 }
 
-/// The decoded amounts of a recovered mint, present together or not at all.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RecoveredMintAmounts {
-    /// USDC minted to the recipient, net of the fee.
-    pub(crate) amount_received: Usdc,
-    pub(crate) fee_collected: Usdc,
+/// The amounts of a recovered mint, decoded together or not at all.
+#[derive(Debug)]
+pub(crate) enum RecoveredMintAmounts {
+    Decoded {
+        /// USDC minted to the recipient, net of the fee.
+        amount_received: Usdc,
+        fee_collected: Usdc,
+    },
+    /// The mint is final but its onchain values did not convert to USDC. The
+    /// raw values and the conversion error are kept so the failure is reported
+    /// rather than read as absent amounts.
+    Undecodable {
+        amount: U256,
+        fee: U256,
+        error: UsdcTransferError,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -5396,20 +5406,27 @@ where
             }
         };
 
-        let amounts = match (u256_to_usdc(receipt.amount), u256_to_usdc(receipt.fee)) {
-            (Ok(amount_received), Ok(fee_collected)) => Some(RecoveredMintAmounts {
+        let amounts = match u256_to_usdc(receipt.amount)
+            .and_then(|amount_received| Ok((amount_received, u256_to_usdc(receipt.fee)?)))
+        {
+            Ok((amount_received, fee_collected)) => RecoveredMintAmounts::Decoded {
                 amount_received,
                 fee_collected,
-            }),
-            (amount, fee) => {
+            },
+            Err(error) => {
                 error!(
                     target: "rebalance",
                     mint_tx = %receipt.tx,
-                    ?amount,
-                    ?fee,
+                    amount = %receipt.amount,
+                    fee = %receipt.fee,
+                    %error,
                     "CCTP mint landed but its amounts could not be decoded; the mint is final"
                 );
-                None
+                RecoveredMintAmounts::Undecodable {
+                    amount: receipt.amount,
+                    fee: receipt.fee,
+                    error,
+                }
             }
         };
 
@@ -18942,9 +18959,15 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.mint_tx, mint_tx);
         assert!(recovered.gas_enqueued, "the enqueue succeeded");
-        let amounts = recovered.amounts.expect("amounts decode from the receipt");
-        assert_eq!(amounts.amount_received, usdc("100"));
-        assert_eq!(amounts.fee_collected, usdc("1"));
+        let RecoveredMintAmounts::Decoded {
+            amount_received,
+            fee_collected,
+        } = recovered.amounts
+        else {
+            panic!("amounts decode from the receipt: {:?}", recovered.amounts);
+        };
+        assert_eq!(amount_received, usdc("100"));
+        assert_eq!(fee_collected, usdc("1"));
 
         let jobs = pending_bot_gas_jobs(&apalis_pool).await;
         assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
@@ -19007,10 +19030,77 @@ mod tests {
             !recovered.gas_enqueued,
             "the enqueue failed, so gas is reported as not enqueued"
         );
-        let amounts = recovered
-            .amounts
-            .expect("amounts still decode from the receipt");
-        assert_eq!(amounts.amount_received, usdc("100"));
+        let RecoveredMintAmounts::Decoded {
+            amount_received, ..
+        } = recovered.amounts
+        else {
+            panic!(
+                "amounts still decode from the receipt: {:?}",
+                recovered.amounts
+            );
+        };
+        assert_eq!(amount_received, usdc("100"));
+    }
+
+    /// A final mint whose onchain amount does not convert to USDC must come back
+    /// as a typed undecodable result carrying the raw values and the error, not
+    /// as absent amounts, and must still carry the mint hash.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn recover_cctp_mint_reports_undecodable_amounts_with_the_error() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let mint_tx =
+            fixed_bytes!("0xeeee000000000000000000000000000000000000000000000000000000000003");
+        let fee = usdc_to_u256(usdc("1")).unwrap();
+        let (manager, _apalis_pool, _server) = manager_with_bot_gas_queue(
+            cqrs,
+            wallet,
+            MockBridge::new().with_recover_mint(
+                valid_cctp_message(),
+                st0x_bridge::MintReceipt {
+                    tx: mint_tx,
+                    amount: U256::MAX,
+                    fee,
+                },
+            ),
+        )
+        .await;
+
+        let attestation = manager
+            .fetch_recovery_attestation(BridgeDirection::BaseToEthereum, TxHash::repeat_byte(0x11))
+            .await
+            .unwrap();
+        let recovered = manager
+            .submit_recovered_cctp_mint(
+                BridgeDirection::BaseToEthereum,
+                TxHash::repeat_byte(0x11),
+                attestation,
+            )
+            .await
+            .expect("a final mint must not be lost when its amounts fail to decode");
+
+        assert_eq!(recovered.mint_tx, mint_tx);
+        let RecoveredMintAmounts::Undecodable {
+            amount,
+            fee: raw_fee,
+            error,
+        } = recovered.amounts
+        else {
+            panic!(
+                "U256::MAX does not convert to USDC: {:?}",
+                recovered.amounts
+            );
+        };
+        assert_eq!(amount, U256::MAX);
+        assert_eq!(raw_fee, fee);
+        assert!(
+            matches!(error, UsdcTransferError::Float(_)),
+            "expected the Float conversion error, got {error:?}"
+        );
     }
 
     /// Acceptance criterion: resuming an Alpaca->Base transfer stalled at

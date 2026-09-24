@@ -5824,7 +5824,10 @@ effect rather than a generic intent:
   operation holds it) and quiesce the USDC rebalancing driver (`503` when a
   transfer is executing), holding both only around the `receiveMessage`
   submission and the bot gas enqueue. The response reports `gasEnqueued`: the
-  gas ledger job was queued, not that the ledger entry exists. Rerunning is
+  gas ledger job was queued, not that the ledger entry exists. Its `amounts` are
+  either `decoded` (net amount received and fee) or `undecodable`: the mint is
+  final but its onchain values did not convert to USDC, so the raw values and
+  the conversion error are reported instead of absent amounts. Rerunning is
   always safe: a consumed CCTP nonce cannot be minted twice, and a rerun whose
   mint already landed adopts that mint. A mint whose outcome could not be
   confirmed is an explicit retryable `502` telling the operator to verify
@@ -5841,13 +5844,16 @@ effect rather than a generic intent:
   writers already in flight to finish and refuses with `503` if they do not,
   leaving them running. Held, it blocks new writers for the whole rebuild. Row
   deletion and event replay run in one `BEGIN IMMEDIATE` SQLite transaction, so
-  a failed replay keeps the previous rows. Work a job spawns and awaits
-  continues the job's own slot rather than claiming a second one, so a pause can
-  never wait on a job that is itself waiting on its spawned work. Recovery
-  routes that also take the recovery lock enter the projection gate first, so a
-  request parked behind a rebuild holds no lock. The `stox view
-  rebuild` CLI
-  runs the same rebuild direct-DB and must run only while the bot is stopped.
+  a failed replay keeps the previous rows. An aggregate whose events fold to a
+  failed lifecycle is rebuilt as failed, not repaired: the rebuild logs a
+  warning and lists it under `failed` in the response. Work a job spawns and
+  awaits continues the job's own slot rather than claiming a second one, so a
+  pause can never wait on a job that is itself waiting on its spawned work.
+  Recovery routes that also take the recovery lock enter the projection gate
+  first, so a request parked behind a rebuild holds no lock. The
+  `stox view
+  rebuild` CLI runs the same rebuild direct-DB and must run only
+  while the bot is stopped.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a
