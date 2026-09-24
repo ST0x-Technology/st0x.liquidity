@@ -4342,10 +4342,15 @@ Alpaca to Base:
      never used for attribution. Two cases:
      - **0 < credit <= nominal**: burn exactly the credit and persist it in
        `BridgingSubmitting.burn_amount`, so a crash-resume scan targets the
-       exact burned amount. A credit below nominal also raises a warning-level
-       operator alert (`operational_alert`) with the credited, requested and
-       shortfall amounts: Alpaca reports no withdrawal fee, so the gap may be a
-       partial or wrong transaction rather than a fee.
+       exact burned amount. Alpaca deducts its network fee and fees from a
+       withdrawal and reports them on the transfer (`network_fee`, `fees`), so a
+       credit below nominal is expected. The bot reads the transfer again by its
+       Alpaca id: a shortfall up to the reported fees is logged at info; a
+       larger shortfall pages the operator (`operational_alert`, ERROR) with the
+       requested, shortfall and reported-fee amounts, since it may be a partial
+       or wrong transaction. If the fees cannot be read (Alpaca omits them, the
+       read fails, or the aggregate predates the recorded transfer id), the
+       shortfall is logged at info without a page.
      - **credit = 0 or credit > nominal**: the reported transaction did not pay
        this withdrawal. Emit `FailBridging` without attempting a burn and
        surface `WithdrawalCreditMismatch` for operator reconciliation. The job

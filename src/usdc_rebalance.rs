@@ -805,6 +805,10 @@ pub enum UsdcRebalance {
         /// before this field was added.
         #[serde(default)]
         withdrawal_tx: Option<TxHash>,
+        /// Carried from `Withdrawing` so the fees Alpaca reported for the
+        /// withdrawal can be read again. `None` in snapshots from before it.
+        #[serde(default)]
+        withdrawal_ref: Option<TransferRef>,
     },
     /// Withdrawal from source has failed (terminal state)
     WithdrawalFailed {
@@ -2002,6 +2006,8 @@ impl EventSourced for UsdcRebalance {
     // v10: the preflight balance is gone again. Settlement credits each
     // transfer from its withdrawal tx receipt, so the field was removed from
     // the command, event and states; serde ignores it in legacy payloads.
+    // `WithdrawalComplete` also carries `withdrawal_ref` now, so the reported
+    // withdrawal fees can be read again.
     const SCHEMA_VERSION: u64 = 10;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -2169,8 +2175,8 @@ impl EventSourced for UsdcRebalance {
                 Self::Withdrawing {
                     direction,
                     amount,
+                    withdrawal_ref,
                     initiated_at,
-                    ..
                 },
             ) => Self::WithdrawalComplete {
                 direction: *direction,
@@ -2178,6 +2184,7 @@ impl EventSourced for UsdcRebalance {
                 initiated_at: *initiated_at,
                 confirmed_at: *confirmed_at,
                 withdrawal_tx: *withdrawal_tx,
+                withdrawal_ref: Some(withdrawal_ref.clone()),
             },
 
             (
@@ -10000,6 +10007,7 @@ mod tests {
             initiated_at,
             confirmed_at,
             withdrawal_tx: None,
+            withdrawal_ref: None,
         };
 
         let dto = state.to_dto(&id);
@@ -10176,6 +10184,7 @@ mod tests {
             initiated_at: now,
             confirmed_at: now,
             withdrawal_tx,
+            withdrawal_ref: None,
         };
         assert_eq!(
             withdrawn(Some(MINT_TX)).ethereum_wallet_credit(),
@@ -10236,6 +10245,7 @@ mod tests {
                 initiated_at: now,
                 confirmed_at: now,
                 withdrawal_tx: None,
+                withdrawal_ref: None,
             }
             .holds_rebalance_guard()
         );
@@ -10711,6 +10721,7 @@ mod tests {
                 initiated_at: now,
                 confirmed_at: now,
                 withdrawal_tx: None,
+                withdrawal_ref: None,
             }
             .guard_recovery_tracking_data(),
             None,
@@ -11277,6 +11288,7 @@ mod tests {
             initiated_at: Utc::now(),
             confirmed_at: Utc::now(),
             withdrawal_tx: Some(tx_hash),
+            withdrawal_ref: None,
         })
         .expect("WithdrawalComplete state serializes");
 
@@ -11646,6 +11658,7 @@ mod tests {
             initiated_at: Utc::now(),
             confirmed_at: Utc::now(),
             withdrawal_tx: None,
+            withdrawal_ref: None,
         };
 
         assert_eq!(
@@ -11684,6 +11697,7 @@ mod tests {
             initiated_at: Utc::now(),
             confirmed_at: Utc::now(),
             withdrawal_tx: Some(alloy::primitives::TxHash::ZERO),
+            withdrawal_ref: None,
         };
 
         assert_eq!(

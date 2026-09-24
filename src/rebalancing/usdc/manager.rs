@@ -1884,20 +1884,9 @@ impl<
             });
         }
 
-        // Bridge what was credited, but page on any shortfall: Alpaca reports no
-        // withdrawal fee, so a short credit may also be a partial or wrong tx,
-        // and nothing else accounts for the rest of the withdrawn USDC.
         if credited < nominal {
-            warn!(
-                target: "operational_alert",
-                alert = true,
-                %id,
-                %withdrawal_tx,
-                credited = %display_usdc(credited),
-                requested = %amount,
-                shortfall = %display_usdc(nominal - credited),
-                "Alpaca withdrawal credited less USDC than requested; bridging the credited amount"
-            );
+            self.report_short_withdrawal_credit(id, withdrawal_tx, amount, nominal - credited)
+                .await;
         }
 
         // The burn lands in a strictly later block than the withdrawal
@@ -1925,6 +1914,106 @@ impl<
             initiated_at,
         )
         .await
+    }
+
+    /// Bridges what was credited either way. Alpaca deducts its network fee and
+    /// fees from a withdrawal, so a shortfall up to the fees it reported is
+    /// expected and only logged; a larger one pages. A shortfall whose fees
+    /// cannot be read is logged without a page, as it is most likely a fee.
+    async fn report_short_withdrawal_credit(
+        &self,
+        id: &UsdcRebalanceId,
+        withdrawal_tx: TxHash,
+        requested: Usdc,
+        shortfall: U256,
+    ) {
+        let Some(reported_fees) = self.reported_withdrawal_fees(id).await else {
+            info!(
+                target: "rebalance",
+                %id,
+                %withdrawal_tx,
+                %requested,
+                shortfall = %display_usdc(shortfall),
+                "Alpaca withdrawal credited less USDC than requested; the reported fees could \
+                 not be read, bridging the credited amount"
+            );
+            return;
+        };
+
+        if shortfall <= reported_fees {
+            info!(
+                target: "rebalance",
+                %id,
+                %withdrawal_tx,
+                %requested,
+                shortfall = %display_usdc(shortfall),
+                reported_fees = %display_usdc(reported_fees),
+                "Alpaca withdrawal credited less USDC than requested, within the fees Alpaca \
+                 reported; bridging the credited amount"
+            );
+            return;
+        }
+
+        error!(
+            target: "operational_alert",
+            alert = true,
+            %id,
+            %withdrawal_tx,
+            %requested,
+            shortfall = %display_usdc(shortfall),
+            reported_fees = %display_usdc(reported_fees),
+            "Alpaca withdrawal credited less USDC than requested net of the fees Alpaca \
+             reported; bridging the credited amount"
+        );
+    }
+
+    /// The network fee plus fees Alpaca reports for the withdrawal of `id`, in
+    /// USDC base units, or `None` (with a warning) when they cannot be read.
+    async fn reported_withdrawal_fees(&self, id: &UsdcRebalanceId) -> Option<U256> {
+        let state = self
+            .cqrs
+            .load(id)
+            .await
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %id, ?error, "Could not load the transfer to read its withdrawal fees");
+            })
+            .ok()
+            .flatten();
+
+        let Some(UsdcRebalance::WithdrawalComplete {
+            withdrawal_ref: Some(TransferRef::AlpacaId(transfer_id)),
+            ..
+        }) = state
+        else {
+            warn!(target: "rebalance", %id, ?state, "No Alpaca transfer id to read the withdrawal fees from");
+            return None;
+        };
+
+        let transfer = self
+            .alpaca_wallet
+            .get_transfer(&transfer_id)
+            .await
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %id, %transfer_id, %error, "Could not read the Alpaca withdrawal to get its fees");
+            })
+            .ok()?;
+
+        let Some(fees) = transfer
+            .reported_fees()
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %id, %transfer_id, ?error, "Could not total the Alpaca withdrawal fees");
+            })
+            .ok()?
+        else {
+            warn!(target: "rebalance", %id, %transfer_id, "Alpaca reported no fees for the withdrawal");
+            return None;
+        };
+
+        usdc_to_u256(fees)
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %id, %transfer_id, %error, "Alpaca withdrawal fees are off the USDC grid");
+            })
+            .ok()
     }
 
     /// DURABLE confirmation re-check: fires on the redrive path
@@ -13416,8 +13505,8 @@ mod tests {
         assert_eq!(burn_amount, Some(usdc("998")));
     }
 
-    /// An undercredited withdrawal still bridges what it credited, but the
-    /// shortfall pages: nothing else accounts for the USDC that left Alpaca.
+    /// A withdrawal credited short by more than the fees Alpaca reported still
+    /// bridges what it credited, but pages: nothing accounts for the rest.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn undercredited_withdrawal_alerts_the_operator() {
@@ -13444,8 +13533,17 @@ mod tests {
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let nominal = usdc("1000");
-        advance_to_withdrawal_complete_alpaca_to_base_with_tx(&cqrs, &id, nominal, chain.mint_tx)
-            .await;
+        let transfer_uuid = Uuid::new_v4();
+        advance_to_withdrawal_complete_alpaca_to_base_via_transfer(
+            &cqrs,
+            &id,
+            nominal,
+            Some(chain.mint_tx),
+            transfer_uuid,
+        )
+        .await;
+        let transfer_mock =
+            mock_complete_withdrawal_with_fees(&server, transfer_uuid, chain.mint_tx, "0.5", "0.5");
 
         let error = manager
             .continue_alpaca_to_base_from_withdrawal_complete(
@@ -13462,10 +13560,11 @@ mod tests {
             matches!(error, UsdcTransferError::BurnRevert(_)),
             "an undercredited withdrawal must still proceed to the burn; got: {error:?}"
         );
+        transfer_mock.assert();
         assert!(logs_contain("operational_alert"));
-        assert!(logs_contain("credited=998"));
         assert!(logs_contain("requested=1000"));
         assert!(logs_contain("shortfall=2"));
+        assert!(logs_contain("reported_fees=1"));
     }
 
     /// Alpaca deducts the network fee and fees it reports from a withdrawal,
@@ -13505,7 +13604,7 @@ mod tests {
             transfer_uuid,
         )
         .await;
-        let _transfer_mock =
+        let transfer_mock =
             mock_complete_withdrawal_with_fees(&server, transfer_uuid, chain.mint_tx, "1.5", "0.5");
 
         let error = manager
@@ -13523,8 +13622,9 @@ mod tests {
             matches!(error, UsdcTransferError::BurnRevert(_)),
             "the fee-short withdrawal must proceed to the burn; got: {error:?}"
         );
+        transfer_mock.assert();
         assert!(!logs_contain("operational_alert"));
-        assert!(logs_contain("credited less USDC than requested"));
+        assert!(logs_contain("within the fees Alpaca reported"));
     }
 
     /// Mocks Alpaca's by-id transfer endpoint answering a complete withdrawal
