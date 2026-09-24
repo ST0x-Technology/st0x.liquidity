@@ -4202,6 +4202,17 @@ impl<
             }
         }
 
+        // The reverted hash is still recorded here, so a restart during the
+        // check reburns on resume.
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.check_ethereum_credit_ledger(id, u256_to_usdc(amount)?)
+                    .await;
+            }
+            // A Base burn does not spend the Ethereum wallet.
+            BridgeDirection::BaseToEthereum => {}
+        }
+
         // Final attempt after the first burn reverted: re-submit (which re-records
         // the new hash) and re-confirm. Its outcome is returned unconditionally.
         let burn_tx = self
