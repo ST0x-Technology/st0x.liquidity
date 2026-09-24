@@ -3900,15 +3900,18 @@ already-submitted action instead of re-issuing it:
   consumed nonce whose mint is not found in that window, or a message that can
   never mint on the destination chain, marks `BridgingFailed` (keeping the burn
   tx and nonce), so `transfer reconcile --kind usdc` can settle it; the bot
-  never scans back to genesis. An AlpacaToBase latch pages the operator, since
-  its retry then finds the transfer failed and does not alert: "the CCTP mint
-  cannot be resolved automatically" for a consumed nonce, "the recorded CCTP
-  message cannot mint on Base" for a message that can never mint (the nonce is
-  not read, so the operator gets the attestation for the burn tx and mints it).
-  A BaseToAlpaca latch does not page: its retry keeps recovering the mint
-  through the post-burn `BridgingFailed` recovery and may still send the
-  deposit, and the job's dead-letter alert covers a give-up. Other lookup
-  failures redrive.
+  never scans back to genesis. A consumed nonce whose mint is not in the window
+  pages the operator in both directions with "the CCTP mint cannot be resolved
+  automatically": only the operator can find that mint. A BaseToAlpaca job ends
+  there, since its post-burn `BridgingFailed` recovery scans no wider; if that
+  recovery runs again (a restart) and cannot find the mint of a used nonce, it
+  pages the same way and stops instead of redriving. A message that can never
+  mint pages only for AlpacaToBase, with "the recorded CCTP message cannot mint
+  on Base" (the nonce is not read, so the operator gets the attestation for the
+  burn tx and mints it); an AlpacaToBase retry finds the transfer failed and
+  does not alert. That BaseToAlpaca latch does not page: its recovery re-polls
+  Circle and may still mint and send the deposit, and the job's dead-letter
+  alert covers a give-up. Other lookup failures redrive.
 
 ##### Commands
 

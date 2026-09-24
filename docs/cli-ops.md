@@ -648,11 +648,15 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   before you reconcile. A legacy `Attested` transfer (no persisted message)
   whose nonce is used but whose Circle re-poll keeps failing the same way (for
   example a malformed complete answer) is marked `BridgingFailed` the same way.
-  For AlpacaToBase both latches page with "the CCTP mint cannot be resolved
-  automatically". A BaseToAlpaca latch (these, or a message that can never mint)
-  does not page: its retry may still adopt the mint and send the deposit, so do
-  not move the funds by hand while it retries; the job's dead-letter alert says
-  when it gave up.
+  A mint outside the scan pages with "the CCTP mint cannot be resolved
+  automatically" in both directions, and the bot stops retrying it: find the
+  mint, then reconcile with `--kind usdc`. A BaseToAlpaca `BridgingFailed`
+  recovery (for example after a restart) that reads the nonce used but cannot
+  find its mint pages the same way and stops. The legacy re-poll latch pages
+  with the same text for AlpacaToBase only. A BaseToAlpaca latch for the legacy
+  re-poll, or for a message that can never mint, does not page: its retry may
+  still adopt or mint and send the deposit, so do not move the funds by hand
+  while it retries; the job's dead-letter alert says when it gave up.
 - An `AlpacaToBase` transfer whose Circle attestation poll fails hard (or, for a
   legacy `Attested` transfer, whose re-poll fails with the nonce unused) is
   marked `BridgingFailed` and pages with "the burned USDC cannot be minted

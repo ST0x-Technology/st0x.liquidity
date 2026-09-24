@@ -3753,7 +3753,8 @@ impl<
     /// BaseToAlpaca only (mint lands on Ethereum); an `AlpacaToBase`
     /// `BridgingFailed` is still surfaced for manual reconciliation. When an
     /// attestation was recorded, the re-polled nonce must be `cctp_nonce`: a
-    /// mismatch is refused on every retry, never minted.
+    /// mismatch is refused on every retry, never minted. A used nonce whose mint
+    /// is outside the recovery scan pages and parks for reconciliation.
     async fn recover_from_bridging_failed(
         &self,
         id: &UsdcRebalanceId,
@@ -3825,6 +3826,23 @@ impl<
             .await
         {
             Ok(receipt) => receipt,
+            // The nonce is used but its mint is not in the scan after the lag
+            // retries: the Attested resume's out-of-window case. No retry
+            // scans wider, so page once per run and park instead of redriving.
+            Err(error)
+                if matches!(
+                    &error,
+                    CctpError::MintRecoveryInconclusive { recovery_error }
+                        if matches!(**recovery_error, CctpError::AlreadyMintedMessageNotFound { .. })
+                ) =>
+            {
+                warn!(target: "rebalance", %id, "Mint of the used nonce is outside the recovery scan; parking for operator reconciliation: {error}");
+                alert_unresolvable_mint(
+                    id,
+                    &format!("nonce used, mint outside the recovery scan: {error}"),
+                );
+                return Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() });
+            }
             // Mirrors the same arm in `execute_cctp_mint`/
             // `execute_cctp_mint_on_ethereum`: whether/how the mint landed is
             // UNKNOWN or already-landed-but-unconfirmed, not "definitely not
