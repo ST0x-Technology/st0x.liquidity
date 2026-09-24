@@ -3395,6 +3395,38 @@ mod tests {
         );
     }
 
+    /// A withdrawal Alpaca reports Complete with no tx hash reached Alpaca fine,
+    /// so its deadline alert must not blame Alpaca connectivity.
+    #[tokio::test]
+    async fn missing_tx_hash_alert_does_not_blame_alpaca_connectivity() {
+        let notifier = Arc::new(CapturingNotifier::default());
+        let notifier_dyn: Arc<dyn Notifier> = notifier.clone();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        alert_withdrawal_poll_deadline_elapsed(
+            &id,
+            WITHDRAWAL_POLL_ALERT_DEADLINE,
+            &AlpacaWalletError::CompletedTransferMissingTx {
+                transfer_id: AlpacaTransferId::from(Uuid::new_v4()),
+            },
+            &notifier_dyn,
+        )
+        .await;
+
+        let messages = notifier.messages();
+        assert_eq!(messages.len(), 1, "got: {messages:?}");
+        let alert = &messages[0];
+        assert!(alert.contains(&id.to_string()), "got: {alert:?}");
+        assert!(
+            !alert.contains("unreachable"),
+            "Alpaca answered, so the alert must not blame connectivity; got: {alert:?}"
+        );
+        assert!(
+            alert.contains("no tx hash"),
+            "the alert must name the missing tx hash; got: {alert:?}"
+        );
+    }
+
     /// `WithdrawalPollInconclusive` at or after the alert deadline must fire an
     /// operator alert via the notifier while STILL scheduling the delayed redrive
     /// and returning `Ok`. The guard stays held and re-polling continues.
