@@ -7729,7 +7729,7 @@ mod tests {
 
         // The fixture seeds the redemption at `VaultWithdrawSubmitting`; advance
         // it to `VaultWithdrawSubmitted` so recovery takes the second match arm.
-        let withdraw_tx = TxHash::from([0x7c; 32]);
+        let withdraw_tx = crate::equity_redemption::prepared_withdrawal_for_test().tx_hash();
         let redemption_store = Arc::new(test_store::<EquityRedemption>(
             pool.clone(),
             services.clone(),

@@ -316,8 +316,9 @@ where
     P: Provider<Ethereum>,
 {
     let _guard = send_lock.lock().await;
-    let nonce = nonce_manager.get_next_nonce(submitter, address).await?;
-    nonce_manager.reserve_prepared_nonce(address, nonce).await;
+    let nonce = nonce_manager
+        .reserve_next_unheld_nonce(submitter, address)
+        .await?;
     let tx = TransactionRequest::default()
         .to(contract)
         .input(calldata.into())
@@ -332,9 +333,9 @@ where
     let envelope = match envelope_result {
         Ok(envelope) => envelope,
         Err(error) => {
-            // `get_next_nonce` already advanced the cache. Roll back only
-            // this failed preparation; earlier persisted preparations remain
-            // reserved across the retry.
+            // `reserve_next_unheld_nonce` already reserved this nonce and
+            // advanced the cache. Roll back only this failed preparation;
+            // earlier persisted preparations remain reserved across the retry.
             nonce_manager.release_prepared_nonce(address, nonce).await;
             return Err(error);
         }

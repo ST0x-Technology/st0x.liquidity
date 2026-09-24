@@ -948,6 +948,46 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         if let Some(aggregate) = ctx.redemption_store.load(&self.aggregate_id).await?
             && !aggregate.is_terminal()
         {
+            // A submission-state redemption whose transfer job budget is now
+            // exhausted has an unresolved onchain withdrawal. With no live sibling
+            // to drive it, nothing exits it automatically: the sweep never
+            // force-fails a submission state and the deadline redrive only pages
+            // while a resume keeps running. Page the operator once so it is not
+            // silently wedged until someone restarts the bot.
+            let unresolved_submission = matches!(
+                aggregate,
+                EquityRedemption::VaultWithdrawPending { .. }
+                    | EquityRedemption::VaultWithdrawSubmitting { .. }
+                    | EquityRedemption::VaultWithdrawSubmitted { .. }
+            );
+            if unresolved_submission
+                && !has_live_sibling_equity_transfer::<Self>(
+                    ctx.job_queue.pool(),
+                    task_identity,
+                    |sibling| {
+                        sibling.aggregate_id == self.aggregate_id
+                            && sibling.generation == self.generation
+                    },
+                )
+                .await?
+            {
+                let message = format!(
+                    "Equity redemption {} ({}) exhausted its transfer job budget while its \
+                     Raindex vault withdrawal is unresolved, and no live job remains to drive \
+                     it. Verify the withdrawal onchain; if it can never confirm, reconcile it \
+                     (`stox transfer reconcile --kind redemption --id {}`) and restart the bot \
+                     to clear the stuck wallet nonce.",
+                    self.aggregate_id, self.symbol, self.aggregate_id,
+                );
+                if let Err(alert_error) = ctx.notifier.notify(&message).await {
+                    warn!(
+                        target: "rebalance",
+                        aggregate_id = %self.aggregate_id,
+                        %alert_error,
+                        "Failed to deliver wedged-withdrawal give-up alert"
+                    );
+                }
+            }
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,

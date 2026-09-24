@@ -130,6 +130,63 @@ impl ResettableNonceManager {
         }
     }
 
+    /// Reserves the next nonce that no reservation or in flight send already
+    /// holds, for a prepared transaction that cannot raise its fee to escape a
+    /// collision.
+    ///
+    /// A prepared (withdrawal) transaction is signed once at a fixed nonce and
+    /// persisted for verbatim rebroadcast, so the nonce it is signed at is the
+    /// only nonce it can ever land at. Allocating it through `get_next_nonce`
+    /// is unsafe: that path deliberately lands back on a `Replaceable` (generic
+    /// broadcast but unconfirmed) hold so the generic send can raise the fee on
+    /// its own stuck transaction, but fixed prepared bytes pinned onto that
+    /// same nonce become permanently unlandable once the generic transaction
+    /// mines. This path instead skips every held nonce, `Reserved` and
+    /// `Replaceable` alike.
+    ///
+    /// The pending floor and the skip every held step are both required.
+    /// Reading `pending` rather than `latest` counts this wallet's own unmined
+    /// sends the cache may have lost to an `invalidate()`, a
+    /// `release_nonce_and_rewind` gap fill, or a restart, so the candidate
+    /// starts at or above the account's real next free nonce instead of a mined
+    /// `latest` a live generic send already occupies. Skipping every held nonce
+    /// then steps past occupancy the cache still tracks, including the
+    /// `Replaceable` holds `get_next_nonce` would land on. The cache is only
+    /// ever raised to `chosen + 1`, never lowered, so a concurrent prepare that
+    /// already advanced further is not rewound.
+    ///
+    /// Callers must hold the wallet send lock across this operation.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) async fn reserve_next_unheld_nonce<TProvider, TNetwork>(
+        &self,
+        provider: &TProvider,
+        address: Address,
+    ) -> TransportResult<u64>
+    where
+        TProvider: Provider<TNetwork>,
+        TNetwork: Network,
+    {
+        let slot = self.slot(address);
+        let mut cached = slot.lock().await;
+
+        // `pending` counts this wallet's own unmined sends the cache may have
+        // dropped; it is the floor for a fixed prepared nonce that a live
+        // generic send must never share.
+        let pending = provider.get_transaction_count(address).pending().await?;
+        let mut candidate = cached.map_or(pending, |current| current.max(pending));
+        while self.is_held(address, candidate) {
+            let advanced = candidate.saturating_add(1);
+            if advanced == candidate {
+                break;
+            }
+            candidate = advanced;
+        }
+        self.hold_nonce(address, candidate, NonceHold::Reserved);
+        *cached = Some(candidate.saturating_add(1));
+        drop(cached);
+        Ok(candidate)
+    }
+
     /// Releases a prepared nonce that will never be broadcast. The cache is
     /// rewound only as far as that nonce; every other prepared or in-flight
     /// nonce remains protected and is skipped by `get_next_nonce`.
@@ -221,6 +278,19 @@ impl ResettableNonceManager {
             .is_some_and(|held| matches!(held.get(&nonce), Some(NonceHold::Reserved)))
     }
 
+    /// Whether any hold, `Reserved` or `Replaceable`, currently sits on
+    /// `nonce`. Unlike `is_reserved`, which a generic broadcast but unconfirmed
+    /// `Replaceable` hold does not satisfy, this treats every occupied nonce as
+    /// held: a prepared allocation must skip both kinds because its fixed signed
+    /// bytes cannot raise their fee to escape a collision the way a generic send
+    /// lands back on its own `Replaceable` nonce to replace it.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    fn is_held(&self, address: Address, nonce: u64) -> bool {
+        self.occupied
+            .get(&address)
+            .is_some_and(|held| held.contains_key(&nonce))
+    }
+
     /// The nonce the next send from `address` would use, without assigning
     /// it (i.e. without consuming it the way [`get_next_nonce`] does).
     /// `None` when the cache holds nothing for `address` yet.
@@ -290,6 +360,9 @@ mod tests {
     use super::*;
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use crate::inflight_nonces::InFlightNonces;
+    use alloy::node_bindings::Anvil;
+    use alloy::primitives::U256;
+    use alloy::rpc::types::TransactionRequest;
 
     #[tokio::test]
     async fn increments_locally_after_first_fetch() {
@@ -567,6 +640,120 @@ mod tests {
         assert_eq!(
             manager_a.get_next_nonce(&provider, address).await.unwrap(),
             0
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn prepared_allocation_skips_generic_in_flight_nonce() {
+        // A prepared (withdrawal) transaction is signed at a fixed nonce and
+        // can never raise its fee to escape a collision, so its allocation must
+        // skip a generic in flight nonce that `get_next_nonce` deliberately
+        // lands back on. Signing fixed bytes onto a nonce a live generic send
+        // already occupies strands them: once that generic send mines, every
+        // rebroadcast is nonce too low.
+        let provider = ProviderBuilder::new().connect_anvil();
+        let address = Address::ZERO;
+
+        let manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(manager.clone());
+        let in_flight_nonce = manager.get_next_nonce(&provider, address).await.unwrap();
+        in_flight.record(
+            address,
+            in_flight_nonce,
+            alloy::primitives::TxHash::repeat_byte(0x42),
+        );
+        manager.invalidate();
+
+        let prepared = manager
+            .reserve_next_unheld_nonce(&provider, address)
+            .await
+            .unwrap();
+        assert!(
+            prepared > in_flight_nonce,
+            "a prepared allocation must skip the generic in flight nonce \
+             (prepared={prepared}, in_flight={in_flight_nonce}), not sign fixed \
+             bytes onto a nonce a live generic send already holds"
+        );
+
+        // Contrast: the generic path in the identical situation still lands
+        // back ON its own in flight nonce so it can replace its stuck send, the
+        // deliberately unchanged behavior for a `Replaceable` hold.
+        let generic_manager = ResettableNonceManager::default();
+        let generic_in_flight = InFlightNonces::new(generic_manager.clone());
+        let generic_nonce = generic_manager
+            .get_next_nonce(&provider, address)
+            .await
+            .unwrap();
+        generic_in_flight.record(
+            address,
+            generic_nonce,
+            alloy::primitives::TxHash::repeat_byte(0x42),
+        );
+        generic_manager.invalidate();
+        assert_eq!(
+            generic_manager
+                .get_next_nonce(&provider, address)
+                .await
+                .unwrap(),
+            generic_nonce,
+            "generic allocation is unchanged: it lands back on its own in \
+             flight nonce for replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_cache_reserve_does_not_seed_below_mined_latest() {
+        // Regression for commit 580e71b6: `reserve_prepared_nonce` must not
+        // seed a cold cache. After a restart a durable prepared transaction's
+        // nonce N can sit below the chain's mined `latest` (that transaction or
+        // a co-signer's transaction mined while this process was down). Seeding
+        // `N + 1` would pin every following send below the mined count, where
+        // it can never land; a cold fetch of `latest` must win instead.
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let address = anvil.addresses()[0];
+
+        // Mine three real self transfers so the account's mined `latest`
+        // advances strictly past both the older prepared nonce N and the buggy
+        // `N + 1` seed, so this test fails if the cold cache seed returns.
+        for _ in 0..3 {
+            provider
+                .send_transaction(
+                    TransactionRequest::default()
+                        .from(address)
+                        .to(address)
+                        .value(U256::ZERO),
+                )
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+        }
+        let mined_latest = provider
+            .get_transaction_count(address)
+            .latest()
+            .await
+            .unwrap();
+        assert_eq!(
+            mined_latest, 3,
+            "the three mined self transfers must advance the account's latest"
+        );
+
+        // A fresh manager is a cold cache, exactly as after a process restart.
+        let manager = ResettableNonceManager::default();
+        let older_prepared_nonce = 0;
+        manager
+            .reserve_prepared_nonce(address, older_prepared_nonce)
+            .await;
+
+        assert_eq!(
+            manager.get_next_nonce(&provider, address).await.unwrap(),
+            mined_latest,
+            "a cold cache must re-fetch the mined latest, not seed the older \
+             prepared nonce + 1: seeding {older_prepared_nonce} + 1 would \
+             strand every following send below the mined count"
         );
     }
 }

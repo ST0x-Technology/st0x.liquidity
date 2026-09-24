@@ -6778,27 +6778,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_equity_transfer_rejects_a_non_reconcilable_redemption() {
-        // VaultWithdrawSubmitted has a broadcast tx and its own force-fail exit,
-        // so reconcile refuses it (only Failed and VaultWithdrawSubmitting qualify).
+    async fn reconcile_equity_transfer_reconciles_a_submitted_redemption() {
+        // A broadcast withdrawal (`VaultWithdrawSubmitted`) may still be live
+        // onchain and is never failed automatically, so an operator who verified
+        // it will never land reconciles it out of band, like the submitting origin.
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
-        let id = redemption_aggregate_id("api-redemption-non-reconcilable");
+        let id = redemption_aggregate_id("api-redemption-submitted-reconcile");
         seed_redemption_submitted(&state.pool, &id).await;
 
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
-                reason: "handled out-of-band".to_string(),
+                reason: "withdrawal outrun by fees; verified dead onchain".to_string(),
             }),
         )
         .await;
 
-        let Err((status, _)) = resp else {
-            panic!("expected an error response");
+        let Ok(Json(_)) = resp else {
+            panic!("a stuck submitted redemption must reconcile");
         };
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "the redemption must land in the Reconciled terminal, got {entity:?}",
+        );
     }
 
     #[tokio::test]

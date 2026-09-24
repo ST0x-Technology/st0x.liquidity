@@ -154,6 +154,15 @@ pub enum EquityRedemptionError {
         amount: U256,
         error_message: String,
     },
+    /// `RecordWithdrawSubmission` was given a hash that does not match the
+    /// persisted prepared transaction. The recorded identity must equal
+    /// `prepared.tx_hash()` so `ConfirmWithdraw` polls the exact transaction a
+    /// resume would rebroadcast.
+    #[error(
+        "RecordWithdrawSubmission hash {recorded} does not match the prepared \
+         transaction hash {prepared}"
+    )]
+    PreparedWithdrawalHashMismatch { recorded: TxHash, prepared: TxHash },
     /// Confirmed Raindex withdrawal receipt did not contain the expected token transfer.
     #[error(
         "Raindex withdrawal receipt {tx_hash} did not contain a transfer \
@@ -1389,13 +1398,20 @@ impl EquityRedemption {
     }
 
     /// Whether an operator may `Reconcile` this redemption to the terminal
-    /// `Reconciled` state: the `Failed` terminal, or the `VaultWithdrawSubmitting`
-    /// origin whose withdrawal fate the operator has verified on-chain. The
-    /// latter is the only in-flight state with no automatic exit -- it is never
-    /// force-failed (its withdrawal may have landed) and the timeout sweep skips
-    /// it -- so reconcile is its manual escape hatch.
+    /// `Reconciled` state: the `Failed` terminal, or a withdrawal submission
+    /// state (`VaultWithdrawPending`, `VaultWithdrawSubmitting`,
+    /// `VaultWithdrawSubmitted`) whose fate the operator has verified onchain.
+    /// The timeout sweep never fails those submission states, because their
+    /// withdrawal may have landed, so reconcile is their manual escape hatch
+    /// once the operator confirms the withdrawal will never land.
     pub fn is_operator_reconcilable(&self) -> bool {
-        self.is_failed() || matches!(self, Self::VaultWithdrawSubmitting { .. })
+        self.is_failed()
+            || matches!(
+                self,
+                Self::VaultWithdrawPending { .. }
+                    | Self::VaultWithdrawSubmitting { .. }
+                    | Self::VaultWithdrawSubmitted { .. }
+            )
     }
 
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
@@ -2236,6 +2252,45 @@ impl EventSourced for EquityRedemption {
                     started_at: *submitting_at,
                     reconciled_at: *reconciled_at,
                 }),
+                // A broadcast withdrawal (`VaultWithdrawSubmitted`) or a legacy
+                // `VaultWithdrawPending`, reconciled after the operator verified
+                // onchain that it will never land: no tx completed, so the tx and
+                // failure fields stay absent and the durable submit or pending
+                // timestamp is the transfer's start.
+                Self::VaultWithdrawSubmitted {
+                    symbol,
+                    quantity,
+                    submitted_at,
+                    ..
+                } => Some(Self::Reconciled {
+                    symbol: symbol.clone(),
+                    chain,
+                    quantity: *quantity,
+                    raindex_withdraw_tx: None,
+                    redemption_tx: None,
+                    tokenization_request_id: None,
+                    failure_reason: None,
+                    reconcile_reason: reason.clone(),
+                    started_at: *submitted_at,
+                    reconciled_at: *reconciled_at,
+                }),
+                Self::VaultWithdrawPending {
+                    symbol,
+                    quantity,
+                    pending_at,
+                    ..
+                } => Some(Self::Reconciled {
+                    symbol: symbol.clone(),
+                    chain,
+                    quantity: *quantity,
+                    raindex_withdraw_tx: None,
+                    redemption_tx: None,
+                    tokenization_request_id: None,
+                    failure_reason: None,
+                    reconcile_reason: reason.clone(),
+                    started_at: *pending_at,
+                    reconciled_at: *reconciled_at,
+                }),
                 _ => return Ok(None),
             },
         })
@@ -2507,7 +2562,10 @@ impl EventSourced for EquityRedemption {
             },
 
             Reconcile { reason } => match self {
-                Self::Failed { symbol, .. } | Self::VaultWithdrawSubmitting { symbol, .. } => {
+                Self::Failed { symbol, .. }
+                | Self::VaultWithdrawPending { symbol, .. }
+                | Self::VaultWithdrawSubmitting { symbol, .. }
+                | Self::VaultWithdrawSubmitted { symbol, .. } => {
                     if reason.trim().is_empty() {
                         return Err(EquityRedemptionError::ReconcileReasonRequired);
                     }
@@ -2547,15 +2605,23 @@ impl EquityRedemption {
                 wrapped_amount,
                 prepared,
                 ..
-            } => Ok(vec![VaultWithdrawSubmitted {
-                symbol: symbol.clone(),
-                quantity: *quantity,
-                token: *token,
-                wrapped_amount: *wrapped_amount,
-                tx_hash,
-                prepared: Some(prepared.clone()),
-                submitted_at,
-            }]),
+            } => {
+                if tx_hash != prepared.tx_hash() {
+                    return Err(EquityRedemptionError::PreparedWithdrawalHashMismatch {
+                        recorded: tx_hash,
+                        prepared: prepared.tx_hash(),
+                    });
+                }
+                Ok(vec![VaultWithdrawSubmitted {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    token: *token,
+                    wrapped_amount: *wrapped_amount,
+                    tx_hash,
+                    prepared: Some(prepared.clone()),
+                    submitted_at,
+                }])
+            }
             Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
             Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
@@ -3498,19 +3564,25 @@ mod tests {
             token,
             vault_id,
             wrapped_amount,
+            prepared,
             ..
         } = state
         else {
             panic!("expected VaultWithdrawSubmitting, got {state:?}");
         };
-        let tx_hash = raindex
+        // Register the mock withdraw transfer that `ConfirmWithdraw` scans for.
+        // The new flow broadcasts the persisted prepared transaction, so the
+        // recorded hash is `prepared.tx_hash()`, not the mock submit return.
+        raindex
             .submit_withdraw(token, vault_id, wrapped_amount, TOKENIZED_EQUITY_DECIMALS)
             .await
             .unwrap();
         store
             .send(
                 id,
-                EquityRedemptionCommand::RecordWithdrawSubmission { tx_hash },
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: prepared.tx_hash(),
+                },
             )
             .await
             .unwrap();
@@ -3811,7 +3883,7 @@ mod tests {
     #[tokio::test]
     async fn record_withdraw_submission_at_uses_supplied_timestamp() {
         let submitted_at = Utc::now() - chrono::Duration::hours(3);
-        let tx_hash = TxHash::repeat_byte(0x43);
+        let tx_hash = prepared_withdrawal_for_test().tx_hash();
 
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![vault_withdraw_submitting_event()])
