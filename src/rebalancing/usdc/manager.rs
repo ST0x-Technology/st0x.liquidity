@@ -20,7 +20,7 @@ use st0x_bridge::cctp::{
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER};
 use st0x_event_sorcery::Store;
-use st0x_evm::{Chain, USDC_BASE, Wallet};
+use st0x_evm::{BroadcastError, Chain, USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
@@ -153,8 +153,12 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
 
     /// Broadcasts `amount` USDC (6-decimal) from the bot wallet to `to` on
     /// Ethereum and returns the tx hash without awaiting the receipt.
-    async fn submit_usdc_on_ethereum(&self, to: Address, amount: U256)
-    -> Result<TxHash, CctpError>;
+    /// A failure tells whether the transfer may have reached the network.
+    async fn submit_usdc_on_ethereum(
+        &self,
+        to: Address,
+        amount: U256,
+    ) -> Result<TxHash, BroadcastError>;
 
     /// Awaits a transfer broadcast by `submit_usdc_on_ethereum` to the
     /// required confirmations; a revert or a drop is a status.
@@ -200,7 +204,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
         &self,
         to: Address,
         amount: U256,
-    ) -> Result<TxHash, CctpError> {
+    ) -> Result<TxHash, BroadcastError> {
         self.submit_usdc_on_ethereum(to, amount).await
     }
 
@@ -4639,8 +4643,10 @@ impl<
             .await
             {
                 Ok(Ok(send_tx)) => send_tx,
-                Ok(Err(error)) if error.is_revert() => {
-                    return Ok(DepositSendBroadcast::Reverted(error));
+                Ok(Err(
+                    BroadcastError::NotBroadcast(error) | BroadcastError::MaybeBroadcast(error),
+                )) if error.is_revert() => {
+                    return Ok(DepositSendBroadcast::Reverted(error.into()));
                 }
                 // The request may have reached the network before it failed.
                 Ok(Err(error)) => {
@@ -6332,7 +6338,7 @@ mod tests {
             &self,
             _to: Address,
             _amount: U256,
-        ) -> Result<TxHash, CctpError> {
+        ) -> Result<TxHash, BroadcastError> {
             let Some(tx_hash) = self.send_usdc_tx else {
                 unimplemented!("MockBridge: submit_usdc_on_ethereum not used in this test")
             };
@@ -6526,7 +6532,7 @@ mod tests {
             &self,
             to: Address,
             amount: U256,
-        ) -> Result<TxHash, CctpError> {
+        ) -> Result<TxHash, BroadcastError> {
             self.inner.submit_usdc_on_ethereum(to, amount).await
         }
 
@@ -6697,7 +6703,7 @@ mod tests {
             &self,
             to: Address,
             amount: U256,
-        ) -> Result<TxHash, CctpError> {
+        ) -> Result<TxHash, BroadcastError> {
             self.inner.submit_usdc_on_ethereum(to, amount).await
         }
 
@@ -6867,7 +6873,7 @@ mod tests {
             &self,
             to: Address,
             amount: U256,
-        ) -> Result<TxHash, CctpError> {
+        ) -> Result<TxHash, BroadcastError> {
             self.inner.submit_usdc_on_ethereum(to, amount).await
         }
 

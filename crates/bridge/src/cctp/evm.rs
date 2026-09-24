@@ -4,7 +4,7 @@ use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
 use alloy::sol;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
@@ -13,8 +13,8 @@ use tracing::{debug, info, trace, warn};
 #[cfg(test)]
 use st0x_evm::Evm;
 use st0x_evm::{
-    EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL, Wallet,
-    wait_for_node_sync,
+    BroadcastError, EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    Wallet, wait_for_node_sync,
 };
 
 use super::{
@@ -806,16 +806,20 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// This is the fund-moving leg of a BaseToAlpaca deposit: the CCTP mint
     /// credits the bot wallet, and this transfer forwards the minted USDC to
     /// Alpaca's deposit address. The caller records the hash before
-    /// [`confirm_usdc`](Self::confirm_usdc) awaits the receipt.
-    pub(super) async fn submit_usdc(&self, to: Address, amount: U256) -> Result<TxHash, CctpError> {
-        Ok(self
-            .wallet
-            .submit_pending(
+    /// [`confirm_usdc`](Self::confirm_usdc) awaits the receipt. A failure
+    /// tells whether the transfer may have reached the network.
+    pub(super) async fn submit_usdc(
+        &self,
+        to: Address,
+        amount: U256,
+    ) -> Result<TxHash, BroadcastError> {
+        self.wallet
+            .send_pending_classified(
                 self.usdc_address,
-                IERC20::transferCall { to, amount },
+                Bytes::from(IERC20::transferCall { to, amount }.abi_encode()),
                 "USDC deposit to Alpaca",
             )
-            .await?)
+            .await
     }
 
     /// Awaits the receipt of a transfer broadcast by

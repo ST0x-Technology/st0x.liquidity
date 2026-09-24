@@ -584,6 +584,30 @@ impl From<std::convert::Infallible> for EvmError {
     }
 }
 
+/// A failed send, split by whether its signed transaction was handed to the
+/// RPC. Only a send that never reached `eth_sendRawTransaction` is known to
+/// have left nothing on the network.
+#[derive(Debug, thiserror::Error)]
+pub enum BroadcastError {
+    /// Failed before any signed transaction was handed to the RPC: nonce
+    /// assignment, gas and fee estimation, or signing.
+    #[error("transaction was not broadcast: {0}")]
+    NotBroadcast(#[source] EvmError),
+    /// Failed after a signed transaction was handed to the RPC, so it may
+    /// be in the mempool or mined.
+    #[error("transaction may have been broadcast: {0}")]
+    MaybeBroadcast(#[source] EvmError),
+}
+
+impl BroadcastError {
+    /// The underlying error, without the broadcast classification.
+    pub fn into_inner(self) -> EvmError {
+        match self {
+            Self::NotBroadcast(error) | Self::MaybeBroadcast(error) => error,
+        }
+    }
+}
+
 /// Read-only EVM chain access with error-decoded view calls.
 ///
 /// Provides the underlying provider for direct chain queries (balance
@@ -843,6 +867,25 @@ pub trait Wallet: Evm {
         calldata: Bytes,
         note: &str,
     ) -> Result<TxHash, EvmError>;
+
+    /// [`send_pending`](Wallet::send_pending), telling a failure that sent
+    /// nothing apart from one whose transaction may be on the network: a
+    /// failed [`prepare_pending`](Wallet::prepare_pending) broadcast nothing.
+    async fn send_pending_classified(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<TxHash, BroadcastError> {
+        let prepared = self
+            .prepare_pending(contract, calldata, note)
+            .await
+            .map_err(BroadcastError::NotBroadcast)?;
+
+        self.broadcast_prepared(&prepared, note)
+            .await
+            .map_err(BroadcastError::MaybeBroadcast)
+    }
 
     /// Wait for a previously submitted transaction to be confirmed.
     ///

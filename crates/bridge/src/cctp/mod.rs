@@ -80,7 +80,9 @@ use serde::Deserialize;
 use st0x_float_macro::float;
 use tracing::{debug, info, warn};
 
-use st0x_evm::{Chain, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{
+    BroadcastError, Chain, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet,
+};
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
 use crate::BridgeDirection;
@@ -1249,7 +1251,8 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
     /// Broadcasts a transfer of `amount` (USDC smallest unit, 6 decimals) of
     /// Ethereum USDC from the bot wallet to `to` and returns its tx hash without
-    /// awaiting the receipt, so the caller can record the hash first.
+    /// awaiting the receipt, so the caller can record the hash first. A
+    /// failure tells whether the transfer may have reached the network.
     ///
     /// Used by the BaseToAlpaca deposit leg to forward minted USDC to Alpaca's
     /// deposit address. The CCTP mint credits the bot's own wallet, so an explicit
@@ -1258,7 +1261,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         &self,
         to: Address,
         amount: U256,
-    ) -> Result<TxHash, CctpError> {
+    ) -> Result<TxHash, BroadcastError> {
         self.ethereum.submit_usdc(to, amount).await
     }
 
