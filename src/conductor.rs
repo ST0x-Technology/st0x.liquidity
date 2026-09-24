@@ -72,6 +72,7 @@ use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
+use crate::database_file_lock::{DatabaseFileLock, acquire_database_file_lock};
 use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
 };
@@ -4834,8 +4835,19 @@ pub async fn account_for_onchain_fill(
         Err(error) => return Err(error.into()),
     }
 
-    if !position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
-        execute_acknowledge_fill(position, trade, threshold, block_timestamp).await?;
+    // The durable check and the acknowledge are separate transactions, and the
+    // `Position` guard only rejects a fill still pending or last acknowledged.
+    // Without one guard across both, a second actor on this fill could pass the
+    // check, then apply the fill after it settled and a newer fill displaced it,
+    // counting it twice. The file lock spans the REST route, the accounting job,
+    // and a standalone CLI process attached to the same database.
+    {
+        let _accounting_guard = acquire_database_file_lock(pool, DatabaseFileLock::FillAccounting)
+            .await
+            .map_err(TradeAccountingError::FillAccountingLock)?;
+        if !position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
+            execute_acknowledge_fill(position, trade, threshold, block_timestamp).await?;
+        }
     }
 
     Ok(FillAccountingOutcome::Accounted { trade_id })
@@ -10748,6 +10760,76 @@ mod tests {
         );
     }
 
+    /// The durable dedup check and the `Position` acknowledge must run under the
+    /// fill accounting file lock, so a second actor on the same fill (another
+    /// task, the REST route, or a CLI process) cannot interleave between them
+    /// and count the fill twice. Accounting must not acknowledge while another
+    /// holder has the lock, and must complete once it is released.
+    #[tokio::test]
+    async fn fill_accounting_waits_for_the_fill_accounting_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(directory.path().join("fill-accounting.sqlite"))
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+
+        let trade = test_trade_with_amount(float!(1.5), 30);
+        let trade_id = OnChainTradeId {
+            chain: trade.chain,
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+        let symbol = trade.symbol.base().clone();
+
+        let held = acquire_database_file_lock(&pool, DatabaseFileLock::FillAccounting)
+            .await
+            .unwrap();
+        let mut accounting = tokio::spawn({
+            let pool = pool.clone();
+            let onchain_trade = frameworks.onchain_trade.clone();
+            let position = frameworks.position.clone();
+            async move {
+                account_for_onchain_fill(
+                    &pool,
+                    &onchain_trade,
+                    &position,
+                    &trade,
+                    1,
+                    ExecutionThreshold::whole_share(),
+                )
+                .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut accounting)
+                .await
+                .is_err(),
+            "accounting must wait while another holder has the fill accounting lock"
+        );
+        assert!(
+            !position_fill_already_recorded(&pool, &symbol, &trade_id)
+                .await
+                .unwrap(),
+            "the fill must not be acknowledged while the lock is held elsewhere"
+        );
+
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), accounting)
+            .await
+            .expect("accounting must finish once the lock is released")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, FillAccountingOutcome::Accounted { .. }));
+        assert!(
+            position_fill_already_recorded(&pool, &symbol, &trade_id)
+                .await
+                .unwrap()
+        );
+    }
+
     /// The in-bot process-tx route and the live trading tick race to hedge the
     /// same symbol through the one `counter_trade_submission_lock` the conductor
     /// shares with both. The `placement_barrier` pins the tick between its
@@ -10799,6 +10881,12 @@ mod tests {
         let tick_event = make_trade_event(10);
         let tick_fill = test_trade_with_amount(float!(1.5), 10);
         let process_tx_fill = test_trade_with_amount(float!(1.5), 20);
+        let process_tx_trade_id = OnChainTradeId {
+            chain: process_tx_fill.chain,
+            tx_hash: process_tx_fill.tx_hash,
+            log_index: process_tx_fill.log_index,
+        };
+        let process_tx_symbol = process_tx_fill.symbol.base().clone();
 
         let tick = tokio::spawn({
             let cqrs = cqrs.clone();
@@ -10824,6 +10912,20 @@ mod tests {
                 .await
             }
         });
+
+        // Accounting runs before the submission lock. Wait until the fill is
+        // recorded, so the timeout below measures the wait on the lock rather
+        // than accounting that has not finished yet.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !position_fill_already_recorded(&pool, &process_tx_symbol, &process_tx_trade_id)
+                .await
+                .unwrap()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("process-tx must finish accounting before contending for the lock");
 
         assert!(
             tokio::time::timeout(Duration::from_secs(1), &mut process_tx)

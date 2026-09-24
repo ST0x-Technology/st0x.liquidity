@@ -124,9 +124,7 @@ pub(crate) enum CheckPositionsError {
     #[error("Failed to enqueue follow-up job: {0}")]
     Enqueue(#[from] QueuePushError),
     #[error("Broker submission lock failed: {0}")]
-    CounterTradeSubmissionLock(
-        #[from] crate::trading::offchain::hedge::CounterTradeSubmissionLockError,
-    ),
+    CounterTradeSubmissionLock(#[from] crate::database_file_lock::DatabaseFileLockError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -48,6 +48,7 @@ pub(crate) mod bindings;
 mod bot_gas;
 mod conductor;
 pub(crate) mod dashboard;
+mod database_file_lock;
 #[cfg(feature = "test-support")]
 pub mod e2e_support;
 mod equity_redemption;

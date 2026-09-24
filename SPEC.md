@@ -5613,12 +5613,12 @@ effect rather than a generic intent:
   count the position; a fill that was witnessed but not yet acknowledged is
   resumed from where the earlier run stopped. It has two execution paths. The
   **CLI** runs it in direct-DB mode, in a separate process from the bot: because
-  no in-process lock can serialize across processes, the persisted pending
-  acknowledgement set (`pending_acknowledged_trade_ids`, see ADR 0010) makes a
-  later cross process redrive of an unsettled fill reject as a duplicate, but it
-  cannot stop two concurrent actors from counting the same fill, so the CLI path
-  **must not run while the bot is live** (see the operational precondition
-  below). The **in-bot REST route**
+  no in-process lock can serialize across processes, fill accounting holds a
+  file lock beside the database from the durable dedup check through the
+  Position acknowledge, and the bot takes the same lock, so a concurrent actor
+  on the same fill finds it recorded instead of counting it twice (see the
+  accounting bullet below). The CLI path still **must not run while the bot is
+  live**. The **in-bot REST route**
   (`POST /liquidity-write/transactions/{tx_hash}/process`) instead runs inside
   the live bot and serializes its position claim and broker placement against
   the trading loop through the shared counter-trade submission lock (ADR 0014),
@@ -5717,23 +5717,20 @@ effect rather than a generic intent:
   (crash- recovery window), and creates the full witness/acknowledge record for
   genuinely missed fills — so every subsequent re-delivery, whether from another
   CLI run or the normal pipeline, hits the dedup guard and skips cleanly.
-  **Operational precondition (both paths)**: run with exclusive processing for
-  that fill: drain any apalis accounting job for the fill, and do not run
-  another `process-tx` for the same `(tx_hash, log_index)` concurrently. The CLI
-  direct database path must also stop the live bot. The durable dedup check and
-  the CQRS apply are separate transactions, and no shared guard spans them on
-  either path. Each Position command decides against the aggregate's latest
-  committed version (serialized by the per aggregate lock within one process and
-  by the event store's sequence check across processes) and rejects a fill whose
-  trade id is still in `pending_acknowledged_trade_ids` or equals
-  `last_acknowledged_trade_id` (`DuplicateTrade`, ADR 0010). A concurrent actor
-  on the same fill can still pass the durable check before the first actor
-  applies it, then apply it after the first actor has settled it out of the set
-  and a newer fill has replaced it in `last_acknowledged_trade_id`, counting it
-  twice. Accounting runs before the shared submission lock is taken, so that
-  lock does not close this window: it serializes only the position claim and
-  broker placement. The **in bot REST route** removes only the stop the bot
-  requirement; the exclusive processing requirement for the fill still applies.
+  **Concurrent accounting of the same fill is serialized on every path.** The
+  durable dedup check and the CQRS apply are separate transactions, and the
+  Position guard rejects only a fill whose trade id is still in
+  `pending_acknowledged_trade_ids` or equals `last_acknowledged_trade_id`
+  (`DuplicateTrade`, ADR 0010). Without one guard spanning both, a second actor
+  could pass the check, then apply the fill after the first actor settled it and
+  a newer fill replaced it in `last_acknowledged_trade_id`, counting it twice.
+  `account_for_onchain_fill` therefore holds the fill accounting file lock
+  (`<database>.fill-accounting.lock`) across both. Every accounting caller takes
+  it (the apalis accounting job, the REST route, and the CLI), and the kernel
+  lock also serializes separate processes. It is independent of the submission
+  lock, which is taken after accounting and serializes only the position claim
+  and broker placement. **Operational precondition (CLI direct database path)**:
+  stop the live bot; the **in bot REST route** removes that requirement.
 
 ### Event Processing Flow
 

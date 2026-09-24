@@ -198,11 +198,17 @@ pub(crate) fn reserving_counter_trade_preflight(order: &MarketOrder) -> CounterT
             required: order.shares,
             available: order.shares.inner(),
         },
-        Direction::Buy => CounterTradeReservation::BuyingPower {
-            required: order.shares,
-            estimated_cost_cents: 15_000,
-            available_buying_power_cents: 10_000_000,
-        },
+        Direction::Buy => {
+            let (cost_cents, _) = (order.shares.inner().inner() * st0x_float_macro::float!(150))
+                .and_then(|cost| cost.to_fixed_decimal_lossy(2))
+                .expect("a fixture buy cost converts to cents");
+            CounterTradeReservation::BuyingPower {
+                required: order.shares,
+                estimated_cost_cents: i64::try_from(cost_cents)
+                    .expect("a fixture buy cost fits in i64 cents"),
+                available_buying_power_cents: 10_000_000,
+            }
+        }
     };
 
     CounterTradePreflight::Allowed {
