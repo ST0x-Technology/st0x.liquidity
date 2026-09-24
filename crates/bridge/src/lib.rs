@@ -188,8 +188,9 @@ pub trait Bridge: Send + Sync + 'static {
     /// mint) and a fixed lookback from the head, since a relayer can mint
     /// before that head is captured. `None`, for a transfer that predates it,
     /// scans the lookback alone. A consumed nonce whose mint is not found in
-    /// that window is an error for operator reconciliation, never a scan to
-    /// genesis.
+    /// that window is an error carrying the floor block's timestamp, never a
+    /// scan to genesis: a floor mined before the transfer started covers its
+    /// mint, so the log is lagging; a later floor may be above the mint.
     async fn find_attested_mint(
         &self,
         direction: BridgeDirection,
