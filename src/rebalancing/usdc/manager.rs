@@ -3756,16 +3756,8 @@ impl<
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                // The recorded `deposit_ref` is the USDC SEND tx (minted USDC
-                // forwarded to Alpaca's deposit address), not the mint tx. The
-                // send already moved funds before `InitiateDeposit` was recorded,
-                // so this resume re-polls Alpaca by it -- no further send occurs.
-                let TransferRef::OnchainTx(send_tx) = deposit_ref else {
-                    return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
-                };
-                self.poll_alpaca_deposit_and_confirm(id, send_tx).await?;
-                self.execute_usdc_to_usd_conversion(id, amount).await?;
-                Ok(())
+                self.resume_base_to_alpaca_deposit(id, amount, deposit_ref)
+                    .await
             }
 
             Some(UsdcRebalance::DepositConfirmed {
@@ -3985,6 +3977,26 @@ impl<
                 direction,
             })
         }
+    }
+
+    /// Resumes a Base->Alpaca transfer whose deposit send already happened.
+    ///
+    /// The recorded `deposit_ref` is the USDC SEND tx (minted USDC forwarded to
+    /// Alpaca's deposit address), not the mint tx. The send moved funds before
+    /// `InitiateDeposit` was recorded, so this re-polls Alpaca by it -- no
+    /// further send occurs.
+    async fn resume_base_to_alpaca_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        deposit_ref: TransferRef,
+    ) -> Result<(), UsdcTransferError> {
+        let TransferRef::OnchainTx(send_tx) = deposit_ref else {
+            return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
+        };
+        self.poll_alpaca_deposit_and_confirm(id, send_tx).await?;
+        self.execute_usdc_to_usd_conversion(id, amount).await?;
+        Ok(())
     }
 
     /// Resumes a transfer stalled at `Converting` (the post-deposit USDC->USD
