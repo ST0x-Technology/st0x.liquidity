@@ -1247,18 +1247,6 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self.ethereum.usdc_credited_in_tx(tx_hash, recipient).await
     }
 
-    /// Sends `amount` (USDC smallest unit, 6 decimals) of Ethereum USDC from the
-    /// bot wallet to `to`, waiting for confirmation, and returns the tx hash.
-    pub async fn send_usdc_on_ethereum(
-        &self,
-        to: Address,
-        amount: U256,
-    ) -> Result<TxHash, CctpError> {
-        self.ethereum
-            .send_usdc::<OpenChainErrorRegistry>(to, amount)
-            .await
-    }
-
     /// Broadcasts a transfer of `amount` (USDC smallest unit, 6 decimals) of
     /// Ethereum USDC from the bot wallet to `to` and returns its tx hash without
     /// awaiting the receipt, so the caller can record the hash first.
@@ -1268,10 +1256,10 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// transfer is required to fund Alpaca -- the mint alone does not deposit.
     pub async fn submit_usdc_on_ethereum(
         &self,
-        _to: Address,
-        _amount: U256,
+        to: Address,
+        amount: U256,
     ) -> Result<TxHash, CctpError> {
-        todo!("broadcast the USDC transfer")
+        self.ethereum.submit_usdc(to, amount).await
     }
 
     /// Awaits the receipt of a transfer broadcast by
@@ -1280,9 +1268,11 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// error; an error means the outcome is still unknown.
     pub async fn confirm_usdc_on_ethereum(
         &self,
-        _tx_hash: TxHash,
+        tx_hash: TxHash,
     ) -> Result<UsdcTransferStatus, CctpError> {
-        todo!("await the USDC transfer receipt")
+        self.ethereum
+            .confirm_usdc::<OpenChainErrorRegistry>(tx_hash)
+            .await
     }
 
     /// Scans Ethereum for a USDC `Transfer(from, to, value == amount)` at or
@@ -6079,10 +6069,10 @@ mod tests {
         let from_block = bridge.ethereum.current_block().await.unwrap();
 
         let send_tx = bridge
-            .ethereum
-            .send_usdc::<NoOpErrorRegistry>(recipient, amount)
+            .submit_usdc_on_ethereum(recipient, amount)
             .await
             .unwrap();
+        bridge.confirm_usdc_on_ethereum(send_tx).await.unwrap();
 
         // The deposit send (`>= from_block`) lands at `send_block`; the first
         // block strictly above it is the exclusion bound for the below-bound case.
@@ -6092,11 +6082,11 @@ mod tests {
         // a small margin past the bound. Advance the head with unrelated sends so
         // the absence assertions resolve to None, not a retryable ScanInconclusive.
         for _ in 0..4 {
-            bridge
-                .ethereum
-                .send_usdc::<NoOpErrorRegistry>(never_funded, amount)
+            let unrelated_tx = bridge
+                .submit_usdc_on_ethereum(never_funded, amount)
                 .await
                 .unwrap();
+            bridge.confirm_usdc_on_ethereum(unrelated_tx).await.unwrap();
         }
 
         assert_eq!(
