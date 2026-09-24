@@ -510,7 +510,9 @@ the guard remains held. The `--direction` must be `to-raindex` for AlpacaToBase.
 
 **Complete with no tx hash**: the transfer is credited only from the tx that
 delivered its USDC, so a Complete withdrawal whose `tx_hash` is still null is
-also inconclusive and re-polled (same 4-hour alert). The wait is bounded by
+also inconclusive and re-polled. The same 4-hour alert fires, but its text says
+Alpaca reports the withdrawal complete with no tx hash, not that Alpaca may be
+unreachable. The wait is bounded by
 `[rebalancing] settlement_retry_deadline_secs`, counted from
 `Withdrawing.initiated_at`. Past it, the bot re-reads the transfer for the hash
 for up to 30 minutes (the Alpaca polling timeout), then fails the bridge

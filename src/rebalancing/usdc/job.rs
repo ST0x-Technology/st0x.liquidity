@@ -482,14 +482,27 @@ async fn alert_withdrawal_poll_deadline_elapsed(
     source: &AlpacaWalletError,
     notifier: &Arc<dyn Notifier>,
 ) {
-    let message = format!(
-        "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
-         for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). Alpaca may \
-         be unreachable or credentials may have changed ({source}). Aggregate stays in \
-         Withdrawing (guard held). Use `stox transfer resume --kind usdc --id \
-         {id} --direction to-raindex` to manually re-poll, or investigate \
-         Alpaca connectivity."
-    );
+    // Alpaca answered for a Complete withdrawal with no tx hash, so the
+    // connectivity diagnosis below would be wrong.
+    let message = if let AlpacaWalletError::CompletedTransferMissingTx { transfer_id } = source {
+        format!(
+            "Alpaca->Base USDC transfer {id}: Alpaca reports withdrawal {transfer_id} \
+             complete with no tx hash for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). \
+             The USDC has likely reached the Ethereum wallet, but the transfer is credited \
+             only from its tx. Aggregate stays in Withdrawing (guard held) and keeps \
+             re-polling for the hash; at the settlement retry deadline it fails to \
+             BridgingFailed for `stox transfer reconcile --kind usdc`."
+        )
+    } else {
+        format!(
+            "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
+             for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). Alpaca may \
+             be unreachable or credentials may have changed ({source}). Aggregate stays in \
+             Withdrawing (guard held). Use `stox transfer resume --kind usdc --id \
+             {id} --direction to-raindex` to manually re-poll, or investigate \
+             Alpaca connectivity."
+        )
+    };
     if let Err(notify_err) = notifier.notify(&message).await {
         warn!(
             target: "rebalance",
