@@ -1951,7 +1951,7 @@ struct RebalancingInfrastructure {
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
     /// Operator pause control for the USDC driver, published on the recovery
     /// handle so a write route can quiesce the workers before it mutates.
-    pub(crate) usdc_driver_pause: Arc<UsdcDriverPause>,
+    usdc_driver_pause: Arc<UsdcDriverPause>,
     /// The conductor-built wired `UsdcRebalance` store, published on the
     /// recovery handle so `fail-usdc-transfer` sends `FailBridging` through the
     /// live reactor rather than a standalone store.
