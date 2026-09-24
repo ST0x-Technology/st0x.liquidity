@@ -642,28 +642,29 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   rejected, including `WithdrawalFailed` and an `AlpacaToBase`
   `ConversionFailed`, whose funds never left Alpaca.
 - An `Attested` resume whose CCTP nonce is used on chain but whose mint is not
-  in the bounded log scan (`MintNotFoundInScanWindow`), or whose message can
-  never mint on the destination chain, marks the transfer `BridgingFailed` with
-  its burn tx and nonce kept, so `--kind usdc` accepts it. Find the mint on
-  chain (the `MessageReceived` log for the recorded nonce) before you reconcile.
-  For BaseToAlpaca, a later resume still retries the mint through the post-burn
-  `BridgingFailed` recovery. A legacy `Attested` transfer (no persisted message)
+  in the bounded log scan (`MintNotFoundInScanWindow`) marks the transfer
+  `BridgingFailed` with its burn tx and nonce kept, so `--kind usdc` accepts it.
+  Find the mint on chain (the `MessageReceived` log for the recorded nonce)
+  before you reconcile. A legacy `Attested` transfer (no persisted message)
   whose nonce is used but whose Circle re-poll keeps failing the same way (for
   example a malformed complete answer) is marked `BridgingFailed` the same way.
   For AlpacaToBase both latches page with "the CCTP mint cannot be resolved
-  automatically". A BaseToAlpaca latch does not page: its retry may still adopt
-  the mint and send the deposit, so do not move the funds by hand while it
-  retries; the job's dead-letter alert says when it gave up.
+  automatically". A BaseToAlpaca latch (these, or a message that can never mint)
+  does not page: its retry may still adopt the mint and send the deposit, so do
+  not move the funds by hand while it retries; the job's dead-letter alert says
+  when it gave up.
 - An `AlpacaToBase` transfer whose Circle attestation poll fails hard (or, for a
   legacy `Attested` transfer, whose re-poll fails with the nonce unused) is
   marked `BridgingFailed` and pages with "the burned USDC cannot be minted
   automatically". Nothing was minted: get the attestation for the burn tx, mint
   it on Base, then reconcile with `--kind usdc`.
 - An `AlpacaToBase` `Attested` transfer whose persisted CCTP message cannot be
-  used (a corrupt envelope) is marked `BridgingFailed` and pages with "the
-  recorded CCTP message cannot mint on Base". The bot did not read the nonce:
-  get the Circle attestation for the burn tx and mint it on Base (if the nonce
-  is already used, find that mint instead), then reconcile with `--kind usdc`.
+  used (a corrupt envelope) or can never mint on Base (a placeholder nonce, a
+  truncated message, another destination domain) is marked `BridgingFailed` with
+  its burn tx kept and pages with "the recorded CCTP message cannot mint on
+  Base". The bot did not read the nonce: get the Circle attestation for the burn
+  tx and mint it on Base (if the nonce is already used, find that mint instead),
+  then reconcile with `--kind usdc`.
 - An `AlpacaToBase` `Attested` transfer whose attestation (persisted, or
   re-polled from Circle for a legacy transfer) carries a nonce other than the
   recorded `cctp_nonce` is marked `BridgingFailed` and pages with "the attested

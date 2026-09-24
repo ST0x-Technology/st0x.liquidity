@@ -3901,10 +3901,14 @@ already-submitted action instead of re-issuing it:
   never mint on the destination chain, marks `BridgingFailed` (keeping the burn
   tx and nonce), so `transfer reconcile --kind usdc` can settle it; the bot
   never scans back to genesis. An AlpacaToBase latch pages the operator, since
-  its retry then finds the transfer failed and does not alert. A BaseToAlpaca
-  latch does not page: its retry keeps recovering the mint through the post-burn
-  `BridgingFailed` recovery and may still send the deposit, and the job's
-  dead-letter alert covers a give-up. Other lookup failures redrive.
+  its retry then finds the transfer failed and does not alert: "the CCTP mint
+  cannot be resolved automatically" for a consumed nonce, "the recorded CCTP
+  message cannot mint on Base" for a message that can never mint (the nonce is
+  not read, so the operator gets the attestation for the burn tx and mints it).
+  A BaseToAlpaca latch does not page: its retry keeps recovering the mint
+  through the post-burn `BridgingFailed` recovery and may still send the
+  deposit, and the job's dead-letter alert covers a give-up. Other lookup
+  failures redrive.
 
 ##### Commands
 
@@ -4163,11 +4167,10 @@ enum BridgeStage { Burn, Attestation, Mint }
   For AlpacaToBase, whose retry then finds the transfer failed and does not
   alert, this latch (and a legacy re-poll failure with the nonce unused) pages
   the operator with "the burned USDC cannot be minted automatically". Failures
-  _within_ the poll loop (HTTP errors, a still-`pending` or malformed `complete`
-  response) are retried and, once the per-poll attempts exhaust, surface as the
-  same retryable timeout -- so a malformed response is bounded by the deadline
-  rather than failing fast. (Failing fast on a definitively malformed `complete`
-  response is a tracked follow-up.)
+  _within_ the poll loop (HTTP errors, a still-`pending` response) are retried
+  and, once the per-poll attempts exhaust, surface as the same retryable
+  timeout. A malformed `complete` response fails at once, like the placeholder
+  nonce.
 - **Attested resume reconstructs the mint offline (no Circle re-poll)**: the
   mint needs the full CCTP message envelope, which `BridgeAttestationReceived`
   persists (the `message` field) alongside the attestation. Resuming from

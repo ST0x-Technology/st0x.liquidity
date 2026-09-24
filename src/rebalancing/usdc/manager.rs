@@ -386,19 +386,32 @@ impl std::fmt::Display for MintScanCallSite {
     }
 }
 
-/// Whether a `find_attested_mint` or Circle re-poll failure recurs on every
-/// retry: Circle's complete answer is malformed, the message bytes can never
-/// mint on this chain, or the bounded scan already missed the consumed nonce's
-/// mint. Exhaustive so a new `CctpError` needs a decision. The rest redrive,
-/// the conservative choice for burned USDC.
-fn cctp_failure_repeats(error: &CctpError) -> bool {
+/// A `find_attested_mint` or Circle re-poll failure that recurs on every
+/// retry.
+enum RepeatingMintFailure {
+    /// Circle's complete answer is malformed, or the message bytes can never
+    /// mint on this chain. The lookup fails before it reads the nonce.
+    MessageCannotMint,
+    /// The consumed nonce's mint is not in the bounded scan.
+    MintOutsideScanWindow,
+}
+
+/// Classifies a `find_attested_mint` or Circle re-poll failure that recurs on
+/// every retry. Exhaustive so a new `CctpError` needs a decision. The rest
+/// (`None`) redrive, the conservative choice for burned USDC.
+fn repeating_mint_failure(error: &CctpError) -> Option<RepeatingMintFailure> {
     match error {
         CctpError::PlaceholderNonce
         | CctpError::MalformedAttestation { .. }
         | CctpError::MessageTooShort { .. }
         | CctpError::MessageDestinationDomainMismatch { .. }
-        | CctpError::MessageTooShortForRecovery { .. }
-        | CctpError::MintNotFoundInScanWindow { .. } => true,
+        | CctpError::MessageTooShortForRecovery { .. } => {
+            Some(RepeatingMintFailure::MessageCannotMint)
+        }
+
+        CctpError::MintNotFoundInScanWindow { .. } => {
+            Some(RepeatingMintFailure::MintOutsideScanWindow)
+        }
 
         CctpError::Evm(_)
         | CctpError::Contract(_)
@@ -425,7 +438,7 @@ fn cctp_failure_repeats(error: &CctpError) -> bool {
         | CctpError::FastTransferFeeNotAvailable { .. }
         | CctpError::AmountBelowFastTransferFee { .. }
         | CctpError::HexDecode(_)
-        | CctpError::FeeValueParse(_) => false,
+        | CctpError::FeeValueParse(_) => None,
     }
 }
 
@@ -906,7 +919,7 @@ impl<
                 .await),
             // Adoption needs the re-polled message, so a repeating failure
             // would redrive in `Attested` forever with no CLI exit.
-            Ok(true) if cctp_failure_repeats(&error) => {
+            Ok(true) if repeating_mint_failure(&error).is_some() => {
                 let reason = format!("Circle re-poll failed on a consumed nonce: {error}");
                 Err(self
                     .latch_unresolvable_mint(id, mint_direction, reason, error)
@@ -2446,6 +2459,7 @@ impl<
             .adopt_attested_mint(
                 id,
                 BridgeDirection::EthereumToBase,
+                burn_tx_hash,
                 &attestation_response,
                 mint_scan_from_block,
                 MintScanCallSite::AlpacaToBase,
@@ -2472,6 +2486,7 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         mint_direction: BridgeDirection,
+        burn_tx: TxHash,
         attestation: &AttestationResponse,
         mint_scan_from_block: Option<u64>,
         call_site: MintScanCallSite,
@@ -2486,7 +2501,14 @@ impl<
             Ok(None) => return Ok(None),
             Err(error) => {
                 return Err(self
-                    .handle_mint_scan_failure(id, mint_direction, error, call_site, initiated_at)
+                    .handle_mint_scan_failure(
+                        id,
+                        mint_direction,
+                        burn_tx,
+                        error,
+                        call_site,
+                        initiated_at,
+                    )
                     .await);
             }
         };
@@ -2963,20 +2985,21 @@ impl<
     /// (whose deadline-gated alert still applies) instead of consuming the
     /// apalis retry budget. A revert-shaped `usedNonces` answer is a provider
     /// artifact (the getter cannot revert), so it redrives too. A lookup that
-    /// can never succeed (a message that cannot mint on this chain, or a
-    /// consumed nonce whose mint is not in the bounded scan) latches
-    /// `BridgingFailed`, which keeps the burn and nonce, so
-    /// `transfer reconcile --kind usdc` can settle it (see
-    /// [`Self::latch_unresolvable_mint`] for who is paged).
+    /// can never succeed latches `BridgingFailed`, which keeps the burn and
+    /// nonce, so `transfer reconcile --kind usdc` can settle it: a message that
+    /// cannot mint on this chain via [`Self::latch_unmintable_message`], a
+    /// consumed nonce whose mint is not in the bounded scan via
+    /// [`Self::latch_unresolvable_mint`].
     async fn handle_mint_scan_failure(
         &self,
         id: &UsdcRebalanceId,
         mint_direction: BridgeDirection,
+        burn_tx: TxHash,
         error: CctpError,
         call_site: MintScanCallSite,
         initiated_at: DateTime<Utc>,
     ) -> UsdcTransferError {
-        if !cctp_failure_repeats(&error) {
+        let Some(repeating_failure) = repeating_mint_failure(&error) else {
             warn!(
                 target: "rebalance",
                 %id,
@@ -2989,7 +3012,7 @@ impl<
                 initiated_at,
                 source: Box::new(error),
             };
-        }
+        };
 
         warn!(
             target: "rebalance",
@@ -2999,8 +3022,16 @@ impl<
              reconciliation: {error}"
         );
         let reason = format!("attested mint lookup failed: {error}");
-        self.latch_unresolvable_mint(id, mint_direction, reason, error)
-            .await
+        match repeating_failure {
+            RepeatingMintFailure::MessageCannotMint => {
+                self.latch_unmintable_message(id, mint_direction, burn_tx, reason, error)
+                    .await
+            }
+            RepeatingMintFailure::MintOutsideScanWindow => {
+                self.latch_unresolvable_mint(id, mint_direction, reason, error)
+                    .await
+            }
+        }
     }
 
     /// Latches a post-burn `BridgingFailed` (burn and nonce kept, so
@@ -4059,6 +4090,7 @@ impl<
             .adopt_attested_mint(
                 id,
                 mint_direction,
+                burn_tx_hash,
                 &attestation_response,
                 mint_scan_from_block,
                 MintScanCallSite::BaseToAlpaca,
@@ -18942,10 +18974,11 @@ mod tests {
 
     /// A message that can never mint on this chain fails at once (every
     /// redrive would read the same bytes) into a state the operator can
-    /// reconcile.
+    /// reconcile. The nonce was never read, so the page asks for a fresh mint.
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn placeholder_nonce_attested_mint_lookup_fails_at_once() {
-        let (error, _, _, state) =
+        let (error, id, _, state) =
             resume_attested_with_failing_mint_lookup(RebalanceDirection::AlpacaToBase, || {
                 CctpError::PlaceholderNonce
             })
@@ -18964,6 +18997,12 @@ mod tests {
             "a lookup that can never succeed must latch a reconcilable BridgingFailed, \
              got: {state:?}"
         );
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the recorded CCTP message cannot mint on Base"
+        )));
+        assert!(!logs_contain(
+            "the CCTP mint cannot be resolved automatically"
+        ));
     }
 
     /// Resumes an `Attested` transfer in `direction` whose consumed nonce has
