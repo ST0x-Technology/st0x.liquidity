@@ -707,6 +707,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::WithdrawalTxMissing { .. }
         | UsdcTransferError::WithdrawalCreditMismatch { .. }
         | UsdcTransferError::WithdrawalCreditUnreadable { .. }
+        | UsdcTransferError::WithdrawalTxAlreadyRecorded { .. }
         | UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
         | UsdcTransferError::BurnRecordTaskFailed { .. }
         | UsdcTransferError::BurnRecordFailed { .. }
