@@ -12858,8 +12858,9 @@ mod tests {
 
     /// A legacy `Attested` transfer whose mint landed but whose Circle re-poll
     /// fails the same way every time can never adopt that mint (adoption needs
-    /// the message), so it latches a reconcilable `BridgingFailed` and pages
-    /// instead of redriving forever in `Attested`, which no CLI command accepts.
+    /// the message), so it latches a reconcilable `BridgingFailed` instead of
+    /// redriving forever in `Attested`, which no CLI command accepts. A
+    /// Base->Alpaca latch does not page: its retry keeps recovering the mint.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn legacy_attested_repeating_repoll_failure_latches_a_landed_mint_for_reconciliation() {
@@ -12884,10 +12885,7 @@ mod tests {
         assert_eq!(*burn_tx_hash, Some(burn_tx), "got: {state:?}");
         assert_eq!(*cctp_nonce, Some(nonce), "got: {state:?}");
         assert!(state.is_reconcilable_failure(), "got: {state:?}");
-        assert!(logs_contain("operational_alert"));
-        assert!(logs_contain(&format!(
-            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
-        )));
+        assert!(!logs_contain("operational_alert"), "{id} must not page");
     }
 
     /// A re-poll error that may clear (an RPC transport failure) on a consumed
@@ -18928,22 +18926,22 @@ mod tests {
         id
     }
 
-    /// The latch pages itself: the job does not alert on it (an Alpaca->Base
-    /// retry finds the aggregate failed and ends quietly).
+    /// A Base->Alpaca retry keeps recovering the mint and may still send the
+    /// deposit, so the latch must not page an operator into moving the funds;
+    /// the job's dead-letter alert covers a give-up.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn attested_mint_outside_the_scan_window_latches_for_reconciliation_base_to_alpaca() {
-        let id = assert_mint_outside_the_scan_window_latches_for_reconciliation(
+        assert_mint_outside_the_scan_window_latches_for_reconciliation(
             RebalanceDirection::BaseToAlpaca,
         )
         .await;
 
-        assert!(logs_contain("operational_alert"));
-        assert!(logs_contain(&format!(
-            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
-        )));
+        assert!(!logs_contain("operational_alert"));
     }
 
+    /// The latch pages itself: the job does not alert on it (an Alpaca->Base
+    /// retry finds the aggregate failed and ends quietly).
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn attested_mint_outside_the_scan_window_latches_for_reconciliation_alpaca_to_base() {
