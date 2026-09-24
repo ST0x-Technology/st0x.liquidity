@@ -19,7 +19,7 @@ use st0x_evm::{
 
 use super::{
     CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt,
-    MintScanFloorCheck, TokenMessengerV2, parse_received_message,
+    MintScanFloorCheck, TokenMessengerV2, UsdcTransferStatus, parse_received_message,
 };
 use crate::BridgeDirection;
 
@@ -800,29 +800,38 @@ impl<W: Wallet> CctpEndpoint<W> {
         usdc_credit_in_receipt(&receipt, self.usdc_address, recipient)
     }
 
-    /// Sends `amount` of this endpoint's USDC from the wallet to `to`, waiting
-    /// for the configured confirmation depth, and returns the transfer tx hash.
+    /// Broadcasts a transfer of `amount` of this endpoint's USDC from the
+    /// wallet to `to` and returns its tx hash without awaiting the receipt.
     ///
     /// This is the fund-moving leg of a BaseToAlpaca deposit: the CCTP mint
     /// credits the bot wallet, and this transfer forwards the minted USDC to
-    /// Alpaca's deposit address. Reuses [`Wallet::submit`] so nonce handling and
-    /// confirmation depth match every other write path; a revert is decoded via
-    /// `Registry`.
-    pub(super) async fn send_usdc<Registry: IntoErrorRegistry>(
-        &self,
-        to: Address,
-        amount: U256,
-    ) -> Result<TxHash, CctpError> {
-        let receipt = self
+    /// Alpaca's deposit address. The caller records the hash before
+    /// [`confirm_usdc`](Self::confirm_usdc) awaits the receipt.
+    pub(super) async fn submit_usdc(&self, to: Address, amount: U256) -> Result<TxHash, CctpError> {
+        Ok(self
             .wallet
-            .submit::<Registry, _>(
+            .submit_pending(
                 self.usdc_address,
                 IERC20::transferCall { to, amount },
                 "USDC deposit to Alpaca",
             )
-            .await?;
+            .await?)
+    }
 
-        Ok(receipt.transaction_hash)
+    /// Awaits the receipt of a transfer broadcast by
+    /// [`submit_usdc`](Self::submit_usdc) to the wallet's confirmation depth.
+    /// A revert (decoded via `Registry`) and a drop are reported as statuses;
+    /// any other error leaves the outcome unknown.
+    pub(super) async fn confirm_usdc<Registry: IntoErrorRegistry>(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<UsdcTransferStatus, CctpError> {
+        match self.wallet.confirm::<Registry>(tx_hash).await {
+            Ok(_) => Ok(UsdcTransferStatus::Confirmed),
+            Err(error) if error.is_revert() => Ok(UsdcTransferStatus::Reverted),
+            Err(error) if error.is_transaction_dropped() => Ok(UsdcTransferStatus::Dropped),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Scans for a USDC `Transfer(from, to, value == amount)` at or after

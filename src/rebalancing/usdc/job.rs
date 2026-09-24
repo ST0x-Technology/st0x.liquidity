@@ -874,6 +874,25 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging inconclusive-burn alert");
                 }
             }
+            // The deposit send cannot be resolved automatically: either the
+            // deposit is already failed for reconciliation, or a send may be in
+            // flight unrecorded. A retry could send the minted USDC twice.
+            Err(
+                error @ (UsdcTransferError::DepositSendUnresolved { .. }
+                | UsdcTransferError::DepositSendRecordFailed { .. }),
+            ) => {
+                error!(
+                    target: "rebalance",
+                    id = %self.id,
+                    %error,
+                    "Base->Alpaca USDC transfer: deposit send unresolved; latched for operator \
+                     reconciliation (no auto-resend)"
+                );
+                let message = format!("{error}.");
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging deposit-send alert");
+                }
+            }
             // The post-deposit conversion's fate is unknown and the order may
             // still fill, so retrying would race a live order and recording a
             // failure would terminalize the rebalance against one. Latched for
