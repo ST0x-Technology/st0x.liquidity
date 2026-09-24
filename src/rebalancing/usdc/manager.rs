@@ -5958,7 +5958,7 @@ mod tests {
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{self, SolEvent};
-    use alloy::transports::TransportErrorKind;
+    use alloy::transports::{RpcError, TransportErrorKind};
     use httpmock::prelude::*;
     use proptest::prelude::*;
     use reqwest::StatusCode;
@@ -6169,6 +6169,11 @@ mod tests {
 
         fn with_usdc_submit_delay(mut self, delay: Duration) -> Self {
             self.usdc_submit_delay = delay;
+            self
+        }
+
+        fn with_failing_usdc_submit(mut self, error: fn() -> BroadcastError) -> Self {
+            self.usdc_submit_error = Some(error);
             self
         }
 
@@ -14990,6 +14995,63 @@ mod tests {
             bridge.usdc_submit_calls(),
             1,
             "the redrive must not broadcast a second deposit send"
+        );
+    }
+
+    fn deposit_send_timed_out() -> BroadcastError {
+        BroadcastError::MaybeBroadcast(EvmError::Transport(RpcError::local_usage_str(
+            "request timed out",
+        )))
+    }
+
+    /// A send that may be on chain fails the deposit for reconciliation. If
+    /// that `FailDeposit` write fails, the retry must still not send again:
+    /// its pre-send scan reads only mined logs and misses an unmined send.
+    #[tokio::test]
+    async fn failed_deposit_latch_after_a_possible_broadcast_does_not_resend() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let bridge = Arc::new(
+            MockBridge::new()
+                .with_failing_usdc_submit(deposit_send_timed_out)
+                .with_empty_usdc_scan(),
+        );
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        stage_bridged_with_mint_tx(&cqrs, &id, amount, usdc("99.99"), TxHash::ZERO).await;
+
+        sqlx::query(
+            "CREATE TRIGGER refuse_deposit_failed BEFORE INSERT ON events \
+             WHEN NEW.event_type = 'UsdcRebalanceEvent::DepositFailed' \
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+        sqlx::query("DROP TRIGGER refuse_deposit_failed")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let _retry = manager.resume_base_to_alpaca(&id, amount).await;
+
+        assert_eq!(
+            bridge.usdc_submit_calls(),
+            1,
+            "the retry must not send while the first send may be on chain"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::DepositFailed { .. }),
+            "the retry fails the deposit for reconciliation, got: {state:?}"
         );
     }
 
