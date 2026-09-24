@@ -2385,7 +2385,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{Notify, broadcast};
 
-    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
+    use st0x_config::{AllocationCtx, ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
         AggregateError, EntityList, LifecycleError, Never, Reactor, StoreBuilder, deps, test_store,
@@ -2406,16 +2406,16 @@ mod tests {
     use crate::equity_redemption::{
         EquityRedemptionError, EquityRedemptionEvent, redemption_aggregate_id,
     };
-    use crate::inventory::{
-        BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
-    };
+    use crate::inventory::{BroadcastingInventory, Inventory, InventoryView, Venue};
     use crate::mint_authorization::{
         MintAuthorizationError, MintAuthorizer, MockMintAuthorizer, SignedMintAuthorization,
         StubVaultModeReader,
     };
     use crate::native_gas::GasReadiness;
     use crate::onchain::mock::{DepositBehavior, DepositCall, MockRaindex};
-    use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
+    use crate::rebalancing::{
+        ChainRebalancingConfig, RebalancingSchedulers, RebalancingServiceConfig,
+    };
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::UsdcRebalance;
     use crate::vault_lookup::MockVaultLookup;
@@ -3051,13 +3051,13 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
-                equity: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: Duration::from_secs(1800),
-                assets: ChainAssets::default(),
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets::default()),
+                )]),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             BTreeMap::from([(
@@ -3208,13 +3208,13 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
-                equity: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: Duration::from_secs(1800),
-                assets: ChainAssets::default(),
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets::default()),
+                )]),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             BTreeMap::from([(
@@ -3616,13 +3616,13 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
-                equity: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: Duration::from_secs(1800),
-                assets: ChainAssets::default(),
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets::default()),
+                )]),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             BTreeMap::from([(
@@ -3767,13 +3767,13 @@ mod tests {
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
-                equity: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+                allocation: AllocationCtx::base_test(),
                 usdc: None,
                 transfer_timeout: Duration::from_secs(1800),
-                assets: ChainAssets::default(),
+                chains: BTreeMap::from([(
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets::default()),
+                )]),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             BTreeMap::from([(

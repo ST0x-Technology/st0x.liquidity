@@ -96,11 +96,16 @@ and the system proves market fit.
 
 - **Inventory Monitoring**: InventoryView tracks total inventory across venues
   (onchain tokens + offchain shares, onchain USDC + offchain USDC)
-- **Imbalance Detection**: When imbalance ratios exceed thresholds (>60% equity
-  imbalance, >70% USDC imbalance), trigger automated rebalancing
-- **Equity Rebalancing**:
-  - Too many tokens onchain: Redeem tokens -> receive shares at Alpaca
-  - Too many shares offchain: Mint tokens -> deposit to Raindex vault
+- **Imbalance Detection**: equity is planned per symbol across every hedged
+  chain against per-chain target shares (see Equity Allocation Planner under
+  Rebalancing Triggers); USDC triggers when its onchain ratio leaves the
+  configured band (>70% USDC imbalance)
+- **Equity Rebalancing**: at most one operation per symbol at a time, on the
+  chain that deviates most from its target share, redemptions before mints:
+  - A chain over its target: Redeem tokens from that chain -> receive shares at
+    Alpaca
+  - A chain under its target: Mint tokens -> deposit to that chain's Raindex
+    vault
 - **USDC Rebalancing**:
   - Too much USDC onchain: Bridge via Circle CCTP (Base -> Ethereum) -> deposit
     to Alpaca
@@ -146,38 +151,41 @@ Every chain the bot touches is declared under `[chains.<name>]` with a
 config carries a `[chains.<name>.trading]` table is a **hedged** chain: the bot
 runs a fill watcher against its order book, accounts its fills and hedges them
 with offsetting broker orders. Exactly one hedged chain must set
-`primary = true` on that table -- the **primary** chain is the chain the bot
-rebalances automatically (Base); hedging and vault balance polling happen on
-every hedged chain. Vault balance polling runs once per hedged chain, each on
-that chain's own Raindex service, its own chain-qualified vault registry and one
-pinned block, so every hedged chain's inventory slot is seeded and corrected. A
-secondary chain's fill updates that chain's own inventory slot and never
-triggers the primary chain's rebalancing check: inventory is not fungible across
-chains, and a secondary is prefunded. The distinction exists so that fill
-watching and inventory polling can go multi-chain before rebalancing does: it
-names the chain the still-single-chain paths use. Once rebalancing is per chain
-(global rebalancer, USDC corridors), `primary` shrinks to the operator's default
-chain, or is removed. Zero or multiple primary claimants fail startup with a
-named error. Chains without a trading table are **transport** chains (RPC +
-confirmations only, e.g. Ethereum while it only carries CCTP transfers). Watch
-settings are per chain: poll interval, ingestion cutoff, asset tables with
-per-chain enable/disable flags. The periodic position check sweeps a symbol when
-any hedged chain enables it and sizes the hedge with the tightest operational
-limit among those chains (one `Position` per symbol cannot say which chain its
-fills came from; the remainder is hedged on a later tick). Startup verifies
-every hedged chain (chain-id identity, cutoff support, and each token address
-the chain's role uses answering `decimals()` on that chain's own endpoint: every
-equity's wrapped share, plus the unwrapped token of each equity the chain
-rebalances) and any failure is fatal; degraded per-chain startup is deferred to
-the chain-disable work. Each probed equity token must report 18 decimals: every
-equity quantity the bot scales is 18-decimal share-wei, so a token at another
-precision is refused by name rather than honoured. The settlement stable is not
-probed: its decimals are pinned in code beside its address. Each wrapped share
-must additionally report the equity's configured unwrapped token as its ERC-4626
-`asset()` — the same attestation the tokenization preflight makes, which a
-hedge-only chain never reaches and a rebalancing secondary makes only for the
-equities that opt in — so a typo landing on another live token refuses startup
-instead of surfacing as the first unresolvable fill.
+`primary = true` on that table -- the **primary** chain anchors USDC rebalancing
+and the operator defaults (Base); equity rebalancing, hedging and vault balance
+polling happen on every hedged chain. Vault balance polling runs once per hedged
+chain, each on that chain's own Raindex service, its own chain-qualified vault
+registry and one pinned block, so every hedged chain's inventory slot is seeded
+and corrected. A secondary chain's fill updates that chain's own inventory slot:
+inventory is not fungible across chains. It schedules the symbol's equity check
+when that chain's listing rebalances the symbol, never the USDC check, which
+still runs on the primary chain; a hedge-only listing is prefunded and schedules
+neither. The distinction exists so that fill watching and inventory polling can
+go multi-chain before rebalancing does: it names the chain the
+still-single-chain paths use. Equity rebalancing is already per chain (see
+Equity Allocation Planner); once the USDC corridors are too, `primary` shrinks
+to the operator's default chain, or is removed. Zero or multiple primary
+claimants fail startup with a named error. Chains without a trading table are
+**transport** chains (RPC + confirmations only, e.g. Ethereum while it only
+carries CCTP transfers). Watch settings are per chain: poll interval, ingestion
+cutoff, asset tables with per-chain enable/disable flags. The periodic position
+check sweeps a symbol when any hedged chain enables it and sizes the hedge with
+the tightest operational limit among those chains (one `Position` per symbol
+cannot say which chain its fills came from; the remainder is hedged on a later
+tick). Startup verifies every hedged chain (chain-id identity, cutoff support,
+and each token address the chain's role uses answering `decimals()` on that
+chain's own endpoint: every equity's wrapped share, plus the unwrapped token of
+each equity the chain rebalances) and any failure is fatal; degraded per-chain
+startup is deferred to the chain-disable work. Each probed equity token must
+report 18 decimals: every equity quantity the bot scales is 18-decimal
+share-wei, so a token at another precision is refused by name rather than
+honoured. The settlement stable is not probed: its decimals are pinned in code
+beside its address. Each wrapped share must additionally report the equity's
+configured unwrapped token as its ERC-4626 `asset()` — the same attestation the
+tokenization preflight makes, which a hedge-only chain never reaches and a
+rebalancing secondary makes only for the equities that opt in — so a typo
+landing on another live token refuses startup instead of surfacing as the first
+unresolvable fill.
 
 The lifecycle is a strict ceiling over the chain's asset settings. The hedged
 chain with `primary = true` must be `active`; startup rejects an observe-only or
@@ -226,22 +234,23 @@ allowance work, and startup logs the chain as hedge-only. It still gets the
 read-only ERC-4626 ratio reader over its own asset table, because vault polling
 reads its market-making vaults like any hedged chain's and those hold wrapped
 vault shares the daily portfolio capture values in underlying units. The
-rebalancer, the portfolio snapshot and the wrapped- and unwrapped-equity
-orphan-recovery aggregates consume the primary chain's entry until the global
-rebalancer owns chain selection; the sets exist so that selection is a lookup
-rather than a rewire. A mint or redemption transfer is not among them: it
-resolves the entry of the chain its record names (see below), so only the
-orphan-recovery aggregates still borrow the primary's. The tokenization
-preflight (below) runs once per hedged chain with that chain's wallet, orderbook
-and settlement stable, as does the stale-allowance revoke on each chain in
-managed inventory mode. The startup MAX approvals run on every hedged chain in
-either mode, but only the settlement-stable grant is unconditional: the equity
-grants (underlying to wrapper vault, wrapped token to the deposit spender) are
-made only on chains that rebalance equity, since a hedge-only secondary has no
-wrapper to approve. Both deposit grants name the spender that chain settles
-deposits through -- its orderbook in legacy inventory mode, its
-`RaindexInventory` in managed mode -- so the same two token identities are
-approved, and proved by the deploy gate, in either inventory mode. A hedged
+rebalancing trigger plans across every hedged chain's entry and dispatches each
+operation with its chain (see Equity Allocation Planner); the portfolio snapshot
+and the wrapped- and unwrapped-equity orphan-recovery aggregates still consume
+the primary chain's entry. A secondary listing that sets
+`wrapped_equity_recovery = "enabled"` is refused at load, naming the chain and
+symbol, since no recovery would claim its stranded tokens. A mint or redemption
+transfer resolves the entry of the chain its record names (see below). The
+tokenization preflight (below) runs once per hedged chain with that chain's
+wallet, orderbook and settlement stable, as does the stale-allowance revoke on
+each chain in managed inventory mode. The startup MAX approvals run on every
+hedged chain in either mode, but only the settlement-stable grant is
+unconditional: the equity grants (underlying to wrapper vault, wrapped token to
+the deposit spender) are made only on chains that rebalance equity, since a
+hedge-only secondary has no wrapper to approve. Both deposit grants name the
+spender that chain settles deposits through -- its orderbook in legacy inventory
+mode, its `RaindexInventory` in managed mode -- so the same two token identities
+are approved, and proved by the deploy gate, in either inventory mode. A hedged
 chain for which this build has no pinned settlement stable fails startup rather
 than borrowing another chain's address.
 
@@ -691,6 +700,12 @@ fails closed on its own: a mint whose mode cannot be read stops at mode
 discovery, before any signing. The signing-step failure is the last line only
 for a known orchestrator-mode mint without its chain's entry or `MintAuth`
 policy.
+
+The per-symbol equity lock is re-armed at startup from every open mint and
+redemption aggregate, and the transfer job row plus the transfer's first event
+are the durable reservation a restart honours: a restart between a job's push
+and its first event finds the pending row and dispatches nothing else for the
+symbol.
 
 Historical backfill resumes from a persisted database checkpoint. The configured
 `deployment_block` is only the initial seed for the first startup or for an
@@ -4866,27 +4881,88 @@ emits imbalance detection events.
 
 **Rebalancing Parameters** (configurable per environment):
 
-- **Equity per symbol**:
-  - Target ratio: 0.5 (aim for 50% onchain, 50% offchain)
-  - Deviation threshold: 0.2 (trigger when ratio deviates by +/-0.2 from target)
-  - Example: Triggers at <0.3 (mint) or >0.7 (redeem)
-  - Minimum rebalancing amount: e.g., $1000 equivalent to avoid tiny operations
+- **Equity per symbol** (`[rebalancing.allocation]`, required):
+  - Target share per chain: `targets.<chain>` (e.g. `base = 0.5` aims for 50% of
+    the symbol's total on Base, the rest at the broker), overridable per listing
+    with `target_share`
+  - Deviation band: `deviation` (e.g. 0.05: a chain is a candidate when its
+    share of the total is more than 5 points off its target)
+  - Alpaca floor: `alpaca_floor`, the share of the total a mint must leave
+    available at the broker; beside it the hedge floor keeps its fixed number of
+    shares
+  - Minimum operation size: `min_operation_usd`, valued at the symbol's last
+    onchain fill price (the block-timestamped `Position.last_price`),
+    overridable per chain with the trading table's `min_operation_usd`
+  - Cooldown: `cooldown_secs` per `(symbol, chain)` after a dispatch
+  - At load, per symbol, the chain targets plus the floor must not exceed 1, and
+    a positive target must exceed the band: an empty chain is only
+    `target * total` short, so a target at or inside the band is never minted
+    into
 - **USDC global**:
   - Target ratio: 0.5 (aim for 50% onchain, 50% offchain)
   - Deviation threshold: 0.3 (trigger when ratio deviates by +/-0.3 from target)
   - Example: Triggers at <0.2 (bridge to Base) or >0.8 (bridge to Alpaca)
   - Minimum rebalancing amount: e.g., $5000 to avoid frequent small transfers
 
+##### Equity Allocation Planner
+
+Every equity check plans one symbol from a pure function over the venues the
+trigger can vouch for: the broker balance, one slot per hedged chain that
+rebalances the symbol (its wrapped vault balance converted through that chain's
+ERC-4626 ratio, its effective target share, the band, its operational limit, its
+minimum operation size, whether its vault registry knows the token and whether
+its wallet is gas-ready), the floors, the cooling chains and the symbol's last
+onchain fill price. A hedge-only listing (`rebalancing = "disabled"`) is neither
+slotted nor counted: its prefunded inventory is outside the planner's total, so
+it never moves the other chains' targets.
+
+- Guards, in order: the broker venue unpolled, no chain slot at all, a
+  rebalancing chain without a slot, or any transfer in flight for the symbol
+  declines the plan. Before planning, the trigger declines the symbol when any
+  chain that rebalances it has no polled slot or a stale poll (`chain_unpolled`,
+  `chain_stale`), so a total is never sized from a partial set of chains.
+- Sizing: `total = broker total + sum of every slot in underlying shares`; zero
+  declines. Each chain's deviation is
+  `underlying on chain - target share * total`, in shares. A chain is a
+  candidate when `|deviation|` exceeds `band * total`.
+- Ranking: redemptions (over target) before mints, larger deviation first, ties
+  by chain order. A candidate whose vault registry does not know the token
+  (`not_in_registry`), whose wallet is not gas-ready, or whose chain is cooling
+  down, is skipped and the next one evaluated. So is a redemption on any chain
+  but the primary (`redemption_unrecoverable`): wallet recovery runs on the
+  primary chain only, so a failed redemption elsewhere would strand its tokens.
+  The trigger reads a chain's registry and probes its wallet's gas only once the
+  planner picks the chain, and re-plans without that chain when either fails, so
+  a symbol within its band reads neither. Each chain is read at most once per
+  check: the re-plan after the Position reservation reuses the first plan's
+  results.
+- Quantity: `|deviation|` capped by the chain's operational limit. A mint is
+  further capped so the broker keeps the larger of `alpaca_floor * total` and
+  the hedge floor available; a broker at or below that declines the whole symbol
+  (the floor is symbol-wide, so no other mint could pass). The result is
+  truncated to nine decimals.
+- Minimum: with no last price the plan declines; the price's age does not
+  matter, since it only values this dust bound. A candidate whose quantity times
+  price is below the chain's minimum is skipped and the next one evaluated.
+- Dispatch: the operation is enqueued as the chosen chain's mint or redemption
+  and the `(symbol, chain)` cooldown starts. One operation per symbol is in
+  flight at a time (the per-symbol lock, the job row and the transfer's first
+  event).
+- Telemetry: every declined plan, the trigger's own staleness skips included,
+  increments `equity_plan_declined_total` by reason and is logged with the
+  symbol and, where one applies, the chain; a dispatched operation logs its
+  chain, direction and quantity once, and each plan logs the total and every
+  chain's deviation at debug.
+
 ##### Trigger Events
 
-When thresholds crossed AND minimum amounts met, InventoryView emits:
+For equity, the planner above returns `EquityPlan::Operation` (a chain, a
+direction and a quantity) or `EquityPlan::Decline` with its reason. For USDC,
+`InventoryView` reports an `Imbalance` (`TooMuchOnchain` or `TooMuchOffchain`)
+when the ratio leaves its band.
 
-- `EquityImbalanceDetected { symbol, direction: Mint/Redeem, quantity,
-  estimated_value_usd }`
-- `UsdcImbalanceDetected { direction: AlpacaToBase/BaseToAlpaca, amount }`
-
-The trigger reacts to these events by enqueueing the matching transfer job
-(`TransferEquityToMarketMaking`, `TransferEquityToHedging`,
+The trigger reacts to an operation or an imbalance by enqueueing the matching
+transfer job (`TransferEquityToMarketMaking`, `TransferEquityToHedging`,
 `TransferUsdcToMarketMaking`, or `TransferUsdcToHedging`), whose worker drives
 the TokenizedEquityMint, EquityRedemption, or UsdcRebalance aggregate.
 
@@ -5203,11 +5279,38 @@ skip the events that arrive, and failed USDC-transfer cleanups stamp
   wrong amount and mark the venue busy, freezing the very counter that resolves
   the divergence.
 
-Guard-skip starvation is observable: the view tracks consecutive guard-skipped
-Hedging snapshots (per symbol for equity, venue-level for cash) and logs a
-warning every five consecutive skips, so an ADR 0015 guard that starves a
-balance of broker truth surfaces at production log levels before the divergence
-machinery escalates. An applied snapshot resets the streak.
+The shared guard machinery follows inventory ownership. Hedging is one chainless
+broker scope, so its equity suppression and snapshot-skip streaks are keyed only
+by symbol and its cash suppression is a single membership. MarketMaking is
+chain-owned: equity suppression and skip streaks are keyed by `(chain, symbol)`,
+and cash suppression and skip streaks are keyed by chain. Hedging is one side of
+every equity transfer, so any transfer makes its reading ambiguous. A
+MarketMaking equity reading on one chain is ambiguous only for a transfer that
+moves that chain's slot: inflight in the slot, or an active mint or redemption
+on that chain. Hedging inflight does not record its destination, so it is
+attributed to the active mint's chain; with no active mint it is ambiguous on
+every chain. USDC rebalancing moves cash only between Hedging and the primary
+chain's vault, so Hedging USDC inflight, an active USDC rebalance, or a read
+fetched before the last completed rebalance makes only the primary chain's
+MarketMaking cash reading ambiguous, and inflight in one chain's slot makes only
+that chain's reading ambiguous. An open hedge order or a fill applied after a
+broker read makes only the Hedging reading ambiguous. The scopes are exactly
+Hedging and one MarketMaking scope per chain; wallet transit locations are not
+scopes. Suppression is read across every scope: any engaged venue or chain makes
+a transfer unsafe to size, and a matching poll at one scope cannot release
+another venue's or chain's membership.
+
+Guard-skip starvation is observable at both venues. The view logs a warning
+every five consecutive skipped equity snapshots for one Hedging symbol or one
+MarketMaking `(chain, symbol)`, and every five skipped cash snapshots for the
+Hedging venue or one MarketMaking chain. Every dropped snapshot counts: one
+refused by the inflight or staleness guards, one pinned below the applied block
+watermark, and one withheld because an unresolved reconciliation request owns
+the balance. An applied snapshot or a successful forced reconciliation resets
+only that streak. The active divergence detector and forced-reconcile commands
+remain Hedging-only. MarketMaking `OnchainEquity` and `OnchainUsdc` skip
+warnings are therefore operator signals, not claims that the onchain balance
+self-healed.
 
 The same machinery closes the restart-across-an-open-order window. The aggregate
 records every poll -- including mid-order broker readings the live view's guards
@@ -5264,10 +5367,13 @@ for every discovered vault in the monotonic vault registry.
 `InventorySnapshotEvent` to maintain venue balances. Inflight tracking ensures
 assets in transit (minting, redeeming, bridging) are accounted for.
 
-Imbalance detection compares each asset's onchain ratio against a configurable
-`ImbalanceThreshold` (target ratio + deviation). Rebalancing is only triggered
-when no inflight operations exist for the asset. The trigger enqueues the
-matching transfer job for execution.
+USDC imbalance detection compares the onchain ratio against a configurable
+`ImbalanceThreshold` (target ratio + deviation). Equity is read as one
+`EquityVenues` per symbol -- the broker balance, one slot per polled chain and
+whether anything is in flight -- that the allocation planner sizes from (see
+Equity Allocation Planner). Rebalancing is only triggered when no inflight
+operations exist for the asset. The trigger enqueues the matching transfer job
+for execution.
 
 #### Failure Handling and Reconciliation
 

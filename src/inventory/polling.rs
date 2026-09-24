@@ -31,7 +31,7 @@ use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 
 use super::BroadcastingInventory;
 use super::divergence::{InventoryDivergenceRecoveryCtx, ReconciliationGeneration};
-use super::view::{HedgeOrderGateCorrection, Venue};
+use super::view::{HedgeOrderGateCorrection, InventoryScope, Venue};
 use crate::alerts::Notifier;
 use crate::inventory::freshness::PollFreshness;
 use crate::inventory::snapshot::{
@@ -1182,7 +1182,10 @@ where
 
         let view = recovery.inventory.read().await;
         let tainted = view.is_restart_cash_tainted();
-        let state = if view.cash_reconciliation_busy(fetched_at)?.is_some() {
+        let state = if view
+            .cash_reconciliation_busy(InventoryScope::Hedging, fetched_at)?
+            .is_some()
+        {
             ObservedCashLedgerState::Busy
         } else {
             let ledger = view.usdc_available(Venue::Hedging);
@@ -1274,13 +1277,13 @@ where
             ObservedCashLedgerState::Match => {
                 if *counter != 0 {
                     *counter = 0;
-                    recovery.gate.release_cash();
+                    recovery.gate.release_cash(InventoryScope::Hedging);
                 }
                 None
             }
             ObservedCashLedgerState::Divergence { ledger } => {
                 *counter += 1;
-                recovery.gate.engage_cash();
+                recovery.gate.engage_cash(InventoryScope::Hedging);
 
                 warn!(
                     target: "inventory",
@@ -1341,7 +1344,7 @@ where
 
         if healed {
             *self.lock_cash_divergence_counter() = 0;
-            recovery.gate.release_cash();
+            recovery.gate.release_cash(InventoryScope::Hedging);
             recovery
                 .inventory
                 .write_without_broadcast()
@@ -1471,7 +1474,7 @@ where
                 .iter()
                 .map(|(symbol, fetched)| {
                     let state = if view
-                        .equity_reconciliation_busy(symbol, fetched_at)?
+                        .equity_reconciliation_busy(symbol, InventoryScope::Hedging, fetched_at)?
                         .is_some()
                     {
                         ObservedLedgerState::Busy
@@ -1604,7 +1607,9 @@ where
 
         if healed {
             self.lock_divergence_counters().remove(&escalation.symbol);
-            recovery.gate.release(&escalation.symbol);
+            recovery
+                .gate
+                .release(InventoryScope::Hedging, &escalation.symbol);
             recovery
                 .inventory
                 .write_without_broadcast()
@@ -1658,13 +1663,13 @@ where
                 ObservedLedgerState::Busy => {}
                 ObservedLedgerState::Match => {
                     if counters.remove(&symbol).is_some() {
-                        recovery.gate.release(&symbol);
+                        recovery.gate.release(InventoryScope::Hedging, &symbol);
                     }
                 }
                 ObservedLedgerState::Divergence { ledger } => {
                     let count = counters.entry(symbol.clone()).or_insert(0);
                     *count += 1;
-                    recovery.gate.engage(&symbol);
+                    recovery.gate.engage(InventoryScope::Hedging, &symbol);
 
                     warn!(
                         target: "inventory",
@@ -6660,7 +6665,9 @@ mod tests {
     #[tokio::test]
     async fn divergence_counter_frozen_while_mint_active() {
         assert_counter_frozen_while_busy(
-            |view, symbol| view.set_active_mint(symbol.clone(), issuer_request_id("frozen")),
+            |view, symbol| {
+                view.set_active_mint(symbol.clone(), Chain::Base, issuer_request_id("frozen"))
+            },
             InventoryView::clear_active_mint,
         )
         .await;
@@ -6670,7 +6677,11 @@ mod tests {
     async fn divergence_counter_frozen_while_redemption_active() {
         assert_counter_frozen_while_busy(
             |view, symbol| {
-                view.set_active_redemption(symbol.clone(), RedemptionAggregateId(Uuid::new_v4()))
+                view.set_active_redemption(
+                    symbol.clone(),
+                    Chain::Base,
+                    RedemptionAggregateId(Uuid::new_v4()),
+                )
             },
             InventoryView::clear_active_redemption,
         )
@@ -7379,7 +7390,8 @@ mod tests {
         let mut view =
             InventoryView::default().with_equity(spym.clone(), test_shares(0), test_shares(136));
         taint_from_restart(&mut view, &spym);
-        let view = view.set_active_mint(spym.clone(), issuer_request_id("tainted-busy"));
+        let view =
+            view.set_active_mint(spym.clone(), Chain::Base, issuer_request_id("tainted-busy"));
         let inventory = broadcasting_inventory(view);
         let gate = Arc::new(InventoryDivergenceGate::default());
         let service = reconciling_service(

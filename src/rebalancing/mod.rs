@@ -13,7 +13,7 @@ pub(crate) use spawn::{BaseWallet, ChainWallets, EthereumWallet, RebalancerServi
 #[cfg(test)]
 pub(crate) use trigger::drain_pending_jobs;
 pub(crate) use trigger::{
-    EquityRebalancingCheck, EquityRebalancingCheckScheduler, RebalancingSchedulers,
-    RebalancingService, RebalancingServiceConfig, UsdcRebalancingCheck,
+    ChainRebalancingConfig, EquityRebalancingCheck, EquityRebalancingCheckScheduler,
+    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, UsdcRebalancingCheck,
     UsdcRebalancingCheckScheduler, UsdcResumeError,
 };

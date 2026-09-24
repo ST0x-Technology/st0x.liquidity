@@ -334,10 +334,17 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
                     Some(float_to_f64(threshold.deviation, 0.3)),
                 )
             });
+        // The dashboard's equity band is the primary chain's default target
+        // share; with only per-symbol overrides there is no single target.
+        let primary_target = rebalancing
+            .allocation
+            .targets
+            .get(&ctx.chains.primary().chain)
+            .map(|target| float_to_f64(target.inner(), 0.5));
 
         (
-            float_to_f64(rebalancing.equity.target, 0.5),
-            float_to_f64(rebalancing.equity.deviation, 0.2),
+            primary_target,
+            float_to_f64(rebalancing.allocation.deviation.inner(), 0.2),
             usdc_target,
             usdc_deviation,
         )
@@ -618,7 +625,7 @@ mod tests {
 
     fn empty_settings() -> st0x_dto::Settings {
         st0x_dto::Settings {
-            equity_target: 0.5,
+            equity_target: Some(0.5),
             equity_deviation: 0.2,
             usdc_target: None,
             usdc_deviation: None,
@@ -647,6 +654,23 @@ mod tests {
             recent_transfers: Vec::new(),
             warnings: Vec::new(),
         })
+    }
+
+    /// Only per-symbol `target_share` overrides are configured, so the
+    /// primary chain has no chain-level default and the dashboard gets no
+    /// equity target rather than a fabricated 0%.
+    #[test]
+    fn settings_from_ctx_reports_no_equity_target_without_a_primary_chain_default() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        let primary = ctx.chains.primary().chain;
+        ctx.rebalancing.allocation.targets.remove(&primary).unwrap();
+
+        let settings = serde_json::to_value(settings_from_ctx(&ctx)).unwrap();
+
+        assert_eq!(settings["equityTarget"], json!(null));
+        assert_eq!(settings["equityDeviation"], json!(0.1));
     }
 
     #[test]

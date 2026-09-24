@@ -36,7 +36,6 @@ use std::sync::{Arc, Mutex};
 
 use st0x_finance::{FractionalShares, Positive, Symbol, Usd};
 use st0x_float_macro::float;
-use st0x_hedge::ImbalanceThreshold;
 use st0x_hedge::OperationMode;
 use st0x_hedge::bindings::{IRaindexV6, IST0xOrchestratorV1};
 use st0x_hedge::e2e_support::seed_mint_at_tokens_wrapped;
@@ -2775,7 +2774,7 @@ async fn unwrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Resul
         // drains the vault the assertions check). A huge deviation keeps the
         // imbalance check from ever triggering a transfer. The recovery<->
         // rebalancing interaction itself is a separate integration concern.
-        .equity_imbalance(ImbalanceThreshold::new(float!(0.5), float!(100))?)
+        .equity_band(float!(100))
         .wrapped_equity_recovery(OperationMode::Enabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .issuance_base_url(infra.issuance_base_url.clone())

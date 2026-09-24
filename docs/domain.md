@@ -282,6 +282,14 @@ ratios between onchain and offchain holdings. Two dimensions:
 Rebalancing is only available with Alpaca Broker API (requires account-level
 access for mint/redeem operations).
 
+### Inventory Scope
+
+One balance owner that divergence suppression and snapshot-skip tracking key
+separately: `Hedging` (the chainless broker account) or `MarketMaking(chain)`
+(the vaults on one chain). The type is `InventoryScope`. Wallet transit
+locations are `PortfolioLocation` reporting rows, not scopes: they hold no
+balance a transfer is sized from.
+
 ### Target Share
 
 The fraction of a symbol's total inventory (broker shares plus every chain's
@@ -298,7 +306,7 @@ symbol is declined as `FloorCapped` only when that leaves no room to mint at
 all. Configured as `[rebalancing.allocation].alpaca_floor`, also a
 `TargetShare`. At load time every rebalanced symbol's chain targets plus the
 floor must not exceed 1. Distinct from the hedge floor, which is a fixed number
-of shares.
+of shares; the planner keeps whichever of the two is larger.
 
 ### Deviation Band
 
@@ -311,12 +319,13 @@ The type is `DeviationBand`.
 
 The smallest equity transfer worth its gas, in dollars, valued at the last
 onchain fill price the `Position` recorded for the symbol. A candidate below it
-is dropped as `BelowMinimum` and the next candidate is evaluated. A missing or
-stale price declines the symbol (`PriceMissing`, `PriceStale`) before any
-candidate is tried, so no per-chain drop masks it. A symbol-wide floor decline
-(`FloorCapped`) reports the per-chain reason (`NoGas`, `CoolingDown`,
-`BelowMinimum`) a higher-ranked candidate was dropped for, when there is one.
-Configured as `[rebalancing.allocation].min_operation_usd` with a per-chain
+is dropped as `BelowMinimum` and the next candidate is evaluated. The price's
+age does not matter, since it only values this dust bound. A missing price
+declines the symbol (`PriceMissing`) before any candidate is tried, so no
+per-chain drop masks it. A symbol-wide floor decline (`FloorCapped`) reports the
+per-chain reason (`NoGas`, `CoolingDown`, `BelowMinimum`) a higher-ranked
+candidate was dropped for, when there is one. Configured as
+`[rebalancing.allocation].min_operation_usd` with a per-chain
 `min_operation_usd` override on the trading table.
 
 ### Reservation
