@@ -16158,6 +16158,192 @@ mod tests {
         assert!(logs_contain("operational_alert"));
     }
 
+    /// A withdrawal tx pays one transfer. Two open transfers that recorded
+    /// the same one (both confirmed it at once) page, even when the check runs
+    /// for one of them.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn credit_ledger_pages_when_open_transfers_share_a_withdrawal_tx() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(
+            U256::from(100_000_000u64),
+            market_maker_wallet,
+        )
+        .await;
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let (manager, cqrs) =
+            manager_with_ledger_on_chain(&chain, &server, market_maker_wallet, pool).await;
+
+        let first = UsdcRebalanceId(Uuid::new_v4());
+        let second = UsdcRebalanceId(Uuid::new_v4());
+        for id in [&first, &second] {
+            advance_to_withdrawal_complete_alpaca_to_base_with_tx(
+                &cqrs,
+                id,
+                usdc("100"),
+                chain.mint_tx,
+            )
+            .await;
+        }
+
+        manager
+            .check_ethereum_credit_ledger(&first, usdc("100"))
+            .await;
+
+        assert!(logs_contain(
+            "Open USDC transfers share one Alpaca withdrawal tx"
+        ));
+        assert!(logs_contain(&first.to_string()));
+        assert!(logs_contain(&second.to_string()));
+    }
+
+    /// Before `ConfirmWithdrawal` records the withdrawal tx, the event store is
+    /// read: a tx another transfer already recorded is not this withdrawal's
+    /// delivery, so the transfer fails for reconciliation without recording it.
+    #[tokio::test]
+    async fn confirm_withdrawal_refuses_a_tx_another_transfer_recorded() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(
+            U256::from(100_000_000u64),
+            market_maker_wallet,
+        )
+        .await;
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let (manager, cqrs) =
+            manager_with_ledger_on_chain(&chain, &server, market_maker_wallet, pool).await;
+
+        let earlier = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_withdrawal_complete_alpaca_to_base_with_tx(
+            &cqrs,
+            &earlier,
+            usdc("100"),
+            chain.mint_tx,
+        )
+        .await;
+
+        let transfer_uuid = Uuid::new_v4();
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        let _complete_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_uuid}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": transfer_uuid.to_string(),
+                    "direction": "OUTGOING",
+                    "amount": "100",
+                    "usd_value": "100",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": "0x0000000000000000000000000000000000000001",
+                    "to_address": format!("{market_maker_wallet:#x}"),
+                    "status": "COMPLETE",
+                    "tx_hash": format!("{:#x}", chain.mint_tx),
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                }));
+        });
+
+        let error = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::WithdrawalTxAlreadyRecorded {
+            id: failed_id,
+            tx,
+            recorded_by,
+        } = error
+        else {
+            panic!("expected WithdrawalTxAlreadyRecorded, got: {error:?}");
+        };
+        assert_eq!(failed_id, id);
+        assert_eq!(tx, chain.mint_tx);
+        assert_eq!(recorded_by, earlier.to_string());
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: None,
+                    ..
+                }
+            ),
+            "expected a pre-burn BridgingFailed, got: {state:?}"
+        );
+        assert!(state.is_reconcilable_failure());
+    }
+
+    async fn manager_with_ledger_on_chain(
+        chain: &EthereumUsdcChain,
+        server: &MockServer,
+        market_maker_wallet: Address,
+        pool: SqlitePool,
+    ) -> (
+        CrossVenueCashTransfer<
+            RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>,
+        >,
+        Arc<Store<UsdcRebalance>>,
+    ) {
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let manager = CrossVenueCashTransfer::new(
+            InstrumentedAlpacaBroker::new(
+                create_test_broker_service(server).await,
+                TelemetrySender::disabled(),
+            ),
+            Arc::new(create_test_wallet_service(server)),
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        )
+        .with_credit_ledger(pool);
+
+        (manager, cqrs)
+    }
+
     /// An open aggregate the ledger cannot read turns the shortfall check off,
     /// so that pages too, naming the aggregate.
     #[tracing_test::traced_test]

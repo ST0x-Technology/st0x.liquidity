@@ -341,6 +341,19 @@ pub enum UsdcTransferError {
         credited: U256,
         nominal: Usdc,
     },
+    /// Another `UsdcRebalance` already recorded this withdrawal tx, so it
+    /// cannot be this withdrawal's delivery. The aggregate is moved to
+    /// `BridgingFailed` for operator reconciliation without recording the tx.
+    #[error(
+        "USDC rebalance {id}: withdrawal tx {tx} is already recorded by USDC rebalance \
+         {recorded_by}; failed for operator reconciliation"
+    )]
+    WithdrawalTxAlreadyRecorded {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        /// The other aggregate's id as persisted in the event store.
+        recorded_by: String,
+    },
     /// The withdrawal tx receipt was read, but its USDC credit cannot be
     /// computed (an undecodable Transfer log, or a sum that overflows). A reread
     /// cannot change the receipt, so the aggregate is moved to `BridgingFailed`
@@ -564,6 +577,7 @@ impl UsdcTransferError {
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }
             | Self::WithdrawalCreditUnreadable { .. }
+            | Self::WithdrawalTxAlreadyRecorded { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::WithdrawalScanTransient { .. }
             | Self::SettlementCheckTransient { .. }
@@ -620,6 +634,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }
             | Self::WithdrawalCreditUnreadable { .. }
+            | Self::WithdrawalTxAlreadyRecorded { .. }
             | Self::SettlementRetryDeadlineElapsed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::WithdrawalScanTransient { .. }

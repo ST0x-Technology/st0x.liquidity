@@ -2308,6 +2308,8 @@ mod tests {
         DepositSendUnresolved,
         /// A deposit send may be in flight unrecorded: a retry could send again.
         DepositSendRecordFailed,
+        /// `FailBridging` is committed; the tx belongs to another transfer.
+        WithdrawalTxAlreadyRecorded,
     }
 
     impl TerminalOutcome {
@@ -2384,6 +2386,13 @@ mod tests {
                     id: id.clone(),
                     send_tx: Some(TxHash::from([0xDB; 32])),
                 },
+                Self::WithdrawalTxAlreadyRecorded => {
+                    UsdcTransferError::WithdrawalTxAlreadyRecorded {
+                        id: id.clone(),
+                        tx: TxHash::from([0xDC; 32]),
+                        recorded_by: "00000000-0000-0000-0000-000000000001".to_string(),
+                    }
+                }
             }
         }
     }
@@ -4307,6 +4316,16 @@ mod tests {
             TerminalOutcome::BurnTxDropped,
             "BurnTxDropped (market-making)",
             Some(TxHash::from([0xAB; 32])),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn market_making_job_fails_closed_on_withdrawal_tx_already_recorded() {
+        assert_market_making_fail_closed(
+            TerminalOutcome::WithdrawalTxAlreadyRecorded,
+            "WithdrawalTxAlreadyRecorded (market-making)",
+            Some(TxHash::from([0xDC; 32])),
         )
         .await;
     }
