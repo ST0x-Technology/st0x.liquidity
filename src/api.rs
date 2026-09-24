@@ -6845,6 +6845,9 @@ mod tests {
                 usdc_recheck: Arc::new(LeftUnchangedUsdcRecheck),
                 usdc_driver_pause: Arc::new(pause),
                 usdc_store: standalone_usdc_store(&state.pool).await,
+                projection_maintenance: Arc::new(
+                    crate::conductor::projection_pause::init_projection_maintenance(),
+                ),
             })
             .ok()
             .expect("recovery cell must start empty");
