@@ -35,10 +35,11 @@ first.
 placement preflight and before claiming the position, while holding the same
 submission guards as the claim and the placement.
 
-- **Deferred:** nothing is persisted. The fill is settled and the verb reports
-  `HedgePlacementDeferred`. The position carries no claim and no anchor, so the
-  standing `CheckPositions` pipeline sees the exposure again and hedges it from
-  a fresh preflight.
+- **Deferred:** the verb writes no claim, no `Pending` intent, and no anchor for
+  this placement; it settles the accounted fill and reports
+  `HedgePlacementDeferred`. With no claim on the position, the standing
+  `CheckPositions` pipeline sees the exposure again and hedges it from a fresh
+  preflight.
 - **Admission error:** nothing is claimed, so the error surfaces with the fill
   left unsettled and a rerun resumes it, the same as a preflight error.
 - **Admitted or recovered:** the verb claims the position and places the order.
@@ -53,9 +54,11 @@ still reports `HedgePlacementDeferred`.
 
 ## Consequences
 
-- A `process-tx` deferral at the check before the claim leaves no durable state
-  behind: no claim, no `Pending` intent, no terminal order, and no anchor.
-  Either way the next hedge is sized by a fresh preflight.
+- A `process-tx` deferral at the check before the claim leaves no state behind
+  for this placement: no claim, no `Pending` intent, no terminal order, and no
+  anchor. Besides accounting and settling the fill, the only writes are
+  reconciling an earlier claim and releasing an earlier anchor, both of which
+  run before admission. Either way the next hedge is sized by a fresh preflight.
 - No new persisted fields, projection columns, or migrations are needed, and
   trade history, reliability, and latency projections are untouched.
 - Admission runs twice on the admitted path, adding one broker lookup by client

@@ -2017,14 +2017,15 @@ pub mod process_tx {
             });
         };
 
-        // Broker admission runs before the claim, so a deferral persists
-        // nothing: no position claim and no `Pending` intent that recovery could
-        // later replay with stale shares or reservation terms. The standing
-        // pipeline sees the exposure again and hedges it from a fresh
-        // preflight. `New` and `Recovered` fall through; the placement below
-        // runs admission again and adopts a recovered order under the same
-        // client order id. Nothing is claimed yet, so an admission error leaves
-        // the fill unsettled for a retry, like a preflight error.
+        // Broker admission runs before the claim, so a deferral writes no
+        // position claim and no `Pending` intent that recovery could later
+        // replay with stale shares or reservation terms; it settles the
+        // already accounted fill. The standing pipeline sees the exposure again
+        // and hedges it from a fresh preflight. `New` and `Recovered` fall
+        // through; the placement below runs admission again and adopts a
+        // recovered order under the same client order id. Nothing is claimed
+        // yet, so an admission error leaves the fill unsettled for a retry,
+        // like a preflight error.
         let admission = order_placer
             .prepare_placement(
                 &MarketOrder {
@@ -6523,7 +6524,7 @@ pub mod process_tx {
             }
         }
 
-        /// An admission error before the claim persists nothing and leaves the
+        /// An admission error before the claim writes no claim and leaves the
         /// fill unsettled, so rerunning process-tx resumes it, exactly like a
         /// preflight error.
         #[tokio::test]
