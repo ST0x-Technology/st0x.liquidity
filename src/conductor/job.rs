@@ -1164,6 +1164,9 @@ where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
 {
+    // Same projection gate as the production handler, so tests run jobs
+    // through the gate a view rebuild pauses.
+    let _projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
     injector
         .perform(
             *kind,
@@ -1194,7 +1197,7 @@ where
     // Gate every projection write this job commits (event-sorcery folds
     // projections synchronously inside `Store::send`) so a materialized-view
     // rebuild can quiesce the workers first. Held for the whole job; released on
-    // return. Ungated until a conductor calls `init_projection_maintenance`.
+    // return. Ungated until a conductor calls `init_projection_gate`.
     let _projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
     perform_bounded::<Ctx, J>(
         &job,
