@@ -8103,7 +8103,7 @@ pub mod process_tx {
             .unwrap();
             assert_eq!(
                 order_count, 1,
-                "concurrent process-tx and tick must place exactly one hedge order, got {order_count}"
+                "concurrent process-tx runs must place exactly one hedge order, got {order_count}"
             );
         }
 
