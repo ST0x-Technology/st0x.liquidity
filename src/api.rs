@@ -7181,6 +7181,9 @@ mod tests {
                 redemption_store,
                 rebalancing_service,
                 usdc_recheck: Arc::new(LeftUnchangedUsdcRecheck),
+                // The resume and recheck routes this fixture serves never reach
+                // CCTP mint recovery, so any double fills the slot.
+                cctp_mint_recovery: Arc::new(InconclusiveMint),
                 usdc_driver_pause: Arc::new(pause),
                 usdc_store: standalone_usdc_store(&state.pool).await,
             })
