@@ -24,7 +24,7 @@ use st0x_execution::{
     ClientOrderId, ConversionDirection, ConversionOrder, CryptoOrderOutcome, Network, Positive,
     TokenSymbol, Transfer, TransferStatus,
 };
-use st0x_finance::{HasZero, Usd, Usdc};
+use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
@@ -449,9 +449,14 @@ impl<
     /// Ethereum wallet balance. Pages on a shortfall or an underivable ledger
     /// and logs unattributed USDC; never fails a transfer. A failed balance
     /// read only warns.
+    ///
+    /// `own_credit` is what transfer `id` is about to send. It is passed in,
+    /// not read from `id`'s state, so callers can check before committing the
+    /// state change that goes with the send.
     pub(crate) async fn check_ethereum_credit_ledger(
         &self,
         id: &UsdcRebalanceId,
+        own_credit: Usdc,
     ) -> CreditLedgerCheck {
         let CreditLedger::Wired(pool) = &self.credit_ledger else {
             debug!(target: "rebalance", %id, "Ethereum credit ledger not wired; skipping check");
@@ -476,7 +481,8 @@ impl<
 
         let outstanding = match credits
             .iter()
-            .try_fold(Usdc::ZERO, |total, (_, credit)| total + *credit)
+            .filter(|(credit_id, _)| credit_id != id)
+            .try_fold(own_credit, |total, (_, credit)| total + *credit)
             .map_err(UsdcTransferError::from)
             .and_then(usdc_to_u256)
         {
@@ -3743,7 +3749,7 @@ impl<
         let deposit_address = self.fetch_alpaca_deposit_address(id).await?;
         let amount_u256 = usdc_to_u256(amount_received)?;
 
-        self.check_ethereum_credit_ledger(id).await;
+        self.check_ethereum_credit_ledger(id, amount_received).await;
 
         let send_tx = self
             .cctp_bridge
@@ -3811,7 +3817,7 @@ impl<
             return Ok(existing_tx);
         }
 
-        self.check_ethereum_credit_ledger(id).await;
+        self.check_ethereum_credit_ledger(id, amount_received).await;
 
         let send_tx = self
             .cctp_bridge
@@ -4546,17 +4552,22 @@ impl<
                     source: Box::new(error),
                 })?,
         };
+        let burn_amount = u256_to_usdc(amount)?;
+
+        // Checked before `BeginBridging`: from `WithdrawalComplete` a restart
+        // redrives safely, but from `BridgingSubmitting` with no recorded burn
+        // it fails closed.
+        self.check_ethereum_credit_ledger(id, burn_amount).await;
+
         self.cqrs
             .send(
                 id,
                 UsdcRebalanceCommand::BeginBridging {
                     from_block,
-                    burn_amount: Some(u256_to_usdc(amount)?),
+                    burn_amount: Some(burn_amount),
                 },
             )
             .await?;
-
-        self.check_ethereum_credit_ledger(id).await;
 
         let burn_receipt = self
             .burn_recording_pending(
@@ -4633,7 +4644,8 @@ impl<
                 self.cqrs
                     .send(id, UsdcRebalanceCommand::ClearPendingBurn)
                     .await?;
-                self.check_ethereum_credit_ledger(id).await;
+                self.check_ethereum_credit_ledger(id, u256_to_usdc(amount)?)
+                    .await;
 
                 self.burn_recording_pending(
                     id,
@@ -13933,7 +13945,9 @@ mod tests {
         stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), chain.mint_tx).await;
 
         assert_eq!(
-            manager.check_ethereum_credit_ledger(&id).await,
+            manager
+                .check_ethereum_credit_ledger(&id, usdc("99.99"))
+                .await,
             CreditLedgerCheck::Shortfall {
                 outstanding: U256::from(99_990_000u64),
                 balance: U256::from(40_000_000u64),
@@ -13990,7 +14004,7 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         assert_eq!(
-            manager.check_ethereum_credit_ledger(&id).await,
+            manager.check_ethereum_credit_ledger(&id, usdc("0")).await,
             CreditLedgerCheck::Unavailable
         );
         assert!(logs_contain("operational_alert"));
@@ -14051,7 +14065,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            manager.check_ethereum_credit_ledger(&withdrawn).await,
+            manager
+                .check_ethereum_credit_ledger(&withdrawn, usdc("10"))
+                .await,
             CreditLedgerCheck::Covered {
                 outstanding: U256::from(109_990_000u64),
                 balance: U256::from(150_000_000u64),
@@ -14160,8 +14176,8 @@ mod tests {
         assert!(logs_contain("shortfall=60"));
     }
 
-    /// The ledger check runs right before the Alpaca->Base burn, after the
-    /// credit is recorded, so the wallet's other USDC is reported, not burned.
+    /// The ledger check runs right before the Alpaca->Base burn, counting the
+    /// credit, so the wallet's other USDC is reported, not burned.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn alpaca_to_base_burn_checks_the_credit_ledger() {
