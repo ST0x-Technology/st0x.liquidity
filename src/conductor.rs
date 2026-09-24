@@ -3491,6 +3491,46 @@ struct TransferStrandedByChainServices {
     symbol: Symbol,
 }
 
+/// Restores a submitted withdrawal's nonce ownership, retrying a transient
+/// transport failure a few times. A hash the node reports as absent
+/// (`PreparedTransactionReconciliationPending`) returns immediately: retrying
+/// cannot make a dropped, never mined withdrawal reappear.
+async fn restore_submitted_withdrawal_with_retry(
+    raindex: &dyn st0x_raindex::Raindex,
+    tx_hash: alloy::primitives::TxHash,
+    prepared: Option<&st0x_evm::PreparedTransaction>,
+) -> Result<(), st0x_raindex::RaindexError> {
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    loop {
+        match raindex
+            .restore_submitted_withdrawal(tx_hash, prepared)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if is_prepared_withdrawal_absent(&error) => return Err(error),
+            Err(error) => {
+                attempt += 1;
+                if attempt >= ATTEMPTS {
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// Whether the node reports the withdrawal's transaction as absent, which no
+/// retry can change, as distinct from a transport failure that may clear.
+fn is_prepared_withdrawal_absent(error: &st0x_raindex::RaindexError) -> bool {
+    matches!(
+        error,
+        st0x_raindex::RaindexError::Evm(
+            st0x_evm::EvmError::PreparedTransactionReconciliationPending { .. }
+        )
+    )
+}
+
 /// Queues one resume job per interrupted mint and redemption. A transfer
 /// whose recorded chain lost its equity services refuses startup instead:
 /// queueing a resume that can only fail would strand it silently.
@@ -3632,49 +3672,69 @@ async fn recover_interrupted_tokenization_aggregates(
 
         let restore_outcome = match &redemption {
             EquityRedemption::VaultWithdrawSubmitting { prepared, .. } => Some(
-                equity_services
-                    .for_chain(redemption.chain())?
-                    .raindex
-                    .restore_submitted_withdrawal(prepared.tx_hash(), Some(prepared))
-                    .await,
+                restore_submitted_withdrawal_with_retry(
+                    equity_services
+                        .for_chain(redemption.chain())?
+                        .raindex
+                        .as_ref(),
+                    prepared.tx_hash(),
+                    Some(prepared),
+                )
+                .await,
             ),
             EquityRedemption::VaultWithdrawSubmitted {
                 tx_hash, prepared, ..
             } => Some(
-                equity_services
-                    .for_chain(redemption.chain())?
-                    .raindex
-                    .restore_submitted_withdrawal(*tx_hash, prepared.as_ref())
-                    .await,
+                restore_submitted_withdrawal_with_retry(
+                    equity_services
+                        .for_chain(redemption.chain())?
+                        .raindex
+                        .as_ref(),
+                    *tx_hash,
+                    prepared.as_ref(),
+                )
+                .await,
             ),
             _ => None,
         };
-        // Startup recovery must never gate on a slow or absent RPC (see this
-        // function's contract). A legacy `VaultWithdrawSubmitted` with no
-        // persisted prepared bytes recovers by an onchain hash lookup, which
-        // returns pending or absent for a dropped, never mined withdrawal on
-        // every restart. Such an aggregate holds no nonce reservation in this
-        // fresh process, so skip the restore, page the operator, and let the
-        // resume job drive it to the reconciliation deadline and a reconcile
-        // rather than crash looping the whole bot.
-        if let Some(Err(error)) = restore_outcome {
-            warn!(
-                target: "rebalance",
-                %redemption_id,
-                %error,
-                "Could not restore submitted withdrawal at startup; skipping the \
-                 nonce restore and deferring to the resume job"
-            );
-            rebalancing_service
-                .notifier()
-                .notify(&format!(
-                    "Equity redemption {redemption_id} could not restore its submitted vault \
-                     withdrawal at startup ({error}). Monitoring started without it; the resume \
-                     job will drive it to the reconciliation deadline. Verify the withdrawal \
-                     onchain and reconcile if it will never confirm."
-                ))
-                .await
-                .ok();
+        match restore_outcome {
+            // The node reports the withdrawal's hash as absent: a dropped, never
+            // mined legacy withdrawal that returns the same on every restart. It
+            // holds no nonce reservation in this fresh process, so skip the
+            // restore, page the operator, and let the resume job drive it to the
+            // reconciliation deadline rather than crash looping the whole bot.
+            Some(Err(error)) if is_prepared_withdrawal_absent(&error) => {
+                warn!(
+                    target: "rebalance",
+                    %redemption_id,
+                    %error,
+                    "Submitted withdrawal hash is absent at startup; skipping the \
+                     nonce restore and deferring to the resume job"
+                );
+                if let Err(alert_error) = rebalancing_service
+                    .notifier()
+                    .notify(&format!(
+                        "Equity redemption {redemption_id} has a submitted vault withdrawal whose \
+                         hash the node cannot return at startup ({error}). Monitoring started \
+                         without it; the resume job will drive it to the reconciliation deadline. \
+                         Verify the withdrawal onchain and reconcile if it will never confirm."
+                    ))
+                    .await
+                {
+                    warn!(
+                        target: "rebalance",
+                        %redemption_id,
+                        %alert_error,
+                        "Failed to deliver startup withdrawal restore alert"
+                    );
+                }
+            }
+            // A transport failure that outlasted the retries is a real RPC fault,
+            // not a gone hash. Do not skip: the withdrawal may still be pending
+            // and must keep its nonce reserved, or a later generic send collides
+            // with it. Fail startup so a healthy RPC is required before running.
+            Some(Err(error)) => return Err(error.into()),
+            Some(Ok(())) | None => {}
         }
 
         rebalancing_service
@@ -7536,6 +7596,7 @@ mod tests {
         rebalancing_service: RebalancingService,
         inventory: Arc<BroadcastingInventory>,
         resume_queue: crate::rebalancing::equity::ResumeTokenizationJobQueue,
+        notifier: Arc<crate::alerts::CapturingNotifier>,
     }
 
     /// Shared setup for the three `recover_interrupted_tokenization_aggregates`
@@ -7624,6 +7685,7 @@ mod tests {
             event_sender,
         ));
         let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
+        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
                 poll_freshness: PollFreshness::always_fresh(),
@@ -7656,7 +7718,7 @@ mod tests {
                 Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
             )]),
             RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
+            notifier.clone(),
         );
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -7683,6 +7745,7 @@ mod tests {
             rebalancing_service,
             inventory,
             resume_queue,
+            notifier,
         }
     }
 
@@ -7823,10 +7886,13 @@ mod tests {
     async fn startup_survives_a_failed_withdrawal_restore() {
         let InterruptedAggregateFixture {
             pool,
+            apalis_pool,
             services,
+            redemption_id,
             raindex,
             rebalancing_service,
             inventory,
+            notifier,
             mut resume_queue,
             ..
         } = seed_interrupted_aggregates_and_build_service_with(
@@ -7862,6 +7928,43 @@ mod tests {
             !raindex.restore_submitted_withdrawal_calls().is_empty(),
             "the failing restore path must have been exercised"
         );
+
+        // Skipping the dead restore must not drop the redemption: its resume job
+        // is still enqueued so the aggregate is driven to the reconciliation
+        // deadline rather than silently abandoned.
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_all(&apalis_pool)
+        .await
+        .unwrap();
+        let targets: Vec<ResumeTokenizationTarget> = payloads
+            .iter()
+            .map(|job| {
+                serde_json::from_slice::<ResumeTokenizationAggregate>(job)
+                    .expect("queued resume job must deserialize")
+                    .target
+            })
+            .collect();
+        assert!(
+            targets.contains(&ResumeTokenizationTarget::Redemption(redemption_id.clone())),
+            "the redemption whose restore was skipped must still enqueue a resume job, \
+             got {targets:?}"
+        );
+
+        // The skipped restore must page the operator, naming the affected
+        // redemption, so the dropped nonce reservation is never silent.
+        let redemption_ref = redemption_id.to_string();
+        let messages = notifier.messages();
+        assert!(
+            messages.iter().any(|message| {
+                message.contains(redemption_ref.as_str())
+                    && message.contains("reconciliation deadline")
+            }),
+            "a failed withdrawal restore must page the operator about redemption \
+             {redemption_id}, got {messages:?}"
+        );
     }
 
     /// Regression: `recover_interrupted_tokenization_aggregates` must enqueue
@@ -7884,6 +7987,7 @@ mod tests {
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             1,
             "test-interrupted-mint",
@@ -8018,6 +8122,7 @@ mod tests {
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             2,
             "dup-test-mint",
@@ -8089,6 +8194,7 @@ mod tests {
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             9,
             "live-owner-mint",
@@ -8192,6 +8298,7 @@ mod tests {
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             4,
             "transfer-owned-mint",
@@ -8279,6 +8386,7 @@ mod tests {
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             6,
             "guardless-row-existing-mint",
@@ -8366,6 +8474,7 @@ mod tests {
             rebalancing_service: _,
             inventory: _,
             resume_queue: _,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             8,
             "pre-wrap-owner-existing-mint",
@@ -8442,6 +8551,7 @@ mod tests {
             rebalancing_service: _,
             inventory: _,
             resume_queue: _,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             10,
             "terminal-handoff-existing-mint",
@@ -8542,6 +8652,7 @@ mod tests {
             rebalancing_service: _,
             inventory: _,
             resume_queue: _,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             11,
             "redrive-existing-mint",
@@ -8612,6 +8723,7 @@ mod tests {
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             7,
             "terminal-row-existing-mint",
@@ -8700,6 +8812,7 @@ mod tests {
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             5,
             "dead-lettered-mint",
@@ -8955,6 +9068,7 @@ mod tests {
             rebalancing_service,
             inventory,
             mut resume_queue,
+            notifier: _,
         } = seed_interrupted_aggregates_and_build_service(
             3,
             "running-orphan-mint",

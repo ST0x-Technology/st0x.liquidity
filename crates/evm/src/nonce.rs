@@ -140,16 +140,16 @@ impl ResettableNonceManager {
     /// mines. This path instead skips every held nonce, `Reserved` and
     /// `Replaceable` alike.
     ///
-    /// The pending floor and the skip every held step are both required.
-    /// Reading `pending` rather than `latest` counts this wallet's own unmined
-    /// sends the cache may have lost to an `invalidate()`, a
-    /// `release_nonce_and_rewind` gap fill, or a restart, so the candidate
-    /// starts at or above the account's real next free nonce instead of a mined
-    /// `latest` a live generic send already occupies. Skipping every held nonce
-    /// then steps past occupancy the cache still tracks, including the
-    /// `Replaceable` holds `get_next_nonce` would land on. The cache is only
-    /// ever raised to `chosen + 1`, never lowered, so a concurrent prepare that
-    /// already advanced further is not rewound.
+    /// The floor and the skip every held step are both required. The floor is
+    /// the higher of `pending` and `latest`. `pending` counts this wallet's own
+    /// unmined sends the cache may have lost to an `invalidate()`, a
+    /// `release_nonce_and_rewind` gap fill, or a restart; `latest` guards against
+    /// a lagging node behind a load balancer serving a `pending` below the mined
+    /// count, which would sign a fixed prepared nonce the chain has already used.
+    /// Skipping every held nonce then steps past occupancy the cache still
+    /// tracks, including the `Replaceable` holds `get_next_nonce` would land on.
+    /// The cache is only ever raised to `chosen + 1`, never lowered, so a
+    /// concurrent prepare that already advanced further is not rewound.
     ///
     /// Callers must hold the wallet send lock across this operation.
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -701,6 +701,32 @@ mod tests {
             generic_nonce,
             "generic allocation is unchanged: it lands back on its own in \
              flight nonce for replacement"
+        );
+    }
+
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    #[tokio::test]
+    async fn reserve_next_unheld_nonce_floors_at_latest_over_a_lagging_pending() {
+        use alloy::primitives::U64;
+        use alloy::providers::mock::Asserter;
+
+        // A lagging node behind a load balancer serves `pending` (3) below the
+        // mined `latest` (7). The prepared allocation must floor at `latest`, so
+        // the reserved nonce is 7, never the stale 3 it could never recover from.
+        // `reserve_next_unheld_nonce` reads `pending` first, then `latest`.
+        let asserter = Asserter::new();
+        asserter.push_success(&U64::from(3));
+        asserter.push_success(&U64::from(7));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let manager = ResettableNonceManager::default();
+
+        let reserved = manager
+            .reserve_next_unheld_nonce(&provider, Address::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            reserved, 7,
+            "a lagging pending must not lower the prepared nonce below the mined latest"
         );
     }
 

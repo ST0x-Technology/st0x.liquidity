@@ -389,7 +389,9 @@ impl Raindex for MockRaindex {
         calls.push((tx_hash, prepared.is_some()));
         drop(calls);
         if self.fail_restore {
-            return Err(RaindexError::ScanInconclusive { from_block: 0 });
+            return Err(RaindexError::Evm(
+                st0x_evm::EvmError::PreparedTransactionReconciliationPending { tx_hash },
+            ));
         }
         Ok(())
     }
