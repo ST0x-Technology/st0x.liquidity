@@ -463,13 +463,22 @@ pub enum CctpError {
     #[error("already-minted CCTP nonce {nonce} had no matching MessageReceived log")]
     AlreadyMintedMessageNotFound { nonce: B256 },
     /// The nonce is consumed on chain but its mint is not in the bounded
-    /// resume scan: it landed below the floor, or the node cannot return its
-    /// log. Not retried by the bot; an operator reconciles it.
+    /// scan: it landed below the floor, or the node's log index lags.
+    /// `from_block_timestamp` (unix seconds) tells them apart: a floor mined
+    /// before the transfer started covers every block its mint can be in.
     #[error(
         "CCTP nonce {nonce} is consumed but no matching MessageReceived log was found at \
-         or after block {from_block}; manual reconciliation required"
+         or after block {from_block} (mined at unix time {from_block_timestamp})"
     )]
-    MintNotFoundInScanWindow { nonce: B256, from_block: u64 },
+    MintNotFoundInScanWindow {
+        nonce: B256,
+        from_block: u64,
+        from_block_timestamp: u64,
+    },
+    /// The node returned no header for the mint scan's floor block, which is
+    /// below the head it reported. Retryable.
+    #[error("mint scan floor block {block} is missing from the node")]
+    MintScanFloorBlockMissing { block: u64 },
     #[error(
         "recovered CCTP MessageReceived log for nonce {nonce} did not match the attested message"
     )]
@@ -586,6 +595,7 @@ impl CctpError {
             | Self::MessageDestinationDomainMismatch { .. }
             | Self::AlreadyMintedMessageNotFound { .. }
             | Self::MintNotFoundInScanWindow { .. }
+            | Self::MintScanFloorBlockMissing { .. }
             | Self::RecoveredMintMessageMismatch { .. }
             | Self::RecoveredMintLogMissingTxHash { .. }
             | Self::RecoveredMintReceiptReverted { .. }
@@ -1447,11 +1457,12 @@ mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::address;
     use alloy::primitives::{B256, BlockNumber, Bytes, U64, b256, keccak256};
+    use alloy::providers::EthGetBlock;
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::{Provider, ProviderBuilder, ProviderCall};
     use alloy::rpc::client::NoParams;
     use alloy::rpc::json_rpc::ErrorPayload;
-    use alloy::rpc::types::TransactionReceipt;
+    use alloy::rpc::types::{BlockNumberOrTag, TransactionReceipt};
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{SolCall, SolEvent};
@@ -1736,9 +1747,9 @@ mod tests {
     /// `MessageReceived` log has not yet been indexed by the queried node.
     /// Wrapped by [`FlakyProbeWallet`], never constructed directly by tests.
     /// Records the lowest `from_block` any scan asked for, so a test can
-    /// assert how far back a scan walked, and reports the head `head_offset`
-    /// blocks above the real one, standing in for a long chain that anvil
-    /// would take minutes to mine.
+    /// assert how far back a scan walked, and reports the chain `head_offset`
+    /// blocks above the real one (head and block reads alike), standing in for
+    /// a long chain that anvil would take minutes to mine.
     #[derive(Clone)]
     struct FlakyGetLogsProvider<InnerProvider> {
         inner: InnerProvider,
@@ -1773,6 +1784,20 @@ mod tests {
 
                 Ok(inner.get_block_number().await? + head_offset)
             }))
+        }
+
+        fn get_block_by_number(
+            &self,
+            number: BlockNumberOrTag,
+        ) -> EthGetBlock<alloy::rpc::types::Block> {
+            let real_number = match number {
+                BlockNumberOrTag::Number(reported) => {
+                    BlockNumberOrTag::Number(reported.saturating_sub(self.head_offset))
+                }
+                other => other,
+            };
+
+            self.inner.get_block_by_number(real_number)
         }
 
         async fn get_logs(
@@ -1880,16 +1905,16 @@ mod tests {
             Arc::clone(&self.provider.remaining_empty_scans)
         }
 
-        /// Reports the chain head `head_offset` blocks above the real one.
-        fn with_reported_head_offset(mut self, head_offset: u64) -> Self {
-            self.provider.head_offset = head_offset;
-            self
-        }
-
         /// Answers the first `stale_unused_reads` `usedNonces()` calls with
         /// zero (unused), as a node behind the block holding the mint would.
         fn with_stale_unused_reads(mut self, stale_unused_reads: u32) -> Self {
             self.remaining_stale_unused_reads = AtomicU32::new(stale_unused_reads);
+            self
+        }
+
+        /// Reports the chain `head_offset` blocks above the real one.
+        fn with_reported_head_offset(mut self, head_offset: u64) -> Self {
+            self.provider.head_offset = head_offset;
             self
         }
 
@@ -4485,7 +4510,7 @@ mod tests {
     /// never be reconstructed (the `MessageReceived` log scan stays empty
     /// well past `SCAN_ATTEMPTS`) must still surface as
     /// `CctpError::MintRecoveryInconclusive`, not the raw
-    /// `AlreadyMintedMessageNotFound` that `reconstruct_existing_mint`
+    /// `MintNotFoundInScanWindow` that `reconstruct_existing_mint`
     /// produces once its own retries are exhausted. The mint is known to
     /// have landed -- the authoritative `usedNonces()` read already proved
     /// it -- so anything other than `MintRecoveryInconclusive` here would
@@ -4523,7 +4548,7 @@ mod tests {
         // MessageReceived backward scan) answers empty every time. 10 empty
         // scans exceeds evm.rs's SCAN_ATTEMPTS (5), so
         // reconstruct_existing_mint exhausts its own retries and returns
-        // AlreadyMintedMessageNotFound instead of ever finding the log.
+        // MintNotFoundInScanWindow instead of ever finding the log.
         let flaky_provider = ProviderBuilder::new()
             .connect(&cctp.base_endpoint)
             .await
@@ -4565,10 +4590,10 @@ mod tests {
         assert!(
             matches!(
                 *recovery_error,
-                CctpError::AlreadyMintedMessageNotFound { .. }
+                CctpError::MintNotFoundInScanWindow { from_block: 0, .. }
             ),
             "the wrapped recovery_error must be the exhausted-retries \
-             AlreadyMintedMessageNotFound; got: {recovery_error:?}"
+             MintNotFoundInScanWindow; got: {recovery_error:?}"
         );
     }
 
@@ -4610,7 +4635,17 @@ mod tests {
             .connect(&cctp.base_endpoint)
             .await
             .unwrap();
-        let head = base_provider.get_block_number().await.unwrap() + head_offset;
+        let real_head = base_provider.get_block_number().await.unwrap();
+        let head = real_head + head_offset;
+        // The provider reads a shifted block as the real one `head_offset`
+        // below it, down to genesis.
+        let floor_timestamp = base_provider
+            .get_block_by_number((head - lookback).saturating_sub(head_offset).into())
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .timestamp;
 
         let flaky_wallet = FlakyProbeWallet::new(
             RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
@@ -4651,12 +4686,14 @@ mod tests {
         let CctpError::MintNotFoundInScanWindow {
             nonce: error_nonce,
             from_block,
+            from_block_timestamp,
         } = error
         else {
             panic!("a consumed nonce outside the window must fail for reconciliation: {error:?}");
         };
         assert_eq!(error_nonce, nonce);
         assert_eq!(from_block, head - lookback);
+        assert_eq!(from_block_timestamp, floor_timestamp);
 
         // A captured floor above the lookback floor scans down to the lookback
         // floor, no further.

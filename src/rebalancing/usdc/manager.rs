@@ -429,14 +429,26 @@ enum RepeatingMintFailure {
     /// Circle's complete answer is malformed, or the message bytes can never
     /// mint on this chain. The lookup fails before it reads the nonce.
     MessageCannotMint,
-    /// The consumed nonce's mint is not in the bounded scan.
+    /// The consumed nonce's mint is not in the bounded scan and can lie below
+    /// its floor.
     MintOutsideScanWindow,
+}
+
+/// Whether the mint of a used nonce can lie below a scan floor mined at
+/// `from_block_timestamp` (unix seconds). A mint lands after its transfer
+/// starts, so a floor mined before `initiated_at` covers every block the mint
+/// can be in, and a missing log there is index lag that a redrive outlasts.
+fn mint_can_lie_below_scan_floor(from_block_timestamp: u64, initiated_at: DateTime<Utc>) -> bool {
+    i128::from(from_block_timestamp) >= i128::from(initiated_at.timestamp())
 }
 
 /// Classifies a `find_attested_mint` or Circle re-poll failure that recurs on
 /// every retry. Exhaustive so a new `CctpError` needs a decision. The rest
 /// (`None`) redrive, the conservative choice for burned USDC.
-fn repeating_mint_failure(error: &CctpError) -> Option<RepeatingMintFailure> {
+fn repeating_mint_failure(
+    error: &CctpError,
+    initiated_at: DateTime<Utc>,
+) -> Option<RepeatingMintFailure> {
     match error {
         CctpError::PlaceholderNonce
         | CctpError::MalformedAttestation { .. }
@@ -446,9 +458,11 @@ fn repeating_mint_failure(error: &CctpError) -> Option<RepeatingMintFailure> {
             Some(RepeatingMintFailure::MessageCannotMint)
         }
 
-        CctpError::MintNotFoundInScanWindow { .. } => {
-            Some(RepeatingMintFailure::MintOutsideScanWindow)
-        }
+        CctpError::MintNotFoundInScanWindow {
+            from_block_timestamp,
+            ..
+        } => mint_can_lie_below_scan_floor(*from_block_timestamp, initiated_at)
+            .then_some(RepeatingMintFailure::MintOutsideScanWindow),
 
         CctpError::Evm(_)
         | CctpError::Contract(_)
@@ -468,6 +482,7 @@ fn repeating_mint_failure(error: &CctpError) -> Option<RepeatingMintFailure> {
         | CctpError::RecoveredMintLogMissingTxHash { .. }
         | CctpError::RecoveredMintReceiptReverted { .. }
         | CctpError::RecoveredMintAndWithdrawEventNotFound { .. }
+        | CctpError::MintScanFloorBlockMissing { .. }
         | CctpError::MintRecoveryInconclusive { .. }
         | CctpError::FeeCalculationOverflow
         | CctpError::Float(_)
@@ -480,12 +495,15 @@ fn repeating_mint_failure(error: &CctpError) -> Option<RepeatingMintFailure> {
 }
 
 /// Whether an inconclusive mint recovery read the nonce used but found no
-/// `MessageReceived` log in its bounded scan. No retry scans wider, so the
-/// caller parks; every other cause may clear on a redrive. Exhaustive so a
-/// new `CctpError` needs a decision.
-fn recovery_mint_outside_scan(recovery_error: &CctpError) -> bool {
+/// `MessageReceived` log in a bounded scan whose floor the mint can lie
+/// below. No retry scans wider, so the caller parks; every other cause may
+/// clear on a redrive. Exhaustive so a new `CctpError` needs a decision.
+fn recovery_mint_outside_scan(recovery_error: &CctpError, initiated_at: DateTime<Utc>) -> bool {
     match recovery_error {
-        CctpError::AlreadyMintedMessageNotFound { .. } => true,
+        CctpError::MintNotFoundInScanWindow {
+            from_block_timestamp,
+            ..
+        } => mint_can_lie_below_scan_floor(*from_block_timestamp, initiated_at),
 
         CctpError::Evm(_)
         | CctpError::Contract(_)
@@ -500,12 +518,13 @@ fn recovery_mint_outside_scan(recovery_error: &CctpError) -> bool {
         | CctpError::MessageTooShort { .. }
         | CctpError::MessageDestinationDomainMismatch { .. }
         | CctpError::MessageTooShortForRecovery { .. }
-        | CctpError::MintNotFoundInScanWindow { .. }
+        | CctpError::MintScanFloorBlockMissing { .. }
         | CctpError::MessageSentEventNotFound { .. }
         | CctpError::MintAndWithdrawEventNotFound
         | CctpError::TxReceiptMissingBlock { .. }
         | CctpError::UsdcCreditOverflow { .. }
         | CctpError::UsdcTransferLogDecode { .. }
+        | CctpError::AlreadyMintedMessageNotFound { .. }
         | CctpError::RecoveredMintMessageMismatch { .. }
         | CctpError::RecoveredMintLogMissingTxHash { .. }
         | CctpError::RecoveredMintReceiptReverted { .. }
@@ -998,7 +1017,7 @@ impl<
                 .await),
             // Adoption needs the re-polled message, so a repeating failure
             // would redrive in `Attested` forever with no CLI exit.
-            Ok(true) if repeating_mint_failure(&error).is_some() => {
+            Ok(true) if repeating_mint_failure(&error, initiated_at).is_some() => {
                 let reason = format!("Circle re-poll failed on a consumed nonce: {error}");
                 Err(self
                     .latch_unresolvable_mint(
@@ -3024,7 +3043,8 @@ impl<
     /// `recover_from_bridging_failed`'s own next attempt), which again adopts
     /// only the mint of this transfer's own nonce. The exception is
     /// `recover_from_bridging_failed` finding no `MessageReceived` log for a
-    /// used nonce: no retry scans wider, so it pages and parks instead of
+    /// used nonce under a floor mined after the transfer started: the mint can
+    /// lie below it and no retry scans wider, so it pages and parks instead of
     /// calling this.
     ///
     /// BOUNDED BY A DEADLINE, mirroring `WithdrawalPollInconclusive`: every call
@@ -3077,8 +3097,9 @@ impl<
     /// can never succeed latches `BridgingFailed`, which keeps the burn and
     /// nonce, so `transfer reconcile --kind usdc` can settle it: a message that
     /// cannot mint on this chain via [`Self::latch_unmintable_message`], a
-    /// consumed nonce whose mint is not in the bounded scan via
-    /// [`Self::latch_mint_outside_scan_window`].
+    /// consumed nonce whose mint can lie below the bounded scan's floor via
+    /// [`Self::latch_mint_outside_scan_window`]. A floor mined before the
+    /// transfer started covers the mint, so a missing log there redrives.
     async fn handle_mint_scan_failure(
         &self,
         id: &UsdcRebalanceId,
@@ -3088,13 +3109,13 @@ impl<
         call_site: MintScanCallSite,
         initiated_at: DateTime<Utc>,
     ) -> UsdcTransferError {
-        let Some(repeating_failure) = repeating_mint_failure(&error) else {
+        let Some(repeating_failure) = repeating_mint_failure(&error, initiated_at) else {
             warn!(
                 target: "rebalance",
                 %id,
                 %call_site,
                 "CCTP mint lookup failed while resuming from Attested; \
-                 nonce state unknown, will retry: {error}"
+                 nonce state unknown or mint log not yet visible, will retry: {error}"
             );
             return UsdcTransferError::MintRecoveryInconclusive {
                 id: id.clone(),
@@ -3171,7 +3192,7 @@ impl<
     }
 
     /// Latches a post-burn `BridgingFailed` (burn and nonce kept) for a
-    /// consumed nonce whose mint is not in the bounded scan, and pages in both
+    /// consumed nonce whose mint can lie below the bounded scan, and pages in both
     /// directions: only an operator can find that mint. A BaseToAlpaca job ends
     /// here, since its `BridgingFailed` recovery scans no wider and can only
     /// page again and park.
@@ -3835,7 +3856,8 @@ impl<
     /// `BridgingFailed` is still surfaced for manual reconciliation. When an
     /// attestation was recorded, the re-polled nonce must be `cctp_nonce`: a
     /// mismatch is refused on every retry, never minted. A used nonce whose mint
-    /// is outside the recovery scan pages and parks for reconciliation.
+    /// can lie below the recovery scan's floor pages and parks for
+    /// reconciliation; under a floor that covers the transfer it redrives.
     async fn recover_from_bridging_failed(
         &self,
         id: &UsdcRebalanceId,
@@ -3908,8 +3930,10 @@ impl<
         {
             Ok(receipt) => receipt,
             // The nonce is used but its mint is not in the scan after the lag
-            // retries: the Attested resume's out-of-window case. No retry
-            // scans wider, so page once per run and park instead of redriving.
+            // retries, and the floor was mined after the transfer started:
+            // the Attested resume's out-of-window case. No retry scans wider,
+            // so page once per run and park instead of redriving. Under an
+            // older floor the log is index lag and redrives below.
             //
             // Any other inconclusive recovery mirrors the same arm in
             // `execute_cctp_mint`/`execute_cctp_mint_on_ethereum`: whether/how
@@ -3927,7 +3951,7 @@ impl<
             // scan is bounded by `RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS` on the
             // bridge side.
             Err(CctpError::MintRecoveryInconclusive { recovery_error }) => {
-                let outside_scan = recovery_mint_outside_scan(&recovery_error);
+                let outside_scan = recovery_mint_outside_scan(&recovery_error, initiated_at);
                 let error = CctpError::MintRecoveryInconclusive { recovery_error };
                 if outside_scan {
                     warn!(target: "rebalance", %id, "Mint of the used nonce is outside the recovery scan; parking for operator reconciliation: {error}");
@@ -6086,7 +6110,8 @@ mod tests {
     /// `execute_cctp_mint_on_ethereum`/`recover_from_bridging_failed` do not
     /// declare `FailBridging` on that error class: the wrapped cause picks a
     /// redrive (e.g. `ScanInconclusive`) or, in `recover_from_bridging_failed`,
-    /// a page and park (`AlreadyMintedMessageNotFound`).
+    /// a page and park (`MintNotFoundInScanWindow` whose floor the mint can
+    /// lie below).
     ///
     /// Generic over `InnerBridge` (rather than a unit struct with
     /// `unimplemented!()` methods) because `recover_from_bridging_failed`
@@ -19098,14 +19123,19 @@ mod tests {
         );
     }
 
-    /// A consumed nonce whose mint the recovery scan cannot find (the lag
-    /// retries are spent) is the Attested resume's out-of-window case: no
-    /// retry scans wider, so the recovery pages the operator and parks the
-    /// transfer instead of redriving forever.
+    /// Resumes a post-burn Base->Alpaca `BridgingFailed` whose idempotent
+    /// mint reports `MintRecoveryInconclusive` wrapping `recovery_error()`.
+    /// Returns the resume error, the aggregate id and its `initiated_at`, and
+    /// the state the aggregate is left in.
     #[cfg(feature = "test-support")]
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn recover_from_bridging_failed_parks_a_mint_outside_the_recovery_scan() {
+    async fn resume_bridging_failed_with_mint_recovery_error(
+        recovery_error: fn() -> CctpError,
+    ) -> (
+        UsdcTransferError,
+        UsdcRebalanceId,
+        DateTime<Utc>,
+        UsdcRebalance,
+    ) {
         let server = MockServer::start();
         let _attestation_mock = mock_complete_attestation(&server);
 
@@ -19160,9 +19190,7 @@ mod tests {
             alpaca_wallet,
             Arc::new(MintErrorBridge {
                 inner: real_cctp_bridge,
-                recovery_error: || CctpError::AlreadyMintedMessageNotFound {
-                    nonce: B256::repeat_byte(0x07),
-                },
+                recovery_error,
             }),
             Arc::new(vault_service),
             cqrs.clone(),
@@ -19174,10 +19202,37 @@ mod tests {
             BotGasReceiptCostEnqueuer::Disabled,
         );
 
+        let initiated_at = match cqrs.load(&id).await.unwrap().expect("aggregate exists") {
+            UsdcRebalance::BridgingFailed { initiated_at, .. } => initiated_at,
+            other => panic!("expected BridgingFailed state, got: {other:?}"),
+        };
+
         let error = manager
             .resume_base_to_alpaca(&id, amount)
             .await
             .unwrap_err();
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+
+        (error, id, initiated_at, state)
+    }
+
+    /// A consumed nonce whose mint the recovery scan cannot find (the lag
+    /// retries are spent), under a floor mined after the transfer started,
+    /// can lie below that floor: no retry scans wider, so the recovery pages
+    /// the operator and parks the transfer instead of redriving forever.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn recover_from_bridging_failed_parks_a_mint_outside_the_recovery_scan() {
+        let (error, id, _, state) = resume_bridging_failed_with_mint_recovery_error(|| {
+            CctpError::MintNotFoundInScanWindow {
+                nonce: B256::repeat_byte(0x07),
+                from_block: 100,
+                from_block_timestamp: u64::MAX,
+            }
+        })
+        .await;
 
         assert!(
             matches!(
@@ -19186,7 +19241,6 @@ mod tests {
             ),
             "a mint no retry can find must park, not redrive; got: {error:?}"
         );
-        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(state, UsdcRebalance::BridgingFailed { .. }),
             "the transfer must stay BridgingFailed for reconciliation; got: {state:?}"
@@ -19199,6 +19253,40 @@ mod tests {
             "find the mint of the recorded nonce on chain, then settle it with \
              `transfer reconcile --kind usdc`"
         ));
+    }
+
+    /// A recovery scan whose floor was mined before the transfer started
+    /// covers every block the mint can be in, so a used nonce with no visible
+    /// log is index lag: the recovery redrives instead of parking.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn recover_from_bridging_failed_redrives_a_lagging_log_in_a_covering_scan() {
+        let (error, id, initiated_at, state) =
+            resume_bridging_failed_with_mint_recovery_error(|| {
+                CctpError::MintNotFoundInScanWindow {
+                    nonce: B256::repeat_byte(0x07),
+                    from_block: 0,
+                    from_block_timestamp: 0,
+                }
+            })
+            .await;
+
+        let UsdcTransferError::MintRecoveryInconclusive {
+            id: err_id,
+            initiated_at: err_initiated_at,
+            ..
+        } = error
+        else {
+            panic!("a lagging log in a covering scan must redrive; got: {error:?}");
+        };
+        assert_eq!(err_id, id);
+        assert_eq!(err_initiated_at, initiated_at);
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "the transfer must stay BridgingFailed; got: {state:?}"
+        );
+        assert!(!logs_contain("operational_alert"));
     }
 
     /// Resumes an `Attested` transfer in `direction` whose pre-mint
@@ -19397,9 +19485,11 @@ mod tests {
         direction: RebalanceDirection,
     ) -> (UsdcTransferError, UsdcRebalanceId) {
         let (error, id, _, state) = resume_attested_with_failing_mint_lookup(direction, || {
+            // Mined after the transfer started, so the mint can lie below it.
             CctpError::MintNotFoundInScanWindow {
                 nonce: B256::repeat_byte(0x07),
                 from_block: 100,
+                from_block_timestamp: u64::MAX,
             }
         })
         .await;
@@ -19479,7 +19569,7 @@ mod tests {
         assert!(
             matches!(
                 *cctp_error,
-                CctpError::MintNotFoundInScanWindow { nonce, from_block: 100 }
+                CctpError::MintNotFoundInScanWindow { nonce, from_block: 100, .. }
                     if nonce == B256::repeat_byte(0x07)
             ),
             "got: {cctp_error:?}"
@@ -19501,6 +19591,7 @@ mod tests {
                 CctpError::MintNotFoundInScanWindow {
                     nonce: B256::repeat_byte(0x07),
                     from_block: 0,
+                    from_block_timestamp: 0,
                 }
             })
             .await;

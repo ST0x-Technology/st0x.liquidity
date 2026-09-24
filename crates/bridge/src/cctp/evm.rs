@@ -98,6 +98,7 @@ const RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS: u64 = 3;
 /// head, below a captured scan floor too: that floor is read after Circle
 /// attests, so a relayer's mint can predate it. A mint older than both is left
 /// to the operator rather than found by a scan to genesis on every resume.
+/// Only a transfer that started before the floor block was mined can have one.
 const MINT_SCAN_LOOKBACK_CHUNKS: u64 = 3;
 
 /// Delay between the `usedNonces()` probes that
@@ -941,8 +942,9 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// The log scan for a consumed nonce is floored at the lower of
     /// `scan_from_block` and [`MINT_SCAN_LOOKBACK_CHUNKS`] below the head.
     /// A log still missing after the lag retries is
-    /// [`CctpError::MintNotFoundInScanWindow`]: every resume would otherwise
-    /// repeat a walk to genesis.
+    /// [`CctpError::MintNotFoundInScanWindow`], which carries the floor
+    /// block's timestamp so the caller can tell index lag from a mint below
+    /// the floor. The scan never walks to genesis.
     pub(super) async fn find_existing_mint<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
@@ -971,22 +973,9 @@ impl<W: Wallet> CctpEndpoint<W> {
         let from_block =
             scan_from_block.map_or(lookback_floor, |captured| captured.min(lookback_floor));
 
-        match self
-            .locate_mint_receipt_with_lag_retries(&received_message, from_block)
+        self.locate_mint_in_scan_window(&received_message, from_block)
             .await
-        {
-            Ok(mint_receipt) => Ok(Some(mint_receipt)),
-            Err(CctpError::AlreadyMintedMessageNotFound { nonce }) => {
-                warn!(
-                    target: "bridge",
-                    %nonce,
-                    from_block,
-                    "CCTP nonce consumed but its mint is not in the scan window"
-                );
-                Err(CctpError::MintNotFoundInScanWindow { nonce, from_block })
-            }
-            Err(other_error) => Err(other_error),
-        }
+            .map(Some)
     }
 
     /// Cheap authoritative gate: `true` once `nonce` has been consumed on this
@@ -1120,8 +1109,49 @@ impl<W: Wallet> CctpEndpoint<W> {
             CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS),
         );
 
-        self.locate_mint_receipt_with_lag_retries(received_message, min_block)
+        self.locate_mint_in_scan_window(received_message, min_block)
             .await
+    }
+
+    /// [`locate_mint_receipt_with_lag_retries`](Self::locate_mint_receipt_with_lag_retries),
+    /// reporting a log still missing as [`CctpError::MintNotFoundInScanWindow`]
+    /// with the timestamp of `from_block`. A mint cannot land before its
+    /// transfer starts, so a floor mined earlier than that start proves the
+    /// scan covers the mint and the missing log is index lag.
+    async fn locate_mint_in_scan_window(
+        &self,
+        received_message: &CctpReceivedMessage<'_>,
+        from_block: u64,
+    ) -> Result<MintReceipt, CctpError> {
+        let nonce = match self
+            .locate_mint_receipt_with_lag_retries(received_message, from_block)
+            .await
+        {
+            Err(CctpError::AlreadyMintedMessageNotFound { nonce }) => nonce,
+            located => return located,
+        };
+
+        let from_block_timestamp = self
+            .wallet
+            .provider()
+            .get_block_by_number(from_block.into())
+            .await?
+            .ok_or(CctpError::MintScanFloorBlockMissing { block: from_block })?
+            .header
+            .timestamp;
+
+        warn!(
+            target: "bridge",
+            %nonce,
+            from_block,
+            from_block_timestamp,
+            "CCTP nonce consumed but its mint is not in the scan window"
+        );
+        Err(CctpError::MintNotFoundInScanWindow {
+            nonce,
+            from_block,
+            from_block_timestamp,
+        })
     }
 
     /// [`locate_mint_receipt`](Self::locate_mint_receipt), retrying only
