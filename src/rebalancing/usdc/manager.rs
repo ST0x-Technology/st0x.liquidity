@@ -5049,6 +5049,16 @@ mod tests {
         // `send_alpaca_deposit_enqueues_wallet_transfer_bot_gas_job` opts in via
         // `with_send_usdc_tx`.
         send_usdc_tx: Option<TxHash>,
+        ledger_probe: Option<LedgerBalanceProbe>,
+    }
+
+    /// Answers the credit ledger's wallet balance read with `balance` and
+    /// records the state `id` was in at that moment.
+    struct LedgerBalanceProbe {
+        store: Arc<Store<UsdcRebalance>>,
+        id: UsdcRebalanceId,
+        balance: U256,
+        seen: Mutex<Vec<UsdcRebalance>>,
     }
 
     impl MockBridge {
@@ -5061,7 +5071,31 @@ mod tests {
                 confirm_revert_count: 1,
                 burn_status: None,
                 send_usdc_tx: None,
+                ledger_probe: None,
             }
+        }
+
+        fn with_ledger_probe(
+            mut self,
+            store: Arc<Store<UsdcRebalance>>,
+            id: UsdcRebalanceId,
+            balance: U256,
+        ) -> Self {
+            self.ledger_probe = Some(LedgerBalanceProbe {
+                store,
+                id,
+                balance,
+                seen: Mutex::new(Vec::new()),
+            });
+            self
+        }
+
+        fn states_seen_by_ledger(&self) -> Vec<UsdcRebalance> {
+            let Some(probe) = &self.ledger_probe else {
+                panic!("MockBridge: no ledger probe configured");
+            };
+
+            probe.seen.lock().unwrap().clone()
         }
 
         fn with_submit_delay(
@@ -5225,7 +5259,13 @@ mod tests {
         }
 
         async fn ethereum_usdc_balance(&self, _holder: Address) -> Result<U256, CctpError> {
-            unimplemented!("MockBridge: ethereum_usdc_balance not used in this test")
+            let Some(probe) = &self.ledger_probe else {
+                unimplemented!("MockBridge: ethereum_usdc_balance not used in this test")
+            };
+
+            let state = probe.store.load(&probe.id).await.unwrap().unwrap();
+            probe.seen.lock().unwrap().push(state);
+            Ok(probe.balance)
         }
 
         async fn ethereum_usdc_credit(
@@ -17229,6 +17269,47 @@ mod tests {
     /// their own `MockBridge` so only the test that actually sends USDC on
     /// Ethereum opts into a canned response (see `MockBridge::with_send_usdc_tx`);
     /// every other caller keeps the default `unimplemented!()` guard.
+    /// The ledger check before the first burn runs while the transfer is
+    /// still `WithdrawalComplete`, which a restart redrives safely. After
+    /// `BeginBridging` with no recorded burn, a restart fails closed.
+    #[tokio::test]
+    async fn first_burn_checks_the_credit_ledger_before_begin_bridging() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        advance_to_withdrawal_complete_alpaca_to_base_with_tx(
+            &cqrs,
+            &id,
+            amount,
+            TxHash::from([9u8; 32]),
+        )
+        .await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new()
+            .with_confirm_revert_count(0)
+            .with_ledger_probe(cqrs.clone(), id.clone(), amount_u256);
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+        let manager = manager.with_credit_ledger(pool);
+
+        manager
+            .execute_cctp_burn_on_ethereum(&id, amount_u256, Some(1))
+            .await
+            .unwrap();
+
+        let seen = manager.cctp_bridge.states_seen_by_ledger();
+        assert_eq!(seen.len(), 1, "one ledger check per burn; got: {seen:?}");
+        assert!(
+            matches!(seen[0], UsdcRebalance::WithdrawalComplete { .. }),
+            "the ledger check must run before BeginBridging; got: {seen:?}"
+        );
+    }
+
     async fn manager_with_bot_gas_queue<Signer: Wallet + Clone>(
         cqrs: Arc<Store<UsdcRebalance>>,
         wallet: Signer,
