@@ -463,20 +463,23 @@ pub(crate) enum PendingRecoveryAction {
     /// under the same `client_order_id` this adopts the existing broker order
     /// rather than creating a second one.
     Replay,
-    /// Retire the intent without contacting the broker again: `process-tx`
-    /// recorded it before admission and the broker never received it.
+    /// Retire the intent without replaying its stored terms: a current broker
+    /// lookup found no order under its `client_order_id`. That is not proof the
+    /// broker never recorded it, so the id stays the idempotency anchor.
     Retire,
 }
 
 /// Classifies an orphaned `Pending` intent before a recovery path acts on it.
 ///
 /// `process-tx` records the position claim and the `Pending` intent before
-/// broker admission runs, so a crash in that window leaves an intent the
-/// broker never saw. Replaying it would resend stale shares and reservation
-/// terms with no fresh preflight (ADR 0022), so such an intent is reconciled
-/// against the broker first: an order under the same `client_order_id` proves
-/// the placement did reach the broker and is adopted by the ordinary replay,
-/// while a confirmed absence retires it.
+/// broker admission runs, so a crash leaves an intent the broker may or may
+/// not have received: the POST can succeed before its outcome is persisted.
+/// Replaying it would resend stale shares and reservation terms with no fresh
+/// preflight (ADR 0022), so such an intent is reconciled against the broker
+/// first: an order under the same `client_order_id` proves the placement did
+/// reach the broker and is adopted by the ordinary replay, while a lookup miss
+/// retires it. A miss is only a current not found answer, not proof of
+/// absence, so the retirement keeps the id as the idempotency anchor.
 ///
 /// A live pipeline intent keeps the ordinary replay, as does any executor with
 /// no order lookup of its own -- the same executor gate
@@ -503,11 +506,11 @@ pub(crate) async fn classify_pending_recovery(
 }
 
 /// The durable reason persisted on an intent retired by
-/// [`retire_never_sent_pending`].
+/// [`retire_unconfirmed_pending`].
 pub(crate) const NEVER_SENT_PROCESS_TX_REASON: &str =
     "process-tx intent retired: the broker holds no order under its client order id";
 
-/// Failures from retiring a never sent `process-tx` placement intent.
+/// Failures from retiring an unconfirmed `process-tx` placement intent.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RetirePendingError {
     #[error("failed to retire the never sent offchain order: {0}")]
@@ -516,12 +519,14 @@ pub(crate) enum RetirePendingError {
     Position(#[from] SendError<Position>),
 }
 
-/// Retires a `process-tx` placement intent the broker never received: drives
-/// the order to a `Deferral` terminal and clears the position claim, releasing
-/// the id rather than keeping it as an idempotency anchor for an order that was
-/// never created (ADR 0022). The standing `CheckPositions` pipeline then
-/// re-hedges the exposure from a fresh preflight.
-pub(crate) async fn retire_never_sent_pending(
+/// Retires a `process-tx` placement intent that a broker lookup did not find:
+/// drives the order to a `Deferral` terminal and clears the position claim
+/// (ADR 0022). The lookup cannot prove the broker never recorded the order, so
+/// the id is preserved as the idempotency anchor: a fresh `client_order_id`
+/// would let a second order through if the original POST did succeed. The
+/// next hedge for the symbol goes through the standard anchor reconciliation
+/// before any fresh placement, which then runs from a fresh preflight.
+pub(crate) async fn retire_unconfirmed_pending(
     offchain_order: &Store<OffchainOrder>,
     position: &Store<Position>,
     symbol: &Symbol,
@@ -542,7 +547,7 @@ pub(crate) async fn retire_never_sent_pending(
             PositionCommand::FailOffChainOrder {
                 offchain_order_id,
                 error: NEVER_SENT_PROCESS_TX_REASON.to_owned(),
-                anchor: AnchorDisposition::Release,
+                anchor: AnchorDisposition::Preserve,
                 kind: OffchainOrderFailureKind::Deferral,
             },
         )

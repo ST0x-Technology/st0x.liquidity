@@ -60,26 +60,35 @@ pipeline placement are unchanged, and `process-tx` sets `ProcessTx`. Both
 recovery paths, `recover_single_orphaned_order` and
 `recover_pending_poll_status`, reconcile a `ProcessTx` `Pending` against the
 broker by `client_order_id` before acting on it. An order under that key proves
-the placement did reach the broker, so the ordinary replay adopts it. A
-confirmed absence means the broker never received it, so it is retired: the
-order fails with the `Deferral` kind and the claim is cleared, releasing the id
-rather than keeping it as an anchor for an order that was never created. A
-lookup that cannot be answered leaves the intent claimed for the next sweep,
-since neither replaying nor retiring is safe without an answer. An executor with
-no order lookup keeps the ordinary replay, the same gate
-`reconcile_failed_anchor` uses. Only `Pending` is the crash window: an order
-that reached `Submitted` or `Accepted` is driven by the poll path instead.
+the placement did reach the broker, so the ordinary replay adopts it. A lookup
+that finds nothing retires it: the order fails with the `Deferral` kind and the
+claim is cleared. A current not found answer is not proof the broker never
+recorded the order, because the POST can succeed before its outcome is persisted
+and the lookup endpoint does not guarantee retention, so the id is kept as the
+idempotency anchor. The next hedge for the symbol then goes through the standard
+anchor reconciliation instead of minting a fresh client order id the broker
+could not dedupe against the original. A lookup that cannot be answered leaves
+the intent claimed for the next sweep, since neither replaying nor retiring is
+safe without an answer. An executor with no order lookup keeps the ordinary
+replay, the same gate `reconcile_failed_anchor` uses. Only `Pending` is the
+crash window: an order that reached `Submitted` or `Accepted` is driven by the
+poll path instead.
 
 ## Consequences
 
 - A `process-tx` deferral never leaves stale shares or reservation terms for a
   recovery path to replay: the claim is cleared on the deferral itself, and an
-  intent stranded by a crash in the admission window is retired once the broker
-  confirms it holds nothing under the client order id. The next hedge is always
-  sized by a fresh preflight.
-- A never sent order id is not kept as the idempotency anchor. Releasing it
-  stops `CheckPositions` from skipping the position and scheduling an anchor
+  intent stranded by a crash in the admission window is retired once a broker
+  lookup finds nothing under the client order id. The next hedge is always sized
+  by a fresh preflight.
+- An order id retired on the deferral itself, whose broker call provably never
+  ran, is not kept as the idempotency anchor. Releasing it stops
+  `CheckPositions` from skipping the position and scheduling an anchor
   reconciliation lookup at the broker for an order that was never created.
+- An intent retired by recovery keeps its id as the anchor, since the lookup
+  cannot prove the broker never saw it. The cost is one anchor reconciliation
+  cycle before the next fresh hedge; releasing it instead risks a second live
+  order.
 - The durable additions are small and default safe: the
   `OffchainOrderFailureKind` field on the `Failed` event and the
   `PlacementProvenance` field on the `Placed` event and `PlaceReserved` command.

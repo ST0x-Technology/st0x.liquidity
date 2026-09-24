@@ -41,7 +41,7 @@ use crate::offchain::order::{
     OffchainOrderPlacement, OrderPlacer, PendingRecoveryAction, PollOrderStatusJobQueue,
     classify_pending_recovery, client_order_id_for_placement,
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
-    push_poll_job_if_absent, retire_never_sent_pending,
+    push_poll_job_if_absent, retire_unconfirmed_pending,
 };
 use crate::position::{AnchorDisposition, Position, PositionCommand, PositionError};
 use crate::position_check::{CheckPositions, CheckPositionsJobQueue};
@@ -1221,8 +1221,8 @@ async fn recover_pending_poll_status(
             // may be one the broker never received (ADR 0022). Reconcile it
             // against the broker before pricing or replaying stale terms: an
             // order under the same key is adopted by the re-drive below, a
-            // confirmed absence retires the intent so the standing position
-            // check re-hedges from a fresh preflight.
+            // lookup miss retires the intent while keeping its id as the
+            // idempotency anchor.
             match classify_pending_recovery(
                 ctx.order_placer.as_ref(),
                 executor,
@@ -1238,9 +1238,9 @@ async fn recover_pending_poll_status(
                         symbol = %symbol,
                         %pending_id,
                         "process-tx placement intent has no broker order under its client order \
-                         id -- retiring it so the position check re-hedges from a fresh preflight"
+                         id -- retiring it and keeping the id as the idempotency anchor"
                     );
-                    retire_never_sent_pending(
+                    retire_unconfirmed_pending(
                         &ctx.offchain_order,
                         &ctx.position,
                         &symbol,
@@ -9066,7 +9066,12 @@ mod tests {
         assert_eq!(kind, OffchainOrderFailureKind::Deferral);
         let recovered_position = position_projection.load(&symbol).await.unwrap().unwrap();
         assert_eq!(recovered_position.pending_offchain_order_id, None);
-        assert_eq!(recovered_position.last_failed_offchain_order_id, None);
+        assert_eq!(
+            recovered_position.last_failed_offchain_order_id,
+            Some(order_id),
+            "a lookup miss is not proof the broker never saw the order, so its id \
+             must stay the idempotency anchor"
+        );
         assert_eq!(
             placements.load(Ordering::SeqCst),
             0,

@@ -86,7 +86,7 @@ use crate::offchain::order::{
     PollOrderStatusJobQueue, TerminalPositionFinalization, classify_pending_recovery,
     client_order_id_for_placement, finalize_cancelled_position_or_log_unpriced,
     place_offchain_order_at_broker, position_command_for_finalization, push_poll_job_if_absent,
-    retire_never_sent_pending, terminal_position_finalization,
+    retire_unconfirmed_pending, terminal_position_finalization,
 };
 #[cfg(test)]
 use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
@@ -4110,10 +4110,10 @@ fn is_pre_wrap_held_for_recovery(
 ///   position and records the intent before broker admission runs, so the
 ///   intent may be one the broker never received (ADR 0022). It is reconciled
 ///   against the broker by `client_order_id` first: an order under that key is
-///   adopted by the ordinary re-drive, while a confirmed absence retires the
-///   intent as a `Deferral` and clears the claim, leaving the standing position
-///   check to re-hedge from a fresh preflight instead of replaying stale shares
-///   and reservation terms.
+///   adopted by the ordinary re-drive, while a lookup miss retires the intent as
+///   a `Deferral` and clears the claim instead of replaying stale shares and
+///   reservation terms. A miss is not proof of absence, so the id stays the
+///   idempotency anchor and the next hedge goes through anchor reconciliation.
 ///
 /// Called at startup (`Conductor::start`) and on every periodic `CheckPositions`
 /// scan. A re-drive that reaches `Submitted` does not enqueue a poll itself: at
@@ -4249,9 +4249,9 @@ async fn recover_single_orphaned_order(
                     warn!(
                         %symbol, %order_id,
                         "process-tx placement intent has no broker order under its client order \
-                         id -- retiring it so the position check re-hedges from a fresh preflight"
+                         id -- retiring it and keeping the id as the idempotency anchor"
                     );
-                    retire_never_sent_pending(offchain_order, position, symbol, order_id).await?;
+                    retire_unconfirmed_pending(offchain_order, position, symbol, order_id).await?;
                     return Ok(());
                 }
                 Err(error) => {
@@ -5779,10 +5779,10 @@ async fn recover_claimed_offchain_order_for_symbol(
             // A `process-tx` intent is recorded before broker admission, so it
             // may be one the broker never received (ADR 0022). Reconcile it
             // against the broker before replaying stale terms: an order under
-            // the same key is adopted by the re-drive below, a confirmed
-            // absence retires the intent so the standing position check
-            // re-hedges from a fresh preflight, and a lookup that cannot be
-            // answered leaves the claim for the next sweep.
+            // the same key is adopted by the re-drive below, a lookup miss
+            // retires the intent while keeping its id as the idempotency
+            // anchor, and a lookup that cannot be answered leaves the claim
+            // for the next sweep.
             match classify_pending_recovery(
                 cqrs.order_placer.as_ref(),
                 executor,
@@ -5797,9 +5797,9 @@ async fn recover_claimed_offchain_order_for_symbol(
                         offchain_order_id = %pending_id,
                         symbol = %position_symbol,
                         "process-tx placement intent has no broker order under its client order \
-                         id -- retiring it so the position check re-hedges from a fresh preflight"
+                         id -- retiring it and keeping the id as the idempotency anchor"
                     );
-                    retire_never_sent_pending(
+                    retire_unconfirmed_pending(
                         &cqrs.offchain_order,
                         &cqrs.position,
                         position_symbol,
@@ -15768,8 +15768,10 @@ mod tests {
             .unwrap();
         assert_eq!(recovered_position.pending_offchain_order_id, None);
         assert_eq!(
-            recovered_position.last_failed_offchain_order_id, None,
-            "an id the broker never saw must not be kept as the idempotency anchor"
+            recovered_position.last_failed_offchain_order_id,
+            Some(fixture.offchain_order_id),
+            "a lookup miss is not proof the broker never saw the order, so its id \
+             must stay the idempotency anchor"
         );
         assert_eq!(
             placements.load(Ordering::SeqCst),
@@ -16088,8 +16090,10 @@ mod tests {
         let recovered_position = cqrs.position.load(&symbol).await.unwrap().unwrap();
         assert_eq!(recovered_position.pending_offchain_order_id, None);
         assert_eq!(
-            recovered_position.last_failed_offchain_order_id, None,
-            "an id the broker never saw must not be kept as the idempotency anchor"
+            recovered_position.last_failed_offchain_order_id,
+            Some(pending_id),
+            "a lookup miss is not proof the broker never saw the order, so its id \
+             must stay the idempotency anchor"
         );
     }
 
