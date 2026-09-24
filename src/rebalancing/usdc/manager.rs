@@ -10373,6 +10373,57 @@ mod tests {
         assert_eq!(attestation_mock.calls(), 1);
     }
 
+    /// An AlpacaToBase retry finds the latched `BridgingFailed` and does not
+    /// alert, so a legacy re-poll nonce mismatch must page at the latch.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn alpaca_to_base_legacy_repoll_nonce_mismatch_pages_the_operator() {
+        let server = MockServer::start();
+        let attestation_mock = mock_complete_attestation(&server);
+
+        let (manager, cqrs, _anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_attested_alpaca_to_base(&cqrs, &id, usdc("100")).await;
+        let burn_tx =
+            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000001");
+
+        // Circle answers with nonce 1 (`mock_complete_attestation`).
+        let recorded = B256::left_padding_from(&999u64.to_be_bytes());
+        let error = manager
+            .attested_attestation_response(
+                &id,
+                BridgeDirection::EthereumToBase,
+                burn_tx,
+                vec![0x01],
+                recorded,
+                None,
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AttestationNonceMismatch { recorded: error_recorded, reconstructed, .. }
+                    if error_recorded == recorded && reconstructed == valid_message_nonce()
+            ),
+            "got: {error:?}",
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "got: {state:?}",
+        );
+        assert_eq!(attestation_mock.calls(), 1);
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the attested CCTP message does not match the recorded nonce"
+        )));
+    }
+
     #[tokio::test]
     async fn resume_base_to_alpaca_from_pre_burn_failure_returns_previously_failed_error() {
         let server = MockServer::start();
