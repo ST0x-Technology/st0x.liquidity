@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use alloy::primitives::U256;
+use alloy::primitives::{TxHash, U256};
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -1594,6 +1594,13 @@ fn is_failure_command_refusal<Entity: st0x_event_sorcery::EventSourced>(
     }
 }
 
+/// Optional `transfer recheck` input: the Alpaca deposit send an operator
+/// found on chain for a USDC deposit that failed with no send recorded.
+#[derive(Deserialize, Default)]
+struct RecheckQuery {
+    deposit_tx: Option<TxHash>,
+}
+
 /// Re-checks a single failed (or active) transfer against the tokenization
 /// provider, recovering it in-process so the live inventory view is corrected.
 ///
@@ -1609,6 +1616,7 @@ fn is_failure_command_refusal<Entity: st0x_event_sorcery::EventSourced>(
 async fn recheck_transfer(
     State(state): State<AppState>,
     Path((kind_str, id)): Path<(String, String)>,
+    Query(query): Query<RecheckQuery>,
 ) -> Result<Json<RecheckResponse>, (StatusCode, Json<ErrorResponse>)> {
     let kind = TransferKind::from_str(&kind_str).map_err(|error| {
         (
@@ -1618,6 +1626,15 @@ async fn recheck_transfer(
             }),
         )
     })?;
+
+    if query.deposit_tx.is_some() && kind != TransferKind::UsdcBridge {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "deposit_tx applies only to a USDC recheck".to_string(),
+            }),
+        ));
+    }
 
     let _guard = state.resume_lock.0.try_lock().map_err(|_| {
         (
@@ -1682,7 +1699,7 @@ async fn recheck_transfer(
 
             let outcome = handle
                 .usdc_recheck
-                .recheck_deposit(&rebalance_id)
+                .recheck_deposit(&rebalance_id, query.deposit_tx)
                 .await
                 .map_err(|error| {
                     error!(?error, %id, "Failed to recheck USDC deposit");
@@ -1749,14 +1766,27 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
 /// equity recheck contract.
 fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String) {
     use UsdcRecheckError::{
-        Alpaca, AlpacaToBaseDeposit, NoOnchainDepositRef, NotDepositFailed, NotFound, Transfer,
+        Alpaca, AlpacaToBaseDeposit, DepositTxAmountMismatch, DepositTxConflict, DepositTxLookup,
+        DepositTxRead, DepositTxRecordedElsewhere, DepositTxUnchecked, NoOnchainDepositRef,
+        NotDepositFailed, NotFound, Transfer,
     };
 
     match error {
         NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
-        AlpacaToBaseDeposit(_) | NoOnchainDepositRef(_) | NotDepositFailed { .. } => {
-            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
-        }
+        AlpacaToBaseDeposit(_)
+        | NoOnchainDepositRef(_)
+        | NotDepositFailed { .. }
+        | DepositTxConflict { .. }
+        | DepositTxRecordedElsewhere { .. }
+        | DepositTxAmountMismatch { .. } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        DepositTxRead { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Ethereum RPC unavailable; retry later".to_string(),
+        ),
+        DepositTxUnchecked(_) | DepositTxLookup { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to recheck transfer".to_string(),
+        ),
         // A parse failure is deterministic -- the same payload fails
         // identically on every retry -- so "retry later" would misguide;
         // only the transport/API failures are transient and keep the 502.

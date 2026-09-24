@@ -222,6 +222,7 @@ impl UsdcRebalanceStage {
             | DepositSendSubmitting { .. }
             | PendingDepositRecorded { .. }
             | DepositSendAborted { .. }
+            | DepositSendAttached { .. }
             | AttestationTimedOut { .. }
             | ConversionConfirmed { .. }
             | ConversionFailed { .. }
@@ -718,8 +719,9 @@ impl RebalancingService {
         // after a restart, where `recover_usdc_guard` reasserts the guard but
         // does not rebuild tracking -- we must NOT speculatively clear the guard
         // on a failure that could be post-burn. So:
-        //   - `DepositFailed` is only reachable from `DepositInitiated`
-        //     (post-mint), hence unconditionally post-burn.
+        //   - `DepositFailed` is only reachable after the mint (from
+        //     `DepositInitiated` or a BaseToAlpaca `Bridged`), hence
+        //     unconditionally post-burn.
         //   - `ConversionFailed` with tracking absent falls back to the durable
         //     `holds_rebalance_guard` classifier (the same one restart recovery
         //     uses): the BaseToAlpaca post-deposit leg preserves, the lost-track
@@ -885,7 +887,8 @@ impl RebalancingService {
             // in `BridgingSubmitting`, and `PendingBurnCleared` resets it before a
             // (re)broadcast; both stay in `BridgingSubmitting` and advance no
             // tracking stage. The deposit send events likewise stay in
-            // `Bridged` until `DepositInitiated`.
+            // `Bridged` until `DepositInitiated`, and `DepositSendAttached`
+            // stays in `DepositFailed`.
             WithdrawalSubmitting { .. }
             | BridgingSubmitting { .. }
             | PendingBurnRecorded { .. }
@@ -893,6 +896,7 @@ impl RebalancingService {
             | DepositSendSubmitting { .. }
             | PendingDepositRecorded { .. }
             | DepositSendAborted { .. }
+            | DepositSendAttached { .. }
             | AttestationTimedOut { .. } => UsdcSettlementOutcome::Reconciled,
             // Withdrawal failure is always pre-burn -> reconcile to source.
             WithdrawalFailed { .. } => self.cancel_tracked_usdc_rebalance(id).await?,

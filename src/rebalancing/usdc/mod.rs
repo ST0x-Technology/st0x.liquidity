@@ -501,8 +501,8 @@ pub enum UsdcTransferError {
     /// committed; the job pages and does not retry.
     #[error(
         "USDC rebalance {id}: {cause}; deposit marked failed for operator \
-         reconciliation (`transfer recheck` if Alpaca credited it, else \
-         `transfer reconcile --kind usdc`)"
+         reconciliation ({})",
+        .cause.operator_step()
     )]
     DepositSendUnresolved {
         id: UsdcRebalanceId,
@@ -515,7 +515,9 @@ pub enum UsdcTransferError {
     /// retry cannot see an unmined send and could send again.
     #[error(
         "USDC rebalance {id}: deposit send may be broadcast but its tx was not \
-         recorded (send tx {send_tx:?}); verify on chain before any resend"
+         recorded (send tx {}); `transfer resume --kind usdc` fails the deposit \
+         for reconciliation without sending again",
+        .send_tx.map_or_else(|| "unknown".to_string(), |send_tx| send_tx.to_string())
     )]
     DepositSendRecordFailed {
         id: UsdcRebalanceId,
@@ -547,6 +549,27 @@ pub enum UnresolvedDepositSend {
     /// Dropped from the mempool, but a dropped tx can still be rebroadcast.
     #[error("the recorded deposit send {tx} was dropped from the mempool")]
     RecordedSendDropped { tx: TxHash },
+}
+
+impl UnresolvedDepositSend {
+    /// The operator command that settles a deposit failed for this cause.
+    pub(crate) const fn operator_step(self) -> &'static str {
+        match self {
+            // No send is recorded on the transfer: the operator must find
+            // this transfer's own send on chain, if there is one.
+            Self::UnrecordedSend { .. } | Self::SubmitInconclusive | Self::SendNotRecorded => {
+                "`transfer recheck --kind usdc --deposit-tx <hash>` with this transfer's own \
+                 send if Alpaca credited it, else `transfer reconcile --kind usdc`"
+            }
+            Self::RecordedSendReverted { .. } => {
+                "the send moved no USDC; settle the minted USDC with `transfer reconcile --kind usdc`"
+            }
+            Self::RecordedSendDropped { .. } => {
+                "`transfer recheck --kind usdc` if the send was mined and Alpaca credited it, \
+                 else `transfer reconcile --kind usdc`"
+            }
+        }
+    }
 }
 
 impl UsdcTransferError {

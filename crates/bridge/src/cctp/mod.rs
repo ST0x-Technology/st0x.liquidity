@@ -1249,6 +1249,19 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self.ethereum.usdc_credited_in_tx(tx_hash, recipient).await
     }
 
+    /// Returns the USDC that `tx_hash` moved from `sender` to `recipient` on
+    /// Ethereum, once the tx has the wallet's required confirmations.
+    pub async fn ethereum_usdc_sent(
+        &self,
+        tx_hash: TxHash,
+        sender: Address,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        self.ethereum
+            .usdc_sent_in_tx(tx_hash, sender, recipient)
+            .await
+    }
+
     /// Broadcasts a transfer of `amount` (USDC smallest unit, 6 decimals) of
     /// Ethereum USDC from the bot wallet to `to` and returns its tx hash without
     /// awaiting the receipt, so the caller can record the hash first. A
@@ -6135,6 +6148,52 @@ mod tests {
     /// The deposit send is broadcast first and confirmed separately, so the
     /// caller can record the hash in between. A mined revert is reported as a
     /// status, since it moved no USDC and the caller decides what follows.
+    /// The operator-supplied deposit tx check: only USDC from the given sender
+    /// to the given recipient counts.
+    #[tokio::test]
+    async fn usdc_sent_counts_only_the_given_sender_and_recipient() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let sender = PrivateKeySigner::from_bytes(&private_key)
+            .unwrap()
+            .address();
+        let recipient = address!("0x000000000000000000000000000000000000bEEF");
+        let amount = U256::from(7_000_000u64);
+        let send_tx = bridge
+            .submit_usdc_on_ethereum(recipient, amount)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            bridge
+                .ethereum_usdc_sent(send_tx, sender, recipient)
+                .await
+                .unwrap(),
+            amount,
+        );
+        assert_eq!(
+            bridge
+                .ethereum_usdc_sent(send_tx, recipient, recipient)
+                .await
+                .unwrap(),
+            U256::ZERO,
+            "USDC from another sender does not count",
+        );
+    }
+
     #[tokio::test]
     async fn submitted_usdc_transfer_confirms_and_a_mined_revert_is_reported() {
         let (ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();

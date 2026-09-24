@@ -544,6 +544,10 @@ pub enum UsdcRebalanceCommand {
     /// ref. Driven by `transfer recheck` after verifying the exact transfer
     /// at Alpaca.
     RecoverDeposit,
+    /// Record an operator-verified deposit send on a BaseToAlpaca
+    /// `DepositFailed` that failed with no send recorded, so `transfer
+    /// recheck` can verify it at Alpaca. Valid only from that state.
+    AttachDepositSend { send_tx: TxHash },
     /// Reconcile a USDC rebalance stranded in the post-burn terminal
     /// `DepositFailed` state to a guard-clearing terminal `Reconciled` state.
     /// The minted USDC was handled out-of-band, so this resolves the transfer
@@ -722,6 +726,12 @@ pub enum UsdcRebalanceEvent {
     /// `BridgingCompletionRecovered`; recorded by `transfer recheck` after
     /// verifying the exact transfer at Alpaca.
     DepositCompletionRecovered { recovered_at: DateTime<Utc> },
+    /// An operator attached the verified deposit send to a BaseToAlpaca
+    /// `DepositFailed` that had none recorded.
+    DepositSendAttached {
+        send_tx: TxHash,
+        attached_at: DateTime<Utc>,
+    },
     /// An operator reconciled a post-burn `DepositFailed` rebalance to the
     /// guard-clearing terminal `Reconciled` state. Carries `direction` so the
     /// reactor derives the source venue without in-memory tracking (which may
@@ -774,6 +784,7 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::DepositCompletionRecovered { .. } => {
                 "UsdcRebalanceEvent::DepositCompletionRecovered"
             }
+            Self::DepositSendAttached { .. } => "UsdcRebalanceEvent::DepositSendAttached",
             Self::OperatorReconciled { .. } => "UsdcRebalanceEvent::OperatorReconciled",
         }
         .to_string()
@@ -1826,7 +1837,8 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::DepositInitiated', \
                'UsdcRebalanceEvent::DepositConfirmed', \
                'UsdcRebalanceEvent::DepositCompletionRecovered', \
-               'UsdcRebalanceEvent::DepositFailed' \
+               'UsdcRebalanceEvent::DepositFailed', \
+               'UsdcRebalanceEvent::DepositSendAttached' \
            ) \
          ORDER BY latest.aggregate_id",
     )
@@ -2005,6 +2017,37 @@ pub(crate) async fn withdrawal_tx_recorded_elsewhere(
     )
     .bind(id.to_string())
     .bind(format!("{withdrawal_tx:#x}"))
+    .fetch_optional(pool)
+    .await
+}
+
+/// Another `UsdcRebalance` that recorded `send_tx` as its Alpaca deposit send,
+/// as its persisted aggregate id. A send pays one transfer only.
+pub(crate) async fn deposit_send_recorded_elsewhere(
+    pool: &SqlitePool,
+    id: &UsdcRebalanceId,
+    send_tx: TxHash,
+) -> Result<Option<String>, sqlx::Error> {
+    let send_tx = format!("{send_tx:#x}");
+    sqlx::query_scalar(
+        "SELECT aggregate_id FROM events \
+         WHERE aggregate_type = 'UsdcRebalance' \
+           AND aggregate_id != ? \
+           AND ( \
+               (event_type = 'UsdcRebalanceEvent::PendingDepositRecorded' \
+                AND json_extract(payload, '$.PendingDepositRecorded.send_tx') = ?) \
+               OR (event_type = 'UsdcRebalanceEvent::DepositSendAttached' \
+                AND json_extract(payload, '$.DepositSendAttached.send_tx') = ?) \
+               OR (event_type = 'UsdcRebalanceEvent::DepositInitiated' \
+                AND json_extract(payload, '$.DepositInitiated.deposit_ref.OnchainTx') = ?) \
+           ) \
+         ORDER BY rowid \
+         LIMIT 1",
+    )
+    .bind(id.to_string())
+    .bind(&send_tx)
+    .bind(&send_tx)
+    .bind(&send_tx)
     .fetch_optional(pool)
     .await
 }
@@ -2722,6 +2765,29 @@ impl EventSourced for UsdcRebalance {
             // command validates (BaseToAlpaca with an on-chain deposit ref);
             // any other pairing falls through to an invalid transition.
             (
+                DepositSendAttached { send_tx, .. },
+                Self::DepositFailed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    deposit_ref: None,
+                    reason,
+                    initiated_at,
+                    failed_at,
+                },
+            ) => Self::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                deposit_ref: Some(TransferRef::OnchainTx(*send_tx)),
+                reason: reason.clone(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
+
+            (
                 DepositCompletionRecovered { recovered_at },
                 Self::DepositFailed {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -2938,7 +3004,7 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             InitiateDepositAt { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
-            ConfirmDeposit | FailDeposit { .. } | RecoverDeposit => {
+            ConfirmDeposit | FailDeposit { .. } | RecoverDeposit | AttachDepositSend { .. } => {
                 Err(UsdcRebalanceError::DepositNotInitiated)
             }
             #[cfg(any(test, feature = "test-support"))]
@@ -3116,6 +3182,7 @@ impl EventSourced for UsdcRebalance {
 
             FailDeposit { reason } => self.transition_fail_deposit(reason),
             RecoverDeposit => self.transition_recover_deposit(),
+            AttachDepositSend { send_tx } => self.transition_attach_deposit_send(send_tx),
             ReconcileStuckRebalance { reason } => self.transition_reconcile_stuck_rebalance(reason),
         }
     }
@@ -3971,6 +4038,36 @@ impl UsdcRebalance {
     /// send tx is the identity the recheck verified at Alpaca, while an
     /// AlpacaToBase deposit is the bot's own on-chain tx (reconcile
     /// territory, not provider recheck).
+    /// Attaches an operator-verified send to a BaseToAlpaca `DepositFailed`
+    /// with none recorded. A recorded send is never replaced.
+    fn transition_attach_deposit_send(
+        &self,
+        send_tx: TxHash,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_ref: None,
+                ..
+            } => Ok(vec![DepositSendAttached {
+                send_tx,
+                attached_at: Utc::now(),
+            }]),
+            Self::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_ref: Some(TransferRef::OnchainTx(recorded)),
+                ..
+            } => Err(UsdcRebalanceError::DepositSendAlreadyRecorded {
+                recorded: *recorded,
+            }),
+            _ => Err(UsdcRebalanceError::InvalidCommand {
+                command: "AttachDepositSend".to_string(),
+                state: "not a BaseToAlpaca DepositFailed with no on-chain deposit ref".to_string(),
+            }),
+        }
+    }
+
     fn transition_recover_deposit(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -4017,8 +4114,8 @@ impl UsdcRebalance {
     /// Valid only from a post-burn terminal failure that strands the guard with
     /// no other exit:
     ///
-    /// - `DepositFailed` -- only reachable from `DepositInitiated`, hence always
-    ///   post-mint.
+    /// - `DepositFailed` -- only reachable after the mint (from
+    ///   `DepositInitiated` or a BaseToAlpaca `Bridged`), hence always post-mint.
     /// - `BridgingFailed` with a recorded `burn_tx_hash` or `cctp_nonce` -- both
     ///   are only ever populated after the burn reaches CCTP, so either proves
     ///   the failure is post-burn (mirrors the reactor's post-burn classifier).
@@ -12489,6 +12586,64 @@ mod tests {
         assert!(matches!(
             error,
             LifecycleError::Apply(UsdcRebalanceError::DepositNotInitiated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_deposit_send_gives_a_deposit_failed_without_a_ref_the_operator_tx() {
+        let staged = [
+            bridged_events(RebalanceDirection::BaseToAlpaca),
+            vec![UsdcRebalanceEvent::DepositFailed {
+                deposit_ref: None,
+                reason: "deposit send not recorded".to_string(),
+                failed_at: Utc::now(),
+            }],
+        ]
+        .concat();
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::AttachDepositSend {
+                send_tx: DEPOSIT_SEND_TX,
+            })
+            .await
+            .events();
+
+        let state = replay::<UsdcRebalance>([staged, events].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::DepositFailed { deposit_ref, .. } = &state else {
+            panic!("Expected DepositFailed, got {state:?}");
+        };
+        assert_eq!(*deposit_ref, Some(TransferRef::OnchainTx(DEPOSIT_SEND_TX)));
+        assert!(state.holds_rebalance_guard());
+    }
+
+    #[tokio::test]
+    async fn attach_deposit_send_never_replaces_a_recorded_send() {
+        let other_send =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000dd");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![
+                deposit_send_started(),
+                deposit_send_recorded(DEPOSIT_SEND_TX),
+                UsdcRebalanceEvent::DepositFailed {
+                    deposit_ref: Some(TransferRef::OnchainTx(DEPOSIT_SEND_TX)),
+                    reason: "recorded send reverted".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ]))
+            .when(UsdcRebalanceCommand::AttachDepositSend {
+                send_tx: other_send,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositSendAlreadyRecorded { recorded })
+                if recorded == DEPOSIT_SEND_TX
         ));
     }
 

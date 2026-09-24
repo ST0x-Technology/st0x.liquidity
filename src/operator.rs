@@ -162,6 +162,7 @@ pub mod equity_redemption {
 
 /// Recovery operations shared by the operator CLI and end-to-end tests.
 pub mod equity_transfer {
+    use alloy::primitives::TxHash;
     use std::time::Duration;
 
     use st0x_config::Ctx;
@@ -515,18 +516,28 @@ pub mod equity_transfer {
         Ok(())
     }
 
-    /// Returns the local server endpoint used to re-check a transfer.
-    pub fn recheck_url(ctx: &Ctx, transfer_kind: RecheckKind, id: &str) -> String {
+    /// Returns the local server endpoint used to re-check a transfer, with
+    /// the operator-found deposit send of a USDC recheck when given.
+    pub fn recheck_url(
+        ctx: &Ctx,
+        transfer_kind: RecheckKind,
+        id: &str,
+        deposit_tx: Option<TxHash>,
+    ) -> String {
         let kind = match transfer_kind {
             RecheckKind::Mint => "equity_mint",
             RecheckKind::Redemption => "equity_redemption",
             RecheckKind::Usdc => "usdc_bridge",
         };
 
-        format!(
+        let url = format!(
             "http://127.0.0.1:{}/transfers/recheck/{kind}/{id}",
             ctx.server_port
-        )
+        );
+        match deposit_tx {
+            Some(deposit_tx) => format!("{url}?deposit_tx={deposit_tx:#x}"),
+            None => url,
+        }
     }
 
     /// Requests an in-process re-check and returns its operator-facing outcome.
@@ -534,8 +545,9 @@ pub mod equity_transfer {
         ctx: &Ctx,
         transfer_kind: RecheckKind,
         id: &str,
+        deposit_tx: Option<TxHash>,
     ) -> anyhow::Result<String> {
-        let url = recheck_url(ctx, transfer_kind, id);
+        let url = recheck_url(ctx, transfer_kind, id, deposit_tx);
         let body = post_operator_request(&url, "transfer recheck", None).await?;
 
         Ok(serde_json::from_str::<serde_json::Value>(&body)

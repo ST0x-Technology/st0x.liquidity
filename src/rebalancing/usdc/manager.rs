@@ -39,8 +39,8 @@ use crate::rebalancing::equity::RecheckOutcome;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, DepositSend, EthereumWalletCredit, RebalanceDirection, TransferRef,
-    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, open_ethereum_credits,
-    withdrawal_tx_recorded_elsewhere,
+    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, deposit_send_recorded_elsewhere,
+    open_ethereum_credits, withdrawal_tx_recorded_elsewhere,
 };
 
 /// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
@@ -154,6 +154,15 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
 
     /// Broadcasts `amount` USDC (6-decimal) from the bot wallet to `to` on
     /// Ethereum and returns the tx hash without awaiting the receipt.
+    /// Returns the USDC that `tx_hash` moved from `sender` to `recipient` on
+    /// Ethereum, once the tx is confirmed.
+    async fn ethereum_usdc_sent(
+        &self,
+        tx_hash: TxHash,
+        sender: Address,
+        recipient: Address,
+    ) -> Result<U256, CctpError>;
+
     /// A failure tells whether the transfer may have reached the network.
     async fn submit_usdc_on_ethereum(
         &self,
@@ -199,6 +208,15 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
         recipient: Address,
     ) -> Result<U256, CctpError> {
         self.ethereum_usdc_credit(tx_hash, recipient).await
+    }
+
+    async fn ethereum_usdc_sent(
+        &self,
+        tx_hash: TxHash,
+        sender: Address,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        self.ethereum_usdc_sent(tx_hash, sender, recipient).await
     }
 
     async fn submit_usdc_on_ethereum(
@@ -3593,6 +3611,12 @@ impl<
     ///   (`reconcile` stays the out-of-band recovery path).
     /// - Everything else: typed refusal; recheck never guesses.
     ///
+    /// `operator_deposit_tx` is the deposit send an operator found on chain
+    /// for a `DepositFailed` with no send recorded (the deposit send was
+    /// never recorded, or was started and its tx lost). It is verified
+    /// before it is attached: see
+    /// [`attach_operator_deposit_tx`](Self::attach_operator_deposit_tx).
+    ///
     /// Idempotent and fund-safe: the withdraw/burn/mint/send legs all sit
     /// behind states this flow never re-enters, `RecoverDeposit` is valid
     /// only from `DepositFailed`, and the conversion leg is the existing
@@ -3600,7 +3624,12 @@ impl<
     pub(crate) async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
+        operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError> {
+        if let Some(send_tx) = operator_deposit_tx {
+            self.attach_operator_deposit_tx(id, send_tx).await?;
+        }
+
         let state = self
             .cqrs
             .load(id)
@@ -3721,6 +3750,97 @@ impl<
             .map_err(Box::new)?;
 
         Ok(RecheckOutcome::Recovered)
+    }
+
+    /// Attaches an operator-supplied deposit send to a BaseToAlpaca
+    /// `DepositFailed` with none recorded, after checking that it moved
+    /// exactly the transfer's amount from the bot wallet to Alpaca's deposit
+    /// address, is confirmed, and is not recorded by another transfer. Any
+    /// other state is left to `recheck_deposit`'s own classification.
+    async fn attach_operator_deposit_tx(
+        &self,
+        id: &UsdcRebalanceId,
+        send_tx: TxHash,
+    ) -> Result<(), UsdcRecheckError> {
+        let state = self
+            .cqrs
+            .load(id)
+            .await
+            .map_err(|error| Box::new(UsdcTransferError::from(error)))?;
+
+        let amount = match state {
+            Some(UsdcRebalance::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_ref: None,
+                amount,
+                ..
+            }) => amount,
+            Some(UsdcRebalance::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_ref: Some(TransferRef::OnchainTx(recorded)),
+                ..
+            }) if recorded == send_tx => return Ok(()),
+            Some(UsdcRebalance::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_ref: Some(TransferRef::OnchainTx(recorded)),
+                ..
+            }) => {
+                return Err(UsdcRecheckError::DepositTxConflict {
+                    id: id.clone(),
+                    tx: send_tx,
+                    recorded,
+                });
+            }
+            _ => return Ok(()),
+        };
+
+        let CreditLedger::Wired(pool) = &self.credit_ledger else {
+            return Err(UsdcRecheckError::DepositTxUnchecked(id.clone()));
+        };
+        if let Some(recorded_by) = deposit_send_recorded_elsewhere(pool, id, send_tx)
+            .await
+            .map_err(|source| UsdcRecheckError::DepositTxLookup {
+                id: id.clone(),
+                source,
+            })?
+        {
+            return Err(UsdcRecheckError::DepositTxRecordedElsewhere {
+                id: id.clone(),
+                tx: send_tx,
+                recorded_by,
+            });
+        }
+
+        let deposit_address = self
+            .fetch_alpaca_deposit_address(id)
+            .await
+            .map_err(Box::new)?;
+        let expected = usdc_to_u256(amount).map_err(Box::new)?;
+        let sent = self
+            .cctp_bridge
+            .ethereum_usdc_sent(send_tx, self.market_maker_wallet, deposit_address)
+            .await
+            .map_err(|source| UsdcRecheckError::DepositTxRead {
+                id: id.clone(),
+                tx: send_tx,
+                source: Box::new(source),
+            })?;
+        if sent != expected {
+            return Err(UsdcRecheckError::DepositTxAmountMismatch {
+                id: id.clone(),
+                tx: send_tx,
+                sent,
+                expected,
+            });
+        }
+
+        info!(target: "rebalance", %id, %send_tx, "Attaching the operator-verified deposit send");
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::AttachDepositSend { send_tx })
+            .await
+            .map_err(|error| Box::new(UsdcTransferError::from(error)))?;
+
+        Ok(())
     }
 
     /// Non-obvious points the match body below cannot express on its own:
@@ -5944,6 +6064,53 @@ pub(crate) enum UsdcRecheckError {
         id: UsdcRebalanceId,
         state: &'static str,
     },
+    #[error(
+        "rebalance {id} already records deposit send {recorded}; the \
+         operator-supplied deposit tx {tx} is not attached"
+    )]
+    DepositTxConflict {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        recorded: TxHash,
+    },
+    #[error(
+        "deposit tx {tx} is already recorded by USDC rebalance {recorded_by}; \
+         it is not attached to rebalance {id}"
+    )]
+    DepositTxRecordedElsewhere {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        recorded_by: String,
+    },
+    #[error(
+        "deposit tx {tx} moved {sent} USDC units from the bot wallet to the \
+         Alpaca deposit address, but rebalance {id} failed with {expected}; \
+         it is not attached"
+    )]
+    DepositTxAmountMismatch {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        sent: U256,
+        expected: U256,
+    },
+    /// The event store is not wired, so the deposit tx cannot be checked
+    /// against other transfers.
+    #[error("rebalance {0}: cannot check the deposit tx against other transfers")]
+    DepositTxUnchecked(UsdcRebalanceId),
+    #[error("rebalance {id}: failed to check the deposit tx against other transfers")]
+    DepositTxLookup {
+        id: UsdcRebalanceId,
+        #[source]
+        source: sqlx::Error,
+    },
+    /// Reading the deposit tx on chain failed -- transient, retry later.
+    #[error("rebalance {id}: failed to read deposit tx {tx} on chain")]
+    DepositTxRead {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        #[source]
+        source: Box<CctpError>,
+    },
     /// Reading Alpaca failed -- transient, retry later.
     #[error("Alpaca wallet error: {0}")]
     Alpaca(#[from] AlpacaWalletError),
@@ -5961,6 +6128,7 @@ pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
+        operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError>;
 }
 
@@ -5972,8 +6140,9 @@ where
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
+        operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError> {
-        Self::recheck_deposit(self, id).await
+        Self::recheck_deposit(self, id, operator_deposit_tx).await
     }
 }
 
@@ -6394,6 +6563,15 @@ mod tests {
             unimplemented!("MockBridge: ethereum_usdc_credit not used in this test")
         }
 
+        async fn ethereum_usdc_sent(
+            &self,
+            _tx_hash: TxHash,
+            _sender: Address,
+            _recipient: Address,
+        ) -> Result<U256, CctpError> {
+            unimplemented!("MockBridge: ethereum_usdc_sent not used in this test")
+        }
+
         async fn submit_usdc_on_ethereum(
             &self,
             _to: Address,
@@ -6599,6 +6777,17 @@ mod tests {
             self.inner.ethereum_usdc_credit(tx_hash, recipient).await
         }
 
+        async fn ethereum_usdc_sent(
+            &self,
+            tx_hash: TxHash,
+            sender: Address,
+            recipient: Address,
+        ) -> Result<U256, CctpError> {
+            self.inner
+                .ethereum_usdc_sent(tx_hash, sender, recipient)
+                .await
+        }
+
         async fn submit_usdc_on_ethereum(
             &self,
             to: Address,
@@ -6770,6 +6959,17 @@ mod tests {
             self.inner.ethereum_usdc_credit(tx_hash, recipient).await
         }
 
+        async fn ethereum_usdc_sent(
+            &self,
+            tx_hash: TxHash,
+            sender: Address,
+            recipient: Address,
+        ) -> Result<U256, CctpError> {
+            self.inner
+                .ethereum_usdc_sent(tx_hash, sender, recipient)
+                .await
+        }
+
         async fn submit_usdc_on_ethereum(
             &self,
             to: Address,
@@ -6938,6 +7138,17 @@ mod tests {
             _recipient: Address,
         ) -> Result<U256, CctpError> {
             Err((self.credit_error)(tx_hash))
+        }
+
+        async fn ethereum_usdc_sent(
+            &self,
+            tx_hash: TxHash,
+            sender: Address,
+            recipient: Address,
+        ) -> Result<U256, CctpError> {
+            self.inner
+                .ethereum_usdc_sent(tx_hash, sender, recipient)
+                .await
         }
 
         async fn submit_usdc_on_ethereum(
@@ -12447,7 +12658,7 @@ mod tests {
             "99.99",
         );
 
-        let outcome = manager.recheck_deposit(&id).await.unwrap();
+        let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
         assert_eq!(outcome, RecheckOutcome::Recovered);
         transfers_mock.assert();
@@ -12457,7 +12668,7 @@ mod tests {
             "Expected ConversionComplete after recheck recovery, got: {final_state:?}"
         );
 
-        let second = manager.recheck_deposit(&id).await.unwrap();
+        let second = manager.recheck_deposit(&id, None).await.unwrap();
         assert_eq!(second, RecheckOutcome::AlreadyCompleted);
         conversion_mock.assert();
     }
@@ -12477,7 +12688,7 @@ mod tests {
         let _transfers_mock =
             create_deposit_transfers_mock(&server, send_tx, "PROCESSING", "99.99");
 
-        let outcome = manager.recheck_deposit(&id).await.unwrap();
+        let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
         assert_eq!(outcome, RecheckOutcome::LeftUnchanged);
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
@@ -12501,7 +12712,7 @@ mod tests {
             advance_to_deposit_failed_base_to_alpaca(&cqrs, &id, usdc("100"), usdc("99.99")).await;
         let _transfers_mock = create_deposit_transfers_mock(&server, send_tx, "FAILED", "99.99");
 
-        let outcome = manager.recheck_deposit(&id).await.unwrap();
+        let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
         assert_eq!(outcome, RecheckOutcome::NotRecoverable);
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
@@ -12536,7 +12747,7 @@ mod tests {
             "99.99",
         );
 
-        let outcome = manager.recheck_deposit(&id).await.unwrap();
+        let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
         assert_eq!(outcome, RecheckOutcome::Recovered);
         let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
@@ -12565,7 +12776,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let outcome = manager.recheck_deposit(&id).await.unwrap();
+        let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
         assert_eq!(outcome, RecheckOutcome::NotDetectedYet);
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
@@ -12587,7 +12798,7 @@ mod tests {
             then.status(500);
         });
 
-        let error = manager.recheck_deposit(&id).await.unwrap_err();
+        let error = manager.recheck_deposit(&id, None).await.unwrap_err();
 
         assert!(matches!(error, UsdcRecheckError::Alpaca(_)));
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
@@ -12621,7 +12832,7 @@ mod tests {
         .await
         .unwrap();
 
-        let error = manager.recheck_deposit(&id).await.unwrap_err();
+        let error = manager.recheck_deposit(&id, None).await.unwrap_err();
 
         assert!(matches!(error, UsdcRecheckError::AlpacaToBaseDeposit(_)));
     }
@@ -12646,7 +12857,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = manager.recheck_deposit(&id).await.unwrap();
+        let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
         assert_eq!(outcome, RecheckOutcome::AlreadyCompleted);
     }
@@ -12680,7 +12891,7 @@ mod tests {
         .await
         .unwrap();
 
-        let error = manager.recheck_deposit(&id).await.unwrap_err();
+        let error = manager.recheck_deposit(&id, None).await.unwrap_err();
 
         assert!(matches!(error, UsdcRecheckError::NoOnchainDepositRef(_)));
     }
@@ -12698,7 +12909,7 @@ mod tests {
 
         let bridged = UsdcRebalanceId(Uuid::new_v4());
         advance_to_bridged_base_to_alpaca(&cqrs, &bridged, usdc("100"), usdc("99.99")).await;
-        let error = manager.recheck_deposit(&bridged).await.unwrap_err();
+        let error = manager.recheck_deposit(&bridged, None).await.unwrap_err();
         let UsdcRecheckError::NotDepositFailed { state, .. } = error else {
             panic!("expected NotDepositFailed for Bridged, got: {error:?}");
         };
@@ -12718,7 +12929,7 @@ mod tests {
         .await
         .unwrap();
         let error = manager
-            .recheck_deposit(&deposit_initiated)
+            .recheck_deposit(&deposit_initiated, None)
             .await
             .unwrap_err();
         let UsdcRecheckError::NotDepositFailed { state, .. } = error else {
@@ -12745,7 +12956,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = manager.recheck_deposit(&id).await.unwrap();
+        let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
         assert_eq!(outcome, RecheckOutcome::AlreadyCompleted);
     }
@@ -12773,7 +12984,7 @@ mod tests {
             "99.99",
         );
 
-        let outcome = manager.recheck_deposit(&id).await.unwrap();
+        let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
         assert_eq!(outcome, RecheckOutcome::Resumed);
         let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
@@ -12789,7 +13000,7 @@ mod tests {
         let (manager, _cqrs, _anvil) = make_resume_test_manager(&server).await;
 
         let error = manager
-            .recheck_deposit(&UsdcRebalanceId(Uuid::new_v4()))
+            .recheck_deposit(&UsdcRebalanceId(Uuid::new_v4()), None)
             .await
             .unwrap_err();
 
@@ -14716,6 +14927,184 @@ mod tests {
             deposit_ref, None,
             "the unrecorded send is not this transfer's deposit"
         );
+    }
+
+    /// Mocks Alpaca's transfer list with one completed incoming deposit for
+    /// `send_tx`, plus the USDC->USD conversion that follows its recovery.
+    fn mock_completed_alpaca_deposit(server: &MockServer, from: Address, send_tx: TxHash) {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "direction": "INCOMING",
+                    "amount": "99.99",
+                    "usd_value": "99.99",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": format!("{from:#x}"),
+                    "to_address": format!("{ALPACA_DEPOSIT_ADDRESS:#x}"),
+                    "status": "COMPLETE",
+                    "tx_hash": format!("{send_tx:#x}"),
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                }]));
+        });
+        create_conversion_order_mock(server, ConversionDirection::UsdcToUsd, "99.99");
+        create_get_order_mock(
+            server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "99.99",
+        );
+    }
+
+    /// Sends `sent` USDC to the deposit address with no record on the staged
+    /// transfer, then fails its deposit with no send recorded, as a resume
+    /// that finds such a send does. Returns the send.
+    async fn fail_deposit_on_an_unrecorded_send(
+        chain: &EthereumUsdcChain,
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        sent: Usdc,
+    ) -> TxHash {
+        stage_bridged_with_mint_tx(cqrs, id, usdc("100"), usdc("99.99"), chain.mint_tx).await;
+        let bridge_wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let unrecorded_send =
+            send_usdc_to_alpaca(&bridge_wallet, usdc_to_u256(sent).unwrap()).await;
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::FailDeposit {
+                reason: "deposit send not recorded".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        unrecorded_send
+    }
+
+    /// An operator who finds the transfer's own unrecorded send on chain
+    /// passes it to `transfer recheck`: it is checked, attached, confirmed at
+    /// Alpaca and converted, like a recorded send.
+    #[tokio::test]
+    async fn recheck_with_an_operator_deposit_tx_recovers_a_deposit_failed_without_a_ref() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let _address_mock = mock_alpaca_deposit_address(&server);
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            cqrs.clone(),
+        )
+        .await
+        .with_credit_ledger(pool);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let send_tx = fail_deposit_on_an_unrecorded_send(&chain, &cqrs, &id, usdc("99.99")).await;
+        assert!(
+            matches!(
+                manager.recheck_deposit(&id, None).await.unwrap_err(),
+                UsdcRecheckError::NoOnchainDepositRef(_)
+            ),
+            "without the operator's tx there is nothing to verify at Alpaca",
+        );
+        mock_completed_alpaca_deposit(&server, chain.bot_address, send_tx);
+
+        let outcome = manager.recheck_deposit(&id, Some(send_tx)).await.unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::ConversionComplete { .. }),
+            "got: {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_refuses_an_operator_deposit_tx_of_another_amount() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let _address_mock = mock_alpaca_deposit_address(&server);
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            cqrs.clone(),
+        )
+        .await
+        .with_credit_ledger(pool);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let send_tx = fail_deposit_on_an_unrecorded_send(&chain, &cqrs, &id, usdc("50")).await;
+
+        let error = manager
+            .recheck_deposit(&id, Some(send_tx))
+            .await
+            .unwrap_err();
+
+        let UsdcRecheckError::DepositTxAmountMismatch { sent, expected, .. } = error else {
+            panic!("expected DepositTxAmountMismatch, got: {error:?}");
+        };
+        assert_eq!(sent, usdc_to_u256(usdc("50")).unwrap());
+        assert_eq!(expected, usdc_to_u256(usdc("99.99")).unwrap());
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::DepositFailed { deposit_ref, .. } = state else {
+            panic!("expected DepositFailed, got: {state:?}");
+        };
+        assert_eq!(deposit_ref, None, "a refused tx is not attached");
+    }
+
+    /// A send another transfer recorded paid that transfer, not this one.
+    #[tokio::test]
+    async fn recheck_refuses_an_operator_deposit_tx_another_transfer_recorded() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let _address_mock = mock_alpaca_deposit_address(&server);
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            cqrs.clone(),
+        )
+        .await
+        .with_credit_ledger(pool);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let send_tx = fail_deposit_on_an_unrecorded_send(&chain, &cqrs, &id, usdc("99.99")).await;
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &other, usdc("100"), usdc("99.99"), chain.mint_tx).await;
+        cqrs.send(&other, UsdcRebalanceCommand::BeginDepositSend)
+            .await
+            .unwrap();
+        cqrs.send(
+            &other,
+            UsdcRebalanceCommand::RecordPendingDeposit { send_tx },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .recheck_deposit(&id, Some(send_tx))
+            .await
+            .unwrap_err();
+
+        let UsdcRecheckError::DepositTxRecordedElsewhere { recorded_by, .. } = error else {
+            panic!("expected DepositTxRecordedElsewhere, got: {error:?}");
+        };
+        assert_eq!(recorded_by, other.to_string());
     }
 
     /// A recorded send is the only one resume looks at, even when a later
