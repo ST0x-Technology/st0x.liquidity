@@ -4656,6 +4656,23 @@ mod tests {
         };
         assert_eq!(error_nonce, nonce);
         assert_eq!(from_block, head - lookback);
+
+        // A captured floor above the lookback floor scans down to the lookback
+        // floor, no further.
+        let captured_error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(head),
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { from_block, .. } = captured_error else {
+            panic!("a consumed nonce outside the window must fail: {captured_error:?}");
+        };
+        assert_eq!(from_block, head - lookback);
+        assert!(lowest_scanned_block.load(Ordering::SeqCst) >= head - lookback);
     }
 
     /// Burns name no destination caller, so a relayer can mint between Circle
@@ -5585,8 +5602,9 @@ mod tests {
             None,
         );
 
-        // A consumed nonce whose mint sits below the floor is left to the
-        // operator: advance the Ethereum head past the mint and scan from it.
+        // A relayer can mint before the floor is captured: advance the Ethereum
+        // head past the mint and scan from it; the bounded lookback still
+        // reaches the mint.
         bridge
             .burn_internal::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
@@ -5600,22 +5618,16 @@ mod tests {
             .await
             .unwrap();
 
-        let error = bridge
+        let found_below_floor = bridge
             .find_attested_mint(
                 BridgeDirection::BaseToEthereum,
                 &minted,
                 Some(head_above_mint),
             )
             .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CctpError::MintNotFoundInScanWindow { nonce, from_block }
-                    if nonce == minted.nonce() && from_block == head_above_mint
-            ),
-            "a mint below the floor must fail for reconciliation, got: {error:?}",
-        );
+            .unwrap()
+            .expect("a mint below the captured floor but inside the lookback must be found");
+        assert_eq!(found_below_floor.tx, mint_receipt.tx);
     }
 
     #[tokio::test]
