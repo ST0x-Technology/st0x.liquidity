@@ -13276,6 +13276,23 @@ mod tests {
         amount: Usdc,
         withdrawal_tx: Option<TxHash>,
     ) {
+        advance_to_withdrawal_complete_alpaca_to_base_via_transfer(
+            cqrs,
+            id,
+            amount,
+            withdrawal_tx,
+            Uuid::new_v4(),
+        )
+        .await;
+    }
+
+    async fn advance_to_withdrawal_complete_alpaca_to_base_via_transfer(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        withdrawal_tx: Option<TxHash>,
+        transfer_uuid: Uuid,
+    ) {
         use UsdcRebalanceCommand::*;
 
         cqrs.send(
@@ -13301,7 +13318,7 @@ mod tests {
             Initiate {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
-                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(transfer_uuid)),
             },
         )
         .await
@@ -13449,6 +13466,98 @@ mod tests {
         assert!(logs_contain("credited=998"));
         assert!(logs_contain("requested=1000"));
         assert!(logs_contain("shortfall=2"));
+    }
+
+    /// Alpaca deducts the network fee and fees it reports from a withdrawal,
+    /// so a credit short by exactly those is expected: logged, not paged.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn withdrawal_credited_short_by_the_reported_fees_does_not_page() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(
+            U256::from(998_000_000u64),
+            market_maker_wallet,
+        )
+        .await;
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider.anvil_mine(Some(3), None).await.unwrap();
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xFD]);
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, revert_bytecode)
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let nominal = usdc("1000");
+        let transfer_uuid = Uuid::new_v4();
+        advance_to_withdrawal_complete_alpaca_to_base_via_transfer(
+            &cqrs,
+            &id,
+            nominal,
+            Some(chain.mint_tx),
+            transfer_uuid,
+        )
+        .await;
+        let _transfer_mock =
+            mock_complete_withdrawal_with_fees(&server, transfer_uuid, chain.mint_tx, "1.5", "0.5");
+
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(
+                &id,
+                nominal,
+                Some(chain.mint_tx),
+                Utc::now(),
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::BurnRevert(_)),
+            "the fee-short withdrawal must proceed to the burn; got: {error:?}"
+        );
+        assert!(!logs_contain("operational_alert"));
+        assert!(logs_contain("credited less USDC than requested"));
+    }
+
+    /// Mocks Alpaca's by-id transfer endpoint answering a complete withdrawal
+    /// paid by `tx_hash`, with the reported `network_fee` and `fees`.
+    fn mock_complete_withdrawal_with_fees<'server>(
+        server: &'server MockServer,
+        transfer_uuid: Uuid,
+        tx_hash: TxHash,
+        network_fee: &str,
+        fees: &str,
+    ) -> httpmock::Mock<'server> {
+        server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers/{transfer_uuid}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": transfer_uuid.to_string(),
+                    "direction": "OUTGOING",
+                    "amount": "1000",
+                    "usd_value": "1000",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": "0x0000000000000000000000000000000000000001",
+                    "to_address": "0x2222222222222222222222222222222222222222",
+                    "status": "COMPLETE",
+                    "tx_hash": format!("{tx_hash:#x}"),
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": network_fee,
+                    "fees": fees
+                }));
+        })
     }
 
     /// A withdrawal tx that paid the market-maker wallet nothing is not this
