@@ -1856,14 +1856,30 @@ event position).
   authentication
 - Graceful shutdown handling to complete in-flight trades before stopping
 - Per-asset market enable/disable: individual equity markets can be disabled via
-  `trading = "disabled"` on the asset's entry in its chain's assets table.
-  Disabled assets accumulate position changes but do not trigger counter-trades
-  or rebalancing operations. When re-enabled (`trading = "enabled"`), the system
-  resumes both executing accumulated counter-trade positions and evaluating
-  rebalancing triggers for any resulting inventory imbalances (same semantics as
-  market close/open behavior). A fill landing on a disabled asset raises a
-  deduplicated critical operational alert (once per process per chain and
-  symbol): the delta exposure it accumulates is deliberate, but never silent
+  `trading = "disabled"` on the asset's entry in its chain's assets table. The
+  flag is the hedge kill switch for that asset on that chain, and it holds for
+  every fill accounted while it is disabled: such a fill is never counter
+  traded, inline or by the periodic position scan. `Position` holds one net per
+  symbol across all hedged chains, so the fill is kept out of it entirely;
+  otherwise the scan would hedge it for any other chain that enables the symbol.
+  Disabling does not unwind a net the symbol already accumulated on that chain
+  while it was enabled: that net stays in `Position`, and the scan keeps hedging
+  it for as long as any hedged chain enables the symbol, so flipping the switch
+  mid incident does not stop the bot hedging exposure it already accounted. An
+  excluded fill is still witnessed on its `OnChainTrade` and recorded in
+  `skipped_fills` with reason `trading_disabled`, and it raises a deduplicated
+  critical operational alert (once per process per chain and symbol), so the
+  exposure it leaves is never silent. The flag is read when the bot accounts the
+  fill, not when the fill lands on chain. Enabling the asset again therefore
+  hedges every fill the bot accounts from the restart on, including fills that
+  landed earlier but were not accounted yet: still queued, not yet backfilled
+  past the ingestion cutoff, or landing during the restart itself. Only fills
+  already recorded in `skipped_fills` with reason `trading_disabled` stay
+  excluded and are never hedged later; an operator covers that delta by hand
+  from those records. Excluded fills also never reach the PnL ledger, which
+  replays `Position` events, so PnL is incomplete for them and a manual cover
+  must be reconciled outside the ledger. Rebalancing is governed separately by
+  the asset's `rebalancing` flag.
 
 ### Infrastructure and Deployment
 

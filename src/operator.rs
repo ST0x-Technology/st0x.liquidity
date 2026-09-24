@@ -132,8 +132,9 @@ pub mod bot_gas {
 
 pub mod conductor {
     pub use crate::conductor::{
-        FillAccountingOutcome, account_for_onchain_fill, configured_equity_symbols,
-        execute_mark_acknowledged, execute_settle_fill, is_expected_place_offchain_order_rejection,
+        ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
+        account_for_onchain_fill, configured_equity_symbols, execute_mark_acknowledged,
+        execute_settle_fill, is_expected_place_offchain_order_rejection,
     };
 
     #[cfg(feature = "test-support")]

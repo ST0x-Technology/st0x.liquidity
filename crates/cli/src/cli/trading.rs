@@ -23,8 +23,9 @@ use st0x_execution::{
 };
 use st0x_float_serde::format_float_with_fallback;
 use st0x_hedge::operator::conductor::{
-    FillAccountingOutcome, account_for_onchain_fill, execute_mark_acknowledged,
-    execute_settle_fill, is_expected_place_offchain_order_rejection,
+    ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
+    account_for_onchain_fill, execute_mark_acknowledged, execute_settle_fill,
+    is_expected_place_offchain_order_rejection,
 };
 use st0x_hedge::operator::offchain::order::{
     BrokerOrderPlacement, OffchainOrder, OffchainOrderId, OffchainOrderPlacement,
@@ -905,6 +906,23 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
     anyhow::bail!("timed out waiting for the buy order to fill")
 }
 
+/// What `process-tx` tells the operator about a fill an earlier run already
+/// finished accounting.
+fn finished_fill_message(outcome: &FillAccountingOutcome, trade_id: &OnChainTradeId) -> String {
+    match outcome {
+        FillAccountingOutcome::ExcludedFromHedging { detail } => format!(
+            "Fill {trade_id} was excluded from hedging while trading was disabled \
+             and is recorded in skipped_fills. The pipeline will not hedge it: {detail}"
+        ),
+        FillAccountingOutcome::AlreadyAcknowledged | FillAccountingOutcome::Accounted { .. } => {
+            format!(
+                "Fill {trade_id} is already fully accounted. Nothing to do; \
+                 the normal pipeline will hedge any unhedged position exposure."
+            )
+        }
+    }
+}
+
 pub(super) async fn process_found_trade<W: Write>(
     onchain_trade: OnchainTrade,
     ctx: &Ctx,
@@ -934,7 +952,51 @@ pub(super) async fn process_found_trade<W: Write>(
         anyhow::bail!("Fill {trade_id}: missing block_number, cannot witness fill");
     };
 
-    let FillAccountingOutcome::Accounted { .. } = account_for_onchain_fill(
+    // Resolved from the fill's own chain, which keys its `skipped_fills` row
+    // and its report, so the flag and the record can never disagree even if
+    // process-tx later decodes secondary chain fills.
+    let Some(fill_chain) = ctx.chains.hedged_chain(onchain_trade.chain) else {
+        anyhow::bail!(
+            "Fill {trade_id} is on {}, which is not a hedged chain",
+            onchain_trade.chain
+        );
+    };
+    let base_symbol = onchain_trade.symbol();
+
+    // Same rule as the bot: a fill on an asset disabled on its own chain
+    // stays out of the hedged position, or the periodic scan hedges it.
+    if !fill_chain.assets.is_trading_enabled(base_symbol) {
+        let outcome = account_for_fill_excluded_from_hedging(
+            pool,
+            &onchain_trade_store,
+            &position_store,
+            &onchain_trade,
+            block_number,
+            "process-tx",
+        )
+        .await?;
+
+        match outcome {
+            ExcludedFillOutcome::Excluded { detail } => writeln!(
+                stdout,
+                "Trading is disabled for {base_symbol} on {}: fill {trade_id} is not \
+                 counter traded and was recorded in skipped_fills: {detail}",
+                onchain_trade.chain
+            )?,
+            ExcludedFillOutcome::AlreadyExcluded { detail } => writeln!(
+                stdout,
+                "Fill {trade_id} was already excluded from hedging and is recorded in \
+                 skipped_fills. The pipeline will not hedge it: {detail}"
+            )?,
+            ExcludedFillOutcome::AlreadyAcknowledged => writeln!(
+                stdout,
+                "Fill {trade_id} is already fully accounted. Nothing to do."
+            )?,
+        }
+        return Ok(());
+    }
+
+    match account_for_onchain_fill(
         pool,
         &onchain_trade_store,
         &position_store,
@@ -943,17 +1005,15 @@ pub(super) async fn process_found_trade<W: Write>(
         ctx.execution_threshold,
     )
     .await?
-    else {
-        writeln!(
-            stdout,
-            "Fill {trade_id} is already fully accounted. Nothing to do; \
-             the normal pipeline will hedge any unhedged position exposure."
-        )?;
-        return Ok(());
-    };
+    {
+        FillAccountingOutcome::Accounted { .. } => {}
+        finished => {
+            writeln!(stdout, "{}", finished_fill_message(&finished, &trade_id))?;
+            return Ok(());
+        }
+    }
 
     let executor_type = ctx.broker.to_supported_executor();
-    let base_symbol = onchain_trade.symbol();
 
     match reconcile_existing_pending_order(
         &offchain_order_store,
@@ -987,26 +1047,14 @@ pub(super) async fn process_found_trade<W: Write>(
         }
     };
 
-    let trading_enabled = ctx.chains.primary().assets.is_trading_enabled(base_symbol);
-
-    if !trading_enabled {
-        writeln!(
-            stdout,
-            "Trading disabled by configuration for {base_symbol}"
-        )?;
-        settle_fill(&onchain_trade_store, &position_store, &onchain_trade).await?;
-        return Ok(());
-    }
-
     let executor = MockExecutor::new();
     let Some(params) = check_execution_readiness(
         &executor,
         &position_projection,
         base_symbol,
         executor_type,
-        &ctx.chains.primary().assets,
+        &fill_chain.assets,
         &ctx.assets,
-        trading_enabled,
     )
     .await?
     else {
@@ -2033,7 +2081,7 @@ mod tests {
     async fn process_tx_settles_the_fill_before_reporting_an_existing_anchor_order() {
         let pool = setup_test_db().await;
         let (_position_store, _symbol, _anchor) = seeded_cli_failed_anchor(&pool).await;
-        let ctx = create_base_test_ctx();
+        let ctx = create_aapl_accounting_test_ctx();
         let onchain_trade = onchain_trade_builder()
             .with_log_index(2)
             .with_block_number(42)
@@ -2254,6 +2302,29 @@ mod tests {
             bot_gas_valuation: None,
             orchestrator: None,
         }
+    }
+
+    /// `create_base_test_ctx` with AAPL, the fixture fill's symbol, enabled
+    /// for trading, so a process-tx fill is accounted into the position
+    /// instead of excluded as a disabled asset fill. The threshold is far
+    /// above the one share fixture fill, so accounting never goes on to hedge.
+    fn create_aapl_accounting_test_ctx() -> Ctx {
+        let mut ctx = create_base_test_ctx();
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![],
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+        ctx.execution_threshold = ExecutionThreshold::shares(positive_fractional("100"));
+        ctx
     }
 
     fn create_alpaca_broker_api_test_ctx(mock_server: &MockServer) -> Ctx {
@@ -3566,12 +3637,12 @@ mod tests {
     /// `process-tx` must resume the acknowledge step when the fill was witnessed
     /// but not yet acknowledged (crash-recovery window). After the call, the
     /// `OnChainTrade` record must be acknowledged and exactly one position fill
-    /// event must exist. Trading is disabled in this test context so hedge
-    /// placement is not reached.
+    /// event must exist. The execution threshold sits above the fixture fill
+    /// so hedge placement is not reached.
     #[tokio::test]
     async fn process_tx_resumes_witnessed_but_unacknowledged_fill() {
         let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
+        let ctx = create_aapl_accounting_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
         let onchain_trade = onchain_trade_builder().with_block_number(1).build();
@@ -3644,7 +3715,7 @@ mod tests {
     #[tokio::test]
     async fn process_tx_witnesses_and_acknowledges_new_fill() {
         let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
+        let ctx = create_aapl_accounting_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
         // block_number is required for the Witness step on a new fill.
@@ -3691,6 +3762,145 @@ mod tests {
         );
     }
 
+    /// `process-tx` follows the bot's rule for a fill on an asset whose
+    /// trading is disabled on the fill's chain: it is witnessed and
+    /// acknowledged but kept out of the hedged position, which the periodic
+    /// scan would otherwise hedge, and recorded in `skipped_fills`.
+    #[tokio::test]
+    async fn process_tx_keeps_fill_on_trading_disabled_asset_out_of_the_position() {
+        let pool = setup_test_db().await;
+        let ctx = create_base_test_ctx();
+        let order_placer = create_order_placer(&ctx, &pool);
+
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+        let trade_id =
+            OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+
+        let mut stdout = Vec::new();
+        process_found_trade(
+            onchain_trade.clone(),
+            &ctx,
+            &pool,
+            &mut stdout,
+            order_placer.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Rerunning while trading is still disabled must repeat the cover
+        // instruction, not report that there is nothing to do.
+        let mut rerun = Vec::new();
+        process_found_trade(onchain_trade, &ctx, &pool, &mut rerun, order_placer)
+            .await
+            .unwrap();
+        let rerun = String::from_utf8(rerun).unwrap();
+        assert!(
+            rerun.contains("cover by SELL") && !rerun.contains("Nothing to do"),
+            "a rerun on an excluded fill must repeat the cover side, got: {rerun}"
+        );
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Trading is disabled for AAPL"),
+            "the operator must be told the fill is not counter traded, got: {output}"
+        );
+        // The fixture is an onchain buy, so the operator covers with a sell.
+        assert!(
+            output.contains("cover by SELL"),
+            "the operator must be told which side covers the delta, got: {output}"
+        );
+
+        let (store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let state = store
+            .load(&trade_id)
+            .await
+            .unwrap()
+            .expect("the fill must still be witnessed");
+        assert!(state.is_acknowledged());
+
+        let (fill_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind(
+                    st0x_hedge::operator::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE,
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            fill_count, 0,
+            "a fill on a trading disabled asset must not reach the position"
+        );
+
+        let reasons: Vec<(String,)> = sqlx::query_as("SELECT reason FROM skipped_fills")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reasons, vec![("trading_disabled".to_string(),)]);
+    }
+
+    /// Running `process-tx` again on an excluded fill after trading is enabled
+    /// must keep it excluded and say so: the fill is not in the position, so
+    /// telling the operator the pipeline will hedge it would leave its delta
+    /// uncovered.
+    #[tokio::test]
+    async fn process_tx_after_enabling_keeps_an_excluded_fill_excluded() {
+        let pool = setup_test_db().await;
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+
+        let disabled_ctx = create_base_test_ctx();
+        process_found_trade(
+            onchain_trade.clone(),
+            &disabled_ctx,
+            &pool,
+            &mut std::io::sink(),
+            create_order_placer(&disabled_ctx, &pool),
+        )
+        .await
+        .unwrap();
+
+        let enabled_ctx = create_aapl_accounting_test_ctx();
+        let mut stdout = Vec::new();
+        process_found_trade(
+            onchain_trade,
+            &enabled_ctx,
+            &pool,
+            &mut stdout,
+            create_order_placer(&enabled_ctx, &pool),
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("The pipeline will not hedge it"),
+            "the operator must be told the excluded fill is not hedged, got: {output}"
+        );
+        assert!(
+            !output.contains("the normal pipeline will hedge"),
+            "an excluded fill must not be promised a hedge, got: {output}"
+        );
+        assert!(
+            output.contains("cover by SELL"),
+            "the operator must be told which side covers the delta, got: {output}"
+        );
+
+        let (fill_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind(
+                    st0x_hedge::operator::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE,
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            fill_count, 0,
+            "the excluded fill must stay out of the position"
+        );
+    }
+
     /// After the CLI applies a fill via `process_found_trade`, the normal
     /// pipeline re-detecting the same fill (via `process_queued_trade`) must
     /// return `Ok(None)` — skipping cleanly — and must NOT emit a second
@@ -3698,7 +3908,7 @@ mod tests {
     #[tokio::test]
     async fn process_tx_then_normal_path_does_not_double_count() {
         let (pool, apalis_pool) = try_setup_test_pools().await.unwrap();
-        let ctx = create_base_test_ctx();
+        let ctx = create_aapl_accounting_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
         let onchain_trade = onchain_trade_builder().with_block_number(42).build();
@@ -3780,7 +3990,6 @@ mod tests {
             onchain_trade,
             &cqrs,
             &ChainAssets::default(),
-            true,
         )
         .await
         .unwrap();
@@ -4361,7 +4570,7 @@ mod tests {
     #[tokio::test]
     async fn process_tx_concurrent_witness_resumes_acknowledge() {
         let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
+        let ctx = create_aapl_accounting_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
         let onchain_trade = onchain_trade_builder().with_block_number(42).build();
@@ -4564,7 +4773,7 @@ mod tests {
     #[tokio::test]
     async fn process_tx_does_not_double_count_witnessed_fill_after_newer_fill_acknowledged() {
         let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
+        let ctx = create_aapl_accounting_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
         // Fill A and fill B: same tx_hash, different log_index so they have
@@ -4658,9 +4867,15 @@ mod tests {
         // re-apply it: last_slot (B) != A, so DuplicateTrade does NOT fire.
 
         // Step 4: Retry process-tx for fill A (crash-recovery scenario).
-        process_found_trade(fill_a, &ctx, &pool, &mut std::io::sink(), order_placer)
+        let mut stdout = Vec::new();
+        process_found_trade(fill_a, &ctx, &pool, &mut stdout, order_placer)
             .await
             .unwrap();
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Trade accumulated but did not trigger execution yet."),
+            "the retry must run the hedged accounting path: {output}"
+        );
 
         // Assertion 1: OnChainTrade A must now be acknowledged.
         let state_a = onchain_store
@@ -4705,7 +4920,7 @@ mod tests {
     #[tokio::test]
     async fn process_tx_none_path_does_not_recount_legacy_position_fill() {
         let pool = setup_test_db().await;
-        let ctx = create_base_test_ctx();
+        let ctx = create_aapl_accounting_test_ctx();
         let order_placer = create_order_placer(&ctx, &pool);
 
         // Fill A and fill B have distinct (tx_hash, log_index) identities.
@@ -4777,9 +4992,15 @@ mod tests {
         // Step 3: Run process_found_trade for fill A. It takes the None branch
         // (no OnChainTrade record), witnesses A, then the authoritative guard must
         // detect A already in Position and skip the re-apply.
-        process_found_trade(fill_a, &ctx, &pool, &mut std::io::sink(), order_placer)
+        let mut stdout = Vec::new();
+        process_found_trade(fill_a, &ctx, &pool, &mut stdout, order_placer)
             .await
             .unwrap();
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Trade accumulated but did not trigger execution yet."),
+            "the None path must run the hedged accounting path: {output}"
+        );
 
         // Assertion 1: OnChainTrade A must be acknowledged (witness + mark ran).
         let state_a = onchain_store
