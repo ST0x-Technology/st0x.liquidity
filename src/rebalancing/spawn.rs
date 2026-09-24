@@ -2,6 +2,7 @@
 
 use alloy::primitives::Address;
 use alloy::providers::RootProvider;
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -155,6 +156,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
         market_maker_wallet: Address,
         usdc_vault_id: RaindexVaultId,
         usdc: Arc<Store<UsdcRebalance>>,
+        pool: SqlitePool,
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
         gas_readiness: Arc<GasReadiness>,
     ) -> UsdcTransferResumeHandles {
@@ -169,7 +171,8 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
                 &self.settlement,
                 bot_gas_enqueuer,
             )
-            .with_gas_readiness(gas_readiness),
+            .with_gas_readiness(gas_readiness)
+            .with_credit_ledger(pool),
         );
 
         let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
@@ -531,7 +534,7 @@ mod tests {
         let (services, _ctx) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
-        let usdc_store = Arc::new(test_store(pool, ()));
+        let usdc_store = Arc::new(test_store(pool.clone(), ()));
 
         let UsdcTransferResumeHandles {
             resume_base_to_alpaca: _,
@@ -541,6 +544,7 @@ mod tests {
             Address::random(),
             RaindexVaultId(B256::ZERO),
             usdc_store,
+            pool,
             BotGasReceiptCostEnqueuer::Disabled,
             crate::native_gas::GasReadiness::always_ready_for_test(),
         );
