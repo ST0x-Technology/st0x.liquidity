@@ -825,6 +825,7 @@ mod tests {
             filled_at: now,
             enrichment: None,
             acknowledged_at: None,
+            exclusion: None,
         };
         assert!(contains_source(
             &references_for(&unacknowledged_trade),

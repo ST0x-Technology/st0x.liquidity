@@ -46,6 +46,16 @@ pub enum RejectionReason {
     },
     #[error("position {symbol} not found")]
     PositionNotFound { symbol: Symbol },
+    #[error("fill {trade_id} was not excluded from hedging, so it has no manual cover to record")]
+    FillNotExcluded {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
+    #[error("excluded fill {trade_id} already has a recorded manual cover")]
+    ExcludedFillAlreadyCovered {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
+    #[error("the cover price must be strictly positive")]
+    NonPositiveCoverPrice,
     #[error(
         "OffchainOrder {offchain_order_id} belongs to {owner}, not {symbol} -- refusing to \
          repair"
@@ -136,6 +146,7 @@ pub mod conductor {
         account_for_onchain_fill, configured_equity_symbols, execute_mark_acknowledged,
         execute_settle_fill, is_expected_place_offchain_order_rejection,
     };
+    pub use crate::trading::onchain::exclusion::{ExclusionCause, exclusion_cause};
 
     #[cfg(feature = "test-support")]
     pub use crate::conductor::{
@@ -823,6 +834,71 @@ pub mod portfolio_snapshot {
         }
 
         Ok(SetEquityMarkOutcome { formatted_mark })
+    }
+}
+
+pub mod excluded_fill {
+    use anyhow::Context;
+    use chrono::{DateTime, Utc};
+    use rain_math_float::Float;
+    use sqlx::SqlitePool;
+    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
+
+    use crate::onchain_trade::{
+        OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId,
+    };
+    use crate::operator::{OperatorError, RejectionReason};
+
+    /// Records the operator's manual broker cover of a fill excluded from
+    /// hedging: its full amount on the opposite side of the fill, at
+    /// `price_usdc`. Booked in the PnL ledger against the excluded fill.
+    ///
+    /// Shared by the ops API. Refuses a fill that was not excluded or already
+    /// has a cover, so a cover is recorded exactly once.
+    pub async fn record_exclusion_cover(
+        pool: &SqlitePool,
+        trade_id: &OnChainTradeId,
+        price_usdc: Float,
+        broker_order_id: Option<String>,
+        covered_at: DateTime<Utc>,
+    ) -> Result<(), OperatorError> {
+        let (onchain_trade, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .context("failed to build onchain trade store")?;
+
+        let result = onchain_trade
+            .send(
+                trade_id,
+                OnChainTradeCommand::RecordExclusionCover {
+                    price_usdc,
+                    broker_order_id,
+                    covered_at,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::NotExcluded | OnChainTradeError::NotFilled,
+            ))) => Err(RejectionReason::FillNotExcluded {
+                trade_id: trade_id.clone(),
+            }
+            .into()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::AlreadyCovered,
+            ))) => Err(RejectionReason::ExcludedFillAlreadyCovered {
+                trade_id: trade_id.clone(),
+            }
+            .into()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::NonPositiveCoverPrice,
+            ))) => Err(RejectionReason::NonPositiveCoverPrice.into()),
+            Err(error) => Err(anyhow::Error::new(error)
+                .context("failed to record the excluded fill cover")
+                .into()),
+        }
     }
 }
 

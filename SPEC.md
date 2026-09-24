@@ -1858,27 +1858,39 @@ event position).
 - Per-asset market enable/disable: individual equity markets can be disabled via
   `trading = "disabled"` on the asset's entry in its chain's assets table. The
   flag is the hedge kill switch for that asset on that chain, and it holds for
-  every fill accounted while it is disabled: such a fill is never counter
-  traded, inline or by the periodic position scan. `Position` holds one net per
-  symbol across all hedged chains, so the fill is kept out of it entirely;
-  otherwise the scan would hedge it for any other chain that enables the symbol.
-  Disabling does not unwind a net the symbol already accumulated on that chain
-  while it was enabled: that net stays in `Position`, and the scan keeps hedging
-  it for as long as any hedged chain enables the symbol, so flipping the switch
-  mid incident does not stop the bot hedging exposure it already accounted. An
-  excluded fill is still witnessed on its `OnChainTrade` and recorded in
-  `skipped_fills` with reason `trading_disabled`, and it raises a deduplicated
-  critical operational alert (once per process per chain and symbol), so the
-  exposure it leaves is never silent. The flag is read when the bot accounts the
-  fill, not when the fill lands on chain. Enabling the asset again therefore
-  hedges every fill the bot accounts from the restart on, including fills that
-  landed earlier but were not accounted yet: still queued, not yet backfilled
-  past the ingestion cutoff, or landing during the restart itself. Only fills
-  already recorded in `skipped_fills` with reason `trading_disabled` stay
-  excluded and are never hedged later; an operator covers that delta by hand
-  from those records. Excluded fills also never reach the PnL ledger, which
-  replays `Position` events, so PnL is incomplete for them and a manual cover
-  must be reconciled outside the ledger. Rebalancing is governed separately by
+  every fill that lands while it is disabled and every fill the bot accounts
+  while it is disabled: such a fill is never counter traded, inline or by the
+  periodic position scan. `Position` holds one net per symbol across all hedged
+  chains, so the fill is kept out of it entirely; otherwise the scan would hedge
+  it for any other chain that enables the symbol. Disabling does not unwind a
+  net the symbol already accumulated on that chain while it was enabled: that
+  net stays in `Position`, and the scan keeps hedging it for as long as any
+  hedged chain enables the symbol, so flipping the switch mid incident does not
+  stop the bot hedging exposure it already accounted. Each restart records the
+  flags it observes per chain and symbol in `trading_enablement`, and a restart
+  that sees an asset go from disabled to enabled sets that asset's cutoff to the
+  restart time. A fill that landed before the cutoff stays excluded even when
+  the bot accounts it after trading is enabled (still queued, not yet backfilled
+  past the ingestion cutoff, or landing during the restart itself); fills that
+  land from the restart on are hedged. An asset first seen enabled has no
+  cutoff, since no disabled period is known. An excluded fill is still witnessed
+  on its `OnChainTrade`, which records the exclusion, and it is recorded in
+  `skipped_fills` with reason `trading_disabled` and a detail naming its cover
+  side. Each excluded fill raises its own critical operational alert, with the
+  fill, its cover side and the uncovered net on its symbol and chain, so the
+  exposure it leaves is never silent; `skipped_fills.paged_at` makes a
+  redelivery after a crash page a fill that was not paged yet. An operator lists
+  excluded fills with `GET /liquidity-read/skipped-fills`
+  (`st0x-liquidity-client read resource skipped-fills`, filters `reason`,
+  `chain`, `symbol`, `since` and `covered`), covers each delta by hand at the
+  broker, and records the cover with
+  `POST
+  /liquidity-write/excluded-fills/{trade_id}/cover`
+  (`st0x-liquidity-client
+  debug cover-excluded-fill`). The PnL ledger books
+  excluded fills and their recorded covers on their own book per symbol, apart
+  from the hedged fills: an excluded fill without a recorded cover is open
+  exposure and the report warns about it. Rebalancing is governed separately by
   the asset's `rebalancing` flag.
 
 ### Infrastructure and Deployment

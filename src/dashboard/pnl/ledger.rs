@@ -38,6 +38,7 @@ use st0x_execution::Direction;
 use st0x_float_serde::format_float;
 
 use crate::bot_gas::{BotGasReceiptCost, BotGasReceiptCostEvent};
+use crate::onchain_trade::{OnChainTrade, OnChainTradeEvent};
 use crate::position::{Position, PositionEvent};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent};
@@ -46,7 +47,7 @@ use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent};
 /// mismatch against the persisted `pnl_ledger_checkpoint.ledger_version`
 /// truncates every ledger table and resets the checkpoint to zero, making
 /// rebuild the same code path as first-deploy backfill.
-pub(crate) const LEDGER_VERSION: i64 = 1;
+pub(crate) const LEDGER_VERSION: i64 = 2;
 
 /// Rows fetched per entity per ingest batch. Bounds peak memory during
 /// backfill; each batch's rows and checkpoint advance commit atomically, so
@@ -184,6 +185,12 @@ impl PnlLedger {
         sqlx::query("DELETE FROM pnl_mint_symbol")
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM pnl_excluded_fill")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM pnl_excluded_fill_cover")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE pnl_ledger_checkpoint SET last_rowid = 0, ledger_version = ?1 WHERE id = 1",
         )
@@ -226,6 +233,8 @@ impl PnlLedger {
             events_since::<UsdcRebalance>(&self.pool, from, head, self.batch_size).await?;
         let gas_costs =
             events_since::<BotGasReceiptCost>(&self.pool, from, head, self.batch_size).await?;
+        let onchain_trades =
+            events_since::<OnChainTrade>(&self.pool, from, head, self.batch_size).await?;
 
         let batch = self.batch_size.get() as usize;
         let bound = [
@@ -233,6 +242,7 @@ impl PnlLedger {
             full_page_bound(&mints, batch),
             full_page_bound(&rebalances, batch),
             full_page_bound(&gas_costs, batch),
+            full_page_bound(&onchain_trades, batch),
         ]
         .into_iter()
         .flatten()
@@ -251,6 +261,12 @@ impl PnlLedger {
         }
         for event in gas_costs.into_iter().filter(|event| event.rowid <= bound) {
             ingest_bot_gas(&mut tx, event).await?;
+        }
+        for event in onchain_trades
+            .into_iter()
+            .filter(|event| event.rowid <= bound)
+        {
+            ingest_onchain_trade(&mut tx, event).await?;
         }
         sqlx::query("UPDATE pnl_ledger_checkpoint SET last_rowid = ?1 WHERE id = 1")
             .bind(bound)
@@ -460,6 +476,86 @@ async fn ingest_position(
         | PositionEvent::OffChainOrderFailed { .. }
         | PositionEvent::FailedOrderAnchorReleased { .. }
         | PositionEvent::OffChainOrderCancelled { .. } => {}
+    }
+
+    Ok(())
+}
+
+/// Books fills excluded from hedging and their manual covers. Every other
+/// `OnChainTrade` event is booked through `Position` (a hedged fill) or
+/// carries no replay input.
+async fn ingest_onchain_trade(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: Sequenced<OnChainTrade>,
+) -> Result<(), PnlLedgerError> {
+    let Sequenced {
+        rowid,
+        id: trade_id,
+        event,
+        ..
+    } = event;
+    match event {
+        OnChainTradeEvent::ExcludedFromHedging {
+            symbol,
+            amount,
+            direction,
+            price_usdc,
+            block_timestamp,
+            excluded_at: _,
+        } => {
+            sqlx::query(
+                "INSERT INTO pnl_excluded_fill \
+                 (event_rowid, symbol, chain, tx_hash, log_index, shares, direction, price_usd, \
+                  executed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(event_rowid) DO NOTHING",
+            )
+            .bind(rowid)
+            .bind(symbol.to_string())
+            .bind(trade_id.chain.to_string())
+            .bind(trade_id.tx_hash.to_string())
+            .bind(i64::try_from(trade_id.log_index)?)
+            .bind(format_float(&amount)?)
+            .bind(direction_text(direction))
+            .bind(format_float(&price_usdc)?)
+            .bind(canonical_timestamp(&block_timestamp))
+            .execute(&mut **tx)
+            .await?;
+        }
+        OnChainTradeEvent::ExclusionCovered {
+            symbol,
+            shares,
+            direction,
+            price_usdc,
+            covered_at,
+            broker_order_id: _,
+            recorded_at: _,
+        } => {
+            sqlx::query(
+                "INSERT INTO pnl_excluded_fill_cover \
+                 (event_rowid, symbol, chain, tx_hash, log_index, shares, direction, price_usd, \
+                  executed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(event_rowid) DO NOTHING",
+            )
+            .bind(rowid)
+            .bind(symbol.to_string())
+            .bind(trade_id.chain.to_string())
+            .bind(trade_id.tx_hash.to_string())
+            .bind(i64::try_from(trade_id.log_index)?)
+            .bind(format_float(&shares)?)
+            .bind(direction_text(direction))
+            .bind(format_float(&price_usdc)?)
+            .bind(canonical_timestamp(&covered_at))
+            .execute(&mut **tx)
+            .await?;
+        }
+        // Hedged fills are booked from `Position`; the rest carry no replay
+        // input.
+        OnChainTradeEvent::Filled { .. }
+        | OnChainTradeEvent::SourceAttributed { .. }
+        | OnChainTradeEvent::Enriched { .. }
+        | OnChainTradeEvent::Acknowledged { .. } => {}
     }
 
     Ok(())

@@ -114,6 +114,55 @@ pub struct OnChainTrade {
     /// existed, which is the resume-safe default.
     #[serde(default)]
     pub(crate) acknowledged_at: Option<DateTime<Utc>>,
+    /// Set when the fill was excluded from hedging instead of applied to
+    /// `Position`: trading was disabled for it on its chain. Its delta is
+    /// covered by hand, and the operator records that cover here.
+    #[serde(default)]
+    pub(crate) exclusion: Option<Exclusion>,
+}
+
+/// A fill kept out of the hedged `Position` because trading was disabled for
+/// it on its chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Exclusion {
+    pub(crate) excluded_at: DateTime<Utc>,
+    /// The operator's manual broker cover, once recorded.
+    pub(crate) cover: Option<ExclusionCover>,
+}
+
+/// A manual broker trade that covers an excluded fill's delta in full, on the
+/// opposite side of the onchain fill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ExclusionCover {
+    #[serde(
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+    )]
+    pub(crate) price_usdc: Float,
+    pub(crate) broker_order_id: Option<String>,
+    pub(crate) covered_at: DateTime<Utc>,
+    pub(crate) recorded_at: DateTime<Utc>,
+}
+
+impl PartialEq for ExclusionCover {
+    fn eq(&self, other: &Self) -> bool {
+        self.price_usdc.eq(other.price_usdc).unwrap_or(false)
+            && self.broker_order_id == other.broker_order_id
+            && self.covered_at == other.covered_at
+            && self.recorded_at == other.recorded_at
+    }
+}
+
+impl Eq for ExclusionCover {}
+
+/// The side of the broker trade that covers an onchain fill: the opposite of
+/// the fill, since an onchain sell leaves the book short and a broker buy
+/// covers it.
+pub(crate) fn cover_direction(fill_direction: Direction) -> Direction {
+    match fill_direction {
+        Direction::Buy => Direction::Sell,
+        Direction::Sell => Direction::Buy,
+    }
 }
 
 #[async_trait]
@@ -127,7 +176,7 @@ impl EventSourced for OnChainTrade {
 
     const AGGREGATE_TYPE: &'static str = "OnChainTrade";
     const PROJECTION: Table = Table("onchain_trade_view");
-    const SCHEMA_VERSION: u64 = 4;
+    const SCHEMA_VERSION: u64 = 5;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use OnChainTradeEvent::*;
@@ -152,9 +201,14 @@ impl EventSourced for OnChainTrade {
                 filled_at: *filled_at,
                 enrichment: None,
                 acknowledged_at: None,
+                exclusion: None,
             }),
 
-            SourceAttributed { .. } | Enriched { .. } | Acknowledged { .. } => None,
+            SourceAttributed { .. }
+            | Enriched { .. }
+            | Acknowledged { .. }
+            | ExcludedFromHedging { .. }
+            | ExclusionCovered { .. } => None,
         }
     }
 
@@ -185,6 +239,38 @@ impl EventSourced for OnChainTrade {
                 source: *source,
                 ..entity.clone()
             })),
+
+            ExcludedFromHedging { excluded_at, .. } => Ok(Some(Self {
+                exclusion: Some(Exclusion {
+                    excluded_at: *excluded_at,
+                    cover: None,
+                }),
+                ..entity.clone()
+            })),
+
+            ExclusionCovered {
+                price_usdc,
+                broker_order_id,
+                covered_at,
+                recorded_at,
+                ..
+            } => {
+                let Some(exclusion) = &entity.exclusion else {
+                    return Ok(None);
+                };
+                Ok(Some(Self {
+                    exclusion: Some(Exclusion {
+                        excluded_at: exclusion.excluded_at,
+                        cover: Some(ExclusionCover {
+                            price_usdc: *price_usdc,
+                            broker_order_id: broker_order_id.clone(),
+                            covered_at: *covered_at,
+                            recorded_at: *recorded_at,
+                        }),
+                    }),
+                    ..entity.clone()
+                }))
+            }
 
             Filled { .. } => Ok(None),
         }
@@ -250,7 +336,9 @@ impl EventSourced for OnChainTrade {
                 filled_at,
             }]),
 
-            AttributeSource { .. } | Acknowledge => Err(OnChainTradeError::NotFilled),
+            AttributeSource { .. } | Acknowledge | Exclude | RecordExclusionCover { .. } => {
+                Err(OnChainTradeError::NotFilled)
+            }
         }
     }
 
@@ -295,6 +383,53 @@ impl EventSourced for OnChainTrade {
                     acknowledged_at: Utc::now(),
                 }])
             }
+
+            Exclude => {
+                if self.is_acknowledged() {
+                    return Err(OnChainTradeError::AlreadyAcknowledged);
+                }
+
+                let now = Utc::now();
+                Ok(vec![
+                    ExcludedFromHedging {
+                        symbol: self.symbol.clone(),
+                        amount: self.amount,
+                        direction: self.direction,
+                        price_usdc: self.price_usdc,
+                        block_timestamp: self.block_timestamp,
+                        excluded_at: now,
+                    },
+                    Acknowledged {
+                        acknowledged_at: now,
+                    },
+                ])
+            }
+
+            RecordExclusionCover {
+                price_usdc,
+                broker_order_id,
+                covered_at,
+            } => {
+                let Some(exclusion) = &self.exclusion else {
+                    return Err(OnChainTradeError::NotExcluded);
+                };
+                if exclusion.cover.is_some() {
+                    return Err(OnChainTradeError::AlreadyCovered);
+                }
+                if !price_usdc.gt(st0x_float_macro::float!(0)).unwrap_or(false) {
+                    return Err(OnChainTradeError::NonPositiveCoverPrice);
+                }
+
+                Ok(vec![ExclusionCovered {
+                    symbol: self.symbol.clone(),
+                    shares: self.amount,
+                    direction: cover_direction(self.direction),
+                    price_usdc,
+                    broker_order_id,
+                    covered_at,
+                    recorded_at: Utc::now(),
+                }])
+            }
         }
     }
 }
@@ -305,6 +440,12 @@ impl OnChainTrade {
     /// trade as fully processed.
     pub fn is_acknowledged(&self) -> bool {
         self.acknowledged_at.is_some()
+    }
+
+    /// Whether the fill was excluded from hedging because trading was
+    /// disabled for it on its chain.
+    pub fn is_excluded(&self) -> bool {
+        self.exclusion.is_some()
     }
 
     pub fn source(&self) -> OnChainTradeSource {
@@ -430,6 +571,12 @@ pub enum OnChainTradeError {
     LegacySourceWitness,
     #[error("Trade has already been acknowledged by the position")]
     AlreadyAcknowledged,
+    #[error("Trade was not excluded from hedging, so it has no manual cover")]
+    NotExcluded,
+    #[error("The excluded trade already has a recorded manual cover")]
+    AlreadyCovered,
+    #[error("A manual cover must have a positive price")]
+    NonPositiveCoverPrice,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,10 +624,25 @@ pub enum OnChainTradeCommand {
         block_timestamp: DateTime<Utc>,
         filled_at: DateTime<Utc>,
     },
-    /// Marks the fill as fully accounted: either applied to `Position` or,
-    /// when trading is disabled on its chain, recorded in `skipped_fills`.
-    /// The dedupe guard treats either as done.
+    /// Marks the fill as fully accounted into `Position`. The dedupe guard
+    /// treats it as done.
     Acknowledge,
+    /// Marks the fill as fully accounted by excluding it from hedging:
+    /// trading is disabled for it on its chain, so it never reaches
+    /// `Position` and its delta is covered by hand. Also acknowledges it, so
+    /// the dedupe guard treats it as done.
+    Exclude,
+    /// Records the operator's manual broker cover of an excluded fill: its
+    /// full amount on the opposite side of the fill, at `price_usdc`.
+    RecordExclusionCover {
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        price_usdc: Float,
+        broker_order_id: Option<String>,
+        covered_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +678,43 @@ pub enum OnChainTradeEvent {
     },
     Acknowledged {
         acknowledged_at: DateTime<Utc>,
+    },
+    /// The fill was excluded from hedging. Carries the fill's own terms so
+    /// the PnL ledger can book it from this event alone.
+    ExcludedFromHedging {
+        symbol: Symbol,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        amount: Float,
+        direction: Direction,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        price_usdc: Float,
+        block_timestamp: DateTime<Utc>,
+        excluded_at: DateTime<Utc>,
+    },
+    /// The operator covered the excluded fill at the broker. `direction` is
+    /// the cover's side, opposite the fill; `shares` is the fill's amount.
+    ExclusionCovered {
+        symbol: Symbol,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        shares: Float,
+        direction: Direction,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        price_usdc: Float,
+        broker_order_id: Option<String>,
+        covered_at: DateTime<Utc>,
+        recorded_at: DateTime<Utc>,
     },
 }
 
@@ -586,6 +785,59 @@ impl PartialEq for OnChainTradeEvent {
                     attributed_at: attributed_b,
                 },
             ) => source_a == source_b && attributed_a == attributed_b,
+            (
+                Self::ExcludedFromHedging {
+                    symbol: symbol_a,
+                    amount: amount_a,
+                    direction: direction_a,
+                    price_usdc: price_a,
+                    block_timestamp: block_ts_a,
+                    excluded_at: excluded_a,
+                },
+                Self::ExcludedFromHedging {
+                    symbol: symbol_b,
+                    amount: amount_b,
+                    direction: direction_b,
+                    price_usdc: price_b,
+                    block_timestamp: block_ts_b,
+                    excluded_at: excluded_b,
+                },
+            ) => {
+                symbol_a == symbol_b
+                    && amount_a.eq(*amount_b).unwrap_or(false)
+                    && direction_a == direction_b
+                    && price_a.eq(*price_b).unwrap_or(false)
+                    && block_ts_a == block_ts_b
+                    && excluded_a == excluded_b
+            }
+            (
+                Self::ExclusionCovered {
+                    symbol: symbol_a,
+                    shares: shares_a,
+                    direction: direction_a,
+                    price_usdc: price_a,
+                    broker_order_id: order_a,
+                    covered_at: covered_a,
+                    recorded_at: recorded_a,
+                },
+                Self::ExclusionCovered {
+                    symbol: symbol_b,
+                    shares: shares_b,
+                    direction: direction_b,
+                    price_usdc: price_b,
+                    broker_order_id: order_b,
+                    covered_at: covered_b,
+                    recorded_at: recorded_b,
+                },
+            ) => {
+                symbol_a == symbol_b
+                    && shares_a.eq(*shares_b).unwrap_or(false)
+                    && direction_a == direction_b
+                    && price_a.eq(*price_b).unwrap_or(false)
+                    && order_a == order_b
+                    && covered_a == covered_b
+                    && recorded_a == recorded_b
+            }
             _ => false,
         }
     }
@@ -600,6 +852,10 @@ impl DomainEvent for OnChainTradeEvent {
             Self::SourceAttributed { .. } => "OnChainTradeEvent::SourceAttributed".to_string(),
             Self::Enriched { .. } => "OnChainTradeEvent::Enriched".to_string(),
             Self::Acknowledged { .. } => "OnChainTradeEvent::Acknowledged".to_string(),
+            Self::ExcludedFromHedging { .. } => {
+                "OnChainTradeEvent::ExcludedFromHedging".to_string()
+            }
+            Self::ExclusionCovered { .. } => "OnChainTradeEvent::ExclusionCovered".to_string(),
         }
     }
 
@@ -765,6 +1021,170 @@ mod tests {
         assert!(matches!(
             error,
             LifecycleError::Apply(OnChainTradeError::AlreadyAcknowledged)
+        ));
+    }
+
+    fn filled_sell(now: DateTime<Utc>) -> OnChainTradeEvent {
+        OnChainTradeEvent::Filled {
+            source: OnChainTradeSource::Raindex,
+            symbol: Symbol::new("AAPL").unwrap(),
+            amount: float!(3),
+            direction: Direction::Sell,
+            price_usdc: float!(150),
+            block_number: 12345,
+            block_timestamp: now,
+            filled_at: now,
+        }
+    }
+
+    fn excluded(now: DateTime<Utc>) -> Vec<OnChainTradeEvent> {
+        vec![
+            filled_sell(now),
+            OnChainTradeEvent::ExcludedFromHedging {
+                symbol: Symbol::new("AAPL").unwrap(),
+                amount: float!(3),
+                direction: Direction::Sell,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                excluded_at: now,
+            },
+            OnChainTradeEvent::Acknowledged {
+                acknowledged_at: now,
+            },
+        ]
+    }
+
+    /// Excluding carries the fill's terms for the PnL ledger and acknowledges
+    /// the fill, so the dedupe guard treats it as done.
+    #[tokio::test]
+    async fn exclude_records_the_fill_terms_and_acknowledges() {
+        let now = Utc::now();
+        let events = TestHarness::<OnChainTrade>::with(())
+            .given(vec![filled_sell(now)])
+            .when(OnChainTradeCommand::Exclude)
+            .await
+            .events();
+
+        let [
+            OnChainTradeEvent::ExcludedFromHedging {
+                amount, direction, ..
+            },
+            OnChainTradeEvent::Acknowledged { .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected an exclusion then an acknowledgement, got {events:?}");
+        };
+        assert!(amount.eq(float!(3)).unwrap());
+        assert_eq!(*direction, Direction::Sell);
+
+        let state = replay::<OnChainTrade>(excluded(now)).unwrap().unwrap();
+        assert!(state.is_acknowledged());
+        assert!(state.is_excluded());
+    }
+
+    /// An onchain sell leaves the book short, so its cover is a broker buy of
+    /// the full amount.
+    #[tokio::test]
+    async fn cover_of_an_excluded_sell_is_a_buy_of_the_full_amount() {
+        let now = Utc::now();
+        let events = TestHarness::<OnChainTrade>::with(())
+            .given(excluded(now))
+            .when(OnChainTradeCommand::RecordExclusionCover {
+                price_usdc: float!(151),
+                broker_order_id: Some("order-1".to_owned()),
+                covered_at: now,
+            })
+            .await
+            .events();
+
+        let [
+            OnChainTradeEvent::ExclusionCovered {
+                shares,
+                direction,
+                price_usdc,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one cover event, got {events:?}");
+        };
+        assert!(shares.eq(float!(3)).unwrap());
+        assert_eq!(*direction, Direction::Buy);
+        assert!(price_usdc.eq(float!(151)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn cover_is_recorded_once() {
+        let now = Utc::now();
+        let mut given = excluded(now);
+        given.push(OnChainTradeEvent::ExclusionCovered {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: float!(3),
+            direction: Direction::Buy,
+            price_usdc: float!(151),
+            broker_order_id: None,
+            covered_at: now,
+            recorded_at: now,
+        });
+
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(given)
+            .when(OnChainTradeCommand::RecordExclusionCover {
+                price_usdc: float!(152),
+                broker_order_id: None,
+                covered_at: now,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::AlreadyCovered)
+        ));
+    }
+
+    /// A hedged fill is covered by the bot's own hedge; a manual cover would
+    /// book it twice.
+    #[tokio::test]
+    async fn hedged_fill_cannot_take_a_manual_cover() {
+        let now = Utc::now();
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(vec![
+                filled_sell(now),
+                OnChainTradeEvent::Acknowledged {
+                    acknowledged_at: now,
+                },
+            ])
+            .when(OnChainTradeCommand::RecordExclusionCover {
+                price_usdc: float!(151),
+                broker_order_id: None,
+                covered_at: now,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::NotExcluded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cover_price_must_be_positive() {
+        let now = Utc::now();
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(excluded(now))
+            .when(OnChainTradeCommand::RecordExclusionCover {
+                price_usdc: float!(0),
+                broker_order_id: None,
+                covered_at: now,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::NonPositiveCoverPrice)
         ));
     }
 

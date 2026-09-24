@@ -46,6 +46,7 @@ use crate::bot_gas::{
     BotGasOperationCategory, BotGasReceiptCost, BotGasReceiptCostError, BotGasReceiptCostEvent,
 };
 use crate::offchain::order::OffchainOrderId;
+use crate::onchain_trade::{OnChainTrade, OnChainTradeEvent};
 use crate::portfolio_snapshot::EtDayRange;
 use crate::position::{Position, PositionEvent, TradeId};
 use crate::test_utils::{persist_event, setup_test_db};
@@ -643,6 +644,7 @@ enum SeedEvent {
     Mint(String, TokenizedEquityMintEvent),
     Rebalance(String, UsdcRebalanceEvent),
     BotGas(String, BotGasReceiptCostEvent),
+    OnChainTrade(String, OnChainTradeEvent),
 }
 
 fn seed_bot_gas(cost: BotGasReceiptCost) -> SeedEvent {
@@ -763,6 +765,9 @@ async fn pnl_test_pool(seed: Vec<SeedEvent>, positions: Vec<PositionViewRow>) ->
             }
             SeedEvent::BotGas(id, event) => {
                 persist_event::<BotGasReceiptCost>(&pool, &id, next_sequence(&id), &event).await;
+            }
+            SeedEvent::OnChainTrade(id, event) => {
+                persist_event::<OnChainTrade>(&pool, &id, next_sequence(&id), &event).await;
             }
         }
     }
@@ -1071,6 +1076,96 @@ async fn source_loader_includes_manual_position_adjustments() {
     assert_eq!(report.summary.open_long_shares, "1");
     assert_eq!(report.summary.unmatched_offchain_shares, "1");
     assert_eq!(report.entries.len(), 0);
+}
+
+const EXCLUDED_TRADE_ID: &str =
+    "base:0x5555555555555555555555555555555555555555555555555555555555555555:5";
+
+/// An onchain sell of 3 AAPL at 150 excluded from hedging.
+fn excluded_sell_event() -> SeedEvent {
+    SeedEvent::OnChainTrade(
+        EXCLUDED_TRADE_ID.to_owned(),
+        OnChainTradeEvent::ExcludedFromHedging {
+            symbol: Symbol::new("AAPL").unwrap(),
+            amount: float!(3),
+            direction: exec_direction(Direction::Sell),
+            price_usdc: float!(150),
+            block_timestamp: parse_timestamp("2026-05-15T13:00:00Z").unwrap(),
+            excluded_at: parse_timestamp("2026-05-15T13:00:05Z").unwrap(),
+        },
+    )
+}
+
+/// An excluded fill replays on its own book against the operator's manual
+/// cover: the hedged fills on the same symbol neither absorb it nor are
+/// disturbed by it, and the cover realizes its PnL.
+#[tokio::test]
+async fn excluded_fill_and_its_manual_cover_realize_pnl_on_their_own_book() {
+    let pool = pnl_test_pool(
+        vec![
+            SeedEvent::Position(
+                "AAPL",
+                onchain_fill_event(Direction::Sell, "100", "10", "2026-05-15T12:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "AAPL",
+                offchain_fill_event(Direction::Buy, "100", "10", "2026-05-15T12:00:01Z"),
+            ),
+            excluded_sell_event(),
+            SeedEvent::OnChainTrade(
+                EXCLUDED_TRADE_ID.to_owned(),
+                OnChainTradeEvent::ExclusionCovered {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: float!(3),
+                    direction: exec_direction(Direction::Buy),
+                    price_usdc: float!(140),
+                    broker_order_id: Some("order-1".to_owned()),
+                    covered_at: parse_timestamp("2026-05-15T14:00:00Z").unwrap(),
+                    recorded_at: parse_timestamp("2026-05-15T14:05:00Z").unwrap(),
+                },
+            ),
+        ],
+        vec![position_row("AAPL", "0")],
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "30");
+    assert_eq!(report.summary.open_short_shares, "0");
+    assert_eq!(report.summary.open_long_shares, "0");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("not yet covered")),
+        "a covered exclusion leaves nothing open: {:?}",
+        report.warnings
+    );
+}
+
+/// Until the cover is recorded the excluded fill is open exposure, and the
+/// report says so.
+#[tokio::test]
+async fn uncovered_excluded_fill_is_open_exposure_with_a_warning() {
+    let pool = pnl_test_pool(vec![excluded_sell_event()], vec![position_row("AAPL", "0")]).await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "0");
+    assert_eq!(report.summary.open_short_shares, "3");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("AAPL") && warning.contains("not yet covered")),
+        "the open excluded exposure must be called out: {:?}",
+        report.warnings
+    );
 }
 
 #[tokio::test]

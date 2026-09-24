@@ -98,7 +98,7 @@ use crate::onchain::backfill::BackfillQueues;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{
     OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId, OnChainTradeSource,
-    SourceAttributionDecision,
+    SourceAttributionDecision, cover_direction,
 };
 use crate::performance::HedgeLatencyProjection;
 use crate::performance::equity_timing::EquityTimingProjection;
@@ -142,6 +142,7 @@ use crate::trading::offchain::hedge::{
     acquire_counter_trade_submission_file_lock, apply_slippage, push_anchor_recovery_job_if_absent,
     resolve_extended_hours_reference_price,
 };
+use crate::trading::onchain::exclusion::{ExclusionCause, record_trading_enablement};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::skipped_fill::{
     SkipReason, record_skipped_fill, trading_disabled_detail,
@@ -2022,6 +2023,11 @@ impl PositionAndRebalancing {
 async fn run_startup_maintenance(ctx: &Ctx, pool: &SqlitePool) -> anyhow::Result<()> {
     grant_startup_token_approvals(ctx).await?;
     catch_up_lifecycle_failures(pool).await?;
+    // Before any fill is accounted: a fill that landed before this restart
+    // enabled its asset stays excluded from hedging.
+    record_trading_enablement(pool, &ctx.chains, Utc::now())
+        .await
+        .context("failed to record the trading flags observed at startup")?;
     Ok(())
 }
 
@@ -4587,6 +4593,26 @@ pub async fn execute_mark_acknowledged(
     }
 }
 
+/// Marks the trade excluded from hedging, which also acknowledges it, so a
+/// redrive does nothing. A re-driven marker (`AlreadyAcknowledged`) is
+/// idempotent; infrastructure errors propagate so the apalis retry re-drives
+/// the idempotent exclusion steps.
+pub async fn execute_mark_excluded(
+    onchain_trade: &Store<OnChainTrade>,
+    trade_id: &OnChainTradeId,
+) -> Result<(), SendError<OnChainTrade>> {
+    match onchain_trade
+        .send(trade_id, OnChainTradeCommand::Exclude)
+        .await
+    {
+        Ok(())
+        | Err(AggregateError::UserError(LifecycleError::Apply(
+            OnChainTradeError::AlreadyAcknowledged,
+        ))) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Prunes a durably acknowledged fill from the position.
 ///
 /// This removes it from the pending-acknowledgement set once its
@@ -4674,10 +4700,10 @@ pub(crate) async fn position_fill_already_recorded(
 
 pub enum FillAccountingOutcome {
     AlreadyAcknowledged,
-    /// Recorded in `skipped_fills` because trading was disabled on its chain
-    /// when it was accounted. Never hedged: an operator covers its delta by
-    /// hand, even after trading is enabled again. `detail` is the recorded
-    /// fill and cover side.
+    /// Excluded from hedging and recorded in `skipped_fills`, because trading
+    /// was disabled for it on its chain. Never hedged: an operator covers its
+    /// delta by hand, even after trading is enabled again. `detail` is the
+    /// recorded fill and cover side.
     ExcludedFromHedging {
         detail: String,
     },
@@ -4828,7 +4854,7 @@ pub async fn account_for_onchain_fill(
     // marker: the `skipped_fills` record already tells the operator to cover
     // the delta by hand, so finish the exclusion instead of hedging it too.
     if let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? {
-        execute_mark_acknowledged(onchain_trade, &trade_id).await?;
+        execute_mark_excluded(onchain_trade, &trade_id).await?;
         warn!(
             ?trade_id,
             symbol = %trade.symbol,
@@ -4866,13 +4892,16 @@ pub enum ExcludedFillOutcome {
 /// acknowledged on its `OnChainTrade`, which makes a redrive do nothing, and
 /// its delta is recorded in `skipped_fills` for an operator to cover by hand.
 ///
-/// `event_type` names what surfaced the fill, for the skipped fill record.
+/// `cause` is why the fill is excluded, from
+/// [`crate::trading::onchain::exclusion::exclusion_cause`]. `event_type`
+/// names what surfaced the fill, for the skipped fill record.
 pub async fn account_for_fill_excluded_from_hedging(
     pool: &SqlitePool,
     onchain_trade: &Store<OnChainTrade>,
     position: &Store<Position>,
     trade: &OnchainTrade,
     block_number: u64,
+    cause: ExclusionCause,
     event_type: &str,
 ) -> Result<ExcludedFillOutcome, TradeAccountingError> {
     let WitnessedFill::Pending { trade_id, .. } =
@@ -4896,16 +4925,11 @@ pub async fn account_for_fill_excluded_from_hedging(
         return Ok(ExcludedFillOutcome::AlreadyAcknowledged);
     }
 
-    // The cover is the opposite side of the onchain fill: an onchain sell
-    // leaves the book short, which a broker buy covers.
-    let cover = match trade.direction {
-        Direction::Buy => Direction::Sell,
-        Direction::Sell => Direction::Buy,
-    };
+    let cover = cover_direction(trade.direction);
     let detail = format!(
         "onchain fill {direction} {amount} {symbol} at {price} USDC on {chain}, \
-         cover by {cover} {amount} {symbol} at the broker: trading is disabled \
-         for {symbol} on {chain}, so the fill is not counter traded",
+         cover by {cover} {amount} {symbol} at the broker: {cause} for {symbol} \
+         on {chain}, so the fill is not counter traded",
         direction = trade.direction,
         amount = trade.amount,
         symbol = trade.symbol.base(),
@@ -4930,7 +4954,7 @@ pub async fn account_for_fill_excluded_from_hedging(
         trade_id: trade_id.clone(),
         source: Box::new(error),
     })?;
-    execute_mark_acknowledged(onchain_trade, &trade_id).await?;
+    execute_mark_excluded(onchain_trade, &trade_id).await?;
 
     warn!(
         ?trade_id,
@@ -11710,6 +11734,7 @@ mod tests {
             &cqrs.position,
             &trade,
             trade_event.block_number,
+            ExclusionCause::TradingDisabled,
             "InventoryTrade",
         )
         .await

@@ -633,7 +633,6 @@ where
     let accountant_ctx = Arc::new(AccountantCtx {
         chains: chain_accounting,
         notifier,
-        disabled_asset_alerts: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         ctx: context.ctx.clone(),
         cache: context.cache,
         cqrs: trade_cqrs,

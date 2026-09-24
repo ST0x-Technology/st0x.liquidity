@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT trading_enabled FROM trading_enablement WHERE chain = ? AND symbol = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "trading_enabled",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "trading_enablement",
+            "name": "trading_enabled"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c9784e475fe60c8b058cf713709411f08797f84f473cac1d1942e2907587729f"
+}

@@ -82,6 +82,28 @@ pub(crate) enum Debug {
         /// Aggregate id path segment.
         id: String,
     },
+    /// Record the manual broker cover of a fill excluded from hedging, so the
+    /// PnL ledger books it and the fill leaves the uncovered set.
+    CoverExcludedFill(CoverExcludedFillArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct CoverExcludedFillArgs {
+    /// The fill's chain (for example base).
+    pub(crate) chain: String,
+    /// The fill's transaction hash.
+    pub(crate) tx_hash: String,
+    /// The fill's log index.
+    pub(crate) log_index: u64,
+    /// Broker execution price per share, in USD.
+    #[arg(long)]
+    pub(crate) price_usdc: String,
+    /// When the broker trade executed (RFC 3339).
+    #[arg(long)]
+    pub(crate) covered_at: String,
+    /// The broker's order id, for the audit trail.
+    #[arg(long)]
+    pub(crate) broker_order_id: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -99,6 +121,7 @@ pub(crate) enum ReadResource {
     Reliability,
     Infra,
     Health,
+    SkippedFills,
 }
 
 impl ReadResource {
@@ -117,6 +140,7 @@ impl ReadResource {
             Self::Reliability => "/performance/reliability",
             Self::Infra => "/performance/infra",
             Self::Health => "/health",
+            Self::SkippedFills => "/skipped-fills",
         }
     }
 }

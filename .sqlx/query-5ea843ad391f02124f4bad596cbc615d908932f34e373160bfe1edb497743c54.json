@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT enabled_since FROM trading_enablement WHERE chain = ? AND symbol = ? AND trading_enabled = 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "enabled_since",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "trading_enablement",
+            "name": "enabled_since"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "5ea843ad391f02124f4bad596cbc615d908932f34e373160bfe1edb497743c54"
+}

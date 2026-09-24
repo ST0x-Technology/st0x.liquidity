@@ -11,20 +11,25 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use rain_math_float::Float;
 use st0x_config::{Ctx, HedgedChain};
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Chain, ReadOnlyEvm};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::{ExecutionError, Executor, Permanence, Symbol};
+use st0x_execution::{Direction, ExecutionError, Executor, FractionalShares, Permanence, Symbol};
+use st0x_float_macro::float;
 use st0x_raindex::RaindexContracts;
 use st0x_registry::{SymbolCache, get_symbol_lock};
 
+use super::exclusion::exclusion_cause;
 use super::inclusion::EmittedOnChain;
-use super::skipped_fill::{SkipReason, record_skipped_fill};
+use super::skipped_fill::{
+    SkipReason, SkippedFillError, UncoveredExcludedFill, excluded_fill_unpaged,
+    mark_excluded_fill_paged, record_skipped_fill, uncovered_excluded_fills,
+};
 use crate::alerts::Notifier;
 use crate::conductor::job::{
     BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak, Job, JobQueue, Label,
@@ -37,6 +42,7 @@ use crate::conductor::{
 use crate::offchain::order::PlaceOffchainOrderError;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
+use crate::onchain_trade::OnChainTradeId;
 use crate::vault_registry::VaultRegistry;
 
 /// Persistent job queue for DEX trade accounting.
@@ -94,13 +100,6 @@ pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) pool: SqlitePool,
     pub(crate) job_queue: DexTradeAccountingJobQueue,
     pub(crate) notifier: Arc<dyn Notifier>,
-    /// Chain and symbol pairs already paged for a fill on a trading disabled
-    /// asset, so an ongoing stream of such fills pages once per process, not
-    /// per fill (same cadence as hedge dead letter alerts). Each such fill is
-    /// kept out of the hedged position and recorded in `skipped_fills`. Keyed
-    /// per chain because each chain's asset table disables the symbol on its
-    /// own. A restart pages again.
-    pub(crate) disabled_asset_alerts: Arc<std::sync::Mutex<HashSet<(Chain, Symbol)>>>,
 }
 
 impl<Node, Exec> Job<AccountantCtx<Node, Exec>> for AccountForDexTrade
@@ -236,36 +235,32 @@ where
         // every hedged chain, so a disabled chain's fill must stay out of it
         // or the periodic scan hedges it for whichever chain enables the
         // symbol.
-        if !chain_ctx
-            .trading
-            .assets
-            .is_trading_enabled(trade.symbol.base())
-        {
+        let cause = exclusion_cause(&ctx.pool, &chain_ctx.trading.assets, &trade)
+            .await
+            .map_err(|error| TradeAccountingError::ExcludedFillRecord {
+                trade_id: OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index),
+                source: Box::new(error),
+            })?;
+        if let Some(cause) = cause {
             let outcome = account_for_fill_excluded_from_hedging(
                 &ctx.cqrs.pool,
                 &ctx.cqrs.onchain_trade,
                 &ctx.cqrs.position,
                 &trade,
                 trade_event.block_number,
+                cause,
                 trade_event.event.kind(),
             )
             .await?;
 
-            // `AlreadyExcluded` pages too: the marker is durable before the
-            // page, so a process that dies in between redelivers into this
-            // outcome, and the fill's delta must still be surfaced. The per
-            // process dedup keeps any other redrive to one page per symbol.
+            // `AlreadyExcluded` pages too when the page is still owed: the
+            // marker is durable before the page, so a process that dies in
+            // between redelivers into this outcome.
             if let ExcludedFillOutcome::Excluded { detail }
             | ExcludedFillOutcome::AlreadyExcluded { detail } = outcome
             {
-                self.alert_disabled_asset_fill(
-                    &ctx.notifier,
-                    &ctx.disabled_asset_alerts,
-                    &trade,
-                    chain_ctx.trading.chain,
-                    &detail,
-                )
-                .await;
+                self.page_excluded_fill(&ctx.pool, &ctx.notifier, &trade, &detail)
+                    .await?;
             }
 
             return Ok(());
@@ -446,49 +441,106 @@ async fn persist_skipped_fill(
 }
 
 impl AccountForDexTrade {
-    /// Critical, deduplicated alert for a fill on a disabled asset. The flag
+    /// Critical alert for each fill excluded from hedging. The trading flag
     /// is the per symbol hedge kill switch, so the fill is never counter
     /// traded, but the exposure it leaves must never be silent. `detail`
-    /// states the delta so the operator can cover it from the page alone.
-    /// Once per process per chain and symbol; delivery failure releases the
-    /// reservation so the next fill tries again.
-    async fn alert_disabled_asset_fill(
+    /// states the fill's delta and the page adds the uncovered net on its
+    /// symbol and chain, so the operator can cover from the page alone.
+    ///
+    /// Paged once per fill, tracked in `skipped_fills.paged_at`: the page
+    /// comes before the paged mark, so a crash in between pages twice rather
+    /// than never. A failed delivery leaves the fill unpaged, so its next
+    /// redelivery pages again.
+    async fn page_excluded_fill(
         &self,
+        pool: &SqlitePool,
         notifier: &Arc<dyn Notifier>,
-        alerted_symbols: &std::sync::Mutex<HashSet<(Chain, Symbol)>>,
         trade: &OnchainTrade,
-        chain: Chain,
         detail: &str,
-    ) {
-        let newly_reserved = {
-            let mut alerted = match alerted_symbols.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            alerted.insert((chain, trade.symbol.base().clone()))
+    ) -> Result<(), TradeAccountingError> {
+        let trade_id = OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index);
+        let record_error = |error: SkippedFillError| TradeAccountingError::ExcludedFillRecord {
+            trade_id: trade_id.clone(),
+            source: Box::new(error),
         };
-        if !newly_reserved {
-            return;
+
+        if !excluded_fill_unpaged(pool, trade.chain, trade.tx_hash, trade.log_index)
+            .await
+            .map_err(record_error)?
+        {
+            return Ok(());
         }
 
+        let symbol = trade.symbol.base();
+        let uncovered = uncovered_excluded_fills(pool, trade.chain, symbol.as_str())
+            .await
+            .map_err(record_error)?;
         let message = format!(
             "Fill on DISABLED asset {symbol} (chain {chain}, tx {tx}): {detail}. Kept out \
              of the hedged position and recorded in skipped_fills; cover the delta by \
-             hand. Further fills on this symbol and chain are not paged again until \
-             restart.",
-            symbol = trade.symbol.base(),
-            tx = self.trade.tx_hash,
+             hand, then record the cover with st0x-liquidity-client debug \
+             cover-excluded-fill {chain} {tx} {log_index}. {uncovered}",
+            chain = trade.chain,
+            tx = trade.tx_hash,
+            log_index = trade.log_index,
+            uncovered = describe_uncovered_net(symbol, trade.chain, &uncovered),
         );
         error!(target: "hedge", %message, "Disabled-asset fill");
         if let Err(error) = notifier.notify(&message).await {
             warn!(target: "hedge", ?error, "Disabled-asset alert delivery failed");
-            let mut alerted = match alerted_symbols.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            alerted.remove(&(chain, trade.symbol.base().clone()));
+            return Ok(());
         }
+
+        mark_excluded_fill_paged(pool, trade.chain, trade.tx_hash, trade.log_index)
+            .await
+            .map_err(record_error)
     }
+}
+
+/// The page's running total: how much of `symbol` on `chain` the operator
+/// still has to cover by hand, netted across every uncovered excluded fill.
+fn describe_uncovered_net(
+    symbol: &Symbol,
+    chain: Chain,
+    uncovered: &[UncoveredExcludedFill],
+) -> String {
+    let count = uncovered.len();
+    let Some(net_to_buy) = uncovered_net_to_buy(uncovered) else {
+        return format!(
+            "{count} uncovered excluded fills on {symbol} ({chain}); their net could not be \
+             computed, see skipped_fills."
+        );
+    };
+
+    match (net_to_buy.is_zero(), net_to_buy.lt(float!(0))) {
+        (Ok(true), _) => {
+            format!("Uncovered excluded fills on {symbol} ({chain}) net to zero ({count} fills).")
+        }
+        (_, Ok(true)) => format!(
+            "Uncovered on {symbol} ({chain}): cover by SELL {} at the broker in total \
+             ({count} fills).",
+            FractionalShares::new((float!(0) - net_to_buy).unwrap_or(net_to_buy))
+        ),
+        _ => format!(
+            "Uncovered on {symbol} ({chain}): cover by BUY {} at the broker in total \
+             ({count} fills).",
+            FractionalShares::new(net_to_buy)
+        ),
+    }
+}
+
+/// Shares to buy at the broker to cover every uncovered excluded fill: an
+/// onchain sell is covered by a broker buy, and an onchain buy by a sell.
+fn uncovered_net_to_buy(uncovered: &[UncoveredExcludedFill]) -> Option<Float> {
+    uncovered.iter().try_fold(float!(0), |net, fill| {
+        let direction = fill.direction.parse::<Direction>().ok()?;
+        let amount = Float::parse(fill.amount.clone()).ok()?;
+        match direction {
+            Direction::Sell => net + amount,
+            Direction::Buy => net - amount,
+        }
+        .ok()
+    })
 }
 
 /// Decodes a raw Raindex event into an [`OnchainTrade`] against ITS chain's
@@ -1038,7 +1090,6 @@ mod tests {
             cache,
             cqrs,
             notifier: Arc::new(crate::alerts::LogNotifier),
-            disabled_asset_alerts: Arc::new(std::sync::Mutex::new(HashSet::new())),
             vault_registry,
             executor,
             pool,
@@ -1146,106 +1197,6 @@ mod tests {
                 .unwrap(),
             None
         );
-    }
-
-    /// The disabled-asset alert fires once per process per symbol; a second
-    /// fill on the same symbol stays silent, and a delivery failure releases
-    /// the reservation so the next fill re-pages.
-    #[tokio::test]
-    async fn disabled_asset_alert_pages_once_per_symbol() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
-        let mut ctx = build_test_accountant_ctx(
-            pool,
-            &apalis_pool,
-            create_test_ctx_with_order_owner(Address::ZERO),
-            SymbolCache::default(),
-            provider,
-            executor,
-            ExecutionThreshold::whole_share(),
-        )
-        .await;
-        ctx.notifier = notifier.clone();
-
-        let job = test_job();
-        let trade = crate::test_utils::OnchainTradeBuilder::new().build();
-
-        let notifier_arc: Arc<dyn Notifier> = notifier.clone();
-        job.alert_disabled_asset_fill(
-            &notifier_arc,
-            &ctx.disabled_asset_alerts,
-            &trade,
-            Chain::Base,
-            "Buy 5 AAPL at 150 USDC",
-        )
-        .await;
-        job.alert_disabled_asset_fill(
-            &notifier_arc,
-            &ctx.disabled_asset_alerts,
-            &trade,
-            Chain::Base,
-            "Buy 7 AAPL at 151 USDC",
-        )
-        .await;
-
-        assert_eq!(
-            notifier.messages().len(),
-            1,
-            "the second fill on the same disabled symbol must not re-page"
-        );
-        assert!(notifier.messages()[0].contains("DISABLED"));
-        assert!(
-            notifier.messages()[0].contains("Buy 5 AAPL at 150 USDC"),
-            "the page must carry the delta to cover: {}",
-            notifier.messages()[0]
-        );
-    }
-
-    /// The dedup key is chain and symbol: a symbol disabled on two hedged
-    /// chains pages once per chain, each message naming its own chain.
-    #[tokio::test]
-    async fn disabled_asset_alert_pages_per_chain() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
-        let mut ctx = build_test_accountant_ctx(
-            pool,
-            &apalis_pool,
-            create_test_ctx_with_order_owner(Address::ZERO),
-            SymbolCache::default(),
-            provider,
-            executor,
-            ExecutionThreshold::whole_share(),
-        )
-        .await;
-        ctx.notifier = notifier.clone();
-
-        let job = test_job();
-        let trade = crate::test_utils::OnchainTradeBuilder::new().build();
-
-        let notifier_arc: Arc<dyn Notifier> = notifier.clone();
-        for chain in [Chain::Base, Chain::Ethereum, Chain::Ethereum] {
-            job.alert_disabled_asset_fill(
-                &notifier_arc,
-                &ctx.disabled_asset_alerts,
-                &trade,
-                chain,
-                "Buy 5 AAPL at 150 USDC",
-            )
-            .await;
-        }
-
-        let messages = notifier.messages();
-        assert_eq!(
-            messages.len(),
-            2,
-            "one page per chain the disabled symbol filled on, deduplicated per chain"
-        );
-        assert!(messages[0].contains("chain base"));
-        assert!(messages[1].contains("chain ethereum"));
     }
 
     /// A job stamped with a chain no hedged entry covers fails loudly
@@ -2314,15 +2265,26 @@ mod tests {
             "the page must carry the recorded delta: {}",
             messages[0]
         );
+        // The running uncovered net on the symbol covers the onchain sell
+        // with a broker buy, like the fill's own detail.
+        assert!(
+            messages[0].contains("Uncovered on COIN (base): cover by BUY")
+                && messages[0].contains("in total (1 fills)"),
+            "the page must carry the uncovered net: {}",
+            messages[0]
+        );
 
         // A process that died after the marker but before paging redelivers
-        // the job into a fresh process, which finds the fill already excluded.
-        // It must still page, or that fill's delta is never surfaced.
-        accountant_ctx.disabled_asset_alerts = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        // the job and finds the fill already excluded but unpaged. It must
+        // still page, or that fill's delta is never surfaced.
+        sqlx::query("UPDATE skipped_fills SET paged_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
         job.perform(&accountant_ctx).await.unwrap();
 
         let messages = notifier.messages();
-        assert_eq!(messages.len(), 2, "the redelivery after a restart pages");
+        assert_eq!(messages.len(), 2, "the redelivery of an unpaged fill pages");
         assert!(
             messages[1].contains(&recorded[0].detail),
             "the redelivered page must carry the recorded delta: {}",

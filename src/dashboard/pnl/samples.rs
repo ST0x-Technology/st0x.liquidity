@@ -57,8 +57,12 @@ pub(crate) fn parse_position_view(
 /// available range ignore.
 fn fill_timestamp(row: &PositionLedgerRow) -> Option<(Venue, &str)> {
     match row {
-        PositionLedgerRow::OnchainFill(fill) => Some((Venue::Onchain, fill.executed_at.as_str())),
-        PositionLedgerRow::OffchainFill(fill) => Some((Venue::Offchain, fill.executed_at.as_str())),
+        PositionLedgerRow::OnchainFill(fill) | PositionLedgerRow::ExcludedFill(fill) => {
+            Some((Venue::Onchain, fill.executed_at.as_str()))
+        }
+        PositionLedgerRow::OffchainFill(fill) | PositionLedgerRow::ExcludedFillCover(fill) => {
+            Some((Venue::Offchain, fill.executed_at.as_str()))
+        }
         PositionLedgerRow::OffchainPlacement(_) | PositionLedgerRow::ManualAdjustment(_) => None,
     }
 }

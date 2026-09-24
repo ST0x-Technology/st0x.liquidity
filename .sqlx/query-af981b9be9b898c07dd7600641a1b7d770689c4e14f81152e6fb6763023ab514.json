@@ -1,0 +1,28 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n             json_extract(trade_view.payload, '$.Live.direction') AS \"direction!: String\",\n             json_extract(trade_view.payload, '$.Live.amount') AS \"amount!: String\"\n           FROM skipped_fills AS skipped\n           JOIN onchain_trade_view AS trade_view\n             ON trade_view.view_id = skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index\n           WHERE skipped.chain = ? AND skipped.reason = ?\n             AND json_extract(trade_view.payload, '$.Live.symbol') = ?\n             AND json_extract(trade_view.payload, '$.Live.exclusion') IS NOT NULL\n             AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "direction!: String",
+        "ordinal": 0,
+        "type_info": "Null",
+        "origin": "Expression"
+      },
+      {
+        "name": "amount!: String",
+        "ordinal": 1,
+        "type_info": "Null",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "af981b9be9b898c07dd7600641a1b7d770689c4e14f81152e6fb6763023ab514"
+}

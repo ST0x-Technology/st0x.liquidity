@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE trading_enablement SET trading_enabled = 0, enabled_since = NULL, observed_at = ? WHERE chain = ? AND symbol = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "b466005836bc418cfebbee90ec125b54821915ef7e8761511333822f092ca9d9"
+}

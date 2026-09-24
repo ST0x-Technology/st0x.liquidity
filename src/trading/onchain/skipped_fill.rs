@@ -166,6 +166,206 @@ pub(crate) async fn trading_disabled_detail(
     .await?)
 }
 
+/// Whether the operational alert for an excluded fill is still owed. Only a
+/// `trading_disabled` row is paged, once: a redelivery after a crash between
+/// the exclusion and the page finds it unpaged and pages it.
+pub(crate) async fn excluded_fill_unpaged(
+    pool: &SqlitePool,
+    chain: Chain,
+    tx_hash: TxHash,
+    log_index: u64,
+) -> Result<bool, SkippedFillError> {
+    let log_index =
+        i64::try_from(log_index).map_err(|_| SkippedFillError::LogIndexOutOfRange { log_index })?;
+    let chain = chain.to_string();
+    let tx_hash = tx_hash.to_string();
+    let reason = SkipReason::TradingDisabled.as_str();
+
+    let unpaged = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM skipped_fills \
+         WHERE chain = ? AND tx_hash = ? AND log_index = ? AND reason = ? \
+         AND paged_at IS NULL",
+        chain,
+        tx_hash,
+        log_index,
+        reason,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(unpaged > 0)
+}
+
+/// Records that the excluded fill's operational alert was emitted.
+pub(crate) async fn mark_excluded_fill_paged(
+    pool: &SqlitePool,
+    chain: Chain,
+    tx_hash: TxHash,
+    log_index: u64,
+) -> Result<(), SkippedFillError> {
+    let log_index =
+        i64::try_from(log_index).map_err(|_| SkippedFillError::LogIndexOutOfRange { log_index })?;
+    let chain = chain.to_string();
+    let tx_hash = tx_hash.to_string();
+    let paged_at = Utc::now().to_rfc3339();
+
+    sqlx::query!(
+        "UPDATE skipped_fills SET paged_at = ? \
+         WHERE chain = ? AND tx_hash = ? AND log_index = ? AND paged_at IS NULL",
+        paged_at,
+        chain,
+        tx_hash,
+        log_index,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// One excluded fill on `symbol` and `chain` whose manual cover is not
+/// recorded yet.
+pub(crate) struct UncoveredExcludedFill {
+    /// The onchain fill's side, as its `OnChainTrade` serializes it.
+    pub(crate) direction: String,
+    /// The fill's amount, in the canonical decimal form its `OnChainTrade`
+    /// serializes.
+    pub(crate) amount: String,
+}
+
+/// Every excluded fill on `symbol` and `chain` still waiting for its manual
+/// cover: the exposure the operator has left to cover by hand.
+pub(crate) async fn uncovered_excluded_fills(
+    pool: &SqlitePool,
+    chain: Chain,
+    symbol: &str,
+) -> Result<Vec<UncoveredExcludedFill>, SkippedFillError> {
+    let chain = chain.to_string();
+    let reason = SkipReason::TradingDisabled.as_str();
+
+    let rows = sqlx::query!(
+        r#"SELECT
+             json_extract(trade_view.payload, '$.Live.direction') AS "direction!: String",
+             json_extract(trade_view.payload, '$.Live.amount') AS "amount!: String"
+           FROM skipped_fills AS skipped
+           JOIN onchain_trade_view AS trade_view
+             ON trade_view.view_id = skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index
+           WHERE skipped.chain = ? AND skipped.reason = ?
+             AND json_extract(trade_view.payload, '$.Live.symbol') = ?
+             AND json_extract(trade_view.payload, '$.Live.exclusion') IS NOT NULL
+             AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL"#,
+        chain,
+        reason,
+        symbol,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| UncoveredExcludedFill {
+            direction: row.direction,
+            amount: row.amount,
+        })
+        .collect())
+}
+
+/// Filters for [`list_skipped_fills`]. Every filter is optional.
+#[derive(Debug, Default)]
+pub(crate) struct SkippedFillFilter {
+    pub(crate) reason: Option<String>,
+    pub(crate) chain: Option<String>,
+    pub(crate) symbol: Option<String>,
+    /// RFC 3339; rows skipped at or after it.
+    pub(crate) since: Option<String>,
+    /// `Some(false)` lists only excluded fills still waiting for a cover.
+    pub(crate) covered: Option<bool>,
+    pub(crate) limit: i64,
+}
+
+/// A skipped fill with the terms of its `OnChainTrade`, when it was witnessed.
+/// Fills skipped before witnessing (an unpriceable or non hedgeable fill) have
+/// only the record's own columns.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct SkippedFillListing {
+    pub(crate) chain: String,
+    pub(crate) tx_hash: String,
+    pub(crate) log_index: i64,
+    pub(crate) event_type: String,
+    pub(crate) reason: String,
+    pub(crate) detail: String,
+    pub(crate) skipped_at: String,
+    pub(crate) paged_at: Option<String>,
+    pub(crate) symbol: Option<String>,
+    pub(crate) direction: Option<String>,
+    pub(crate) amount: Option<String>,
+    pub(crate) price_usdc: Option<String>,
+    pub(crate) block_timestamp: Option<String>,
+    pub(crate) excluded_at: Option<String>,
+    pub(crate) cover_price_usdc: Option<String>,
+    pub(crate) cover_broker_order_id: Option<String>,
+    pub(crate) covered_at: Option<String>,
+}
+
+/// Skipped fills matching `filter`, newest first.
+pub(crate) async fn list_skipped_fills(
+    pool: &SqlitePool,
+    filter: &SkippedFillFilter,
+) -> Result<Vec<SkippedFillListing>, SkippedFillError> {
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT skipped.chain, skipped.tx_hash, skipped.log_index, skipped.event_type, \
+         skipped.reason, skipped.detail, skipped.skipped_at, skipped.paged_at, \
+         json_extract(trade_view.payload, '$.Live.symbol') AS symbol, \
+         json_extract(trade_view.payload, '$.Live.direction') AS direction, \
+         json_extract(trade_view.payload, '$.Live.amount') AS amount, \
+         json_extract(trade_view.payload, '$.Live.price_usdc') AS price_usdc, \
+         json_extract(trade_view.payload, '$.Live.block_timestamp') AS block_timestamp, \
+         json_extract(trade_view.payload, '$.Live.exclusion.excluded_at') AS excluded_at, \
+         json_extract(trade_view.payload, '$.Live.exclusion.cover.price_usdc') AS cover_price_usdc, \
+         json_extract(trade_view.payload, '$.Live.exclusion.cover.broker_order_id') \
+           AS cover_broker_order_id, \
+         json_extract(trade_view.payload, '$.Live.exclusion.cover.covered_at') AS covered_at \
+         FROM skipped_fills AS skipped \
+         LEFT JOIN onchain_trade_view AS trade_view \
+           ON trade_view.view_id = skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index \
+         WHERE 1 = 1",
+    );
+
+    if let Some(reason) = &filter.reason {
+        query.push(" AND skipped.reason = ").push_bind(reason);
+    }
+    if let Some(chain) = &filter.chain {
+        query.push(" AND skipped.chain = ").push_bind(chain);
+    }
+    if let Some(symbol) = &filter.symbol {
+        query
+            .push(" AND json_extract(trade_view.payload, '$.Live.symbol') = ")
+            .push_bind(symbol);
+    }
+    if let Some(since) = &filter.since {
+        query.push(" AND skipped.skipped_at >= ").push_bind(since);
+    }
+    match filter.covered {
+        Some(true) => {
+            query.push(
+                " AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NOT NULL",
+            );
+        }
+        Some(false) => {
+            query.push(
+                " AND json_extract(trade_view.payload, '$.Live.exclusion') IS NOT NULL \
+                 AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL",
+            );
+        }
+        None => {}
+    }
+    query
+        .push(" ORDER BY skipped.skipped_at DESC, skipped.rowid DESC LIMIT ")
+        .push_bind(filter.limit);
+
+    Ok(query.build_query_as().fetch_all(pool).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::b256;

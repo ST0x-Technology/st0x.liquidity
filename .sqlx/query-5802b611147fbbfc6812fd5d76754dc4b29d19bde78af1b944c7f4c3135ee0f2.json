@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) FROM skipped_fills WHERE chain = ? AND tx_hash = ? AND log_index = ? AND reason = ? AND paged_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "COUNT(*)",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5802b611147fbbfc6812fd5d76754dc4b29d19bde78af1b944c7f4c3135ee0f2"
+}

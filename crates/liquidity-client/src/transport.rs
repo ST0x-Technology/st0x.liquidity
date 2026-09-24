@@ -172,6 +172,30 @@ impl<A: TokenSource + Sync> Client<A> {
         .await
     }
 
+    /// Sends `body` as JSON to a write route.
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let url = self.url(WRITE_PREFIX, path, &[]);
+        let target = url.to_string();
+        let token = self
+            .write_auth
+            .bearer()
+            .await
+            .map_err(TransportError::Auth)?;
+        self.dispatch(
+            self.http
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_string()),
+            target,
+            token,
+        )
+        .await
+    }
+
     async fn dispatch(
         &self,
         request: reqwest::RequestBuilder,

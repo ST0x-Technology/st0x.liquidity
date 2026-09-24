@@ -24,7 +24,7 @@ use st0x_execution::{
 use st0x_float_serde::format_float_with_fallback;
 use st0x_hedge::operator::conductor::{
     ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
-    account_for_onchain_fill, execute_mark_acknowledged, execute_settle_fill,
+    account_for_onchain_fill, exclusion_cause, execute_mark_acknowledged, execute_settle_fill,
     is_expected_place_offchain_order_rejection,
 };
 use st0x_hedge::operator::offchain::order::{
@@ -963,15 +963,17 @@ pub(super) async fn process_found_trade<W: Write>(
     };
     let base_symbol = onchain_trade.symbol();
 
-    // Same rule as the bot: a fill on an asset disabled on its own chain
-    // stays out of the hedged position, or the periodic scan hedges it.
-    if !fill_chain.assets.is_trading_enabled(base_symbol) {
+    // Same rule as the bot: a fill on an asset disabled on its own chain, or
+    // that landed before its restart enabled it, stays out of the hedged
+    // position, or the periodic scan hedges it.
+    if let Some(cause) = exclusion_cause(pool, &fill_chain.assets, &onchain_trade).await? {
         let outcome = account_for_fill_excluded_from_hedging(
             pool,
             &onchain_trade_store,
             &position_store,
             &onchain_trade,
             block_number,
+            cause,
             "process-tx",
         )
         .await?;
@@ -979,8 +981,8 @@ pub(super) async fn process_found_trade<W: Write>(
         match outcome {
             ExcludedFillOutcome::Excluded { detail } => writeln!(
                 stdout,
-                "Trading is disabled for {base_symbol} on {}: fill {trade_id} is not \
-                 counter traded and was recorded in skipped_fills: {detail}",
+                "Fill {trade_id} on {base_symbol} ({}) is excluded from hedging: it is \
+                 not counter traded and was recorded in skipped_fills: {detail}",
                 onchain_trade.chain
             )?,
             ExcludedFillOutcome::AlreadyExcluded { detail } => writeln!(
@@ -3801,8 +3803,9 @@ mod tests {
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
-            output.contains("Trading is disabled for AAPL"),
-            "the operator must be told the fill is not counter traded, got: {output}"
+            output.contains("excluded from hedging")
+                && output.contains("trading is disabled for AAPL"),
+            "the operator must be told the fill is not counter traded and why, got: {output}"
         );
         // The fixture is an onchain buy, so the operator covers with a sell.
         assert!(
@@ -4756,16 +4759,17 @@ mod tests {
 
     /// Regression test for the crash-window double-count bug:
     ///
-    /// 1. Fill A is witnessed and acknowledged in Position (slot = A), but the
-    ///    process crashes BEFORE `mark_acknowledged` runs — OnChainTrade A stays
-    ///    Witnessed.
-    /// 2. Fill B arrives and is fully processed (slot advances to B).
+    /// 1. Fill A is witnessed and applied to Position, but the process crashes
+    ///    BEFORE `mark_acknowledged` runs, so OnChainTrade A stays Witnessed.
+    ///    A is a legacy fill applied before the pending set existed, so
+    ///    Position no longer holds it as pending.
+    /// 2. Fill B arrives and is fully processed.
     /// 3. `process-tx` is retried for A.
     ///
-    /// Without the durable `position_fill_already_recorded` guard, the resume
-    /// path would call `execute_acknowledge_fill(A)` again. Because the slot now
-    /// holds B (not A), `PositionError::DuplicateTrade` does NOT fire and A is
-    /// counted a second time — corrupting the net position.
+    /// Only the durable `position_fill_already_recorded` guard stops the resume
+    /// path from calling `execute_acknowledge_fill(A)` again: Position's own
+    /// duplicate check only covers fills still in its pending set, so without
+    /// the guard A is counted a second time, corrupting the net position.
     ///
     /// After the fix, the retry must:
     /// - Apply fill A exactly once (total fill events = 2: one A + one B).
@@ -4826,6 +4830,10 @@ mod tests {
         .await
         .unwrap();
 
+        // A legacy fill: applied before the pending set existed, so Position
+        // does not hold it as pending and its own duplicate check cannot see it.
+        execute_settle_fill(&position_store, &fill_a).await.unwrap();
+
         // Simulate crash: do NOT call execute_mark_acknowledged for fill A.
         // OnChainTrade A stays Witnessed; Position already has A applied.
 
@@ -4860,11 +4868,11 @@ mod tests {
             .unwrap();
 
         // At this point:
-        // - Position has fill_a and fill_b applied (last_slot = fill_b's trade_id).
+        // - Position has fill_a and fill_b applied, and fill_a is not pending.
         // - OnChainTrade fill_a is Witnessed (not Acknowledged).
         // - OnChainTrade fill_b is Acknowledged.
         // Without the durable guard, retrying process-tx for fill_a would
-        // re-apply it: last_slot (B) != A, so DuplicateTrade does NOT fire.
+        // re-apply it.
 
         // Step 4: Retry process-tx for fill A (crash-recovery scenario).
         let mut stdout = Vec::new();
@@ -4908,12 +4916,12 @@ mod tests {
     /// Regression test for the None-path (fresh-witness) double-count hole:
     ///
     /// A legacy fill whose Position record was written (e.g. via a prior direct
-    /// `execute_acknowledge_fill` call) but whose OnChainTrade record was NEVER
-    /// created causes `process_found_trade` to take the `None` branch. Without
-    /// the unified durable guard the fresh-witness arm would call
-    /// `execute_acknowledge_fill` again; because the Position slot already
-    /// advanced to a newer fill (B), `DuplicateTrade` does NOT fire and fill A
-    /// is counted a second time.
+    /// `execute_acknowledge_fill` call, before the pending set existed) but
+    /// whose OnChainTrade record was NEVER created causes `process_found_trade`
+    /// to take the `None` branch. Without the unified durable guard the
+    /// fresh-witness arm would call `execute_acknowledge_fill` again; Position
+    /// no longer holds A as pending, so its own duplicate check cannot see it
+    /// and fill A is counted a second time.
     ///
     /// After the fix the unified `position_fill_already_recorded` guard runs on
     /// every path — including the `None` path — and blocks the re-apply.
@@ -4945,9 +4953,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Step 1: Apply fill A to Position ONLY — no OnChainTrade witness record.
-        // This simulates a legacy fill whose OnChainTrade record was never created.
-        // process_found_trade will load None for trade_id_a and take the None path.
+        // Step 1: Apply fill A to Position ONLY, with no OnChainTrade witness
+        // record, then settle it out of the pending set. This simulates a legacy
+        // fill applied before the pending set existed whose OnChainTrade record
+        // was never created. process_found_trade will load None for trade_id_a
+        // and take the None path.
         execute_acknowledge_fill(
             &position_store,
             &fill_a,
@@ -4956,10 +4966,10 @@ mod tests {
         )
         .await
         .unwrap();
+        execute_settle_fill(&position_store, &fill_a).await.unwrap();
 
-        // Step 2: Fully process fill B so the Position slot advances beyond A.
-        // Now last_acknowledged_trade_id = B, so a re-apply of A bypasses the
-        // single-slot DuplicateTrade guard without the durable check.
+        // Step 2: Fully process fill B. A re-apply of A is now visible only to
+        // the durable check.
         onchain_store
             .send(
                 &trade_id_b,

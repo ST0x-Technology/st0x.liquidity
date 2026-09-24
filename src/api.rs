@@ -49,10 +49,12 @@ use crate::equity_redemption::{
 };
 use crate::iap_auth::{IapVerifier, require_iap};
 use crate::offchain::order::OffchainOrderId;
+use crate::onchain_trade::{OnChainTradeId, cover_direction};
 use crate::operator::OperatorError;
 use crate::operator::equity_transfer::{
     EquityTransferKind, FailTransferError, validate_failure_reason,
 };
+use crate::operator::excluded_fill::record_exclusion_cover;
 use crate::operator::portfolio_snapshot::{EquityMarkCorrection, set_equity_mark};
 use crate::operator::position::{
     OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
@@ -71,6 +73,9 @@ use crate::rebalancing::usdc::{RecheckUsdcDeposit, UsdcRecheckError};
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
+};
+use crate::trading::onchain::skipped_fill::{
+    SkippedFillFilter, SkippedFillListing, list_skipped_fills,
 };
 use crate::usdc_rebalance::{
     RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
@@ -2541,6 +2546,201 @@ async fn set_position_exposure(
     }))
 }
 
+/// Query parameters for the skipped fills read route. Every filter is
+/// optional.
+#[derive(Deserialize, Default)]
+struct SkippedFillsQuery {
+    /// Skip reason, for example `trading_disabled`.
+    reason: Option<String>,
+    chain: Option<String>,
+    symbol: Option<String>,
+    /// RFC 3339; rows skipped at or after it.
+    since: Option<String>,
+    /// `false` lists only excluded fills still waiting for their manual cover,
+    /// `true` only covered ones.
+    covered: Option<bool>,
+    limit: Option<i64>,
+}
+
+/// One skipped fill. The trade terms come from the fill's `OnChainTrade` and
+/// are absent for fills skipped before they were witnessed (an unpriceable or
+/// non hedgeable fill). `cover_direction` is the broker side that covers the
+/// fill's delta, present whenever `direction` is.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkippedFillResponse {
+    chain: String,
+    tx_hash: String,
+    log_index: i64,
+    trade_id: String,
+    event_type: String,
+    reason: String,
+    detail: String,
+    skipped_at: String,
+    paged_at: Option<String>,
+    symbol: Option<String>,
+    direction: Option<st0x_dto::Direction>,
+    amount: Option<String>,
+    price_usdc: Option<String>,
+    block_timestamp: Option<String>,
+    cover_direction: Option<st0x_dto::Direction>,
+    excluded_at: Option<String>,
+    cover: Option<SkippedFillCoverResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkippedFillCoverResponse {
+    price_usdc: String,
+    broker_order_id: Option<String>,
+    covered_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkippedFillsResponse {
+    skipped_fills: Vec<SkippedFillResponse>,
+}
+
+impl From<SkippedFillListing> for SkippedFillResponse {
+    fn from(row: SkippedFillListing) -> Self {
+        let direction = row
+            .direction
+            .as_deref()
+            .and_then(|direction| direction.parse::<st0x_dto::Direction>().ok());
+        let cover = match (row.cover_price_usdc, row.covered_at) {
+            (Some(price_usdc), Some(covered_at)) => Some(SkippedFillCoverResponse {
+                price_usdc,
+                broker_order_id: row.cover_broker_order_id,
+                covered_at,
+            }),
+            _ => None,
+        };
+
+        Self {
+            trade_id: format!("{}:{}:{}", row.chain, row.tx_hash, row.log_index),
+            chain: row.chain,
+            tx_hash: row.tx_hash,
+            log_index: row.log_index,
+            event_type: row.event_type,
+            reason: row.reason,
+            detail: row.detail,
+            skipped_at: row.skipped_at,
+            paged_at: row.paged_at,
+            symbol: row.symbol,
+            direction,
+            amount: row.amount,
+            price_usdc: row.price_usdc,
+            block_timestamp: row.block_timestamp,
+            cover_direction: direction.map(cover_direction),
+            excluded_at: row.excluded_at,
+            cover,
+        }
+    }
+}
+
+/// Fills the accountant skipped instead of hedging, newest first: fills
+/// excluded because trading was disabled for them (with their cover side and
+/// any recorded manual cover) and fills skipped as unhedgeable.
+async fn skipped_fills(
+    State(state): State<AppState>,
+    Query(query): Query<SkippedFillsQuery>,
+) -> Result<
+    ([(HeaderName, &'static str); 1], Json<SkippedFillsResponse>),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let since = parse_filter_time(query.since.as_deref(), "since")
+        .map_err(|_| ops_precondition_error("since must be an RFC 3339 timestamp"))?
+        .map(|since| since.to_rfc3339());
+    let filter = SkippedFillFilter {
+        reason: query.reason,
+        chain: query.chain,
+        symbol: query.symbol,
+        since,
+        covered: query.covered,
+        limit: query.limit.unwrap_or(100).clamp(1, 500),
+    };
+
+    let rows = list_skipped_fills(&state.pool, &filter)
+        .await
+        .map_err(|error| {
+            error!(?error, "Failed to query skipped fills");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to query skipped fills".to_string(),
+                }),
+            )
+        })?;
+
+    Ok((
+        [(CACHE_CONTROL, "no-store")],
+        Json(SkippedFillsResponse {
+            skipped_fills: rows.into_iter().map(SkippedFillResponse::from).collect(),
+        }),
+    ))
+}
+
+/// Wire contract for recording the manual cover of an excluded fill.
+#[derive(Deserialize)]
+struct CoverExcludedFillRequest {
+    /// Strictly positive broker execution price per share, in USD.
+    price_usdc: String,
+    /// When the broker trade executed (RFC 3339).
+    covered_at: String,
+    /// The broker's order id, for the audit trail.
+    broker_order_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoverExcludedFillResponse {
+    trade_id: String,
+    price_usdc: String,
+    covered_at: String,
+}
+
+/// Records that the operator covered an excluded fill's delta at the broker,
+/// so the PnL ledger books the cover and the fill leaves the uncovered set.
+async fn cover_excluded_fill(
+    State(state): State<AppState>,
+    Path(trade_id): Path<String>,
+    Json(request): Json<CoverExcludedFillRequest>,
+) -> Result<Json<CoverExcludedFillResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let trade_id = trade_id
+        .parse::<OnChainTradeId>()
+        .map_err(ops_precondition_error)?;
+    let price_usdc =
+        Positive::new(Float::parse(request.price_usdc).map_err(ops_precondition_error)?)
+            .map_err(|_| ops_precondition_error("price_usdc must be strictly positive"))?
+            .inner();
+    let covered_at = request
+        .covered_at
+        .parse::<DateTime<Utc>>()
+        .map_err(ops_precondition_error)?;
+    let broker_order_id = request
+        .broker_order_id
+        .filter(|broker_order_id| !broker_order_id.trim().is_empty());
+
+    record_exclusion_cover(
+        &state.pool,
+        &trade_id,
+        price_usdc,
+        broker_order_id,
+        covered_at,
+    )
+    .await
+    .map_err(ops_operator_error)?;
+
+    info!(%trade_id, "Recorded the manual cover of an excluded fill");
+
+    Ok(Json(CoverExcludedFillResponse {
+        trade_id: trade_id.to_string(),
+        price_usdc: st0x_float_serde::format_float(&price_usdc).map_err(ops_precondition_error)?,
+        covered_at: covered_at.to_rfc3339(),
+    }))
+}
+
 /// Wire contract for the portfolio-snapshot mark route.
 #[derive(Deserialize)]
 struct SetEquityMarkRequest {
@@ -2685,6 +2885,7 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             get(performance_reliability),
         )
         .route("/liquidity-read/performance/infra", get(performance_infra))
+        .route("/liquidity-read/skipped-fills", get(skipped_fills))
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&read_verifier);
             async move { require_iap(verifier, request, next).await }
@@ -2733,6 +2934,10 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .route(
             "/liquidity-write/portfolio-snapshot/marks",
             post(set_portfolio_snapshot_mark),
+        )
+        .route(
+            "/liquidity-write/excluded-fills/{trade_id}/cover",
+            post(cover_excluded_fill),
         )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
@@ -2822,6 +3027,7 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         )
         .route("/orders/raindex", get(raindex_orders))
         .route("/transfers/interrupted", get(interrupted_transfers))
+        .route("/skipped-fills", get(skipped_fills))
 }
 
 #[cfg(test)]
@@ -7098,6 +7304,123 @@ mod tests {
             serde_json::to_value(response).unwrap(),
             serde_json::json!({ "symbol": "MSTR", "previous_net": "0", "target_net": "5" })
         );
+    }
+
+    /// Excludes a default AAPL fill (onchain BUY 1 at 150 on base) the way
+    /// the accountant does when trading is disabled for it.
+    async fn seed_excluded_fill(pool: &SqlitePool) -> crate::onchain::OnchainTrade {
+        let (onchain_trade, _) =
+            StoreBuilder::<crate::onchain_trade::OnChainTrade>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+        let (position, _) = StoreBuilder::<crate::position::Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let trade = crate::test_utils::OnchainTradeBuilder::new().build();
+        crate::conductor::account_for_fill_excluded_from_hedging(
+            pool,
+            &onchain_trade,
+            &position,
+            &trade,
+            1,
+            crate::trading::onchain::exclusion::ExclusionCause::TradingDisabled,
+            "ClearV3",
+        )
+        .await
+        .unwrap();
+        trade
+    }
+
+    async fn list(state: &AppState, covered: Option<bool>) -> Vec<SkippedFillResponse> {
+        let (_, Json(response)) = skipped_fills(
+            State(state.clone()),
+            Query(SkippedFillsQuery {
+                reason: Some("trading_disabled".to_owned()),
+                covered,
+                ..SkippedFillsQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        response.skipped_fills
+    }
+
+    /// The operator finds an excluded fill with its cover side, records the
+    /// cover once, and the fill then leaves the uncovered set.
+    #[tokio::test]
+    async fn excluded_fill_is_listed_until_its_cover_is_recorded() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let trade = seed_excluded_fill(&state.pool).await;
+        let trade_id = format!("base:{}:{}", trade.tx_hash, trade.log_index);
+
+        let uncovered = list(&state, Some(false)).await;
+        assert_eq!(uncovered.len(), 1);
+        assert_eq!(uncovered[0].trade_id, trade_id);
+        assert_eq!(uncovered[0].symbol.as_deref(), Some("AAPL"));
+        assert_eq!(uncovered[0].direction, Some(st0x_dto::Direction::Buy));
+        assert_eq!(
+            uncovered[0].cover_direction,
+            Some(st0x_dto::Direction::Sell),
+            "an onchain buy is covered by a broker sell"
+        );
+        assert!(uncovered[0].cover.is_none());
+
+        let request = || CoverExcludedFillRequest {
+            price_usdc: "151".to_owned(),
+            covered_at: "2026-09-24T15:00:00Z".to_owned(),
+            broker_order_id: Some("order-1".to_owned()),
+        };
+        let Json(recorded) = cover_excluded_fill(
+            State(state.clone()),
+            Path(trade_id.clone()),
+            Json(request()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded.trade_id, trade_id);
+
+        let (status, _) =
+            cover_excluded_fill(State(state.clone()), Path(trade_id), Json(request()))
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a cover is recorded once");
+
+        assert!(list(&state, Some(false)).await.is_empty());
+        let covered = list(&state, Some(true)).await;
+        assert_eq!(covered.len(), 1);
+        let cover = covered[0].cover.as_ref().expect("the recorded cover");
+        assert_eq!(cover.price_usdc, "151");
+        assert_eq!(cover.broker_order_id.as_deref(), Some("order-1"));
+    }
+
+    /// A hedged fill already has the bot's own hedge, so it cannot take a
+    /// manual cover.
+    #[tokio::test]
+    async fn cover_of_a_fill_that_was_not_excluded_is_rejected() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let trade_id = format!(
+            "base:{}:1",
+            crate::test_utils::OnchainTradeBuilder::new()
+                .build()
+                .tx_hash
+        );
+
+        let (status, Json(error)) = cover_excluded_fill(
+            State(state),
+            Path(trade_id),
+            Json(CoverExcludedFillRequest {
+                price_usdc: "151".to_owned(),
+                covered_at: "2026-09-24T15:00:00Z".to_owned(),
+                broker_order_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("not excluded"), "{}", error.error);
     }
 
     #[tokio::test]

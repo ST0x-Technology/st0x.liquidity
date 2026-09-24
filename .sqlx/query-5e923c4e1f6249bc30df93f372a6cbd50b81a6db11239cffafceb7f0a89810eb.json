@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO trading_enablement (chain, symbol, trading_enabled, enabled_since, observed_at) VALUES (?, ?, ?, NULL, ?) ON CONFLICT (chain, symbol) DO UPDATE SET trading_enabled = excluded.trading_enabled, enabled_since = NULL, observed_at = excluded.observed_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "5e923c4e1f6249bc30df93f372a6cbd50b81a6db11239cffafceb7f0a89810eb"
+}
