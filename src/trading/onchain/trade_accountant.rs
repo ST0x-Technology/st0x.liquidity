@@ -251,7 +251,13 @@ where
             )
             .await?;
 
-            if let ExcludedFillOutcome::Excluded { detail } = outcome {
+            // `AlreadyExcluded` pages too: the marker is durable before the
+            // page, so a process that dies in between redelivers into this
+            // outcome, and the fill's delta must still be surfaced. The per
+            // process dedup keeps any other redrive to one page per symbol.
+            if let ExcludedFillOutcome::Excluded { detail }
+            | ExcludedFillOutcome::AlreadyExcluded { detail } = outcome
+            {
                 self.alert_disabled_asset_fill(
                     &ctx.notifier,
                     &ctx.disabled_asset_alerts,
@@ -2193,8 +2199,9 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        // decimals() for USDC and wtCOIN, once per perform.
-        for _ in 0..2 {
+        // decimals() for USDC and wtCOIN, once per perform (the run, the
+        // redrive, and the redelivery after a restart).
+        for _ in 0..3 {
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         }
@@ -2306,6 +2313,20 @@ mod tests {
             messages[0].contains(&recorded[0].detail),
             "the page must carry the recorded delta: {}",
             messages[0]
+        );
+
+        // A process that died after the marker but before paging redelivers
+        // the job into a fresh process, which finds the fill already excluded.
+        // It must still page, or that fill's delta is never surfaced.
+        accountant_ctx.disabled_asset_alerts = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        job.perform(&accountant_ctx).await.unwrap();
+
+        let messages = notifier.messages();
+        assert_eq!(messages.len(), 2, "the redelivery after a restart pages");
+        assert!(
+            messages[1].contains(&recorded[0].detail),
+            "the redelivered page must carry the recorded delta: {}",
+            messages[1]
         );
     }
 
