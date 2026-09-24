@@ -6829,6 +6829,7 @@ mod tests {
                 rebalancing_service,
                 usdc_recheck: Arc::new(LeftUnchangedUsdcRecheck),
                 usdc_driver_pause: Arc::new(pause),
+                usdc_store: standalone_usdc_store(&state.pool).await,
             })
             .ok()
             .expect("recovery cell must start empty");
