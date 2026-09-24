@@ -102,6 +102,34 @@ pub(crate) async fn record_skipped_fill(
     Ok(())
 }
 
+/// The recorded detail when the fill is excluded because trading was
+/// disabled on its chain. That record is the durable decision not to hedge
+/// the fill: an operator covers its delta by hand from it, so the hedged path
+/// must not hedge the same fill when a redrive runs after trading was enabled
+/// again, and every surface reporting it repeats the detail and cover side.
+pub(crate) async fn trading_disabled_detail(
+    pool: &SqlitePool,
+    chain: Chain,
+    tx_hash: TxHash,
+    log_index: u64,
+) -> Result<Option<String>, SkippedFillError> {
+    let log_index =
+        i64::try_from(log_index).map_err(|_| SkippedFillError::LogIndexOutOfRange { log_index })?;
+
+    let detail: Option<(String,)> = sqlx::query_as(
+        "SELECT detail FROM skipped_fills \
+         WHERE chain = ? AND tx_hash = ? AND log_index = ? AND reason = ?",
+    )
+    .bind(chain.to_string())
+    .bind(tx_hash.to_string())
+    .bind(log_index)
+    .bind(SkipReason::TradingDisabled.as_str())
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(detail.map(|(detail,)| detail))
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::b256;

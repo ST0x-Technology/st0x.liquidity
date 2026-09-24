@@ -1865,11 +1865,16 @@ event position).
   witnessed on its `OnChainTrade` and recorded in `skipped_fills` with reason
   `trading_disabled`, and it raises a deduplicated critical operational alert
   (once per process per chain and symbol), so the exposure it leaves is never
-  silent. Enabling the asset again hedges only fills from then on: nothing that
-  landed while it was disabled is hedged later, so a large backlog is never
-  counter traded in one go. An operator covers that delta by hand from the
-  `skipped_fills` records. Rebalancing is governed separately by the asset's
-  `rebalancing` flag.
+  silent. The flag is read when the bot accounts the fill, not when the fill
+  lands on chain. Enabling the asset again therefore hedges every fill the bot
+  accounts from the restart on, including fills that landed earlier but were not
+  accounted yet: still queued, not yet backfilled past the ingestion cutoff, or
+  landing during the restart itself. Only fills already recorded in
+  `skipped_fills` stay excluded and are never hedged later; an operator covers
+  that delta by hand from those records. Excluded fills also never reach the PnL
+  ledger, which replays `Position` events, so PnL is incomplete for them and a
+  manual cover must be reconciled outside the ledger. Rebalancing is governed
+  separately by the asset's `rebalancing` flag.
 
 ### Infrastructure and Deployment
 

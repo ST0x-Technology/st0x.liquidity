@@ -94,11 +94,12 @@ pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) pool: SqlitePool,
     pub(crate) job_queue: DexTradeAccountingJobQueue,
     pub(crate) notifier: Arc<dyn Notifier>,
-    /// Chain-and-symbol pairs already paged for accumulating fills while
-    /// disabled, so an ongoing stream of such fills pages once per process,
-    /// not per fill (same cadence as hedge dead-letter alerts). Keyed per
-    /// chain because each chain's asset table disables the symbol on its own.
-    /// A restart re-pages.
+    /// Chain and symbol pairs already paged for a fill on a trading disabled
+    /// asset, so an ongoing stream of such fills pages once per process, not
+    /// per fill (same cadence as hedge dead letter alerts). Each such fill is
+    /// kept out of the hedged position and recorded in `skipped_fills`. Keyed
+    /// per chain because each chain's asset table disables the symbol on its
+    /// own. A restart pages again.
     pub(crate) disabled_asset_alerts: Arc<std::sync::Mutex<HashSet<(Chain, Symbol)>>>,
 }
 
@@ -250,12 +251,13 @@ where
             )
             .await?;
 
-            if matches!(outcome, ExcludedFillOutcome::Excluded) {
+            if let ExcludedFillOutcome::Excluded { detail } = outcome {
                 self.alert_disabled_asset_fill(
                     &ctx.notifier,
                     &ctx.disabled_asset_alerts,
                     &trade,
                     chain_ctx.trading.chain,
+                    &detail,
                 )
                 .await;
             }
@@ -440,8 +442,9 @@ async fn persist_skipped_fill(
 impl AccountForDexTrade {
     /// Critical, deduplicated alert for a fill on a disabled asset. The flag
     /// is the per symbol hedge kill switch, so the fill is never counter
-    /// traded, but the exposure it leaves must never be silent. Once per
-    /// process per chain and symbol; delivery failure releases the
+    /// traded, but the exposure it leaves must never be silent. `detail`
+    /// states the delta so the operator can cover it from the page alone.
+    /// Once per process per chain and symbol; delivery failure releases the
     /// reservation so the next fill tries again.
     async fn alert_disabled_asset_fill(
         &self,
@@ -449,6 +452,7 @@ impl AccountForDexTrade {
         alerted_symbols: &std::sync::Mutex<HashSet<(Chain, Symbol)>>,
         trade: &OnchainTrade,
         chain: Chain,
+        detail: &str,
     ) {
         let newly_reserved = {
             let mut alerted = match alerted_symbols.lock() {
@@ -462,11 +466,12 @@ impl AccountForDexTrade {
         }
 
         let message = format!(
-            "Fill on DISABLED asset {} (chain {chain}, tx {}): not counter traded \
-             and kept out of the hedged position; its delta is recorded in \
-             skipped_fills and must be covered by hand",
-            trade.symbol.base(),
-            self.trade.tx_hash,
+            "Fill on DISABLED asset {symbol} (chain {chain}, tx {tx}): {detail}. Kept out \
+             of the hedged position and recorded in skipped_fills; cover the delta by \
+             hand. Further fills on this symbol and chain are not paged again until \
+             restart.",
+            symbol = trade.symbol.base(),
+            tx = self.trade.tx_hash,
         );
         error!(target: "hedge", %message, "Disabled-asset fill");
         if let Err(error) = notifier.notify(&message).await {
@@ -599,7 +604,7 @@ pub enum TradeAccountingError {
     EnqueueJob(#[from] crate::conductor::job::QueuePushError),
     #[error("Position fill lookup failed: {0}")]
     PositionFillLookup(#[from] crate::conductor::PositionFillLookupError),
-    #[error("Failed to record fill {trade_id} excluded from hedging: {source}")]
+    #[error("Failed to read or record the exclusion of fill {trade_id} from hedging: {source}")]
     ExcludedFillRecord {
         trade_id: crate::onchain_trade::OnChainTradeId,
         #[source]
@@ -1167,6 +1172,7 @@ mod tests {
             &ctx.disabled_asset_alerts,
             &trade,
             Chain::Base,
+            "Buy 5 AAPL at 150 USDC",
         )
         .await;
         job.alert_disabled_asset_fill(
@@ -1174,6 +1180,7 @@ mod tests {
             &ctx.disabled_asset_alerts,
             &trade,
             Chain::Base,
+            "Buy 7 AAPL at 151 USDC",
         )
         .await;
 
@@ -1183,6 +1190,11 @@ mod tests {
             "the second fill on the same disabled symbol must not re-page"
         );
         assert!(notifier.messages()[0].contains("DISABLED"));
+        assert!(
+            notifier.messages()[0].contains("Buy 5 AAPL at 150 USDC"),
+            "the page must carry the delta to cover: {}",
+            notifier.messages()[0]
+        );
     }
 
     /// The dedup key is chain and symbol: a symbol disabled on two hedged
@@ -1210,8 +1222,14 @@ mod tests {
 
         let notifier_arc: Arc<dyn Notifier> = notifier.clone();
         for chain in [Chain::Base, Chain::Ethereum, Chain::Ethereum] {
-            job.alert_disabled_asset_fill(&notifier_arc, &ctx.disabled_asset_alerts, &trade, chain)
-                .await;
+            job.alert_disabled_asset_fill(
+                &notifier_arc,
+                &ctx.disabled_asset_alerts,
+                &trade,
+                chain,
+                "Buy 5 AAPL at 150 USDC",
+            )
+            .await;
         }
 
         let messages = notifier.messages();
@@ -2259,6 +2277,15 @@ mod tests {
         assert_eq!(recorded.len(), 1, "the redrive must not record it twice");
         assert_eq!(recorded[0].reason, "trading_disabled");
         assert_eq!(recorded[0].event_type, "InventoryTrade");
+        // The fixture withdrew wtCOIN from the vault (an onchain sell), so the
+        // operator must buy at the broker; naming the fill side alone would
+        // send them the wrong way.
+        assert!(
+            recorded[0].detail.contains("onchain fill SELL")
+                && recorded[0].detail.contains("cover by BUY"),
+            "the record must name the cover side: {}",
+            recorded[0].detail
+        );
 
         let (order_count,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM events WHERE event_type = 'OffchainOrderEvent::Placed'",
@@ -2273,6 +2300,11 @@ mod tests {
         assert!(
             !messages[0].contains("accumulating"),
             "the page must not claim the fill accumulates for a later hedge: {}",
+            messages[0]
+        );
+        assert!(
+            messages[0].contains(&recorded[0].detail),
+            "the page must carry the recorded delta: {}",
             messages[0]
         );
     }
