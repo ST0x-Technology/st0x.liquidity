@@ -24,7 +24,7 @@ use st0x_execution::{
     ClientOrderId, ConversionDirection, ConversionOrder, CryptoOrderOutcome, Network, Positive,
     TokenSymbol, Transfer, TransferStatus,
 };
-use st0x_finance::{Usd, Usdc};
+use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
@@ -35,8 +35,8 @@ use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
-    ConversionAmounts, RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand,
-    UsdcRebalanceId, open_ethereum_credits,
+    ConversionAmounts, EthereumWalletCredit, RebalanceDirection, TransferRef, UsdcRebalance,
+    UsdcRebalanceCommand, UsdcRebalanceId, open_ethereum_credits,
 };
 
 /// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
@@ -306,7 +306,8 @@ enum CreditLedger {
 }
 
 /// What the Ethereum wallet credit ledger check found: the USDC credited to
-/// open transfers and not yet sent (`outstanding`) against the wallet balance.
+/// open transfers and not yet sent (`outstanding`), plus what may still be
+/// in the wallet from sends in flight (`in_flight`), against the balance.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CreditLedgerCheck {
     Unwired,
@@ -314,10 +315,12 @@ pub(crate) enum CreditLedgerCheck {
     Unavailable,
     Covered {
         outstanding: U256,
+        in_flight: U256,
         balance: U256,
     },
     Shortfall {
         outstanding: U256,
+        in_flight: U256,
         balance: U256,
     },
 }
@@ -479,14 +482,15 @@ impl<
             }
         };
 
-        let outstanding = match credits
-            .iter()
+        let credits: Vec<_> = credits
+            .into_iter()
             .filter(|(credit_id, _)| credit_id != id)
-            .try_fold(own_credit, |total, (_, credit)| total + *credit)
-            .map_err(UsdcTransferError::from)
-            .and_then(usdc_to_u256)
-        {
-            Ok(outstanding) => outstanding,
+            .collect();
+
+        // An in-flight send may or may not have left the wallet, so it only
+        // widens the range: it never pages a shortfall.
+        let (outstanding, possible) = match total_credits(own_credit, &credits) {
+            Ok(totals) => totals,
             Err(error) => {
                 error!(
                     target: "operational_alert",
@@ -498,6 +502,7 @@ impl<
                 return CreditLedgerCheck::Unavailable;
             }
         };
+        let in_flight = possible - outstanding;
 
         let balance = match self
             .cctp_bridge
@@ -512,34 +517,43 @@ impl<
         };
 
         if balance < outstanding {
+            let held_by: Vec<_> = credits
+                .iter()
+                .filter_map(|(credit_id, credit)| match credit {
+                    EthereumWalletCredit::Held(_) => Some(credit_id),
+                    EthereumWalletCredit::InFlight(_) => None,
+                })
+                .collect();
             error!(
                 target: "operational_alert",
                 alert = true,
                 %id,
-                open_transfers = credits.len(),
+                ?held_by,
                 outstanding = %display_usdc(outstanding),
+                in_flight = %display_usdc(in_flight),
                 balance = %display_usdc(balance),
                 shortfall = %display_usdc(outstanding - balance),
                 "Ethereum wallet USDC is short of the credits of the open USDC transfers"
             );
             return CreditLedgerCheck::Shortfall {
                 outstanding,
+                in_flight,
                 balance,
             };
         }
 
-        let unattributed = balance - outstanding;
-        if !unattributed.is_zero() {
+        if balance > possible {
             info!(
                 target: "rebalance",
                 %id,
-                unattributed = %display_usdc(unattributed),
+                unattributed = %display_usdc(balance - possible),
                 "Ethereum wallet holds USDC no open transfer is credited with"
             );
         }
 
         CreditLedgerCheck::Covered {
             outstanding,
+            in_flight,
             balance,
         }
     }
@@ -4881,6 +4895,25 @@ impl<
 /// Converts a USDC decimal amount to U256 with 6 decimals.
 ///
 /// Delegates to [`Usdc::to_u256_6_decimals`].
+/// Totals the ledger as `(held, held + in flight)` in USDC base units, `held`
+/// starting from the sending transfer's own credit.
+fn total_credits(
+    own_credit: Usdc,
+    credits: &[(UsdcRebalanceId, EthereumWalletCredit)],
+) -> Result<(U256, U256), UsdcTransferError> {
+    let (held, in_flight) = credits.iter().try_fold(
+        (own_credit, Usdc::ZERO),
+        |(held, in_flight), (_, credit)| -> Result<_, UsdcTransferError> {
+            match credit {
+                EthereumWalletCredit::Held(amount) => Ok(((held + *amount)?, in_flight)),
+                EthereumWalletCredit::InFlight(amount) => Ok((held, (in_flight + *amount)?)),
+            }
+        },
+    )?;
+
+    Ok((usdc_to_u256(held)?, usdc_to_u256((held + in_flight)?)?))
+}
+
 fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcTransferError> {
     Ok(usdc.to_u256_6_decimals()?)
 }
@@ -13969,6 +14002,7 @@ mod tests {
                 .await,
             CreditLedgerCheck::Shortfall {
                 outstanding: U256::from(99_990_000u64),
+                in_flight: U256::ZERO,
                 balance: U256::from(40_000_000u64),
             }
         );
@@ -14089,6 +14123,7 @@ mod tests {
                 .await,
             CreditLedgerCheck::Covered {
                 outstanding: U256::from(109_990_000u64),
+                in_flight: U256::ZERO,
                 balance: U256::from(150_000_000u64),
             }
         );
@@ -17477,9 +17512,14 @@ mod tests {
             .check_ethereum_credit_ledger(&UsdcRebalanceId(Uuid::new_v4()), usdc("0"))
             .await;
 
-        assert!(
-            matches!(result, CreditLedgerCheck::Covered { .. }),
-            "a maybe-broadcast burn must not count as held; got: {result:?}"
+        assert_eq!(
+            result,
+            CreditLedgerCheck::Covered {
+                outstanding: U256::ZERO,
+                in_flight: U256::from(100_000_000u64),
+                balance: U256::ZERO,
+            },
+            "a maybe-broadcast burn must not count as held"
         );
         assert!(!logs_contain("operational_alert"));
     }

@@ -1270,24 +1270,26 @@ impl UsdcRebalance {
         })
     }
 
-    /// USDC this transfer was credited with that still sits in the shared
+    /// USDC this transfer was credited with that may still sit in the shared
     /// Ethereum wallet: credited from its delivering tx and not yet sent on.
-    /// An AlpacaToBase credit leaves with the burn, so a broadcast burn
-    /// (`pending_burn_tx`) no longer counts; a BaseToAlpaca credit leaves with
-    /// the Alpaca deposit send (`DepositInitiated`).
-    pub(crate) fn ethereum_wallet_credit(&self) -> Option<Usdc> {
+    /// A BaseToAlpaca credit leaves with the Alpaca deposit send
+    /// (`DepositInitiated`). An AlpacaToBase credit leaves with the burn, and
+    /// `BridgingSubmitting` cannot tell whether it has: a recorded burn may
+    /// be unmined, and with no recorded hash the burn may be unsent or
+    /// broadcast with its hash lost (`BurnRecordFailed`, an inconclusive
+    /// submit).
+    pub(crate) fn ethereum_wallet_credit(&self) -> Option<EthereumWalletCredit> {
         match self {
             Self::BridgingSubmitting {
                 direction: RebalanceDirection::AlpacaToBase,
                 burn_amount,
-                pending_burn_tx: None,
                 ..
-            } => *burn_amount,
+            } => burn_amount.map(EthereumWalletCredit::InFlight),
             Self::Bridged {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount_received,
                 ..
-            } => Some(*amount_received),
+            } => Some(EthereumWalletCredit::Held(*amount_received)),
             Self::BridgingSubmitting { .. }
             | Self::Bridged { .. }
             | Self::Converting { .. }
@@ -1831,6 +1833,15 @@ pub(crate) async fn any_rebalance_holds_guard(
     Ok(false)
 }
 
+/// What one open transfer has in the shared Ethereum wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EthereumWalletCredit {
+    /// Credited and not yet sent: in the wallet.
+    Held(Usdc),
+    /// Being sent: up to this amount may still be in the wallet.
+    InFlight(Usdc),
+}
+
 /// Why the Ethereum wallet credit ledger could not be derived.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EthereumCreditLedgerError {
@@ -1853,7 +1864,7 @@ pub(crate) enum EthereumCreditLedgerError {
 pub(crate) async fn open_ethereum_credits(
     pool: &SqlitePool,
     store: &Store<UsdcRebalance>,
-) -> Result<Vec<(UsdcRebalanceId, Usdc)>, EthereumCreditLedgerError> {
+) -> Result<Vec<(UsdcRebalanceId, EthereumWalletCredit)>, EthereumCreditLedgerError> {
     let InterruptedUsdcRebalances { ids, unparseable } =
         interrupted_usdc_rebalance_ids(pool).await?;
 
@@ -10057,8 +10068,9 @@ mod tests {
         fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000bb");
 
     /// A transfer's Ethereum wallet credit is outstanding only between the
-    /// credit and the send: an AlpacaToBase burn intent with no broadcast burn,
-    /// or a BaseToAlpaca mint not yet forwarded to Alpaca.
+    /// credit and the send: a BaseToAlpaca mint not yet forwarded to Alpaca is
+    /// held, and an AlpacaToBase burn intent is in flight whether or not a
+    /// burn hash is recorded.
     #[test]
     fn ethereum_wallet_credit_covers_only_credited_unsent_usdc() {
         use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
@@ -10088,11 +10100,11 @@ mod tests {
 
         assert_eq!(
             burn_intent(AlpacaToBase, None).ethereum_wallet_credit(),
-            Some(credited)
+            Some(EthereumWalletCredit::InFlight(credited))
         );
         assert_eq!(
             burn_intent(AlpacaToBase, Some(BURN_TX)).ethereum_wallet_credit(),
-            None
+            Some(EthereumWalletCredit::InFlight(credited))
         );
         assert_eq!(
             burn_intent(BaseToAlpaca, None).ethereum_wallet_credit(),
@@ -10100,7 +10112,7 @@ mod tests {
         );
         assert_eq!(
             minted(BaseToAlpaca).ethereum_wallet_credit(),
-            Some(credited)
+            Some(EthereumWalletCredit::Held(credited))
         );
         assert_eq!(minted(AlpacaToBase).ethereum_wallet_credit(), None);
         assert_eq!(
