@@ -67,6 +67,12 @@ pub(crate) enum SkippedFillError {
 /// on `(chain, tx_hash, log_index)` -- the fill identity -- so a backfill re-scan that
 /// re-processes the same fill records a single row rather than duplicating it on
 /// every pass.
+///
+/// The first write wins, except that a `trading_disabled` record supersedes an
+/// earlier row for another reason: it is the durable decision not to hedge the
+/// fill, which [`trading_disabled_detail`] must find and whose cover side the
+/// operator reconciles from. The earlier reason and detail are kept in its
+/// detail.
 pub(crate) async fn record_skipped_fill(
     pool: &SqlitePool,
     chain: Chain,
@@ -80,9 +86,35 @@ pub(crate) async fn record_skipped_fill(
     let tx_hash = tx_hash.to_string();
     let log_index =
         i64::try_from(log_index).map_err(|_| SkippedFillError::LogIndexOutOfRange { log_index })?;
-    let reason = reason.as_str();
     let skipped_at = Utc::now().to_rfc3339();
 
+    if reason == SkipReason::TradingDisabled {
+        sqlx::query(
+            "INSERT INTO skipped_fills \
+             (chain, tx_hash, log_index, event_type, reason, detail, skipped_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (chain, tx_hash, log_index) DO UPDATE SET \
+             event_type = excluded.event_type, \
+             reason = excluded.reason, \
+             detail = excluded.detail || ' (earlier skipped as ' || skipped_fills.reason \
+             || ' at ' || skipped_fills.skipped_at || ': ' || skipped_fills.detail || ')', \
+             skipped_at = excluded.skipped_at \
+             WHERE skipped_fills.reason <> excluded.reason",
+        )
+        .bind(chain)
+        .bind(tx_hash)
+        .bind(log_index)
+        .bind(event_type)
+        .bind(reason.as_str())
+        .bind(detail)
+        .bind(skipped_at)
+        .execute(pool)
+        .await?;
+
+        return Ok(());
+    }
+
+    let reason = reason.as_str();
     sqlx::query!(
         "INSERT INTO skipped_fills \
          (chain, tx_hash, log_index, event_type, reason, detail, skipped_at) \
@@ -224,6 +256,52 @@ mod tests {
         // First write wins under ON CONFLICT DO NOTHING.
         assert_eq!(rows[0].reason, "unpriceable_fill");
         assert_eq!(rows[0].detail, "first");
+    }
+
+    #[tokio::test]
+    async fn trading_disabled_record_supersedes_an_earlier_skip_and_keeps_it() {
+        let (pool, _apalis) = setup_test_pools().await;
+        let tx_hash = b256!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let record = |reason, detail| {
+            record_skipped_fill(
+                &pool,
+                Chain::Base,
+                tx_hash,
+                7,
+                "InventoryTrade",
+                reason,
+                detail,
+            )
+        };
+
+        record(SkipReason::UnrecognizedInventoryToken, "token 0xabc")
+            .await
+            .unwrap();
+        record(SkipReason::TradingDisabled, "cover by BUY 3 COIN")
+            .await
+            .unwrap();
+
+        let detail = trading_disabled_detail(&pool, Chain::Base, tx_hash, 7)
+            .await
+            .unwrap()
+            .expect("the trading_disabled decision must be retrievable");
+        assert!(
+            detail.starts_with(
+                "cover by BUY 3 COIN (earlier skipped as unrecognized_inventory_token at "
+            ) && detail.ends_with(": token 0xabc)"),
+            "the detail must lead with the cover side and keep the earlier record: {detail}"
+        );
+
+        // A redrive of the exclusion and a later skip leave the decision as is.
+        record(SkipReason::TradingDisabled, "cover by BUY 3 COIN")
+            .await
+            .unwrap();
+        record(SkipReason::NonHedgeablePair, "later").await.unwrap();
+
+        let rows = skipped_rows(&pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reason, "trading_disabled");
+        assert_eq!(rows[0].detail, detail);
     }
 
     #[tokio::test]
