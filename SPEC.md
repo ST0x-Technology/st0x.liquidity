@@ -3899,10 +3899,12 @@ already-submitted action instead of re-issuing it:
   fixed lookback alone for a transfer recorded before that head was captured. A
   consumed nonce whose mint is not found in that window, or a message that can
   never mint on the destination chain, marks `BridgingFailed` (keeping the burn
-  tx and nonce), so `transfer reconcile --kind usdc` can settle it, and pages
-  the operator at the latch (an AlpacaToBase retry then finds the transfer
-  failed and does not alert); the bot never scans back to genesis. Other lookup
-  failures redrive.
+  tx and nonce), so `transfer reconcile --kind usdc` can settle it; the bot
+  never scans back to genesis. An AlpacaToBase latch pages the operator, since
+  its retry then finds the transfer failed and does not alert. A BaseToAlpaca
+  latch does not page: its retry keeps recovering the mint through the post-burn
+  `BridgingFailed` recovery and may still send the deposit, and the job's
+  dead-letter alert covers a give-up. Other lookup failures redrive.
 
 ##### Commands
 
@@ -4186,10 +4188,11 @@ enum BridgeStage { Burn, Attestation, Mint }
   from a node behind the mint). When the nonce reads consumed (the mint landed),
   an error that repeats on every re-poll (a malformed complete answer, a
   placeholder nonce, a truncated message) marks the same reconcilable
-  `BridgingFailed` and pages the operator, since adopting the mint needs the
-  re-polled message; any other error, or a failed nonce read, redrives so a
-  later attempt adopts the mint. The `attestation_retry_deadline` bounds only
-  the `AwaitingAttestation` wait (where the attestation may never arrive).
+  `BridgingFailed` (paging the operator for AlpacaToBase), since adopting the
+  mint needs the re-polled message; any other error, or a failed nonce read,
+  redrives so a later attempt adopts the mint. The `attestation_retry_deadline`
+  bounds only the `AwaitingAttestation` wait (where the attestation may never
+  arrive).
 - Bridge mint transaction requires valid attestation
 - Bridge mint transaction must be confirmed before destination deposit
 - A `receiveMessage()` revert because the CCTP nonce was already used is

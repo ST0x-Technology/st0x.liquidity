@@ -908,7 +908,9 @@ impl<
             // would redrive in `Attested` forever with no CLI exit.
             Ok(true) if cctp_failure_repeats(&error) => {
                 let reason = format!("Circle re-poll failed on a consumed nonce: {error}");
-                Err(self.latch_unresolvable_mint(id, reason, error).await)
+                Err(self
+                    .latch_unresolvable_mint(id, mint_direction, reason, error)
+                    .await)
             }
             Ok(true) => {
                 warn!(
@@ -2447,7 +2449,7 @@ impl<
             Ok(None) => return Ok(None),
             Err(error) => {
                 return Err(self
-                    .handle_mint_scan_failure(id, error, call_site, initiated_at)
+                    .handle_mint_scan_failure(id, mint_direction, error, call_site, initiated_at)
                     .await);
             }
         };
@@ -2927,10 +2929,12 @@ impl<
     /// can never succeed (a message that cannot mint on this chain, or a
     /// consumed nonce whose mint is not in the bounded scan) latches
     /// `BridgingFailed`, which keeps the burn and nonce, so
-    /// `transfer reconcile --kind usdc` can settle it, and pages.
+    /// `transfer reconcile --kind usdc` can settle it (see
+    /// [`Self::latch_unresolvable_mint`] for who is paged).
     async fn handle_mint_scan_failure(
         &self,
         id: &UsdcRebalanceId,
+        mint_direction: BridgeDirection,
         error: CctpError,
         call_site: MintScanCallSite,
         initiated_at: DateTime<Utc>,
@@ -2958,15 +2962,20 @@ impl<
              reconciliation: {error}"
         );
         let reason = format!("attested mint lookup failed: {error}");
-        self.latch_unresolvable_mint(id, reason, error).await
+        self.latch_unresolvable_mint(id, mint_direction, reason, error)
+            .await
     }
 
     /// Latches a post-burn `BridgingFailed` (burn and nonce kept, so
     /// `transfer reconcile --kind usdc` accepts it) for a mint the bot cannot
-    /// resolve, and pages: the job does not alert on this latch.
+    /// resolve. An AlpacaToBase latch pages: its retry finds the transfer
+    /// failed and does not alert. A BaseToAlpaca retry keeps recovering the
+    /// mint and may still send the deposit, so paging would race the bot; the
+    /// job's dead-letter alert covers a give-up.
     async fn latch_unresolvable_mint(
         &self,
         id: &UsdcRebalanceId,
+        mint_direction: BridgeDirection,
         reason: String,
         error: CctpError,
     ) -> UsdcTransferError {
@@ -2985,14 +2994,17 @@ impl<
 
         // A crash between the committed FailBridging and this page leaves the
         // latch unpaged; paging first could page for a latch that never landed.
-        error!(
-            target: "operational_alert",
-            alert = true,
-            %id,
-            "USDC transfer {id}: the CCTP mint cannot be resolved automatically ({reason}). \
-             Bridge marked failed; find the mint of the recorded nonce on chain, then \
-             settle it with `transfer reconcile --kind usdc`."
-        );
+        match mint_direction {
+            BridgeDirection::EthereumToBase => error!(
+                target: "operational_alert",
+                alert = true,
+                %id,
+                "USDC transfer {id}: the CCTP mint cannot be resolved automatically ({reason}). \
+                 Bridge marked failed; find the mint of the recorded nonce on chain, then \
+                 settle it with `transfer reconcile --kind usdc`."
+            ),
+            BridgeDirection::BaseToEthereum => {}
+        }
 
         UsdcTransferError::Cctp(Box::new(error))
     }
