@@ -13276,11 +13276,31 @@ mod tests {
         >,
         Arc<Store<UsdcRebalance>>,
     ) {
+        build_manager_with_ethereum_chain_and_alpaca_wallet(
+            chain,
+            server,
+            market_maker_wallet,
+            create_test_wallet_service(server),
+        )
+        .await
+    }
+
+    async fn build_manager_with_ethereum_chain_and_alpaca_wallet(
+        chain: &EthereumUsdcChain,
+        server: &MockServer,
+        market_maker_wallet: Address,
+        alpaca_wallet: AlpacaWalletService,
+    ) -> (
+        CrossVenueCashTransfer<
+            RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>,
+        >,
+        Arc<Store<UsdcRebalance>>,
+    ) {
         let alpaca_broker = InstrumentedAlpacaBroker::new(
             create_test_broker_service(server).await,
             TelemetrySender::disabled(),
         );
-        let alpaca_wallet = Arc::new(create_test_wallet_service(server));
+        let alpaca_wallet = Arc::new(alpaca_wallet);
         let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
         let cqrs = create_test_store_instance().await;
@@ -15396,6 +15416,98 @@ mod tests {
                 }
             ),
             "Aggregate must be a pre-burn BridgingFailed so reconcile can settle it; got: {state:?}"
+        );
+    }
+
+    /// The settlement deadline counts from `initiated_at`, so a withdrawal
+    /// Alpaca held Pending past it is first seen Complete without a hash after
+    /// the deadline. The bot still waits a grace for the hash before failing.
+    #[tokio::test]
+    async fn completed_withdrawal_past_the_deadline_waits_a_grace_for_its_tx_hash() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
+                .await;
+        ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap()
+            .anvil_mine(Some(3), None)
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let (manager, cqrs) = build_manager_with_ethereum_chain_and_alpaca_wallet(
+            &chain,
+            &server,
+            market_maker_wallet,
+            create_short_poll_wallet_service(&server),
+        )
+        .await;
+
+        let transfer_uuid = Uuid::new_v4();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        let initiated_at = Utc::now()
+            - chrono::Duration::from_std(TEST_SETTLEMENT_RETRY_DEADLINE).unwrap()
+            - chrono::Duration::seconds(1);
+
+        let no_hash = mock_complete_withdrawal_with_tx(&server, transfer_uuid, None);
+        let poll = manager.poll_and_confirm_withdrawal(&id, &withdrawal_id, initiated_at);
+        let report_hash = async {
+            while no_hash.calls_async().await == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            no_hash.delete_async().await;
+            mock_complete_withdrawal_with_tx(&server, transfer_uuid, Some(chain.mint_tx))
+        };
+        let (result, _with_hash) = tokio::join!(poll, report_hash);
+
+        assert_eq!(
+            result.unwrap(),
+            chain.mint_tx,
+            "the hash reported within the grace must confirm the withdrawal"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::WithdrawalComplete {
+                    withdrawal_tx: Some(tx),
+                    ..
+                } if tx == chain.mint_tx
+            ),
+            "got: {state:?}"
         );
     }
 
