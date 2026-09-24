@@ -1296,8 +1296,8 @@ impl UsdcRebalance {
 
     /// USDC this transfer was credited with that may still sit in the shared
     /// Ethereum wallet: credited from its delivering tx and not yet sent on.
-    /// A BaseToAlpaca credit leaves with the Alpaca deposit send
-    /// (`DepositInitiated`). An AlpacaToBase credit arrives with the withdrawal
+    /// A BaseToAlpaca credit leaves with the Alpaca deposit send: in flight
+    /// once its hash is recorded, gone at `DepositInitiated`. An AlpacaToBase credit arrives with the withdrawal
     /// tx Alpaca reported and leaves with the burn, and
     /// `BridgingSubmitting` cannot tell whether it has: a recorded burn may
     /// be unmined, and with no recorded hash the burn may be unsent or
@@ -1322,8 +1322,13 @@ impl UsdcRebalance {
             Self::Bridged {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount_received,
+                pending_deposit_tx,
                 ..
-            } => Some(EthereumWalletCredit::Held(*amount_received)),
+            } => Some(match pending_deposit_tx {
+                None => EthereumWalletCredit::Held(*amount_received),
+                // The recorded send may be mined or not yet.
+                Some(_) => EthereumWalletCredit::InFlight(*amount_received),
+            }),
             Self::BridgingSubmitting { .. }
             | Self::Bridged { .. }
             | Self::Converting { .. }
@@ -1772,6 +1777,7 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::BridgeAttestationReceived', \
                'UsdcRebalanceEvent::AttestationTimedOut', \
                'UsdcRebalanceEvent::Bridged', \
+               'UsdcRebalanceEvent::PendingDepositRecorded', \
                'UsdcRebalanceEvent::BridgingFailed', \
                'UsdcRebalanceEvent::BridgingCompletionRecovered', \
                'UsdcRebalanceEvent::DepositInitiated', \
@@ -1961,6 +1967,7 @@ async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>,
                'UsdcRebalanceEvent::PendingBurnRecorded', \
                'UsdcRebalanceEvent::PendingBurnCleared', \
                'UsdcRebalanceEvent::Bridged', \
+               'UsdcRebalanceEvent::PendingDepositRecorded', \
                'UsdcRebalanceEvent::BridgingCompletionRecovered' \
            ) \
          ORDER BY latest.aggregate_id",
@@ -2028,7 +2035,10 @@ impl EventSourced for UsdcRebalance {
     // the command, event and states; serde ignores it in legacy payloads.
     // `WithdrawalComplete` also carries `withdrawal_ref` now, so the reported
     // withdrawal fees can be read again.
-    const SCHEMA_VERSION: u64 = 10;
+    // v11: `Bridged` carries `pending_deposit_tx`, the BaseToAlpaca deposit
+    // send recorded at broadcast by the new `PendingDepositRecorded` event.
+    // Legacy events and snapshots default it to `None`.
+    const SCHEMA_VERSION: u64 = 11;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -2483,9 +2493,30 @@ impl EventSourced for UsdcRebalance {
                 failed_at: *failed_at,
             },
 
-            (PendingDepositRecorded { .. }, Self::Bridged { .. }) => {
-                todo!("evolve PendingDepositRecorded")
-            }
+            (
+                PendingDepositRecorded { send_tx, .. },
+                Self::Bridged {
+                    direction,
+                    amount,
+                    amount_received,
+                    fee_collected,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    minted_at,
+                    ..
+                },
+            ) => Self::Bridged {
+                direction: *direction,
+                amount: *amount,
+                amount_received: *amount_received,
+                fee_collected: *fee_collected,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                minted_at: *minted_at,
+                pending_deposit_tx: Some(*send_tx),
+            },
 
             (
                 DepositInitiated {
@@ -2541,6 +2572,14 @@ impl EventSourced for UsdcRebalance {
                 Self::DepositInitiated {
                     direction,
                     amount,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    ..
+                }
+                | Self::Bridged {
+                    direction,
+                    amount_received: amount,
                     burn_tx_hash,
                     mint_tx_hash,
                     initiated_at,
@@ -3600,9 +3639,43 @@ impl UsdcRebalance {
     /// Records the broadcast BaseToAlpaca deposit send tx on `Bridged`.
     fn transition_record_pending_deposit(
         &self,
-        _send_tx: TxHash,
+        send_tx: TxHash,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        todo!("record the pending deposit send")
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Bridged {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            } => Ok(vec![PendingDepositRecorded {
+                send_tx,
+                recorded_at: Utc::now(),
+            }]),
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
+            // An AlpacaToBase deposit goes into the Base vault, not through
+            // the shared Ethereum wallet.
+            Self::Bridged {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecordPendingDeposit".to_string(),
+                state: format!("{self:?}"),
+            }),
+        }
     }
 
     fn transition_initiate_deposit(
@@ -3688,7 +3761,22 @@ impl UsdcRebalance {
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::BridgingFailed { .. }
-            | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+            | Self::Bridged {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            } => Err(UsdcRebalanceError::DepositNotInitiated),
+            // A Base->Alpaca deposit send that cannot be resolved: the minted
+            // USDC may have left the wallet, so it fails post-mint for
+            // reconciliation, keeping the recorded send if there is one.
+            Self::Bridged {
+                direction: RebalanceDirection::BaseToAlpaca,
+                pending_deposit_tx,
+                ..
+            } => Ok(vec![DepositFailed {
+                deposit_ref: pending_deposit_tx.map(TransferRef::OnchainTx),
+                reason,
+                failed_at: Utc::now(),
+            }]),
             Self::DepositInitiated { deposit_ref, .. } => Ok(vec![DepositFailed {
                 deposit_ref: Some(deposit_ref.clone()),
                 reason,
