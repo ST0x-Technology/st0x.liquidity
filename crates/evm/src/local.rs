@@ -320,7 +320,7 @@ mod tests {
 
     use crate::inflight_nonces::NonceOwnership;
     use crate::submit::release_in_flight_after_wait;
-    use crate::{NoOpErrorRegistry, ReceiptWaitConfig, wait_for_receipt_with_config};
+    use crate::{BroadcastError, NoOpErrorRegistry, ReceiptWaitConfig, wait_for_receipt_with_config};
 
     use super::*;
 
@@ -732,6 +732,58 @@ mod tests {
         );
         wallet.discard_prepared(&retry).await;
         wallet.discard_prepared(&earlier).await;
+    }
+
+    /// A transfer the wallet cannot cover reverts at gas estimation, before
+    /// anything is signed or sent.
+    #[tokio::test]
+    async fn classified_send_reports_a_gas_estimation_revert_as_not_broadcast() {
+        let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let nonce_before = wallet
+            .provider()
+            .get_transaction_count(signer_address)
+            .await
+            .unwrap();
+
+        let error = wallet
+            .send_pending_classified(
+                token_address,
+                Bytes::from(
+                    IERC20::transferCall {
+                        to: Address::random(),
+                        amount: U256::MAX,
+                    }
+                    .abi_encode(),
+                ),
+                "unaffordable transfer",
+            )
+            .await
+            .unwrap_err();
+
+        let BroadcastError::NotBroadcast(error) = error else {
+            panic!("a gas estimation revert sends nothing, got: {error:?}");
+        };
+        assert!(error.is_revert(), "expected a revert, got: {error:?}");
+        assert_eq!(
+            wallet
+                .provider()
+                .get_transaction_count(signer_address)
+                .await
+                .unwrap(),
+            nonce_before,
+        );
+    }
+
+    #[tokio::test]
+    async fn classified_send_returns_the_hash_of_the_broadcast_transaction() {
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+
+        let tx_hash = wallet
+            .send_pending_classified(signer_address, Bytes::new(), "classified send")
+            .await
+            .unwrap();
+
+        assert!(wallet.await_receipt(tx_hash).await.unwrap().status());
     }
 
     /// Regression test threading the `in_flight` wiring through the
