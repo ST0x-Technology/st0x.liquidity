@@ -662,6 +662,12 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   marked `BridgingFailed` and pages with "the burned USDC cannot be minted
   automatically". Nothing was minted: get the attestation for the burn tx, mint
   it on Base, then reconcile with `--kind usdc`.
+- An `AlpacaToBase` transfer whose Base mint fails hard (for example a
+  `receiveMessage` revert with the nonce still unused after the recovery window)
+  is marked `BridgingFailed` and pages with "the CCTP mint on Base did not
+  complete". Check the recorded nonce on Base: if it is used, find its mint; if
+  not, get the attestation for the burn tx and mint it on Base. Then reconcile
+  with `--kind usdc`.
 - An `AlpacaToBase` `Attested` transfer whose persisted CCTP message cannot be
   used (a corrupt envelope) or can never mint on Base (a placeholder nonce, a
   truncated message, another destination domain) is marked `BridgingFailed` with
