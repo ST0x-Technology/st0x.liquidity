@@ -1156,6 +1156,11 @@ enum ClaimOutcome {
     Completed,
     /// The pending intent remains claimed until broker admission permits it.
     Deferred,
+    /// An unconfirmed `process-tx` intent was retired (ADR 0022). Nothing is
+    /// outstanding at the broker and the standing pipeline owns the retry
+    /// through the kept idempotency anchor, so this is routine rather than a
+    /// hedge given up on: it is neither counted nor paged.
+    Retired,
     /// Nothing is outstanding at the broker: no pending order, one that is
     /// already terminal, or a re-drive the broker rejected (which rolled the
     /// position back). Abandoning here abandons a hedge that was never
@@ -1248,7 +1253,7 @@ async fn recover_pending_poll_status(
                     )
                     .await?;
 
-                    return Ok(ClaimOutcome::NothingClaimed);
+                    return Ok(ClaimOutcome::Retired);
                 }
                 Err(error) => {
                     warn!(
@@ -2250,6 +2255,20 @@ impl PlaceHedge {
                     offchain_order_id = %self.offchain_order_id,
                     "Pending hedge retained until broker admission permits recovery"
                 );
+                Ok(())
+            }
+
+            ClaimOutcome::Retired => {
+                info!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    offchain_order_id = %self.offchain_order_id,
+                    ?error,
+                    "PlaceHedge: symbol-scoped failure while an unconfirmed process-tx intent held \
+                     the claim; the intent was retired and the standing pipeline owns the retry, \
+                     so it is not counted or paged as abandoned"
+                );
+
                 Ok(())
             }
 
@@ -9056,7 +9075,7 @@ mod tests {
             .unwrap();
 
         let outcome = recover_pending_poll_status(&ctx, order_id).await.unwrap();
-        assert!(matches!(outcome, ClaimOutcome::NothingClaimed));
+        assert!(matches!(outcome, ClaimOutcome::Retired));
 
         let OffchainOrder::Failed { kind, .. } =
             ctx.offchain_order.load(&order_id).await.unwrap().unwrap()
@@ -9076,6 +9095,98 @@ mod tests {
             placements.load(Ordering::SeqCst),
             0,
             "retiring the intent must not place a fresh order at the broker"
+        );
+    }
+
+    /// Retiring an unconfirmed `process-tx` intent is routine (ADR 0022), so a
+    /// symbol-scoped failure that finds one holding the claim must neither
+    /// count nor page it as an abandoned hedge: the standing pipeline owns the
+    /// retry. A false page would also burn the pair's one alert slot.
+    #[tokio::test]
+    async fn a_retired_process_tx_intent_is_not_paged_as_an_abandoned_hedge() {
+        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
+        let TestInfra { ctx, notifier, .. } = create_hedge_ctx_for_executor(
+            absent_at_broker_order_placer(Arc::new(AtomicUsize::new(0))),
+            SupportedExecutor::AlpacaBrokerApi,
+        )
+        .await;
+        // A symbol no other dead-letter test uses, so the shared recorder's
+        // count is this test's alone.
+        let symbol = Symbol::new("MSTR").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(1.0))).unwrap();
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(1.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let pending_id = OffchainOrderId::new();
+        ctx.position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: pending_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.offchain_order
+            .send(
+                &pending_id,
+                OffchainOrderCommand::PlaceReserved {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(pending_id.as_uuid()),
+                    kind: CounterTradeOrderKind::Market,
+                    buying_power_reservation: None,
+                    placed_at: None,
+                    provenance: PlacementProvenance::ProcessTx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let job = hedge_job(&symbol, 1.0, Direction::Sell);
+        job.handle_place_hedge_error(
+            &ctx,
+            TradeAccountingError::LimitQuoteUnavailable {
+                symbol: symbol.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                ctx.offchain_order.load(&pending_id).await.unwrap(),
+                Some(OffchainOrder::Failed {
+                    kind: OffchainOrderFailureKind::Deferral,
+                    ..
+                })
+            ),
+            "the unconfirmed intent must be retired as a deferral"
+        );
+        assert_eq!(
+            notifier.messages(),
+            Vec::<String>::new(),
+            "a routine retirement must not page an abandoned hedge"
+        );
+        assert_eq!(
+            dead_letter_count(
+                &metrics_handle.render(),
+                &symbol,
+                DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteUnavailable),
+            ),
+            0,
+            "a routine retirement must not count as a dead-lettered hedge"
         );
     }
 
