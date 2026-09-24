@@ -386,6 +386,19 @@ impl std::fmt::Display for MintScanCallSite {
     }
 }
 
+/// Pages the operator about a latched `BridgingFailed` whose consumed nonce's
+/// mint the bot cannot find.
+fn alert_unresolvable_mint(id: &UsdcRebalanceId, reason: &str) {
+    error!(
+        target: "operational_alert",
+        alert = true,
+        %id,
+        "USDC transfer {id}: the CCTP mint cannot be resolved automatically ({reason}). \
+         Bridge marked failed; find the mint of the recorded nonce on chain, then \
+         settle it with `transfer reconcile --kind usdc`."
+    );
+}
+
 /// A `find_attested_mint` or Circle re-poll failure that recurs on every
 /// retry.
 enum RepeatingMintFailure {
@@ -2989,7 +3002,7 @@ impl<
     /// nonce, so `transfer reconcile --kind usdc` can settle it: a message that
     /// cannot mint on this chain via [`Self::latch_unmintable_message`], a
     /// consumed nonce whose mint is not in the bounded scan via
-    /// [`Self::latch_unresolvable_mint`].
+    /// [`Self::latch_mint_outside_scan_window`].
     async fn handle_mint_scan_failure(
         &self,
         id: &UsdcRebalanceId,
@@ -3028,18 +3041,19 @@ impl<
                     .await
             }
             RepeatingMintFailure::MintOutsideScanWindow => {
-                self.latch_unresolvable_mint(id, mint_direction, reason, error)
+                self.latch_mint_outside_scan_window(id, mint_direction, reason, error)
                     .await
             }
         }
     }
 
     /// Latches a post-burn `BridgingFailed` (burn and nonce kept, so
-    /// `transfer reconcile --kind usdc` accepts it) for a mint the bot cannot
-    /// resolve. An AlpacaToBase latch pages: its retry finds the transfer
-    /// failed and does not alert. A BaseToAlpaca retry keeps recovering the
-    /// mint and may still send the deposit, so paging would race the bot; the
-    /// job's dead-letter alert covers a give-up.
+    /// `transfer reconcile --kind usdc` accepts it) for a legacy re-poll that
+    /// keeps failing on a consumed nonce. An AlpacaToBase latch pages: its
+    /// retry finds the transfer failed and does not alert. A BaseToAlpaca retry
+    /// re-polls Circle through the post-burn `BridgingFailed` recovery, which
+    /// may still adopt the mint, and the job's dead-letter alert covers a
+    /// give-up.
     async fn latch_unresolvable_mint(
         &self,
         id: &UsdcRebalanceId,
@@ -3063,18 +3077,46 @@ impl<
         // A crash between the committed FailBridging and this page leaves the
         // latch unpaged; paging first could page for a latch that never landed.
         match mint_direction {
-            BridgeDirection::EthereumToBase => error!(
-                target: "operational_alert",
-                alert = true,
-                %id,
-                "USDC transfer {id}: the CCTP mint cannot be resolved automatically ({reason}). \
-                 Bridge marked failed; find the mint of the recorded nonce on chain, then \
-                 settle it with `transfer reconcile --kind usdc`."
-            ),
+            BridgeDirection::EthereumToBase => alert_unresolvable_mint(id, &reason),
             BridgeDirection::BaseToEthereum => {}
         }
 
         UsdcTransferError::Cctp(Box::new(error))
+    }
+
+    /// Latches a post-burn `BridgingFailed` (burn and nonce kept) for a
+    /// consumed nonce whose mint is not in the bounded scan, and pages in both
+    /// directions: only an operator can find that mint. A BaseToAlpaca job ends
+    /// here, since its `BridgingFailed` recovery scans no wider and would
+    /// redrive forever.
+    async fn latch_mint_outside_scan_window(
+        &self,
+        id: &UsdcRebalanceId,
+        mint_direction: BridgeDirection,
+        reason: String,
+        error: CctpError,
+    ) -> UsdcTransferError {
+        if let Err(send_error) = self
+            .cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: reason.clone(),
+                },
+            )
+            .await
+        {
+            return send_error.into();
+        }
+
+        alert_unresolvable_mint(id, &reason);
+
+        match mint_direction {
+            BridgeDirection::EthereumToBase => UsdcTransferError::Cctp(Box::new(error)),
+            BridgeDirection::BaseToEthereum => {
+                UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }
+            }
+        }
     }
 
     #[instrument(target = "rebalance", skip(self, attestation_response), fields(%id), level = tracing::Level::DEBUG)]
