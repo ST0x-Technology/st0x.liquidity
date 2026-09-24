@@ -158,13 +158,14 @@ impl RaindexError {
 
     /// `true` when reconciliation may succeed after the transaction or RPC
     /// backend becomes visible. These errors require durable redrive rather
-    /// than a finite worker retry budget. Formal JSON-RPC error responses are
-    /// terminal: the node processed and rejected the request, so repeating it
-    /// indefinitely cannot improve visibility.
+    /// than a finite worker retry budget. Deterministic RPC failures are
+    /// terminal: a formal JSON-RPC rejection, an encoding or decoding error,
+    /// or a local usage error fails identically on every redrive, so repeating
+    /// it cannot improve visibility (see [`is_transient_rpc`]).
     pub fn is_reconciliation_pending(&self) -> bool {
         match self {
             Self::ScanInconclusive { .. } => true,
-            Self::RpcTransport(error) => error.as_error_resp().is_none(),
+            Self::RpcTransport(error) => is_transient_rpc(error),
             Self::Evm(error) => error.is_confirmation_pending(),
             // A contract-layer error can carry the same transient transport
             // failure as `RpcTransport` (connection reset/timeout with no formal
@@ -173,7 +174,7 @@ impl RaindexError {
             // Any other contract error shape (revert, unknown function) is
             // terminal.
             Self::Contract(alloy::contract::Error::TransportError(error)) => {
-                error.as_error_resp().is_none()
+                is_transient_rpc(error)
             }
             Self::Contract(_)
             | Self::Float(_)
@@ -184,6 +185,17 @@ impl RaindexError {
             | Self::MissingOperatorRole { .. } => false,
         }
     }
+}
+
+/// `true` only for RPC failures that can clear once the backend becomes
+/// reachable again or the awaited value becomes visible on another node.
+/// Every other `RpcError` is deterministic and fails identically on every
+/// redrive: a formal `ErrorResp` rejection, a serialization or deserialization
+/// failure, a local usage error, or an unsupported feature. Classifying any of
+/// them pending would loop the uncapped reconciliation redrive forever without
+/// ever surfacing for operator action.
+fn is_transient_rpc(error: &RpcError<TransportErrorKind>) -> bool {
+    matches!(error, RpcError::Transport(_) | RpcError::NullResp)
 }
 
 /// Abstraction for Raindex (Rain OrderBook) operations.
@@ -344,6 +356,22 @@ mod tests {
             error.is_reconciliation_pending(),
             "a transient transport failure reaching the caller through the \
              contract layer is retryable, matching the RpcTransport path"
+        );
+    }
+
+    #[test]
+    fn deterministic_deser_error_is_not_reconciliation_pending() {
+        let deser = serde_json::from_str::<u64>("\"not a number\"").unwrap_err();
+        let error = RaindexError::RpcTransport(RpcError::DeserError {
+            err: deser,
+            text: "\"not a number\"".to_string(),
+        });
+
+        assert!(
+            !error.is_reconciliation_pending(),
+            "a deserialization failure is deterministic: the response has the \
+             wrong shape on every redrive, so uncapped reconciliation can never \
+             make it succeed"
         );
     }
 }
