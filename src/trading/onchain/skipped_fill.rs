@@ -87,9 +87,11 @@ pub(crate) async fn record_skipped_fill(
     let log_index =
         i64::try_from(log_index).map_err(|_| SkippedFillError::LogIndexOutOfRange { log_index })?;
     let skipped_at = Utc::now().to_rfc3339();
+    let is_trading_disabled = reason == SkipReason::TradingDisabled;
+    let reason = reason.as_str();
 
-    if reason == SkipReason::TradingDisabled {
-        sqlx::query(
+    if is_trading_disabled {
+        sqlx::query!(
             "INSERT INTO skipped_fills \
              (chain, tx_hash, log_index, event_type, reason, detail, skipped_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
@@ -101,21 +103,20 @@ pub(crate) async fn record_skipped_fill(
              || ': ' || skipped_fills.detail || ')', \
              skipped_at = excluded.skipped_at \
              WHERE skipped_fills.reason <> excluded.reason",
+            chain,
+            tx_hash,
+            log_index,
+            event_type,
+            reason,
+            detail,
+            skipped_at,
         )
-        .bind(chain)
-        .bind(tx_hash)
-        .bind(log_index)
-        .bind(event_type)
-        .bind(reason.as_str())
-        .bind(detail)
-        .bind(skipped_at)
         .execute(pool)
         .await?;
 
         return Ok(());
     }
 
-    let reason = reason.as_str();
     sqlx::query!(
         "INSERT INTO skipped_fills \
          (chain, tx_hash, log_index, event_type, reason, detail, skipped_at) \
@@ -149,18 +150,20 @@ pub(crate) async fn trading_disabled_detail(
     let log_index =
         i64::try_from(log_index).map_err(|_| SkippedFillError::LogIndexOutOfRange { log_index })?;
 
-    let detail: Option<(String,)> = sqlx::query_as(
+    let chain = chain.to_string();
+    let tx_hash = tx_hash.to_string();
+    let reason = SkipReason::TradingDisabled.as_str();
+
+    Ok(sqlx::query_scalar!(
         "SELECT detail FROM skipped_fills \
          WHERE chain = ? AND tx_hash = ? AND log_index = ? AND reason = ?",
+        chain,
+        tx_hash,
+        log_index,
+        reason,
     )
-    .bind(chain.to_string())
-    .bind(tx_hash.to_string())
-    .bind(log_index)
-    .bind(SkipReason::TradingDisabled.as_str())
     .fetch_optional(pool)
-    .await?;
-
-    Ok(detail.map(|(detail,)| detail))
+    .await?)
 }
 
 #[cfg(test)]

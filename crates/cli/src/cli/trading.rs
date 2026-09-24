@@ -952,8 +952,15 @@ pub(super) async fn process_found_trade<W: Write>(
         anyhow::bail!("Fill {trade_id}: missing block_number, cannot witness fill");
     };
 
-    // process-tx only decodes primary chain fills.
-    let fill_chain = ctx.chains.primary();
+    // Resolved from the fill's own chain, which keys its `skipped_fills` row
+    // and its report, so the flag and the record can never disagree even if
+    // process-tx later decodes secondary chain fills.
+    let Some(fill_chain) = ctx.chains.hedged_chain(onchain_trade.chain) else {
+        anyhow::bail!(
+            "Fill {trade_id} is on {}, which is not a hedged chain",
+            onchain_trade.chain
+        );
+    };
     let base_symbol = onchain_trade.symbol();
 
     // Same rule as the bot: a fill on an asset disabled on its own chain
@@ -3816,7 +3823,9 @@ mod tests {
 
         let (fill_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind("PositionEvent::OnChainOrderFilled")
+                .bind(
+                    st0x_hedge::operator::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE,
+                )
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -3880,7 +3889,9 @@ mod tests {
 
         let (fill_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
-                .bind("PositionEvent::OnChainOrderFilled")
+                .bind(
+                    st0x_hedge::operator::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE,
+                )
                 .fetch_one(&pool)
                 .await
                 .unwrap();
