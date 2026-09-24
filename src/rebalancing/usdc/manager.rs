@@ -17447,6 +17447,43 @@ mod tests {
         );
     }
 
+    /// A burn with no recorded hash may already have left the wallet: a
+    /// `BurnRecordFailed` or an inconclusive broadcast leaves the same state.
+    /// Its credit must not page a shortfall for another transfer.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn credit_ledger_does_not_page_for_a_burn_that_may_have_been_broadcast() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let burning = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridging_submitting_alpaca_to_base_with_burn_amount(
+            &cqrs,
+            &burning,
+            usdc("100"),
+            1,
+            usdc("100"),
+        )
+        .await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new().with_ledger_probe(cqrs.clone(), burning, U256::ZERO);
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, bridge).await;
+        let manager = manager.with_credit_ledger(pool);
+
+        let result = manager
+            .check_ethereum_credit_ledger(&UsdcRebalanceId(Uuid::new_v4()), usdc("0"))
+            .await;
+
+        assert!(
+            matches!(result, CreditLedgerCheck::Covered { .. }),
+            "a maybe-broadcast burn must not count as held; got: {result:?}"
+        );
+        assert!(!logs_contain("operational_alert"));
+    }
+
     async fn manager_with_bot_gas_queue<Signer: Wallet + Clone>(
         cqrs: Arc<Store<UsdcRebalance>>,
         wallet: Signer,
