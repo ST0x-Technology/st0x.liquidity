@@ -5694,8 +5694,7 @@ mod tests {
         );
 
         // Scanning from a bound above the send's block excludes it; the head is
-        // already far enough
-        // past `above_block` for the absence to resolve to None.
+        // already far enough past `above_block` for the absence to resolve to None.
         assert_eq!(
             bridge
                 .find_recent_usdc_transfer(sender, recipient, amount, above_block)
