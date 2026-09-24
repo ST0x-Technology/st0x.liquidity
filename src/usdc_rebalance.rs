@@ -434,8 +434,9 @@ pub enum UsdcRebalanceCommand {
     /// Record the Circle attestation. Valid from `Bridging` or
     /// `AwaitingAttestation` state.
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
-    /// `mint_scan_from_block` is the destination chain head captured before the mint:
-    /// the floor of the resume lookup for the mint of this transfer's nonce.
+    /// `mint_scan_from_block` is the destination chain head captured before the mint.
+    /// The resume lookup for the mint of this transfer's nonce starts at the lower of
+    /// it and a fixed lookback from the head.
     ReceiveAttestation {
         attestation: Vec<u8>,
         cctp_nonce: B256,
@@ -615,10 +616,11 @@ pub enum UsdcRebalanceEvent {
     PendingBurnCleared { cleared_at: DateTime<Utc> },
     /// Circle attestation received. Enables minting on destination chain.
     /// The cctp_nonce is extracted from the attested message (the real nonce, not the placeholder).
-    /// `mint_scan_from_block` is the destination chain head captured before the mint,
-    /// the floor of the resume lookup for the mint of this transfer's nonce. It is
-    /// `None` for events persisted before this field existed: such a resume looks
-    /// back a fixed window from the head instead of scanning from genesis.
+    /// `mint_scan_from_block` is the destination chain head captured before the mint.
+    /// The resume lookup for the mint of this transfer's nonce starts at the lower of
+    /// it and a fixed lookback from the head. It is `None` for events persisted
+    /// before this field existed: such a resume scans the lookback alone instead of
+    /// scanning from genesis.
     BridgeAttestationReceived {
         attestation: Vec<u8>,
         cctp_nonce: B256,
@@ -870,9 +872,10 @@ pub enum UsdcRebalance {
         /// Circle. `None` for transfers whose `BridgeAttestationReceived` predates
         /// this field: such a resume falls back to re-polling Circle.
         message: Option<Vec<u8>>,
-        /// Destination chain head captured before the mint: the floor of the
-        /// resume lookup for the mint of this transfer's nonce. `None` for
-        /// transfers whose `BridgeAttestationReceived` predates this field.
+        /// Destination chain head captured before the mint. The resume lookup
+        /// for the mint of this transfer's nonce starts at the lower of it and a
+        /// fixed lookback from the head. `None` for transfers whose
+        /// `BridgeAttestationReceived` predates this field.
         mint_scan_from_block: Option<u64>,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
