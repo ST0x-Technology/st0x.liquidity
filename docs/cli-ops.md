@@ -468,6 +468,9 @@ stox transfer fail --kind mint --id <issuer-request-id> --reason "rejected by pr
 stox transfer fail --kind redemption --id <redemption-aggregate-id> --reason "stuck, handled manually"
 ```
 
+Without container access, the same route is reachable through IAP with
+`st0x-liquidity-client --env <env> debug fail-equity-transfer <mint|redemption> <id> --reason ...`.
+
 After force-failing, use `transfer reconcile` (see "Reconciling Stuck Failed
 Transfers" below) if the stranded funds were already handled out-of-band and the
 transfer should be marked resolved rather than left in `Failed`.

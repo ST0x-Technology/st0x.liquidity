@@ -154,8 +154,12 @@ impl<A: TokenSource + Sync> Client<A> {
         self.dispatch(self.http.get(url), target, token).await
     }
 
-    pub async fn post(&self, path: &str) -> Result<serde_json::Value, TransportError> {
-        let url = self.url(WRITE_PREFIX, path, &[]);
+    pub async fn post(
+        &self,
+        path: &str,
+        params: &[(String, String)],
+    ) -> Result<serde_json::Value, TransportError> {
+        let url = self.url(WRITE_PREFIX, path, params);
         let target = url.to_string();
         let token = self
             .write_auth
@@ -218,6 +222,11 @@ impl<A: TokenSource + Sync> Client<A> {
             return Err(TransportError::Unauthorized(format!(
                 "IAP redirected to sign-in (status {status}, location {location}); the token was missing, expired, or not accepted"
             )));
+        }
+        // A write route that reports success with no body, like the equity
+        // transfer fail route, has nothing to decode.
+        if status == StatusCode::NO_CONTENT {
+            return Ok(serde_json::Value::Null);
         }
         let body = response
             .text()
@@ -374,7 +383,7 @@ mod tests {
         let (port, requests) = capture_server()?;
         let client = fake_client(port)?;
 
-        let value = client.post("/transfers/recheck/mint/abc").await?;
+        let value = client.post("/transfers/recheck/mint/abc", &[]).await?;
         assert_eq!(value, serde_json::json!({}));
 
         let request = requests.recv()?;
@@ -444,6 +453,15 @@ mod tests {
             }
             other => panic!("expected Http, got {other:?}"),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_content_success_yields_null() -> Result<(), Box<dyn std::error::Error>> {
+        let (port, _requests) = serve("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")?;
+        let client = fake_client(port)?;
+        let value = client.post("/transfers/fail/equity_mint/abc", &[]).await?;
+        assert_eq!(value, serde_json::Value::Null);
         Ok(())
     }
 

@@ -163,7 +163,7 @@ async fn dispatch<A: TokenSource + Sync>(
             );
             client.get(&path, &args.params).await?
         }
-        Command::Debug(Debug::Resume) => client.post("/transfers/resume").await?,
+        Command::Debug(Debug::Resume) => client.post("/transfers/resume", &[]).await?,
         Command::Debug(Debug::Recheck { kind, id }) => {
             let kind = match kind {
                 RecheckTransferType::Mint => "equity_mint",
@@ -172,7 +172,7 @@ async fn dispatch<A: TokenSource + Sync>(
             };
             let id = encode_segment(&id);
             client
-                .post(&format!("/transfers/recheck/{kind}/{id}"))
+                .post(&format!("/transfers/recheck/{kind}/{id}"), &[])
                 .await?
         }
         Command::Debug(Debug::ResumeUsdc { direction, id }) => {
@@ -182,7 +182,7 @@ async fn dispatch<A: TokenSource + Sync>(
             };
             let id = encode_segment(&id);
             client
-                .post(&format!("/transfers/usdc/resume/{direction}/{id}"))
+                .post(&format!("/transfers/usdc/resume/{direction}/{id}"), &[])
                 .await?
         }
         Command::Debug(Debug::ReconcileUsdc { id, reason }) => {
@@ -222,6 +222,19 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post_json(
                     &format!("/transfers/usdc/{id}/fail"),
                     &wire::FailUsdcTransferRequest { reason },
+                )
+                .await?
+        }
+        Command::Debug(Debug::FailEquityTransfer { kind, id, reason }) => {
+            let kind = match kind {
+                EquityTransferKind::Mint => "equity_mint",
+                EquityTransferKind::Redemption => "equity_redemption",
+            };
+            let id = encode_segment(&id);
+            client
+                .post_json(
+                    &format!("/transfers/fail/{kind}/{id}"),
+                    &wire::FailEquityTransferRequest { reason },
                 )
                 .await?
         }
@@ -265,10 +278,14 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::ProcessTx { tx_hash }) => {
+        Command::Debug(Debug::ProcessTx { tx_hash, chain }) => {
             let tx_hash = encode_segment(&tx_hash);
+            let params: Vec<(String, String)> = chain
+                .map(|chain| ("chain".to_owned(), chain.wire_name().to_owned()))
+                .into_iter()
+                .collect();
             client
-                .post(&format!("/transactions/{tx_hash}/process"))
+                .post(&format!("/transactions/{tx_hash}/process"), &params)
                 .await?
         }
     };
@@ -286,9 +303,9 @@ mod tests {
     use super::{ApiError, dispatch};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
-        Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read, ReadResource,
-        RecheckTransferType, ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs,
-        TradeEventsArgs, TransferEventsArgs, UsdcDirection,
+        Command, Debug, EquityTransferKind, HedgedChain, PortfolioSnapshot, Position, Read,
+        ReadResource, RecheckTransferType, ReleaseHedgeArgs, ResourceArgs, SetMarkArgs,
+        SetPositionArgs, TradeEventsArgs, TransferEventsArgs, UsdcDirection,
     };
     use crate::output::OutputError;
     use crate::transport::{Client, TransportError};
@@ -638,14 +655,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_tx_posts_the_hash_segment() -> Result<(), Box<dyn std::error::Error>> {
-        let request = request_for(Command::Debug(Debug::ProcessTx {
+    async fn fail_equity_transfer_posts_the_kind_segment_and_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (kind, segment) in [
+            (EquityTransferKind::Mint, "equity_mint"),
+            (EquityTransferKind::Redemption, "equity_redemption"),
+        ] {
+            let request = request_for(Command::Debug(Debug::FailEquityTransfer {
+                kind,
+                id: "abc".to_owned(),
+                reason: "stuck at the issuer".to_owned(),
+            }))
+            .await?;
+            assert_eq!(
+                request_line(&request),
+                format!("POST /liquidity-write/transfers/fail/{segment}/abc HTTP/1.1")
+            );
+            assert_eq!(
+                request_body(&request),
+                serde_json::json!({ "reason": "stuck at the issuer" })
+            );
+        }
+        Ok(())
+    }
+
+    /// Omitting `--chain` sends no query, so the bot resolves the primary
+    /// chain; an explicit secondary is sent as its `Chain` wire name.
+    #[tokio::test]
+    async fn process_tx_sends_the_chain_only_when_given() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let primary = request_for(Command::Debug(Debug::ProcessTx {
             tx_hash: "0xabc".to_owned(),
+            chain: None,
         }))
         .await?;
         assert_eq!(
-            request_line(&request),
+            request_line(&primary),
             "POST /liquidity-write/transactions/0xabc/process HTTP/1.1"
+        );
+
+        let secondary = request_for(Command::Debug(Debug::ProcessTx {
+            tx_hash: "0xabc".to_owned(),
+            chain: Some(HedgedChain::Ethereum),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&secondary),
+            "POST /liquidity-write/transactions/0xabc/process?chain=ethereum HTTP/1.1"
         );
         Ok(())
     }
