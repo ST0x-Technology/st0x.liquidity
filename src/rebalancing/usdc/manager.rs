@@ -3173,8 +3173,8 @@ impl<
     /// Latches a post-burn `BridgingFailed` (burn and nonce kept) for a
     /// consumed nonce whose mint is not in the bounded scan, and pages in both
     /// directions: only an operator can find that mint. A BaseToAlpaca job ends
-    /// here, since its `BridgingFailed` recovery scans no wider and would
-    /// redrive forever.
+    /// here, since its `BridgingFailed` recovery scans no wider and can only
+    /// page again and park.
     async fn latch_mint_outside_scan_window(
         &self,
         id: &UsdcRebalanceId,
@@ -19425,7 +19425,7 @@ mod tests {
 
     /// The `BridgingFailed` recovery scans no wider than this lookup, so it
     /// could never adopt the mint: the latch pages the operator and ends the
-    /// job instead of handing it to a recovery that would redrive forever.
+    /// job instead of handing it to a recovery that can only page again.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn attested_mint_outside_the_scan_window_latches_for_reconciliation_base_to_alpaca() {

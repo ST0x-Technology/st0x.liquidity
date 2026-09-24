@@ -171,7 +171,9 @@ impl MintRecoveryConfig {
     }
 
     /// Two probes 10 ms apart, for downstream tests (via
-    /// [`CctpBridge::with_fast_mint_recovery_policy`](super::CctpBridge::with_fast_mint_recovery_policy)).
+    /// [`with_fast_mint_recovery_policy`][fast_policy]).
+    ///
+    /// [fast_policy]: super::CctpBridge::with_fast_mint_recovery_policy
     #[cfg(any(test, feature = "test-support"))]
     pub(super) const fn fast() -> Self {
         Self {
