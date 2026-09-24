@@ -1740,8 +1740,7 @@ mod tests {
     use crate::offchain::order::poll_status::PollOrderStatusCtx;
     use crate::offchain::order::{
         CounterTradeOrderKind, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
-        OffchainOrderFailureKind, OrderPlacementResult, PlacementProvenance, PollOrderStatus,
-        ReconcileOrderFillJobQueue,
+        OrderPlacementResult, PollOrderStatus, ReconcileOrderFillJobQueue,
     };
     use crate::position::{
         AnchorDisposition, EquityTransferReservationId, PositionCommand, TradeId,
@@ -2583,7 +2582,6 @@ mod tests {
                     kind: CounterTradeOrderKind::Market,
                     buying_power_reservation: None,
                     placed_at: None,
-                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -2593,7 +2591,6 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -2618,7 +2615,6 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "lost placement response".to_string(),
                     anchor: crate::position::AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -4075,7 +4071,6 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "dry-run placement failed".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -4087,7 +4082,6 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "dry-run placement failed".to_string(),
                     anchor: AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

@@ -27,7 +27,7 @@ use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
-use crate::offchain::order::{CancellationReason, OffchainOrderFailureKind, OffchainOrderId};
+use crate::offchain::order::{CancellationReason, OffchainOrderId};
 
 /// A price economically observed at a specific point in time. Folds
 /// `last_price_usdc` and `last_price_observed_at` into one type so a price
@@ -832,13 +832,12 @@ impl EventSourced for Position {
                 offchain_order_id,
                 error,
                 anchor,
-                kind,
             } => {
                 self.validate_pending_execution(offchain_order_id)?;
 
                 warn!(
                     target: "hedge",
-                    %offchain_order_id, symbol = %self.symbol, %error, ?anchor, ?kind,
+                    %offchain_order_id, symbol = %self.symbol, %error, ?anchor,
                     "Offchain venue rejected"
                 );
 
@@ -847,7 +846,6 @@ impl EventSourced for Position {
                     error,
                     failed_at: Utc::now(),
                     anchor,
-                    kind,
                 }])
             }
 
@@ -890,13 +888,41 @@ impl EventSourced for Position {
                 expected_net,
                 price_usdc,
                 ..
-            } => self.manually_adjust_position_events(
-                target_net,
-                reason,
-                expected_net,
-                price_usdc,
-                Utc::now(),
-            ),
+            } => {
+                self.validate_operator_mutation_allowed()?;
+
+                if let Some(pending) = self.pending_offchain_order_id {
+                    return Err(PositionError::ManualAdjustmentBlockedByPendingExecution {
+                        offchain_order_id: pending,
+                    });
+                }
+
+                Self::validate_manual_adjustment(
+                    expected_net,
+                    self.net,
+                    target_net,
+                    &self.threshold,
+                    self.last_price.map(|observation| observation.price),
+                    price_usdc,
+                )?;
+
+                warn!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    previous_net = %self.net,
+                    target_net = %target_net,
+                    %reason,
+                    "Manually adjusted position"
+                );
+
+                Ok(vec![PositionEvent::ManualPositionAdjusted {
+                    previous_net: self.net,
+                    target_net,
+                    reason,
+                    price_usdc,
+                    adjusted_at: Utc::now(),
+                }])
+            }
         }
     }
 }
@@ -1461,53 +1487,6 @@ impl Position {
         Ok(())
     }
 
-    /// A manual adjustment on a live position: it overrides accounting by
-    /// hand, so it is refused while a hedge is in flight, validated against
-    /// the net the operator observed, and recorded loudly before the event is
-    /// emitted.
-    fn manually_adjust_position_events(
-        &self,
-        target_net: FractionalShares,
-        reason: String,
-        expected_net: Option<FractionalShares>,
-        price_usdc: Option<Float>,
-        adjusted_at: DateTime<Utc>,
-    ) -> Result<Vec<PositionEvent>, PositionError> {
-        self.validate_operator_mutation_allowed()?;
-
-        if let Some(pending) = self.pending_offchain_order_id {
-            return Err(PositionError::ManualAdjustmentBlockedByPendingExecution {
-                offchain_order_id: pending,
-            });
-        }
-
-        Self::validate_manual_adjustment(
-            expected_net,
-            self.net,
-            target_net,
-            &self.threshold,
-            self.last_price.map(|observation| observation.price),
-            price_usdc,
-        )?;
-
-        warn!(
-            target: "hedge",
-            symbol = %self.symbol,
-            previous_net = %self.net,
-            target_net = %target_net,
-            %reason,
-            "Manually adjusted position"
-        );
-
-        Ok(vec![PositionEvent::ManualPositionAdjusted {
-            previous_net: self.net,
-            target_net,
-            reason,
-            price_usdc,
-            adjusted_at,
-        }])
-    }
-
     /// Checks if this position is ready for execution
     /// based on its configured threshold.
     ///
@@ -1820,12 +1799,6 @@ pub enum PositionCommand {
         /// the failed placement's key reached a terminal state; see
         /// `AnchorDisposition`.
         anchor: AnchorDisposition,
-        /// Whether the retirement is a schedule or admission deferral or a
-        /// genuine failure. The position side is identical either way, but
-        /// only a genuine failure counts as a failed hedge cycle in the
-        /// latency report (ADR 0022).
-        #[serde(default)]
-        kind: OffchainOrderFailureKind,
     },
     ReleaseFailedOrderAnchor {
         expected_offchain_order_id: OffchainOrderId,
@@ -1934,11 +1907,6 @@ pub enum PositionEvent {
         failed_at: DateTime<Utc>,
         #[serde(default)]
         anchor: AnchorDisposition,
-        /// Whether the order was retired by a deferral or by a genuine
-        /// failure. Events persisted before this field existed decode as
-        /// `Failure`, so legacy terminals keep counting as hedge failures.
-        #[serde(default)]
-        kind: OffchainOrderFailureKind,
     },
     FailedOrderAnchorReleased {
         expected_offchain_order_id: OffchainOrderId,
@@ -2179,16 +2147,14 @@ impl PartialEq for PositionEvent {
                     error: e1,
                     failed_at: f1,
                     anchor: a1,
-                    kind: k1,
                 },
                 Self::OffChainOrderFailed {
                     offchain_order_id: o2,
                     error: e2,
                     failed_at: f2,
                     anchor: a2,
-                    kind: k2,
                 },
-            ) => o1 == o2 && e1 == e2 && f1 == f2 && a1 == a2 && k1 == k2,
+            ) => o1 == o2 && e1 == e2 && f1 == f2 && a1 == a2,
             (
                 Self::FailedOrderAnchorReleased {
                     expected_offchain_order_id: e1,
@@ -2497,13 +2463,11 @@ impl std::fmt::Debug for PositionCommand {
                 offchain_order_id,
                 error,
                 anchor,
-                kind,
             } => f
                 .debug_struct("FailOffChainOrder")
                 .field("offchain_order_id", offchain_order_id)
                 .field("error", error)
                 .field("anchor", anchor)
-                .field("kind", kind)
                 .finish(),
             Self::ReleaseFailedOrderAnchor {
                 expected_offchain_order_id,
@@ -2655,14 +2619,12 @@ impl std::fmt::Debug for PositionEvent {
                 error,
                 failed_at,
                 anchor,
-                kind,
             } => f
                 .debug_struct("OffChainOrderFailed")
                 .field("offchain_order_id", offchain_order_id)
                 .field("error", error)
                 .field("failed_at", failed_at)
                 .field("anchor", anchor)
-                .field("kind", kind)
                 .finish(),
             Self::FailedOrderAnchorReleased {
                 expected_offchain_order_id,
@@ -2797,7 +2759,6 @@ mod tests {
                 error: "placement response lost".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             },
         ]
     }
@@ -4212,7 +4173,6 @@ mod tests {
                 offchain_order_id,
                 error: "Broker API timeout".to_string(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             })
             .await
             .events();
@@ -4333,7 +4293,6 @@ mod tests {
                 error: "broker rejected".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             },
             placed(cancelled_order_id),
             PositionEvent::OffChainOrderCancelled {
@@ -5031,7 +4990,6 @@ mod tests {
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             },
         ])
         .unwrap()
@@ -5093,7 +5051,6 @@ mod tests {
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             },
             OffChainOrderPlaced {
                 offchain_order_id: second_order_id,
@@ -5111,7 +5068,6 @@ mod tests {
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             },
         ])
         .unwrap()
@@ -5169,7 +5125,6 @@ mod tests {
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             },
             OffChainOrderPlaced {
                 offchain_order_id: second_order_id,
@@ -5187,7 +5142,6 @@ mod tests {
                 error: "expired".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Release,
-                kind: OffchainOrderFailureKind::Failure,
             },
         ])
         .unwrap()
@@ -5242,7 +5196,6 @@ mod tests {
                 error: "expired".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Release,
-                kind: OffchainOrderFailureKind::Failure,
             },
         ])
         .unwrap()
@@ -5256,12 +5209,11 @@ mod tests {
     }
 
     /// Replay-parity contract (verify-migrations): a `PositionEvent::OffChainOrderFailed`
-    /// payload persisted before `anchor` and `kind` existed has neither key at all. It must
-    /// still deserialize, defaulting to `Preserve` and `Failure` so replaying prod history
-    /// reproduces the pre-change anchor behavior exactly and keeps counting legacy terminals
-    /// as hedge failures.
+    /// payload persisted before `anchor` existed has no `anchor` key at all. It must still
+    /// deserialize, defaulting to `Preserve` so replaying prod history reproduces the
+    /// pre-change anchor behavior exactly.
     #[test]
-    fn legacy_off_chain_order_failed_event_defaults_to_preserve_and_failure() {
+    fn legacy_off_chain_order_failed_event_defaults_to_preserve() {
         // A literal, not re-serialized from the current type: a change to the wire
         // format must break this test rather than move both sides together.
         let payload = json!({
@@ -5273,13 +5225,12 @@ mod tests {
         });
 
         let legacy: PositionEvent = serde_json::from_value(payload)
-            .expect("a pre-anchor event (missing the new fields) must still deserialize");
+            .expect("a pre-anchor event (missing the new field) must still deserialize");
 
-        let PositionEvent::OffChainOrderFailed { anchor, kind, .. } = legacy else {
+        let PositionEvent::OffChainOrderFailed { anchor, .. } = legacy else {
             panic!("expected OffChainOrderFailed, got: {legacy:?}");
         };
         assert_eq!(anchor, AnchorDisposition::Preserve);
-        assert_eq!(kind, OffchainOrderFailureKind::Failure);
     }
 
     #[test]
@@ -5324,7 +5275,6 @@ mod tests {
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             },
             OffChainOrderPlaced {
                 offchain_order_id: retry_order_id,
@@ -5399,7 +5349,6 @@ mod tests {
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             },
             PositionEvent::ManualPositionAdjusted {
                 previous_net: FractionalShares::new(float!(1.5)),
@@ -5885,7 +5834,6 @@ mod tests {
             error: "Market closed".to_string(),
             failed_at: timestamp,
             anchor: AnchorDisposition::Preserve,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
         assert_eq!(event.timestamp(), timestamp);

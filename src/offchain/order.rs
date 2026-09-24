@@ -128,13 +128,11 @@ pub struct OffchainOrderPlacement {
     kind: CounterTradeOrderKind,
     buying_power_reservation: Option<BuyingPowerReservationCents>,
     placed_at: Option<DateTime<Utc>>,
-    provenance: PlacementProvenance,
 }
 
 fn missing_pending_limit_price_failure(order_id: OffchainOrderId) -> OffchainOrderCommand {
     OffchainOrderCommand::MarkPlacementFailed {
         error: PlaceOffchainOrderError::PendingLimitPriceMissing { order_id }.to_string(),
-        kind: OffchainOrderFailureKind::Failure,
     }
 }
 
@@ -173,7 +171,6 @@ impl OffchainOrderPlacement {
             kind,
             buying_power_reservation: None,
             placed_at: None,
-            provenance: PlacementProvenance::LivePipeline,
         }
     }
 
@@ -189,14 +186,6 @@ impl OffchainOrderPlacement {
     #[must_use]
     pub(crate) fn with_optional_placed_at(mut self, placed_at: Option<DateTime<Utc>>) -> Self {
         self.placed_at = placed_at;
-        self
-    }
-
-    /// Records which placement path owns this intent, so recovery can retire a
-    /// `process-tx` intent the broker never received instead of replaying it.
-    #[must_use]
-    pub(crate) fn with_provenance(mut self, provenance: PlacementProvenance) -> Self {
-        self.provenance = provenance;
         self
     }
 }
@@ -247,7 +236,6 @@ pub async fn place_offchain_order_at_broker(
         kind,
         buying_power_reservation,
         placed_at,
-        provenance,
     } = placement;
 
     // Admission gates this attempt's request (a Market recovery attempt must
@@ -273,7 +261,6 @@ pub async fn place_offchain_order_at_broker(
                 kind: kind.clone(),
                 buying_power_reservation,
                 placed_at,
-                provenance,
             },
         )
         .await?;
@@ -430,7 +417,6 @@ pub async fn place_offchain_order_at_broker(
 
             OffchainOrderCommand::MarkPlacementFailed {
                 error: error.to_string(),
-                kind: OffchainOrderFailureKind::Failure,
             }
         }
     };
@@ -454,105 +440,6 @@ pub fn client_order_id_for_placement(
 ) -> ClientOrderId {
     let idempotency_source = last_failed_offchain_order_id.unwrap_or(offchain_order_id);
     ClientOrderId::from_uuid(idempotency_source.as_uuid())
-}
-
-/// What an orphan recovery path should do with a `Pending` placement intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingRecoveryAction {
-    /// Re-drive the durable placement. For an intent the broker already holds
-    /// under the same `client_order_id` this adopts the existing broker order
-    /// rather than creating a second one.
-    Replay,
-    /// Retire the intent without replaying its stored terms: a current broker
-    /// lookup found no order under its `client_order_id`. That is not proof the
-    /// broker never recorded it, so the id stays the idempotency anchor.
-    Retire,
-}
-
-/// Classifies an orphaned `Pending` intent before a recovery path acts on it.
-///
-/// `process-tx` records the position claim and the `Pending` intent before
-/// broker admission runs, so a crash leaves an intent the broker may or may
-/// not have received: the POST can succeed before its outcome is persisted.
-/// Replaying it would resend stale shares and reservation terms with no fresh
-/// preflight (ADR 0022), so such an intent is reconciled against the broker
-/// first: an order under the same `client_order_id` proves the placement did
-/// reach the broker and is adopted by the ordinary replay, while a lookup miss
-/// retires it. A miss is only a current not found answer, not proof of
-/// absence, so the retirement keeps the id as the idempotency anchor.
-///
-/// A live pipeline intent keeps the ordinary replay, as does any executor with
-/// no order lookup of its own -- the same executor gate
-/// `reconcile_failed_anchor` uses for the idempotency anchor.
-pub(crate) async fn classify_pending_recovery(
-    order_placer: &dyn OrderPlacer,
-    executor: SupportedExecutor,
-    provenance: PlacementProvenance,
-    client_order_id: &ClientOrderId,
-) -> Result<PendingRecoveryAction, Box<dyn std::error::Error + Send + Sync>> {
-    if provenance == PlacementProvenance::LivePipeline
-        || executor != SupportedExecutor::AlpacaBrokerApi
-    {
-        return Ok(PendingRecoveryAction::Replay);
-    }
-
-    match order_placer
-        .get_order_by_client_order_id(client_order_id)
-        .await?
-    {
-        Some(_) => Ok(PendingRecoveryAction::Replay),
-        None => Ok(PendingRecoveryAction::Retire),
-    }
-}
-
-/// The durable reason persisted on an intent retired by
-/// [`retire_unconfirmed_pending`].
-pub(crate) const NEVER_SENT_PROCESS_TX_REASON: &str =
-    "process-tx intent retired: the broker holds no order under its client order id";
-
-/// Failures from retiring an unconfirmed `process-tx` placement intent.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum RetirePendingError {
-    #[error("failed to retire the never sent offchain order: {0}")]
-    OffchainOrder(#[from] SendError<OffchainOrder>),
-    #[error("failed to clear the never sent offchain order from the position: {0}")]
-    Position(#[from] SendError<Position>),
-}
-
-/// Retires a `process-tx` placement intent that a broker lookup did not find:
-/// drives the order to a `Deferral` terminal and clears the position claim
-/// (ADR 0022). The lookup cannot prove the broker never recorded the order, so
-/// the id is preserved as the idempotency anchor: a fresh `client_order_id`
-/// would let a second order through if the original POST did succeed. The
-/// next hedge for the symbol goes through the standard anchor reconciliation
-/// before any fresh placement, which then runs from a fresh preflight.
-pub(crate) async fn retire_unconfirmed_pending(
-    offchain_order: &Store<OffchainOrder>,
-    position: &Store<Position>,
-    symbol: &Symbol,
-    offchain_order_id: OffchainOrderId,
-) -> Result<(), RetirePendingError> {
-    offchain_order
-        .send(
-            &offchain_order_id,
-            OffchainOrderCommand::MarkPlacementFailed {
-                error: NEVER_SENT_PROCESS_TX_REASON.to_owned(),
-                kind: OffchainOrderFailureKind::Deferral,
-            },
-        )
-        .await?;
-    position
-        .send(
-            symbol,
-            PositionCommand::FailOffChainOrder {
-                offchain_order_id,
-                error: NEVER_SENT_PROCESS_TX_REASON.to_owned(),
-                anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Deferral,
-            },
-        )
-        .await?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -618,28 +505,22 @@ fn market_session_from_extended(is_extended_hours: bool) -> MarketSession {
     }
 }
 
-/// Projects the terms of a placement intent onto the `Placed` event that
-/// records it. Every `initialize` arm funnels through here, so a placement
-/// recorded by the CLI, the live pipeline, or a fixture persists the same
-/// shape.
-fn placed_event(placement: OffchainOrderPlacement) -> OffchainOrderEvent {
-    let OffchainOrderPlacement {
-        symbol,
-        shares,
-        direction,
-        executor,
-        client_order_id,
-        kind,
-        buying_power_reservation,
-        placed_at,
-        provenance,
-    } = placement;
+fn placed_event(
+    symbol: Symbol,
+    shares: Positive<FractionalShares>,
+    direction: Direction,
+    executor: SupportedExecutor,
+    client_order_id: &ClientOrderId,
+    kind: &CounterTradeOrderKind,
+    buying_power_reservation: Option<BuyingPowerReservationCents>,
+    placed_at: DateTime<Utc>,
+) -> OffchainOrderEvent {
     let requested_market_session = kind.market_session();
     let (limit_price, close_flatten) = match kind {
         CounterTradeOrderKind::ExtendedHoursLimit {
             limit_price,
             close_flatten,
-        } => (Some(limit_price), close_flatten),
+        } => (Some(*limit_price), *close_flatten),
         CounterTradeOrderKind::Market => (None, false),
     };
 
@@ -648,13 +529,12 @@ fn placed_event(placement: OffchainOrderPlacement) -> OffchainOrderEvent {
         shares,
         direction,
         executor,
-        placed_at: placed_at.unwrap_or_else(Utc::now),
+        placed_at,
         is_extended_hours: requested_market_session == MarketSession::Extended,
         limit_price,
-        client_order_id: Some(client_order_id),
+        client_order_id: Some(client_order_id.clone()),
         close_flatten,
         buying_power_reservation,
-        provenance,
     }
 }
 
@@ -696,10 +576,6 @@ pub enum OffchainOrder {
         close_flatten: bool,
         #[serde(default)]
         buying_power_reservation: Option<BuyingPowerReservationCents>,
-        /// Which placement path recorded this intent. Drives whether recovery
-        /// replays the stored terms or retires an intent the broker never saw.
-        #[serde(default)]
-        provenance: PlacementProvenance,
     },
     /// `shares` carries the broker-accepted quantity for orders placed after the
     /// durable-job extraction (built from `OffchainOrderEvent::Accepted`'s
@@ -807,12 +683,6 @@ pub enum OffchainOrder {
         market_session: MarketSession,
         #[serde(default)]
         close_flatten: bool,
-        /// Whether this terminal records an expected deferral or a genuine
-        /// failure, so the dashboard can keep a deferred placement -- which
-        /// never reached the broker -- out of the trade feed. Projections
-        /// persisted before this field existed replay as genuine failures.
-        #[serde(default)]
-        kind: OffchainOrderFailureKind,
     },
     /// Terminal state after a successful broker cancellation. Distinct
     /// from `Failed` so analytics and the cancel-and-replace recovery
@@ -855,7 +725,6 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             client_order_id,
             close_flatten,
             buying_power_reservation,
-            provenance,
         } => Some(OffchainOrder::Pending {
             symbol: symbol.clone(),
             shares: *shares,
@@ -867,7 +736,6 @@ fn originate_offchain_order(event: &OffchainOrderEvent) -> Option<OffchainOrder>
             market_session: market_session_from_extended(*is_extended_hours),
             close_flatten: *close_flatten,
             buying_power_reservation: *buying_power_reservation,
-            provenance: *provenance,
         }),
         _ => None,
     }
@@ -994,7 +862,7 @@ impl EventSourced for OffchainOrder {
 
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
     const PROJECTION: Table = Table("offchain_order_view");
-    const SCHEMA_VERSION: u64 = 8;
+    const SCHEMA_VERSION: u64 = 7;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         originate_offchain_order(event)
@@ -1096,20 +964,15 @@ impl EventSourced for OffchainOrder {
                 *cancel_requested_at,
             )),
 
-            // The entity records the failure kind so the dashboard can tell a
-            // deferral -- which never reached the broker and is therefore not
-            // a trade -- from a genuine failure.
             Failed {
                 error,
                 filled_shares,
                 failed_at,
-                kind,
             } => Ok(evolve_failed(
                 entity,
                 error.clone(),
                 *filled_shares,
                 *failed_at,
-                *kind,
             )),
 
             Cancelled {
@@ -1142,14 +1005,16 @@ impl EventSourced for OffchainOrder {
                 executor,
                 client_order_id,
                 kind,
-            } => Ok(vec![placed_event(OffchainOrderPlacement::with_kind(
+            } => Ok(vec![placed_event(
                 symbol,
                 shares,
                 direction,
                 executor,
-                client_order_id,
-                kind,
-            ))]),
+                &client_order_id,
+                &kind,
+                None,
+                Utc::now(),
+            )]),
 
             PlaceReserved {
                 symbol,
@@ -1160,19 +1025,15 @@ impl EventSourced for OffchainOrder {
                 kind,
                 buying_power_reservation,
                 placed_at,
-                provenance,
             } => Ok(vec![placed_event(
-                OffchainOrderPlacement::with_kind(
-                    symbol,
-                    shares,
-                    direction,
-                    executor,
-                    client_order_id,
-                    kind,
-                )
-                .with_buying_power_reservation(buying_power_reservation)
-                .with_optional_placed_at(placed_at)
-                .with_provenance(provenance),
+                symbol,
+                shares,
+                direction,
+                executor,
+                &client_order_id,
+                &kind,
+                buying_power_reservation,
+                placed_at.unwrap_or_else(Utc::now),
             )]),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -1185,15 +1046,14 @@ impl EventSourced for OffchainOrder {
                 kind,
                 placed_at,
             } => Ok(vec![placed_event(
-                OffchainOrderPlacement::with_kind(
-                    symbol,
-                    shares,
-                    direction,
-                    executor,
-                    client_order_id,
-                    kind,
-                )
-                .with_optional_placed_at(Some(placed_at)),
+                symbol,
+                shares,
+                direction,
+                executor,
+                &client_order_id,
+                &kind,
+                None,
+                placed_at,
             )]),
 
             _ => Err(OffchainOrderError::NotPlaced),
@@ -1231,7 +1091,6 @@ impl EventSourced for OffchainOrder {
                 kind: _,
                 buying_power_reservation: _,
                 placed_at: _,
-                provenance: _,
             } => validate_place_replay(self, &symbol, direction, executor),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -1383,12 +1242,11 @@ impl EventSourced for OffchainOrder {
             // concurrent attempt already accepted. Enforcing it here -- against the
             // aggregate's authoritative state -- closes the load-then-send race a
             // caller-side re-check could not.
-            OffchainOrderCommand::MarkPlacementFailed { error, kind } => match self {
+            OffchainOrderCommand::MarkPlacementFailed { error } => match self {
                 Self::Pending { .. } => Ok(vec![OffchainOrderEvent::Failed {
                     error,
                     filled_shares: None,
                     failed_at: Utc::now(),
-                    kind,
                 }]),
                 Self::Submitted { symbol, .. }
                 | Self::PartiallyFilled { symbol, .. }
@@ -1513,7 +1371,6 @@ fn mark_failed_events(
         error,
         filled_shares,
         failed_at,
-        kind: OffchainOrderFailureKind::Failure,
     }])
 }
 
@@ -1534,7 +1391,6 @@ fn mark_failed_unfilled_events(
                 error,
                 filled_shares: None,
                 failed_at,
-                kind: OffchainOrderFailureKind::Failure,
             }])
         }
         OffchainOrder::PartiallyFilled { shares_filled, .. } => {
@@ -1770,7 +1626,6 @@ fn evolve_failed(
     error: String,
     filled_shares: Option<FractionalShares>,
     failed_at: DateTime<Utc>,
-    kind: OffchainOrderFailureKind,
 ) -> Option<OffchainOrder> {
     match entity {
         OffchainOrder::Pending {
@@ -1796,7 +1651,6 @@ fn evolve_failed(
             failed_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
-            kind,
         }),
         OffchainOrder::Submitted {
             symbol,
@@ -1823,7 +1677,6 @@ fn evolve_failed(
             failed_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
-            kind,
         }),
         OffchainOrder::PartiallyFilled {
             symbol,
@@ -1860,7 +1713,6 @@ fn evolve_failed(
             failed_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
-            kind,
         }),
         OffchainOrder::Cancelling {
             symbol,
@@ -1888,7 +1740,6 @@ fn evolve_failed(
             failed_at,
             market_session: *market_session,
             close_flatten: *close_flatten,
-            kind,
         }),
         OffchainOrder::Filled { .. }
         | OffchainOrder::Failed { .. }
@@ -2123,13 +1974,11 @@ fn terminal_quantity_provenance(
 }
 
 impl OffchainOrder {
-    /// Renders a terminal fill or failure as a dashboard [`Trade`], or `None`
-    /// when the terminal is a deferred placement: it never reached the broker,
-    /// so it has no fill and is not a trade the feed can show.
+    /// Renders a terminal fill or failure as a dashboard [`Trade`].
     pub(crate) fn try_into_trade(
         self,
         id: &OffchainOrderId,
-    ) -> Result<Option<Trade>, TradeConversionError> {
+    ) -> Result<Trade, TradeConversionError> {
         let (symbol, shares, direction, executor, occurred_at, outcome) = match self {
             Self::Filled {
                 symbol,
@@ -2146,10 +1995,6 @@ impl OffchainOrder {
                 filled_at,
                 TradeOutcome::Filled,
             ),
-            Self::Failed {
-                kind: OffchainOrderFailureKind::Deferral,
-                ..
-            } => return Ok(None),
             Self::Failed {
                 symbol,
                 shares,
@@ -2222,7 +2067,7 @@ impl OffchainOrder {
             Self::Cancelling { .. } => return Err(TradeConversionError::Cancelling),
         };
 
-        Ok(Some(Trade {
+        Ok(Trade {
             id: id.to_string(),
             occurred_at,
             venue: match executor {
@@ -2233,7 +2078,7 @@ impl OffchainOrder {
             symbol,
             shares,
             outcome,
-        }))
+        })
     }
 
     pub fn symbol(&self) -> &Symbol {
@@ -2384,12 +2229,9 @@ pub enum NoFillOutcome {
         cancelled_at: DateTime<Utc>,
     },
     /// Broker rejection/failure: issue `PositionCommand::FailOffChainOrder`.
-    /// `kind` is the order's persisted failure kind, so a `Deferral` terminal
-    /// is finalized as the deferral it was rather than as a hedge failure.
     Failed {
         error: String,
         anchor: AnchorDisposition,
-        kind: OffchainOrderFailureKind,
     },
 }
 
@@ -2426,16 +2268,13 @@ pub fn position_command_for_finalization(
             reason,
             cancelled_at,
         }),
-        TerminalPositionFinalization::NoFill(NoFillOutcome::Failed {
-            error,
-            anchor,
-            kind,
-        }) => Some(PositionCommand::FailOffChainOrder {
-            offchain_order_id,
-            error,
-            anchor,
-            kind,
-        }),
+        TerminalPositionFinalization::NoFill(NoFillOutcome::Failed { error, anchor }) => {
+            Some(PositionCommand::FailOffChainOrder {
+                offchain_order_id,
+                error,
+                anchor,
+            })
+        }
         TerminalPositionFinalization::UnpricedFill { .. } => None,
     }
 }
@@ -2511,7 +2350,6 @@ pub fn terminal_position_finalization(
             direction,
             executor_order_id: Some(executor_order_id),
             error,
-            kind,
             ..
         } => Some(classify_terminal_fill(
             *retained_fill,
@@ -2523,22 +2361,14 @@ pub fn terminal_position_finalization(
             NoFillOutcome::Failed {
                 error: error.clone(),
                 anchor: AnchorDisposition::Preserve,
-                kind: *kind,
             },
         )),
 
         // Failed with no recorded fill (or no executor id) -- nothing to apply.
-        // A `Deferral` terminal preserves the anchor too: finalization cannot
-        // tell a recovery retirement after a broker lookup miss, which keeps
-        // the id because a miss is not proof of absence (ADR 0022), from a
-        // deferral whose broker call never ran. Preserving costs at most one
-        // anchor reconciliation cycle; releasing could let a second order
-        // through under a fresh client order id.
-        OffchainOrder::Failed { error, kind, .. } => Some(TerminalPositionFinalization::NoFill(
+        OffchainOrder::Failed { error, .. } => Some(TerminalPositionFinalization::NoFill(
             NoFillOutcome::Failed {
                 error: error.clone(),
                 anchor: AnchorDisposition::Preserve,
-                kind: *kind,
             },
         )),
 
@@ -2711,7 +2541,6 @@ async fn reconcile_pre_cancel(
                     error,
                     filled_shares: shares_filled,
                     failed_at,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
         }
@@ -3193,7 +3022,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         };
         counter!("hedge_placement_deferred_total", "reason" => reason.metric_label()).increment(1);
         info!(symbol = %order.symbol, client_order_id = %order.client_order_id,
-            reason = reason.metric_label(), "Retaining hedge intent until broker admission permits placement");
+            reason = reason.metric_label(), "Broker admission deferred hedge placement");
         Ok(PlacementAdmission::Deferred)
     }
     async fn place_market_order(
@@ -3425,47 +3254,6 @@ impl CounterTradeOrderKind {
     }
 }
 
-/// Distinguishes the two terminals an `OffchainOrder` failure can record, so
-/// reliability accounting counts only the genuine ones.
-///
-/// A schedule or admission gate declining to send a placement is an expected
-/// outcome of the close flatten policy (ADR 0022), not a broker failure: the
-/// exposure stays unhedged and the standing pipeline hedges it again from a
-/// fresh preflight. Every other terminal -- a broker error, backpressure, a
-/// store failure, a broker rejection observed while polling -- is a genuine
-/// failure.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub enum OffchainOrderFailureKind {
-    /// A schedule or admission gate deferred the placement before the broker
-    /// accepted it. Never counted as a hedge failure.
-    Deferral,
-    /// The order genuinely failed. The default for events persisted before this
-    /// discriminator existed, so legacy terminals keep counting as failures.
-    #[default]
-    Failure,
-}
-
-/// Which placement path recorded a placement intent.
-///
-/// The `process-tx` verb writes the position claim and the `Pending` intent
-/// before broker admission runs (ADR 0022), so a crash after admission
-/// declined the placement -- and before the retirement commits -- leaves a
-/// durable `Pending` intent the broker never received. Recovery reads this
-/// field to retire such an intent rather than replay its stored shares and
-/// reservation terms without a fresh preflight.
-///
-/// Every live pipeline placement, and every event persisted before this field
-/// existed, reads back as `LivePipeline` and keeps the existing recovery
-/// behaviour.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub enum PlacementProvenance {
-    /// Recorded by the standing pipeline, which owns its own retry.
-    #[default]
-    LivePipeline,
-    /// Recorded by the `process-tx` operator verb before broker admission.
-    ProcessTx,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OffchainOrderCommand {
     Place {
@@ -3491,9 +3279,6 @@ pub enum OffchainOrderCommand {
         /// idempotency key. Fresh placements stamp the command handling time.
         #[serde(default)]
         placed_at: Option<DateTime<Utc>>,
-        /// Which placement path recorded this intent.
-        #[serde(default)]
-        provenance: PlacementProvenance,
     },
     /// Test/fixture-only: identical to `Place` but takes `placed_at`
     /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
@@ -3558,11 +3343,7 @@ pub enum OffchainOrderCommand {
     /// `Pending`, so a stale attempt cannot fail a live order a concurrent attempt
     /// already accepted. The poll-rejection path instead uses `MarkFailed`, which
     /// may fail a live `Submitted`/`PartiallyFilled` order.
-    MarkPlacementFailed {
-        error: String,
-        /// Whether the retirement is an expected deferral or a genuine failure.
-        kind: OffchainOrderFailureKind,
-    },
+    MarkPlacementFailed { error: String },
     MarkFailed {
         error: String,
         /// Broker-reported cumulative fill quantity. `None` means the caller
@@ -3620,12 +3401,6 @@ pub enum OffchainOrderEvent {
         /// the entity so replay and recovery preserve the original reservation.
         #[serde(default)]
         buying_power_reservation: Option<BuyingPowerReservationCents>,
-        /// Which placement path recorded this intent, so recovery can tell a
-        /// `process-tx` intent the broker may never have received from a live
-        /// pipeline one. Events predating this field read back as
-        /// `LivePipeline`.
-        #[serde(default)]
-        provenance: PlacementProvenance,
     },
     /// Legacy broker-acceptance event. Predates the durable-job extraction,
     /// where `Place` did the broker call inline and emitted this alongside
@@ -3673,11 +3448,6 @@ pub enum OffchainOrderEvent {
         #[serde(default)]
         filled_shares: Option<FractionalShares>,
         failed_at: DateTime<Utc>,
-        /// Whether this terminal records an expected deferral or a genuine
-        /// failure. Legacy events predating the field are genuine failures, so
-        /// their reliability accounting is unchanged.
-        #[serde(default)]
-        kind: OffchainOrderFailureKind,
     },
     Cancelled {
         reason: CancellationReason,
@@ -4152,7 +3922,6 @@ mod tests {
             client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
             close_flatten: true,
             buying_power_reservation: None,
-            provenance: PlacementProvenance::LivePipeline,
         };
 
         // The submitted terms are recorded on the event for audit.
@@ -4256,7 +4025,6 @@ mod tests {
             failed_at: failure_time,
             market_session: MarketSession::Regular,
             close_flatten: false,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
         let finalization =
@@ -4292,7 +4060,6 @@ mod tests {
             failed_at: failure_time,
             market_session: MarketSession::Regular,
             close_flatten: false,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
         let finalization =
@@ -4302,7 +4069,6 @@ mod tests {
             TerminalPositionFinalization::NoFill(NoFillOutcome::Failed {
                 error: "expired".to_string(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             })
         );
     }
@@ -4324,7 +4090,6 @@ mod tests {
             failed_at: failure_time,
             market_session: MarketSession::Regular,
             close_flatten: false,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
         let finalization =
@@ -4334,7 +4099,6 @@ mod tests {
             TerminalPositionFinalization::NoFill(NoFillOutcome::Failed {
                 error: "broker unreachable".to_string(),
                 anchor: AnchorDisposition::Preserve,
-                kind: OffchainOrderFailureKind::Failure,
             })
         );
     }
@@ -4361,13 +4125,11 @@ mod tests {
             failed_at: failure_time,
             market_session: MarketSession::Regular,
             close_flatten: false,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
         let trade = order
             .try_into_trade(&OffchainOrderId::new())
-            .expect("valid terminal failure should convert")
-            .expect("a genuine failure must render as a trade");
+            .expect("valid terminal failure should convert");
         assert_eq!(trade.occurred_at, failure_time);
         assert!(trade.shares.inner().inner().eq(float!(2)).unwrap());
         match trade.outcome {
@@ -4432,13 +4194,11 @@ mod tests {
             failed_at,
             market_session: MarketSession::Regular,
             close_flatten: false,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
         let trade = order
             .try_into_trade(&OffchainOrderId::new())
-            .expect("overfilled terminal failures must remain visible")
-            .expect("a genuine failure must render as a trade");
+            .expect("overfilled terminal failures must remain visible");
         let TradeOutcome::Failed {
             filled_shares,
             remaining_shares,
@@ -4467,48 +4227,6 @@ mod tests {
         );
     }
 
-    /// A deferred placement never reached the broker: the terminal carries no
-    /// fill, so it is not a trade and the dashboard must not render one. The
-    /// identical terminal recorded as a genuine failure still converts.
-    #[test]
-    fn deferred_placement_terminal_is_not_a_trade() {
-        let failed_at = Utc::now();
-        let terminal = |kind| OffchainOrder::Failed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
-            requested_shares: None,
-            direction: Direction::Sell,
-            executor: SupportedExecutor::DryRun,
-            retained_fill: None,
-            filled_shares: None,
-            executor_order_id: None,
-            error: "hedge placement deferred".to_string(),
-            placed_at: failed_at,
-            failed_at,
-            market_session: MarketSession::Regular,
-            close_flatten: false,
-            kind,
-        };
-
-        let deferred = terminal(OffchainOrderFailureKind::Deferral)
-            .try_into_trade(&OffchainOrderId::new())
-            .unwrap();
-        assert!(
-            deferred.is_none(),
-            "a deferred placement never reached the broker and must not \
-             render as a trade, got: {deferred:?}"
-        );
-
-        let trade = terminal(OffchainOrderFailureKind::Failure)
-            .try_into_trade(&OffchainOrderId::new())
-            .unwrap()
-            .expect("a genuine failure must render as a trade");
-        let TradeOutcome::Failed { error, .. } = trade.outcome else {
-            panic!("a genuine failure must keep its failure outcome");
-        };
-        assert_eq!(error, "hedge placement deferred");
-    }
-
     #[test]
     fn cancelled_trade_distinguishes_explicit_zero_fill() {
         let cancelled_at = Utc::now();
@@ -4528,10 +4246,7 @@ mod tests {
             cancelled_at,
         };
 
-        let trade = order
-            .try_into_trade(&OffchainOrderId::new())
-            .unwrap()
-            .expect("a cancelled terminal must render as a trade");
+        let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
         assert_eq!(trade.shares, requested);
         let TradeOutcome::Cancelled {
             accepted_shares,
@@ -4578,10 +4293,7 @@ mod tests {
             cancelled_at,
         };
 
-        let trade = order
-            .try_into_trade(&OffchainOrderId::new())
-            .unwrap()
-            .expect("a cancelled terminal must render as a trade");
+        let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
         let TradeOutcome::Cancelled {
             filled_shares,
             remaining_shares,
@@ -4626,10 +4338,7 @@ mod tests {
         });
 
         let state: OffchainOrder = serde_json::from_value(legacy_payload).unwrap();
-        let trade = state
-            .try_into_trade(&OffchainOrderId::new())
-            .unwrap()
-            .expect("a cancelled terminal must render as a trade");
+        let trade = state.try_into_trade(&OffchainOrderId::new()).unwrap();
         let TradeOutcome::Cancelled {
             accepted_shares,
             filled_shares,
@@ -4666,13 +4375,9 @@ mod tests {
             failed_at,
             market_session: MarketSession::Regular,
             close_flatten: false,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
-        let trade = order
-            .try_into_trade(&OffchainOrderId::new())
-            .unwrap()
-            .expect("a genuine failure must render as a trade");
+        let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
         let TradeOutcome::Failed { filled_shares, .. } = trade.outcome else {
             panic!("failed order must retain its failure outcome");
         };
@@ -4715,10 +4420,7 @@ mod tests {
             ),
             "legacy Failed payload must default fill metadata to None, got: {state:?}"
         );
-        let trade = state
-            .try_into_trade(&OffchainOrderId::new())
-            .unwrap()
-            .expect("a legacy failure must render as a trade");
+        let trade = state.try_into_trade(&OffchainOrderId::new()).unwrap();
         let TradeOutcome::Failed {
             accepted_shares,
             filled_shares,
@@ -4793,7 +4495,6 @@ mod tests {
             market_session: MarketSession::Extended,
             close_flatten: true,
             buying_power_reservation: None,
-            provenance: PlacementProvenance::LivePipeline,
         };
         let cancelling = OffchainOrder::Cancelling {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -4839,7 +4540,6 @@ mod tests {
             failed_at: placed_at,
             market_session: MarketSession::Extended,
             close_flatten: true,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
         for (variant, state) in [
@@ -4928,8 +4628,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .try_into_trade(&id)
-            .unwrap()
-            .expect("a genuine failure must render as a trade");
+            .unwrap();
         assert!(trade.shares.inner().inner().eq(float!(100)).unwrap());
         let TradeOutcome::Failed {
             accepted_shares,
@@ -4967,7 +4666,6 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker did not accept order".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -4979,8 +4677,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .try_into_trade(&id)
-            .unwrap()
-            .expect("a genuine failure must render as a trade");
+            .unwrap();
         let TradeOutcome::Failed {
             accepted_shares,
             filled_shares,
@@ -5287,7 +4984,6 @@ mod tests {
                     },
                     buying_power_reservation: Some(durable_reservation),
                     placed_at: None,
-                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -5346,7 +5042,6 @@ mod tests {
                 client_order_id: Some(ClientOrderId::from_uuid(Uuid::new_v4())),
                 close_flatten: false,
                 buying_power_reservation: None,
-                provenance: PlacementProvenance::LivePipeline,
             }])
             .when(missing_pending_limit_price_failure(order_id))
             .await
@@ -6348,7 +6043,6 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker unreachable".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -6376,7 +6070,6 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "stale broker error".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -7158,7 +6851,6 @@ mod tests {
             market_session: MarketSession::Regular,
             close_flatten: false,
             buying_power_reservation: None,
-            provenance: PlacementProvenance::LivePipeline,
         };
 
         let err = pending
@@ -7189,7 +6881,6 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker rejected".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -7237,7 +6928,6 @@ mod tests {
             client_order_id: None,
             close_flatten: false,
             buying_power_reservation: None,
-            provenance: PlacementProvenance::LivePipeline,
         };
 
         // Strip the post-upgrade keys to reconstruct the exact payload shape
@@ -7256,12 +6946,12 @@ mod tests {
             error: "broker rejected".to_string(),
             filled_shares: None,
             failed_at,
-            kind: OffchainOrderFailureKind::Failure,
         })
         .unwrap();
-        let failed_object = failed_value["Failed"].as_object_mut().unwrap();
-        failed_object.remove("filled_shares");
-        failed_object.remove("kind");
+        failed_value["Failed"]
+            .as_object_mut()
+            .unwrap()
+            .remove("filled_shares");
 
         let legacy_events: Vec<OffchainOrderEvent> = [
             placed_value,
@@ -7330,7 +7020,6 @@ mod tests {
                 client_order_id: None,
                 close_flatten: false,
                 buying_power_reservation: None,
-                provenance: PlacementProvenance::LivePipeline,
             },
             OffchainOrderEvent::Submitted {
                 executor_order_id: ExecutorOrderId::new("broker-cancelled"),

@@ -531,7 +531,7 @@ pub(super) mod test_helpers {
 
     use super::projection::HedgeLatencyProjection;
     use super::report::{ReportRange, SymbolPerformance, load_hedge_performance};
-    use crate::offchain::order::{OffchainOrderFailureKind, OffchainOrderId};
+    use crate::offchain::order::OffchainOrderId;
 
     pub(crate) fn timestamp(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_750_000_000 + seconds, 0).unwrap()
@@ -571,19 +571,15 @@ pub(super) mod test_helpers {
         Symbol::new("AAPL").unwrap()
     }
 
-    /// A retirement of `kind`: a genuine `Failure` is a failed hedge cycle,
-    /// while a `Deferral` retires the order without one (ADR 0022).
-    pub(crate) fn position_retired_event(
+    pub(crate) fn position_failed_event(
         order_id: OffchainOrderId,
         failed_offset: i64,
-        kind: OffchainOrderFailureKind,
     ) -> PositionEvent {
         PositionEvent::OffChainOrderFailed {
             offchain_order_id: order_id,
             error: "broker rejected".to_string(),
             failed_at: timestamp(failed_offset),
             anchor: AnchorDisposition::Preserve,
-            kind,
         }
     }
 

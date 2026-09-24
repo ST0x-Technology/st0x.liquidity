@@ -509,8 +509,8 @@ mod tests {
     use super::*;
     use crate::inventory::{self, BroadcastingInventory};
     use crate::offchain::order::{
-        CounterTradeOrderKind, OffchainOrder, OffchainOrderCommand, OffchainOrderFailureKind,
-        OffchainOrderId, noop_order_placer,
+        CounterTradeOrderKind, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
+        noop_order_placer,
     };
 
     fn dummy_fill(symbol: &str) -> Statement {
@@ -964,7 +964,6 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "asset is not tradable".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

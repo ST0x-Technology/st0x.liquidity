@@ -5609,39 +5609,43 @@ effect rather than a generic intent:
   sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two
   commands above it belongs to no object group -- there is no stuck aggregate to
   recover, only a missing fill to backfill. It **fails closed on a fill already
-  recorded** in the `OnChainTrade` log, whether acknowledged or merely
-  witnessed: re-applying it would double-count the position, so only a fill with
-  no record is accounted. It has two execution paths. The **CLI** runs it in
-  direct-DB mode, in a separate process from the bot: because no in-process lock
-  can serialize across processes, the persisted pending-acknowledgement set (see
-  ADR 0010), not process isolation, is what makes a cross-process re-drive
-  reject as a duplicate rather than double-count, so the CLI path **must not run
-  while the bot is concurrently accounting the same symbol**. The **in-bot REST
-  route** (`POST /liquidity-write/transactions/{tx_hash}/process`) instead runs
-  inside the live bot and serializes its position claim and broker placement
-  against the trading loop through the shared counter-trade submission lock (ADR
-  0014), so it does **not** require stopping the bot; it gates on full startup
+  acknowledged** in the `OnChainTrade` log, since applying it again would double
+  count the position; a fill that was witnessed but not yet acknowledged is
+  resumed from where the earlier run stopped. It has two execution paths. The
+  **CLI** runs it in direct-DB mode, in a separate process from the bot: because
+  no in-process lock can serialize across processes, the persisted
+  pending-acknowledgement set (see ADR 0010), not process isolation, is what
+  makes a cross-process re-drive reject as a duplicate rather than double-count,
+  so the CLI path **must not run while the bot is concurrently accounting the
+  same symbol**. The **in-bot REST route**
+  (`POST /liquidity-write/transactions/{tx_hash}/process`) instead runs inside
+  the live bot and serializes its position claim and broker placement against
+  the trading loop through the shared counter-trade submission lock (ADR 0014),
+  so it does **not** require stopping the bot; it gates on full startup
   readiness (503 until then), selects the hedged chain from the `chain` query
   (defaulting to the primary), returns the decoded fill alongside its outcome,
   and runs the accounting and placement on a detached task so a client
   disconnect cannot strand a placed order before its Submitted event persists.
-  **On an admission deferral** (ADR 0022), broker admission defers the placement
-  before any broker call, so process-tx fails the order, releases its id,
-  settles the fill, and returns `ProcessTxOutcome::HedgePlacementDeferred` so
-  the standing periodic position check hedges the exposure again. **On an
-  admission error**, broker admission similarly fails before the broker call, so
-  process-tx fails the order, releases its id, clears the claim, settles the
-  fill, and surfaces the error to the caller (500 from the REST route, nonzero
-  exit from the CLI). **On broker backpressure**, the broker call did run, so
-  process-tx preserves the failed order id as the idempotency anchor, clears the
-  claim, settles the fill, and surfaces the error; the standing position check
-  then runs anchor recovery under that client id. None of these cases retain a
-  Pending intent. This behavior lives in the shared process-tx placement path
-  used by both the CLI and the REST route. **Before placement**, a Pending claim
-  already held by the live pipeline is settled against and reported as a
-  deferral (PendingHedgeDeferred) when the schedule is enabled, and rejected
-  (after settling the fill) as RetainedPendingWithoutSchedule when the schedule
-  is disabled.
+  **Broker admission runs before the claim** (ADR 0022). On an admission
+  deferral process-tx persists nothing: it settles the fill and returns
+  `ProcessTxOutcome::HedgePlacementDeferred`, and the standing periodic position
+  check hedges the exposure again from a fresh preflight. An admission error at
+  that check likewise claims nothing; it surfaces to the caller (500 from the
+  REST route, nonzero exit from the CLI) with the fill left unsettled, so a
+  rerun resumes it. The placement runs admission again after the claim; **if
+  admission changed in between**, a deferral or an admission error there fails
+  the order, releases its id, clears the claim, and settles the fill, reporting
+  `HedgePlacementDeferred` for a deferral and surfacing an error. **On broker
+  backpressure**, the broker call did run, so process-tx preserves the failed
+  order id as the idempotency anchor, clears the claim, settles the fill, and
+  surfaces the error; the standing position check then runs anchor recovery
+  under that client id. None of these cases retain a Pending intent. This
+  behavior lives in the shared process-tx placement path used by both the CLI
+  and the REST route. **Before placement**, a Pending claim already held by the
+  live pipeline is settled against and reported as a deferral
+  (PendingHedgeDeferred) when the schedule is enabled, and rejected (after
+  settling the fill) as RetainedPendingWithoutSchedule when the schedule is
+  disabled.
 
 **Standing rules:**
 

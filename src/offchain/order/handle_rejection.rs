@@ -20,8 +20,8 @@ use st0x_execution::{
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{
-    JobError, NoFillOutcome, OffchainOrder, OffchainOrderCommand, OffchainOrderFailureKind,
-    OffchainOrderId, RetainedFill, TerminalPositionFinalization, terminal_position_finalization,
+    JobError, NoFillOutcome, OffchainOrder, OffchainOrderCommand, OffchainOrderId, RetainedFill,
+    TerminalPositionFinalization, terminal_position_finalization,
 };
 use crate::position::{AnchorDisposition, Position, PositionCommand};
 
@@ -240,7 +240,6 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                         offchain_order_id: self.offchain_order_id,
                         error: self.error.clone(),
                         anchor: AnchorDisposition::Preserve,
-                        kind: OffchainOrderFailureKind::Failure,
                     },
                 }
             }
@@ -250,7 +249,6 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                     offchain_order_id: self.offchain_order_id,
                     error: self.error.clone(),
                     anchor: AnchorDisposition::from_broker_terminality(self.broker_terminality),
-                    kind: OffchainOrderFailureKind::Failure,
                 }
             }
 
@@ -286,7 +284,6 @@ fn position_command_for_retained_fill(
             offchain_order_id,
             error: fallback_error,
             anchor,
-            kind: OffchainOrderFailureKind::Failure,
         };
     }
 
@@ -295,7 +292,6 @@ fn position_command_for_retained_fill(
             offchain_order_id,
             error: fallback_error,
             anchor,
-            kind: OffchainOrderFailureKind::Failure,
         },
         |positive_filled| PositionCommand::CompleteOffChainOrder {
             offchain_order_id,
@@ -1012,7 +1008,6 @@ mod tests {
                     offchain_order_id: first_order_id,
                     error: "first attempt lost in flight".to_string(),
                     anchor: AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

@@ -37,11 +37,10 @@ use crate::conductor::job::{
 #[cfg(test)]
 use crate::offchain::order::PollOrderStatus;
 use crate::offchain::order::{
-    CounterTradeOrderKind, JobError, OffchainOrder, OffchainOrderFailureKind, OffchainOrderId,
-    OffchainOrderPlacement, OrderPlacer, PendingRecoveryAction, PollOrderStatusJobQueue,
-    classify_pending_recovery, client_order_id_for_placement,
+    CounterTradeOrderKind, JobError, OffchainOrder, OffchainOrderId, OffchainOrderPlacement,
+    OrderPlacer, PollOrderStatusJobQueue, client_order_id_for_placement,
     finalize_cancelled_position_or_log_unpriced, place_offchain_order_at_broker,
-    push_poll_job_if_absent, retire_unconfirmed_pending,
+    push_poll_job_if_absent,
 };
 use crate::position::{AnchorDisposition, Position, PositionCommand, PositionError};
 use crate::position_check::{CheckPositions, CheckPositionsJobQueue};
@@ -1156,11 +1155,6 @@ enum ClaimOutcome {
     Completed,
     /// The pending intent remains claimed until broker admission permits it.
     Deferred,
-    /// An unconfirmed `process-tx` intent was retired (ADR 0022). Nothing is
-    /// outstanding at the broker and the standing pipeline owns the retry
-    /// through the kept idempotency anchor, so this is routine rather than a
-    /// hedge given up on: it is neither counted nor paged.
-    Retired,
     /// Nothing is outstanding at the broker: no pending order, one that is
     /// already terminal, or a re-drive the broker rejected (which rolled the
     /// position back). Abandoning here abandons a hedge that was never
@@ -1186,12 +1180,6 @@ enum ClaimOutcome {
 ///   reaches a submitted/terminal state instead of sitting `Pending` with a
 ///   live, unpolled broker order until the next bot restart. `Place` is a no-op
 ///   on the existing aggregate and the broker dedupes on `client_order_id`.
-///   A `Pending` recorded by `process-tx` is first reconciled against the
-///   broker by `client_order_id`, because that path records the intent before
-///   broker admission runs (ADR 0022): an order under that key is adopted by
-///   the re-drive, a confirmed absence retires the intent as a `Deferral` and
-///   clears the claim so the standing position check re-hedges from a fresh
-///   preflight.
 /// - terminal/absent: nothing to do.
 async fn recover_pending_poll_status(
     ctx: &HedgeCtx,
@@ -1212,63 +1200,8 @@ async fn recover_pending_poll_status(
             direction,
             executor,
             market_session,
-            provenance,
             ..
         }) => {
-            let anchor = ctx
-                .position
-                .load(&symbol)
-                .await?
-                .and_then(|position| position.last_failed_offchain_order_id);
-            let client_order_id = client_order_id_for_placement(pending_id, anchor);
-
-            // A `process-tx` intent is recorded before broker admission, so it
-            // may be one the broker never received (ADR 0022). Reconcile it
-            // against the broker before pricing or replaying stale terms: an
-            // order under the same key is adopted by the re-drive below, a
-            // lookup miss retires the intent while keeping its id as the
-            // idempotency anchor.
-            match classify_pending_recovery(
-                ctx.order_placer.as_ref(),
-                executor,
-                provenance,
-                &client_order_id,
-            )
-            .await
-            {
-                Ok(PendingRecoveryAction::Replay) => {}
-                Ok(PendingRecoveryAction::Retire) => {
-                    warn!(
-                        target: "hedge",
-                        symbol = %symbol,
-                        %pending_id,
-                        "process-tx placement intent has no broker order under its client order \
-                         id -- retiring it and keeping the id as the idempotency anchor"
-                    );
-                    retire_unconfirmed_pending(
-                        &ctx.offchain_order,
-                        &ctx.position,
-                        &symbol,
-                        pending_id,
-                    )
-                    .await?;
-
-                    return Ok(ClaimOutcome::Retired);
-                }
-                Err(error) => {
-                    warn!(
-                        target: "hedge",
-                        symbol = %symbol,
-                        %pending_id,
-                        %error,
-                        "Could not reconcile the process-tx placement intent against the broker; \
-                         leaving it claimed for the next recovery sweep"
-                    );
-
-                    return Ok(ClaimOutcome::Deferred);
-                }
-            }
-
             let order_kind = if ctx.close_flatten_policy.schedule_enabled() {
                 // Pending lacks the original limit. Admission adopts the client ID
                 // first; an absent order can only be re-driven during Regular.
@@ -1297,6 +1230,13 @@ async fn recover_pending_poll_status(
                 order_kind
             };
 
+            let anchor = ctx
+                .position
+                .load(&symbol)
+                .await?
+                .and_then(|position| position.last_failed_offchain_order_id);
+            let client_order_id = client_order_id_for_placement(pending_id, anchor);
+
             let placement_result = place_offchain_order_at_broker(
                 &ctx.offchain_order,
                 ctx.order_placer.as_ref(),
@@ -1308,8 +1248,7 @@ async fn recover_pending_poll_status(
                     executor,
                     client_order_id,
                     order_kind,
-                )
-                .with_provenance(provenance),
+                ),
             )
             .await;
             let placed = match placement_result {
@@ -1400,7 +1339,6 @@ async fn route_placement_outcome(
                         // No broker terminality classification available
                         // here; fail-safe preserves.
                         anchor: AnchorDisposition::Preserve,
-                        kind: OffchainOrderFailureKind::Failure,
                     },
                 )
                 .await?;
@@ -1435,7 +1373,6 @@ async fn route_placement_outcome(
                         offchain_order_id,
                         error: "Offchain order missing after Place".to_string(),
                         anchor: AnchorDisposition::Preserve,
-                        kind: OffchainOrderFailureKind::Failure,
                     },
                 )
                 .await?;
@@ -1686,7 +1623,13 @@ impl PlaceHedge {
 
     async fn perform_body(&self, ctx: &HedgeCtx) -> Result<(), TradeAccountingError> {
         if ctx.close_flatten_policy.schedule_enabled() {
+            // Both locks, as in `recover_actual_pending_order`: recovery can
+            // replay a `Pending` through the broker, and a standalone CLI
+            // holds only the file lock between recording that intent and
+            // calling the broker.
             let _submission_guard = ctx.counter_trade_submission_lock.lock().await;
+            let _file_submission_guard =
+                acquire_counter_trade_submission_file_lock(&ctx.pool).await?;
             if let Some(pending_id) = ctx
                 .position
                 .load(&self.symbol)
@@ -2258,20 +2201,6 @@ impl PlaceHedge {
                 Ok(())
             }
 
-            ClaimOutcome::Retired => {
-                info!(
-                    target: "hedge",
-                    symbol = %self.symbol,
-                    offchain_order_id = %self.offchain_order_id,
-                    ?error,
-                    "PlaceHedge: symbol-scoped failure while an unconfirmed process-tx intent held \
-                     the claim; the intent was retired and the standing pipeline owns the retry, \
-                     so it is not counted or paged as abandoned"
-                );
-
-                Ok(())
-            }
-
             ClaimOutcome::NothingClaimed => {
                 self.record_abandoned_hedge(ctx, reason, error).await;
 
@@ -2348,7 +2277,7 @@ mod tests {
     use crate::conductor::job::Job;
     use crate::offchain::order::{
         BrokerOrderPlacement, ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand,
-        OffchainOrderFailureKind, OrderPlacementResult, OrderPlacer, PlacementProvenance,
+        OrderPlacementResult, OrderPlacer,
     };
     use crate::position::{
         AnchorDisposition, EquityTransferReservationId, Position, PositionCommand, TradeId,
@@ -2508,66 +2437,6 @@ mod tests {
         }
 
         Arc::new(SucceedingPlacer)
-    }
-
-    /// Places successfully but reports that the broker holds nothing under any
-    /// client order id, and counts the placements it was asked to make, so a
-    /// recovery test can assert a retired intent was never re-sent.
-    fn absent_at_broker_order_placer(placements: Arc<AtomicUsize>) -> Arc<dyn OrderPlacer> {
-        struct AbsentAtBrokerPlacer {
-            placements: Arc<AtomicUsize>,
-        }
-
-        #[async_trait::async_trait]
-        impl OrderPlacer for AbsentAtBrokerPlacer {
-            async fn place_market_order(
-                &self,
-                order: st0x_execution::MarketOrder,
-            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
-            {
-                self.placements.fetch_add(1, Ordering::SeqCst);
-                Ok(OrderPlacementResult {
-                    executor_order_id: ExecutorOrderId::new("test-order-123"),
-                    placed_shares: order.shares,
-                    placed_at: Utc::now(),
-                    is_extended_hours: false,
-                    limit_price: None,
-                })
-            }
-
-            async fn place_limit_order(
-                &self,
-                order: st0x_execution::LimitOrder,
-            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
-            {
-                self.placements.fetch_add(1, Ordering::SeqCst);
-                Ok(OrderPlacementResult {
-                    executor_order_id: ExecutorOrderId::new("test-limit-order-123"),
-                    placed_shares: order.shares,
-                    placed_at: Utc::now(),
-                    is_extended_hours: order.extended_hours,
-                    limit_price: Some(order.limit_price),
-                })
-            }
-
-            async fn cancel_order(
-                &self,
-                _executor_order_id: &st0x_execution::ExecutorOrderId,
-            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
-            {
-                Ok(st0x_execution::CancellationOutcome::Requested)
-            }
-
-            async fn get_order_by_client_order_id(
-                &self,
-                _client_order_id: &ClientOrderId,
-            ) -> Result<Option<BrokerOrderPlacement>, Box<dyn std::error::Error + Send + Sync>>
-            {
-                Ok(None)
-            }
-        }
-
-        Arc::new(AbsentAtBrokerPlacer { placements })
     }
 
     /// Succeeds like [`succeeding_order_placer`], but records every
@@ -2855,7 +2724,6 @@ mod tests {
                     kind: CounterTradeOrderKind::Market,
                     buying_power_reservation: Some(reservation),
                     placed_at: None,
-                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -2865,7 +2733,6 @@ mod tests {
                 &order_id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -3220,7 +3087,6 @@ mod tests {
                     },
                     buying_power_reservation: Some(reservation),
                     placed_at: Some("2026-09-17T15:00:00Z".parse().unwrap()),
-                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -3230,7 +3096,6 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -3255,7 +3120,6 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "lost placement response".to_string(),
                     anchor: AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -3670,7 +3534,6 @@ mod tests {
                         BuyingPowerReservationCents::new(20_000).unwrap(),
                     ),
                     placed_at: None,
-                    provenance: PlacementProvenance::LivePipeline,
                 },
             )
             .await
@@ -3680,7 +3543,6 @@ mod tests {
                 &anchor,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "lost placement response".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -3705,7 +3567,6 @@ mod tests {
                     offchain_order_id: anchor,
                     error: "lost placement response".to_string(),
                     anchor: AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -5723,7 +5584,6 @@ mod tests {
             market_session: MarketSession::Regular,
             close_flatten: false,
             buying_power_reservation: None,
-            provenance: PlacementProvenance::LivePipeline,
         };
 
         let error =
@@ -5982,7 +5842,6 @@ mod tests {
             failed_at: chrono::Utc::now(),
             market_session: MarketSession::Regular,
             close_flatten: false,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
         route_placement_outcome(&ctx, &symbol, offchain_order_id, Some(failed))
@@ -6041,7 +5900,6 @@ mod tests {
                     offchain_order_id: first_order_id,
                     error: "first attempt lost in flight".to_string(),
                     anchor: AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -6076,7 +5934,6 @@ mod tests {
             failed_at: chrono::Utc::now(),
             market_session: MarketSession::Regular,
             close_flatten: false,
-            kind: OffchainOrderFailureKind::Failure,
         };
 
         route_placement_outcome(&ctx, &symbol, second_order_id, Some(failed))
@@ -9017,179 +8874,6 @@ mod tests {
         );
     }
 
-    /// The hedge-side twin of the conductor orphan sweep: a `process-tx`
-    /// intent recorded before broker admission, with no broker order under its
-    /// client order id, is retired instead of re-driven with its stale shares.
-    #[tokio::test]
-    async fn recover_pending_poll_status_retires_a_never_sent_process_tx_intent() {
-        let placements = Arc::new(AtomicUsize::new(0));
-        let TestInfra {
-            ctx,
-            position_projection,
-            ..
-        } = create_hedge_ctx_for_executor(
-            absent_at_broker_order_placer(placements.clone()),
-            SupportedExecutor::AlpacaBrokerApi,
-        )
-        .await;
-        let symbol = Symbol::new("AAPL").unwrap();
-        let shares = Positive::new(FractionalShares::new(float!(1.0))).unwrap();
-        fill_position(
-            &ctx.position,
-            &symbol,
-            FractionalShares::new(float!(1.0)),
-            Direction::Buy,
-        )
-        .await;
-
-        let order_id = OffchainOrderId::new();
-        ctx.position
-            .send(
-                &symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id: order_id,
-                    shares,
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::AlpacaBrokerApi,
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-        ctx.offchain_order
-            .send(
-                &order_id,
-                OffchainOrderCommand::PlaceReserved {
-                    symbol: symbol.clone(),
-                    shares,
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: ClientOrderId::from_uuid(order_id.as_uuid()),
-                    kind: CounterTradeOrderKind::Market,
-                    buying_power_reservation: None,
-                    placed_at: None,
-                    provenance: PlacementProvenance::ProcessTx,
-                },
-            )
-            .await
-            .unwrap();
-
-        let outcome = recover_pending_poll_status(&ctx, order_id).await.unwrap();
-        assert!(matches!(outcome, ClaimOutcome::Retired));
-
-        let OffchainOrder::Failed { kind, .. } =
-            ctx.offchain_order.load(&order_id).await.unwrap().unwrap()
-        else {
-            panic!("a process-tx intent the broker never received must be retired");
-        };
-        assert_eq!(kind, OffchainOrderFailureKind::Deferral);
-        let recovered_position = position_projection.load(&symbol).await.unwrap().unwrap();
-        assert_eq!(recovered_position.pending_offchain_order_id, None);
-        assert_eq!(
-            recovered_position.last_failed_offchain_order_id,
-            Some(order_id),
-            "a lookup miss is not proof the broker never saw the order, so its id \
-             must stay the idempotency anchor"
-        );
-        assert_eq!(
-            placements.load(Ordering::SeqCst),
-            0,
-            "retiring the intent must not place a fresh order at the broker"
-        );
-    }
-
-    /// Retiring an unconfirmed `process-tx` intent is routine (ADR 0022), so a
-    /// symbol-scoped failure that finds one holding the claim must neither
-    /// count nor page it as an abandoned hedge: the standing pipeline owns the
-    /// retry. A false page would also burn the pair's one alert slot.
-    #[tokio::test]
-    async fn a_retired_process_tx_intent_is_not_paged_as_an_abandoned_hedge() {
-        let metrics_handle = crate::metrics::setup().expect("install Prometheus recorder");
-        let TestInfra { ctx, notifier, .. } = create_hedge_ctx_for_executor(
-            absent_at_broker_order_placer(Arc::new(AtomicUsize::new(0))),
-            SupportedExecutor::AlpacaBrokerApi,
-        )
-        .await;
-        // A symbol no other dead-letter test uses, so the shared recorder's
-        // count is this test's alone.
-        let symbol = Symbol::new("MSTR").unwrap();
-        let shares = Positive::new(FractionalShares::new(float!(1.0))).unwrap();
-        fill_position(
-            &ctx.position,
-            &symbol,
-            FractionalShares::new(float!(1.0)),
-            Direction::Buy,
-        )
-        .await;
-
-        let pending_id = OffchainOrderId::new();
-        ctx.position
-            .send(
-                &symbol,
-                PositionCommand::PlaceOffChainOrder {
-                    offchain_order_id: pending_id,
-                    shares,
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::AlpacaBrokerApi,
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-        ctx.offchain_order
-            .send(
-                &pending_id,
-                OffchainOrderCommand::PlaceReserved {
-                    symbol: symbol.clone(),
-                    shares,
-                    direction: Direction::Sell,
-                    executor: SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: ClientOrderId::from_uuid(pending_id.as_uuid()),
-                    kind: CounterTradeOrderKind::Market,
-                    buying_power_reservation: None,
-                    placed_at: None,
-                    provenance: PlacementProvenance::ProcessTx,
-                },
-            )
-            .await
-            .unwrap();
-
-        let job = hedge_job(&symbol, 1.0, Direction::Sell);
-        job.handle_place_hedge_error(
-            &ctx,
-            TradeAccountingError::LimitQuoteUnavailable {
-                symbol: symbol.clone(),
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            matches!(
-                ctx.offchain_order.load(&pending_id).await.unwrap(),
-                Some(OffchainOrder::Failed {
-                    kind: OffchainOrderFailureKind::Deferral,
-                    ..
-                })
-            ),
-            "the unconfirmed intent must be retired as a deferral"
-        );
-        assert_eq!(
-            notifier.messages(),
-            Vec::<String>::new(),
-            "a routine retirement must not page an abandoned hedge"
-        );
-        assert_eq!(
-            dead_letter_count(
-                &metrics_handle.render(),
-                &symbol,
-                DeadLetterReason::SymbolScoped(SymbolScopedReason::LimitQuoteUnavailable),
-            ),
-            0,
-            "a routine retirement must not count as a dead-lettered hedge"
-        );
-    }
-
     #[tokio::test]
     async fn perform_blocks_while_submission_lock_held() {
         // ADR 0014: PlaceHedge::perform serializes on the shared submission lock,
@@ -9284,7 +8968,6 @@ mod tests {
                     offchain_order_id: expired_order_id,
                     error: "expired".to_string(),
                     anchor: AnchorDisposition::Release,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

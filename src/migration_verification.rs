@@ -589,7 +589,6 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
     use crate::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
-    use crate::offchain::order::{OffchainOrderFailureKind, PlacementProvenance};
     use crate::onchain_trade::OnChainTradeSource;
     use crate::portfolio_snapshot::{
         PortfolioBalanceRowWithMark, PortfolioSnapshotCommand, PortfolioSnapshotId,
@@ -851,7 +850,6 @@ mod tests {
             market_session: MarketSession::Regular,
             close_flatten: false,
             buying_power_reservation: None,
-            provenance: PlacementProvenance::LivePipeline,
         };
         assert!(contains_source(
             &references_for(&open_order),
@@ -873,7 +871,6 @@ mod tests {
                 failed_at: now,
                 market_session: MarketSession::Regular,
                 close_flatten: false,
-                kind: OffchainOrderFailureKind::Failure,
             })
             .is_empty()
         );

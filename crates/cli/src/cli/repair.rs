@@ -157,9 +157,7 @@ mod tests {
     use st0x_finance::{Positive, Usd};
     use st0x_float_macro::float;
     use st0x_hedge::operator::inventory::{PortfolioAsset, PortfolioBalanceRow, PortfolioLocation};
-    use st0x_hedge::operator::offchain::order::{
-        OffchainOrder, OffchainOrderCommand, OffchainOrderFailureKind, OrderPlacer,
-    };
+    use st0x_hedge::operator::offchain::order::{OffchainOrder, OffchainOrderCommand, OrderPlacer};
     use st0x_hedge::operator::portfolio_snapshot::{
         PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotCommand,
         PortfolioSnapshotId, PortfolioSnapshotProjection,
@@ -1040,7 +1038,6 @@ mod tests {
                     offchain_order_id: order_id,
                     error: "partial prior run".to_string(),
                     anchor: AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -1207,7 +1204,6 @@ mod tests {
                     offchain_order_id: order_id,
                     error: "partial prior run".to_string(),
                     anchor: AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -1287,7 +1283,6 @@ mod tests {
                     offchain_order_id: pointed,
                     error: "clears the pointer".to_string(),
                     anchor: AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -1406,7 +1401,6 @@ mod tests {
                     offchain_order_id: order_id,
                     error: "clears the pointer".to_string(),
                     anchor: AnchorDisposition::Preserve,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await

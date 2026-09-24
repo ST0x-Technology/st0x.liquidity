@@ -28,8 +28,7 @@ use st0x_finance::{FractionalShares, NotPositive, Positive};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::EquityRedemption;
 use crate::offchain::order::{
-    OffchainOrder, OffchainOrderEvent, OffchainOrderFailureKind, OffchainOrderId,
-    TradeConversionError,
+    OffchainOrder, OffchainOrderEvent, OffchainOrderId, TradeConversionError,
 };
 use crate::onchain_trade::{
     OnChainTrade, OnChainTradeEvent, OnChainTradeId, ParseOnChainTradeIdError,
@@ -456,18 +455,9 @@ impl DashboardTradeHandoffMonitor {
                     })?
                     .ok_or(DashboardTradeHandoffAttemptError::Missing { id: *id })?;
 
-                let converted = order.try_into_trade(id).map_err(|source| {
+                let trade = order.try_into_trade(id).map_err(|source| {
                     DashboardTradeHandoffAttemptError::Conversion { id: *id, source }
                 })?;
-
-                let Some(trade) = converted else {
-                    debug!(
-                        target: "dashboard",
-                        %id,
-                        "Deferred placement carries no dashboard trade; dropping the reload"
-                    );
-                    return Ok(());
-                };
 
                 self.enqueuer.enqueue(trade).await?;
             }
@@ -1031,17 +1021,7 @@ impl Broadcaster {
     ) -> Result<(), DashboardTradeEnqueueError> {
         match load_entity::<OffchainOrder>(&self.pool, &id).await {
             Ok(Some(order)) => match order.try_into_trade(&id) {
-                Ok(Some(trade)) => return self.enqueue_trade(trade).await,
-                // A deferred placement never reached the broker, so there is
-                // no trade to deliver and nothing to retry.
-                Ok(None) => {
-                    debug!(
-                        target: "dashboard",
-                        %id,
-                        "Deferred placement carries no dashboard trade; skipping delivery"
-                    );
-                    return Ok(());
-                }
+                Ok(trade) => return self.enqueue_trade(trade).await,
                 Err(error) => warn!(
                     target: "dashboard",
                     %id, %error,
@@ -1237,22 +1217,14 @@ impl Reactor for Broadcaster {
             .on(|id, event| async move {
                 use OffchainOrderEvent::*;
                 match event {
-                    // The event carries the kind, so a deferred placement never
-                    // even attempts a trade handoff: it never reached the
-                    // broker and has no fill to show. It must be matched ahead
-                    // of the genuine terminals it shares a variant with.
-                    Failed {
-                        kind: OffchainOrderFailureKind::Deferral,
-                        ..
+                    Filled { .. } | Failed { .. } | Cancelled { .. } => {
+                        self.enqueue_offchain_trade(id).await?;
                     }
-                    | Placed { .. }
+                    Placed { .. }
                     | Submitted { .. }
                     | Accepted { .. }
                     | PartiallyFilled { .. }
                     | CancelRequested { .. } => {}
-                    Filled { .. } | Failed { .. } | Cancelled { .. } => {
-                        self.enqueue_offchain_trade(id).await?;
-                    }
                 }
 
                 Ok(())
@@ -1307,9 +1279,7 @@ mod tests {
         FailureInjector, TerminalFailureSignal, build_supervised_worker, build_worker_inner,
     };
     use crate::dashboard::{TradeQuery, query_trades};
-    use crate::offchain::order::{
-        OffchainOrderCommand, OffchainOrderEvent, OffchainOrderFailureKind,
-    };
+    use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent};
     use crate::onchain_trade::{
         InventoryVenue, OnChainTradeCommand, OnChainTradeError, OnChainTradeSource,
     };
@@ -1454,40 +1424,6 @@ mod tests {
                     error: "broker unavailable".to_string(),
                     filled_shares,
                     failed_at: chrono::Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
-    }
-
-    async fn persist_deferred_offchain_order(pool: SqlitePool, id: OffchainOrderId) {
-        let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool)
-            .build(crate::offchain::order::noop_order_placer())
-            .await
-            .unwrap();
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::Place {
-                    symbol: Symbol::new("AAPL").unwrap(),
-                    shares: st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
-                        st0x_float_macro::float!(1),
-                    ))
-                    .unwrap(),
-                    direction: st0x_execution::Direction::Sell,
-                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-                    client_order_id: st0x_execution::ClientOrderId::from_uuid(id.as_uuid()),
-                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                &id,
-                OffchainOrderCommand::MarkPlacementFailed {
-                    error: "hedge placement deferred".to_string(),
-                    kind: OffchainOrderFailureKind::Deferral,
                 },
             )
             .await
@@ -1702,7 +1638,6 @@ mod tests {
                     error: "broker unavailable".to_string(),
                     filled_shares: None,
                     failed_at: now,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -1734,7 +1669,6 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker unavailable".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -1759,61 +1693,6 @@ mod tests {
         .await
         .expect("the handoff monitor should reload and enqueue the terminal order");
         monitor.abort();
-    }
-
-    /// A deferred placement never reached the broker, so the reactor hands
-    /// nothing to the dashboard for it, while a genuine failure on the same
-    /// path still enqueues its delivery.
-    #[tokio::test]
-    async fn deferred_placement_is_never_handed_to_the_dashboard() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let (sender, _receiver) = broadcast::channel(16);
-        let delivery = DashboardTradeDelivery::new(&apalis_pool, &pool, sender);
-        let harness = ReactorHarness::new(delivery.broadcaster.clone());
-        let deferred_id = OffchainOrderId::new();
-        let failed_id = OffchainOrderId::new();
-        let now = chrono::Utc::now();
-
-        persist_deferred_offchain_order(pool.clone(), deferred_id).await;
-        persist_failed_offchain_order(pool, failed_id, None).await;
-
-        harness
-            .receive::<OffchainOrder>(
-                deferred_id,
-                OffchainOrderEvent::Failed {
-                    error: "hedge placement deferred".to_string(),
-                    filled_shares: None,
-                    failed_at: now,
-                    kind: OffchainOrderFailureKind::Deferral,
-                },
-            )
-            .await
-            .expect("a deferral must be reacted to without an error");
-        harness
-            .receive::<OffchainOrder>(
-                failed_id,
-                OffchainOrderEvent::Failed {
-                    error: "broker unavailable".to_string(),
-                    filled_shares: None,
-                    failed_at: now,
-                    kind: OffchainOrderFailureKind::Failure,
-                },
-            )
-            .await
-            .expect("a genuine failure must be handed off");
-
-        let queued: Vec<String> =
-            sqlx_apalis::query_scalar("SELECT idempotency_key FROM Jobs WHERE job_type = ?")
-                .bind(std::any::type_name::<DeliverDashboardTrade>())
-                .fetch_all(delivery.queue.pool())
-                .await
-                .unwrap();
-
-        assert_eq!(
-            queued,
-            vec![failed_id.to_string()],
-            "only the genuine failure may be delivered as a dashboard trade"
-        );
     }
 
     #[tokio::test]
@@ -2228,7 +2107,6 @@ mod tests {
                 &id,
                 OffchainOrderCommand::MarkPlacementFailed {
                     error: "broker unavailable".to_string(),
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -3076,7 +2954,6 @@ mod tests {
             error: "asset is not tradable".to_string(),
             filled_shares: None,
             failed_at: now,
-            kind: OffchainOrderFailureKind::Failure,
         };
         harness.receive::<OffchainOrder>(id, failed).await.unwrap();
 

@@ -33,7 +33,7 @@ use crate::conductor::job::{
 use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
-use crate::offchain::order::{PlaceOffchainOrderError, RetirePendingError};
+use crate::offchain::order::PlaceOffchainOrderError;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
 use crate::vault_registry::VaultRegistry;
@@ -685,18 +685,6 @@ pub enum TradeAccountingError {
     BrokerAnchorMissingLimitPrice { symbol: st0x_execution::Symbol },
 }
 
-/// Retiring a never sent `process-tx` intent fails through the same two
-/// aggregates the rest of this error already carries, so the recovery paths
-/// propagate it with `?` instead of restating the mapping at each call site.
-impl From<RetirePendingError> for TradeAccountingError {
-    fn from(error: RetirePendingError) -> Self {
-        match error {
-            RetirePendingError::OffchainOrder(source) => Self::OffchainOrderCommand(source),
-            RetirePendingError::Position(source) => Self::PositionCommand(source),
-        }
-    }
-}
-
 /// A failure re-deriving an order kind after the position is already claimed.
 ///
 /// The variant records the claim-aware scope when the wrapper is constructed.
@@ -927,7 +915,7 @@ mod tests {
         AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3, SignedContextV1,
         TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
     };
-    use crate::offchain::order::{OffchainOrder, PlacementProvenance, noop_order_placer};
+    use crate::offchain::order::{OffchainOrder, noop_order_placer};
     use crate::onchain::backfill::{BackfillRange, load_backfill_checkpoint};
     use crate::onchain::io::Usdc;
     use crate::onchain::trade::{INVENTORY_TOKEN_DECIMALS_MAX_RETRIES, InventoryTrade};
@@ -2873,7 +2861,6 @@ mod tests {
                     market_session: st0x_execution::MarketSession::Regular,
                     close_flatten: false,
                     buying_power_reservation: None,
-                    provenance: PlacementProvenance::LivePipeline,
                 },
             },
         ];

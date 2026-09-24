@@ -7,7 +7,6 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use alloy::primitives::{TxHash, U256};
-use alloy::providers::ProviderBuilder;
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -1336,6 +1335,8 @@ pub(crate) struct ProcessTxHandle {
     /// than waiting for the next startup recovery sweep.
     pub(crate) poll_status_queue: PollOrderStatusJobQueue,
     pub(crate) poll_interval: std::time::Duration,
+    /// The conductor's bounded, instrumented provider for every hedged chain.
+    pub(crate) providers: std::collections::BTreeMap<Chain, crate::conductor::HttpProvider>,
 }
 
 /// Serializes operator transfer-recovery requests so they cannot race through
@@ -2842,26 +2843,21 @@ async fn process_transaction(
         )
     })?;
 
-    // A hung RPC endpoint that accepts the connection but never responds would
-    // otherwise park this request forever, so bound the transport
-    // with the same connect and request timeouts the conductor's providers use.
-    let rpc_url = trading_chain.rpc_url.clone();
-    let http_client = reqwest::Client::builder()
-        .connect_timeout(crate::conductor::RPC_CONNECT_TIMEOUT)
-        .timeout(crate::conductor::RPC_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| {
+    // The conductor's bounded, instrumented provider for the chain: a hung
+    // endpoint surfaces as an error instead of parking this request, and the
+    // route's RPC calls are timed like every other bot RPC call.
+    let provider = handle
+        .providers
+        .get(&trading_chain.chain)
+        .cloned()
+        .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: format!("failed to build the RPC client: {error}"),
+                    error: format!("no RPC provider is wired for chain {}", trading_chain.chain),
                 }),
             )
         })?;
-    let is_local = alloy::transports::utils::guess_local_url(rpc_url.as_str());
-    let transport = alloy::transports::http::Http::with_client(http_client, rpc_url);
-    let rpc_client = alloy::rpc::client::ClientBuilder::default().transport(transport, is_local);
-    let provider = ProviderBuilder::new().connect_client(rpc_client);
     let report = spawn_and_join_process_tx(
         tx_hash,
         state.ctx.clone(),
@@ -3174,6 +3170,7 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    use alloy::providers::ProviderBuilder;
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -3220,8 +3217,7 @@ mod tests {
         self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
     };
     use crate::offchain::order::{
-        OffchainOrder, OffchainOrderEvent, OffchainOrderFailureKind, OffchainOrderId,
-        OrderPlacementResult,
+        OffchainOrder, OffchainOrderEvent, OffchainOrderId, OrderPlacementResult,
     };
     use crate::onchain_trade::{
         InventoryVenue, OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource,
@@ -5069,7 +5065,6 @@ mod tests {
                     error: "rejected".to_string(),
                     filled_shares: None,
                     failed_at: now,
-                    kind: OffchainOrderFailureKind::Failure,
                 },
             )
             .await
@@ -7697,31 +7692,6 @@ mod tests {
         }
     }
 
-    /// Exhaustive by construction: adding a `ProcessTxOutcome` variant makes this
-    /// match fail to compile until the new variant gets a wire mapping in
-    /// `ProcessTxOutcomeResponse::from` and a serialization case in
-    /// `process_tx_response_serializes_each_mapped_outcome`.
-    #[test]
-    fn process_tx_outcome_variants_are_all_wire_mapped() {
-        fn assert_mapped(outcome: &ProcessTxOutcome) {
-            match outcome {
-                ProcessTxOutcome::NoTradeableEvents
-                | ProcessTxOutcome::TransactionNotFound { .. }
-                | ProcessTxOutcome::AlreadyAccounted
-                | ProcessTxOutcome::PendingHedgeInFlight
-                | ProcessTxOutcome::BelowExecutionThreshold
-                | ProcessTxOutcome::TradingDisabled { .. }
-                | ProcessTxOutcome::PlacementRejected { .. }
-                | ProcessTxOutcome::PreflightDeferred { .. }
-                | ProcessTxOutcome::HedgePlaced { .. }
-                | ProcessTxOutcome::HedgePlacementCleared { .. }
-                | ProcessTxOutcome::HedgePlacementDeferred { .. }
-                | ProcessTxOutcome::PendingHedgeDeferred { .. } => {}
-            }
-        }
-        assert_mapped(&ProcessTxOutcome::NoTradeableEvents);
-    }
-
     /// `OrderPlacer` whose market placement parks on a `Notify`: it signals that
     /// the broker call has begun, waits to be released, then signals that it
     /// completed. Driving `process_transaction`'s placement through this lets a
@@ -7890,6 +7860,7 @@ mod tests {
             stores,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            providers: std::collections::BTreeMap::new(),
         };
 
         let request = tokio::spawn(async move {
@@ -7942,6 +7913,7 @@ mod tests {
             stores,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            providers: std::collections::BTreeMap::new(),
         };
 
         let Err((status, Json(_body))) = spawn_and_join_process_tx(
@@ -8083,6 +8055,7 @@ mod tests {
             stores,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            providers: std::collections::BTreeMap::new(),
         };
 
         let Err((status, Json(body))) =
@@ -8243,6 +8216,7 @@ mod tests {
             stores,
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            providers: std::collections::BTreeMap::new(),
         };
 
         let Err((status, Json(body))) =

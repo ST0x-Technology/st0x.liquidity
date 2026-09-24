@@ -796,7 +796,7 @@ fn render_process_tx_outcome<W: Write>(
         ProcessTxOutcome::HedgePlacementDeferred { symbol } => {
             writeln!(
                 stdout,
-                "No hedge placed for {symbol}: broker admission deferred the placement, so the never-sent pending order was cleared and the fill settled. The standing CheckPositions pipeline will re-hedge the exposure once admission permits."
+                "No hedge placed for {symbol}: broker admission deferred the placement, so no order was left pending and the fill settled. The standing CheckPositions pipeline will hedge the exposure again once admission permits."
             )?;
         }
         ProcessTxOutcome::PendingHedgeDeferred {
@@ -2997,7 +2997,7 @@ mod tests {
                 outcome: ProcessTxOutcome::HedgePlacementDeferred { symbol: symbol() },
             },
             format!(
-                "{fill_summary}No hedge placed for {}: broker admission deferred the placement, so the never-sent pending order was cleared and the fill settled. The standing CheckPositions pipeline will re-hedge the exposure once admission permits.\n",
+                "{fill_summary}No hedge placed for {}: broker admission deferred the placement, so no order was left pending and the fill settled. The standing CheckPositions pipeline will hedge the exposure again once admission permits.\n",
                 symbol()
             ),
         ));
