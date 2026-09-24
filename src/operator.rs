@@ -7951,11 +7951,10 @@ pub mod process_tx {
             Arc<st0x_event_sorcery::Store<Position>>,
             Arc<st0x_event_sorcery::Projection<Position>>,
         ) {
-            use crate::inventory::{
-                BroadcastingInventory, ImbalanceThreshold, InventoryView, PollFreshness,
-            };
+            use crate::inventory::{BroadcastingInventory, InventoryView, PollFreshness};
             use crate::rebalancing::{
-                RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
+                ChainRebalancingConfig, RebalancingSchedulers, RebalancingService,
+                RebalancingServiceConfig,
             };
             use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
@@ -7987,16 +7986,16 @@ pub mod process_tx {
                     inventory_staleness_bound: std::time::Duration::from_secs(300),
                     cash_reserved: None,
                     hedge_floor: st0x_execution::HedgeFloor::default(),
-                    equity: ImbalanceThreshold {
-                        target: st0x_float_macro::float!(0.5),
-                        deviation: st0x_float_macro::float!(0.2),
-                    },
+                    allocation: st0x_config::AllocationCtx::base_test(),
                     usdc: None,
                     transfer_timeout: std::time::Duration::from_secs(60),
-                    assets: ChainAssets {
-                        equities: crate::test_utils::rebalancing_enabled_equities(&["AAPL"]),
-                        cash: None,
-                    },
+                    chains: std::collections::BTreeMap::from([(
+                        Chain::Base,
+                        ChainRebalancingConfig::for_test(ChainAssets {
+                            equities: crate::test_utils::rebalancing_enabled_equities(&["AAPL"]),
+                            cash: None,
+                        }),
+                    )]),
                 },
                 vault_registry,
                 std::collections::BTreeMap::from([(

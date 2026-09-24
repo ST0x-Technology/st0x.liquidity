@@ -4914,9 +4914,10 @@ where
     // `Position::PlaceOffChainOrder` (the claim) and `OffchainOrder::Place`
     // (the aggregate), so a pending pointer observed here under the lock is a
     // genuine orphan -- never a claim whose aggregate is about to exist.
-    // Acquired once and held to the end of the function (through both the
-    // extended-hours enqueue and the inline placement), so the mutex is taken
-    // exactly once per trade.
+    // Readiness stays inside the hold: `is_ready_for_execution` depends on what
+    // reconcile just cleared, and the inline claim must follow readiness under
+    // the same hold. The extended hours branch never claims inline, so it
+    // releases the guard across its network bound crossed price preflight.
     let counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
     match reconcile_existing_pending_order(
@@ -4957,9 +4958,15 @@ where
     // crossed reference the job will price from; the ordinary latest-trade
     // preflight can understate a ramped limit's buying-power requirement.
     if execution.market_session == MarketSession::Extended {
+        // The enqueued PlaceHedge job claims under its own lock, so release the
+        // guard across the crossed price preflight (Alpaca calendar and quote
+        // calls) and reacquire it for the reservation gated submission
+        // preflight, as before the reconcile hoist.
+        drop(counter_trade_submission_guard);
         let Some(preflight) = resolve_extended_hours_preflight(&execution, cqrs).await else {
             return Ok(None);
         };
+        let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
         let _file_submission_guard = acquire_counter_trade_submission_file_lock(&cqrs.pool).await?;
         let reserved = if execution.direction == Direction::Buy {
             match crate::trading::offchain::hedge::live_buying_power_reservations(&cqrs.pool).await
