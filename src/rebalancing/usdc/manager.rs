@@ -14010,6 +14010,67 @@ mod tests {
         assert!(logs_contain("shortfall=59.99"));
     }
 
+    /// A withdrawal whose tx already paid the wallet holds that credit until
+    /// its burn: the ledger counts it, so another transfer's send that would
+    /// dip into it pages.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn credit_ledger_counts_a_paid_withdrawal_awaiting_its_burn() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(
+            U256::from(100_000_000u64),
+            market_maker_wallet,
+        )
+        .await;
+        ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap()
+            .anvil_mine(Some(3), None)
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
+        let manager = CrossVenueCashTransfer::new(
+            InstrumentedAlpacaBroker::new(
+                create_test_broker_service(&server).await,
+                TelemetrySender::disabled(),
+            ),
+            Arc::new(create_test_wallet_service(&server)),
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        )
+        .with_credit_ledger(pool);
+
+        let withdrawn = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_withdrawal_complete_alpaca_to_base_with_tx(
+            &cqrs,
+            &withdrawn,
+            usdc("100"),
+            chain.mint_tx,
+        )
+        .await;
+
+        let result = manager
+            .check_ethereum_credit_ledger(&UsdcRebalanceId(Uuid::new_v4()), usdc("100"))
+            .await;
+
+        assert!(
+            matches!(result, CreditLedgerCheck::Shortfall { .. }),
+            "the paid withdrawal's credit must count as held; got: {result:?}"
+        );
+        assert!(logs_contain("operational_alert"));
+    }
+
     /// An open aggregate the ledger cannot read turns the shortfall check off,
     /// so that pages too, naming the aggregate.
     #[tracing_test::traced_test]
