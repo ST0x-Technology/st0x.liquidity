@@ -644,8 +644,8 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// Whether a manual-transfer outcome is a retryable wait the BOT's worker
 /// should drive, not the CLI. The set mirrors the apalis worker's own
 /// delayed-redrive outcomes: `AttestationTimedOut`, the settlement-wait
-/// errors (`WithdrawalTxUnderconfirmed`, `WalletUsdcInsufficient`,
-/// `WithdrawalScanTransient`, `SettlementCheckTransient`), a non-backpressure
+/// errors (`WithdrawalTxUnderconfirmed`, `WithdrawalScanTransient`,
+/// `SettlementCheckTransient`), a non-backpressure
 /// `WithdrawalPollInconclusive` (Alpaca unreachable), and
 /// `MintRecoveryInconclusive`. The CLI must NOT keep redriving these itself:
 /// its process would race the bot's worker on the same aggregate (the
@@ -657,7 +657,6 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
     match error {
         UsdcTransferError::AttestationTimedOut { .. }
         | UsdcTransferError::WithdrawalTxUnderconfirmed { .. }
-        | UsdcTransferError::WalletUsdcInsufficient { .. }
         | UsdcTransferError::WithdrawalScanTransient { .. }
         | UsdcTransferError::SettlementCheckTransient { .. }
         | UsdcTransferError::MintRecoveryInconclusive { .. } => true,
@@ -665,7 +664,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
             source.backpressure().is_none()
         }
         // Terminal for this CLI invocation: deadlines elapsed, terminal
-        // aggregate states, pre-flight refusals, and genuine errors.
+        // aggregate states, and genuine errors.
         // Enumerated exhaustively so a new variant forces a conscious
         // classification here instead of silently defaulting to "do not hand
         // off" -- a new worker-redriven wait that lands in this arm by
@@ -706,11 +705,9 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::ConversionOutcomeUnresolved { .. }
         | UsdcTransferError::PostDepositConversionShortFill { .. }
         | UsdcTransferError::WithdrawalRefMustBeAlpacaId { .. }
-        | UsdcTransferError::WalletUsdcAmbientBalance { .. }
-        | UsdcTransferError::MissingPreflightBalance { .. }
-        | UsdcTransferError::WalletUsdcAmbientPreflight { .. }
-        | UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable { .. }
-        | UsdcTransferError::PreflightBalanceUnavailable { .. }
+        | UsdcTransferError::WithdrawalTxMissing { .. }
+        | UsdcTransferError::WithdrawalCreditMismatch { .. }
+        | UsdcTransferError::WithdrawalCreditUnreadable { .. }
         | UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
         | UsdcTransferError::BurnRecordTaskFailed { .. }
         | UsdcTransferError::BurnRecordFailed { .. }
@@ -1001,7 +998,8 @@ async fn run_usdc_transfer<Writer: Write>(
         },
         BotGasReceiptCostEnqueuer::Disabled,
     )
-    .with_gas_readiness(gas_readiness);
+    .with_gas_readiness(gas_readiness)
+    .with_credit_ledger(pool.clone());
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
 
@@ -2386,12 +2384,6 @@ mod tests {
                 required: 3,
                 actual: 1,
             },
-            UsdcTransferError::WalletUsdcInsufficient {
-                id: id.clone(),
-                nominal: Usdc::new(float!(100)),
-                current: U256::ZERO,
-                baseline: U256::ZERO,
-            },
             UsdcTransferError::SettlementCheckTransient {
                 id: id.clone(),
                 source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
@@ -3125,7 +3117,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xB0B1)),
-                preflight_balance: U256::ZERO,
             },
             UsdcRebalanceCommand::ConfirmConversion {
                 conversion: ConversionAmounts::new(amount, amount),
@@ -4151,7 +4142,6 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                    preflight_balance: U256::ZERO,
                 },
             )
             .await
@@ -4898,7 +4888,6 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xC01D_0001)),
-                    preflight_balance: U256::ZERO,
                 },
             )
             .await
