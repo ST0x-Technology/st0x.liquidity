@@ -270,6 +270,11 @@ fn should_page_reference_price_failure(
 /// holds, so the sweep takes the most conservative cap; whatever the cap leaves
 /// behind is hedged on a later tick. `None` when no hedged chain enables the
 /// symbol.
+///
+/// "Any chain enables it" is safe only because a fill on a chain that
+/// disables the symbol never reaches the `Position`
+/// ([`crate::conductor::account_for_fill_excluded_from_hedging`]); otherwise
+/// this sweep would counter trade it for the chain that enables the symbol.
 fn backstop_sizing_assets<'registry>(
     chains: &'registry ChainRegistry,
     symbol: &Symbol,
@@ -725,7 +730,6 @@ where
             self.executor.to_supported_executor(),
             assets,
             &self.ctx.assets,
-            true,
         )
         .await
         .inspect_err(|error| error!(%symbol, %error, "Execution readiness check failed"));

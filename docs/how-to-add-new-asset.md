@@ -200,7 +200,9 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 **Fields:**
 
 - `trading`: Set to `"disabled"` initially, enable once everything else is
-  ready.
+  ready. A fill on this chain while it is disabled is never counter traded, not
+  even after trading is enabled: it is recorded in `skipped_fills` with reason
+  `trading_disabled` and has to be covered by hand.
 - `rebalancing`: Whether the bot auto-rebalances this asset between venues.
   Usually `"disabled"` at first.
 - `wrapped_equity_recovery`: Explicit opt-in for recovery of wrapped-equity

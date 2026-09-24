@@ -144,6 +144,7 @@ use crate::trading::offchain::hedge::{
     resolve_extended_hours_reference_price,
 };
 use crate::trading::onchain::inclusion::EmittedOnChain;
+use crate::trading::onchain::skipped_fill::{SkipReason, record_skipped_fill};
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
 use crate::unwrapped_equity_recovery::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
@@ -4569,14 +4570,25 @@ pub enum FillAccountingOutcome {
     Accounted { trade_id: OnChainTradeId },
 }
 
-pub async fn account_for_onchain_fill(
-    pool: &SqlitePool,
+/// Where a fill stands once it is witnessed into its `OnChainTrade` log.
+enum WitnessedFill {
+    /// An earlier attempt already acknowledged it.
+    AlreadyAcknowledged,
+    /// Witnessed but not acknowledged yet: this attempt finishes it.
+    Pending {
+        trade_id: OnChainTradeId,
+        block_timestamp: DateTime<Utc>,
+    },
+}
+
+/// Witnesses `trade` into its `OnChainTrade` log, the step every fill takes
+/// whether or not it is hedged. The acknowledged marker it reads back is the
+/// dedupe guard that makes a redrive do nothing.
+async fn witness_onchain_fill(
     onchain_trade: &Store<OnChainTrade>,
-    position: &Store<Position>,
     trade: &OnchainTrade,
     block_number: u64,
-    threshold: ExecutionThreshold,
-) -> Result<FillAccountingOutcome, TradeAccountingError> {
+) -> Result<WitnessedFill, TradeAccountingError> {
     let trade_id = OnChainTradeId {
         chain: trade.chain,
         tx_hash: trade.tx_hash,
@@ -4610,12 +4622,7 @@ pub async fn account_for_onchain_fill(
                     symbol = %trade.symbol,
                     "Trade already processed (duplicate event), skipping"
                 );
-                // Self-heal a marker-without-settle leak (ADR 0010): a crash
-                // between MARK and SETTLE leaves the trade marked but still in
-                // the pending set. The marker is durable, so prune it now. A
-                // no-op when already pruned.
-                execute_settle_fill(position, trade).await?;
-                return Ok(FillAccountingOutcome::AlreadyAcknowledged);
+                return Ok(WitnessedFill::AlreadyAcknowledged);
             }
 
             info!(
@@ -4631,8 +4638,7 @@ pub async fn account_for_onchain_fill(
             if !witnessed {
                 match onchain_trade.load(&trade_id).await? {
                     Some(reloaded) if reloaded.is_acknowledged() => {
-                        execute_settle_fill(position, trade).await?;
-                        return Ok(FillAccountingOutcome::AlreadyAcknowledged);
+                        return Ok(WitnessedFill::AlreadyAcknowledged);
                     }
                     Some(_) => {
                         info!(
@@ -4652,6 +4658,33 @@ pub async fn account_for_onchain_fill(
         Err(error) => return Err(error.into()),
     }
 
+    Ok(WitnessedFill::Pending {
+        trade_id,
+        block_timestamp,
+    })
+}
+
+pub async fn account_for_onchain_fill(
+    pool: &SqlitePool,
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    trade: &OnchainTrade,
+    block_number: u64,
+    threshold: ExecutionThreshold,
+) -> Result<FillAccountingOutcome, TradeAccountingError> {
+    let WitnessedFill::Pending {
+        trade_id,
+        block_timestamp,
+    } = witness_onchain_fill(onchain_trade, trade, block_number).await?
+    else {
+        // Self-heal a marker-without-settle leak (ADR 0010): a crash between
+        // MARK and SETTLE leaves the trade marked but still in the pending
+        // set. The marker is durable, so prune it now. A no-op when already
+        // pruned.
+        execute_settle_fill(position, trade).await?;
+        return Ok(FillAccountingOutcome::AlreadyAcknowledged);
+    };
+
     if !position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
         execute_acknowledge_fill(position, trade, threshold, block_timestamp).await?;
     }
@@ -4659,6 +4692,89 @@ pub async fn account_for_onchain_fill(
     Ok(FillAccountingOutcome::Accounted { trade_id })
 }
 
+pub enum ExcludedFillOutcome {
+    /// An earlier attempt already finished this fill.
+    AlreadyAcknowledged,
+    /// This attempt recorded the fill as excluded from hedging.
+    Excluded,
+}
+
+/// Accounts a fill on an asset whose trading is disabled on the fill's own
+/// chain, keeping it out of the hedged `Position`.
+///
+/// `Position` holds one net per symbol across every hedged chain, and the
+/// periodic scan hedges that net whenever any hedged chain enables the
+/// symbol, so such a fill must never reach it. The fill is witnessed and
+/// acknowledged on its `OnChainTrade`, which makes a redrive do nothing, and
+/// its delta is recorded in `skipped_fills` for an operator to cover by hand.
+///
+/// `event_type` names what surfaced the fill, for the skipped fill record.
+pub async fn account_for_fill_excluded_from_hedging(
+    pool: &SqlitePool,
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    trade: &OnchainTrade,
+    block_number: u64,
+    event_type: &str,
+) -> Result<ExcludedFillOutcome, TradeAccountingError> {
+    let WitnessedFill::Pending { trade_id, .. } =
+        witness_onchain_fill(onchain_trade, trade, block_number).await?
+    else {
+        // Same self heal as `account_for_onchain_fill`, for a fill accounted
+        // into the position before trading was disabled. Does nothing otherwise.
+        execute_settle_fill(position, trade).await?;
+        return Ok(ExcludedFillOutcome::AlreadyAcknowledged);
+    };
+
+    // Applied to the position before trading was disabled and interrupted
+    // before its marker: finish that accounting (ADR 0010) instead of
+    // recording a delta the position already holds.
+    if position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
+        execute_mark_acknowledged(onchain_trade, &trade_id).await?;
+        execute_settle_fill(position, trade).await?;
+        return Ok(ExcludedFillOutcome::AlreadyAcknowledged);
+    }
+
+    let detail = format!(
+        "{direction} {amount} {symbol} at {price} USDC: trading is disabled for \
+         {symbol} on {chain}, so the fill is not counter traded",
+        direction = trade.direction,
+        amount = trade.amount,
+        symbol = trade.symbol.base(),
+        price = trade.price,
+        chain = trade.chain,
+    );
+    // Recorded before the marker: a crash in between redrives this step,
+    // and the record is idempotent on the fill identity.
+    record_skipped_fill(
+        pool,
+        trade.chain,
+        trade.tx_hash,
+        trade.log_index,
+        event_type,
+        SkipReason::TradingDisabled,
+        &detail,
+    )
+    .await
+    .map_err(|error| TradeAccountingError::ExcludedFillRecord {
+        trade_id: trade_id.clone(),
+        source: Box::new(error),
+    })?;
+    execute_mark_acknowledged(onchain_trade, &trade_id).await?;
+
+    warn!(
+        ?trade_id,
+        symbol = %trade.symbol,
+        %detail,
+        "Fill on a trading disabled asset excluded from the hedged position"
+    );
+
+    Ok(ExcludedFillOutcome::Excluded)
+}
+
+/// Accounts and hedges a fill on an asset whose trading is enabled on the
+/// fill's own chain. Fills on a disabled asset never reach here: they go
+/// through [`account_for_fill_excluded_from_hedging`].
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub async fn process_queued_trade<E: Executor>(
     executor: &E,
@@ -4666,7 +4782,6 @@ pub async fn process_queued_trade<E: Executor>(
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     assets: &ChainAssets,
-    asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError>
 where
     TradeAccountingError: From<E::Error>,
@@ -4712,7 +4827,6 @@ where
         configured_executor,
         assets,
         &cqrs.hedging,
-        asset_enabled,
     )
     .await?
     else {
@@ -10285,15 +10399,8 @@ mod tests {
         let trade_event = make_trade_event(10);
         let trade = test_trade_with_amount(float!(0.5), 10);
 
-        let result = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await;
+        let result =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets).await;
 
         assert_eq!(
             result.unwrap(),
@@ -10332,15 +10439,8 @@ mod tests {
         let trade_event = make_trade_event(20);
         let trade = test_trade_with_amount(float!(1.5), 20);
 
-        let result = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await;
+        let result =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets).await;
 
         let offchain_order_id = result
             .unwrap()
@@ -10411,7 +10511,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 40),
             &cqrs,
             &assets,
-            true,
         )
         .await;
 
@@ -10431,7 +10530,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 40),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -10504,7 +10602,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 41),
             &cqrs,
             &assets,
-            true,
         )
         .await;
         assert!(
@@ -10569,7 +10666,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -10665,7 +10761,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -10733,16 +10828,9 @@ mod tests {
             .expect("witnessed aggregate exists");
         assert!(witnessed_state.enrichment.is_none());
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+            .await
+            .unwrap();
 
         let recovered = cqrs
             .onchain_trade
@@ -10831,7 +10919,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -10977,7 +11064,6 @@ mod tests {
             test_trade_with_amount(float!(1.0), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -10989,7 +11075,6 @@ mod tests {
             test_trade_with_amount(float!(2.0), 61),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11014,7 +11099,6 @@ mod tests {
             test_trade_with_amount(float!(1.0), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11088,7 +11172,6 @@ mod tests {
             test_trade_with_amount(float!(2.0), 61),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11110,7 +11193,6 @@ mod tests {
             test_trade_with_amount(float!(1.0), 60),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11249,16 +11331,9 @@ mod tests {
         let mut trade = test_trade_with_amount(float!(1.5), 60);
         trade.block_timestamp = None;
 
-        let error = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap_err();
+        let error = process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, TradeAccountingError::MissingBlockTimestamp { .. }),
             "a fill without a block timestamp must fail loudly, not drop silently; got {error:?}"
@@ -11294,7 +11369,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 50),
             &cqrs,
             &assets,
-            true,
         )
         .await;
         assert!(
@@ -11308,7 +11382,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 50),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11394,7 +11467,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 30),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11407,7 +11479,6 @@ mod tests {
             test_trade_with_amount(float!(1.5), 30),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -11481,7 +11552,7 @@ mod tests {
             cash_withdrawable_cents: None,
         });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -11537,7 +11608,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -11914,7 +11985,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12028,7 +12099,6 @@ mod tests {
             test_trade_with_amount_and_direction(float!(5), 78, Direction::Buy),
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -12107,7 +12177,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12178,7 +12248,7 @@ mod tests {
                 cash_withdrawable_cents: None,
             });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .expect("closed apalis pool should defer to the CheckPositions backstop");
         assert_eq!(
@@ -12242,7 +12312,7 @@ mod tests {
         });
 
         let offchain_order_id =
-            process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+            process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
                 .await
                 .unwrap()
                 .expect("Should place a partial hedge order, not skip entirely");
@@ -12305,7 +12375,7 @@ mod tests {
             cash_withdrawable_cents: None,
         });
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12362,7 +12432,7 @@ mod tests {
             })
             .with_preflight_price(float!(100));
 
-        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets, true)
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, &assets)
             .await
             .unwrap();
 
@@ -12398,7 +12468,6 @@ mod tests {
             trade_1,
             &cqrs,
             &assets,
-            true,
         )
         .await;
 
@@ -12417,7 +12486,6 @@ mod tests {
             trade_2,
             &cqrs,
             &assets,
-            true,
         )
         .await;
 
@@ -12457,7 +12525,6 @@ mod tests {
             trade_1,
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -12472,7 +12539,6 @@ mod tests {
             trade_2,
             &cqrs,
             &assets,
-            true,
         )
         .await;
 
@@ -12528,7 +12594,6 @@ mod tests {
             trade_1,
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -12544,16 +12609,9 @@ mod tests {
             let trade_event = make_trade_event(log_index);
             let trade = test_trade_with_amount(float!(0.1), log_index);
 
-            process_queued_trade(
-                &MockExecutor::new(),
-                &trade_event,
-                trade,
-                &cqrs,
-                &assets,
-                true,
-            )
-            .await
-            .unwrap();
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+                .await
+                .unwrap();
         }
 
         assert_eq!(
@@ -12585,7 +12643,6 @@ mod tests {
             trade_1,
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap()
@@ -12601,7 +12658,6 @@ mod tests {
             trade_2,
             &cqrs,
             &assets,
-            true,
         )
         .await
         .unwrap();
@@ -13932,16 +13988,9 @@ mod tests {
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+            .await
+            .unwrap();
 
         let position = cqrs
             .position_projection
@@ -14103,17 +14152,11 @@ mod tests {
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
 
-        let offchain_order_id = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap()
-        .expect("a failed placement still reports the order id");
+        let offchain_order_id =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+                .await
+                .unwrap()
+                .expect("a failed placement still reports the order id");
 
         let position = cqrs
             .position_projection
@@ -14262,16 +14305,9 @@ mod tests {
 
         let trade = test_trade_with_amount(float!("1.5"), 60);
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            &assets,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, &assets)
+            .await
+            .unwrap();
 
         let trade_id = OnChainTradeId {
             chain: Chain::Base,
@@ -16077,7 +16113,6 @@ mod tests {
                         test_trade_with_amount(float!(1.5), index),
                         &cqrs,
                         &assets,
-                        true,
                     )
                     .await
                     .unwrap(),

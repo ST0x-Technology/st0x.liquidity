@@ -1856,14 +1856,20 @@ event position).
   authentication
 - Graceful shutdown handling to complete in-flight trades before stopping
 - Per-asset market enable/disable: individual equity markets can be disabled via
-  `trading = "disabled"` on the asset's entry in its chain's assets table.
-  Disabled assets accumulate position changes but do not trigger counter-trades
-  or rebalancing operations. When re-enabled (`trading = "enabled"`), the system
-  resumes both executing accumulated counter-trade positions and evaluating
-  rebalancing triggers for any resulting inventory imbalances (same semantics as
-  market close/open behavior). A fill landing on a disabled asset raises a
-  deduplicated critical operational alert (once per process per chain and
-  symbol): the delta exposure it accumulates is deliberate, but never silent
+  `trading = "disabled"` on the asset's entry in its chain's assets table. The
+  flag is the hedge kill switch for that asset on that chain, and it holds on
+  every path: a fill on a disabled asset is never counter traded, inline or by
+  the periodic position scan. `Position` holds one net per symbol across all
+  hedged chains, so the fill is kept out of it entirely; otherwise the scan
+  would hedge it for any other chain that enables the symbol. The fill is still
+  witnessed on its `OnChainTrade` and recorded in `skipped_fills` with reason
+  `trading_disabled`, and it raises a deduplicated critical operational alert
+  (once per process per chain and symbol), so the exposure it leaves is never
+  silent. Enabling the asset again hedges only fills from then on: nothing that
+  landed while it was disabled is hedged later, so a large backlog is never
+  counter traded in one go. An operator covers that delta by hand from the
+  `skipped_fills` records. Rebalancing is governed separately by the asset's
+  `rebalancing` flag.
 
 ### Infrastructure and Deployment
 

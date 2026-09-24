@@ -1,7 +1,8 @@
 //! Durable record of on-chain fills the accountant skipped instead of hedging.
 //!
 //! [`AccountForDexTrade`] swallows unpriceable fills and non-hedgeable pairs so a
-//! single anomalous (or crafted) fill cannot trip the conductor-wide fail-stop.
+//! single anomalous (or crafted) fill cannot trip the conductor-wide fail-stop,
+//! and keeps fills on trading disabled assets out of the hedged `Position`.
 //! Persisting them here means a skipped fill survives log rotation and can be
 //! reconciled by hand, rather than being visible only in an `error!` line.
 //!
@@ -33,6 +34,10 @@ pub(crate) enum SkipReason {
     /// The cash leg, truncated to the settlement stable's own grid, still
     /// carried digits the six-decimal internal amount cannot hold.
     UnrepresentableCashAmount,
+    /// Trading is disabled for the symbol on the fill's own chain, so the fill
+    /// is kept out of the hedged `Position` and never counter traded. Its
+    /// delta is exposure an operator covers by hand.
+    TradingDisabled,
 }
 
 impl SkipReason {
@@ -44,6 +49,7 @@ impl SkipReason {
             Self::InvalidInventoryAmount => "invalid_inventory_amount",
             Self::UnrecognizedInventoryToken => "unrecognized_inventory_token",
             Self::UnrepresentableCashAmount => "unrepresentable_cash_amount",
+            Self::TradingDisabled => "trading_disabled",
         }
     }
 }
