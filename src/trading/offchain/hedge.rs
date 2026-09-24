@@ -4509,7 +4509,7 @@ mod tests {
 
         // Port 1 is reserved and never listening, so this is a genuine
         // connect failure carried in a real `reqwest::Error`.
-        let transport = reqwest::Client::new()
+        let transport = reqwest_alpaca::Client::new()
             .get("http://127.0.0.1:1/v2/stocks/AAPL/trades/latest")
             .send()
             .await

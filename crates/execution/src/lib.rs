@@ -10,16 +10,9 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::{debug, info};
 
-pub(crate) use st0x_float_serde::{
-    deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
-    serialize_float_as_string,
-};
-
 pub use st0x_float_macro::float;
 
-mod alpaca_amount;
 pub mod alpaca_broker_api;
-mod alpaca_market_data;
 mod alpaca_wallet;
 pub mod error;
 mod hedge_floor;
@@ -27,21 +20,19 @@ pub mod mock;
 pub mod order;
 mod rate_limit;
 
-pub use alpaca_amount::AlpacaAmount;
-pub use alpaca_broker_api::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
+pub use alpaca_broker_api::{ALPACA_TOKEN_URL, KmsJwtError};
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
     AlpacaBrokerApiMode, AlpacaBrokerAuth, AssetDetails, ConversionDirection, ConversionOrder,
     CryptoOrderOutcome, DeadlineCancel, JournalResponse, JournalStatus, TimeInForce,
 };
+pub use st0x_alpaca::broker::AlpacaAmount;
 // `AlpacaMarketDataError` is wrapped by `AlpacaBrokerApiError::LatestTrade`,
 // which delegates its own `backpressure()` classification straight to the
 // wrapped error (RAI-1494), so the parent app never needs to name or
 // downcast this type in production -- test-only, so tests can still
 // construct the exact wrapped shape (`LatestTrade(AlpacaMarketDataError::
 // ApiError { .. })`) that `fetch_latest_trade_price` produces.
-#[cfg(any(test, feature = "test-support"))]
-pub use alpaca_market_data::AlpacaMarketDataError;
 pub use error::PersistenceError;
 pub use hedge_floor::HedgeFloor;
 pub use mock::{MockExecutor, MockExecutorCtx};
@@ -51,6 +42,8 @@ pub use order::{
     RecoveredOrderPlacement,
 };
 pub use rate_limit::retry_after_from_response_headers;
+#[cfg(any(test, feature = "test-support"))]
+pub use st0x_alpaca::broker::AlpacaMarketDataError;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use alpaca_wallet::AlpacaWalletClient;
@@ -233,10 +226,7 @@ pub enum LatestQuoteError {
 /// because `AlpacaWalletError` and `st0x-tokenization`'s
 /// `AlpacaTokenizationError` (a downstream crate that already depends on
 /// `st0x-execution`) both need to return it too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Backpressure {
-    pub retry_after: Option<Duration>,
-}
+pub use st0x_alpaca::Backpressure;
 
 /// Whether an Alpaca failure can plausibly resolve on an immediate retry.
 ///
