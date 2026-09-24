@@ -7965,24 +7965,24 @@ pub(crate) async fn wire_usdc_reactor_store(
     ));
     let config = RebalancingServiceConfig {
         poll_freshness: PollFreshness::always_fresh(),
-        equity: ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
-        },
         inventory_staleness_bound: Duration::from_secs(300),
+        allocation: AllocationCtx::base_test(),
         usdc: Some(ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
-        assets: ChainAssets {
-            equities: ChainEquities::default(),
-            cash: Some(ChainCashAsset {
-                vault_ids: Vec::new(),
-                rebalancing: OperationMode::Enabled,
-                operational_limit: None,
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainRebalancingConfig::for_test(ChainAssets {
+                equities: ChainEquities::default(),
+                cash: Some(ChainCashAsset {
+                    vault_ids: Vec::new(),
+                    rebalancing: OperationMode::Enabled,
+                    operational_limit: None,
+                }),
             }),
-        },
+        )]),
         cash_reserved: None,
         hedge_floor: HedgeFloor::default(),
     };
