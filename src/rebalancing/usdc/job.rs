@@ -693,7 +693,10 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             // timeout) and fails closed on ambiguity, so this per-attempt timeout
             // realistically only fires during the post-record confirm/receipt
             // wait, where `pending_burn_tx` is already set -- the resume adopts it
-            // rather than reburning. Count against the shared redrive budget so
+            // rather than reburning. The Alpaca deposit send is marked started
+            // (`DepositSendSubmitting`) before its broadcast, so a redrive that
+            // finds it started with no recorded tx fails the deposit for
+            // reconciliation instead of sending again. Count against the shared redrive budget so
             // repeated timeouts (e.g., a permanently hung RPC) eventually surface
             // for operator review.
             return self.handle_hedging_timeout_redrive(ctx).await;

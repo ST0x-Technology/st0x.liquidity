@@ -20,7 +20,7 @@ use st0x_bridge::cctp::{
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER};
 use st0x_event_sorcery::Store;
-use st0x_evm::{BroadcastError, Chain, USDC_BASE, Wallet};
+use st0x_evm::{BroadcastError, Chain, EvmError, USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
@@ -38,8 +38,9 @@ use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
-    ConversionAmounts, EthereumWalletCredit, RebalanceDirection, TransferRef, UsdcRebalance,
-    UsdcRebalanceCommand, UsdcRebalanceId, open_ethereum_credits, withdrawal_tx_recorded_elsewhere,
+    ConversionAmounts, DepositSend, EthereumWalletCredit, RebalanceDirection, TransferRef,
+    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, open_ethereum_credits,
+    withdrawal_tx_recorded_elsewhere,
 };
 
 /// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
@@ -375,8 +376,9 @@ enum AttestationPollOutcome {
 /// How the broadcast of a deposit send ended.
 enum DepositSendBroadcast {
     Recorded(TxHash),
-    /// Refused before broadcast: nothing was sent.
-    Reverted(CctpError),
+    /// Refused before broadcast: nothing was sent, and the started send is
+    /// cleared unless that write failed.
+    NotBroadcast(EvmError),
     /// It may have reached the network.
     Inconclusive,
 }
@@ -3880,17 +3882,12 @@ impl<
                 direction,
                 amount_received,
                 mint_tx_hash,
-                pending_deposit_tx,
+                deposit_send,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                self.continue_from_bridged_resume(
-                    id,
-                    amount_received,
-                    mint_tx_hash,
-                    pending_deposit_tx,
-                )
-                .await
+                self.continue_from_bridged_resume(id, amount_received, mint_tx_hash, deposit_send)
+                    .await
             }
 
             Some(UsdcRebalance::DepositInitiated {
@@ -4108,8 +4105,13 @@ impl<
             )
             .await?;
 
-        self.continue_from_bridged_resume(id, amount_received, mint_receipt.tx, None)
-            .await
+        self.continue_from_bridged_resume(
+            id,
+            amount_received,
+            mint_receipt.tx,
+            DepositSend::NotStarted,
+        )
+        .await
     }
 
     fn require_base_to_alpaca(
@@ -4413,7 +4415,7 @@ impl<
             id,
             u256_to_usdc(mint_receipt.amount)?,
             mint_receipt.tx,
-            None,
+            DepositSend::NotStarted,
         )
         .await
     }
@@ -4465,20 +4467,29 @@ impl<
     /// Resumes a transfer stalled at `Bridged`, then drives the deposit leg to
     /// terminal.
     ///
-    /// With a recorded send (`pending_deposit_tx`) only that tx is checked:
-    /// other transfers send the same amount to the same deposit address from
-    /// the shared wallet, so no other send may be adopted. With none, see
+    /// With a recorded send only that tx is checked: other transfers send the
+    /// same amount to the same deposit address from the shared wallet, so no
+    /// other send may be adopted. A send started with no tx recorded may be on
+    /// chain or still broadcasting from an attempt that timed out, so the
+    /// deposit fails for reconciliation and nothing is sent. With no send
+    /// started, see
     /// [`send_unless_an_unrecorded_send_landed`](Self::send_unless_an_unrecorded_send_landed).
     async fn continue_from_bridged_resume(
         &self,
         id: &UsdcRebalanceId,
         amount_received: Usdc,
         mint_tx: TxHash,
-        pending_deposit_tx: Option<TxHash>,
+        deposit_send: DepositSend,
     ) -> Result<(), UsdcTransferError> {
-        let send_tx = match pending_deposit_tx {
-            Some(send_tx) => self.confirm_deposit_send(id, send_tx).await?,
-            None => {
+        let send_tx = match deposit_send {
+            DepositSend::Recorded { send_tx } => self.confirm_deposit_send(id, send_tx).await?,
+            DepositSend::Submitting { submitting_at } => {
+                error!(target: "rebalance", %id, %submitting_at, "Deposit send was started but its tx was not recorded; not sending again");
+                return Err(self
+                    .fail_unresolved_deposit_send(id, UnresolvedDepositSend::SendNotRecorded)
+                    .await);
+            }
+            DepositSend::NotStarted => {
                 self.send_unless_an_unrecorded_send_landed(id, amount_received, mint_tx)
                     .await?
             }
@@ -4606,9 +4617,9 @@ impl<
             .await?
         {
             DepositSendBroadcast::Recorded(send_tx) => send_tx,
-            DepositSendBroadcast::Reverted(error) => {
-                warn!(target: "rebalance", %id, "Alpaca deposit send reverted before broadcast: {error}");
-                return Err(UsdcTransferError::Cctp(Box::new(error)));
+            DepositSendBroadcast::NotBroadcast(error) => {
+                warn!(target: "rebalance", %id, "Alpaca deposit send failed before broadcast; retrying: {error}");
+                return Err(UsdcTransferError::Cctp(Box::new(error.into())));
             }
             DepositSendBroadcast::Inconclusive => {
                 return Err(self
@@ -4621,10 +4632,13 @@ impl<
         self.confirm_deposit_send(id, send_tx).await
     }
 
-    /// Broadcasts the deposit send and records its hash with
-    /// `RecordPendingDeposit`, on a detached task so a job timeout cannot drop
-    /// the future between the broadcast and the record (see
-    /// [`submit_and_record_burn`](Self::submit_and_record_burn)).
+    /// Marks the deposit send started (`BeginDepositSend`), broadcasts it and
+    /// records its hash (`RecordPendingDeposit`), on a detached task so a job
+    /// timeout cannot drop the future between these steps (see
+    /// [`submit_and_record_burn`](Self::submit_and_record_burn)). A send
+    /// refused before broadcast is cleared (`AbortDepositSend`) so a retry
+    /// can send; any other failure leaves it started, and a resume then
+    /// fails the deposit for reconciliation instead of sending again.
     async fn submit_and_record_deposit_send(
         &self,
         id: &UsdcRebalanceId,
@@ -4636,6 +4650,12 @@ impl<
         let task_id = id.clone();
 
         tokio::spawn(async move {
+            cqrs.send(&task_id, UsdcRebalanceCommand::BeginDepositSend)
+                .await
+                .inspect_err(|error| {
+                    error!(target: "rebalance", id = %task_id, ?error, "Failed to mark the deposit send started; not broadcasting");
+                })?;
+
             let send_tx = match tokio::time::timeout(
                 BURN_BROADCAST_TIMEOUT,
                 cctp_bridge.submit_usdc_on_ethereum(deposit_address, amount),
@@ -4643,14 +4663,18 @@ impl<
             .await
             {
                 Ok(Ok(send_tx)) => send_tx,
-                Ok(Err(
-                    BroadcastError::NotBroadcast(error) | BroadcastError::MaybeBroadcast(error),
-                )) if error.is_revert() => {
-                    return Ok(DepositSendBroadcast::Reverted(error.into()));
+                Ok(Err(BroadcastError::NotBroadcast(error))) => {
+                    if let Err(abort_error) = cqrs
+                        .send(&task_id, UsdcRebalanceCommand::AbortDepositSend)
+                        .await
+                    {
+                        error!(target: "rebalance", id = %task_id, ?abort_error, "Failed to clear a deposit send refused before broadcast; the next attempt fails it for reconciliation");
+                    }
+                    return Ok(DepositSendBroadcast::NotBroadcast(error));
                 }
-                // The request may have reached the network before it failed.
-                Ok(Err(error)) => {
-                    error!(target: "rebalance", id = %task_id, ?error, "Alpaca deposit send failed with a non-revert error; it may be on chain");
+                // The request reached the RPC before it failed.
+                Ok(Err(error @ BroadcastError::MaybeBroadcast(_))) => {
+                    error!(target: "rebalance", id = %task_id, ?error, "Alpaca deposit send failed after reaching the RPC; it may be on chain");
                     return Ok(DepositSendBroadcast::Inconclusive);
                 }
                 Err(_) => {
@@ -4744,7 +4768,9 @@ impl<
         Err(self.fail_unresolved_deposit_send(id, cause).await)
     }
 
-    /// Fails the deposit from `Bridged` for operator reconciliation.
+    /// Fails the deposit from `Bridged` for operator reconciliation. If that
+    /// write fails the error is retried: the started send stays on the
+    /// aggregate, so the retry takes this path again and never sends.
     async fn fail_unresolved_deposit_send(
         &self,
         id: &UsdcRebalanceId,
@@ -4762,6 +4788,7 @@ impl<
             )
             .await
         {
+            error!(target: "rebalance", %id, ?error, "Failed to commit FailDeposit for an unresolved deposit send; retrying");
             return error.into();
         }
 
@@ -12213,6 +12240,9 @@ mod tests {
         // a re-burn/re-mint would hit the un-deployed CCTP contracts and fail loud.
         let bridge_wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
         let existing_send = send_usdc_to_alpaca(&bridge_wallet, amount_u256).await;
+        cqrs.send(&id, UsdcRebalanceCommand::BeginDepositSend)
+            .await
+            .unwrap();
         cqrs.send(
             &id,
             UsdcRebalanceCommand::RecordPendingDeposit {
@@ -14708,6 +14738,9 @@ mod tests {
 
         let bridge_wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
         let recorded_send = send_usdc_to_alpaca(&bridge_wallet, amount_u256).await;
+        cqrs.send(&id, UsdcRebalanceCommand::BeginDepositSend)
+            .await
+            .unwrap();
         cqrs.send(
             &id,
             UsdcRebalanceCommand::RecordPendingDeposit {
@@ -14790,6 +14823,9 @@ mod tests {
         stage_bridged_with_mint_tx(&cqrs, &id, amount, usdc("99.99"), chain.mint_tx).await;
 
         let reverted_send = mine_reverted_usdc_transfer(&chain).await;
+        cqrs.send(&id, UsdcRebalanceCommand::BeginDepositSend)
+            .await
+            .unwrap();
         cqrs.send(
             &id,
             UsdcRebalanceCommand::RecordPendingDeposit {
@@ -15002,6 +15038,46 @@ mod tests {
         BroadcastError::MaybeBroadcast(EvmError::Transport(RpcError::local_usage_str(
             "request timed out",
         )))
+    }
+
+    /// A send that failed after reaching the RPC may be on chain, so the
+    /// deposit fails for reconciliation with no deposit ref.
+    #[tokio::test]
+    async fn deposit_send_that_may_be_on_chain_fails_for_reconciliation() {
+        let bridge = Arc::new(
+            MockBridge::new()
+                .with_failing_usdc_submit(deposit_send_timed_out)
+                .with_empty_usdc_scan(),
+        );
+        let cqrs = create_test_store_instance().await;
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        stage_bridged_with_mint_tx(&cqrs, &id, amount, usdc("99.99"), TxHash::ZERO).await;
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::DepositSendUnresolved {
+                    cause: UnresolvedDepositSend::SubmitInconclusive,
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::DepositFailed { deposit_ref, .. } = state else {
+            panic!("expected DepositFailed, got: {state:?}");
+        };
+        assert_eq!(deposit_ref, None);
+        assert_eq!(bridge.usdc_submit_calls(), 1);
     }
 
     /// A send that may be on chain fails the deposit for reconciliation. If
@@ -20826,6 +20902,9 @@ mod tests {
         let cqrs = Arc::new(test_store(pool.clone(), ()));
         let sending = UsdcRebalanceId(Uuid::new_v4());
         stage_bridged_with_mint_tx(&cqrs, &sending, usdc("100"), usdc("100"), TxHash::ZERO).await;
+        cqrs.send(&sending, UsdcRebalanceCommand::BeginDepositSend)
+            .await
+            .unwrap();
         cqrs.send(
             &sending,
             UsdcRebalanceCommand::RecordPendingDeposit {

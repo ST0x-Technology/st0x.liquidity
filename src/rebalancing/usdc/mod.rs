@@ -538,6 +538,10 @@ pub enum UnresolvedDepositSend {
     /// send may be on chain.
     #[error("the deposit send broadcast failed or timed out and may still be on chain")]
     SubmitInconclusive,
+    /// A send was started but its tx was never recorded: its attempt timed
+    /// out or crashed mid-broadcast, or the write failed. It may be on chain.
+    #[error("a deposit send was started but its tx was not recorded; it may be on chain")]
+    SendNotRecorded,
     #[error("the recorded deposit send {tx} was mined reverted")]
     RecordedSendReverted { tx: TxHash },
     /// Dropped from the mempool, but a dropped tx can still be rebroadcast.
