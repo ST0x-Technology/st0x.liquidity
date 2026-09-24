@@ -4397,29 +4397,31 @@ Base to Alpaca:
 ###### Ethereum wallet credit ledger
 
 The ledger is derived from open `UsdcRebalance` aggregates, never stored
-separately. A transfer is credited-not-yet-sent (held) while its credited USDC
-sits in the Ethereum wallet: a BaseToAlpaca `Bridged`, or an AlpacaToBase
-`WithdrawalComplete` whose withdrawal tx has reached the required confirmations
-(its credit is read from the receipt before the balance; until then, or if the
-read fails, it is in flight up to the nominal amount). An AlpacaToBase
-`BridgingSubmitting` with a `burn_amount` is in flight: its burn may be unsent,
-unmined, or broadcast with its hash lost (`BurnRecordFailed`, an inconclusive
-submit), and the state cannot tell these apart. In-flight credit never pages a
-shortfall; it only raises the amount above which wallet USDC is reported
-unattributed. Right before an AlpacaToBase burn (including a reburn after a burn
-reverted, on resume or in process after a confirm-time revert; the reverted hash
-stays recorded during the check so a restart there still reburns) or a
-BaseToAlpaca deposit send, the bot reads the wallet's USDC balance and compares
-it with the held total. The sending transfer's own credit is passed to the
-check, not read from its state. The first burn's check runs before
-`BeginBridging`, while the transfer is still `WithdrawalComplete`: a restart
-there redrives safely, and no awaited work sits between `BeginBridging` and the
-burn. A balance below the held total pages the operator (`operational_alert`),
-naming the transfers that hold credit; a balance above held plus in flight is
-logged as unattributed USDC. If an open aggregate cannot be read (unparseable
-id, failed load), the ledger cannot be derived and that pages too, naming the
-aggregate, because the shortfall check is off until it is fixed. A failed wallet
-balance read only warns. The check never blocks or fails a transfer.
+separately. It loads only the aggregates whose latest event leaves them in a
+state that can hold credit, so finished transfers are never replayed. A transfer
+is credited-not-yet-sent (held) while its credited USDC sits in the Ethereum
+wallet: a BaseToAlpaca `Bridged`, or an AlpacaToBase `WithdrawalComplete` whose
+withdrawal tx has reached the required confirmations (its credit is read from
+the receipt before the balance; until then, or if the read fails, it is in
+flight up to the nominal amount). An AlpacaToBase `BridgingSubmitting` with a
+`burn_amount` is in flight: its burn may be unsent, unmined, or broadcast with
+its hash lost (`BurnRecordFailed`, an inconclusive submit), and the state cannot
+tell these apart. In-flight credit never pages a shortfall; it only raises the
+amount above which wallet USDC is reported unattributed. Right before an
+AlpacaToBase burn (including a reburn after a burn reverted, on resume or in
+process after a confirm-time revert; the reverted hash stays recorded during the
+check so a restart there still reburns) or a BaseToAlpaca deposit send, the bot
+reads the wallet's USDC balance and compares it with the held total. The sending
+transfer's own credit is passed to the check, not read from its state. The first
+burn's check runs before `BeginBridging`, while the transfer is still
+`WithdrawalComplete`: a restart there redrives safely, and no awaited work sits
+between `BeginBridging` and the burn. A balance below the held total pages the
+operator (`operational_alert`), naming the transfers that hold credit; a balance
+above held plus in flight is logged as unattributed USDC. If an open aggregate
+cannot be read (unparseable id, failed load), the ledger cannot be derived and
+that pages too, naming the aggregate, because the shortfall check is off until
+it is fixed. A failed wallet balance read only warns. The check never blocks or
+fails a transfer.
 
 ###### Fast Transfer Benefits
 

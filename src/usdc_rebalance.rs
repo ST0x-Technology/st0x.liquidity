@@ -1881,8 +1881,14 @@ pub(crate) async fn open_ethereum_credits(
     pool: &SqlitePool,
     store: &Store<UsdcRebalance>,
 ) -> Result<Vec<(UsdcRebalanceId, EthereumWalletCredit)>, EthereumCreditLedgerError> {
-    let InterruptedUsdcRebalances { ids, unparseable } =
-        interrupted_usdc_rebalance_ids(pool).await?;
+    let mut ids = Vec::new();
+    let mut unparseable = Vec::new();
+    for raw in ethereum_credit_candidate_ids(pool).await? {
+        match raw.parse::<UsdcRebalanceId>() {
+            Ok(id) => ids.push(id),
+            Err(_) => unparseable.push(raw),
+        }
+    }
 
     if !unparseable.is_empty() {
         return Err(EthereumCreditLedgerError::UnparseableIds { unparseable });
@@ -1905,6 +1911,38 @@ pub(crate) async fn open_ethereum_credits(
     }
 
     Ok(credits)
+}
+
+/// The `UsdcRebalance` aggregates whose latest event leaves them in a state
+/// that can hold Ethereum wallet credit (`WithdrawalComplete`,
+/// `BridgingSubmitting`, `Bridged`), so the credit ledger does not replay
+/// finished transfers.
+async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'UsdcRebalance' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         WHERE last_ev.aggregate_type = 'UsdcRebalance' \
+           AND last_ev.event_type IN ( \
+               'UsdcRebalanceEvent::WithdrawalConfirmed', \
+               'UsdcRebalanceEvent::BridgingSubmitting', \
+               'UsdcRebalanceEvent::PendingBurnRecorded', \
+               'UsdcRebalanceEvent::PendingBurnCleared', \
+               'UsdcRebalanceEvent::Bridged', \
+               'UsdcRebalanceEvent::BridgingCompletionRecovered' \
+           ) \
+         ORDER BY latest.aggregate_id",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 #[async_trait]

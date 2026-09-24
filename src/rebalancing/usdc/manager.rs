@@ -14166,11 +14166,9 @@ mod tests {
             &pool,
             "poisoned-rebalance-id",
             1,
-            &UsdcRebalanceEvent::ConversionInitiated {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount: usdc("100"),
-                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                initiated_at: Utc::now(),
+            &UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
             },
         )
         .await;
