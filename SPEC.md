@@ -4176,18 +4176,19 @@ enum BridgeStage { Burn, Attestation, Mint }
   `cctp_nonce` -- and mints with no Circle call. A reconstruction failure
   (corrupt envelope, placeholder nonce, or nonce mismatch) marks
   `BridgingFailed` for operator reconciliation, since the USDC is already
-  burned. Transfers whose `BridgeAttestationReceived` predates the `message`
-  field carry `None` and fall back to re-polling Circle: the attestation is
-  permanently retrievable, so a timeout there retries until success rather than
-  failing (bounding it would strand recoverable funds). The re-polled nonce is
-  cross-checked against the recorded `cctp_nonce` the same way, and the
-  BaseToAlpaca `BridgingFailed` recovery checks it again before it mints, so a
-  mismatch stays failed for operator reconciliation. A hard re-poll error marks
-  `BridgingFailed` only when the destination chain reads the recorded nonce
-  unused on every read over the mint recovery probe window (one read can come
-  from a node behind the mint). When the nonce reads consumed (the mint landed),
-  an error that repeats on every re-poll (a malformed complete answer, a
-  placeholder nonce, a truncated message) marks the same reconcilable
+  burned; for AlpacaToBase an unusable envelope pages with "the recorded CCTP
+  message cannot mint on Base". Transfers whose `BridgeAttestationReceived`
+  predates the `message` field carry `None` and fall back to re-polling Circle:
+  the attestation is permanently retrievable, so a timeout there retries until
+  success rather than failing (bounding it would strand recoverable funds). The
+  re-polled nonce is cross-checked against the recorded `cctp_nonce` the same
+  way, and the BaseToAlpaca `BridgingFailed` recovery checks it again before it
+  mints, so a mismatch stays failed for operator reconciliation. A hard re-poll
+  error marks `BridgingFailed` only when the destination chain reads the
+  recorded nonce unused on every read over the mint recovery probe window (one
+  read can come from a node behind the mint). When the nonce reads consumed (the
+  mint landed), an error that repeats on every re-poll (a malformed complete
+  answer, a placeholder nonce, a truncated message) marks the same reconcilable
   `BridgingFailed` (paging the operator for AlpacaToBase), since adopting the
   mint needs the re-polled message; any other error, or a failed nonce read,
   redrives so a later attempt adopts the mint. The `attestation_retry_deadline`
