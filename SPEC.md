@@ -1870,11 +1870,12 @@ event position).
   accounts from the restart on, including fills that landed earlier but were not
   accounted yet: still queued, not yet backfilled past the ingestion cutoff, or
   landing during the restart itself. Only fills already recorded in
-  `skipped_fills` stay excluded and are never hedged later; an operator covers
-  that delta by hand from those records. Excluded fills also never reach the PnL
-  ledger, which replays `Position` events, so PnL is incomplete for them and a
-  manual cover must be reconciled outside the ledger. Rebalancing is governed
-  separately by the asset's `rebalancing` flag.
+  `skipped_fills` with reason `trading_disabled` stay excluded and are never
+  hedged later; an operator covers that delta by hand from those records.
+  Excluded fills also never reach the PnL ledger, which replays `Position`
+  events, so PnL is incomplete for them and a manual cover must be reconciled
+  outside the ledger. Rebalancing is governed separately by the asset's
+  `rebalancing` flag.
 
 ### Infrastructure and Deployment
 
