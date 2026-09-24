@@ -142,6 +142,38 @@ mod tests {
         drop(guard);
     }
 
+    /// Drives the real `run` loop through the process global projection gate
+    /// that `init_projection_gate` wires at startup: while a rebuild
+    /// holds the pause the monitor must not poll, and it polls once the pause
+    /// is released. Pausing the global gate is process scoped, so this relies
+    /// on nextest running each test in its own process.
+    #[tokio::test]
+    async fn run_parks_on_the_global_projection_gate_while_a_rebuild_is_paused() {
+        let rebuild = crate::conductor::projection_pause::pause_projection_gate_for_test().await;
+
+        let (tx, mut rx) = unbounded_channel();
+        let mut monitor = InventoryMonitor {
+            poller: Arc::new(NotifyingPoller { tx, fail: false }),
+            interval: Duration::from_secs(10),
+        };
+        let handle = tokio::spawn(async move { monitor.run().await });
+
+        assert!(
+            timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "the monitor must not poll while a rebuild holds the projection gate"
+        );
+
+        drop(rebuild);
+        timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the monitor must poll once the rebuild releases the gate")
+            .expect("the poller channel must stay open");
+
+        handle.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn run_polls_on_each_interval_tick() {
         let (tx, mut rx) = unbounded_channel();

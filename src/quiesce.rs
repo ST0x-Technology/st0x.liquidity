@@ -336,27 +336,22 @@ mod tests {
         drop(guard);
     }
 
-    // The join handle holds the second pause guard as its output and is used
-    // twice (the `is_finished` poll and the `await`), which the nursery lint
-    // misreads as a single-use temporary.
-    #[allow(clippy::significant_drop_tightening)]
     #[tokio::test]
     async fn pausers_are_serialized() {
         let (control, _gate) = quiesce(TEST_TIMEOUT);
-        let control = Arc::new(control);
 
         let first = control.pause().await.unwrap();
 
-        let second_control = Arc::clone(&control);
-        let second = tokio::spawn(async move { second_control.pause().await });
         // The second pauser must wait for the first guard to drop.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut second = std::pin::pin!(control.pause());
         assert!(
-            !second.is_finished(),
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
             "a second pauser waits for the first guard"
         );
 
         drop(first);
-        second.await.unwrap().unwrap();
+        drop(second.await.unwrap());
     }
 }

@@ -975,21 +975,6 @@ where
     ))
 }
 
-/// Publishes the recovery handle that backs `/transfers/resume`.
-///
-/// Called only after all startup work (inventory hydration, orphan recovery,
-/// store builds) completes, so the endpoint returns 503 until the conductor is
-/// ready. Every half of the handle always exists (rebalancing is the only
-/// topology), so publication is unconditional. A losing `set` race is
-/// ignored: the cell is written once per boot, so an already-populated cell
-/// holds an equivalent handle.
-fn publish_recovery_handle(
-    recovery_cell: &tokio::sync::OnceCell<crate::api::RecoveryHandle>,
-    handle: crate::api::RecoveryHandle,
-) {
-    let _ = recovery_cell.set(handle);
-}
-
 /// Publishes the process-tx handle backing the in-bot process-tx route, set
 /// after startup so the endpoint returns 503 until the conductor is ready. A
 /// losing `set` race is ignored: the cell is written once per boot, so an
@@ -1305,8 +1290,7 @@ impl Conductor {
 
         // Publish the process-global projection gate before spawning the apalis
         // monitor so every worker execution is gated from its first poll.
-        let projection_maintenance =
-            Arc::new(crate::conductor::projection_pause::init_projection_maintenance());
+        crate::conductor::projection_pause::init_projection_gate();
 
         let conductor = builder::spawn()
             .context(conductor_ctx)
@@ -1353,19 +1337,19 @@ impl Conductor {
             .worker_failure_notifier(notifier)
             .call()?;
 
-        publish_recovery_handle(
-            &recovery_cell,
-            crate::api::RecoveryHandle {
-                transfer: recovery_transfer,
-                mint_store: recovery_mint_store,
-                redemption_store: recovery_redemption_store,
-                rebalancing_service: recovery_service,
-                usdc_recheck,
-                usdc_driver_pause,
-                usdc_store: recovery_usdc_store,
-                projection_maintenance,
-            },
-        );
+        // Published only after all startup work (inventory hydration, orphan
+        // recovery, store builds) completes, so `/transfers/resume` answers 503
+        // until the conductor is ready. The cell is written once per boot, so a
+        // losing `set` race leaves an equivalent handle in place.
+        let _ = recovery_cell.set(crate::api::RecoveryHandle {
+            transfer: recovery_transfer,
+            mint_store: recovery_mint_store,
+            redemption_store: recovery_redemption_store,
+            rebalancing_service: recovery_service,
+            usdc_recheck,
+            usdc_driver_pause,
+            usdc_store: recovery_usdc_store,
+        });
 
         publish_process_tx_handle(
             &process_tx_cell,
@@ -6648,11 +6632,9 @@ mod tests {
     use crate::onchain::trade::{InventoryTrade, OnchainTrade};
     use crate::position::EquityTransferReservationStatus;
     use crate::rebalancing::equity::{
-        EquityTransferServices, RecheckOutcome, ResumeTokenizationAggregate,
-        ResumeTokenizationJobQueue, ResumeTokenizationTarget, TransferEquityToHedging,
-        TransferEquityToMarketMaking,
+        EquityTransferServices, ResumeTokenizationAggregate, ResumeTokenizationJobQueue,
+        ResumeTokenizationTarget, TransferEquityToHedging, TransferEquityToMarketMaking,
     };
-    use crate::rebalancing::usdc::UsdcRecheckError;
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService};
     use crate::test_utils::{
         OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_log, get_test_order,
@@ -6666,7 +6648,6 @@ mod tests {
         UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
     };
 
-    use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_lookup::MockVaultLookup;
     use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
     use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
@@ -18802,91 +18783,6 @@ mod tests {
             .expect("wallet + bot_gas_valuation configured must build a ctx");
 
         assert_eq!(result.chainlink_feed, chainlink_feed);
-    }
-
-    /// `/transfers/resume` recovery stub: publication happens after startup,
-    /// so nothing ever calls it inside `publish_recovery_handle` tests.
-    struct NeverCalledUsdcRecheck;
-
-    #[async_trait::async_trait]
-    impl RecheckUsdcDeposit for NeverCalledUsdcRecheck {
-        async fn recheck_deposit(
-            &self,
-            _id: &UsdcRebalanceId,
-        ) -> Result<RecheckOutcome, UsdcRecheckError> {
-            Ok(RecheckOutcome::LeftUnchanged)
-        }
-    }
-
-    /// The collapse to the single always-rebalancing topology makes every
-    /// half of the recovery handle concrete, so publishing after startup
-    /// must always populate the OnceCell backing `/transfers/resume` (the
-    /// endpoint's 503-until-ready window ends at exactly this call) -- and
-    /// with exactly the values that were published.
-    #[tokio::test]
-    async fn publish_recovery_handle_always_sets_the_cell() {
-        let pool = setup_test_db().await;
-
-        let services = recovery_services(
-            Arc::new(MockRaindex::new()),
-            Arc::new(MockTokenizer::new()),
-            Arc::new(MockWrapper::new()),
-        );
-        let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let redemption_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            services,
-            mint_store.clone(),
-            redemption_store.clone(),
-        ));
-        let rebalancing_service = freeze_guard_test_service().await;
-        let usdc_recheck: Arc<dyn RecheckUsdcDeposit> = Arc::new(NeverCalledUsdcRecheck);
-        let usdc_driver_pause = Arc::new(crate::rebalancing::usdc::usdc_driver_pause().0);
-        let usdc_store = Arc::new(test_store::<UsdcRebalance>(pool, ()));
-        let projection_maintenance =
-            Arc::new(crate::conductor::projection_pause::init_projection_maintenance());
-
-        let recovery_cell = tokio::sync::OnceCell::new();
-
-        publish_recovery_handle(
-            &recovery_cell,
-            crate::api::RecoveryHandle {
-                transfer: transfer.clone(),
-                mint_store: mint_store.clone(),
-                redemption_store: redemption_store.clone(),
-                rebalancing_service: rebalancing_service.clone(),
-                usdc_recheck,
-                usdc_driver_pause: usdc_driver_pause.clone(),
-                usdc_store: usdc_store.clone(),
-                projection_maintenance: projection_maintenance.clone(),
-            },
-        );
-
-        let handle = recovery_cell
-            .get()
-            .expect("publishing the recovery handle must always populate the cell");
-        assert!(
-            Arc::ptr_eq(&handle.transfer, &transfer),
-            "the cell must hold the published transfer"
-        );
-        assert!(Arc::ptr_eq(&handle.mint_store, &mint_store));
-        assert!(Arc::ptr_eq(&handle.redemption_store, &redemption_store));
-        assert!(
-            Arc::ptr_eq(&handle.usdc_driver_pause, &usdc_driver_pause),
-            "the cell must hold the published USDC driver pause"
-        );
-        assert!(
-            Arc::ptr_eq(&handle.usdc_store, &usdc_store),
-            "the cell must hold the published wired USDC store"
-        );
-        assert!(
-            Arc::ptr_eq(&handle.rebalancing_service, &rebalancing_service),
-            "the cell must hold the published rebalancing service"
-        );
-        assert!(
-            Arc::ptr_eq(&handle.projection_maintenance, &projection_maintenance),
-            "the cell must hold the projection maintenance controller created before workers spawn",
-        );
     }
 
     fn ctx_with_orchestrator(addresses: Option<OrchestratorAddresses>) -> Ctx {

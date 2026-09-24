@@ -1334,11 +1334,6 @@ pub(crate) struct RecoveryHandle {
     /// to the durable outcome. A standalone store would bypass the reactor and
     /// leave the running bot latched with `guardHeld: false` reported.
     pub(crate) usdc_store: Arc<Store<UsdcRebalance>>,
-    /// Controller through which a materialized-view rebuild route pauses every
-    /// projection writer before deleting and replaying the view.
-    #[allow(dead_code)]
-    pub(crate) projection_maintenance:
-        Arc<crate::conductor::projection_pause::ProjectionMaintenance>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
@@ -6845,9 +6840,6 @@ mod tests {
                 usdc_recheck: Arc::new(LeftUnchangedUsdcRecheck),
                 usdc_driver_pause: Arc::new(pause),
                 usdc_store: standalone_usdc_store(&state.pool).await,
-                projection_maintenance: Arc::new(
-                    crate::conductor::projection_pause::init_projection_maintenance(),
-                ),
             })
             .ok()
             .expect("recovery cell must start empty");
