@@ -1111,8 +1111,9 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// re-polling the attestation) rather than treating it as "not yet
     /// minted".
     ///
-    /// `scan_from_block` floors the log scan for a consumed nonce; `None` looks
-    /// back a fixed window from the head (see [`crate::Bridge::find_attested_mint`]).
+    /// The log scan for a consumed nonce starts at the lower of
+    /// `scan_from_block` and a fixed lookback from the head; `None` scans the
+    /// lookback alone (see [`crate::Bridge::find_attested_mint`]).
     pub async fn find_existing_mint(
         &self,
         direction: BridgeDirection,
