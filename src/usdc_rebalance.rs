@@ -12827,4 +12827,68 @@ mod tests {
         };
         assert_eq!(deposit_send, DepositSend::NotStarted);
     }
+
+    /// Each event carrying a deposit send hash records that send for its
+    /// transfer on its own, so the lookup must match every one of them.
+    #[tokio::test]
+    async fn deposit_send_recorded_elsewhere_matches_every_event_carrying_the_send() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let now = Utc::now();
+        let events = |send_tx| {
+            [
+                UsdcRebalanceEvent::DepositSendPrepared {
+                    prepared: PreparedTransaction::for_test(send_tx, 7),
+                    prepared_at: now,
+                },
+                UsdcRebalanceEvent::PendingDepositRecorded {
+                    send_tx,
+                    recorded_at: now,
+                },
+                UsdcRebalanceEvent::DepositSendAttached {
+                    send_tx,
+                    attached_at: now,
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::OnchainTx(send_tx),
+                    deposit_initiated_at: now,
+                },
+                UsdcRebalanceEvent::DepositFailed {
+                    deposit_ref: Some(TransferRef::OnchainTx(send_tx)),
+                    reason: "unresolved deposit send".to_string(),
+                    failed_at: now,
+                },
+            ]
+        };
+
+        for shape in 0..events(TxHash::ZERO).len() {
+            let send_tx = TxHash::random();
+            let event = events(send_tx)[shape].clone();
+            let recorder = UsdcRebalanceId(Uuid::new_v4());
+            crate::test_utils::persist_event::<UsdcRebalance>(
+                &pool,
+                &recorder.to_string(),
+                1,
+                &event,
+            )
+            .await;
+
+            let other = UsdcRebalanceId(Uuid::new_v4());
+            assert_eq!(
+                deposit_send_recorded_elsewhere(&pool, &other, send_tx)
+                    .await
+                    .unwrap(),
+                Some(recorder.to_string()),
+                "{} records the send",
+                event.event_type(),
+            );
+            assert_eq!(
+                deposit_send_recorded_elsewhere(&pool, &recorder, send_tx)
+                    .await
+                    .unwrap(),
+                None,
+                "{}: a transfer's own record is not elsewhere",
+                event.event_type(),
+            );
+        }
+    }
 }
