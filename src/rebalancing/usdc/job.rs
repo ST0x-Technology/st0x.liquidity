@@ -349,6 +349,21 @@ where
     }
 }
 
+/// Ends the attempt quietly for a transfer on a corridor this build does not
+/// serve: no retry can change that, and a dead letter would page on every
+/// sweep. The rebalancing sweep holds the transfer and pages once.
+fn intercept_unserved_corridor<JobError>(
+    result: Result<(), UsdcTransferError>,
+) -> ControlFlow<Result<(), JobError>, Result<(), UsdcTransferError>> {
+    match result {
+        Err(error @ UsdcTransferError::CorridorMismatch { .. }) => {
+            warn!(target: "rebalance", %error, "USDC transfer not redriven; left for the operator");
+            ControlFlow::Break(Ok(()))
+        }
+        other => ControlFlow::Continue(other),
+    }
+}
+
 async fn intercept_gas_readiness_failure<Ctx, TaskJob>(
     job: &TaskJob,
     job_queue: &JobQueue<TaskJob>,
@@ -739,6 +754,10 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
+        let result = match intercept_unserved_corridor(result) {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(result) => result,
+        };
 
         match result {
             Ok(()) => {}
@@ -775,22 +794,6 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                     %id,
                     "Base->Alpaca USDC transfer already in a terminal failed state; \
                      nothing to redrive, leaving for operator reconciliation"
-                );
-            }
-            // Permanent for this build: a retry or dead letter would only page
-            // again. The rebalancing sweep holds the transfer and pages once.
-            Err(UsdcTransferError::CorridorMismatch {
-                id,
-                recorded,
-                served,
-            }) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    %recorded,
-                    %served,
-                    "Base->Alpaca USDC transfer is on a corridor this build does not serve; \
-                     left for the operator"
                 );
             }
             Err(UsdcTransferError::WithdrawalScanTransient {
@@ -1512,6 +1515,10 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
+        let result = match intercept_unserved_corridor(result) {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(result) => result,
+        };
 
         self.settle_transfer_outcome(ctx, result).await
     }
@@ -1629,22 +1636,6 @@ impl TransferUsdcToMarketMaking {
                     %id,
                     "Alpaca->Base USDC transfer already in a terminal failed state; \
                      nothing to redrive, leaving for operator reconciliation"
-                );
-            }
-            // Permanent for this build: a retry or dead letter would only page
-            // again. The rebalancing sweep holds the transfer and pages once.
-            Err(UsdcTransferError::CorridorMismatch {
-                id,
-                recorded,
-                served,
-            }) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    %recorded,
-                    %served,
-                    "Alpaca->Base USDC transfer is on a corridor this build does not serve; \
-                     left for the operator"
                 );
             }
             // The withdrawal tx did not pay this withdrawal (nothing, or more
