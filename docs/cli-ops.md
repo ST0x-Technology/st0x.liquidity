@@ -642,25 +642,27 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   rejected, including `WithdrawalFailed` and an `AlpacaToBase`
   `ConversionFailed`, whose funds never left Alpaca.
 - An `Attested` resume whose CCTP nonce is used on chain but whose mint is not
-  in the bounded log scan (`MintNotFoundInScanWindow`) redrives when the scan's
-  floor block was mined before the transfer started: the scan covers the mint,
-  so the log is only lagging. When the floor is newer, the mint can lie below
-  it, and the resume marks the transfer `BridgingFailed` with its burn tx and
-  nonce kept, so `--kind usdc` accepts it. Find the mint on chain (the
-  `MessageReceived` log for the recorded nonce) before you reconcile. A legacy
-  `Attested` transfer (no persisted message) whose nonce is used but whose
-  Circle re-poll keeps failing the same way (for example a malformed complete
-  answer) is marked `BridgingFailed` the same way. A mint outside the scan pages
-  with "the CCTP mint cannot be resolved automatically" in both directions, and
-  the bot stops retrying it: find the mint, then reconcile with `--kind usdc`. A
-  BaseToAlpaca `BridgingFailed` recovery (for example after a restart) that
-  reads the nonce used but cannot find its mint applies the same floor rule: it
-  redrives while its scan covers the transfer, and otherwise pages the same way
-  and stops. The legacy re-poll latch pages with the same text for AlpacaToBase
-  only. A BaseToAlpaca latch for the legacy re-poll, or for a message that can
-  never mint, does not page: its retry may still adopt or mint and send the
-  deposit, so do not move the funds by hand while it retries; the job's
-  dead-letter alert says when it gave up.
+  in the bounded log scan (`MintNotFoundInScanWindow`) redrives when the nonce
+  read unused at the block below the scan's floor: the scan covers the mint, so
+  the log is only lagging. When that read fails (a node without state that old),
+  it redrives if the floor block was mined before the transfer started. When the
+  nonce was used below the floor, or the read failed and the floor is newer, the
+  mint can lie below it, and the resume marks the transfer `BridgingFailed` with
+  its burn tx and nonce kept, so `--kind usdc` accepts it. Find the mint on
+  chain (the `MessageReceived` log for the recorded nonce) before you reconcile.
+  A legacy `Attested` transfer (no persisted message) whose nonce is used but
+  whose Circle re-poll keeps failing the same way (for example a malformed
+  complete answer) is marked `BridgingFailed` the same way. A mint outside the
+  scan pages with "the CCTP mint cannot be resolved automatically" in both
+  directions, and the bot stops retrying it: find the mint, then reconcile with
+  `--kind usdc`. A BaseToAlpaca `BridgingFailed` recovery (for example after a
+  restart) that reads the nonce used but cannot find its mint applies the same
+  floor rule: it redrives while the rule places the mint inside its scan, and
+  otherwise pages the same way and stops. The legacy re-poll latch pages with
+  the same text for AlpacaToBase only. A BaseToAlpaca latch for the legacy
+  re-poll, or for a message that can never mint, does not page: its retry may
+  still adopt or mint and send the deposit, so do not move the funds by hand
+  while it retries; the job's dead-letter alert says when it gave up.
 - An `AlpacaToBase` transfer whose Circle attestation poll fails hard (or, for a
   legacy `Attested` transfer, whose re-poll fails with the nonce unused) is
   marked `BridgingFailed` and pages with "the burned USDC cannot be minted
