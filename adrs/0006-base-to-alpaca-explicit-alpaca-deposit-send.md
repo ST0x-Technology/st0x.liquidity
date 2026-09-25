@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, amended 2026-09-24 (see Amendment)
+Accepted, amended 2026-09-25 (see Amendment)
 
 ## Context
 
