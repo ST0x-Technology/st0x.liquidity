@@ -3909,9 +3909,14 @@ already-submitted action instead of re-issuing it:
   can have the mint below it. For a mint below the floor, or one that can lie
   below it, resume marks `BridgingFailed` (keeping the burn tx and nonce), so
   `transfer reconcile --kind usdc` can settle it; a message that can never mint
-  on the destination chain does the same. Such a mint pages the operator in both
-  directions with "the CCTP mint cannot be resolved automatically": only the
-  operator can find that mint. A BaseToAlpaca job ends there, since its
+  on the destination chain does the same. So does a used nonce whose mint is
+  found but cannot be adopted: its `MessageReceived` body differs from the
+  recorded message (for example a relayer minted a re-attested fast-transfer
+  body with a new `expirationBlock`), its tx reverted, or it has no
+  `MintAndWithdraw`. Every redrive would get the same answer, and the log is
+  never matched on less than the full body. Such a mint pages the operator in
+  both directions with "the CCTP mint cannot be resolved automatically": only
+  the operator can find that mint. A BaseToAlpaca job ends there, since its
   post-burn `BridgingFailed` recovery scans no wider; if that recovery runs
   again (a restart) and cannot find the mint of a used nonce, it applies the
   same floor rule: it redrives when the rule places the mint inside its scan,
