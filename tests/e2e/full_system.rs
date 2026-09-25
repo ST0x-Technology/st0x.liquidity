@@ -53,10 +53,10 @@ use st0x_hedge::mock_api::{
     REDEMPTION_WALLET, RedemptionOutcome, TokenizationRequestType, TokenizationStatus,
 };
 use st0x_hedge::{
-    AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
-    Position, RebalancingCtx, UsdcRebalancing, seed_simulated_equity_redemption_history,
-    seed_simulated_hedge_latency_history, seed_simulated_mint_history,
-    seed_simulated_usdc_rebalance_history,
+    AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset,
+    ImbalanceThreshold, OperationMode, Position, RebalancingCtx,
+    seed_simulated_equity_redemption_history, seed_simulated_hedge_latency_history,
+    seed_simulated_mint_history, seed_simulated_usdc_rebalance_history,
 };
 
 use crate::assert::ExpectedPosition;
@@ -137,7 +137,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
             float!(0.5),
             float!(0.1),
         )?)
-        .usdc(UsdcRebalancing::Enabled {
+        .usdc(ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.1),
         })
@@ -607,7 +607,7 @@ attestation_retry_deadline_secs = 86400
 settlement_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
 allocation = {{ targets = {{ base = 0.5 }}, alpaca_floor = 0, deviation = 0.1, min_operation_usd = 1, cooldown_secs = 1 }}
-usdc = {{ mode = "enabled", target = 0.5, deviation = 0.1 }}
+usdc = {{ mode = "enabled", corridors = {{ base = {{ hop = "cctp", target = 0.5, deviation = 0.1 }} }} }}
 
 [chains.base.trading.assets.equities.AAPL]
 tokenized_equity = "{aapl_unwrapped}"

@@ -259,6 +259,23 @@ freeze_check = "enabled"
 
 [rebalancing.usdc]
 mode = "enabled"
+# Transitional: the released image reads these two. This build requires
+# them to equal [rebalancing.usdc.corridors.base] and ignores them
+# otherwise. Deleted, and then refused by name, once a release that reads
+# corridors is live.
+target = 0.6
+deviation = 0.05
+
+# One table per cash corridor, keyed by the chain whose vault it serves.
+# Every corridor routes through the bot's Ethereum wallet, where Alpaca
+# deposits and withdraws.
+# hop: how USDC crosses between that chain and Ethereum. "cctp" (Circle
+#   burn and mint) on Base. "relay" is reserved for Robinhood and refused
+#   by this build.
+# target: the chain vault's share of (that vault's USDC + Alpaca cash).
+# deviation: the band around target inside which nothing moves.
+[rebalancing.usdc.corridors.base]
+hop = "cctp"
 target = 0.6
 deviation = 0.05
 

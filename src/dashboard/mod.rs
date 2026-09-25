@@ -328,10 +328,10 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
     let (equity_target, equity_deviation, usdc_target, usdc_deviation) = {
         let rebalancing = &ctx.rebalancing;
         let (usdc_target, usdc_deviation) =
-            rebalancing.usdc.as_ref().map_or((None, None), |threshold| {
+            rebalancing.usdc.as_ref().map_or((None, None), |usdc| {
                 (
-                    Some(float_to_f64(threshold.target, 0.5)),
-                    Some(float_to_f64(threshold.deviation, 0.3)),
+                    Some(float_to_f64(usdc.threshold.target, 0.5)),
+                    Some(float_to_f64(usdc.threshold.deviation, 0.3)),
                 )
             });
         // The dashboard's equity band is the primary chain's default target

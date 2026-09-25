@@ -604,6 +604,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use uuid::Uuid;
 
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_dto::{
         EquityMintOperation, EquityMintStatus, EquityMintTag, EquityRedemptionOperation,
         EquityRedemptionStatus, EquityRedemptionTag, TransferOperation, TransferWarning,
@@ -923,6 +924,7 @@ mod tests {
             1,
             "UsdcRebalanceEvent::ConversionInitiated",
             serde_json::to_value(UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(500)),
                 order_id: ClientOrderId::from_uuid(usdc_id),
@@ -1287,6 +1289,7 @@ mod tests {
 
         let usdc_id = Uuid::new_v4();
         let usdc = UsdcRebalance::Converting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100)),
             order_id: ClientOrderId::from_uuid(usdc_id),

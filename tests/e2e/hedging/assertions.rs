@@ -19,7 +19,7 @@ pub(crate) use st0x_hedge::ExecutionThreshold;
 use st0x_hedge::OffchainOrderId;
 use st0x_hedge::bindings::IRaindexV6;
 use st0x_hedge::mock_api::REDEMPTION_WALLET;
-use st0x_hedge::{AllocationCtx, OperationMode, RebalancingCtx, UsdcRebalancing};
+use st0x_hedge::{AllocationCtx, OperationMode, RebalancingCtx};
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
 pub(crate) use crate::assert::ExpectedPosition;
@@ -111,7 +111,7 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
             float!(0.5),
             float!(0.1),
         )?)
-        .usdc(UsdcRebalancing::Disabled)
+        .maybe_usdc(None)
         .freeze_check(OperationMode::Disabled)
         .call();
 

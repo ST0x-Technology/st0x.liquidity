@@ -1884,13 +1884,13 @@ async fn resume_usdc_transfer(
 /// stay generic (the full error is logged at the call site).
 fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
-        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, Database, DirectionMismatch,
-        GuardHeldElsewhere, NotFound, NotReady, Queue,
+        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CorridorNotServed, Database,
+        DirectionMismatch, GuardHeldElsewhere, NotFound, NotReady, Queue,
     };
 
     match error {
         NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
-        DirectionMismatch { .. } | AlreadyTerminal { .. } => {
+        DirectionMismatch { .. } | AlreadyTerminal { .. } | CorridorNotServed { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
         }
         AlreadyInFlight { .. } | GuardHeldElsewhere => (StatusCode::CONFLICT, error.to_string()),
@@ -2964,6 +2964,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
         BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
         create_test_ctx_with_order_owner,
@@ -5106,6 +5107,7 @@ mod tests {
             .receive::<UsdcRebalance>(
                 operation_id,
                 UsdcRebalanceEvent::WithdrawalSubmitting {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: st0x_finance::Usdc::new(float!(500)),
                     from_block: 1,
@@ -6263,10 +6265,24 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::AlreadyTerminal {
-            id,
+            id: id.clone(),
             state: "Reconciled",
         });
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, message) = usdc_resume_error_response(&UsdcResumeError::CorridorNotServed {
+            id,
+            recorded: UsdcCorridor::HubRouted {
+                chain: Chain::Robinhood,
+                hop: HopKind::Relay,
+            },
+            served: UsdcCorridor::BASE_CCTP,
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.starts_with("USDC transfer corridor mismatch"),
+            "{message}"
+        );
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::AlreadyInFlight {
             row_id: "row-1".to_string(),
@@ -6376,6 +6392,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     from_block: 1,
@@ -6387,6 +6404,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),
@@ -6481,6 +6499,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     from_block: 1,
@@ -6492,6 +6511,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),

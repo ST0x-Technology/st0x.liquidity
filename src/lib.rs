@@ -121,7 +121,6 @@ pub use st0x_config::ExecutionThreshold;
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::{
     AllocationCtx, BotGasValuationConfig, ImbalanceThreshold, RebalancingCtx, RebalancingCtxError,
-    UsdcRebalancing,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::{

@@ -111,6 +111,17 @@ and the system proves market fit.
     to Alpaca
   - Too much USDC offchain: Withdraw from Alpaca -> bridge via Circle CCTP
     (Ethereum -> Base) -> deposit to orderbook vault
+  - Every cash transfer runs on a named **USDC corridor**: the chain whose cash
+    vault it serves and the **hop** that moves USDC between that chain and the
+    bot's Ethereum wallet, where Alpaca deposits and withdraws (the **hub**).
+    Hop kinds: `cctp` (Circle burn and mint) and `relay` (reserved for
+    Robinhood; no build wires it yet). Each corridor is a table under
+    `[rebalancing.usdc.corridors.<chain>]` with its `hop`, `target` and
+    `deviation`; the chain's cash vault, per-transfer limit and confirmations
+    come from the chain's own tables. Today the only corridor is Base via CCTP.
+  - The corridor is recorded on each transfer when it starts. A transfer
+    recorded before corridors existed reads as Base via CCTP, the only route
+    there was.
 - **Complete Audit Trail**: All rebalancing operations tracked as events
   (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
@@ -137,7 +148,8 @@ Operators pause rebalancing with narrow, explicit controls:
   rebalancing proceeds. This bypass is an operator escape hatch for an issuance
   outage.
 - **USDC-specific controls** (`usdc` mode under `[rebalancing]`): stop new USDC
-  rebalancing flows.
+  rebalancing flows on every corridor. The corridor tables stay in place and are
+  still validated, so pausing and resuming is a one-line change.
 - **Circuit breakers**: stop a transfer after repeated failures and alert the
   operator.
 
@@ -152,40 +164,42 @@ config carries a `[chains.<name>.trading]` table is a **hedged** chain: the bot
 runs a fill watcher against its order book, accounts its fills and hedges them
 with offsetting broker orders. Exactly one hedged chain must set
 `primary = true` on that table -- the **primary** chain anchors USDC rebalancing
-and the operator defaults (Base); equity rebalancing, hedging and vault balance
-polling happen on every hedged chain. Vault balance polling runs once per hedged
-chain, each on that chain's own Raindex service, its own chain-qualified vault
-registry and one pinned block, so every hedged chain's inventory slot is seeded
-and corrected. A secondary chain's fill updates that chain's own inventory slot:
-inventory is not fungible across chains. It schedules the symbol's equity check
-when that chain's listing rebalances the symbol, never the USDC check, which
-still runs on the primary chain; a hedge-only listing is prefunded and schedules
-neither. The distinction exists so that fill watching and inventory polling can
-go multi-chain before rebalancing does: it names the chain the
-still-single-chain paths use. Equity rebalancing is already per chain (see
-Equity Allocation Planner); once the USDC corridors are too, `primary` shrinks
-to the operator's default chain, or is removed. Zero or multiple primary
-claimants fail startup with a named error. Chains without a trading table are
-**transport** chains (RPC + confirmations only, e.g. Ethereum while it only
-carries CCTP transfers). Watch settings are per chain: poll interval, ingestion
-cutoff, asset tables with per-chain enable/disable flags. The periodic position
-check sweeps a symbol when any hedged chain enables it and sizes the hedge with
-the tightest operational limit among those chains (one `Position` per symbol
-cannot say which chain its fills came from; the remainder is hedged on a later
-tick). Startup verifies every hedged chain (chain-id identity, cutoff support,
-and each token address the chain's role uses answering `decimals()` on that
-chain's own endpoint: every equity's wrapped share, plus the unwrapped token of
-each equity the chain rebalances) and any failure is fatal; degraded per-chain
-startup is deferred to the chain-disable work. Each probed equity token must
-report 18 decimals: every equity quantity the bot scales is 18-decimal
-share-wei, so a token at another precision is refused by name rather than
-honoured. The settlement stable is not probed: its decimals are pinned in code
-beside its address. Each wrapped share must additionally report the equity's
-configured unwrapped token as its ERC-4626 `asset()` — the same attestation the
-tokenization preflight makes, which a hedge-only chain never reaches and a
-rebalancing secondary makes only for the equities that opt in — so a typo
-landing on another live token refuses startup instead of surfacing as the first
-unresolvable fill.
+and the operator defaults (Base). The corridor table names the cash chain; until
+each corridor has its own cash guard, the trigger, inventory and services of the
+cash path still run on the primary chain, so a corridor keyed by another chain
+is refused at load; equity rebalancing, hedging and vault balance polling happen
+on every hedged chain. Vault balance polling runs once per hedged chain, each on
+that chain's own Raindex service, its own chain-qualified vault registry and one
+pinned block, so every hedged chain's inventory slot is seeded and corrected. A
+secondary chain's fill updates that chain's own inventory slot: inventory is not
+fungible across chains. It schedules the symbol's equity check when that chain's
+listing rebalances the symbol, never the USDC check, which still runs on the
+primary chain; a hedge-only listing is prefunded and schedules neither. The
+distinction exists so that fill watching and inventory polling can go
+multi-chain before rebalancing does: it names the chain the still-single-chain
+paths use. Equity rebalancing is already per chain (see Equity Allocation
+Planner); once the USDC corridors are too, `primary` shrinks to the operator's
+default chain, or is removed. Zero or multiple primary claimants fail startup
+with a named error. Chains without a trading table are **transport** chains
+(RPC + confirmations only, e.g. Ethereum while it only carries CCTP transfers).
+Watch settings are per chain: poll interval, ingestion cutoff, asset tables with
+per-chain enable/disable flags. The periodic position check sweeps a symbol when
+any hedged chain enables it and sizes the hedge with the tightest operational
+limit among those chains (one `Position` per symbol cannot say which chain its
+fills came from; the remainder is hedged on a later tick). Startup verifies
+every hedged chain (chain-id identity, cutoff support, and each token address
+the chain's role uses answering `decimals()` on that chain's own endpoint: every
+equity's wrapped share, plus the unwrapped token of each equity the chain
+rebalances) and any failure is fatal; degraded per-chain startup is deferred to
+the chain-disable work. Each probed equity token must report 18 decimals: every
+equity quantity the bot scales is 18-decimal share-wei, so a token at another
+precision is refused by name rather than honoured. The settlement stable is not
+probed: its decimals are pinned in code beside its address. Each wrapped share
+must additionally report the equity's configured unwrapped token as its ERC-4626
+`asset()` — the same attestation the tokenization preflight makes, which a
+hedge-only chain never reaches and a rebalancing secondary makes only for the
+equities that opt in — so a typo landing on another live token refuses startup
+instead of surfacing as the first unresolvable fill.
 
 The lifecycle is a strict ceiling over the chain's asset settings. The hedged
 chain with `primary = true` must be `active`; startup rejects an observe-only or
@@ -1942,6 +1956,35 @@ validates every config the repository ships -- `config/**/*.toml`,
 `example.config.toml`, and `e2e/config.toml` -- on every pull request. Configs
 are discovered by walking `config/`, so a new environment directory is covered
 the day it is added rather than the day someone remembers to list it.
+
+##### Cash corridor rules
+
+The `[rebalancing.usdc.corridors.<chain>]` tables are checked at load, and each
+rule fails startup with a named error:
+
+1. USDC mode enabled with no corridor table.
+2. A corridor table missing `hop`, `target` or `deviation`, or carrying an
+   unknown key. There are no defaults.
+3. A corridor keyed by a chain that is not configured, not enabled, or has no
+   trading cash table with a vault id.
+4. A corridor keyed `ethereum`: the direct Ethereum corridor is not built.
+5. `hop = "cctp"` on a chain whose settlement stable is not Circle's USDC
+   (Robinhood), or on a chain this build has no CCTP domain for (HyperEVM).
+6. `hop = "relay"` on any chain: this build has no Relay hop.
+7. USDC mode enabled and a chain whose cash table enables rebalancing has no
+   corridor table: there is no implicit corridor.
+8. A corridor chain other than the primary chain, until each corridor has its
+   own cash guard.
+9. Transitional: `target` or `deviation` still set directly under
+   `[rebalancing.usdc]` and different from the corridor's value. The released
+   image reads those two keys and ignores the corridor tables, so both stay in
+   the deployed config, equal, until a release that reads corridors is live; a
+   later release refuses them by name.
+10. Corridor tables are validated when USDC mode is disabled too, so a typo is
+    caught on the day it is written, not on the day the mode is enabled.
+
+The hub (the Ethereum wallet), the CCTP domains and the USDC addresses are
+pinned in code per chain, never configured.
 
 #### Tools
 
@@ -3719,6 +3762,23 @@ enum RebalanceDirection {
     BaseToAlpaca,
 }
 
+// How USDC crosses between a corridor chain and the Ethereum hub.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HopKind {
+    Cctp,
+    // Reserved for Robinhood: no build wires it yet.
+    Relay,
+}
+
+// The route a cash transfer takes between Alpaca and one chain's vault:
+// chain vault <-> hop <-> Ethereum wallet <-> Alpaca. Persisted externally
+// tagged, e.g. {"HubRouted": {"chain": "base", "hop": "cctp"}}.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum UsdcCorridor {
+    HubRouted { chain: Chain, hop: HopKind },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AlpacaTransferId(String);
 
@@ -3741,23 +3801,30 @@ enum ReconcileReason {
 
 **States**:
 
+Every state carries the transfer's `corridor`, set by the event that originates
+it and kept by every later transition. A state or snapshot recorded before the
+field existed reads as Base via CCTP.
+
 ```rust
 enum UsdcRebalance {
     // Conversion phase (USD/USDC trading on Alpaca)
     Converting {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         order_id: Uuid,
         initiated_at: DateTime<Utc>,
     },
     ConversionComplete {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         initiated_at: DateTime<Utc>,
         converted_at: DateTime<Utc>,
     },
     ConversionFailed {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         order_id: Uuid,
         reason: String,
@@ -3768,18 +3835,21 @@ enum UsdcRebalance {
     // Withdrawal phase
     Withdrawing {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
     WithdrawalComplete {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
     },
     WithdrawalFailed {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         reason: String,
@@ -3790,6 +3860,7 @@ enum UsdcRebalance {
     // Bridging phase (CCTP cross-chain transfer)
     Bridging {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
@@ -3800,6 +3871,7 @@ enum UsdcRebalance {
     // which it is marked BridgingFailed for operator reconciliation.
     AwaitingAttestation {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
@@ -3808,6 +3880,7 @@ enum UsdcRebalance {
     },
     Attested {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         cctp_nonce: B256,
@@ -3826,6 +3899,7 @@ enum UsdcRebalance {
     },
     Bridged {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         amount_received: Usdc,
         fee_collected: Usdc,
@@ -3840,6 +3914,7 @@ enum UsdcRebalance {
     },
     BridgingFailed {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<B256>,
@@ -3851,6 +3926,7 @@ enum UsdcRebalance {
     // Deposit phase
     DepositInitiated {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -3860,6 +3936,7 @@ enum UsdcRebalance {
     },
     DepositConfirmed {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -3868,6 +3945,7 @@ enum UsdcRebalance {
     },
     DepositFailed {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -3883,6 +3961,7 @@ enum UsdcRebalance {
     // starting at `reconciled_at`.
     Reconciled {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         reason: ReconcileReason,
         initiated_at: DateTime<Utc>,
@@ -3896,7 +3975,27 @@ enum UsdcRebalance {
 Resuming a transfer after a crash must never re-execute an irreversible on-chain
 action that already succeeded. Each phase records its intent (and the relevant
 chain head) before the action, so resume can scan the chain to adopt an
-already-submitted action instead of re-issuing it:
+already-submitted action instead of re-issuing it.
+
+A cash transfer service serves one corridor, fixed by what the build wires
+(today Base via CCTP), whether or not USDC mode is enabled, so in-flight
+transfers always recover. A fresh transfer must ask for that corridor and
+records it on its originating command. A resume or recheck of a transfer
+recorded on another corridor, or a fresh transfer asking for another corridor,
+fails closed before any send and leaves the transfer untouched; the error starts
+with "USDC transfer corridor mismatch" and names both corridors. Automation
+treats a recorded transfer on another corridor as permanent for the build: its
+job ends without a retry, startup recovery (even while a job is live) and the
+timeout sweep never re-arm it, and its guard stays held. A fresh job asking for
+another corridor has no transfer to hold: it retries, dead-letters, and its
+dead-letter alert pages once. Startup recovery pages once per transfer per run
+(the record is kept in memory) with "USDC transfer corridor mismatch: transfer
+{id} runs on the {corridor} corridor, which this build does not serve"; the
+timeout sweep retries that page until it is delivered and raises no other stall
+alert for the transfer. The next sweep releases its guard once it is reconciled,
+or once an operator moves it to a state that holds no guard (such as a pre-burn
+`BridgingFailed`). A manual `transfer resume` is refused (422). The way out is a
+build that serves that corridor.
 
 - `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
   (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
@@ -3927,38 +4026,42 @@ already-submitted action instead of re-issuing it:
   -- before attempting a fresh mint. The match is by nonce, never by recipient
   or amount: other transfers mint to the same wallet, possibly the same amount.
   The log scan is bounded: it starts at the lower of the destination head
-  captured when the attestation is recorded, less a margin of a few minutes of
-  blocks, and a fixed lookback from the current head (a relayer can mint before
-  that head is captured), or at the fixed lookback alone for a transfer recorded
-  before that head was captured. The bot never scans back to genesis. A consumed
-  nonce whose log is not found in that window is placed by a `usedNonces` read
-  at the block below the floor: unused there, the window covers the mint and the
-  missing log is index lag, so resume redrives like any other lookup failure
-  (deadline-gated alert); used there, the mint lies below the floor. When that
-  read fails (for example a node without state that old), the floor block's
-  timestamp decides instead: a mint lands after its transfer starts, so a floor
-  mined before the transfer started covers the mint (redrive), and a newer floor
-  can have the mint below it. For a mint below the floor, or one that can lie
-  below it, resume marks `BridgingFailed` (keeping the burn tx and nonce), so
-  `transfer reconcile --kind usdc` can settle it; a message that can never mint
-  on the destination chain does the same. So does a used nonce whose mint is
-  found but cannot be adopted: its `MessageReceived` body differs from the
-  recorded message (for example a relayer minted a re-attested fast-transfer
-  body with a new `expirationBlock`), its tx reverted, or it has no
-  `MintAndWithdraw`. Every redrive would get the same answer, and the log is
-  never matched on less than the full body. Such a mint pages the operator in
-  both directions with "the CCTP mint cannot be resolved automatically": only
-  the operator can find that mint. A BaseToAlpaca job ends there, since its
-  post-burn `BridgingFailed` recovery scans no wider; if that recovery runs
-  again (a restart) and cannot find the mint of a used nonce, it applies the
-  same floor rule: it redrives when the rule places the mint inside its scan,
-  and otherwise pages the same way and stops. A message that can never mint
-  pages only for AlpacaToBase, with "the recorded CCTP message cannot mint on
-  Base" (the nonce is not read, so the operator gets the attestation for the
-  burn tx and mints it); an AlpacaToBase retry finds the transfer failed and
-  does not alert. That BaseToAlpaca latch does not page: its recovery re-polls
-  Circle and may still mint and send the deposit, and the job's dead-letter
-  alert covers a give-up. Other lookup failures redrive.
+  captured when the attestation is recorded, less a margin of 10 minutes of
+  blocks, and a lookback of 33 h 20 min of blocks from the current head (a
+  relayer can mint before that head is captured), or at the lookback alone for a
+  transfer recorded before that head was captured. Both windows are time spans,
+  converted to blocks with the destination chain's minimum block interval pinned
+  in code, rounded up: 300 and 60,000 blocks on Base, 50 and 10,000 on Ethereum.
+  The lookback stays above the 24 h attestation deadline. The scan that rebuilds
+  a mint just seen consuming its nonce uses the same lookback. The bot never
+  scans back to genesis. A consumed nonce whose log is not found in that window
+  is placed by a `usedNonces` read at the block below the floor: unused there,
+  the window covers the mint and the missing log is index lag, so resume
+  redrives like any other lookup failure (deadline-gated alert); used there, the
+  mint lies below the floor. When that read fails (for example a node without
+  state that old), the floor block's timestamp decides instead: a mint lands
+  after its transfer starts, so a floor mined before the transfer started covers
+  the mint (redrive), and a newer floor can have the mint below it. For a mint
+  below the floor, or one that can lie below it, resume marks `BridgingFailed`
+  (keeping the burn tx and nonce), so `transfer reconcile --kind usdc` can
+  settle it; a message that can never mint on the destination chain does the
+  same. So does a used nonce whose mint is found but cannot be adopted: its
+  `MessageReceived` body differs from the recorded message (for example a
+  relayer minted a re-attested fast-transfer body with a new `expirationBlock`),
+  its tx reverted, or it has no `MintAndWithdraw`. Every redrive would get the
+  same answer, and the log is never matched on less than the full body. Such a
+  mint pages the operator in both directions with "the CCTP mint cannot be
+  resolved automatically": only the operator can find that mint. A BaseToAlpaca
+  job ends there, since its post-burn `BridgingFailed` recovery scans no wider;
+  if that recovery runs again (a restart) and cannot find the mint of a used
+  nonce, it applies the same floor rule: it redrives when the rule places the
+  mint inside its scan, and otherwise pages the same way and stops. A message
+  that can never mint pages only for AlpacaToBase, with "the recorded CCTP
+  message cannot mint on Base" (the nonce is not read, so the operator gets the
+  attestation for the burn tx and mints it); an AlpacaToBase retry finds the
+  transfer failed and does not alert. That BaseToAlpaca latch does not page: its
+  recovery re-polls Circle and may still mint and send the deposit, and the
+  job's dead-letter alert covers a give-up. Other lookup failures redrive.
 
 ##### Commands
 
@@ -3967,6 +4070,7 @@ enum UsdcRebalanceCommand {
     // Conversion commands (AlpacaToBase: pre-withdrawal, BaseToAlpaca: post-deposit)
     InitiateConversion {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         order_id: Uuid,
     },
@@ -3975,9 +4079,18 @@ enum UsdcRebalanceCommand {
     // Post-deposit conversion for BaseToAlpaca direction only
     InitiatePostDepositConversion { order_id: Uuid },
 
-    // Withdrawal commands
+    // Withdrawal commands. `BeginWithdrawal` and `Initiate` carry the
+    // corridor too; on a started transfer a corridor other than the recorded
+    // one is refused.
+    BeginWithdrawal {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        from_block: u64,
+    },
     Initiate {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         withdrawal: TransferRef,
     },
@@ -4025,9 +4138,13 @@ enum UsdcRebalanceCommand {
 
 ```rust
 enum UsdcRebalanceEvent {
+    // The originating events carry the corridor. It is absent from events
+    // recorded before it existed, which read as Base via CCTP. A post-deposit
+    // ConversionInitiated repeats the transfer's corridor.
     // Conversion events
     ConversionInitiated {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         order_id: Uuid,
         initiated_at: DateTime<Utc>,
@@ -4038,8 +4155,16 @@ enum UsdcRebalanceEvent {
     ConversionFailed { alpaca_order_id: Option<AlpacaOrderId>, failed_at: DateTime<Utc> },
 
     // Withdrawal events
+    WithdrawalSubmitting {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        from_block: u64,
+        submitting_at: DateTime<Utc>,
+    },
     Initiated {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
@@ -5654,13 +5779,13 @@ for every discovered vault in the monotonic vault registry.
 `InventorySnapshotEvent` to maintain venue balances. Inflight tracking ensures
 assets in transit (minting, redeeming, bridging) are accounted for.
 
-USDC imbalance detection compares the onchain ratio against a configurable
-`ImbalanceThreshold` (target ratio + deviation). Equity is read as one
-`EquityVenues` per symbol -- the broker balance, one slot per polled chain and
-whether anything is in flight -- that the allocation planner sizes from (see
-Equity Allocation Planner). Rebalancing is only triggered when no inflight
-operations exist for the asset. The trigger enqueues the matching transfer job
-for execution.
+USDC imbalance detection compares the onchain ratio against the corridor's
+`ImbalanceThreshold` (its `target` ratio + `deviation`), and the job it enqueues
+carries that corridor. Equity is read as one `EquityVenues` per symbol -- the
+broker balance, one slot per polled chain and whether anything is in flight --
+that the allocation planner sizes from (see Equity Allocation Planner).
+Rebalancing is only triggered when no inflight operations exist for the asset.
+The trigger enqueues the matching transfer job for execution.
 
 #### Failure Handling and Reconciliation
 
