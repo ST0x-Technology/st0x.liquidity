@@ -15368,6 +15368,123 @@ mod tests {
         assert_eq!(recorded_by, other.to_string());
     }
 
+    /// A signed send nobody broadcast leaves its nonce free, so it can still
+    /// mine and must not be reconciled.
+    #[tokio::test]
+    async fn deposit_send_with_a_free_nonce_is_not_superseded() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            create_test_store_instance().await,
+        )
+        .await;
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let prepared = sign_usdc_to_alpaca(&wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
+
+        let error = manager
+            .verify_deposit_send_superseded(&prepared)
+            .await
+            .unwrap_err();
+
+        let DepositSendNotSuperseded::NonceFree {
+            tx,
+            nonce,
+            confirmed_next_nonce,
+        } = error
+        else {
+            panic!("expected NonceFree, got: {error:?}");
+        };
+        assert_eq!(tx, prepared.tx_hash());
+        assert_eq!(nonce, prepared.nonce());
+        assert_eq!(confirmed_next_nonce, prepared.nonce());
+    }
+
+    /// A different tx mined at the send's nonce proves the send can never
+    /// mine, once that tx has the required confirmations.
+    #[tokio::test]
+    async fn deposit_send_whose_nonce_another_tx_took_is_superseded_once_confirmed() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            create_test_store_instance().await,
+        )
+        .await;
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let prepared = sign_usdc_to_alpaca(&wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
+
+        // The runbook's cancel: a 0-value self transfer at the send's nonce.
+        let bot_provider = ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(
+                PrivateKeySigner::from_bytes(&chain.bot_key).unwrap(),
+            ))
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        bot_provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(chain.bot_address)
+                    .value(U256::ZERO)
+                    .nonce(prepared.nonce()),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let error = manager
+            .verify_deposit_send_superseded(&prepared)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DepositSendNotSuperseded::NonceFree { .. }),
+            "a cancel with fewer than the required confirmations is no proof yet, got: {error:?}"
+        );
+
+        bot_provider.anvil_mine(Some(2), None).await.unwrap();
+
+        manager
+            .verify_deposit_send_superseded(&prepared)
+            .await
+            .unwrap();
+    }
+
+    /// A mined send moved the USDC to Alpaca, so reconciling it would move
+    /// the funds twice.
+    #[tokio::test]
+    async fn mined_deposit_send_is_not_superseded() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            create_test_store_instance().await,
+        )
+        .await;
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let prepared = sign_usdc_to_alpaca(&wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
+        broadcast_signed(&wallet, &prepared).await;
+        wallet.provider().anvil_mine(Some(2), None).await.unwrap();
+
+        let error = manager
+            .verify_deposit_send_superseded(&prepared)
+            .await
+            .unwrap_err();
+
+        let DepositSendNotSuperseded::Mined { tx } = error else {
+            panic!("expected Mined, got: {error:?}");
+        };
+        assert_eq!(tx, prepared.tx_hash());
+    }
+
     /// Signs a send of `amount` USDC from `wallet` to the Alpaca deposit
     /// address, as the deposit leg does, without broadcasting it.
     async fn sign_usdc_to_alpaca<Signer: Wallet>(

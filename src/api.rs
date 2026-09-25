@@ -6342,6 +6342,37 @@ mod tests {
             .unwrap();
     }
 
+    /// Seeds a `UsdcRebalance` (BaseToAlpaca) into `Bridged` with a signed
+    /// deposit send.
+    async fn seed_usdc_bridged_with_signed_send(pool: &SqlitePool, id: &UsdcRebalanceId) {
+        seed_usdc_bridging_submitting(pool, id, false).await;
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        for command in [
+            UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: TxHash::repeat_byte(0x33),
+            },
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0xAA],
+                cctp_nonce: alloy::primitives::B256::repeat_byte(0x44),
+                message: vec![0xBB],
+                mint_scan_from_block: 3,
+            },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: TxHash::repeat_byte(0x55),
+                amount_received: Usdc::new(float!(499.9)),
+                fee_collected: Usdc::new(float!(0.1)),
+            },
+            UsdcRebalanceCommand::PrepareDepositSend {
+                prepared: st0x_evm::PreparedTransaction::for_test(TxHash::repeat_byte(0x66), 7),
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
     /// Seeds a `UsdcRebalance` (BaseToAlpaca) into `BridgingSubmitting`, then
     /// records a pending burn tx when `with_pending_burn` so the state carries
     /// `pending_burn_tx: Some(_)`.
@@ -6609,6 +6640,37 @@ mod tests {
             panic!("expected an error response");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Only the bot's chain read proves a signed deposit send can no longer
+    /// mine, so reconciling one before the bot can read it is refused.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_refuses_a_signed_deposit_send_until_the_bot_can_read_it() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridged_with_signed_send(&state.pool, &id).await;
+
+        let resp = reconcile_usdc_transfer(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(ReconcileUsdcRequest {
+                reason: ReconcileReasonWire::FundsMovedManually,
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            matches!(
+                load_usdc_rebalance(&state.pool, &id).await,
+                UsdcRebalance::Bridged { .. }
+            ),
+            "a refused reconcile leaves the transfer Bridged",
+        );
     }
 
     #[tokio::test]
