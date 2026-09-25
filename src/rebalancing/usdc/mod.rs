@@ -244,7 +244,7 @@ pub enum UsdcTransferError {
     #[error("USDC rebalance {id} cannot resume: aggregate is in terminal failure state")]
     PreviouslyFailedAggregate { id: UsdcRebalanceId },
     #[error(
-        "USDC transfer corridor mismatch: rebalance {id} runs on the {recorded} corridor, \
+        "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
          this service serves {served}; left untouched for the operator"
     )]
     CorridorMismatch {
@@ -253,7 +253,7 @@ pub enum UsdcTransferError {
         served: UsdcCorridor,
     },
     #[error(
-        "USDC transfer corridor mismatch: rebalance {id} asks for the {requested} corridor, \
+        "USDC transfer corridor mismatch: transfer {id} asks for the {requested} corridor, \
          this service serves {served}; nothing was recorded"
     )]
     CorridorNotServed {

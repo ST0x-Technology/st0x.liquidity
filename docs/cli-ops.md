@@ -866,11 +866,13 @@ before the startup token approvals.
   its funds. The bot holds the transfer and its guard: its job ends without a
   retry, and startup and the timeout sweep do not re-arm it. A job for a fresh
   transfer asking for that corridor (nothing recorded yet) dead-letters instead,
-  and its dead-letter alert carries the same text. `transfer resume` is refused
-  with the same "USDC transfer corridor mismatch" text, and `transfer recheck`
-  too; `transfer reconcile` does not accept the pre-burn states such a transfer
-  is usually in. Do not try them. Deploy a build (and config) that serves the
-  named corridor; that build resumes the transfer where it stopped.
+  and its dead-letter alert starts with the same words. `transfer resume` and
+  `transfer recheck` are refused with messages that start with the same words.
+  `transfer reconcile` does not accept the pre-burn states such a transfer is
+  usually in; do not try it there. A held transfer in a reconcilable failed
+  state can be reconciled as usual, and the next sweep releases its guard.
+  Deploy a build (and config) that serves the named corridor; that build resumes
+  the transfer where it stopped.
 
 ### Clearing a dropped pending burn (`BridgingSubmitting` latch)
 

@@ -351,7 +351,8 @@ where
 
 /// Ends the attempt quietly for a transfer on a corridor this build does not
 /// serve: no retry can change that, and a dead letter would page on every
-/// sweep. The rebalancing sweep holds the transfer and pages once.
+/// sweep. Startup recovery holds the transfer and pages once; the timeout
+/// sweep retries that page until it is delivered.
 fn intercept_unserved_corridor<JobError>(
     result: Result<(), UsdcTransferError>,
 ) -> ControlFlow<Result<(), JobError>, Result<(), UsdcTransferError>> {
@@ -2461,7 +2462,7 @@ mod tests {
         DepositSendUnresolved,
         /// `FailBridging` is committed; the tx belongs to another transfer.
         WithdrawalTxAlreadyRecorded,
-        /// Permanent for this build; the rebalancing sweep pages once.
+        /// Permanent for this build; startup recovery pages, retried by the sweep.
         CorridorMismatch,
     }
 
@@ -6697,7 +6698,7 @@ mod tests {
 
     /// A transfer on a corridor this build does not serve cannot progress;
     /// retrying and dead-lettering would page on every sweep. The job ends
-    /// quietly and the rebalancing sweep pages once.
+    /// quietly; startup recovery pages once, retried by the sweep.
     #[tokio::test]
     async fn jobs_end_quietly_on_a_corridor_this_build_does_not_serve() {
         let pool = setup_queue_pool().await;

@@ -2964,7 +2964,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
-    use st0x_bridge::corridor::UsdcCorridor;
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
         BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
         create_test_ctx_with_order_owner,
@@ -6265,10 +6265,24 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::AlreadyTerminal {
-            id,
+            id: id.clone(),
             state: "Reconciled",
         });
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, message) = usdc_resume_error_response(&UsdcResumeError::CorridorNotServed {
+            id,
+            recorded: UsdcCorridor::HubRouted {
+                chain: Chain::Robinhood,
+                hop: HopKind::Relay,
+            },
+            served: UsdcCorridor::BASE_CCTP,
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.starts_with("USDC transfer corridor mismatch"),
+            "{message}"
+        );
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::AlreadyInFlight {
             row_id: "row-1".to_string(),
