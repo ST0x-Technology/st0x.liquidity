@@ -139,9 +139,12 @@ with a `PreparedTransaction`, RAI-2485):
    that start, with a warning; wraps and deposits still approve on demand. A
    failure to list or load the signed sends, or an unparseable transfer id,
    skips them the same way, since a send it hides has no reserved nonce.
-5. Resume with no signed send still scans from the mint block (for transfers
-   that reached `Bridged` before this change), but a match is never adopted: it
-   fails the transfer for reconciliation. An empty scan signs and sends.
+5. Resume of a transfer loaded at `Bridged` with no signed send still scans from
+   the mint block (for transfers that reached `Bridged` before this change), but
+   a match is never adopted: it fails the transfer for reconciliation. An empty
+   scan signs and sends. A transfer that reaches `Bridged` during the resume (an
+   adopted attested mint, or a post-burn `BridgingFailed` recovery) has no send
+   yet, so it signs and sends with no scan.
 
 `FailDeposit` is now also valid from a BaseToAlpaca `Bridged`, so the failure is
 a reconcilable, guard-holding `DepositFailed` that keeps the signed send as its
