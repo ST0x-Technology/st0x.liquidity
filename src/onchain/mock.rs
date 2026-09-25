@@ -91,6 +91,7 @@ pub struct MockRaindex {
     restored_prepared_withdrawals: AtomicUsize,
     restore_submitted_withdrawal_calls: Mutex<Vec<(TxHash, bool)>>,
     fail_restore: bool,
+    withdrawals_mined: bool,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -161,6 +162,7 @@ impl MockRaindex {
             restored_prepared_withdrawals: AtomicUsize::new(0),
             restore_submitted_withdrawal_calls: Mutex::new(Vec::new()),
             fail_restore: false,
+            withdrawals_mined: false,
         }
     }
 
@@ -169,6 +171,13 @@ impl MockRaindex {
     #[cfg(test)]
     pub(crate) fn with_failing_restore(mut self) -> Self {
         self.fail_restore = true;
+        self
+    }
+
+    /// Makes `tx_mined` report every transaction as mined.
+    #[cfg(test)]
+    pub(crate) fn with_mined_withdrawals(mut self) -> Self {
+        self.withdrawals_mined = true;
         self
     }
 
@@ -442,6 +451,10 @@ impl Raindex for MockRaindex {
             .as_ref()
             .copied()
             .ok_or(RaindexError::ScanInconclusive { from_block })
+    }
+
+    async fn tx_mined(&self, _tx_hash: TxHash) -> Result<bool, RaindexError> {
+        Ok(self.withdrawals_mined)
     }
 
     async fn confirm_tx_receipt(

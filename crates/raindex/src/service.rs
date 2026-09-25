@@ -779,6 +779,15 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         Self::find_recent_withdrawal(self, token, vault_id, from_block).await
     }
 
+    async fn tx_mined(&self, tx_hash: TxHash) -> Result<bool, RaindexError> {
+        Ok(self
+            .evm
+            .provider()
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .is_some())
+    }
+
     async fn confirm_tx_receipt(
         &self,
         tx_hash: TxHash,
@@ -1681,6 +1690,24 @@ mod tests {
             ),
             "expected MissingOperatorRole, got: {error:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn tx_mined_reports_a_receipt_without_waiting() {
+        let local_evm = LocalEvm::new().await.unwrap();
+        let service = create_test_raindex_service(&local_evm);
+        let mined = TestERC20::new(local_evm.token_address, local_evm.wallet.signing_provider())
+            .approve(local_evm.orderbook_address, U256::from(1))
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash;
+
+        assert!(service.tx_mined(mined).await.unwrap());
+        assert!(!service.tx_mined(TxHash::random()).await.unwrap());
     }
 
     #[tokio::test]

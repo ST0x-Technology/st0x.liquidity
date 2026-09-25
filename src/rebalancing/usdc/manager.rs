@@ -3586,10 +3586,8 @@ impl<
                     info!(target: "rebalance", %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), "Reserved the nonce of a signed Alpaca deposit send");
                     outcome.restored += 1;
 
-                    if let Err(error) = self.cctp_bridge.broadcast_usdc_on_ethereum(prepared).await
-                    {
-                        error!(target: "operational_alert", alert = true, %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
-                        outcome.unbroadcast += 1;
+                    if !self.rebroadcast_restored_deposit_send(&id, prepared).await {
+                        outcome.unmined += 1;
                     }
                 }
                 Ok(state) => {
@@ -3602,6 +3600,34 @@ impl<
         }
 
         outcome
+    }
+
+    /// Rebroadcasts a deposit send restored at startup and reports whether it
+    /// is mined. A failed rebroadcast pages; a send with no receipt, or whose
+    /// receipt cannot be read, counts as not mined.
+    async fn rebroadcast_restored_deposit_send(
+        &self,
+        id: &UsdcRebalanceId,
+        prepared: &PreparedTransaction,
+    ) -> bool {
+        let tx = prepared.tx_hash();
+        let nonce = prepared.nonce();
+        if let Err(error) = self.cctp_bridge.broadcast_usdc_on_ethereum(prepared).await {
+            error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+            return false;
+        }
+
+        match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                warn!(target: "rebalance", %id, %tx, nonce, "Restored Alpaca deposit send is not mined yet at startup");
+                false
+            }
+            Err(error) => {
+                warn!(target: "rebalance", %id, %tx, nonce, ?error, "Could not read the receipt of a restored Alpaca deposit send at startup; treating it as not mined");
+                false
+            }
+        }
     }
 
     /// Executes the full Base to Alpaca rebalancing workflow.
@@ -6249,9 +6275,9 @@ pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
 pub(crate) struct RestoredDepositSends {
     /// Sends whose nonce is reserved again.
     pub(crate) restored: usize,
-    /// Restored sends whose rebroadcast failed: their nonce stays reserved
-    /// with no transaction any node is known to hold.
-    pub(crate) unbroadcast: usize,
+    /// Restored sends with no receipt after the startup rebroadcast, or
+    /// whose rebroadcast failed: later sends from the wallet wait behind them.
+    pub(crate) unmined: usize,
 }
 
 /// Trait-erased startup hook that reserves the nonces of persisted signed
@@ -6402,6 +6428,7 @@ mod tests {
         usdc_broadcast_error: Option<fn() -> CctpError>,
         usdc_discarded: Mutex<Vec<TxHash>>,
         usdc_restored: Mutex<Vec<TxHash>>,
+        mined_usdc_sends: Mutex<Vec<TxHash>>,
         // Opt-in: the mint block lookup and the pre-send scan find nothing,
         // as a scan of mined logs does while a send is still unmined.
         empty_usdc_scan: bool,
@@ -6439,6 +6466,7 @@ mod tests {
                 usdc_broadcast_error: None,
                 usdc_discarded: Mutex::new(Vec::new()),
                 usdc_restored: Mutex::new(Vec::new()),
+                mined_usdc_sends: Mutex::new(Vec::new()),
                 empty_usdc_scan: false,
                 ledger_probe: None,
                 empty_burn_scan: false,
@@ -6520,6 +6548,12 @@ mod tests {
 
         fn with_usdc_broadcast_delay(mut self, delay: Duration) -> Self {
             self.usdc_broadcast_delay = delay;
+            self
+        }
+
+        /// Reports `tx_hash` as mined to `ethereum_tx_confirmations`.
+        fn with_mined_usdc_send(self, tx_hash: TxHash) -> Self {
+            self.mined_usdc_sends.lock().unwrap().push(tx_hash);
             self
         }
 
@@ -6699,9 +6733,14 @@ mod tests {
     impl UsdcBridgeHelper for MockBridge {
         async fn ethereum_tx_confirmations(
             &self,
-            _tx_hash: TxHash,
+            tx_hash: TxHash,
         ) -> Result<Option<u64>, CctpError> {
-            unimplemented!("MockBridge: ethereum_tx_confirmations not used in this test")
+            Ok(self
+                .mined_usdc_sends
+                .lock()
+                .unwrap()
+                .contains(&tx_hash)
+                .then_some(1))
         }
 
         async fn ethereum_tx_block(&self, _tx_hash: TxHash) -> Result<u64, CctpError> {
@@ -15736,7 +15775,7 @@ mod tests {
             restarted.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 1,
-                unbroadcast: 0,
+                unmined: 0,
             }
         );
 
@@ -16090,7 +16129,7 @@ mod tests {
             manager.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 2,
-                unbroadcast: 0,
+                unmined: 2,
             }
         );
 
@@ -16134,6 +16173,44 @@ mod tests {
         assert_eq!(broadcasts, signed);
     }
 
+    /// After the startup rebroadcast, only a restored send with no receipt
+    /// counts as unmined: a mined one leaves the Ethereum approvals enabled.
+    #[tokio::test]
+    async fn startup_restore_counts_only_the_deposit_sends_not_mined() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let mined = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 3);
+        let pending = PreparedTransaction::for_test(TxHash::repeat_byte(0xA2), 4);
+        let bridge = Arc::new(MockBridge::new().with_mined_usdc_send(mined.tx_hash()));
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        for prepared in [&mined, &pending] {
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99"), TxHash::ZERO).await;
+            cqrs.send(
+                &id,
+                UsdcRebalanceCommand::PrepareDepositSend {
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            manager.restore_prepared_deposit_sends(&pool).await,
+            RestoredDepositSends {
+                restored: 2,
+                unmined: 1,
+            }
+        );
+        let mut broadcasts = bridge.usdc_broadcasts();
+        broadcasts.sort();
+        assert_eq!(broadcasts, vec![mined.tx_hash(), pending.tx_hash()]);
+    }
+
     /// A restored send whose rebroadcast fails keeps its nonce, pages, and is
     /// counted so startup skips the Ethereum wallet's approvals.
     #[tracing_test::traced_test]
@@ -16164,7 +16241,7 @@ mod tests {
             manager.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 1,
-                unbroadcast: 1,
+                unmined: 1,
             }
         );
 
@@ -16236,7 +16313,7 @@ mod tests {
             manager.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 0,
-                unbroadcast: 0,
+                unmined: 0,
             }
         );
 
@@ -16288,7 +16365,7 @@ mod tests {
             manager.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 1,
-                unbroadcast: 0,
+                unmined: 1,
             }
         );
 
@@ -16338,7 +16415,7 @@ mod tests {
             manager.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 1,
-                unbroadcast: 0,
+                unmined: 1,
             }
         );
 

@@ -908,6 +908,10 @@ impl Raindex for FixtureRaindex {
             .ok_or(RaindexError::ScanInconclusive { from_block })
     }
 
+    async fn tx_mined(&self, _tx_hash: TxHash) -> Result<bool, RaindexError> {
+        unimplemented!("FixtureRaindex: redemption fixture never restores at startup")
+    }
+
     async fn confirm_tx_receipt(
         &self,
         tx_hash: TxHash,
