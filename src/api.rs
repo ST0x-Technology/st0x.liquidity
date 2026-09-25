@@ -2156,7 +2156,8 @@ fn ops_command_error<Entity: EventSourced>(
 /// any write. A Base->Alpaca `Bridged` with a signed deposit send reconciles
 /// only once the bot reads on chain the operator's `supersedingTx`: a tx from
 /// the bot wallet at the send's nonce with the required confirmations (`409`
-/// until it proves that, `503` before the bot is ready).
+/// until it proves that, `503` before the bot is ready). A `supersedingTx`
+/// on a transfer with no signed send is a `400`.
 async fn reconcile_usdc_transfer(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2195,28 +2196,16 @@ async fn reconcile_usdc_transfer(
         ));
     }
 
-    // The aggregate command is pure, so the chain proof that the signed send
-    // can never mine is read here, before the command.
-    if let Some(prepared) = rebalance.prepared_deposit_send() {
-        let handle = state.recovery.get().ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "Recovery not ready yet (conductor still starting)".to_string(),
-                }),
-            )
-        })?;
-
-        handle
-            .usdc_recheck
-            .verify_deposit_send_superseded(prepared, request.superseding_tx)
-            .await
-            .map_err(|error| {
-                warn!(?error, %id, "Refused to reconcile a USDC transfer with a signed deposit send");
-                let (status, message) = deposit_send_not_superseded_response(&id, &error);
-                (status, Json(ErrorResponse { error: message }))
-            })?;
-    }
+    check_signed_deposit_send_superseded(
+        state
+            .recovery
+            .get()
+            .map(|handle| handle.usdc_recheck.as_ref()),
+        &id,
+        &rebalance,
+        request.superseding_tx,
+    )
+    .await?;
 
     store
         .send(
@@ -2231,6 +2220,50 @@ async fn reconcile_usdc_transfer(
         transfer_id: id.to_string(),
         outcome: "reconciled",
     }))
+}
+
+/// The aggregate command is pure, so the chain proof that a signed send can
+/// never mine is read before it, through the bot's `usdc_recheck` (`None`
+/// before the bot is ready: `503`). A superseding tx on a transfer with no
+/// signed send is a `400`.
+async fn check_signed_deposit_send_superseded(
+    usdc_recheck: Option<&dyn RecheckUsdcDeposit>,
+    id: &UsdcRebalanceId,
+    rebalance: &UsdcRebalance,
+    superseding_tx: Option<TxHash>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(prepared) = rebalance.prepared_deposit_send() else {
+        return match superseding_tx {
+            Some(_) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Transfer {id} has no signed deposit send; supersedingTx applies only \
+                         to one that has"
+                    ),
+                }),
+            )),
+            None => Ok(()),
+        };
+    };
+
+    let usdc_recheck = usdc_recheck.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    usdc_recheck
+        .verify_deposit_send_superseded(prepared, superseding_tx)
+        .await
+        .map_err(|error| {
+            warn!(?error, %id, "Refused to reconcile a USDC transfer with a signed deposit send");
+            let (status, message) = deposit_send_not_superseded_response(id, &error);
+            (status, Json(ErrorResponse { error: message }))
+        })
 }
 
 /// Maps a refused deposit-send chain check to an HTTP status: a missing or
@@ -6728,6 +6761,93 @@ mod tests {
                 UsdcRebalance::Bridged { .. }
             ),
             "a refused reconcile leaves the transfer Bridged",
+        );
+    }
+
+    /// A superseding tx names what took a signed send's nonce, so it is refused
+    /// on a transfer with no signed send rather than silently ignored.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_refuses_a_superseding_tx_without_a_signed_deposit_send() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_failed(&state.pool, &id).await;
+        let request = serde_json::from_value(serde_json::json!({
+            "reason": "funds-moved-manually",
+            "supersedingTx": TxHash::repeat_byte(0x77),
+        }))
+        .unwrap();
+
+        let resp =
+            reconcile_usdc_transfer(State(state.clone()), Path(id.to_string()), Json(request))
+                .await;
+
+        let Err((status, _)) = resp else {
+            panic!("expected an error response");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            matches!(
+                load_usdc_rebalance(&state.pool, &id).await,
+                UsdcRebalance::BridgingFailed { .. }
+            ),
+            "a refused reconcile leaves the transfer as it was",
+        );
+    }
+
+    /// Records the superseding tx the reconcile chain check receives.
+    struct RecordingUsdcRecheck {
+        superseding_txs: std::sync::Mutex<Vec<Option<TxHash>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RecheckUsdcDeposit for RecordingUsdcRecheck {
+        async fn recheck_deposit(
+            &self,
+            _id: &UsdcRebalanceId,
+            _operator_deposit_tx: Option<TxHash>,
+        ) -> Result<RecheckOutcome, UsdcRecheckError> {
+            unimplemented!("RecordingUsdcRecheck: recheck not used in this test")
+        }
+
+        async fn verify_deposit_send_superseded(
+            &self,
+            _prepared: &st0x_evm::PreparedTransaction,
+            superseding_tx: Option<TxHash>,
+        ) -> Result<(), DepositSendNotSuperseded> {
+            self.superseding_txs.lock().unwrap().push(superseding_tx);
+            Ok(())
+        }
+    }
+
+    /// The `supersedingTx` of a reconcile body reaches the bot's chain check.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_passes_the_superseding_tx_to_the_chain_check() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridged_with_signed_send(&state.pool, &id).await;
+        let request: ReconcileUsdcRequest = serde_json::from_value(serde_json::json!({
+            "reason": "funds-moved-manually",
+            "supersedingTx": TxHash::repeat_byte(0x77),
+        }))
+        .unwrap();
+        let recheck = RecordingUsdcRecheck {
+            superseding_txs: std::sync::Mutex::new(Vec::new()),
+        };
+
+        check_signed_deposit_send_superseded(
+            Some(&recheck),
+            &id,
+            &load_usdc_rebalance(&state.pool, &id).await,
+            request.superseding_tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *recheck.superseding_txs.lock().unwrap(),
+            vec![Some(TxHash::repeat_byte(0x77))]
         );
     }
 

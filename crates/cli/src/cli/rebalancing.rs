@@ -1442,8 +1442,9 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
     reason: ReconcileReason,
+    superseding_tx: Option<TxHash>,
     pool: &SqlitePool,
-    verify_deposit_send: impl AsyncFnOnce(&PreparedTransaction) -> anyhow::Result<()>,
+    verify_deposit_send: impl AsyncFnOnce(&PreparedTransaction, Option<TxHash>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let id = UsdcRebalanceId(id);
     writeln!(stdout, "Reconciling stuck USDC transfer id: {id}")?;
@@ -1474,10 +1475,19 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
 
     // The aggregate command is pure, so the chain proof that the signed send
     // can never mine is read here, before the command.
-    if let Some(prepared) = state.prepared_deposit_send() {
-        verify_deposit_send(prepared).await.with_context(|| {
-            format!("transfer reconcile: refusing to reconcile USDC transfer {id}")
-        })?;
+    match (state.prepared_deposit_send(), superseding_tx) {
+        (Some(prepared), _) => {
+            verify_deposit_send(prepared, superseding_tx)
+                .await
+                .with_context(|| {
+                    format!("transfer reconcile: refusing to reconcile USDC transfer {id}")
+                })?;
+        }
+        (None, Some(_)) => anyhow::bail!(
+            "transfer reconcile: --superseding-tx applies only to a transfer with a signed \
+             deposit send; transfer {id} has none. Refusing to act."
+        ),
+        (None, None) => {}
     }
 
     usdc_store
@@ -3146,6 +3156,7 @@ mod tests {
             &mut stdout,
             unknown_id,
             ReconcileReason::FundsMovedManually,
+            None,
             &pool,
             no_deposit_send_to_verify,
         )
@@ -3189,6 +3200,7 @@ mod tests {
             &mut stdout,
             id,
             ReconcileReason::FundsMovedManually,
+            None,
             &pool,
             no_deposit_send_to_verify,
         )
@@ -3264,6 +3276,7 @@ mod tests {
             &mut stdout,
             id,
             ReconcileReason::FundsMovedManually,
+            None,
             &pool,
             no_deposit_send_to_verify,
         )
@@ -3293,7 +3306,10 @@ mod tests {
     }
 
     /// Transfers without a signed deposit send have nothing to check on chain.
-    async fn no_deposit_send_to_verify(prepared: &PreparedTransaction) -> anyhow::Result<()> {
+    async fn no_deposit_send_to_verify(
+        prepared: &PreparedTransaction,
+        _superseding_tx: Option<TxHash>,
+    ) -> anyhow::Result<()> {
         panic!("no signed deposit send to verify, got: {prepared:?}")
     }
 
@@ -3326,8 +3342,9 @@ mod tests {
             &mut stdout,
             id,
             ReconcileReason::FundsMovedManually,
+            None,
             &pool,
-            async |checked: &PreparedTransaction| {
+            async |checked: &PreparedTransaction, _| {
                 assert_eq!(checked, &prepared, "the chain check reads the signed send");
                 Err(DepositSendNotSuperseded::NoSupersedingTx {
                     tx: checked.tx_hash(),
@@ -3358,6 +3375,49 @@ mod tests {
         assert!(
             matches!(state, UsdcRebalance::Bridged { .. }),
             "a refused reconcile leaves the transfer Bridged, got: {state:?}"
+        );
+    }
+
+    /// A superseding tx names what took a signed send's nonce, so it is refused
+    /// on a transfer with no signed send rather than silently ignored.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_refuses_a_superseding_tx_without_a_signed_deposit_send() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xD5E3);
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_deposit_failed(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            Some(TxHash::repeat_byte(0xCA)),
+            &pool,
+            no_deposit_send_to_verify,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "transfer reconcile: --superseding-tx applies only to a transfer with a signed \
+                 deposit send; transfer {} has none. Refusing to act.",
+                UsdcRebalanceId(id)
+            )
+        );
+        let state = store
+            .load(&UsdcRebalanceId(id))
+            .await
+            .unwrap()
+            .expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::DepositFailed { .. }),
+            "a refused reconcile leaves the transfer as it was, got: {state:?}"
         );
     }
 
@@ -3392,8 +3452,16 @@ mod tests {
             &mut stdout,
             id,
             ReconcileReason::FundsMovedManually,
+            Some(TxHash::repeat_byte(0xCA)),
             &pool,
-            async |_: &PreparedTransaction| Ok(()),
+            async |_: &PreparedTransaction, superseding_tx| {
+                assert_eq!(
+                    superseding_tx,
+                    Some(TxHash::repeat_byte(0xCA)),
+                    "the chain check gets the operator's superseding tx"
+                );
+                Ok(())
+            },
         )
         .await
         .unwrap();

@@ -757,9 +757,10 @@ the startup token approvals.
     minted USDC to Alpaca by hand if needed, then
     `stox transfer reconcile --kind usdc --id <id> --reason <reason> --superseding-tx <cancel>`
     (valid for a Base->Alpaca `Bridged` with a signed send; the API takes
-    `supersedingTx` in the body), then restart the bot to release the send's
-    nonce so later sends from the wallet proceed. `<cancel>` is the hash of the
-    tx that took the send's nonce. Reconcile reads it on the bot's Ethereum node
+    `supersedingTx` in the body; both refuse it for a transfer with no signed
+    send, the API with `400`), then restart the bot to release the send's nonce
+    so later sends from the wallet proceed. `<cancel>` is the hash of the tx
+    that took the send's nonce. Reconcile reads it on the bot's Ethereum node
     and refuses (the API with `409`) unless it is mined from the bot wallet, at
     the send's nonce, is not `<tx>` itself, has the required confirmations, and
     paid the Alpaca deposit address no USDC (a fee-bumped copy of the send did,

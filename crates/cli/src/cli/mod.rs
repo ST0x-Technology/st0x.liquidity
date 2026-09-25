@@ -939,10 +939,11 @@ pub enum TransferCommand {
         /// `deposit-credited-offline`; for `mint`/`redemption` it is free text.
         #[arg(short = 'r', long = "reason")]
         reason: AuditReason,
-        /// usdc only, required for a transfer with a signed deposit send: the
-        /// tx that took the send's nonce (e.g. the cancel). The bot checks that
-        /// it is from the bot's Ethereum wallet, at the send's nonce, not the
-        /// send itself, and has the required confirmations.
+        /// usdc only, required for a transfer with a signed deposit send and
+        /// refused for any other: the tx that took the send's nonce (the
+        /// 0-value self-transfer cancel). The bot checks that it is from the
+        /// bot's Ethereum wallet, at the send's nonce, not the send itself, has
+        /// the required confirmations, and paid the deposit address no USDC.
         #[arg(long = "superseding-tx")]
         superseding_tx: Option<TxHash>,
     },
@@ -1893,8 +1894,9 @@ async fn run_transfer_command<W: Write>(
                 stdout,
                 id,
                 reason.into(),
+                superseding_tx,
                 pool,
-                async |prepared: &PreparedTransaction| {
+                async |prepared: &PreparedTransaction, superseding_tx| {
                     rebalancing::verify_deposit_send_superseded_on_chain(
                         ctx,
                         prepared,

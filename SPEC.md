@@ -6882,7 +6882,8 @@ therefore performs an explicit fund-moving send:
      (`--superseding-tx`) and refuses unless the chain shows it mined from the
      bot wallet at the send's nonce, distinct from the send, with the required
      confirmations, and paying the send's deposit address no USDC, so a
-     fee-bumped copy of the send is refused.
+     fee-bumped copy of the send is refused. A superseding tx on a transfer with
+     no signed send is refused.
    - Mined reverted: it moved no USDC. The bot does not sign another send; it
      emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
      (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job

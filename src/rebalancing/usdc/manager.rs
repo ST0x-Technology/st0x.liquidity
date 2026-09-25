@@ -15587,7 +15587,7 @@ mod tests {
     /// nodes at different heights, so they do not prove the send can never
     /// mine: only a tx the operator names at the send's nonce does.
     #[tokio::test]
-    async fn deposit_send_is_not_superseded_by_a_nonce_read_past_it_and_no_receipt() {
+    async fn deposit_send_is_not_superseded_without_a_named_superseding_tx() {
         let bridge = MockBridge::new();
         let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 3);
 
