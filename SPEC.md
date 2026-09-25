@@ -6844,11 +6844,14 @@ therefore performs an explicit fund-moving send:
      job redrives after 30 s, broadcasting the same bytes again, with no retry
      budget. Once 4 hours have passed since the send was persisted, every
      redrive pages the operator and the cadence slows to 30 minutes. A signed
-     send is never re-signed or fee-bumped, so one whose nonce another tx took,
-     or signed at a fee the market then outran, can never confirm; the operator
-     verifies on chain and settles it with `transfer reconcile --kind usdc`,
-     which accepts a BaseToAlpaca `Bridged` with a signed send, then restarts
-     the bot to release the send's nonce.
+     send is never re-signed or fee-bumped. One whose nonce another tx took
+     never confirms. One that will not confirm at its current fee can still mine
+     when fees drop, so the operator first cancels it: a higher-fee 0-value
+     self-transfer from the bot wallet at the same nonce, mined. Only once a
+     different tx is mined at the send's nonce does the operator settle the
+     minted USDC and run `transfer reconcile --kind usdc`, which accepts a
+     BaseToAlpaca `Bridged` with a signed send, then restart the bot to release
+     the send's nonce.
    - Mined reverted: it moved no USDC. The bot does not sign another send; it
      emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
      (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job

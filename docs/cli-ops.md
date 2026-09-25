@@ -638,11 +638,11 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   left Alpaca even with no burn, e.g. the settlement deadline, a missing
   withdrawal tx hash, or a withdrawal credit mismatch), a `BaseToAlpaca`
   `ConversionFailed`, and a `BaseToAlpaca` `Bridged` with a signed deposit send
-  that you verified on chain will never confirm (see "Base->Alpaca deposit send
-  pages"). Its `--reason` must be one of `funds-moved-manually` or
-  `deposit-credited-offline`; any other value is rejected. Every other state is
-  rejected, including `WithdrawalFailed` and an `AlpacaToBase`
-  `ConversionFailed`, whose funds never left Alpaca.
+  whose nonce you verified on chain is taken by a different mined tx (see
+  "Base->Alpaca deposit send pages"). Its `--reason` must be one of
+  `funds-moved-manually` or `deposit-credited-offline`; any other value is
+  rejected. Every other state is rejected, including `WithdrawalFailed` and an
+  `AlpacaToBase` `ConversionFailed`, whose funds never left Alpaca.
 - `--kind usdc` is bookkeeping only: it moves no funds. Before you reconcile a
   post-burn `BridgingFailed`, finish the transfer by hand: (1) read the recorded
   nonce (`usedNonces`) on the destination chain (Base for `AlpacaToBase`,
@@ -724,14 +724,38 @@ the nonce of every signed send still on `Bridged`.
 - **"signed deposit send <tx> is not confirmed yet ... It has stayed unconfirmed
   for ..."** (`DepositSendReconciliationPending`, paged every 30 minutes once 4
   hours have passed since the send was signed): the transfer stays `Bridged`,
-  holds the guard, and the job keeps broadcasting the same bytes. Check `<tx>`
-  on chain. Pending with a low fee, or absent while the bot wallet's nonce has
-  moved past it (another tx took its nonce): it will never confirm, because the
-  bot never re-signs or fee-bumps it. Move the minted USDC by hand if needed,
-  then `stox transfer reconcile --kind usdc --id <id> --reason <reason>` (valid
-  for a Base->Alpaca `Bridged` with a signed send), then restart the bot to
-  release the send's nonce so later sends from the wallet proceed. If it
-  confirmed, do nothing: the next redrive continues the deposit.
+  holds the guard, and the job keeps broadcasting the same bytes. The bot never
+  re-signs or fee-bumps it. Check `<tx>` on chain:
+  - Confirmed: do nothing. The next redrive continues the deposit.
+  - No receipt, and the bot wallet's `latest` nonce is past the send's nonce: a
+    different tx took the nonce, so the send can never mine. Settle it (below).
+  - Pending, or dropped while the nonce is still free: it will not confirm at
+    its current fee, but it can still mine when fees drop, and the bot keeps
+    rebroadcasting it. Do **not** move the USDC or reconcile yet: that can move
+    the minted USDC twice. Wait for fees to drop, or cancel the send. There is
+    no CLI command for the cancel yet; do it by hand:
+    1. Read the send's nonce from `<tx>` on a block explorer, or from the
+       database:
+
+       ```sql
+       SELECT json_extract(payload, '$.DepositSendPrepared.prepared.nonce')
+       FROM events
+       WHERE aggregate_id = '<id>'
+         AND event_type = 'UsdcRebalanceEvent::DepositSendPrepared';
+       ```
+    2. From the bot's Ethereum wallet (its signer), send a 0-value ETH transfer
+       to the wallet itself at that nonce, with `maxFeePerGas` and
+       `maxPriorityFeePerGas` at least 10% above `<tx>`'s and `maxFeePerGas`
+       above the current base fee.
+    3. Wait until the cancel has the required confirmations, then check that
+       `<tx>` has no receipt and the wallet's `latest` nonce is past the send's
+       nonce. If `<tx>` mined instead, do nothing: the next redrive continues
+       the deposit.
+  - To settle, only once a different tx is mined at the send's nonce: move the
+    minted USDC to Alpaca by hand if needed, then
+    `stox transfer reconcile --kind usdc --id <id> --reason <reason>` (valid for
+    a Base->Alpaca `Bridged` with a signed send), then restart the bot to
+    release the send's nonce so later sends from the wallet proceed.
 - **"Could not list signed Alpaca deposit sends at startup"** or **"Could not
   load a transfer with a signed Alpaca deposit send at startup"**
   (`operational_alert`): the bot started without reserving that send's nonce, so

@@ -143,10 +143,11 @@ const WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_sec
 /// Duration after which repeated `DepositSendReconciliationPending` redrives
 /// page the operator, anchored on the persisted `prepared_at` of the signed
 /// Alpaca deposit send so the countdown survives restarts. A signed send is
-/// never re-signed or fee-bumped, so one whose nonce another tx took, or
-/// signed at a fee the market outran, can never confirm; before the deadline
-/// the redrive is silent, and the deadline keeps that stall from becoming a
-/// multi-day outage while later sends from the wallet queue behind its nonce.
+/// never re-signed or fee-bumped, so one whose nonce another tx took never
+/// confirms and one signed below the market fee waits until fees drop; before
+/// the deadline the redrive is silent, and the deadline keeps that stall from
+/// becoming a multi-day outage while later sends from the wallet queue behind
+/// its nonce.
 const DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Delay before rebroadcasting a signed deposit send whose outcome is not
@@ -1340,13 +1341,15 @@ impl TransferUsdcToHedging {
         if let Some(elapsed) = alert_deadline_elapsed {
             let message = format!(
                 "{error}. It has stayed unconfirmed for {elapsed:?} \
-                 (>{DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE:?}). A signed send whose nonce \
-                 another tx took, or signed at a fee the market then outran, cannot confirm and \
-                 is never re-signed or fee-bumped, so later sends from the Ethereum wallet queue \
-                 behind its nonce. Automatic rebroadcast continues at a slower cadence (guard \
-                 held). Verify the send on chain; if it can never confirm, settle the minted \
-                 USDC, reconcile the transfer (`transfer reconcile --kind usdc --id {id}`), then \
-                 restart the bot to release the send's nonce."
+                 (>{DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE:?}). The send is never re-signed \
+                 or fee-bumped, so later sends from the Ethereum wallet queue behind its nonce. \
+                 Automatic rebroadcast continues at a slower cadence (guard held). A send that \
+                 will not confirm at its current fee can still mine when fees drop: do not move \
+                 the minted USDC or reconcile until a different tx is mined at the send's nonce \
+                 (cancel it with a higher-fee 0-value self-transfer at that nonce from the bot \
+                 wallet, see docs/cli-ops.md). Only then settle the minted USDC, reconcile the \
+                 transfer (`transfer reconcile --kind usdc --id {id}`) and restart the bot to \
+                 release the send's nonce."
             );
             if let Err(notify_error) = ctx.notifier.notify(&message).await {
                 warn!(target: "rebalance", ?notify_error, "Failed to deliver deposit-send reconciliation deadline alert");
