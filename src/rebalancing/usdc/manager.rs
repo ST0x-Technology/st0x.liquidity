@@ -384,6 +384,10 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     /// the USDC-to-Alpaca wallet transfer succeed (ADR 0017).
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
     credit_ledger: CreditLedger,
+    /// Held across the sign and persist of a deposit send, so a redrive
+    /// waits for a timed-out attempt's prepare and takes its persisted send
+    /// instead of signing at the next nonce.
+    deposit_send_prepare: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Where the Ethereum wallet credit ledger reads the open transfers from.
@@ -689,6 +693,7 @@ impl<
             gas_readiness: ConfiguredGasReadiness::default(),
             bot_gas_enqueuer,
             credit_ledger: CreditLedger::Unwired,
+            deposit_send_prepare: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -4812,6 +4817,10 @@ impl<
     /// future between the two: a signed send that was never persisted keeps
     /// its nonce reserved and stalls every later send from the wallet. A
     /// failed write goes through `release_unpersisted_deposit_send`.
+    ///
+    /// Sign and persist run under `deposit_send_prepare`, after a reload: a
+    /// send another attempt persisted is returned instead of signing a
+    /// second one, whose nonce could be left as a gap.
     async fn prepare_and_persist_deposit_send(
         &self,
         id: &UsdcRebalanceId,
@@ -4820,9 +4829,19 @@ impl<
     ) -> Result<(PreparedTransaction, DateTime<Utc>), UsdcTransferError> {
         let cctp_bridge = Arc::clone(&self.cctp_bridge);
         let cqrs = Arc::clone(&self.cqrs);
+        let prepare_lock = Arc::clone(&self.deposit_send_prepare);
         let task_id = id.clone();
 
         tokio::spawn(async move {
+            let _prepare_guard = prepare_lock.lock().await;
+
+            if let Some(UsdcRebalance::Bridged { deposit_send, .. }) = cqrs.load(&task_id).await?
+                && let Some((persisted, prepared_at)) = deposit_send.prepared()
+            {
+                info!(target: "rebalance", id = %task_id, tx = %persisted.tx_hash(), "Another attempt persisted the signed Alpaca deposit send; not signing again");
+                return Ok((persisted.clone(), prepared_at));
+            }
+
             let prepared = cctp_bridge
                 .prepare_usdc_on_ethereum(deposit_address, amount)
                 .await
@@ -6019,7 +6038,8 @@ fn total_credits(
 
 /// After a failed `PrepareDepositSend` write, releases the signed send's
 /// nonce when a reload proves these bytes are not persisted: `Bridged` with
-/// no signed send, or with another attempt's (two prepares raced). The write
+/// no signed send, or with another's (not expected: prepares of one manager
+/// are serialized, so only a second process could persist one). The write
 /// may have committed, so any other reload keeps the nonce reserved rather
 /// than risk reusing it under bytes that can still be sent, and pages: every
 /// later send from the wallet waits behind it until a restart.
@@ -15895,15 +15915,13 @@ mod tests {
         assert!(!state.has_prepared_deposit_send(), "got: {state:?}");
     }
 
-    /// Two prepares for one transfer (a timed-out attempt and its redrive)
-    /// race: the loser's write finds the winner's signed send persisted, so
-    /// the loser's bytes can never be sent and its nonce is released.
+    /// A signed send whose write failed while another signed send for the
+    /// transfer is persisted can never be sent, so its nonce is released and
+    /// the persisted send is kept.
     #[tokio::test]
     async fn raced_deposit_send_prepare_releases_the_losing_nonce() {
-        let bridge = Arc::new(MockBridge::new().with_send_usdc_tx(MOCK_DEPOSIT_SEND_TX));
+        let bridge = Arc::new(MockBridge::new());
         let cqrs = create_test_store_instance().await;
-        let (manager, _server, _anvil) =
-            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), TxHash::ZERO).await;
@@ -15916,18 +15934,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let loser = PreparedTransaction::for_test(TxHash::repeat_byte(0xB2), 8);
 
-        let error = manager
-            .prepare_and_persist_deposit_send(&id, Address::random(), U256::from(99_990_000))
-            .await
-            .unwrap_err();
+        release_unpersisted_deposit_send(&*bridge, &cqrs, &id, &loser).await;
 
-        assert!(
-            matches!(error, UsdcTransferError::Aggregate(_)),
-            "got: {error:?}"
-        );
-        assert_eq!(bridge.usdc_discarded(), vec![MOCK_DEPOSIT_SEND_TX]);
-        assert!(bridge.usdc_broadcasts().is_empty());
+        assert_eq!(bridge.usdc_discarded(), vec![loser.tx_hash()]);
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         let UsdcRebalance::Bridged { deposit_send, .. } = state else {
             panic!("expected Bridged, got: {state:?}");
@@ -15938,6 +15949,37 @@ mod tests {
                 .map(|(prepared, _)| prepared.tx_hash()),
             Some(winner.tx_hash())
         );
+    }
+
+    /// A prepare after another attempt persisted a signed send returns that
+    /// send and signs nothing.
+    #[tokio::test]
+    async fn deposit_send_prepare_takes_an_already_persisted_send() {
+        let bridge = Arc::new(MockBridge::new().with_send_usdc_tx(MOCK_DEPOSIT_SEND_TX));
+        let cqrs = create_test_store_instance().await;
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), TxHash::ZERO).await;
+        let persisted = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 7);
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::PrepareDepositSend {
+                prepared: persisted.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (prepared, _) = manager
+            .prepare_and_persist_deposit_send(&id, Address::random(), U256::from(99_990_000))
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.tx_hash(), persisted.tx_hash());
+        assert_eq!(bridge.usdc_prepare_calls(), 0);
+        assert!(bridge.usdc_discarded().is_empty());
     }
 
     /// A timed-out attempt's prepare is still signing when its redrive
