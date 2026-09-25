@@ -16057,6 +16057,162 @@ mod tests {
         assert_eq!(restored, vec![prepared_only.tx_hash(), recorded.tx_hash()]);
     }
 
+    /// Makes every load of `id` fail: its first event no longer deserializes,
+    /// and no snapshot lets the load skip it.
+    async fn corrupt_usdc_rebalance(pool: &SqlitePool, id: &UsdcRebalanceId) {
+        sqlx::query("DELETE FROM snapshots WHERE aggregate_id = ?1")
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE events SET payload = '{\"NotAnEvent\":{}}' \
+             WHERE aggregate_id = ?1 AND sequence = 1",
+        )
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A startup list failure pages and startup continues with nothing
+    /// restored.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn startup_restore_pages_when_signed_deposit_sends_cannot_be_listed() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let bridge = Arc::new(MockBridge::new());
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+        sqlx::query("DROP TABLE events")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 0);
+
+        assert!(bridge.usdc_restored().is_empty());
+        assert!(logs_contain(
+            "Could not list signed Alpaca deposit sends at startup; their nonces are not \
+             reserved until each transfer resumes"
+        ));
+    }
+
+    /// A signed send under an unparseable transfer id pages, and the others
+    /// are still restored.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn startup_restore_pages_an_unparseable_transfer_id_and_restores_the_rest() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let bridge = Arc::new(MockBridge::new());
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        persist_event::<UsdcRebalance>(
+            &pool,
+            "not-a-transfer-id",
+            1,
+            &UsdcRebalanceEvent::DepositSendPrepared {
+                prepared: PreparedTransaction::for_test(TxHash::repeat_byte(0xB1), 2),
+                prepared_at: Utc::now(),
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99"), TxHash::ZERO).await;
+        let signed = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 3);
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::PrepareDepositSend {
+                prepared: signed.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 1);
+
+        assert_eq!(bridge.usdc_restored(), vec![signed.tx_hash()]);
+        assert!(logs_contain(
+            "Signed Alpaca deposit sends with unparseable transfer ids were not restored at \
+             startup"
+        ));
+        assert!(logs_contain("not-a-transfer-id"));
+    }
+
+    /// A transfer that fails to load pages with its id, and the others are
+    /// still restored.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn startup_restore_pages_a_transfer_that_fails_to_load_and_restores_the_rest() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let bridge = Arc::new(MockBridge::new());
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let mut signed = Vec::new();
+        for (byte, nonce) in [(0xA1, 3), (0xA2, 4)] {
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99"), TxHash::ZERO).await;
+            let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(byte), nonce);
+            cqrs.send(
+                &id,
+                UsdcRebalanceCommand::PrepareDepositSend {
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            signed.push((id, prepared));
+        }
+        let (broken, _) = &signed[0];
+        let (_, loadable_send) = &signed[1];
+        corrupt_usdc_rebalance(&pool, broken).await;
+
+        assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 1);
+
+        assert_eq!(bridge.usdc_restored(), vec![loadable_send.tx_hash()]);
+        assert!(logs_contain(
+            "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce \
+             is not reserved until it resumes"
+        ));
+        assert!(logs_contain(&format!("id={broken}")));
+    }
+
+    /// A failed deposit send write whose reload also fails keeps the nonce
+    /// reserved, since the bytes may be persisted, and pages.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn unpersisted_deposit_send_whose_reload_fails_keeps_its_nonce_and_pages() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let bridge = MockBridge::new();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99"), TxHash::ZERO).await;
+        corrupt_usdc_rebalance(&pool, &id).await;
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(0xC1), 5);
+
+        release_unpersisted_deposit_send(&bridge, &cqrs, &id, &prepared).await;
+
+        assert!(
+            bridge.usdc_discarded().is_empty(),
+            "the nonce stays reserved"
+        );
+        assert!(logs_contain(
+            "Cannot tell whether a signed Alpaca deposit send was persisted; its nonce stays \
+             reserved and later Ethereum wallet sends wait behind it until a restart"
+        ));
+        assert!(logs_contain(&format!("id={id}")));
+    }
+
     /// Sends `amount` USDC from the bot wallet to the Alpaca deposit address.
     async fn send_usdc_to_alpaca<Signer: Wallet>(wallet: &Signer, amount: U256) -> TxHash {
         wallet
