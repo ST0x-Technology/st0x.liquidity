@@ -284,12 +284,9 @@ pub enum UsdcRebalanceError {
     /// No deposit send was started, so there is no send to record.
     #[error("no deposit send was started for this transfer")]
     DepositSendNotStarted,
-    /// `RecordPendingDeposit` was given a hash other than the persisted signed
-    /// send's, which is the only send this transfer can make.
-    #[error(
-        "RecordPendingDeposit hash {recorded} does not match the prepared deposit send \
-         hash {prepared}"
-    )]
+    /// A deposit tx other than the persisted signed send's, which is the only
+    /// send this transfer can make.
+    #[error("deposit tx {recorded} does not match the prepared deposit send hash {prepared}")]
     PreparedDepositHashMismatch { recorded: TxHash, prepared: TxHash },
     /// The deposit send tx is already recorded and is never replaced.
     #[error("deposit send {recorded} is already recorded for this transfer")]
@@ -4034,10 +4031,30 @@ impl UsdcRebalance {
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
-            Self::Bridged { .. } => Ok(vec![DepositInitiated {
-                deposit_ref: deposit,
-                deposit_initiated_at,
-            }]),
+            Self::Bridged { deposit_send, .. } => {
+                // A signed send is the only send this transfer can make.
+                if let Some((prepared, _)) = deposit_send.prepared() {
+                    let TransferRef::OnchainTx(recorded) = &deposit else {
+                        return Err(UsdcRebalanceError::InvalidCommand {
+                            command: "InitiateDeposit".to_string(),
+                            state: "Bridged with a signed deposit send, given a non-onchain \
+                                    deposit ref"
+                                .to_string(),
+                        });
+                    };
+                    if *recorded != prepared.tx_hash() {
+                        return Err(UsdcRebalanceError::PreparedDepositHashMismatch {
+                            recorded: *recorded,
+                            prepared: prepared.tx_hash(),
+                        });
+                    }
+                }
+
+                Ok(vec![DepositInitiated {
+                    deposit_ref: deposit,
+                    deposit_initiated_at,
+                }])
+            }
             Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. }
