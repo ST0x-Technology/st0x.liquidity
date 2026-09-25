@@ -5758,28 +5758,31 @@ effect rather than a generic intent:
   the same `witness -> enrich -> acknowledge -> mark -> settle` exactly-once
   sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two
   commands above it belongs to no object group -- there is no stuck aggregate to
-  recover, only a missing fill to backfill. It is **idempotent on a fill already
-  acknowledged** in the `OnChainTrade` log: it changes nothing and reports
-  `AlreadyAccounted`, or `AlreadyExcluded` for a fill kept out of hedging, since
-  applying it again would double count the position; a fill that was witnessed
-  but not yet acknowledged is resumed from where the earlier run stopped. It has
-  two execution paths. The **CLI** runs it in direct-DB mode, in a separate
-  process from the bot: because no in-process lock can serialize across
-  processes, fill accounting holds a file lock beside the database from the
-  durable dedup check through the Position acknowledge, and the bot takes the
-  same lock, so a concurrent actor on the same fill finds it recorded instead of
-  counting it twice (see the accounting bullet below). The CLI path still **must
-  not run while the bot is live**: its standalone stores reach none of the bot's
-  live reactors, its submitted orders are enrolled for status polling only at
-  the next bot startup, and its placer has no admission gate (see below). The
-  file locks are defense in depth, not a supported concurrent mode. The **in-bot
-  REST route** (`POST /liquidity-write/transactions/{tx_hash}/process`) instead
-  runs inside the live bot and serializes its position claim and broker
-  placement against the trading loop through the shared counter-trade submission
-  lock (ADR 0014), so it does **not** require stopping the bot; it gates on full
-  startup readiness (503 until then), selects the hedged chain from the `chain`
-  query (defaulting to the primary), returns the decoded fill alongside its
-  outcome, and runs the accounting and placement on a detached task so a client
+  recover, only a missing fill to backfill. It **does not repeat fill accounting
+  or hedging for a fill already acknowledged** in the `OnChainTrade` log, since
+  applying it again would double count the position: it reports
+  `AlreadyAccounted`, or `AlreadyExcluded` for a fill kept out of hedging. It
+  may still repair bookkeeping on that fill: it records a missing source
+  attribution on the `OnChainTrade`, and settles the fill if a crash between
+  mark and settle left it pending (ADR 0010). A fill that was witnessed but not
+  yet acknowledged is resumed from where the earlier run stopped. It has two
+  execution paths. The **CLI** runs it in direct-DB mode, in a separate process
+  from the bot: because no in-process lock can serialize across processes, fill
+  accounting holds a file lock beside the database from the durable dedup check
+  through the Position acknowledge, and the bot takes the same lock, so a
+  concurrent actor on the same fill finds it recorded instead of counting it
+  twice (see the accounting bullet below). The CLI path still **must not run
+  while the bot is live**: its standalone stores reach none of the bot's live
+  reactors, its submitted orders are enrolled for status polling only at the
+  next bot startup, and its placer has no admission gate (see below). The file
+  locks are defense in depth, not a supported concurrent mode. The **in-bot REST
+  route** (`POST /liquidity-write/transactions/{tx_hash}/process`) instead runs
+  inside the live bot and serializes its position claim and broker placement
+  against the trading loop through the shared counter-trade submission lock (ADR
+  0014), so it does **not** require stopping the bot; it gates on full startup
+  readiness (503 until then), selects the hedged chain from the `chain` query
+  (defaulting to the primary), returns the decoded fill alongside its outcome,
+  and runs the accounting and placement on a detached task so a client
   disconnect cannot strand a placed order before its Submitted event persists.
   Graceful shutdown waits for that task, up to the drain timeout, and a request
   arriving once the drain began refuses with 503; a task still running at the
@@ -5872,8 +5875,9 @@ effect rather than a generic intent:
   `ReconcileStuckRebalance` command (see above) is the first realization of the
   `reconcile` verb.
 - **`process-tx` implements the ADR-0005 exactly-once fill accounting
-  protocol.** It is idempotent (reporting it as already accounted) if the fill
-  is already acknowledged, resumes if it was witnessed but not yet acknowledged
+  protocol.** It does not repeat accounting for a fill already acknowledged
+  (reporting it as already accounted, and only repairing its source attribution
+  or a pending settle), resumes if it was witnessed but not yet acknowledged
   (crash- recovery window), and creates the full witness/acknowledge record for
   genuinely missed fills — so every subsequent re-delivery, whether from another
   CLI run or the normal pipeline, hits the dedup guard and skips cleanly.

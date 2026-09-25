@@ -1611,7 +1611,9 @@ pub mod process_tx {
         NoTradeableEvents,
         /// The selected chain's RPC endpoint did not find the transaction.
         TransactionNotFound { tx_hash: TxHash, chain: Chain },
-        /// The fill was already fully accounted; nothing to do.
+        /// The fill was already fully accounted, so its accounting and hedge were
+        /// not repeated. The run may still have recorded a missing source
+        /// attribution or settled a fill a crash left pending.
         AlreadyAccounted,
         /// An existing pending hedge is in flight, so the fill was settled
         /// without placing a new hedge.
