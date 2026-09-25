@@ -3298,6 +3298,18 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             gas_readiness,
         );
 
+        // Before any job can send from the Ethereum wallet: a signed deposit
+        // send persisted before the restart keeps its nonce.
+        let restored_deposit_sends = usdc_handles
+            .restore_deposit_sends
+            .restore_prepared_deposit_sends(&deps.pool)
+            .await;
+        info!(
+            target: "rebalance",
+            restored_deposit_sends,
+            "Restored the nonces of signed Alpaca deposit sends"
+        );
+
         let deliver_mint_authorization_ctx = Arc::new(DeliverMintAuthorizationCtx {
             deliverer: mint_authorization.issuance_client,
             mint_store: built.mint.clone(),

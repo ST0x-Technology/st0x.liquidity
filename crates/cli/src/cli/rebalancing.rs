@@ -646,8 +646,8 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// delayed-redrive outcomes: `AttestationTimedOut`, the settlement-wait
 /// errors (`WithdrawalTxUnderconfirmed`, `WithdrawalScanTransient`,
 /// `SettlementCheckTransient`), a non-backpressure
-/// `WithdrawalPollInconclusive` (Alpaca unreachable), and
-/// `MintRecoveryInconclusive`. The CLI must NOT keep redriving these itself:
+/// `WithdrawalPollInconclusive` (Alpaca unreachable),
+/// `MintRecoveryInconclusive`, and `DepositSendReconciliationPending`. The CLI must NOT keep redriving these itself:
 /// its process would race the bot's worker on the same aggregate (the
 /// CLI-vs-server race), so the first such outcome hands the transfer off to
 /// the running bot instead. Errors outside this set -- including
@@ -659,7 +659,8 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::WithdrawalTxUnderconfirmed { .. }
         | UsdcTransferError::WithdrawalScanTransient { .. }
         | UsdcTransferError::SettlementCheckTransient { .. }
-        | UsdcTransferError::MintRecoveryInconclusive { .. } => true,
+        | UsdcTransferError::MintRecoveryInconclusive { .. }
+        | UsdcTransferError::DepositSendReconciliationPending { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
             source.backpressure().is_none()
         }
@@ -715,7 +716,8 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::BurnSubmitInconclusive { .. }
         | UsdcTransferError::BurnTxDropped { .. }
         | UsdcTransferError::DepositSendUnresolved { .. }
-        | UsdcTransferError::DepositSendRecordFailed { .. } => false,
+        | UsdcTransferError::DepositSendTaskPanicked { .. }
+        | UsdcTransferError::PreparedDepositHashMismatch { .. } => false,
     }
 }
 
@@ -1452,15 +1454,15 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     };
 
     // Authoritative gate is the aggregate command; this preflight shares its
-    // predicate (`is_reconcilable_failure`, the single source of the
-    // reconcile-eligibility rule) only to give the operator a clearer error
-    // first.
-    if !state.is_reconcilable_failure() {
+    // predicates (`is_reconcilable_failure` and `has_prepared_deposit_send`)
+    // only to give the operator a clearer error first.
+    if !state.is_reconcilable_failure() && !state.has_prepared_deposit_send() {
         anyhow::bail!(
             "transfer reconcile: transfer {id} is in state {state:?}, not a terminal \
              failure that strands the in-progress guard or off-venue funds (DepositFailed, \
              post-burn BridgingFailed, AlpacaToBase BridgingFailed, or a BaseToAlpaca \
-             ConversionFailed). Refusing to act."
+             ConversionFailed), nor a Base->Alpaca Bridged with a signed deposit send. \
+             Refusing to act."
         );
     }
 
@@ -3146,8 +3148,8 @@ mod tests {
             err_msg.ends_with(
                 ", not a terminal failure that strands the in-progress guard or \
                  off-venue funds (DepositFailed, post-burn BridgingFailed, \
-                 AlpacaToBase BridgingFailed, or a BaseToAlpaca ConversionFailed). \
-                 Refusing to act."
+                 AlpacaToBase BridgingFailed, or a BaseToAlpaca ConversionFailed), nor \
+                 a Base->Alpaca Bridged with a signed deposit send. Refusing to act."
             ),
             "reconcile of an in-progress aggregate must refuse with the exact \
              contract text; got: {err_msg}"

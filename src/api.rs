@@ -2172,14 +2172,15 @@ async fn reconcile_usdc_transfer(
         ));
     };
 
-    if !rebalance.is_reconcilable_failure() {
+    if !rebalance.is_reconcilable_failure() && !rebalance.has_prepared_deposit_send() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: format!(
                     "Transfer {id} is in {}, not a reconcilable terminal failure \
                      (DepositFailed, post-burn BridgingFailed, a BaseToAlpaca \
-                     ConversionFailed, or an AlpacaToBase BridgingFailed); refusing \
+                     ConversionFailed, or an AlpacaToBase BridgingFailed) nor a \
+                     BaseToAlpaca Bridged with a signed deposit send; refusing \
                      to reconcile.",
                     rebalance.state_name()
                 ),

@@ -14,7 +14,9 @@ pub(crate) use job::{
     TransferUsdcToMarketMakingJobQueue,
 };
 pub use manager::{CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams};
-pub(crate) use manager::{RecheckUsdcDeposit, UsdcRecheckError, u256_to_usdc};
+pub(crate) use manager::{
+    RecheckUsdcDeposit, RestorePreparedDepositSends, UsdcRecheckError, u256_to_usdc,
+};
 
 use std::time::Duration;
 
@@ -508,21 +510,50 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         cause: UnresolvedDepositSend,
     },
-    /// The Base->Alpaca deposit send may be broadcast, but its tx is not
-    /// recorded: every `RecordPendingDeposit` attempt failed (`send_tx` is in
-    /// the logs), or the task that broadcasts and records it panicked. The
-    /// aggregate stays `Bridged`; the job pages and does not retry, because a
-    /// retry cannot see an unmined send and could send again.
-    #[error(
-        "USDC rebalance {id}: deposit send may be broadcast but its tx was not \
-         recorded (send tx {}); `transfer resume --kind usdc` fails the deposit \
-         for reconciliation without sending again",
-        .send_tx.map_or_else(|| "unknown".to_string(), |send_tx| send_tx.to_string())
-    )]
-    DepositSendRecordFailed {
+    /// The signed Base->Alpaca deposit send is persisted but not confirmed
+    /// yet: its broadcast was not accepted, its receipt is not known, or it
+    /// was dropped. The aggregate stays `Bridged` and the job redrives, which
+    /// broadcasts the same signed bytes again; it can never send twice.
+    /// `prepared_at` anchors the durable operator alert deadline.
+    #[error("USDC rebalance {id}: signed deposit send {tx} is not confirmed yet: {cause}")]
+    DepositSendReconciliationPending {
         id: UsdcRebalanceId,
-        send_tx: Option<TxHash>,
+        tx: TxHash,
+        prepared_at: DateTime<Utc>,
+        cause: DepositSendPending,
     },
+    /// The task that signs and persists the deposit send panicked. The signed
+    /// send is either persisted, and the retry broadcasts it, or it is not,
+    /// and the retry signs one; nothing was broadcast.
+    #[error("USDC rebalance {id}: the deposit send prepare task panicked; nothing was broadcast")]
+    DepositSendTaskPanicked { id: UsdcRebalanceId },
+    /// The broadcast of the signed deposit send returned a hash other than
+    /// the persisted one, so the recorded identity would not be the tx that
+    /// confirms.
+    #[error(
+        "USDC rebalance {id}: signed deposit send hash mismatch: expected {expected}, \
+         broadcast returned {actual}"
+    )]
+    PreparedDepositHashMismatch {
+        id: UsdcRebalanceId,
+        expected: TxHash,
+        actual: TxHash,
+    },
+}
+
+/// Why a signed Base->Alpaca deposit send is not confirmed yet.
+#[derive(Debug, Error)]
+pub enum DepositSendPending {
+    /// The RPC did not accept the broadcast. The node may not see the tx
+    /// yet, or another tx took its nonce.
+    #[error("its broadcast was not accepted: {0}")]
+    Broadcast(#[source] Box<CctpError>),
+    /// Its receipt could not be read to the required confirmations.
+    #[error("its confirmation is not known: {0}")]
+    Confirmation(#[source] Box<CctpError>),
+    /// Absent from the mempool, never mined.
+    #[error("it was dropped from the mempool")]
+    Dropped,
 }
 
 /// Why a Base->Alpaca deposit send cannot be resolved automatically.
@@ -536,19 +567,8 @@ pub enum UnresolvedDepositSend {
          Alpaca deposit address landed after the mint and may belong to another transfer"
     )]
     UnrecordedSend { tx: TxHash },
-    /// The broadcast timed out or failed after the request was sent, so the
-    /// send may be on chain.
-    #[error("the deposit send broadcast failed or timed out and may still be on chain")]
-    SubmitInconclusive,
-    /// A send was started but its tx was never recorded: its attempt timed
-    /// out or crashed mid-broadcast, or the write failed. It may be on chain.
-    #[error("a deposit send was started but its tx was not recorded; it may be on chain")]
-    SendNotRecorded,
     #[error("the recorded deposit send {tx} was mined reverted")]
     RecordedSendReverted { tx: TxHash },
-    /// Dropped from the mempool, but a dropped tx can still be rebroadcast.
-    #[error("the recorded deposit send {tx} was dropped from the mempool")]
-    RecordedSendDropped { tx: TxHash },
 }
 
 impl UnresolvedDepositSend {
@@ -557,16 +577,12 @@ impl UnresolvedDepositSend {
         match self {
             // No send is recorded on the transfer: the operator must find
             // this transfer's own send on chain, if there is one.
-            Self::UnrecordedSend { .. } | Self::SubmitInconclusive | Self::SendNotRecorded => {
+            Self::UnrecordedSend { .. } => {
                 "`transfer recheck --kind usdc --deposit-tx <hash>` with this transfer's own \
                  send if Alpaca credited it, else `transfer reconcile --kind usdc`"
             }
             Self::RecordedSendReverted { .. } => {
                 "the send moved no USDC; settle the minted USDC with `transfer reconcile --kind usdc`"
-            }
-            Self::RecordedSendDropped { .. } => {
-                "`transfer recheck --kind usdc` if the send was mined and Alpaca credited it, \
-                 else `transfer reconcile --kind usdc`"
             }
         }
     }
@@ -626,7 +642,9 @@ impl UsdcTransferError {
             | Self::BurnSubmitInconclusive { .. }
             | Self::BurnTxDropped { .. }
             | Self::DepositSendUnresolved { .. }
-            | Self::DepositSendRecordFailed { .. } => None,
+            | Self::DepositSendReconciliationPending { .. }
+            | Self::DepositSendTaskPanicked { .. }
+            | Self::PreparedDepositHashMismatch { .. } => None,
         }
     }
 }
@@ -685,7 +703,9 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::BurnSubmitInconclusive { .. }
             | Self::BurnTxDropped { .. }
             | Self::DepositSendUnresolved { .. }
-            | Self::DepositSendRecordFailed { .. } => false,
+            | Self::DepositSendReconciliationPending { .. }
+            | Self::DepositSendTaskPanicked { .. }
+            | Self::PreparedDepositHashMismatch { .. } => false,
         }
     }
 }
