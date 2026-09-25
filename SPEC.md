@@ -3830,6 +3830,10 @@ enum UsdcRebalance {
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
+        // BaseToAlpaca deposit send: NotStarted, Prepared (signed and
+        // persisted) or Recorded (broadcast at least once). NotStarted for
+        // snapshots taken before this field existed.
+        deposit_send: DepositSend,
     },
     BridgingFailed {
         direction: RebalanceDirection,

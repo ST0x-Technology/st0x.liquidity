@@ -1414,13 +1414,12 @@ impl UsdcRebalance {
     /// USDC this transfer was credited with that may still sit in the shared
     /// Ethereum wallet: credited from its delivering tx and not yet sent on.
     /// A BaseToAlpaca credit leaves with the Alpaca deposit send: in flight
-    /// once its hash is recorded, gone at `DepositInitiated`. An AlpacaToBase
-    /// credit arrives with the withdrawal tx Alpaca reported and leaves with
-    /// the burn, and
-    /// `BridgingSubmitting` cannot tell whether it has: a recorded burn may
-    /// be unmined, and with no recorded hash the burn may be unsent or
-    /// broadcast with its hash lost (`BurnRecordFailed`, an inconclusive
-    /// submit).
+    /// once the send is signed (`Prepared`), gone at `DepositInitiated`. An
+    /// AlpacaToBase credit arrives with the withdrawal tx Alpaca reported and
+    /// leaves with the burn, and `BridgingSubmitting` cannot tell whether it
+    /// has: a recorded burn may be unmined, and with no recorded hash the burn
+    /// may be unsent or broadcast with its hash lost (`BurnRecordFailed`, an
+    /// inconclusive submit).
     pub(crate) fn ethereum_wallet_credit(&self) -> Option<EthereumWalletCredit> {
         match self {
             Self::WithdrawalComplete {
@@ -2854,10 +2853,8 @@ impl EventSourced for UsdcRebalance {
                 failed_at: *failed_at,
             },
 
-            // Un-fail a BaseToAlpaca `DepositFailed` whose Alpaca deposit
-            // settled after the polling deadline. Only matches the shape the
-            // command validates (BaseToAlpaca with an on-chain deposit ref);
-            // any other pairing falls through to an invalid transition.
+            // Records the operator-verified send on a BaseToAlpaca
+            // `DepositFailed` that had none.
             (
                 DepositSendAttached { send_tx, .. },
                 Self::DepositFailed {
@@ -2881,6 +2878,10 @@ impl EventSourced for UsdcRebalance {
                 failed_at: *failed_at,
             },
 
+            // Un-fail a BaseToAlpaca `DepositFailed` whose Alpaca deposit
+            // settled after the polling deadline. Only matches the shape the
+            // command validates (BaseToAlpaca with an on-chain deposit ref);
+            // any other pairing falls through to an invalid transition.
             (
                 DepositCompletionRecovered { recovered_at },
                 Self::DepositFailed {
@@ -4129,13 +4130,6 @@ impl UsdcRebalance {
         }
     }
 
-    /// Un-fail a BaseToAlpaca `DepositFailed` whose Alpaca deposit settled
-    /// after the polling deadline, transitioning to `DepositConfirmed` so
-    /// the USDC->USD conversion leg completes. Valid only from a
-    /// BaseToAlpaca `DepositFailed` carrying an on-chain deposit ref: the
-    /// send tx is the identity the recheck verified at Alpaca, while an
-    /// AlpacaToBase deposit is the bot's own on-chain tx (reconcile
-    /// territory, not provider recheck).
     /// Attaches an operator-verified send to a BaseToAlpaca `DepositFailed`
     /// with none recorded. A recorded send is never replaced.
     fn transition_attach_deposit_send(
@@ -4166,6 +4160,13 @@ impl UsdcRebalance {
         }
     }
 
+    /// Un-fail a BaseToAlpaca `DepositFailed` whose Alpaca deposit settled
+    /// after the polling deadline, transitioning to `DepositConfirmed` so
+    /// the USDC->USD conversion leg completes. Valid only from a
+    /// BaseToAlpaca `DepositFailed` carrying an on-chain deposit ref: the
+    /// send tx is the identity the recheck verified at Alpaca, while an
+    /// AlpacaToBase deposit is the bot's own on-chain tx (reconcile
+    /// territory, not provider recheck).
     fn transition_recover_deposit(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {

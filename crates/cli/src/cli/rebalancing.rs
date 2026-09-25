@@ -650,10 +650,10 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// errors (`WithdrawalTxUnderconfirmed`, `WithdrawalScanTransient`,
 /// `SettlementCheckTransient`), a non-backpressure
 /// `WithdrawalPollInconclusive` (Alpaca unreachable),
-/// `MintRecoveryInconclusive`, and `DepositSendReconciliationPending`. The CLI must NOT keep redriving these itself:
-/// its process would race the bot's worker on the same aggregate (the
-/// CLI-vs-server race), so the first such outcome hands the transfer off to
-/// the running bot instead. Errors outside this set -- including
+/// `MintRecoveryInconclusive`, and `DepositSendReconciliationPending`. The
+/// CLI must NOT keep redriving these itself: its process would race the
+/// bot's worker on the same aggregate (the CLI-vs-server race), so the first
+/// such outcome hands the transfer off to the running bot instead. Errors outside this set -- including
 /// `AttestationRetryDeadlineElapsed` and a previously-failed aggregate --
 /// are terminal for the CLI invocation.
 fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
