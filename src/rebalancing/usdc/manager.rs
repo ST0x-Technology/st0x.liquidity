@@ -6562,6 +6562,7 @@ mod tests {
         CctpAttestationMock, CctpBridge, CctpCorridor, CctpCtx, TestMintBurnToken,
         deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
     };
+    use st0x_config::HedgedChain;
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::{AbiDecodedErrorType, Evm, EvmError, IERC20, NoOpErrorRegistry, Wallet};
@@ -15281,6 +15282,25 @@ mod tests {
         cqrs: Arc<Store<UsdcRebalance>>,
     ) -> CrossVenueCashTransfer<RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>>
     {
+        build_deposit_manager_with_settlement(
+            chain,
+            server,
+            alpaca_wallet,
+            cqrs,
+            &test_settlement_params(),
+        )
+        .await
+    }
+
+    /// [`build_deposit_manager`] with the given settlement parameters.
+    async fn build_deposit_manager_with_settlement(
+        chain: &EthereumUsdcChain,
+        server: &MockServer,
+        alpaca_wallet: Arc<AlpacaWalletService>,
+        cqrs: Arc<Store<UsdcRebalance>>,
+        settlement: &UsdcSettlementParams,
+    ) -> CrossVenueCashTransfer<RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>>
+    {
         let alpaca_broker = InstrumentedAlpacaBroker::new(
             create_test_broker_service(server).await,
             TelemetrySender::disabled(),
@@ -15295,7 +15315,7 @@ mod tests {
             Arc::new(vault_service),
             cqrs,
             MarketMakingUsdcEndpoints::new(chain.bot_address, TEST_VAULT_ID),
-            &test_settlement_params(),
+            settlement,
             BotGasReceiptCostEnqueuer::Disabled,
         )
     }
@@ -15667,6 +15687,58 @@ mod tests {
             .verify_deposit_send_superseded(&prepared, Some(cancel))
             .await
             .unwrap();
+    }
+
+    /// The cancel lands on Ethereum, so it needs Ethereum's depth, not the
+    /// primary chain's: one between the two is not yet proof.
+    #[tokio::test]
+    async fn deposit_send_superseding_tx_needs_the_ethereum_confirmation_depth() {
+        let mut chains = ChainRegistry::single_hedged_chain(
+            HedgedChain::test().required_confirmations(3).call(),
+        );
+        chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::Ethereum)
+                .required_confirmations(5)
+                .call(),
+        );
+        let settlement = UsdcSettlementParams {
+            ethereum_required_confirmations: deposit_send_required_confirmations(&chains).unwrap(),
+            ..test_settlement_params()
+        };
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let manager = build_deposit_manager_with_settlement(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            create_test_store_instance().await,
+            &settlement,
+        )
+        .await;
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let prepared = sign_usdc_to_alpaca(&wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
+        let bot_provider = bot_provider(&chain).await;
+        let cancel =
+            send_self_transfer(&bot_provider, chain.bot_address, Some(prepared.nonce())).await;
+        bot_provider.anvil_mine(Some(3), None).await.unwrap();
+
+        let error = manager
+            .verify_deposit_send_superseded(&prepared, Some(cancel))
+            .await
+            .expect_err("4 confirmations are past Base's depth but short of Ethereum's");
+
+        assert!(
+            matches!(
+                error,
+                DepositSendNotSuperseded::SupersedingTxUnconfirmed {
+                    confirmations: 4,
+                    required: 5,
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
     }
 
     /// A named tx proves nothing unless the bot wallet mined it at the send's
