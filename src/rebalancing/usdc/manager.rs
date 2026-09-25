@@ -4802,9 +4802,8 @@ impl<
     /// Signs the deposit send and persists it (`PrepareDepositSend`) before
     /// any broadcast, on a detached task so a job timeout cannot drop the
     /// future between the two: a signed send that was never persisted keeps
-    /// its nonce reserved and stalls every later send from the wallet. If the
-    /// write fails and a reload shows it did not land, the nonce is released;
-    /// otherwise the persisted send is left for the resume to broadcast.
+    /// its nonce reserved and stalls every later send from the wallet. A
+    /// failed write goes through `release_unpersisted_deposit_send`.
     async fn prepare_and_persist_deposit_send(
         &self,
         id: &UsdcRebalanceId,
@@ -4836,16 +4835,8 @@ impl<
                 )
                 .await;
             if let Err(error) = persisted {
-                // The write can fail after it committed. Only a reload that
-                // shows no signed send proves these bytes will never be sent.
-                if let Ok(Some(UsdcRebalance::Bridged {
-                    deposit_send: DepositSend::NotStarted,
-                    ..
-                })) = cqrs.load(&task_id).await
-                {
-                    cctp_bridge.discard_usdc_on_ethereum(&prepared).await;
-                }
                 error!(target: "rebalance", id = %task_id, ?error, "Failed to persist the signed Alpaca deposit send; not broadcasting");
+                release_unpersisted_deposit_send(&*cctp_bridge, &cqrs, &task_id, &prepared).await;
                 return Err(error.into());
             }
 
@@ -6016,6 +6007,40 @@ fn total_credits(
     )?;
 
     Ok((usdc_to_u256(held)?, usdc_to_u256((held + in_flight)?)?))
+}
+
+/// After a failed `PrepareDepositSend` write, releases the signed send's
+/// nonce when a reload proves these bytes are not persisted: `Bridged` with
+/// no signed send, or with another attempt's (two prepares raced). The write
+/// may have committed, so any other reload keeps the nonce reserved rather
+/// than risk reusing it under bytes that can still be sent, and pages: every
+/// later send from the wallet waits behind it until a restart.
+async fn release_unpersisted_deposit_send<Helper: UsdcBridgeHelper + ?Sized>(
+    cctp_bridge: &Helper,
+    cqrs: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    prepared: &PreparedTransaction,
+) {
+    let tx = prepared.tx_hash();
+    let nonce = prepared.nonce();
+
+    let reload = cqrs.load(id).await;
+    if let Ok(Some(UsdcRebalance::Bridged { deposit_send, .. })) = &reload {
+        let persisted = deposit_send
+            .prepared()
+            .map(|(persisted, _)| persisted.tx_hash());
+        if persisted == Some(tx) {
+            warn!(target: "rebalance", %id, %tx, "The failed deposit send write committed; the resume broadcasts it");
+            return;
+        }
+
+        warn!(target: "rebalance", %id, %tx, nonce, ?persisted, "Releasing the nonce of a signed Alpaca deposit send that was not persisted");
+        cctp_bridge.discard_usdc_on_ethereum(prepared).await;
+        return;
+    }
+
+    let reload = reload.map(|state| state.map(|state| state.state_name()));
+    error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?reload, "Cannot tell whether a signed Alpaca deposit send was persisted; its nonce stays reserved and later Ethereum wallet sends wait behind it until a restart");
 }
 
 fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcTransferError> {

@@ -6830,10 +6830,12 @@ therefore performs an explicit fund-moving send:
    persists the signed transaction on `Bridged` with `PrepareDepositSend`
    (refused if a send was already signed, so one transfer has one send). The
    sign and persist run on a detached task, so a job timeout cannot stop between
-   them. If the write fails and a reload shows no signed send, the nonce is
-   released and nothing is sent; a failure to sign sends nothing, and the job
-   retries. Then it broadcasts the persisted bytes ("already known" counts as
-   success), records the hash with `RecordPendingDeposit` (it must equal the
+   them. If the write fails and a reload shows no signed send, or another
+   attempt's signed send (two prepares raced), the nonce is released and nothing
+   is sent; if the reload fails, the nonce stays reserved and the bot pages,
+   since the bytes may be persisted. A failure to sign sends nothing, and the
+   job retries. Then it broadcasts the persisted bytes ("already known" counts
+   as success), records the hash with `RecordPendingDeposit` (it must equal the
    signed send's hash), and waits for the send to reach the required
    confirmations.
    - Broadcast refused or failed, receipt not known yet, or the send dropped
