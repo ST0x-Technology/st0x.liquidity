@@ -16450,6 +16450,27 @@ mod tests {
         assert_eq!(broadcasts, vec![mined.tx_hash(), pending.tx_hash()]);
     }
 
+    /// A listing that fails may hide a signed send whose nonce is then not
+    /// reserved, so it counts as unmined and startup skips the Ethereum
+    /// wallet's approvals and revokes.
+    #[tokio::test]
+    async fn startup_restore_counts_a_failed_listing_as_unmined() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let bridge = Arc::new(MockBridge::new());
+        let (manager, _server, _anvil) = deposit_send_manager(cqrs, Arc::clone(&bridge)).await;
+        let unmigrated = SqlitePool::connect(":memory:").await.unwrap();
+
+        assert_eq!(
+            manager.restore_prepared_deposit_sends(&unmigrated).await,
+            RestoredDepositSends {
+                restored: 0,
+                unmined: 1,
+            }
+        );
+    }
+
     /// A restored send whose rebroadcast fails keeps its nonce, pages, and is
     /// counted so startup skips the Ethereum wallet's approvals.
     #[tracing_test::traced_test]
