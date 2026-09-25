@@ -6908,7 +6908,10 @@ therefore performs an explicit fund-moving send:
    - **No signed send:** scan Ethereum for a USDC
      `Transfer(from = bot wallet, to = deposit address, value = amount received)`
      at or after the mint tx's block. This covers transfers that reached
-     `Bridged` on a build that sent without persisting the signed send first.
+     `Bridged` on a build that sent without persisting the signed send first, so
+     only a transfer loaded at `Bridged` runs it. A transfer that reaches
+     `Bridged` during the resume (an adopted attested mint, or a post-burn
+     `BridgingFailed` recovery) has no send yet and signs and sends at once.
      None found: sign and send as in step 2. One found: it may be another
      corridor's send of the same amount through the shared wallet, so the bot
      never adopts it: it emits `FailDeposit` with no `deposit_ref` and pages

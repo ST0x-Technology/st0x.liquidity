@@ -4354,13 +4354,8 @@ impl<
             )
             .await?;
 
-        self.continue_from_bridged_resume(
-            id,
-            amount_received,
-            mint_receipt.tx,
-            DepositSend::NotStarted,
-        )
-        .await
+        // The transfer failed before `Bridged`, so it has no send yet.
+        self.continue_from_bridged_fresh(id, amount_received).await
     }
 
     fn require_base_to_alpaca(
@@ -4660,13 +4655,10 @@ impl<
                 .await;
         };
 
-        self.continue_from_bridged_resume(
-            id,
-            u256_to_usdc(mint_receipt.amount)?,
-            mint_receipt.tx,
-            DepositSend::NotStarted,
-        )
-        .await
+        // The adopted mint moves the transfer to `Bridged` only now, so it has
+        // no send yet.
+        self.continue_from_bridged_fresh(id, u256_to_usdc(mint_receipt.amount)?)
+            .await
     }
 
     /// Mints on the destination chain from a fresh attestation and continues to
@@ -4700,8 +4692,9 @@ impl<
     ///
     /// # Fresh vs resume
     ///
-    /// Reached right after this execution minted, so no send exists yet: it
-    /// sends with no pre-send chain scan. The signed send is persisted on
+    /// Reached right after this execution moved the transfer to `Bridged` (a
+    /// fresh mint, an adopted attested mint, or a `BridgingFailed` recovery),
+    /// so no send exists yet: it sends with no pre-send chain scan. The signed send is persisted on
     /// `Bridged` before its broadcast, so a crash before `InitiateDeposit`
     /// resumes by broadcasting those same bytes
     /// ([`continue_from_bridged_resume`](Self::continue_from_bridged_resume)).
@@ -14850,7 +14843,7 @@ mod tests {
             )
             .await
             .unwrap();
-        ethereum_wallet
+        let unrelated_send = ethereum_wallet
             .send(
                 USDC_ADDRESS,
                 Bytes::from(
@@ -14863,7 +14856,8 @@ mod tests {
                 "unrelated deposit send",
             )
             .await
-            .unwrap();
+            .unwrap()
+            .transaction_hash;
 
         let server = MockServer::start();
         let _address_mock = mock_alpaca_deposit_address(&server);
@@ -14908,17 +14902,18 @@ mod tests {
             cqrs.send(&id, command).await.unwrap();
         }
 
-        // No Alpaca deposit is mocked, so the leg stops at the Alpaca poll,
-        // after its own send.
+        // No Alpaca deposit is mocked, so the leg fails at the Alpaca poll,
+        // after its own send is recorded.
         manager
             .resume_base_to_alpaca(&id, amount)
             .await
             .unwrap_err();
 
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
-        assert!(
-            matches!(state, UsdcRebalance::DepositInitiated { .. }),
-            "the recovered transfer sends its own deposit, got: {state:?}"
+        assert_ne!(
+            deposit_ref_tx(&state),
+            unrelated_send,
+            "the recovered transfer records its own send"
         );
         let balance: U256 = ethereum_wallet
             .call::<NoOpErrorRegistry, _>(
