@@ -15845,6 +15845,51 @@ mod tests {
         assert!(!state.has_prepared_deposit_send(), "got: {state:?}");
     }
 
+    /// Two prepares for one transfer (a timed-out attempt and its redrive)
+    /// race: the loser's write finds the winner's signed send persisted, so
+    /// the loser's bytes can never be sent and its nonce is released.
+    #[tokio::test]
+    async fn raced_deposit_send_prepare_releases_the_losing_nonce() {
+        let bridge = Arc::new(MockBridge::new().with_send_usdc_tx(MOCK_DEPOSIT_SEND_TX));
+        let cqrs = create_test_store_instance().await;
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), TxHash::ZERO).await;
+        let winner = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 7);
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::PrepareDepositSend {
+                prepared: winner.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .prepare_and_persist_deposit_send(&id, Address::random(), U256::from(99_990_000))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Aggregate(_)),
+            "got: {error:?}"
+        );
+        assert_eq!(bridge.usdc_discarded(), vec![MOCK_DEPOSIT_SEND_TX]);
+        assert!(bridge.usdc_broadcasts().is_empty());
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::Bridged { deposit_send, .. } = state else {
+            panic!("expected Bridged, got: {state:?}");
+        };
+        assert_eq!(
+            deposit_send
+                .prepared()
+                .map(|(prepared, _)| prepared.tx_hash()),
+            Some(winner.tx_hash())
+        );
+    }
+
     /// Startup restores the nonce of every signed send still on `Bridged`,
     /// recorded or not, and of no other transfer.
     #[tokio::test]
