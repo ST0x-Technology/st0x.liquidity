@@ -727,8 +727,8 @@ impl<
 
     /// Refuses, before any call, a transfer this service's corridor does not
     /// carry: one recorded on another corridor, or a fresh one asking for
-    /// another. The transfer is left untouched; the job's dead-letter alert
-    /// pages with this error once its retries are spent.
+    /// another. The transfer is left untouched; the job ends without a retry
+    /// and the rebalancing sweep pages once.
     fn require_served_corridor(
         &self,
         id: &UsdcRebalanceId,

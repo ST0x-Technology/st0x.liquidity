@@ -777,6 +777,22 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                      nothing to redrive, leaving for operator reconciliation"
                 );
             }
+            // Permanent for this build: a retry or dead letter would only page
+            // again. The rebalancing sweep holds the transfer and pages once.
+            Err(UsdcTransferError::CorridorMismatch {
+                id,
+                recorded,
+                served,
+            }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %recorded,
+                    %served,
+                    "Base->Alpaca USDC transfer is on a corridor this build does not serve; \
+                     left for the operator"
+                );
+            }
             Err(UsdcTransferError::WithdrawalScanTransient {
                 id,
                 initiated_at,
@@ -1613,6 +1629,22 @@ impl TransferUsdcToMarketMaking {
                     %id,
                     "Alpaca->Base USDC transfer already in a terminal failed state; \
                      nothing to redrive, leaving for operator reconciliation"
+                );
+            }
+            // Permanent for this build: a retry or dead letter would only page
+            // again. The rebalancing sweep holds the transfer and pages once.
+            Err(UsdcTransferError::CorridorMismatch {
+                id,
+                recorded,
+                served,
+            }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %recorded,
+                    %served,
+                    "Alpaca->Base USDC transfer is on a corridor this build does not serve; \
+                     left for the operator"
                 );
             }
             // The withdrawal tx did not pay this withdrawal (nothing, or more

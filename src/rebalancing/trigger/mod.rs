@@ -210,6 +210,15 @@ pub(crate) enum UsdcResumeError {
     GuardHeldElsewhere,
     #[error("USDC rebalancing stores are not wired yet (conductor still starting)")]
     NotReady,
+    #[error(
+        "USDC transfer corridor mismatch: rebalance {id} runs on the {recorded} corridor, \
+         this build serves {served}; nothing was enqueued"
+    )]
+    CorridorNotServed {
+        id: UsdcRebalanceId,
+        recorded: UsdcCorridor,
+        served: UsdcCorridor,
+    },
     #[error("aggregate error: {0}")]
     Aggregate(#[source] Box<st0x_event_sorcery::SendError<UsdcRebalance>>),
     #[error(transparent)]
@@ -274,6 +283,9 @@ pub(crate) struct RebalancingServiceConfig {
     /// The corridor new cash transfers run on and its band; `None` while
     /// USDC mode is disabled.
     pub(crate) usdc: Option<UsdcCorridorCtx>,
+    /// The corridor this build's cash transfer service carries, whatever the
+    /// USDC mode. A transfer recorded on another one is held, never re-armed.
+    pub(crate) served_usdc_corridor: UsdcCorridor,
     pub(crate) transfer_timeout: Duration,
     /// Every hedged chain's asset table and minimum. The planner slots a
     /// symbol on each chain that rebalances it; the USDC trigger reads the
@@ -889,6 +901,9 @@ pub(crate) struct RebalancingService {
     /// silence the page about stranded funds: the alert is re-attempted on every
     /// sweep until one delivery succeeds, while the error log stays one-shot.
     post_burn_timeout_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    /// Transfers on a corridor this build does not serve whose page was
+    /// delivered, so the sweep pages once, not every tick.
+    corridor_not_served_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     mint_event_sync: Arc<Mutex<()>>,
     redemption_event_sync: Arc<Mutex<()>>,
     usdc_event_sync: Arc<Mutex<()>>,
@@ -944,6 +959,10 @@ enum UsdcTimeoutCleanup {
         corridor: UsdcCorridor,
         amount: Usdc,
     },
+    /// The same pre-burn Alpaca-to-Base state, recorded on a corridor this
+    /// build does not serve: a re-armed job could only be refused, so the
+    /// guard stays held and the operator is paged once.
+    HeldForUnservedCorridor { corridor: UsdcCorridor },
 }
 
 /// Outcome of examining a tracked redemption during the timeout sweep.
@@ -1060,6 +1079,7 @@ impl RebalancingService {
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
+            corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
@@ -1914,10 +1934,46 @@ impl RebalancingService {
                         .await?;
                     self.usdc_in_progress.store(true, Ordering::SeqCst);
                 }
+                UsdcTimeoutCleanup::HeldForUnservedCorridor { corridor } => {
+                    self.usdc_in_progress.store(true, Ordering::SeqCst);
+                    self.page_unserved_corridor_once(&id, corridor).await;
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Pages once per transfer (retried until delivered) that it runs on a
+    /// corridor this build does not serve and is held with its guard.
+    async fn page_unserved_corridor_once(&self, id: &UsdcRebalanceId, corridor: UsdcCorridor) {
+        if self.corridor_not_served_alerted.read().await.contains(id) {
+            return;
+        }
+
+        let served = self.config.served_usdc_corridor;
+        let message = format!(
+            "USDC transfer corridor mismatch: transfer {id} runs on the {corridor} corridor, \
+             which this build does not serve (it serves {served}). Held with its guard and \
+             not re-armed; deploy a build that serves {corridor} (docs/cli-ops.md)."
+        );
+
+        match self.notifier.notify(&message).await {
+            Ok(()) => {
+                self.corridor_not_served_alerted
+                    .write()
+                    .await
+                    .insert(id.clone());
+            }
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    ?error,
+                    "Failed to deliver the unserved-corridor page; will retry next sweep"
+                );
+            }
+        }
     }
 
     /// Whether a USDC transfer apalis row for `id` exists in *either* direction in
@@ -2376,6 +2432,23 @@ impl RebalancingService {
         let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
         if let Some(store) = usdc_store {
             match store.load(id).await {
+                Ok(Some(
+                    UsdcRebalance::Withdrawing {
+                        direction: RebalanceDirection::AlpacaToBase,
+                        corridor,
+                        ..
+                    }
+                    | UsdcRebalance::WithdrawalComplete {
+                        direction: RebalanceDirection::AlpacaToBase,
+                        corridor,
+                        ..
+                    },
+                )) if corridor != self.config.served_usdc_corridor => {
+                    drop(tracking_guard);
+                    return Ok(Some(UsdcTimeoutCleanup::HeldForUnservedCorridor {
+                        corridor,
+                    }));
+                }
                 Ok(Some(
                     UsdcRebalance::Withdrawing {
                         direction: RebalanceDirection::AlpacaToBase,
@@ -5263,6 +5336,14 @@ impl RebalancingService {
             });
         }
 
+        if state.corridor() != self.config.served_usdc_corridor {
+            return Err(UsdcResumeError::CorridorNotServed {
+                id: id.clone(),
+                recorded: state.corridor(),
+                served: self.config.served_usdc_corridor,
+            });
+        }
+
         // Clean terminals have nothing to resume; refusing here beats
         // enqueueing a job that immediately errors. Exhaustive so a new
         // variant forces a conscious classification.
@@ -6683,6 +6764,12 @@ impl RebalancingService {
             policy,
         } in candidates
         {
+            if corridor != self.config.served_usdc_corridor {
+                self.usdc_in_progress.store(true, Ordering::SeqCst);
+                self.page_unserved_corridor_once(&id, corridor).await;
+                continue;
+            }
+
             let blocked = match policy {
                 RearmPolicy::RecoverableFailure | RearmPolicy::AlpacaToBaseIdempotentRedrive => {
                     self.transfer_live_job_for_id(&id).await?
@@ -8054,6 +8141,7 @@ mod tests {
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
+            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
@@ -11175,6 +11263,7 @@ mod tests {
 
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -27303,6 +27392,7 @@ mod tests {
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,

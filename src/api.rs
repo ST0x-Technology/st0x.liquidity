@@ -1884,13 +1884,13 @@ async fn resume_usdc_transfer(
 /// stay generic (the full error is logged at the call site).
 fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
-        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, Database, DirectionMismatch,
-        GuardHeldElsewhere, NotFound, NotReady, Queue,
+        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CorridorNotServed, Database,
+        DirectionMismatch, GuardHeldElsewhere, NotFound, NotReady, Queue,
     };
 
     match error {
         NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
-        DirectionMismatch { .. } | AlreadyTerminal { .. } => {
+        DirectionMismatch { .. } | AlreadyTerminal { .. } | CorridorNotServed { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
         }
         AlreadyInFlight { .. } | GuardHeldElsewhere => (StatusCode::CONFLICT, error.to_string()),
