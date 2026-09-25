@@ -772,10 +772,13 @@ before the startup token approvals.
     and refuses (the API with `409`) unless it is mined from the bot wallet, at
     the send's nonce, is not `<tx>` itself, has Ethereum's required
     confirmations, and paid the Alpaca deposit address no USDC (a fee-bumped
-    copy of the send did, so the deposit went through); each refusal names the
-    failed check. No receipt for `<tx>` is not proof: a lagging node shows none
-    for a send that did mine. "could not read superseding tx" (the API: `502`)
-    is transient; retry.
+    copy of the send did, so the deposit went through) unless another transfer
+    signed, attached or recorded it as its own deposit send (the deposit address
+    is shared, so another transfer's send can take the nonce); each refusal
+    names the failed check. No receipt for `<tx>` is not proof: a lagging node
+    shows none for a send that did mine. "could not read superseding tx" (the
+    API: `502`) and "could not check whether another transfer recorded
+    superseding tx" (the API: `500`) are transient; retry.
 - **"Could not list signed Alpaca deposit sends at startup"** or **"Could not
   load a transfer with a signed Alpaca deposit send at startup"**
   (`operational_alert`): the bot started without reserving that send's nonce, so

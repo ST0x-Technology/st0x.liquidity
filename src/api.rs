@@ -2336,7 +2336,7 @@ async fn check_signed_deposit_send_superseded(
     })?;
 
     usdc_recheck
-        .verify_deposit_send_superseded(prepared, superseding_tx)
+        .verify_deposit_send_superseded(id, prepared, superseding_tx)
         .await
         .map_err(|error| {
             warn!(?error, %id, "Refused to reconcile a USDC transfer with a signed deposit send");
@@ -2368,6 +2368,10 @@ fn deposit_send_not_superseded_response(
         DepositSendNotSuperseded::Read { .. } => (
             StatusCode::BAD_GATEWAY,
             "Ethereum RPC unavailable; retry later".to_string(),
+        ),
+        DepositSendNotSuperseded::Lookup { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Event store read failed; retry later".to_string(),
         ),
     }
 }
@@ -7413,6 +7417,7 @@ mod tests {
 
         async fn verify_deposit_send_superseded(
             &self,
+            _id: &UsdcRebalanceId,
             _prepared: &st0x_evm::PreparedTransaction,
             superseding_tx: Option<TxHash>,
         ) -> Result<(), DepositSendNotSuperseded> {
@@ -7485,6 +7490,19 @@ mod tests {
             (
                 StatusCode::BAD_GATEWAY,
                 "Ethereum RPC unavailable; retry later".to_string()
+            ),
+        );
+        assert_eq!(
+            deposit_send_not_superseded_response(
+                &id,
+                &DepositSendNotSuperseded::Lookup {
+                    superseding: tx,
+                    source: sqlx::Error::PoolClosed,
+                },
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Event store read failed; retry later".to_string()
             ),
         );
     }

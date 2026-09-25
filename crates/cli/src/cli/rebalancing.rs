@@ -1522,11 +1522,14 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     Ok(())
 }
 
-/// Proves on the configured Ethereum wallet that `prepared` can never mine:
-/// `superseding_tx` is the wallet's tx at its nonce, with the confirmation
-/// depth the bot's USDC transfers use.
+/// Proves on the configured Ethereum wallet that `prepared`, the signed
+/// deposit send of transfer `id`, can never mine: `superseding_tx` is the
+/// wallet's tx at its nonce, with the confirmation depth the bot's USDC
+/// transfers use. `pool` tells another transfer's deposit send from a copy.
 pub(super) async fn verify_deposit_send_superseded_on_chain(
     ctx: &Ctx,
+    pool: &SqlitePool,
+    id: &UsdcRebalanceId,
     prepared: &PreparedTransaction,
     superseding_tx: Option<TxHash>,
 ) -> anyhow::Result<()> {
@@ -1545,6 +1548,8 @@ pub(super) async fn verify_deposit_send_superseded_on_chain(
 
     Ok(verify_deposit_send_superseded(
         &bridge,
+        Some(pool),
+        id,
         prepared,
         superseding_tx,
         wallet_ctx.ethereum_wallet().address(),

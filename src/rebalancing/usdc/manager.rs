@@ -6440,8 +6440,9 @@ pub enum DepositSendNotSuperseded {
     },
     #[error(
         "superseding tx {superseding} paid {paid} USDC units to the Alpaca deposit address \
-         {deposit_address}, like the deposit send it would replace: the deposit went \
-         through, so do not reconcile. Cancel a send only with a 0-value self-transfer"
+         {deposit_address}, like the deposit send it would replace, and no other transfer \
+         recorded it: the deposit went through, so do not reconcile. Cancel a send only \
+         with a 0-value self-transfer"
     )]
     SupersedingTxPaidTheDepositAddress {
         superseding: TxHash,
@@ -6454,6 +6455,14 @@ pub enum DepositSendNotSuperseded {
     UnreadableDepositSend { tx: TxHash },
     #[error(transparent)]
     EthereumChainMissing(#[from] EthereumChainMissing),
+    /// Reading the event store for another transfer's claim on the
+    /// superseding tx failed -- transient, retry later.
+    #[error("could not check whether another transfer recorded superseding tx {superseding}")]
+    Lookup {
+        superseding: TxHash,
+        #[source]
+        source: sqlx::Error,
+    },
     /// Reading Ethereum failed -- transient, retry later.
     #[error("could not read superseding tx {superseding} on Ethereum; retry")]
     Read {
@@ -6463,15 +6472,20 @@ pub enum DepositSendNotSuperseded {
     },
 }
 
-/// Proves that `prepared` can never mine.
+/// Proves that `prepared`, the signed deposit send of transfer `id`, can
+/// never mine.
 ///
 /// The operator-named `superseding_tx` must be a different tx from
-/// `bot_wallet` at the send's nonce with `required_confirmations` that paid
-/// the send's deposit address nothing, so a fee-bumped copy of the send is
-/// refused. Only a tx the node shows as mined counts, so a node that lags
-/// refuses rather than proves.
+/// `bot_wallet` at the send's nonce with `required_confirmations`. It must
+/// pay the send's deposit address nothing, so a fee-bumped copy of the send
+/// is refused, unless another transfer in `event_store` signed, attached or
+/// recorded it as its own deposit send: the deposit address is shared, so
+/// that send is not a copy of this one. Only a tx the node shows as mined
+/// counts, so a node that lags refuses rather than proves.
 pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
     bridge: &Helper,
+    event_store: Option<&SqlitePool>,
+    id: &UsdcRebalanceId,
     prepared: &PreparedTransaction,
     superseding_tx: Option<TxHash>,
     bot_wallet: Address,
@@ -6531,17 +6545,32 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         .ethereum_usdc_credit(superseding, deposit_address)
         .await
         .map_err(read)?;
-    if !paid.is_zero() {
-        return Err(
+    if paid.is_zero() {
+        return Ok(());
+    }
+
+    let recorded_by = match event_store {
+        Some(pool) => deposit_send_recorded_elsewhere(pool, id, superseding)
+            .await
+            .map_err(|source| DepositSendNotSuperseded::Lookup {
+                superseding,
+                source,
+            })?,
+        None => None,
+    };
+    match recorded_by {
+        Some(recorded_by) => {
+            info!(target: "rebalance", %id, %superseding, %recorded_by, "Superseding tx is another transfer's deposit send");
+            Ok(())
+        }
+        None => Err(
             DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress {
                 superseding,
                 deposit_address,
                 paid,
             },
-        );
+        ),
     }
-
-    Ok(())
 }
 
 /// The address a signed deposit send pays: the `to` of its USDC `transfer`.
@@ -6583,6 +6612,7 @@ pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
 
     async fn verify_deposit_send_superseded(
         &self,
+        id: &UsdcRebalanceId,
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded>;
@@ -6631,15 +6661,22 @@ where
 
     async fn verify_deposit_send_superseded(
         &self,
+        id: &UsdcRebalanceId,
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded> {
         let required_confirmations = self
             .ethereum_required_confirmations
             .ok_or(EthereumChainMissing)?;
+        let event_store = match &self.credit_ledger {
+            CreditLedger::Wired(pool) => Some(pool),
+            CreditLedger::Unwired => None,
+        };
 
         verify_deposit_send_superseded(
             &*self.cctp_bridge,
+            event_store,
+            id,
             prepared,
             superseding_tx,
             self.market_maker_wallet,
@@ -16128,9 +16165,17 @@ mod tests {
         let bridge = MockBridge::new();
         let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 3);
 
-        let error = verify_deposit_send_superseded(&bridge, &prepared, None, Address::ZERO, 3)
-            .await
-            .expect_err("a lagging receipt read is no proof that another tx took the nonce");
+        let error = verify_deposit_send_superseded(
+            &bridge,
+            None,
+            &UsdcRebalanceId(Uuid::new_v4()),
+            &prepared,
+            None,
+            Address::ZERO,
+            3,
+        )
+        .await
+        .expect_err("a lagging receipt read is no proof that another tx took the nonce");
 
         assert!(
             matches!(
@@ -16163,7 +16208,11 @@ mod tests {
             send_self_transfer(&bot_provider, chain.bot_address, Some(prepared.nonce())).await;
 
         let error = manager
-            .verify_deposit_send_superseded(&prepared, Some(cancel))
+            .verify_deposit_send_superseded(
+                &UsdcRebalanceId(Uuid::new_v4()),
+                &prepared,
+                Some(cancel),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -16181,7 +16230,11 @@ mod tests {
         bot_provider.anvil_mine(Some(2), None).await.unwrap();
 
         manager
-            .verify_deposit_send_superseded(&prepared, Some(cancel))
+            .verify_deposit_send_superseded(
+                &UsdcRebalanceId(Uuid::new_v4()),
+                &prepared,
+                Some(cancel),
+            )
             .await
             .unwrap();
     }
@@ -16223,7 +16276,11 @@ mod tests {
         bot_provider.anvil_mine(Some(3), None).await.unwrap();
 
         let error = manager
-            .verify_deposit_send_superseded(&prepared, Some(cancel))
+            .verify_deposit_send_superseded(
+                &UsdcRebalanceId(Uuid::new_v4()),
+                &prepared,
+                Some(cancel),
+            )
             .await
             .expect_err("4 confirmations are past Base's depth but short of Ethereum's");
 
@@ -16290,7 +16347,11 @@ mod tests {
         let mut errors = Vec::new();
         for (superseding, case) in refusals {
             let error = manager
-                .verify_deposit_send_superseded(&prepared, Some(superseding))
+                .verify_deposit_send_superseded(
+                    &UsdcRebalanceId(Uuid::new_v4()),
+                    &prepared,
+                    Some(superseding),
+                )
                 .await
                 .unwrap_err();
             errors.push((case, error));
@@ -16335,19 +16396,23 @@ mod tests {
     }
 
     /// A fee-bumped copy of the send is a different tx from the bot wallet
-    /// at the send's nonce, but it paid the Alpaca deposit address, so the
-    /// deposit went through and reconciling would move the USDC twice.
+    /// at the send's nonce, but it paid the Alpaca deposit address and no
+    /// other transfer recorded it, so the deposit went through and
+    /// reconciling would move the USDC twice.
     #[tokio::test]
     async fn deposit_send_is_not_superseded_by_a_fee_bumped_copy_of_it() {
         let chain = deploy_ethereum_usdc_chain().await;
         let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
         let manager = build_deposit_manager(
             &chain,
             &server,
             Arc::new(create_short_poll_wallet_service(&server)),
-            create_test_store_instance().await,
+            Arc::new(test_store(pool.clone(), ())),
         )
-        .await;
+        .await
+        .with_credit_ledger(pool);
         let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
         let amount = usdc_to_u256(usdc("99.99")).unwrap();
         let prepared = sign_usdc_to_alpaca(&wallet, amount).await;
@@ -16381,7 +16446,11 @@ mod tests {
         assert_ne!(fee_bumped, prepared.tx_hash());
 
         let error = manager
-            .verify_deposit_send_superseded(&prepared, Some(fee_bumped))
+            .verify_deposit_send_superseded(
+                &UsdcRebalanceId(Uuid::new_v4()),
+                &prepared,
+                Some(fee_bumped),
+            )
             .await
             .expect_err("a tx that paid the Alpaca deposit address does not supersede the send");
 
@@ -16454,7 +16523,11 @@ mod tests {
         .await;
 
         manager
-            .verify_deposit_send_superseded(&prepared, Some(other_send))
+            .verify_deposit_send_superseded(
+                &UsdcRebalanceId(Uuid::new_v4()),
+                &prepared,
+                Some(other_send),
+            )
             .await
             .unwrap();
     }

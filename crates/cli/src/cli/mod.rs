@@ -46,6 +46,7 @@ use st0x_hedge::operator::performance::reliability::LifecycleFailureProjection;
 use st0x_hedge::operator::portfolio_snapshot::PortfolioSnapshotProjection;
 use st0x_hedge::operator::position::Position;
 use st0x_hedge::operator::process_tx;
+use st0x_hedge::operator::usdc_rebalance::UsdcRebalanceId;
 use st0x_hedge::operator::vault_registry::VaultRegistry;
 
 /// Direction for transferring assets between trading venues.
@@ -956,7 +957,8 @@ pub enum TransferCommand {
         /// refused for any other: the tx that took the send's nonce (the
         /// 0-value self-transfer cancel). The bot checks that it is from the
         /// bot's Ethereum wallet, at the send's nonce, not the send itself, has
-        /// the required confirmations, and paid the deposit address no USDC.
+        /// the required confirmations, and paid the deposit address no USDC
+        /// unless another transfer recorded it as its own deposit send.
         #[arg(long = "superseding-tx")]
         superseding_tx: Option<TxHash>,
     },
@@ -1914,6 +1916,8 @@ async fn run_transfer_command<W: Write>(
                 async |prepared: &PreparedTransaction, superseding_tx| {
                     rebalancing::verify_deposit_send_superseded_on_chain(
                         ctx,
+                        pool,
+                        &UsdcRebalanceId(id),
                         prepared,
                         superseding_tx,
                     )
