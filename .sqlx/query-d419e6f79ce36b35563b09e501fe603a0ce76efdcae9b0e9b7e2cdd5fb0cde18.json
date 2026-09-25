@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO trading_disabled_period (chain, symbol, disabled_from_block, enabled_from_block, enabled_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (chain, symbol, enabled_from_block) DO UPDATE SET disabled_from_block = MIN(disabled_from_block, excluded.disabled_from_block)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "d419e6f79ce36b35563b09e501fe603a0ce76efdcae9b0e9b7e2cdd5fb0cde18"
+}

@@ -97,8 +97,8 @@ use crate::onchain::approvals::{ApprovalTarget, build_approval_targets, grant_st
 use crate::onchain::backfill::BackfillQueues;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{
-    OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId, OnChainTradeSource,
-    SourceAttributionDecision, cover_direction,
+    OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeEvent, OnChainTradeId,
+    OnChainTradeSource, SourceAttributionDecision, cover_direction,
 };
 use crate::performance::HedgeLatencyProjection;
 use crate::performance::equity_timing::EquityTimingProjection;
@@ -4689,6 +4689,9 @@ pub async fn execute_mark_excluded(
 /// booked in the PnL ledger. A fill the position already holds is left alone:
 /// it was hedged, and its row only says it was also seen while disabled.
 ///
+/// Candidates come from the event log, never `onchain_trade_view`, which can
+/// miss an event for good after a live update lost under contention.
+///
 /// Runs at startup before any fill is accounted; idempotent.
 pub(crate) async fn adopt_legacy_exclusions(
     pool: &SqlitePool,
@@ -4697,13 +4700,22 @@ pub(crate) async fn adopt_legacy_exclusions(
     let candidates: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT skipped.chain, skipped.tx_hash, skipped.log_index \
          FROM skipped_fills AS skipped \
-         JOIN onchain_trade_view AS trade_view \
-           ON trade_view.view_id = \
-              skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index \
-         WHERE skipped.reason = 'trading_disabled' \
-           AND json_extract(trade_view.payload, '$.Live.acknowledged_at') IS NOT NULL \
-           AND json_extract(trade_view.payload, '$.Live.exclusion') IS NULL",
+         WHERE skipped.reason = ?1 \
+           AND EXISTS (SELECT 1 FROM events AS trade_event \
+             WHERE trade_event.aggregate_type = ?2 \
+               AND trade_event.aggregate_id = \
+                 skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index \
+               AND trade_event.event_type = ?3) \
+           AND NOT EXISTS (SELECT 1 FROM events AS trade_event \
+             WHERE trade_event.aggregate_type = ?2 \
+               AND trade_event.aggregate_id = \
+                 skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index \
+               AND trade_event.event_type = ?4)",
     )
+    .bind(SkipReason::TradingDisabled.as_str())
+    .bind(OnChainTrade::AGGREGATE_TYPE)
+    .bind(OnChainTradeEvent::ACKNOWLEDGED_EVENT_TYPE)
+    .bind(OnChainTradeEvent::EXCLUDED_FROM_HEDGING_EVENT_TYPE)
     .fetch_all(pool)
     .await
     .context("failed to find fills excluded before exclusions were recorded")?;
@@ -4714,6 +4726,11 @@ pub(crate) async fn adopt_legacy_exclusions(
             .parse()
             .with_context(|| format!("invalid fill identity {chain}:{tx_hash}:{log_index}"))?;
         let Some(state) = onchain_trade.load(&trade_id).await? else {
+            error!(
+                %trade_id,
+                "Acknowledged fill recorded as trading disabled has no loadable OnChainTrade; \
+                 not adopting it as excluded"
+            );
             continue;
         };
         if position_fill_already_recorded(pool, &state.symbol, &trade_id).await? {
@@ -4844,7 +4861,7 @@ pub enum FillAccountingOutcome {
 
 /// The recorded detail when `trade` is excluded because trading was disabled
 /// on its chain.
-async fn recorded_trading_disabled_detail(
+pub(crate) async fn recorded_trading_disabled_detail(
     pool: &SqlitePool,
     trade: &OnchainTrade,
 ) -> Result<Option<String>, TradeAccountingError> {
@@ -4875,7 +4892,6 @@ async fn recorded_trading_disabled_detail(
 async fn acknowledged_exclusion_detail(
     pool: &SqlitePool,
     trade: &OnchainTrade,
-    excluded: bool,
 ) -> Result<Option<String>, TradeAccountingError> {
     let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? else {
         return Ok(None);
@@ -4889,7 +4905,6 @@ async fn acknowledged_exclusion_detail(
     if position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
         error!(
             %trade_id,
-            excluded,
             %detail,
             "Fill is both in the hedged position and recorded as excluded from hedging; the \
              bot hedges it, so it must not also be covered by hand. Reconcile it"
@@ -4902,9 +4917,8 @@ async fn acknowledged_exclusion_detail(
 
 /// Where a fill stands once it is witnessed into its `OnChainTrade` log.
 enum WitnessedFill {
-    /// An earlier attempt already acknowledged it; `excluded` when that
-    /// attempt excluded it from hedging.
-    AlreadyAcknowledged { excluded: bool },
+    /// An earlier attempt already acknowledged it.
+    AlreadyAcknowledged,
     /// Witnessed but not acknowledged yet: this attempt finishes it.
     Pending {
         trade_id: OnChainTradeId,
@@ -4953,9 +4967,7 @@ async fn witness_onchain_fill(
                     symbol = %trade.symbol,
                     "Trade already processed (duplicate event), skipping"
                 );
-                return Ok(WitnessedFill::AlreadyAcknowledged {
-                    excluded: state.is_excluded(),
-                });
+                return Ok(WitnessedFill::AlreadyAcknowledged);
             }
 
             info!(
@@ -4971,9 +4983,7 @@ async fn witness_onchain_fill(
             if !witnessed {
                 match onchain_trade.load(&trade_id).await? {
                     Some(reloaded) if reloaded.is_acknowledged() => {
-                        return Ok(WitnessedFill::AlreadyAcknowledged {
-                            excluded: reloaded.is_excluded(),
-                        });
+                        return Ok(WitnessedFill::AlreadyAcknowledged);
                     }
                     Some(_) => {
                         info!(
@@ -5013,7 +5023,7 @@ pub async fn account_for_onchain_fill(
                 trade_id,
                 block_timestamp,
             } => (trade_id, block_timestamp),
-            WitnessedFill::AlreadyAcknowledged { excluded } => {
+            WitnessedFill::AlreadyAcknowledged => {
                 // Self-heal a marker-without-settle leak (ADR 0010): a crash
                 // between MARK and SETTLE leaves the trade marked but still in
                 // the pending set. The marker is durable, so prune it now. A
@@ -5022,7 +5032,7 @@ pub async fn account_for_onchain_fill(
                 // A fill excluded while trading was disabled is also
                 // acknowledged; report it as excluded so no caller promises the
                 // pipeline hedges it.
-                return Ok(acknowledged_exclusion_detail(pool, trade, excluded)
+                return Ok(acknowledged_exclusion_detail(pool, trade)
                     .await?
                     .map_or(FillAccountingOutcome::AlreadyAcknowledged, |detail| {
                         FillAccountingOutcome::ExcludedFromHedging { detail }
@@ -5078,8 +5088,9 @@ pub enum ExcludedFillOutcome {
     Excluded { detail: String },
 }
 
-/// Accounts a fill on an asset whose trading is disabled on the fill's own
-/// chain, keeping it out of the hedged `Position`.
+/// Accounts a fill excluded from hedging, keeping it out of the hedged
+/// `Position`: trading is disabled for its symbol on its own chain, or the fill
+/// landed inside a closed disabled period (see `cause`).
 ///
 /// `Position` holds one net per symbol across every hedged chain, and the
 /// periodic scan hedges that net whenever any hedged chain enables the
@@ -5101,12 +5112,12 @@ pub async fn account_for_fill_excluded_from_hedging(
 ) -> Result<ExcludedFillOutcome, TradeAccountingError> {
     let trade_id = match witness_onchain_fill(onchain_trade, trade, block_number).await? {
         WitnessedFill::Pending { trade_id, .. } => trade_id,
-        WitnessedFill::AlreadyAcknowledged { excluded } => {
+        WitnessedFill::AlreadyAcknowledged => {
             // Same self heal as `account_for_onchain_fill`, for a fill
             // accounted into the position before trading was disabled. Does
             // nothing otherwise.
             execute_settle_fill(position, trade).await?;
-            return Ok(acknowledged_exclusion_detail(pool, trade, excluded)
+            return Ok(acknowledged_exclusion_detail(pool, trade)
                 .await?
                 .map_or(ExcludedFillOutcome::AlreadyAcknowledged, |detail| {
                     ExcludedFillOutcome::AlreadyExcluded { detail }
@@ -5164,9 +5175,40 @@ pub async fn account_for_fill_excluded_from_hedging(
     Ok(ExcludedFillOutcome::Excluded { detail })
 }
 
+/// What the operator does about an excluded fill: recheck the uncovered list,
+/// cover at the broker, and record the cover.
+///
+/// Shared by the bot's page and the
+/// CLI `process-tx` output, which is the only prompt for a fill the bot never
+/// delivers.
+pub fn excluded_fill_cover_instructions(trade: &OnchainTrade) -> String {
+    format!(
+        "Before covering anything, recheck what is still uncovered on {symbol} ({chain}) \
+         with st0x-liquidity-client --env <production|staging> read resource skipped-fills \
+         --param covered=false --param chain={chain} --param symbol={symbol}, passing each \
+         page's nextBefore as --param before=<nextBefore> until none is returned, since a \
+         cover may have been recorded since. Cover \
+         only what is listed, each fill by its own broker trade on its cover side for its \
+         full amount, and record each fill's cover once it executes. Record this fill's \
+         cover with st0x-liquidity-client --env <production|staging> debug \
+         cover-excluded-fill {chain} {tx} {log_index} --shares {amount} --price-usdc \
+         <broker price> --covered-at <RFC 3339 execution time>.",
+        symbol = trade.symbol.base(),
+        amount = trade.amount,
+        chain = trade.chain,
+        tx = trade.tx_hash,
+        log_index = trade.log_index,
+    )
+}
+
 /// Accounts and hedges a fill on an asset whose trading is enabled on the
-/// fill's own chain. Fills on a disabled asset never reach here: they go
-/// through [`account_for_fill_excluded_from_hedging`].
+/// fill's own chain.
+///
+/// A fill whose exclusion is already recorded (a
+/// redelivery after trading was enabled, or an exclusion interrupted before
+/// its marker) is finished as excluded by `account_for_onchain_fill` and
+/// returns `Ok(None)` without a hedge; the accountant pages it from that
+/// outcome.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub async fn process_queued_trade<E: Executor>(
     executor: &E,
@@ -6785,6 +6827,43 @@ mod tests {
         assert!(
             logs_contain("skipping the asset read canary"),
             "the skip branch must announce itself rather than pass silently"
+        );
+    }
+
+    /// The disabled period boundaries are block numbers on each fill's own
+    /// chain, so every hedged chain's head comes from that chain's provider,
+    /// never the primary's, and a hedged chain without a provider fails
+    /// startup instead of being recorded against the wrong chain.
+    #[tokio::test]
+    async fn startup_reads_each_hedged_chains_own_head() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary = ctx.chains.primary().clone();
+        secondary.chain = Chain::Ethereum;
+        ctx.chains.insert_secondary(secondary);
+
+        let head_provider = |head: u64| {
+            let asserter = Asserter::new();
+            asserter.push_success(&serde_json::Value::from(head));
+            ProviderBuilder::new().connect_mocked_client(asserter)
+        };
+        let watch_providers = BTreeMap::from([(Chain::Ethereum, head_provider(23_000_000))]);
+
+        let heads = read_hedged_chain_heads(&ctx, &head_provider(48_000_000), &watch_providers)
+            .await
+            .unwrap();
+        assert_eq!(
+            heads,
+            BTreeMap::from([(Chain::Base, 48_000_000), (Chain::Ethereum, 23_000_000)])
+        );
+
+        let error = read_hedged_chain_heads(&ctx, &head_provider(48_000_000), &BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no provider for hedged chain ethereum"),
+            "{error}"
         );
     }
 
@@ -12037,6 +12116,12 @@ mod tests {
         )
         .await
         .unwrap();
+        // Candidates come from the event log: a view that lost its updates
+        // must not hide a fill from adoption.
+        sqlx::query("DELETE FROM onchain_trade_view")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         assert_eq!(
             adopt_legacy_exclusions(&pool, &cqrs.onchain_trade)

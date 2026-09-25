@@ -415,7 +415,16 @@ framework (no reactors dispatched). Production code reads through `Projection`.
 ## Forbidden Patterns
 
 1. **NEVER write directly to the `events` table** -- use `Store::send()`
-2. **NEVER query the `events` table with raw SQL** -- use framework APIs
+2. **NEVER query the `events` table with raw SQL** -- use framework APIs. Narrow
+   exception: a read only guard or listing that must not trust a view (a
+   projection drops a live update it cannot write under contention, and startup
+   `catch_up` compares versions only, so a view can miss an event for good) may
+   test for or read an event by the `(aggregate_type, aggregate_id)` primary key
+   prefix and an `event_type` constant from the event enum, only for aggregates
+   that keep `CompactionPolicy::Retain`, with the reason the view cannot be
+   trusted documented at the call site. Examples:
+   `position_fill_already_recorded`, `adopt_legacy_exclusions` and the excluded
+   fill queries in `src/trading/onchain/skipped_fill.rs`.
 3. **NEVER modify events** -- they're immutable historical facts
 4. **NEVER delete retained events** -- only explicit compactable observational
    aggregates may prune pre-snapshot events through event-sorcery compaction
@@ -732,7 +741,8 @@ For entities that don't need services, use `type Services = ()`.
 ### Other Forbidden Patterns
 
 2. **Never query the `events` table directly with raw SQL** - use `EventStore`
-   trait methods or the framework's query API
+   trait methods or the framework's query API (see the narrow exception under
+   Forbidden Patterns above)
 3. **Never query view tables with raw SQL** - use `GenericQuery::load()`
 4. **Never modify events** - they're immutable historical facts
 5. **Never delete retained events** - only explicit compactable observational

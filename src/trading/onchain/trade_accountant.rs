@@ -38,7 +38,8 @@ use crate::conductor::job::{
 use crate::conductor::{
     ExcludedFillOutcome, TradeProcessingCqrs, VaultDiscoveryCtx,
     account_for_fill_excluded_from_hedging, discover_vaults_for_trade,
-    position_fill_already_recorded, process_queued_trade,
+    excluded_fill_cover_instructions, position_fill_already_recorded, process_queued_trade,
+    recorded_trading_disabled_detail,
 };
 use crate::offchain::order::PlaceOffchainOrderError;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
@@ -236,12 +237,17 @@ where
         // every hedged chain, so a disabled chain's fill must stay out of it
         // or the periodic scan hedges it for whichever chain enables the
         // symbol.
-        let cause = exclusion_cause(&ctx.pool, &chain_ctx.trading.assets, &trade)
-            .await
-            .map_err(|error| TradeAccountingError::ExcludedFillRecord {
-                trade_id: OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index),
-                source: Box::new(error),
-            })?;
+        let cause = exclusion_cause(
+            &ctx.pool,
+            &chain_ctx.trading.assets,
+            &trade,
+            trade_event.block_number,
+        )
+        .await
+        .map_err(|error| TradeAccountingError::ExcludedFillRecord {
+            trade_id: OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index),
+            source: Box::new(error),
+        })?;
         if let Some(cause) = cause {
             let outcome = account_for_fill_excluded_from_hedging(
                 &ctx.cqrs.pool,
@@ -267,6 +273,7 @@ where
             return Ok(());
         }
 
+        let paging_trade = trade.clone();
         match process_queued_trade(
             &ctx.executor,
             trade_event,
@@ -276,7 +283,15 @@ where
         )
         .await
         {
-            Ok(_) => Ok(()),
+            Ok(Some(_)) => Ok(()),
+            // The hedged path also finishes an exclusion it finds recorded (a
+            // fill excluded earlier, landing outside every disabled period on
+            // this delivery). Its page may still be owed, for example after a
+            // crash before paging or an exclusion by CLI `process-tx`.
+            Ok(None) => {
+                self.page_if_excluded(&ctx.pool, &ctx.notifier, &paging_trade)
+                    .await
+            }
             Err(error) => self.handle_process_queued_trade_error(ctx, error).await,
         }
     }
@@ -442,6 +457,23 @@ async fn persist_skipped_fill(
 }
 
 impl AccountForDexTrade {
+    /// Pages the fill if it is recorded as excluded and its page is still owed.
+    /// `page_excluded_fill` gates on the paged mark, a recorded cover and the
+    /// fill being in `Position`, so this is a no op for a hedged fill.
+    async fn page_if_excluded(
+        &self,
+        pool: &SqlitePool,
+        notifier: &Arc<dyn Notifier>,
+        trade: &OnchainTrade,
+    ) -> Result<(), TradeAccountingError> {
+        let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? else {
+            return Ok(());
+        };
+
+        self.page_excluded_fill(pool, notifier, trade, &detail)
+            .await
+    }
+
     /// Critical alert for each fill excluded from hedging. The trading flag
     /// is the per symbol hedge kill switch, so the fill is never counter
     /// traded, but the exposure it leaves must never be silent. `detail`
@@ -493,18 +525,11 @@ impl AccountForDexTrade {
         let message = format!(
             "Fill on DISABLED asset {symbol} (chain {chain}, tx {tx}) kept out of the hedged \
              position and recorded in skipped_fills. As of this page: {detail}. {uncovered} \
-             Before covering anything, recheck what is still uncovered with \
-             st0x-liquidity-client --env <production|staging> read resource skipped-fills \
-             --param covered=false, since a cover may have been recorded since. Cover only \
-             what is listed, then record each fill's cover with st0x-liquidity-client --env \
-             <production|staging> debug cover-excluded-fill {chain} {tx} \
-             {log_index} --shares {amount} --price-usdc <broker price> --covered-at <RFC 3339 \
-             execution time>.",
-            amount = trade.amount,
+             {instructions}",
             chain = trade.chain,
             tx = trade.tx_hash,
-            log_index = trade.log_index,
             uncovered = describe_uncovered_net(symbol, trade.chain, &uncovered),
+            instructions = excluded_fill_cover_instructions(trade),
         );
         error!(target: "hedge", %message, "Disabled-asset fill");
         if let Err(error) = notifier.notify(&message).await {
@@ -518,50 +543,64 @@ impl AccountForDexTrade {
     }
 }
 
-/// The page's running total: how much of `symbol` on `chain` the operator
-/// still has to cover by hand, netted across every uncovered excluded fill.
+/// The page's running total: the exposure every uncovered excluded fill on
+/// `symbol` and `chain` leaves, netted. It is context only: each fill is still
+/// covered by its own broker trade, so the PnL ledger books real executions.
 fn describe_uncovered_net(
     symbol: &Symbol,
     chain: Chain,
     uncovered: &[UncoveredExcludedFill],
 ) -> String {
     let count = uncovered.len();
-    let Some(net_to_buy) = uncovered_net_to_buy(uncovered) else {
-        return format!(
+    match uncovered_exposure(uncovered) {
+        Some(UncoveredExposure::Flat) => {
+            format!("Uncovered on {symbol} ({chain}): net flat across {count} fills.")
+        }
+        Some(UncoveredExposure::Long(shares)) => format!(
+            "Uncovered on {symbol} ({chain}): net long {} across {count} fills.",
+            FractionalShares::new(shares)
+        ),
+        Some(UncoveredExposure::Short(shares)) => format!(
+            "Uncovered on {symbol} ({chain}): net short {} across {count} fills.",
+            FractionalShares::new(shares)
+        ),
+        None => format!(
             "{count} uncovered excluded fills on {symbol} ({chain}); their net could not be \
              computed, see skipped_fills."
-        );
-    };
-
-    match (net_to_buy.is_zero(), net_to_buy.lt(float!(0))) {
-        (Ok(true), _) => {
-            format!("Uncovered excluded fills on {symbol} ({chain}) net to zero ({count} fills).")
-        }
-        (_, Ok(true)) => format!(
-            "Uncovered on {symbol} ({chain}): cover by SELL {} at the broker in total \
-             ({count} fills).",
-            FractionalShares::new((float!(0) - net_to_buy).unwrap_or(net_to_buy))
-        ),
-        _ => format!(
-            "Uncovered on {symbol} ({chain}): cover by BUY {} at the broker in total \
-             ({count} fills).",
-            FractionalShares::new(net_to_buy)
         ),
     }
 }
 
-/// Shares to buy at the broker to cover every uncovered excluded fill: an
-/// onchain sell is covered by a broker buy, and an onchain buy by a sell.
-fn uncovered_net_to_buy(uncovered: &[UncoveredExcludedFill]) -> Option<Float> {
-    uncovered.iter().try_fold(float!(0), |net, fill| {
+/// The net position every uncovered excluded fill leaves the bot with.
+enum UncoveredExposure {
+    Flat,
+    /// Shares the bot is net long, strictly positive.
+    Long(Float),
+    /// Shares the bot is net short, strictly positive.
+    Short(Float),
+}
+
+/// Nets the uncovered excluded fills into the position they leave: an onchain
+/// buy adds to it and an onchain sell takes from it. `None` when any amount,
+/// side or arithmetic step fails, never a guess.
+fn uncovered_exposure(uncovered: &[UncoveredExcludedFill]) -> Option<UncoveredExposure> {
+    let net = uncovered.iter().try_fold(float!(0), |net, fill| {
         let direction = fill.direction.parse::<Direction>().ok()?;
         let amount = Float::parse(fill.amount.clone()).ok()?;
         match direction {
-            Direction::Sell => net + amount,
-            Direction::Buy => net - amount,
+            Direction::Buy => net + amount,
+            Direction::Sell => net - amount,
         }
         .ok()
-    })
+    })?;
+
+    if net.is_zero().ok()? {
+        Some(UncoveredExposure::Flat)
+    } else if net.lt(float!(0)).ok()? {
+        Some(UncoveredExposure::Short((float!(0) - net).ok()?))
+    } else {
+        Some(UncoveredExposure::Long(net))
+    }
 }
 
 /// Decodes a raw Raindex event into an [`OnchainTrade`] against ITS chain's
@@ -2132,15 +2171,17 @@ mod tests {
         assert_eq!(order_count, 1, "the hedge order must be placed");
     }
 
-    /// A fill on an asset whose trading is disabled on the fill's own chain
-    /// must never reach the `Position`. `Position` is one net per symbol
-    /// across every hedged chain and the periodic scan hedges it whenever
-    /// ANY hedged chain enables the symbol, so a disabled chain's fill that
-    /// lands in the net is counter traded a minute later. The fill is still
-    /// witnessed and acknowledged, so a redrive does nothing, and its delta is
-    /// recorded once in `skipped_fills` for manual reconciliation.
-    #[tokio::test]
-    async fn perform_excludes_fill_on_trading_disabled_asset_from_the_position() {
+    /// A wtCOIN fill on Base while trading is disabled for COIN there, with
+    /// its accountant context paging into a capturing notifier and mocked
+    /// `decimals()` answers for `performs` runs of the job.
+    async fn disabled_coin_fill(
+        performs: usize,
+    ) -> (
+        SqlitePool,
+        AccountForDexTrade,
+        AccountantCtx<impl Provider + Clone + 'static, MockExecutor>,
+        Arc<crate::alerts::CapturingNotifier>,
+    ) {
         let (pool, apalis_pool) = setup_test_pools().await;
         let asserter = Asserter::new();
 
@@ -2180,9 +2221,8 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        // decimals() for USDC and wtCOIN, once per perform (the run, the
-        // redrive, and two redeliveries of an unpaged fill).
-        for _ in 0..4 {
+        // decimals() for USDC and wtCOIN, once per perform.
+        for _ in 0..performs {
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         }
@@ -2229,6 +2269,21 @@ mod tests {
         )
         .await;
         accountant_ctx.notifier = notifier.clone();
+
+        (pool, job, accountant_ctx, notifier)
+    }
+
+    /// A fill on an asset whose trading is disabled on the fill's own chain
+    /// must never reach the `Position`. `Position` is one net per symbol
+    /// across every hedged chain and the periodic scan hedges it whenever
+    /// ANY hedged chain enables the symbol, so a disabled chain's fill that
+    /// lands in the net is counter traded a minute later. The fill is still
+    /// witnessed and acknowledged, so a redrive does nothing, and its delta is
+    /// recorded once in `skipped_fills` for manual reconciliation.
+    #[tokio::test]
+    async fn perform_excludes_fill_on_trading_disabled_asset_from_the_position() {
+        // The run, the redrive, and two redeliveries of an unpaged fill.
+        let (pool, job, accountant_ctx, notifier) = disabled_coin_fill(4).await;
 
         job.perform(&accountant_ctx).await.unwrap();
         job.perform(&accountant_ctx).await.unwrap();
@@ -2295,11 +2350,11 @@ mod tests {
             "the page must carry the recorded delta: {}",
             messages[0]
         );
-        // The running uncovered net on the symbol covers the onchain sell
-        // with a broker buy, like the fill's own detail.
+        // The running uncovered net on the symbol: the onchain sell leaves
+        // the bot short.
         assert!(
-            messages[0].contains("Uncovered on COIN (base): cover by BUY")
-                && messages[0].contains("in total (1 fills)"),
+            messages[0].contains("Uncovered on COIN (base): net short")
+                && messages[0].contains("across 1 fills"),
             "the page must carry the uncovered net: {}",
             messages[0]
         );
@@ -2354,6 +2409,213 @@ mod tests {
             notifier.messages().len(),
             2,
             "a covered fill is owed no page"
+        );
+    }
+
+    /// Trading enabled again, with the fill outside every recorded disabled
+    /// period: a redelivery of an excluded fill takes the hedged path, which
+    /// finishes the exclusion and must still page the fill if its page is
+    /// owed, without hedging it.
+    #[tokio::test]
+    async fn hedged_path_pages_an_unpaged_excluded_fill_after_trading_is_enabled() {
+        let (pool, job, mut accountant_ctx, notifier) = disabled_coin_fill(2).await;
+        job.perform(&accountant_ctx).await.unwrap();
+        assert_eq!(notifier.messages().len(), 1, "the exclusion pages once");
+
+        sqlx::query("UPDATE skipped_fills SET paged_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for chain_accounting in accountant_ctx.chains.values_mut() {
+            for asset in chain_accounting
+                .trading
+                .assets
+                .equities
+                .symbols
+                .values_mut()
+            {
+                asset.trading = OperationMode::Enabled;
+            }
+        }
+        job.perform(&accountant_ctx).await.unwrap();
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            2,
+            "the hedged path pages an excluded fill whose page is owed"
+        );
+        let net = accountant_ctx
+            .cqrs
+            .position_projection
+            .load(&Symbol::new("COIN").unwrap())
+            .await
+            .unwrap()
+            .map_or(FractionalShares::ZERO, |position| position.net);
+        assert_eq!(net, FractionalShares::ZERO, "and still does not hedge it");
+    }
+
+    /// A fill that landed inside a closed disabled period stays excluded when
+    /// the accountant delivers it after trading was enabled again: config says
+    /// enabled, and only the fill's own block, checked against the recorded
+    /// period, keeps it out of the hedged position.
+    #[tokio::test]
+    async fn fill_inside_a_closed_disabled_period_is_excluded_after_the_enable() {
+        let (pool, job, mut accountant_ctx, notifier) = disabled_coin_fill(1).await;
+        for chain_accounting in accountant_ctx.chains.values_mut() {
+            for asset in chain_accounting
+                .trading
+                .assets
+                .equities
+                .symbols
+                .values_mut()
+            {
+                asset.trading = OperationMode::Enabled;
+            }
+        }
+        // The fixture fill landed in block 48_030_415.
+        sqlx::query(
+            "INSERT INTO trading_disabled_period \
+             (chain, symbol, disabled_from_block, enabled_from_block, enabled_at) \
+             VALUES ('base', 'COIN', 48030400, 48030500, '2026-09-25T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        job.perform(&accountant_ctx).await.unwrap();
+
+        let net = accountant_ctx
+            .cqrs
+            .position_projection
+            .load(&Symbol::new("COIN").unwrap())
+            .await
+            .unwrap()
+            .map_or(FractionalShares::ZERO, |position| position.net);
+        assert_eq!(net, FractionalShares::ZERO, "the fill is not hedged");
+
+        let (detail,): (String,) =
+            sqlx::query_as("SELECT detail FROM skipped_fills WHERE reason = 'trading_disabled'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            detail.contains("landed in block 48030415")
+                && detail.contains("enabled from block 48030500"),
+            "{detail}"
+        );
+        assert_eq!(notifier.messages().len(), 1, "the exclusion pages");
+    }
+
+    /// A fill classified both ways (excluded, and also in `Position`) is
+    /// hedged by the bot, so a redelivery never pages it, under the disabled
+    /// config or after trading is enabled: a page would send the operator to
+    /// cover at the broker a fill the bot already hedges.
+    #[tokio::test]
+    async fn fill_also_in_position_is_never_paged_on_redelivery() {
+        let (pool, job, mut accountant_ctx, notifier) = disabled_coin_fill(3).await;
+        job.perform(&accountant_ctx).await.unwrap();
+        assert_eq!(notifier.messages().len(), 1, "the exclusion pages once");
+
+        let (tx_hash, log_index): (String, i64) =
+            sqlx::query_as("SELECT tx_hash, log_index FROM skipped_fills")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let trade_id: OnChainTradeId = format!("base:{tx_hash}:{log_index}").parse().unwrap();
+        let state = accountant_ctx
+            .cqrs
+            .onchain_trade
+            .load(&trade_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut hedged = crate::test_utils::OnchainTradeBuilder::new()
+            .with_symbol("wtCOIN")
+            .with_amount(state.amount)
+            .with_direction(Direction::Sell)
+            .with_log_index(u64::try_from(log_index).unwrap())
+            .build();
+        hedged.tx_hash = tx_hash.parse().unwrap();
+        crate::conductor::execute_acknowledge_fill(
+            &accountant_ctx.cqrs.position,
+            &hedged,
+            accountant_ctx.cqrs.execution_threshold,
+            hedged.block_timestamp.unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE skipped_fills SET paged_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        job.perform(&accountant_ctx).await.unwrap();
+        for chain_accounting in accountant_ctx.chains.values_mut() {
+            for asset in chain_accounting
+                .trading
+                .assets
+                .equities
+                .symbols
+                .values_mut()
+            {
+                asset.trading = OperationMode::Enabled;
+            }
+        }
+        job.perform(&accountant_ctx).await.unwrap();
+
+        assert_eq!(notifier.messages().len(), 1, "a hedged fill is never paged");
+        let (paged,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM skipped_fills WHERE paged_at IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(paged, 0);
+    }
+
+    fn uncovered(direction: &str, amount: &str) -> UncoveredExcludedFill {
+        UncoveredExcludedFill {
+            direction: direction.to_owned(),
+            amount: amount.to_owned(),
+        }
+    }
+
+    /// The page's running net is the exposure the uncovered excluded fills
+    /// leave, netted across fills: an onchain sell leaves the bot short and an
+    /// onchain buy leaves it long. An unreadable amount yields no figure.
+    #[test]
+    fn uncovered_net_names_the_exposure_side_and_size() {
+        let symbol = Symbol::new("COIN").unwrap();
+        let describe =
+            |fills: &[UncoveredExcludedFill]| describe_uncovered_net(&symbol, Chain::Base, fills);
+
+        assert!(
+            describe(&[uncovered("sell", "3")]).contains("net short 3 across 1 fills"),
+            "{}",
+            describe(&[uncovered("sell", "3")])
+        );
+        assert!(
+            describe(&[uncovered("buy", "2")]).contains("net long 2 across 1 fills"),
+            "{}",
+            describe(&[uncovered("buy", "2")])
+        );
+        assert!(
+            describe(&[uncovered("sell", "3"), uncovered("buy", "3")])
+                .contains("net flat across 2 fills"),
+            "{}",
+            describe(&[uncovered("sell", "3"), uncovered("buy", "3")])
+        );
+        let mixed = describe(&[
+            uncovered("buy", "5"),
+            uncovered("sell", "2"),
+            uncovered("buy", "1"),
+        ]);
+        assert!(mixed.contains("net long 4 across 3 fills"), "{mixed}");
+        let unreadable = describe(&[uncovered("sell", "3"), uncovered("buy", "not a number")]);
+        assert!(
+            unreadable.contains(
+                "2 uncovered excluded fills on COIN (base); their net could not be computed"
+            ),
+            "an unreadable amount must never yield a guessed instruction: {unreadable}"
         );
     }
 

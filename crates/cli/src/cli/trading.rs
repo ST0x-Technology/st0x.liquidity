@@ -24,8 +24,8 @@ use st0x_execution::{
 use st0x_float_serde::format_float_with_fallback;
 use st0x_hedge::operator::conductor::{
     ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
-    account_for_onchain_fill, exclusion_cause, execute_mark_acknowledged, execute_settle_fill,
-    is_expected_place_offchain_order_rejection,
+    account_for_onchain_fill, excluded_fill_cover_instructions, exclusion_cause,
+    execute_mark_acknowledged, execute_settle_fill, is_expected_place_offchain_order_rejection,
 };
 use st0x_hedge::operator::offchain::order::{
     BrokerOrderPlacement, OffchainOrder, OffchainOrderId, OffchainOrderPlacement,
@@ -907,12 +907,19 @@ async fn place_market_order_until_filled<Exec: Executor, W: Write>(
 }
 
 /// What `process-tx` tells the operator about a fill an earlier run already
-/// finished accounting.
-fn finished_fill_message(outcome: &FillAccountingOutcome, trade_id: &OnChainTradeId) -> String {
+/// finished accounting. An excluded fill carries the cover instructions: this
+/// run may be the only prompt for a fill the bot never delivers.
+fn finished_fill_message(outcome: &FillAccountingOutcome, onchain_trade: &OnchainTrade) -> String {
+    let trade_id = OnChainTradeId::new(
+        onchain_trade.chain,
+        onchain_trade.tx_hash,
+        onchain_trade.log_index,
+    );
     match outcome {
         FillAccountingOutcome::ExcludedFromHedging { detail } => format!(
             "Fill {trade_id} was excluded from hedging while trading was disabled \
-             and is recorded in skipped_fills. The pipeline will not hedge it: {detail}"
+             and is recorded in skipped_fills. The pipeline will not hedge it: {detail}. {}",
+            excluded_fill_cover_instructions(onchain_trade)
         ),
         FillAccountingOutcome::AlreadyAcknowledged | FillAccountingOutcome::Accounted { .. } => {
             format!(
@@ -920,6 +927,40 @@ fn finished_fill_message(outcome: &FillAccountingOutcome, trade_id: &OnChainTrad
                  the normal pipeline will hedge any unhedged position exposure."
             )
         }
+    }
+}
+
+/// Tells the operator what `process-tx` did with a fill excluded from
+/// hedging and, since the bot never pages a fill it does not deliver, how to
+/// recheck the uncovered list and record the cover.
+fn report_excluded_fill<W: Write>(
+    stdout: &mut W,
+    onchain_trade: &OnchainTrade,
+    outcome: ExcludedFillOutcome,
+) -> std::io::Result<()> {
+    let trade_id = OnChainTradeId::new(
+        onchain_trade.chain,
+        onchain_trade.tx_hash,
+        onchain_trade.log_index,
+    );
+    let instructions = excluded_fill_cover_instructions(onchain_trade);
+    match outcome {
+        ExcludedFillOutcome::Excluded { detail } => writeln!(
+            stdout,
+            "Fill {trade_id} on {} ({}) is excluded from hedging: it is not counter traded \
+             and was recorded in skipped_fills: {detail}. {instructions}",
+            onchain_trade.symbol(),
+            onchain_trade.chain
+        ),
+        ExcludedFillOutcome::AlreadyExcluded { detail } => writeln!(
+            stdout,
+            "Fill {trade_id} was already excluded from hedging and is recorded in \
+             skipped_fills. The pipeline will not hedge it: {detail}. {instructions}"
+        ),
+        ExcludedFillOutcome::AlreadyAcknowledged => writeln!(
+            stdout,
+            "Fill {trade_id} is already fully accounted. Nothing to do."
+        ),
     }
 }
 
@@ -966,7 +1007,9 @@ pub(super) async fn process_found_trade<W: Write>(
     // Same rule as the bot: a fill on an asset disabled on its own chain, or
     // that landed before its restart enabled it, stays out of the hedged
     // position, or the periodic scan hedges it.
-    if let Some(cause) = exclusion_cause(pool, &fill_chain.assets, &onchain_trade).await? {
+    if let Some(cause) =
+        exclusion_cause(pool, &fill_chain.assets, &onchain_trade, block_number).await?
+    {
         let outcome = account_for_fill_excluded_from_hedging(
             pool,
             &onchain_trade_store,
@@ -978,23 +1021,7 @@ pub(super) async fn process_found_trade<W: Write>(
         )
         .await?;
 
-        match outcome {
-            ExcludedFillOutcome::Excluded { detail } => writeln!(
-                stdout,
-                "Fill {trade_id} on {base_symbol} ({}) is excluded from hedging: it is \
-                 not counter traded and was recorded in skipped_fills: {detail}",
-                onchain_trade.chain
-            )?,
-            ExcludedFillOutcome::AlreadyExcluded { detail } => writeln!(
-                stdout,
-                "Fill {trade_id} was already excluded from hedging and is recorded in \
-                 skipped_fills. The pipeline will not hedge it: {detail}"
-            )?,
-            ExcludedFillOutcome::AlreadyAcknowledged => writeln!(
-                stdout,
-                "Fill {trade_id} is already fully accounted. Nothing to do."
-            )?,
-        }
+        report_excluded_fill(stdout, &onchain_trade, outcome)?;
         return Ok(());
     }
 
@@ -1010,7 +1037,11 @@ pub(super) async fn process_found_trade<W: Write>(
     {
         FillAccountingOutcome::Accounted { .. } => {}
         finished => {
-            writeln!(stdout, "{}", finished_fill_message(&finished, &trade_id))?;
+            writeln!(
+                stdout,
+                "{}",
+                finished_fill_message(&finished, &onchain_trade)
+            )?;
             return Ok(());
         }
     }
@@ -3777,6 +3808,10 @@ mod tests {
         let onchain_trade = onchain_trade_builder().with_block_number(42).build();
         let trade_id =
             OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+        let cover_command = format!(
+            "debug cover-excluded-fill base {} {}",
+            onchain_trade.tx_hash, onchain_trade.log_index
+        );
 
         let mut stdout = Vec::new();
         process_found_trade(
@@ -3811,6 +3846,13 @@ mod tests {
         assert!(
             output.contains("cover by SELL"),
             "the operator must be told which side covers the delta, got: {output}"
+        );
+        // A fill the bot never delivers is never paged, so the output is the
+        // operator's only prompt to record the cover.
+        assert!(
+            output.contains("read resource skipped-fills --param covered=false")
+                && output.contains(&cover_command),
+            "the operator must be told how to record the cover, got: {output}"
         );
 
         let (store, _) = StoreBuilder::<OnChainTradeCqrs>::new(pool.clone())
@@ -3864,6 +3906,10 @@ mod tests {
         .await
         .unwrap();
 
+        let cover_command = format!(
+            "debug cover-excluded-fill base {} {}",
+            onchain_trade.tx_hash, onchain_trade.log_index
+        );
         let enabled_ctx = create_aapl_accounting_test_ctx();
         let mut stdout = Vec::new();
         process_found_trade(
@@ -3889,6 +3935,12 @@ mod tests {
             output.contains("cover by SELL"),
             "the operator must be told which side covers the delta, got: {output}"
         );
+        assert!(
+            output.contains("--param covered=false --param chain=base --param symbol=AAPL")
+                && output.contains(&cover_command),
+            "the rerun may be the only prompt, so it must say how to record the cover, \
+             got: {output}"
+        );
 
         let (fill_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
@@ -3902,6 +3954,60 @@ mod tests {
             fill_count, 0,
             "the excluded fill must stay out of the position"
         );
+    }
+
+    /// A fresh fill that landed inside a closed disabled period stays out of
+    /// the position even though the CLI's config already enables the asset:
+    /// only the fill's own block, checked against the recorded period, keeps
+    /// it from being hedged.
+    #[tokio::test]
+    async fn process_tx_excludes_a_fill_from_a_closed_disabled_period() {
+        let pool = setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO trading_disabled_period \
+             (chain, symbol, disabled_from_block, enabled_from_block, enabled_at) \
+             VALUES ('base', 'AAPL', 40, 50, '2026-09-25T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+        let cover_command = format!(
+            "debug cover-excluded-fill base {} {}",
+            onchain_trade.tx_hash, onchain_trade.log_index
+        );
+
+        let enabled_ctx = create_aapl_accounting_test_ctx();
+        let mut stdout = Vec::new();
+        process_found_trade(
+            onchain_trade,
+            &enabled_ctx,
+            &pool,
+            &mut stdout,
+            create_order_placer(&enabled_ctx, &pool),
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("landed in block 42") && output.contains("enabled from block 50"),
+            "the operator must be told why the fill is excluded, got: {output}"
+        );
+        assert!(
+            output.contains(&cover_command),
+            "the operator must be told how to record the cover, got: {output}"
+        );
+
+        let (fill_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind(
+                    st0x_hedge::operator::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE,
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fill_count, 0, "the fill must stay out of the position");
     }
 
     /// After the CLI applies a fill via `process_found_trade`, the normal

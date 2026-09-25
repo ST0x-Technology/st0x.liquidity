@@ -31,6 +31,7 @@ use crate::onchain_trade::OnChainTrade;
 use crate::portfolio_snapshot::PortfolioSnapshot;
 use crate::position::Position;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::trading::onchain::skipped_fill::unadopted_legacy_exclusion_symbols;
 use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecovery;
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistry;
@@ -103,6 +104,7 @@ impl fmt::Display for VerificationReport {
 enum SymbolReferenceSource {
     Position,
     UnacknowledgedOnChainTrade,
+    UncoveredExcludedFill,
     OpenOffchainOrder,
     VaultRegistry,
     InventorySnapshot,
@@ -127,6 +129,7 @@ impl fmt::Display for SymbolReferenceSource {
         let label = match self {
             Self::Position => "position",
             Self::UnacknowledgedOnChainTrade => "unacknowledged onchain trade",
+            Self::UncoveredExcludedFill => "excluded fill awaiting its manual cover",
             Self::OpenOffchainOrder => "open offchain order",
             Self::VaultRegistry => "vault registry",
             Self::InventorySnapshot => "inventory snapshot",
@@ -314,8 +317,10 @@ pub async fn verify_migrations(
 
     clear_snapshots(&scratch_pool).await?;
 
-    let (replay_reports, symbol_references) =
+    let (mut replay_reports, mut symbol_references) =
         run_replay_checks_with_references(&scratch_pool).await;
+    replay_reports
+        .push(add_unadopted_legacy_exclusions(&scratch_pool, &mut symbol_references).await);
     let symbol_compatibility = SymbolCompatibilityReport::new(symbol_policy, &symbol_references);
 
     scratch_pool.close().await;
@@ -344,6 +349,54 @@ async fn clear_snapshots(pool: &SqlitePool) -> Result<(), VerificationError> {
 
     Ok(())
 }
+
+/// Fills excluded before exclusions were recorded on their trades gain their
+/// `ExcludedFromHedging` event only at the first bot start after this deploy,
+/// so replay alone does not see them. Their uncovered exposure blocks retiring
+/// the symbol like any other uncovered exclusion, read from the durable
+/// records without writing to the scratch copy. A failure is reported like a
+/// replay failure, so the rest of the report still reaches the operator.
+async fn add_unadopted_legacy_exclusions(
+    pool: &SqlitePool,
+    references: &mut SymbolReferences,
+) -> AggregateReplayReport {
+    let mut report = AggregateReplayReport {
+        aggregate_type: LEGACY_EXCLUSION_SCAN,
+        total: 0,
+        failures: Vec::new(),
+    };
+    let symbols = match unadopted_legacy_exclusion_symbols(pool).await {
+        Ok(symbols) => symbols,
+        Err(error) => {
+            report.failures.push(ReplayFailure {
+                aggregate_id: "*".to_string(),
+                error: format!("failed to read the unadopted legacy exclusions: {error}"),
+            });
+            return report;
+        }
+    };
+
+    report.total = symbols.len();
+    for symbol in symbols {
+        match Symbol::new(&symbol) {
+            Ok(symbol) => add_reference(
+                references,
+                &symbol,
+                SymbolReferenceSource::UncoveredExcludedFill,
+            ),
+            Err(error) => report.failures.push(ReplayFailure {
+                aggregate_id: symbol,
+                error: format!("invalid symbol on an unadopted legacy exclusion: {error}"),
+            }),
+        }
+    }
+
+    report
+}
+
+/// Report label of the scan for fills excluded before exclusions were
+/// recorded on trades, which is not an aggregate replay of its own.
+const LEGACY_EXCLUSION_SCAN: &str = "unadopted legacy exclusions";
 
 #[cfg(test)]
 async fn run_replay_checks(pool: &SqlitePool) -> Vec<AggregateReplayReport> {
@@ -447,6 +500,19 @@ impl DurableSymbolReferences for OnChainTrade {
                 references,
                 &self.symbol,
                 SymbolReferenceSource::UnacknowledgedOnChainTrade,
+            );
+        }
+        // An excluded fill without its cover is open unhedged exposure, like
+        // a nonzero position, so the symbol must not leave the config yet.
+        if self
+            .exclusion
+            .as_ref()
+            .is_some_and(|exclusion| exclusion.cover.is_none())
+        {
+            add_reference(
+                references,
+                &self.symbol,
+                SymbolReferenceSource::UncoveredExcludedFill,
             );
         }
     }
@@ -835,7 +901,39 @@ mod tests {
         assert!(
             references_for(&OnChainTrade {
                 acknowledged_at: Some(now),
-                ..unacknowledged_trade
+                ..unacknowledged_trade.clone()
+            })
+            .is_empty()
+        );
+        let uncovered_exclusion = OnChainTrade {
+            acknowledged_at: Some(now),
+            exclusion: Some(crate::onchain_trade::Exclusion {
+                excluded_at: now,
+                cover: None,
+            }),
+            ..unacknowledged_trade
+        };
+        assert!(contains_source(
+            &references_for(&uncovered_exclusion),
+            &symbol,
+            SymbolReferenceSource::UncoveredExcludedFill,
+        ));
+        assert!(
+            !SymbolReferenceSource::UncoveredExcludedFill.allows_retirement(),
+            "an uncovered excluded fill blocks retiring its symbol"
+        );
+        assert!(
+            references_for(&OnChainTrade {
+                exclusion: Some(crate::onchain_trade::Exclusion {
+                    excluded_at: now,
+                    cover: Some(crate::onchain_trade::ExclusionCover {
+                        price_usdc: float!(1),
+                        broker_order_id: None,
+                        covered_at: now,
+                        recorded_at: now,
+                    }),
+                }),
+                ..uncovered_exclusion
             })
             .is_empty()
         );
@@ -1139,7 +1237,13 @@ mod tests {
         assert_eq!(bytes_before, bytes_after, "source database was mutated");
 
         assert!(!report.has_failures());
-        assert_eq!(report.replay_reports.len(), 12);
+        // Every aggregate type plus the scan for unadopted legacy exclusions.
+        assert_eq!(report.replay_reports.len(), 13);
+        assert!(
+            find_report(&report.replay_reports, LEGACY_EXCLUSION_SCAN)
+                .failures
+                .is_empty()
+        );
         assert_eq!(find_report(&report.replay_reports, "Position").total, 1);
     }
 
@@ -1200,6 +1304,59 @@ mod tests {
         assert!(rendered.contains("QSEP"), "{rendered}");
         assert!(rendered.contains("position"), "{rendered}");
         assert!(rendered.contains("vault registry"), "{rendered}");
+    }
+
+    /// A fill excluded before exclusions were recorded on trades has only its
+    /// acknowledged marker and a `trading_disabled` record until the first
+    /// bot start adopts it. The gate must still see its uncovered exposure.
+    #[tokio::test]
+    async fn legacy_uncovered_exclusion_blocks_retiring_its_symbol() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        let (onchain_trade, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let trade = crate::test_utils::OnchainTradeBuilder::new()
+            .with_symbol("wtQSEP")
+            .build();
+        crate::conductor::execute_witness_trade(
+            &onchain_trade,
+            &trade,
+            1,
+            trade.block_timestamp.unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::trading::onchain::skipped_fill::record_skipped_fill(
+            &pool,
+            trade.chain,
+            trade.tx_hash,
+            trade.log_index,
+            "ClearV3",
+            crate::trading::onchain::skipped_fill::SkipReason::TradingDisabled,
+            "legacy",
+        )
+        .await
+        .unwrap();
+        crate::conductor::execute_mark_acknowledged(
+            &onchain_trade,
+            &crate::onchain_trade::OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index),
+        )
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let report = verify_migrations(&source_path, &symbol_policy(&["AAPL"], &["QSEP"]))
+            .await
+            .unwrap();
+
+        assert!(report.has_failures());
+        let rendered = report.to_string();
+        assert!(
+            rendered.contains("QSEP")
+                && rendered.contains("excluded fill awaiting its manual cover"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

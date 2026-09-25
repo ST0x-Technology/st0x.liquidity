@@ -171,8 +171,8 @@ pub(crate) struct PositionReplayDelta {
     pub(crate) position_net: Float,
 }
 
-/// One replay-input row loaded from the PnL ledger: one of the four position
-/// row kinds, already typed at ingestion (ADR 0018). Decimal fields stay as
+/// One replay-input row loaded from the PnL ledger: one of the position row
+/// kinds, already typed at ingestion (ADR 0018). Decimal fields stay as
 /// the canonical strings the ledger stores so the replay's parse/validation
 /// layer and the response's verbatim timestamp passthrough are unchanged.
 #[derive(Debug, Clone)]

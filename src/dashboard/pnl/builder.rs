@@ -124,7 +124,7 @@ pub(crate) fn build_pnl_response_from_rows(
     let available_range = build_available_range(&event_rows, &mut warnings);
     let sample_stats = build_sample_stats(&event_rows, query, &mut warnings);
     let mut books: HashMap<Symbol, SymbolBook> = HashMap::new();
-    let mut excluded_books: HashMap<(Symbol, String), SymbolBook> = HashMap::new();
+    let mut excluded_books: BTreeMap<(Symbol, String), SymbolBook> = BTreeMap::new();
     let mut entries = Vec::new();
     let mut unmatched_offchain_allocations = Vec::new();
     let mut position_replay_deltas = Vec::new();
@@ -334,7 +334,7 @@ fn book_for<'books>(
     row: &PositionLedgerRow,
     symbol: Symbol,
     books: &'books mut HashMap<Symbol, SymbolBook>,
-    excluded_books: &'books mut HashMap<(Symbol, String), SymbolBook>,
+    excluded_books: &'books mut BTreeMap<(Symbol, String), SymbolBook>,
 ) -> &'books mut SymbolBook {
     match row {
         PositionLedgerRow::ExcludedFill(ExcludedFillRow { trade_id, .. })
@@ -355,7 +355,7 @@ fn book_for<'books>(
 /// yet, reported as a warning per symbol, but never reconciled with the
 /// position view's net, which excluded fills never reached.
 fn finalize_excluded_books(
-    excluded_books: &mut HashMap<(Symbol, String), SymbolBook>,
+    excluded_books: &mut BTreeMap<(Symbol, String), SymbolBook>,
     full_total: &mut SummaryAcc,
     replay_symbols: &mut Vec<(Symbol, SummaryAcc)>,
     warnings: &mut Vec<String>,
@@ -363,28 +363,22 @@ fn finalize_excluded_books(
 ) -> Result<(), PnlError> {
     let no_position_nets = HashMap::new();
     let mut per_symbol: BTreeMap<Symbol, SummaryAcc> = BTreeMap::new();
-    let mut keys: Vec<_> = excluded_books.keys().cloned().collect();
-    keys.sort();
-    for key in keys {
-        let Some(book) = excluded_books.get_mut(&key) else {
-            continue;
-        };
-        let (symbol, _) = key;
+    for ((symbol, _), book) in excluded_books.iter_mut() {
         finalize_book(
-            &symbol,
+            symbol,
             book,
             &no_position_nets,
             warnings,
             position_replay_deltas,
         )?;
-        add_summary(per_symbol.entry(symbol).or_default(), &book.summary)?;
+        add_summary(per_symbol.entry(symbol.clone()).or_default(), &book.summary)?;
     }
 
     for (symbol, summary) in per_symbol {
         let open_shares = (summary.open_long_shares + summary.open_short_shares)?;
         if !open_shares.is_zero()? {
             warnings.push(format!(
-                "Excluded fills on {symbol} (trading disabled) leave {} shares not yet covered \
+                "Fills on {symbol} excluded from hedging leave {} shares not yet covered \
                  by a recorded manual cover; their PnL is open until the cover is recorded.",
                 fmt_decimal(open_shares)?
             ));

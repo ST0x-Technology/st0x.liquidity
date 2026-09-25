@@ -100,7 +100,8 @@ pub(crate) struct CoverExcludedFillArgs {
     #[arg(long)]
     pub(crate) shares: String,
     /// Broker execution price per share, in USD; the volume weighted price
-    /// when the cover took several broker orders.
+    /// when the cover took several broker orders. A recorded cover is final:
+    /// no command amends it, so check the price and time before submitting.
     #[arg(long)]
     pub(crate) price_usdc: String,
     /// When the broker trade executed (RFC 3339).

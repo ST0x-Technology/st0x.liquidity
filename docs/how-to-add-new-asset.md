@@ -200,17 +200,25 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 **Fields:**
 
 - `trading`: Set to `"disabled"` initially, enable once everything else is
-  ready. A fill on this chain that lands while it is disabled is never counter
-  traded, not even after trading is enabled: it is recorded in `skipped_fills`
-  with reason `trading_disabled`, paged, and has to be covered by hand. Fills
-  that land while it is disabled stay excluded even if the bot accounts them
-  after the restart that enables trading; the boundary is the block after the
-  chain head that restart reads: fills up to and including that head stay
-  excluded, and fills from the next block on are hedged. List excluded fills
-  with
+  ready. To stop trading an asset later, set it back to `"disabled"` rather than
+  removing the entry: once the entry is gone, its inventory fills are no longer
+  recognized and are skipped with reason `unrecognized_inventory_token` instead
+  of being excluded and coverable. A fill on this chain that lands while it is
+  disabled is never counter traded, not even after trading is enabled: it is
+  recorded in `skipped_fills` with reason `trading_disabled`, paged, and has to
+  be covered by hand. A fill the bot accounts while trading is disabled is
+  excluded the same way, even if it landed before the disable. Fills that land
+  while it is disabled stay excluded even if the bot accounts them after the
+  restart that enables trading; the boundary is the block after the chain head
+  that restart reads: fills up to and including that head stay excluded, and
+  fills from the next block on are hedged. If that restart reads a head behind
+  the one the disabling restart read (a stale node), the bot refuses to start
+  and records nothing; another start clears it once the node reports a current
+  head. List excluded fills with
   `st0x-liquidity-client --env <production|staging> read resource
   skipped-fills --param reason=trading_disabled --param covered=false`,
-  and once a fill's whole amount is covered at the broker, record it with
+  cover each fill by its own broker trade on its cover side for its full amount,
+  and once it executes record it with
   `st0x-liquidity-client --env <production|staging> debug cover-excluded-fill
   <chain> <tx> <log_index> --shares <amount> --price-usdc <price> --covered-at
   <time>`

@@ -14,7 +14,7 @@ use alloy::hex::FromHexError;
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rain_math_float::Float;
+use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
@@ -115,8 +115,9 @@ pub struct OnChainTrade {
     #[serde(default)]
     pub(crate) acknowledged_at: Option<DateTime<Utc>>,
     /// Set when the fill was excluded from hedging instead of applied to
-    /// `Position`: trading was disabled for it on its chain. Its delta is
-    /// covered by hand, and the operator records that cover here.
+    /// `Position`: trading was disabled for it on its chain, or it landed
+    /// while trading was disabled. Its delta is covered by hand, and the
+    /// operator records that cover here.
     #[serde(default)]
     pub(crate) exclusion: Option<Exclusion>,
 }
@@ -423,10 +424,10 @@ impl EventSourced for OnChainTrade {
                 if exclusion.cover.is_some() {
                     return Err(OnChainTradeError::AlreadyCovered);
                 }
-                if !shares.eq(self.amount).unwrap_or(false) {
+                if !shares.eq(self.amount)? {
                     return Err(OnChainTradeError::CoverSharesMismatch);
                 }
-                if !price_usdc.gt(st0x_float_macro::float!(0)).unwrap_or(false) {
+                if !price_usdc.gt(st0x_float_macro::float!(0))? {
                     return Err(OnChainTradeError::NonPositiveCoverPrice);
                 }
                 let recorded_at = Utc::now();
@@ -613,8 +614,22 @@ pub enum OnChainTradeError {
     CoverSharesMismatch,
     #[error("A manual cover cannot execute before the fill it covers")]
     CoverBeforeFill,
-    #[error("A manual cover cannot execute in the future")]
+    #[error("A manual cover cannot execute more than five minutes in the future")]
     CoverInFuture,
+    // Stores the error as String rather than the typed FloatError because
+    // OnChainTradeError must implement Serialize/Deserialize (it's a CQRS error
+    // type), and FloatError from rain_float does not implement those traits.
+    // This is a conscious trade-off, not an oversight, as on PositionError.
+    #[error("A manual cover's amounts could not be compared: {0}")]
+    CoverArithmetic(String),
+}
+
+// FloatError cannot be stored directly in OnChainTradeError (see the
+// CoverArithmetic variant above), so it is converted to String here.
+impl From<FloatError> for OnChainTradeError {
+    fn from(error: FloatError) -> Self {
+        Self::CoverArithmetic(error.to_string())
+    }
 }
 
 /// How far a manual cover's execution time may run ahead of the bot's clock:
@@ -670,7 +685,8 @@ pub enum OnChainTradeCommand {
     /// treats it as done.
     Acknowledge,
     /// Marks the fill as fully accounted by excluding it from hedging:
-    /// trading is disabled for it on its chain, so it never reaches
+    /// trading is disabled for it on its chain, or it landed while trading was
+    /// disabled and is accounted after it was enabled again. It never reaches
     /// `Position` and its delta is covered by hand. Also acknowledges it, so
     /// the dedupe guard treats it as done.
     Exclude,
@@ -901,20 +917,27 @@ impl Eq for OnChainTradeEvent {}
 impl DomainEvent for OnChainTradeEvent {
     fn event_type(&self) -> String {
         match self {
-            Self::Filled { .. } => "OnChainTradeEvent::Filled".to_string(),
+            Self::Filled { .. } => Self::FILLED_EVENT_TYPE.to_string(),
             Self::SourceAttributed { .. } => "OnChainTradeEvent::SourceAttributed".to_string(),
             Self::Enriched { .. } => "OnChainTradeEvent::Enriched".to_string(),
-            Self::Acknowledged { .. } => "OnChainTradeEvent::Acknowledged".to_string(),
-            Self::ExcludedFromHedging { .. } => {
-                "OnChainTradeEvent::ExcludedFromHedging".to_string()
-            }
-            Self::ExclusionCovered { .. } => "OnChainTradeEvent::ExclusionCovered".to_string(),
+            Self::Acknowledged { .. } => Self::ACKNOWLEDGED_EVENT_TYPE.to_string(),
+            Self::ExcludedFromHedging { .. } => Self::EXCLUDED_FROM_HEDGING_EVENT_TYPE.to_string(),
+            Self::ExclusionCovered { .. } => Self::EXCLUSION_COVERED_EVENT_TYPE.to_string(),
         }
     }
 
     fn event_version(&self) -> String {
         "1.0".to_string()
     }
+}
+
+impl OnChainTradeEvent {
+    pub(crate) const FILLED_EVENT_TYPE: &'static str = "OnChainTradeEvent::Filled";
+    pub(crate) const ACKNOWLEDGED_EVENT_TYPE: &'static str = "OnChainTradeEvent::Acknowledged";
+    pub(crate) const EXCLUDED_FROM_HEDGING_EVENT_TYPE: &'static str =
+        "OnChainTradeEvent::ExcludedFromHedging";
+    pub(crate) const EXCLUSION_COVERED_EVENT_TYPE: &'static str =
+        "OnChainTradeEvent::ExclusionCovered";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1246,7 +1269,7 @@ mod tests {
     }
 
     /// The cover must be the fill's full amount, executed after the fill and
-    /// not in the future.
+    /// not more than five minutes in the future.
     #[tokio::test]
     async fn cover_must_match_the_fill_amount_and_follow_it_in_time() {
         let now = Utc::now();

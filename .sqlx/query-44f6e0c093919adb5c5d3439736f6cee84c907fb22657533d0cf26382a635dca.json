@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) FROM skipped_fills AS skipped WHERE skipped.chain = ? AND skipped.tx_hash = ? AND skipped.log_index = ? AND skipped.reason = ? AND skipped.paged_at IS NULL AND NOT EXISTS ( SELECT 1 FROM events AS cover_event WHERE cover_event.aggregate_type = ? AND cover_event.aggregate_id = skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index AND cover_event.event_type = ?)",
+  "describe": {
+    "columns": [
+      {
+        "name": "COUNT(*)",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "44f6e0c093919adb5c5d3439736f6cee84c907fb22657533d0cf26382a635dca"
+}

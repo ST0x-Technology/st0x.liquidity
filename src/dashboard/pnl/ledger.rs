@@ -86,7 +86,7 @@ pub(crate) enum PnlLedgerError {
     InvalidBotGasCost(#[from] crate::bot_gas::BotGasReceiptCostError),
 }
 
-/// Checkpointed ingester over the four PnL source aggregates. One instance
+/// Checkpointed ingester over the five PnL source aggregates. One instance
 /// per process; concurrent `catch_up` calls serialize on the internal mutex,
 /// so overlapping reactor nudges and request-path freshness checks cannot
 /// race each other.
@@ -321,7 +321,21 @@ impl Reactor for PnlLedgerReactor {
             .on(|_id, _event| async move { self.ledger.catch_up().await.map(|_head| ()) })
             .on(|_id, _event| async move { self.ledger.catch_up().await.map(|_head| ()) })
             .on(|_id, _event| async move { self.ledger.catch_up().await.map(|_head| ()) })
-            .on(|_id, _event| async move { self.ledger.catch_up().await.map(|_head| ()) })
+            // Only exclusions and their covers carry ledger input; the other
+            // trade events of every hedged fill would run a catch up that
+            // never finds work.
+            .on(|_id, event| async move {
+                match event {
+                    OnChainTradeEvent::ExcludedFromHedging { .. }
+                    | OnChainTradeEvent::ExclusionCovered { .. } => {
+                        self.ledger.catch_up().await.map(|_head| ())
+                    }
+                    OnChainTradeEvent::Filled { .. }
+                    | OnChainTradeEvent::SourceAttributed { .. }
+                    | OnChainTradeEvent::Enriched { .. }
+                    | OnChainTradeEvent::Acknowledged { .. } => Ok(()),
+                }
+            })
             .exhaustive()
             .await
     }

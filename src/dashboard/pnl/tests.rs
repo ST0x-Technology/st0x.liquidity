@@ -1310,13 +1310,16 @@ async fn uncovered_excluded_fill_is_open_exposure_with_a_warning() {
     );
 }
 
+// An onchain fill's payload feeds `idx_events_position_fill_tx_hash`, so SQLite
+// refuses malformed text for it at write time; an offchain fill has no such
+// index, which leaves the ingestion check as the guard under test.
 #[tokio::test]
 async fn ledger_ingestion_rejects_malformed_persisted_payload_text() {
     let pool = pnl_test_pool(Vec::new(), position_rows()).await;
     sqlx::query(
         "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
          event_type, event_version, payload, metadata) \
-         VALUES ('Position', 'RKLB', 1, 'PositionEvent::OnChainOrderFilled', '1.0', \
+         VALUES ('Position', 'RKLB', 1, 'PositionEvent::OffChainOrderFilled', '1.0', \
          '{not-json', '{}')",
     )
     .execute(&pool)

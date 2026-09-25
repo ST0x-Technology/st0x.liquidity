@@ -73,7 +73,7 @@ pub enum RejectionReason {
     },
     #[error("the cover cannot have executed before the fill it covers")]
     CoverBeforeFill,
-    #[error("the cover cannot have executed in the future")]
+    #[error("the cover cannot have executed more than five minutes ahead of the bot's clock")]
     CoverInFuture,
     #[error("another request changed excluded fill {trade_id} concurrently; retry")]
     ConcurrentCover {
@@ -166,8 +166,8 @@ pub mod bot_gas {
 pub mod conductor {
     pub use crate::conductor::{
         ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
-        account_for_onchain_fill, configured_equity_symbols, execute_mark_acknowledged,
-        execute_settle_fill, is_expected_place_offchain_order_rejection,
+        account_for_onchain_fill, configured_equity_symbols, excluded_fill_cover_instructions,
+        execute_mark_acknowledged, execute_settle_fill, is_expected_place_offchain_order_rejection,
     };
     pub use crate::trading::onchain::exclusion::{ExclusionCause, exclusion_cause};
 
@@ -883,7 +883,9 @@ pub mod excluded_fill {
     ///
     /// Shared by the ops API. Refuses a fill that was not excluded or already
     /// has a cover, so a cover is recorded exactly once, including when two
-    /// requests race.
+    /// requests race. Success means the `ExclusionCovered` event is durable;
+    /// the uncovered listing and the pager read it from the event log, so no
+    /// view has to catch up first.
     pub async fn record_exclusion_cover(
         pool: &SqlitePool,
         trade_id: &OnChainTradeId,
@@ -897,15 +899,29 @@ pub mod excluded_fill {
             .await
             .context("failed to build onchain trade store")?;
 
-        // A fill also in `Position` is hedged by the bot; a manual cover would
-        // double it.
-        if let Some(state) = onchain_trade
+        let Some(state) = onchain_trade
             .load(trade_id)
             .await
             .context("failed to load the excluded fill")?
-            && position_fill_already_recorded(pool, &state.symbol, trade_id)
-                .await
-                .context("failed to check the fill against the position")?
+        else {
+            return Err(RejectionReason::FillNotExcluded {
+                trade_id: trade_id.clone(),
+            }
+            .into());
+        };
+        // Checked before the position: a plain hedged fill is simply not
+        // excluded, not a record conflict.
+        if !state.is_excluded() {
+            return Err(RejectionReason::FillNotExcluded {
+                trade_id: trade_id.clone(),
+            }
+            .into());
+        }
+        // A fill also in `Position` is hedged by the bot; a manual cover would
+        // double it.
+        if position_fill_already_recorded(pool, &state.symbol, trade_id)
+            .await
+            .context("failed to check the fill against the position")?
         {
             return Err(RejectionReason::ExcludedFillInPosition {
                 trade_id: trade_id.clone(),
@@ -944,21 +960,11 @@ pub mod excluded_fill {
             ))) => Err(RejectionReason::NonPositiveCoverPrice.into()),
             Err(AggregateError::UserError(LifecycleError::Apply(
                 OnChainTradeError::CoverSharesMismatch,
-            ))) => {
-                let expected = onchain_trade
-                    .load(trade_id)
-                    .await
-                    .context("failed to load the excluded fill")?
-                    .map(|state| state.amount);
-                Err(RejectionReason::CoverSharesMismatch {
-                    trade_id: trade_id.clone(),
-                    expected: expected.map_or_else(
-                        || "unknown".to_owned(),
-                        |amount| st0x_float_serde::format_float_with_fallback(&amount),
-                    ),
-                }
-                .into())
+            ))) => Err(RejectionReason::CoverSharesMismatch {
+                trade_id: trade_id.clone(),
+                expected: st0x_float_serde::format_float_with_fallback(&state.amount),
             }
+            .into()),
             Err(AggregateError::UserError(LifecycleError::Apply(
                 OnChainTradeError::CoverBeforeFill,
             ))) => Err(RejectionReason::CoverBeforeFill.into()),

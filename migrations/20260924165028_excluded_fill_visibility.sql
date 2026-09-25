@@ -21,7 +21,8 @@ CREATE TABLE trading_enablement (
     trading_enabled INTEGER NOT NULL CHECK (trading_enabled IN (0, 1)),
     disabled_from_block INTEGER,
     observed_at TEXT NOT NULL,
-    PRIMARY KEY (chain, symbol)
+    PRIMARY KEY (chain, symbol),
+    CHECK ((trading_enabled = 1) = (disabled_from_block IS NULL))
 ) STRICT;
 
 -- One row per closed disabled period, written by the restart that saw the
@@ -38,7 +39,8 @@ CREATE TABLE trading_disabled_period (
 ) STRICT;
 
 -- One row per OnChainTradeEvent::ExcludedFromHedging: an onchain fill kept
--- out of `Position`, booked in the PnL ledger on its own book per symbol.
+-- out of `Position`, booked in the PnL ledger on its own book per excluded
+-- fill, apart from the hedged fills and from other excluded fills.
 -- Same conventions as the other pnl_* tables (see 20260805164942).
 CREATE TABLE pnl_excluded_fill (
     event_rowid INTEGER PRIMARY KEY,
@@ -69,3 +71,16 @@ CREATE TABLE pnl_excluded_fill_cover (
 ) STRICT;
 
 CREATE INDEX idx_pnl_excluded_fill_cover_symbol ON pnl_excluded_fill_cover (symbol);
+
+-- The PnL read path drops an excluded fill, or its cover, that also has a
+-- hedged row (a fill classified both ways); this index makes that lookup a
+-- seek instead of a scan of every hedged fill.
+CREATE INDEX idx_pnl_onchain_fill_identity ON pnl_onchain_fill (chain, tx_hash, log_index);
+
+-- The excluded fill listing and the page's uncovered net check, per row,
+-- whether `Position` also holds the fill. Without this index each check scans
+-- the symbol's whole `Position` stream; with it, it seeks the fill's hash.
+-- Partial on the event type, which the lookup names literally.
+CREATE INDEX idx_events_position_fill_tx_hash
+ON events (json_extract(payload, '$.OnChainOrderFilled.trade_id.tx_hash'))
+WHERE event_type = 'PositionEvent::OnChainOrderFilled';
