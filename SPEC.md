@@ -4258,9 +4258,12 @@ enum BridgeStage { Burn, Attestation, Mint }
   post-burn transfer, whose next redrive re-attempts the mint directly instead
   (idempotency there comes from CCTP's nonce being authoritative, not from that
   bounded scan). The exception is a `BaseToAlpaca` `BridgingFailed` recovery
-  that reads the nonce used but finds no `MessageReceived` log in its scan: no
-  redrive scans wider, so it pages "the CCTP mint cannot be resolved
-  automatically" and parks the transfer for reconciliation.
+  that reads the nonce used but finds no `MessageReceived` log in its scan, when
+  the floor rule of the `Attested` resume above says the mint can lie below that
+  scan: no redrive scans wider, so it pages "the CCTP mint cannot be resolved
+  automatically" and parks the transfer for reconciliation. When the floor rule
+  places the mint inside the scan, the missing log is index lag and the recovery
+  redrives.
 - **Inconclusive mint recovery: redrive and operator alert**: the job layer
   schedules an unbounded delayed redrive (like the settlement-phase
   RPC-transient case above) rather than consuming the apalis retry budget, since
