@@ -21,6 +21,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
+#[cfg(test)]
+use tokio::sync::broadcast;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -29,13 +31,19 @@ use rain_math_float::Float;
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode, TargetShare,
 };
+#[cfg(test)]
+use st0x_config::{ChainCashAsset, ChainEquities};
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, SendError,
     Store, deps,
 };
+#[cfg(test)]
+use st0x_event_sorcery::{StoreBuilder, test_store};
 use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, HedgeFloor, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
+#[cfg(test)]
+use st0x_float_macro::float;
 use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId};
 use st0x_wrapper::{Wrapper, WrapperError};
 
@@ -45,6 +53,8 @@ use self::allocation::{
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
+#[cfg(test)]
+use crate::alerts::LogNotifier;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::conductor::job::{BackpressureStreak, QueuePushError};
@@ -67,6 +77,8 @@ use crate::position::{
     EquityTransferReservationId, EquityTransferReservationStatus, Position, PositionCommand,
     PositionError, PositionEvent,
 };
+#[cfg(test)]
+use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::equity::{
     TransferEquityToHedging, TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
     TransferEquityToMarketMakingJobQueue,
@@ -7931,6 +7943,84 @@ pub(crate) async fn drain_pending_jobs(
             return Ok(processed);
         }
     }
+}
+
+/// Test-only factory that wires a [`RebalancingService`] to a fresh
+/// `UsdcRebalance` store exactly as the conductor wires `built.usdc`: the
+/// service is subscribed to the store as a reactor, and the same handle is
+/// registered via [`RebalancingService::set_stores`]. Returns the service and
+/// the wired store so a test can send `FailBridging` through the store and
+/// assert the reactor reconciled the in-memory guard and inventory. This is the
+/// seam the `fail-usdc-transfer` route depends on -- a standalone store would
+/// persist the event but never run the reactor, leaving a running bot latched.
+#[cfg(test)]
+pub(crate) async fn wire_usdc_reactor_store(
+    pool: &sqlx::SqlitePool,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> (Arc<RebalancingService>, Arc<Store<UsdcRebalance>>) {
+    let (event_sender, _) = broadcast::channel(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
+        InventoryView::default(),
+        event_sender,
+    ));
+    let config = RebalancingServiceConfig {
+        poll_freshness: PollFreshness::always_fresh(),
+        inventory_staleness_bound: Duration::from_secs(300),
+        allocation: AllocationCtx::base_test(),
+        usdc: Some(ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        }),
+        transfer_timeout: Duration::from_secs(30 * 60),
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainRebalancingConfig::for_test(ChainAssets {
+                equities: ChainEquities::default(),
+                cash: Some(ChainCashAsset {
+                    vault_ids: Vec::new(),
+                    rebalancing: OperationMode::Enabled,
+                    operational_limit: None,
+                }),
+            }),
+        )]),
+        cash_reserved: None,
+        hedge_floor: HedgeFloor::default(),
+    };
+    let service = Arc::new(RebalancingService::new(
+        config,
+        Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+        BTreeMap::new(),
+        inventory,
+        BTreeMap::new(),
+        RebalancingSchedulers::new(apalis_pool),
+        Arc::new(LogNotifier),
+    ));
+
+    // Empty chains: the usdc reactor path never reads equity services, and the
+    // mint/redemption stores exist only to satisfy `set_stores`.
+    let services = EquityTransferServices {
+        chains: BTreeMap::new(),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+    };
+    let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        .with(service.clone())
+        .build(services.clone())
+        .await
+        .unwrap();
+    let (redemption_store, _) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        .with(service.clone())
+        .build(services)
+        .await
+        .unwrap();
+    let (usdc_store, _) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        .with(service.clone())
+        .build(())
+        .await
+        .unwrap();
+    service
+        .set_stores(mint_store, redemption_store, usdc_store.clone())
+        .await;
+    (service, usdc_store)
 }
 
 #[cfg(test)]
