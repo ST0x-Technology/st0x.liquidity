@@ -409,17 +409,17 @@ impl EquityTransferServices {
     /// direct `events` insert (docs/cqrs.md forbids those, including in tests).
     #[cfg(test)]
     pub(crate) fn confirming_withdrawal(token: Address, amount: U256) -> Self {
-        use crate::onchain::mock::MockRaindex;
-        use crate::vault_lookup::MockVaultLookup;
-
         Self {
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainEquityServices {
                     wallet: Address::ZERO,
-                    raindex: Arc::new(MockRaindex::new().with_withdraw_transfer(token, amount)),
+                    raindex: Arc::new(
+                        crate::onchain::mock::MockRaindex::new()
+                            .with_withdraw_transfer(token, amount),
+                    ),
                     vault_lookup: Arc::new(
-                        MockVaultLookup::new()
+                        crate::vault_lookup::MockVaultLookup::new()
                             .with_default_vault(RaindexVaultId(alloy::primitives::B256::ZERO)),
                     ),
                     tokenizer: Arc::new(st0x_tokenization::mock::MockTokenizer::new()),
