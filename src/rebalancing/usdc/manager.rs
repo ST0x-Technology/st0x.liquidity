@@ -3600,9 +3600,10 @@ impl<
     /// 4. Poll Circle API for attestation -> `ReceiveAttestation` command
     /// 5. Execute CCTP mint on Ethereum (credits the bot wallet)
     ///    -> `ConfirmBridging` command
-    /// 6. Send the minted USDC from the bot wallet directly to Alpaca's deposit
-    ///    address (fresh path; the resume-from-`Bridged` path scans-or-adopts for
-    ///    idempotency, mirroring the burn) -> `InitiateDeposit` records the send tx
+    /// 6. Sign the send of the minted USDC from the bot wallet to Alpaca's
+    ///    deposit address and persist it -> `PrepareDepositSend`; broadcast it
+    ///    -> `RecordPendingDeposit`; once confirmed -> `InitiateDeposit`. A
+    ///    resume with a signed send broadcasts the same bytes again
     /// 7. Poll Alpaca by the send tx until deposit credited -> `ConfirmDeposit`
     ///
     /// On errors, sends appropriate `Fail*` command to transition
@@ -6348,11 +6349,10 @@ mod tests {
         submit_started: Option<Arc<Notify>>,
         confirm_revert_count: usize,
         burn_status: Option<st0x_bridge::BurnTxStatus>,
-        // `unimplemented!()` is the default for `send_usdc_on_ethereum`, same as
-        // every other unused method on this mock -- so a test that unexpectedly
-        // walks into that path still panics loudly. Only
-        // `send_alpaca_deposit_enqueues_wallet_transfer_bot_gas_job` opts in via
-        // `with_send_usdc_tx`.
+        // `unimplemented!()` is the default for `prepare_usdc_on_ethereum`, same
+        // as every other unused method on this mock -- so a test that
+        // unexpectedly walks into the deposit send still panics loudly. The
+        // deposit send tests opt in via `with_send_usdc_tx`.
         send_usdc_tx: Option<TxHash>,
         usdc_prepare_calls: AtomicUsize,
         usdc_broadcasts: Mutex<Vec<TxHash>>,
