@@ -6449,7 +6449,9 @@ pub struct EthereumChainMissing;
 pub fn deposit_send_required_confirmations(
     chains: &ChainRegistry,
 ) -> Result<u64, EthereumChainMissing> {
-    Ok(chains.primary().required_confirmations)
+    chains
+        .required_confirmations(Chain::Ethereum)
+        .ok_or(EthereumChainMissing)
 }
 
 /// Trait-erased entry point for the operator `transfer recheck` of a failed

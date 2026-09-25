@@ -4368,10 +4368,11 @@ enum BridgeStage { Burn, Attestation, Mint }
   post-burn failure" under Failure Handling. For a signed send, the operator
   names the tx that took its nonce, and the API and CLI read it on chain before
   the command: they refuse unless it is mined from the bot's Ethereum wallet at
-  the send's nonce, is not the send itself, has the required confirmations, and
-  paid the send's deposit address no USDC (a fee-bumped copy of the send did). A
-  missing receipt for the send is never proof, since a lagging node shows none
-  for a send that mined.
+  the send's nonce, is not the send itself, has Ethereum's required
+  confirmations (`[chains.ethereum]`, not the primary chain's), and paid the
+  send's deposit address no USDC (a fee-bumped copy of the send did). A missing
+  receipt for the send is never proof, since a lagging node shows none for a
+  send that mined.
 
 ##### Integration Points
 
