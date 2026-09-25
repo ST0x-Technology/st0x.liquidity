@@ -2148,6 +2148,7 @@ mod tests {
     use st0x_hedge::operator::offchain::order::OffchainOrderId;
     use st0x_hedge::operator::onchain::mock::MockRaindex;
     use st0x_hedge::operator::position::TradeId;
+    use st0x_hedge::operator::rebalancing::usdc::DepositSendNotSuperseded;
     use st0x_hedge::operator::test_utils::try_setup_test_db;
     use st0x_hedge::operator::usdc_rebalance::{
         ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
@@ -3101,6 +3102,7 @@ mod tests {
             unknown_id,
             ReconcileReason::FundsMovedManually,
             &pool,
+            no_deposit_send_to_verify,
         )
         .await;
 
@@ -3143,6 +3145,7 @@ mod tests {
             id,
             ReconcileReason::FundsMovedManually,
             &pool,
+            no_deposit_send_to_verify,
         )
         .await;
 
@@ -3217,6 +3220,7 @@ mod tests {
             id,
             ReconcileReason::FundsMovedManually,
             &pool,
+            no_deposit_send_to_verify,
         )
         .await
         .unwrap();
@@ -3240,6 +3244,77 @@ mod tests {
             !state.holds_rebalance_guard(),
             "Reconciled must not hold the durable guard, so a restart does \
              not re-latch it"
+        );
+    }
+
+    /// Transfers without a signed deposit send have nothing to check on chain.
+    async fn no_deposit_send_to_verify(prepared: &PreparedTransaction) -> anyhow::Result<()> {
+        panic!("no signed deposit send to verify, got: {prepared:?}")
+    }
+
+    /// A signed deposit send that can still mine is not reconciled: the CLI
+    /// names the transfer and the chain check's reason, and leaves it `Bridged`.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_refuses_a_signed_deposit_send_that_can_still_mine() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xD5E2);
+
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridged(&store, id).await;
+        let prepared =
+            PreparedTransaction::for_test(alloy::primitives::TxHash::repeat_byte(0xD5), 9);
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::PrepareDepositSend {
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let error = reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            &pool,
+            async |checked: &PreparedTransaction| {
+                assert_eq!(checked, &prepared, "the chain check reads the signed send");
+                Err(DepositSendNotSuperseded::NonceFree {
+                    tx: checked.tx_hash(),
+                    nonce: checked.nonce(),
+                    confirmed_next_nonce: checked.nonce(),
+                }
+                .into())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "transfer reconcile: refusing to reconcile USDC transfer {}: {}",
+                UsdcRebalanceId(id),
+                DepositSendNotSuperseded::NonceFree {
+                    tx: prepared.tx_hash(),
+                    nonce: 9,
+                    confirmed_next_nonce: 9,
+                },
+            )
+        );
+        let state = store
+            .load(&UsdcRebalanceId(id))
+            .await
+            .unwrap()
+            .expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Bridged { .. }),
+            "a refused reconcile leaves the transfer Bridged, got: {state:?}"
         );
     }
 
@@ -3275,6 +3350,7 @@ mod tests {
             id,
             ReconcileReason::FundsMovedManually,
             &pool,
+            async |_: &PreparedTransaction| Ok(()),
         )
         .await
         .unwrap();
