@@ -792,19 +792,19 @@ the startup token approvals.
   settled, so startup grants the approvals.
 - **"Startup token approvals skipped"** (`operational_alert`, with `chain`): a
   signed send restored at startup on that chain (an Alpaca deposit send, or a
-  vault withdrawal) could not be rebroadcast, so a new send from that wallet
-  would wait behind its nonce. The bot runs without that chain's startup
-  approvals and revokes, and wraps or deposits that lack an allowance fail. The
-  rebroadcast page names the send: the deposit send page above, or **"Equity
+  vault withdrawal) is not mined yet: its rebroadcast failed, or it is pending,
+  possibly at a fee too low to confirm. A new send from that wallet would wait
+  behind its nonce, so the bot runs without that chain's startup approvals and
+  revokes, and wraps or deposits that lack an allowance fail. The `rebalance`
+  log names the send: "Restored Alpaca deposit send is not mined yet at startup"
+  or "Restored vault withdrawal is not mined yet at startup" (with `id` and
+  `tx`), or a rebroadcast page: the deposit send page above, or **"Equity
   redemption `<id>` has a signed vault withdrawal ... that could not be
   rebroadcast at startup"**, whose resume job broadcasts the withdrawal again.
-  Clear that send, then restart.
-- **Startup fails with "startup token approvals failed on `<chain>`"** after
-  about 5 minutes, and does so on every restart: an approval waited for its
-  receipt behind a signed send at a lower nonce that does not mine (it reached
-  the node at a fee too low to confirm). Find the lowest pending tx of that
-  chain's bot wallet. If it is an Alpaca deposit send, follow the not-confirmed
-  page above (wait for fees to drop, or cancel it at its nonce), then restart.
+  Usually the send mines within a few blocks: restart once it has. If it stays
+  pending, it will not confirm at its fee: for a deposit send follow the
+  not-confirmed page above (wait for fees to drop, or cancel it at its nonce),
+  then restart.
 - **"Cannot tell whether a signed Alpaca deposit send was persisted"**
   (`operational_alert`): a `PrepareDepositSend` write failed and the reload that
   checks it failed too. The bot keeps the send's nonce reserved, so later sends
