@@ -248,11 +248,10 @@ async fn drain_client_messages(stream: &mut futures_util::stream::SplitStream<We
     }
 }
 
-async fn send_initial_state(
-    sink: &mut SplitSink<WebSocket, Message>,
-    state: &AppState,
-    trade_protocol: TradeProtocol,
-) -> bool {
+/// Assembles the full `CurrentState` statement — the same payload the
+/// WebSocket seeds a new client with. Shared by the WS seed and the REST
+/// `/api/state` endpoint so the two can never drift.
+async fn build_current_state(state: &AppState, trade_protocol: TradeProtocol) -> Statement {
     let inventory_dto = state.inventory.read().await.to_dto();
     let transfers = transfer_loader::load_transfers(&state.pool).await;
     let mut warnings = transfers.warnings;
@@ -270,7 +269,7 @@ async fn send_initial_state(
     };
     let positions = load_positions(&state.pool).await;
 
-    let initial = Statement::CurrentState(Box::new(CurrentState {
+    Statement::CurrentState(Box::new(CurrentState {
         trades,
         inventory: inventory_dto,
         positions,
@@ -279,7 +278,15 @@ async fn send_initial_state(
         active_transfers: transfers.active,
         recent_transfers: transfers.recent,
         warnings,
-    }));
+    }))
+}
+
+async fn send_initial_state(
+    sink: &mut SplitSink<WebSocket, Message>,
+    state: &AppState,
+    trade_protocol: TradeProtocol,
+) -> bool {
+    let initial = build_current_state(state, trade_protocol).await;
 
     match send_json(sink, &initial, trade_protocol).await {
         SendOutcome::Sent => {
@@ -320,8 +327,33 @@ async fn stream_broadcasts(
     }
 }
 
+/// `GET /api/state` — the WebSocket's `current_state` seed as a one-shot
+/// REST response, for pull-based consumers (the telemetry exporter) that
+/// need inventory/positions/settings without holding a socket open. Same
+/// envelope as the WS frame: `{"type":"current_state","data":{...}}`,
+/// honoring the same `trade_protocol` query parameter.
+async fn state_endpoint(
+    State(state): State<AppState>,
+    Query(query): Query<WebSocketQuery>,
+) -> axum::response::Response {
+    let statement = build_current_state(&state, query.trade_protocol).await;
+    match serialize_statement(&statement, query.trade_protocol) {
+        Ok(json) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json,
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(target: "dashboard", %error, "Failed to serialize /api/state response");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub(crate) fn routes() -> Router<AppState> {
-    Router::new().route("/ws", get(ws_endpoint))
+    Router::new()
+        .route("/ws", get(ws_endpoint))
+        .route("/state", get(state_endpoint))
 }
 
 pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
