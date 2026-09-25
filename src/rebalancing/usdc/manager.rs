@@ -15691,6 +15691,57 @@ mod tests {
         );
     }
 
+    /// A send mined before the transfer's mint cannot carry its minted USDC:
+    /// it is an older send, such as a manual one recorded nowhere, so it is
+    /// not attached.
+    #[tokio::test]
+    async fn recheck_refuses_an_operator_deposit_tx_mined_before_the_mint() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let _address_mock = mock_alpaca_deposit_address(&server);
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            cqrs.clone(),
+        )
+        .await
+        .with_credit_ledger(pool);
+        let bridge_wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let older_send =
+            send_usdc_to_alpaca(&bridge_wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
+        let later_mint = bridge_wallet
+            .send(chain.bot_address, Bytes::new(), "the transfer's mint")
+            .await
+            .unwrap()
+            .transaction_hash;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), later_mint).await;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::FailDeposit {
+                reason: "deposit send not recorded".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        manager
+            .recheck_deposit(&id, Some(older_send))
+            .await
+            .expect_err("a send mined before the mint is not this transfer's");
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::DepositFailed { deposit_ref, .. } = state else {
+            panic!("expected DepositFailed, got: {state:?}");
+        };
+        assert_eq!(deposit_ref, None, "a refused tx is not attached");
+    }
+
     #[tokio::test]
     async fn recheck_refuses_an_operator_deposit_tx_of_another_amount() {
         let chain = deploy_ethereum_usdc_chain().await;
