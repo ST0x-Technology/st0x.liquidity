@@ -709,9 +709,10 @@ so no startup approval or revoke waits behind a send no node holds. It then
 reads each restored send's receipt, without waiting. A chain with a restored
 send that is not mined at that point (its rebroadcast failed, or it is pending,
 possibly at too low a fee to confirm) gets neither its approvals nor its revokes
-on that start: startup pages and continues, since an approval there would wait
-behind that nonce until its confirmation timeout and fail every restart. Only a
-chain whose restored sends are all mined keeps its approvals.
+on that start: startup logs a warning and continues, since an approval there
+would wait behind that nonce until its confirmation timeout and fail every
+restart. Wraps and deposits there still approve on demand. Only a chain whose
+restored sends are all mined gets its startup approvals.
 
 The per-symbol equity lock is re-armed at startup from every open mint and
 redemption aggregate, and the transfer job row plus the transfer's first event
@@ -6878,7 +6879,7 @@ therefore performs an explicit fund-moving send:
      behind a send no node holds. A failed startup rebroadcast pages and keeps
      the nonce reserved. A restored send that is not mined after the rebroadcast
      (or whose rebroadcast failed) skips the Ethereum startup approvals and
-     revokes on that start, with a page; the transfer's resume broadcasts the
+     revokes on that start, with a warning; the transfer's resume broadcasts the
      send again.
 3. **Resume from `Bridged`.**
    - **Signed send persisted:** broadcast the same bytes and continue as in

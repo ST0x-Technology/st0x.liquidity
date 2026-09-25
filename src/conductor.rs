@@ -1503,11 +1503,11 @@ fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
 /// persisted before the restart. Fails fast -- the bot must not come up
 /// healthy with these missing.
 ///
-/// Skips, with a page, each chain in `unmined_restore_chains`: its wallet
+/// Defers, with a warning, each chain in `unmined_restore_chains`: its wallet
 /// holds a restored nonce whose send is not mined yet (it could not be
 /// rebroadcast, or it is pending, maybe at too low a fee), so an approval
 /// would wait behind it until the confirmation timeout and fail startup on
-/// every restart.
+/// every restart. Wraps and deposits there still approve on demand.
 ///
 /// Skips entirely when no wallet is configured -- without one the bot never
 /// wraps or deposits, so it has no allowances to grant.
@@ -1529,13 +1529,12 @@ async fn grant_startup_token_approvals(
 
     for (chain, targets) in startup_approval_targets(ctx) {
         if unmined_restore_chains.contains(&chain) {
-            error!(
-                target: "operational_alert",
-                alert = true,
+            warn!(
+                target: "orderbook",
                 %chain,
-                "Startup token approvals skipped: a signed send restored at startup is not mined \
-                 yet, and a new send from this wallet would wait behind its nonce. Wraps and \
-                 deposits that lack an allowance fail until a restart after that send is mined"
+                "Startup token approvals deferred on this chain: a signed send restored at \
+                 startup is not mined yet, and an approval would wait behind its nonce. Wraps \
+                 and deposits still approve on demand"
             );
             continue;
         }
@@ -19040,10 +19039,10 @@ mod tests {
         );
     }
 
-    /// A chain whose restored send is not mined gets no startup
-    /// approvals, only a page: they would wait behind that nonce and fail
-    /// startup on every restart. The stub wallet reaches no node, so any
-    /// approval startup attempts fails.
+    /// A chain whose restored send is not mined gets no startup approvals,
+    /// only a warning: they would wait behind that nonce and fail startup on
+    /// every restart. The stub wallet reaches no node, so any approval
+    /// startup attempts fails.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn startup_approvals_skip_a_chain_with_an_unmined_restored_send() {
@@ -19057,18 +19056,26 @@ mod tests {
             .expect("skipped chains attempt no approval");
 
         logs_assert(|lines| {
-            let pages = lines
+            let deferrals = lines
                 .iter()
                 .filter(|line| {
-                    line.contains("operational_alert")
-                        && line.contains("alert=true")
-                        && line.contains("Startup token approvals skipped")
+                    line.contains(" WARN ")
+                        && line.contains("orderbook")
+                        && line.contains(
+                            "Startup token approvals deferred on this chain: a signed send \
+                             restored at startup is not mined yet, and an approval would wait \
+                             behind its nonce. Wraps and deposits still approve on demand",
+                        )
                 })
                 .count();
-            (pages == 2)
+            (deferrals == 2)
                 .then_some(())
-                .ok_or_else(|| format!("expected one page per chain, got {pages}"))
+                .ok_or_else(|| format!("expected one warning per chain, got {deferrals}"))
         });
+        assert!(
+            !logs_contain("operational_alert"),
+            "a deferral must not page"
+        );
         grant_startup_token_approvals(&ctx, &BTreeSet::from([Chain::Base]))
             .await
             .expect_err("an unskipped chain attempts its approvals");

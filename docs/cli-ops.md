@@ -785,26 +785,24 @@ the startup token approvals.
 - **"Could not rebroadcast a signed Alpaca deposit send at startup"**
   (`operational_alert`, with `id`, `tx` and `nonce`): the bot keeps the send's
   nonce reserved and started without the Ethereum startup token approvals and
-  stale-allowance revokes (the **"Startup token approvals skipped"** page below
-  names the chain). The transfer's resume broadcasts the send again. Read the
-  `error`: an RPC fault clears by itself; for a send that will never confirm,
-  follow the not-confirmed page above. Restart after the send confirms or is
-  settled, so startup grants the approvals.
-- **"Startup token approvals skipped"** (`operational_alert`, with `chain`): a
-  signed send restored at startup on that chain (an Alpaca deposit send, or a
-  vault withdrawal) is not mined yet: its rebroadcast failed, or it is pending,
-  possibly at a fee too low to confirm. A new send from that wallet would wait
-  behind its nonce, so the bot runs without that chain's startup approvals and
-  revokes, and wraps or deposits that lack an allowance fail. The `rebalance`
-  log names the send: "Restored Alpaca deposit send is not mined yet at startup"
-  or "Restored vault withdrawal is not mined yet at startup" (with `id` and
-  `tx`), or a rebroadcast page: the deposit send page above, or **"Equity
-  redemption `<id>` has a signed vault withdrawal ... that could not be
-  rebroadcast at startup"**, whose resume job broadcasts the withdrawal again.
-  Usually the send mines within a few blocks: restart once it has. If it stays
-  pending, it will not confirm at its fee: for a deposit send follow the
-  not-confirmed page above (wait for fees to drop, or cancel it at its nonce),
-  then restart.
+  stale-allowance revokes (the **"Startup token approvals deferred"** warning
+  below names the chain). The transfer's resume broadcasts the send again. Read
+  the `error`: an RPC fault clears by itself; for a send that will never
+  confirm, follow the not-confirmed page above.
+- **"Startup token approvals deferred on this chain"** (warning, not a page,
+  target `orderbook`, with `chain`): a signed send restored at startup on that
+  chain (an Alpaca deposit send, or a vault withdrawal) is not mined yet: its
+  rebroadcast failed, or it is pending, possibly at a fee too low to confirm. An
+  approval would wait behind its nonce, so startup grants none there and skips
+  that chain's stale-allowance revokes. Wraps and deposits still approve on
+  demand. The `rebalance` log names the send: "Restored Alpaca deposit send is
+  not mined yet at startup" (with `id` and `tx`), "Restored vault withdrawal is
+  not mined yet at startup" (with `redemption_id` and `tx_hash`), or a
+  rebroadcast page: the deposit send page above, or **"Equity redemption `<id>`
+  has a signed vault withdrawal ... that could not be rebroadcast at startup"**,
+  whose resume job broadcasts the withdrawal again. If the send stays pending,
+  it will not confirm at its fee: for a deposit send follow the not-confirmed
+  page above (wait for fees to drop, or cancel it at its nonce).
 - **"Cannot tell whether a signed Alpaca deposit send was persisted"**
   (`operational_alert`): a `PrepareDepositSend` write failed and the reload that
   checks it failed too. The bot keeps the send's nonce reserved, so later sends
