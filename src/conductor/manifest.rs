@@ -209,6 +209,7 @@ mod tests {
 
     fn test_trigger_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
+            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,

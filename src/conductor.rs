@@ -3220,6 +3220,7 @@ fn build_rebalancing_service(
             poll_freshness: deps.poll_freshness.clone(),
             inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
             usdc: rebalancing_ctx.usdc,
+            served_usdc_corridor: rebalancing_ctx.cctp_corridor.usdc_corridor(),
             transfer_timeout: rebalancing_ctx.transfer_timeout,
             chains,
             allocation,
@@ -7505,6 +7506,7 @@ mod tests {
 
         Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -8366,6 +8368,7 @@ mod tests {
         let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -9989,6 +9992,7 @@ mod tests {
         let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -10101,6 +10105,7 @@ mod tests {
         let vault_registry2: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool2.clone(), ()));
         let rebalancing_service2 = RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -14717,6 +14722,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -14860,6 +14866,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -15025,6 +15032,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -15191,6 +15199,7 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,

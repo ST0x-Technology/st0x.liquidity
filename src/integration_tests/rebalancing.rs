@@ -255,6 +255,7 @@ fn rebalancing_enabled_cash() -> ChainCashAsset {
 
 fn test_trigger_config() -> RebalancingServiceConfig {
     RebalancingServiceConfig {
+        served_usdc_corridor: UsdcCorridor::BASE_CCTP,
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
@@ -2424,6 +2425,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     };
 
     let config = RebalancingServiceConfig {
+        served_usdc_corridor: UsdcCorridor::BASE_CCTP,
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
@@ -2561,6 +2563,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         }),
     };
     let config = RebalancingServiceConfig {
+        served_usdc_corridor: UsdcCorridor::BASE_CCTP,
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
@@ -2662,6 +2665,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let wide_config = RebalancingServiceConfig {
+            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
@@ -2733,6 +2737,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let tight_config = RebalancingServiceConfig {
+            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
