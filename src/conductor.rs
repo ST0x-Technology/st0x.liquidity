@@ -15,7 +15,7 @@ use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
-use alloy::rpc::client::ClientBuilder;
+use alloy::rpc::client::{ClientBuilder, RpcClient};
 use anyhow::Context;
 use apalis::prelude::Status;
 use apalis_core::error::BoxDynError;
@@ -858,8 +858,8 @@ pub(crate) type HttpProvider = FillProvider<
 /// contract calls) with no error surfaced (RAI-2218). 30s accommodates the
 /// heavy eth_getLogs range scans backfill issues; the wallet transport uses
 /// 20s for its smaller payloads.
-pub const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The hedged chains beyond the primary: the ones needing their own
 /// providers, watchers, and accounting entries.
@@ -871,13 +871,11 @@ fn hedged_secondaries(ctx: &Ctx) -> Vec<HedgedChain> {
         .collect()
 }
 
-/// An HTTP provider whose transport is wrapped by the telemetry layer (every
-/// JSON-RPC call from any handle is timed) and bounded by the RPC timeouts,
-/// so a hung endpoint surfaces as an error instead of a silent park.
-fn bounded_http_provider(
-    rpc_url: &Url,
-    telemetry: &TelemetrySender,
-) -> anyhow::Result<HttpProvider> {
+/// The HTTP transport every chain RPC client shares, bounded by the RPC
+/// timeouts, paired with whether the endpoint looks local.
+fn bounded_http_transport(
+    rpc_url: Url,
+) -> anyhow::Result<(alloy::transports::http::Http<reqwest::Client>, bool)> {
     let http_client = reqwest::Client::builder()
         .connect_timeout(RPC_CONNECT_TIMEOUT)
         .timeout(RPC_REQUEST_TIMEOUT)
@@ -886,7 +884,27 @@ fn bounded_http_provider(
     // Same heuristic ClientBuilder::http applies, so local nodes keep
     // alloy's faster polling defaults.
     let is_local = alloy::transports::utils::guess_local_url(rpc_url.as_str());
-    let transport = alloy::transports::http::Http::with_client(http_client, rpc_url.clone());
+    let transport = alloy::transports::http::Http::with_client(http_client, rpc_url);
+
+    Ok((transport, is_local))
+}
+
+/// An RPC client over the bounded HTTP transport without the telemetry layer,
+/// for the `process-tx` CLI, which has no telemetry writer.
+pub fn bounded_rpc_client(rpc_url: Url) -> anyhow::Result<RpcClient> {
+    let (transport, is_local) = bounded_http_transport(rpc_url)?;
+
+    Ok(ClientBuilder::default().transport(transport, is_local))
+}
+
+/// An HTTP provider whose transport is wrapped by the telemetry layer (every
+/// JSON-RPC call from any handle is timed) and bounded by the RPC timeouts,
+/// so a hung endpoint surfaces as an error instead of a silent park.
+fn bounded_http_provider(
+    rpc_url: &Url,
+    telemetry: &TelemetrySender,
+) -> anyhow::Result<HttpProvider> {
+    let (transport, is_local) = bounded_http_transport(rpc_url.clone())?;
     let rpc_client = ClientBuilder::default()
         .layer(RpcTelemetryLayer::new(telemetry.clone()))
         .transport(transport, is_local);
@@ -980,7 +998,9 @@ fn publish_recovery_handle(
 }
 
 /// Publishes the process-tx handle backing the in-bot process-tx route, set
-/// after startup so the endpoint returns 503 until the conductor is ready.
+/// after startup so the endpoint returns 503 until the conductor is ready. A
+/// losing `set` race is ignored: the cell is written once per boot, so an
+/// already populated cell holds an equivalent handle.
 fn publish_process_tx_handle(
     process_tx_cell: &tokio::sync::OnceCell<crate::api::ProcessTxHandle>,
     order_placer: Arc<dyn OrderPlacer>,
@@ -1002,8 +1022,9 @@ fn publish_process_tx_handle(
 
 /// Handles the conductor shares with the axum server's `AppState`: the
 /// dashboard event stream, the broadcasting inventory, the recovery cell the
-/// conductor populates for `/transfers/resume`, and the PnL ledger whose
-/// ingestion both sides drive.
+/// conductor populates for `/transfers/resume`, the process-tx cell the
+/// conductor populates for the in bot process-tx route, and the PnL ledger
+/// whose ingestion both sides drive.
 pub(crate) struct ServerHandles {
     pub(crate) event_sender: broadcast::Sender<Statement>,
     pub(crate) inventory: Arc<BroadcastingInventory>,
@@ -10675,49 +10696,66 @@ mod tests {
         );
     }
 
-    fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
-        struct TestOrderPlacer;
+    /// An `OrderPlacer` whose every call succeeds, optionally counting broker
+    /// `place_market_order` calls.
+    struct SucceedingOrderPlacer {
+        market_orders: Option<Arc<AtomicUsize>>,
+    }
 
-        #[async_trait::async_trait]
-        impl OrderPlacer for TestOrderPlacer {
-            async fn place_market_order(
-                &self,
-                order: MarketOrder,
-            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
-            {
-                Ok(OrderPlacementResult {
-                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
-                    placed_shares: order.shares,
-                    placed_at: Utc::now(),
-                    is_extended_hours: false,
-                    limit_price: None,
-                })
+    #[async_trait::async_trait]
+    impl OrderPlacer for SucceedingOrderPlacer {
+        async fn place_market_order(
+            &self,
+            order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            if let Some(market_orders) = &self.market_orders {
+                market_orders.fetch_add(1, Ordering::SeqCst);
             }
-
-            async fn place_limit_order(
-                &self,
-                order: st0x_execution::LimitOrder,
-            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
-            {
-                Ok(OrderPlacementResult {
-                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
-                    placed_shares: order.shares,
-                    placed_at: Utc::now(),
-                    is_extended_hours: order.extended_hours,
-                    limit_price: Some(order.limit_price),
-                })
-            }
-
-            async fn cancel_order(
-                &self,
-                _executor_order_id: &st0x_execution::ExecutorOrderId,
-            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
-            {
-                Ok(st0x_execution::CancellationOutcome::Requested)
-            }
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                placed_shares: order.shares,
+                placed_at: Utc::now(),
+                is_extended_hours: false,
+                limit_price: None,
+            })
         }
 
-        Arc::new(TestOrderPlacer)
+        async fn place_limit_order(
+            &self,
+            order: st0x_execution::LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
+                placed_shares: order.shares,
+                placed_at: Utc::now(),
+                is_extended_hours: order.extended_hours,
+                limit_price: Some(order.limit_price),
+            })
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &st0x_execution::ExecutorOrderId,
+        ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(st0x_execution::CancellationOutcome::Requested)
+        }
+    }
+
+    fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
+        Arc::new(SucceedingOrderPlacer {
+            market_orders: None,
+        })
+    }
+
+    /// A `succeeding_order_placer` that also counts broker `place_market_order`
+    /// calls, so a test can assert exactly one broker submission.
+    fn counting_order_placer() -> (Arc<dyn OrderPlacer>, Arc<AtomicUsize>) {
+        let market_orders = Arc::new(AtomicUsize::new(0));
+        let placer = Arc::new(SucceedingOrderPlacer {
+            market_orders: Some(market_orders.clone()),
+        });
+        (placer, market_orders)
     }
 
     async fn create_cqrs_frameworks(
@@ -11115,45 +11153,6 @@ mod tests {
         );
     }
 
-    /// An `OrderPlacer` that counts broker `place_market_order` calls and
-    /// otherwise succeeds, so a test can assert exactly one broker submission.
-    fn counting_order_placer() -> (Arc<dyn OrderPlacer>, Arc<AtomicUsize>) {
-        struct Counting(Arc<AtomicUsize>);
-        #[async_trait::async_trait]
-        impl OrderPlacer for Counting {
-            async fn place_market_order(
-                &self,
-                order: MarketOrder,
-            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
-            {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(OrderPlacementResult {
-                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
-                    placed_shares: order.shares,
-                    placed_at: Utc::now(),
-                    is_extended_hours: false,
-                    limit_price: None,
-                })
-            }
-            async fn place_limit_order(
-                &self,
-                _order: st0x_execution::LimitOrder,
-            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
-            {
-                unimplemented!("counting placer: limit orders not used")
-            }
-            async fn cancel_order(
-                &self,
-                _executor_order_id: &ExecutorOrderId,
-            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
-            {
-                unimplemented!("counting placer: cancellation not used")
-            }
-        }
-        let count = Arc::new(AtomicUsize::new(0));
-        (Arc::new(Counting(count.clone())), count)
-    }
-
     /// Two live ticks race to hedge the same symbol. The `placement_barrier`
     /// pins the first claimer in the exact window between its `Position` claim
     /// and its `OffchainOrder` creation, holding it open until the test
@@ -11261,12 +11260,8 @@ mod tests {
     /// holder has the lock, and must complete once it is released.
     #[tokio::test]
     async fn fill_accounting_waits_for_the_fill_accounting_lock() {
-        let directory = tempfile::tempdir().unwrap();
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(directory.path().join("fill-accounting.sqlite"))
-            .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        let (pool, _apalis_pool, _db_path, _dir) =
+            crate::test_utils::setup_file_backed_test_db(Duration::from_secs(1)).await;
         let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
 
         let trade = test_trade_with_amount(float!(1.5), 30);
@@ -11296,6 +11291,23 @@ mod tests {
                 .await
             }
         });
+
+        // Accounting witnesses the fill before it takes the lock. Wait until
+        // the witness lands, so the timeout below measures the wait on the
+        // lock rather than a witness write that has not finished yet.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while frameworks
+                .onchain_trade
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("accounting must witness the fill before contending for the lock");
 
         assert!(
             tokio::time::timeout(Duration::from_millis(300), &mut accounting)
@@ -11351,16 +11363,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().assets.equities.symbols.insert(
             Symbol::new("AAPL").unwrap(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
+            equity_asset(Address::ZERO, Address::ZERO),
         );
         // The stores the conductor publishes to the route: the same frameworks
         // the tick writes through.
@@ -17288,18 +17291,22 @@ mod tests {
                 .await
                 .unwrap();
             for index in [90, 91] {
-                assert_eq!(
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(5),
                     process_queued_trade(
                         &MockExecutor::with_failure("readiness must not run for retained claim"),
                         &make_trade_event(index),
                         test_trade_with_amount(float!(1.5), index),
                         &cqrs,
                         &assets,
-                    )
-                    .await
-                    .unwrap(),
-                    None
+                    ),
+                )
+                .await
+                .expect(
+                    "process_queued_trade must not deadlock reconciling a scheduled pending order \
+                     under the submission lock",
                 );
+                assert_eq!(outcome.unwrap(), None);
             }
             assert_eq!(
                 cqrs.position
@@ -17335,86 +17342,6 @@ mod tests {
                 i64::from(accepted)
             );
         }
-    }
-
-    #[tokio::test]
-    async fn process_queued_trade_completes_scheduled_pending_reconciliation_under_the_submission_lock()
-     {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let (frameworks, _) = create_cqrs_frameworks(&pool).await;
-        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
-            &frameworks,
-            &pool,
-            ExecutionThreshold::whole_share(),
-            &apalis_pool,
-        );
-        let config = toml::from_str(
-            r#"
-                mode = "enabled"
-                environment = "staging"
-                poll_interval_secs = 5
-                request_timeout_secs = 3
-                response_freshness_secs = 30
-                calendar_max_age_secs = 7200
-                evidence_clock_skew_secs = 2
-                emergency_buffer_secs = 900
-                [[scopes]]
-                id = "extended"
-                profile_revision = "v1"
-                extended_hours = true
-                assets = ["AAPL"]
-            "#,
-        )
-        .unwrap();
-        let schedule = crate::trading_schedule::TradingScheduleStore::load(config, pool.clone())
-            .await
-            .unwrap();
-        let policy = CloseFlattenPolicy::from_secs(900)
-            .unwrap()
-            .with_schedule(Some(Arc::new(schedule)));
-        assert!(
-            policy.schedule_enabled(),
-            "the reconciliation branch under test only runs for a schedule-enabled policy"
-        );
-        let symbol = Symbol::new("AAPL").unwrap();
-        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
-        let pending_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
-        let executor = MockExecutor::new().with_market_session(MarketSession::Extended);
-        cqrs.order_placer = Arc::new(crate::offchain::order::ExecutorOrderPlacer {
-            executor,
-            close_flatten_policy: Some(policy.clone()),
-        });
-        cqrs.close_flatten_policy = policy;
-        cqrs.offchain_order
-            .send(
-                &pending_id,
-                OffchainOrderCommand::Place {
-                    symbol: symbol.clone(),
-                    shares,
-                    direction: Direction::Sell,
-                    executor: st0x_execution::SupportedExecutor::DryRun,
-                    client_order_id: ClientOrderId::from_uuid(pending_id.as_uuid()),
-                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
-                },
-            )
-            .await
-            .unwrap();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(5),
-            process_queued_trade(
-                &MockExecutor::with_failure("readiness must not run for retained claim"),
-                &make_trade_event(90),
-                test_trade_with_amount(float!(1.5), 90),
-                &cqrs,
-                &assets,
-            ),
-        )
-        .await
-        .expect(
-            "process_queued_trade must not deadlock reconciling a scheduled pending order under \
-             the submission lock",
-        );
-        assert_eq!(outcome.unwrap(), None);
     }
 
     #[tokio::test]

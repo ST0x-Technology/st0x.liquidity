@@ -1,14 +1,14 @@
 # ADR 0022: process-tx checks broker admission before claiming the position
 
-- Status: Accepted
+- Status: Proposed
 - Date: 2026-09-24
 
 ## Context
 
 The `process-tx` operator verb accounts a decoded onchain fill and, when the
-position still needs a hedge, places one under the shared submission lock. Under
-the schedule aware close flatten policy broker admission can defer a placement
-outside the regular session.
+position still needs a hedge, places one under the shared submission lock (ADR
+0014). Under the schedule aware close flatten policy broker admission can defer
+a placement outside the regular session.
 
 `place_offchain_order_at_broker` records the placement intent (`PlaceReserved`,
 leaving the order `Pending`) before it runs admission, and `process-tx` claims
@@ -16,9 +16,10 @@ the position (`PlaceOffChainOrder`) before calling it. A deferral therefore
 arrived after the claim and the `Pending` intent were already durable. Retaining
 that intent handed the standing pipeline a `Pending` order whose recovery paths
 (`recover_pending_poll_status` and `recover_single_orphaned_order`) replay the
-stored shares and reservation terms without rerunning preflight, so changed
-cash, equity, hedge floor, or whole share eligibility could make the
-resubmission unsafe.
+stored shares and reservation terms without rerunning preflight
+([ADR 0021](0021-durable-buying-power-reservations.md)), so changed cash,
+equity, hedge floor, or whole share eligibility could make the resubmission
+unsafe.
 
 Unwinding the intent after the fact instead needed durable machinery: a failure
 kind on the order and position failure events so a deferral would not count as a

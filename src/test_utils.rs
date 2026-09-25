@@ -9,7 +9,7 @@ use alloy::network::TransactionBuilder;
 use alloy::node_bindings::{Anvil, AnvilInstance};
 #[cfg(test)]
 use alloy::primitives::LogData;
-use alloy::primitives::{Address, B256, address, bytes, fixed_bytes};
+use alloy::primitives::{Address, B256, TxHash, address, bytes, fixed_bytes};
 #[cfg(test)]
 use alloy::providers::Provider;
 #[cfg(test)]
@@ -176,6 +176,45 @@ pub fn try_rebalancing_enabled_equities(symbols: &[&str]) -> anyhow::Result<Chai
 #[cfg(test)]
 pub fn rebalancing_enabled_equities(symbols: &[&str]) -> ChainEquities {
     try_rebalancing_enabled_equities(symbols).expect("test symbols must be valid")
+}
+
+/// An equity asset enabled for trading only, with zero token addresses and
+/// no vaults: the minimal asset a hedging test needs for its symbol.
+pub fn trading_enabled_equity() -> ChainEquityAsset {
+    ChainEquityAsset {
+        tokenized_equity: Address::ZERO,
+        tokenized_equity_derivative: Address::ZERO,
+        vault_ids: Vec::new(),
+        trading: OperationMode::Enabled,
+        rebalancing: OperationMode::Disabled,
+        wrapped_equity_recovery: OperationMode::Disabled,
+        operational_limit: None,
+        target_share: None,
+    }
+}
+
+/// A decoded process-tx fill for `symbol`: log index 7, a sell of 1.5 shares
+/// at 123.45.
+pub fn try_process_tx_fill_fixture(
+    tx_hash: TxHash,
+    symbol: &str,
+) -> anyhow::Result<crate::operator::process_tx::ProcessTxFill> {
+    Ok(crate::operator::process_tx::ProcessTxFill {
+        tx_hash,
+        log_index: 7,
+        symbol: Symbol::new(symbol)?,
+        direction: Direction::Sell,
+        quantity: FractionalShares::new(Float::parse("1.5".to_owned())?),
+        price: Float::parse("123.45".to_owned())?,
+    })
+}
+
+#[cfg(test)]
+pub fn process_tx_fill_fixture(
+    tx_hash: TxHash,
+    symbol: &str,
+) -> crate::operator::process_tx::ProcessTxFill {
+    try_process_tx_fill_fixture(tx_hash, symbol).expect("test fill fields must be valid")
 }
 
 /// The preflight verdict a broker-backed `OrderPlacer` answers a counter trade
@@ -530,6 +569,26 @@ pub(crate) async fn replay_after_competing_writer<T: std::fmt::Debug>(
         .expect_err("replay must wait for the writer before reading its snapshot");
     blocker.commit().await.unwrap();
     replay.await
+}
+
+/// Counts the live (`Pending`, `Queued` or `Running`) `PollOrderStatus` jobs
+/// queued for one offchain order.
+#[cfg(test)]
+pub(crate) async fn live_poll_job_count(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    offchain_order_id: crate::offchain::order::OffchainOrderId,
+) -> i64 {
+    sqlx_apalis::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM Jobs \
+         WHERE job_type = ? \
+           AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
+           AND status IN ('Pending', 'Queued', 'Running')",
+    )
+    .bind(std::any::type_name::<crate::offchain::order::PollOrderStatus>())
+    .bind(offchain_order_id.to_string())
+    .fetch_one(apalis_pool)
+    .await
+    .unwrap()
 }
 
 /// Shared constructor for positive share quantities in tests.

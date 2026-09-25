@@ -5758,60 +5758,8 @@ effect rather than a generic intent:
   the same `witness -> enrich -> acknowledge -> mark -> settle` exactly-once
   sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two
   commands above it belongs to no object group -- there is no stuck aggregate to
-  recover, only a missing fill to backfill. It **does not repeat fill accounting
-  or hedging for a fill already acknowledged** in the `OnChainTrade` log, since
-  applying it again would double count the position: it reports
-  `AlreadyAccounted`, or `AlreadyExcluded` for a fill kept out of hedging. It
-  may still repair bookkeeping on that fill: it records a missing source
-  attribution on the `OnChainTrade`, and settles the fill if a crash between
-  mark and settle left it pending (ADR 0010). A fill that was witnessed but not
-  yet acknowledged is resumed from where the earlier run stopped. It has two
-  execution paths. The **CLI** runs it in direct-DB mode, in a separate process
-  from the bot: because no in-process lock can serialize across processes, fill
-  accounting holds a file lock beside the database from the durable dedup check
-  through the Position acknowledge, and the bot takes the same lock, so a
-  concurrent actor on the same fill finds it recorded instead of counting it
-  twice (see the accounting bullet below). The CLI path still **must not run
-  while the bot is live**: its standalone stores reach none of the bot's live
-  reactors, and its placer has no admission gate (see below). The file locks are
-  defense in depth, not a supported concurrent mode. The **in-bot REST route**
-  (`POST /liquidity-write/transactions/{tx_hash}/process`) instead runs inside
-  the live bot and serializes its position claim and broker placement against
-  the trading loop through the shared counter-trade submission lock (ADR 0014),
-  so it does **not** require stopping the bot; it gates on full startup
-  readiness (503 until then), selects the hedged chain from the `chain` query
-  (defaulting to the primary), returns the decoded fill alongside its outcome,
-  and runs the accounting and placement on a detached task so a client
-  disconnect cannot strand a placed order before its Submitted event persists.
-  Graceful shutdown stops the server and waits for that task, up to the drain
-  timeout; a request that still reaches the handler after the drain began is
-  refused with 503, and a task still running at the timeout is dropped when the
-  process exits. **Broker admission runs before the claim** (ADR 0022) on the
-  REST route, whose placer applies the trading schedule. The CLI placer has no
-  admission gate: it places with session validation bypassed, so it never defers
-  and never reports `HedgePlacementDeferred`. On an admission deferral
-  process-tx writes no claim, no Pending intent, and no anchor for this
-  placement: it settles the accounted fill and returns
-  `ProcessTxOutcome::HedgePlacementDeferred` (a reconciliation of an earlier
-  claim or anchor that ran before admission stays recorded), and the standing
-  periodic position check hedges the exposure again from a fresh preflight. An
-  admission error at that check likewise claims nothing; it surfaces to the
-  caller as a 500 with the fill left unsettled, so a rerun resumes it. The
-  placement runs admission again after the claim; **if admission changed in
-  between**, a deferral or an admission error there fails the order, releases
-  its id, clears the claim, and settles the fill, reporting
-  `HedgePlacementDeferred` for a deferral and surfacing an error. **On broker
-  backpressure**, the broker call did run, so process-tx preserves the failed
-  order id as the idempotency anchor, clears the claim, settles the fill, and
-  surfaces the error; the standing position check then runs anchor recovery
-  under that client id. None of these cases retain a Pending intent. The claim,
-  placement, and settlement behavior lives in the shared process-tx placement
-  path used by both the CLI and the REST route; only the admission outcomes
-  depend on the placer. **Before placement**, a Pending claim already held by
-  the live pipeline is settled against and reported as a deferral
-  (PendingHedgeDeferred) when the schedule is enabled, and rejected (after
-  settling the fill) as RetainedPendingWithoutSchedule when the schedule is
-  disabled.
+  recover, only a missing fill to backfill. Its accounting, execution paths, and
+  hedge placement rules are in the `process-tx` standing rule below.
 
 **Standing rules:**
 
@@ -5875,16 +5823,21 @@ effect rather than a generic intent:
   `ReconcileStuckRebalance` command (see above) is the first realization of the
   `reconcile` verb.
 - **`process-tx` implements the ADR-0005 exactly-once fill accounting
-  protocol.** It does not repeat accounting for a fill already acknowledged
-  (reporting it as already accounted or already excluded, and only repairing its
-  source attribution or a pending settle), resumes if it was witnessed but not
-  yet acknowledged (crash- recovery window), and creates the full
-  witness/acknowledge record for genuinely missed fills — so every subsequent
-  re-delivery, whether from another CLI run or the normal pipeline, hits the
-  dedup guard and skips cleanly. **Concurrent accounting of the same fill is
-  serialized on every path.** The durable dedup check and the CQRS apply are
-  separate transactions, and the Position guard rejects only a fill whose trade
-  id is still in `pending_acknowledged_trade_ids` or equals
+  protocol.** It **does not repeat fill accounting or hedging for a fill already
+  acknowledged** in the `OnChainTrade` log, since applying it again would double
+  count the position: it reports `AlreadyAccounted`, or `AlreadyExcluded` for a
+  fill kept out of hedging. It may still repair bookkeeping on that fill: it
+  records a missing source attribution on the `OnChainTrade`, and settles the
+  fill if a crash between mark and settle left it pending (ADR 0010). A fill
+  that was witnessed but not yet acknowledged is resumed from where the earlier
+  run stopped (crash recovery window), and a genuinely missed fill gets the full
+  witness/acknowledge record, so every subsequent re-delivery, whether from
+  another CLI run or the normal pipeline, hits the dedup guard and skips
+  cleanly. A decoded fill with no block number cannot be witnessed and fails as
+  an operational error (a 500 on the REST route). **Concurrent accounting of the
+  same fill is serialized on every path.** The durable dedup check and the CQRS
+  apply are separate transactions, and the Position guard rejects only a fill
+  whose trade id is still in `pending_acknowledged_trade_ids` or equals
   `last_acknowledged_trade_id` (`DuplicateTrade`, ADR 0010). Without one guard
   spanning both, a second actor could pass the check, then apply the fill after
   the first actor settled it and a newer fill replaced it in
@@ -5903,9 +5856,62 @@ effect rather than a generic intent:
   the position (see Risk Management) and reports its cover detail; a fill
   excluded earlier stays excluded and is reported as such. It is independent of
   the submission lock, which is taken after accounting and serializes only the
-  position claim and broker placement. **Operational precondition (CLI direct
-  database path)**: stop the live bot; the **in bot REST route** removes that
-  requirement.
+  position claim and broker placement.
+
+  It has two execution paths. The **CLI** runs it in direct-DB mode, in a
+  separate process from the bot, and selects the hedged chain with `--network`,
+  defaulting to the primary chain and rejecting a chain not configured as
+  hedged. No in process lock can serialize across processes, so the fill
+  accounting file lock above is what lets a concurrent actor on the same fill
+  find it recorded instead of counting it twice. **Operational precondition (CLI
+  direct database path)**: stop the live bot. The CLI's standalone stores reach
+  none of the bot's live reactors, and its placer has no admission gate (see
+  below). The file locks are defense in depth, not a supported concurrent mode.
+  The **in bot REST route**
+  (`POST /liquidity-write/transactions/{tx_hash}/process`) removes that
+  requirement: it runs inside the live bot and serializes its position claim and
+  broker placement against the trading loop through the shared counter trade
+  submission lock (ADR 0014), so it does **not** require stopping the bot. It
+  gates on full startup readiness (503 until then), selects the hedged chain
+  from the `chain` query (defaulting to the primary), returns the decoded fill
+  alongside its outcome, and runs the accounting and placement on a detached
+  task so a client disconnect cannot strand a placed order before its Submitted
+  event persists. Graceful shutdown stops the server and waits for that task, up
+  to the drain timeout; a request that still reaches the handler after the drain
+  began is refused with 503, and a task still running at the timeout is dropped
+  when the process exits.
+
+  The claim, placement, and settlement behavior lives in the shared process-tx
+  placement path used by both the CLI and the REST route; only the admission
+  outcomes depend on the placer. **Before placement**, a Pending claim already
+  held by the live pipeline is settled against and reported as a deferral
+  (`ProcessTxOutcome::PendingHedgeDeferred`) when the schedule is enabled, and
+  rejected (after settling the fill) as
+  `RejectionReason::RetainedPendingWithoutSchedule` when the schedule is
+  disabled. A preserved failed order anchor is then reconciled with the broker:
+  when the broker still holds that order, the fill is settled and the placement
+  rejected (`RejectionReason::FailedAnchorStillAtBroker`), while an operational
+  failure of that reconciliation leaves the fill unsettled so a rerun resumes
+  it. A placement preflight that skips the hedge settles the fill and reports
+  `ProcessTxOutcome::PreflightDeferred` with the skip reason. **Broker admission
+  runs before the claim** (ADR 0022) on the REST route, whose placer applies the
+  trading schedule. The CLI placer has no admission gate: it places with session
+  validation bypassed, so it never defers and never reports
+  `HedgePlacementDeferred`. On an admission deferral process-tx writes no claim,
+  no Pending intent, and no anchor for this placement: it settles the accounted
+  fill and returns `ProcessTxOutcome::HedgePlacementDeferred` (a reconciliation
+  of an earlier claim or anchor that ran before admission stays recorded), and
+  the standing periodic position check hedges the exposure again from a fresh
+  preflight. An admission error at that check likewise claims nothing; it
+  surfaces to the caller as a 500 with the fill left unsettled, so a rerun
+  resumes it. The placement runs admission again after the claim; **if admission
+  changed in between**, a deferral or an admission error there fails the order,
+  releases its id, clears the claim, and settles the fill, reporting
+  `HedgePlacementDeferred` for a deferral and surfacing an error. **On broker
+  backpressure**, the broker call did run, so process-tx preserves the failed
+  order id as the idempotency anchor, clears the claim, settles the fill, and
+  surfaces the error; the standing position check then runs anchor recovery
+  under that client id. None of these cases retain a Pending intent.
 
 ### Event Processing Flow
 

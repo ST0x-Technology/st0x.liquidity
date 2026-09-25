@@ -1747,7 +1747,7 @@ mod tests {
     use crate::position::{
         AnchorDisposition, EquityTransferReservationId, PositionCommand, TradeId,
     };
-    use crate::test_utils::{TEST_POLL_INTERVAL, setup_test_pools};
+    use crate::test_utils::{TEST_POLL_INTERVAL, live_poll_job_count, setup_test_pools};
 
     async fn build_ctx(
         pool: SqlitePool,
@@ -5410,23 +5410,6 @@ mod tests {
         assert!(remaining.contains(&"failed-exhausted".to_string()));
         assert!(remaining.contains(&"done-1".to_string()));
         assert!(remaining.contains(&"killed-1".to_string()));
-    }
-
-    async fn live_poll_job_count(
-        apalis_pool: &apalis_sqlite::SqlitePool,
-        offchain_order_id: OffchainOrderId,
-    ) -> i64 {
-        sqlx_apalis::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM Jobs \
-             WHERE job_type = ? \
-               AND json_extract(CAST(job AS TEXT), '$.offchain_order_id') = ? \
-               AND status IN ('Pending', 'Queued', 'Running')",
-        )
-        .bind(poll_status_job_type())
-        .bind(offchain_order_id.to_string())
-        .fetch_one(apalis_pool)
-        .await
-        .unwrap()
     }
 
     /// Simulates a single-concurrency apalis worker draining the oldest live

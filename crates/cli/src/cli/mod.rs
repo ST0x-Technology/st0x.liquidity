@@ -38,12 +38,14 @@ use st0x_registry::SymbolCache;
 
 #[cfg(test)]
 use st0x_hedge::operator::bot_gas::BotGasReceiptCostEnqueuer;
+use st0x_hedge::operator::conductor::bounded_rpc_client;
 use st0x_hedge::operator::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
 use st0x_hedge::operator::performance::equity_timing::EquityTimingProjection;
 use st0x_hedge::operator::performance::rebalance::RebalanceTimingProjection;
 use st0x_hedge::operator::performance::reliability::LifecycleFailureProjection;
 use st0x_hedge::operator::portfolio_snapshot::PortfolioSnapshotProjection;
 use st0x_hedge::operator::position::Position;
+use st0x_hedge::operator::process_tx;
 use st0x_hedge::operator::vault_registry::VaultRegistry;
 
 /// Direction for transferring assets between trading venues.
@@ -405,13 +407,16 @@ pub enum Commands {
     /// anyway: its writes reach none of the bot's live reactors, and its placer
     /// has no admission gate. Against a running bot, call the bot's
     /// `POST /liquidity-write/transactions/{tx_hash}/process` route instead.
+    /// `--network` selects the hedged chain the transaction is read from;
+    /// without it the configured primary chain is used.
     ProcessTx {
         /// Transaction hash (0x prefixed, 64 hex characters)
         #[arg(long = "tx-hash")]
         tx_hash: TxHash,
         /// Hedged chain to query; defaults to the configured primary chain.
-        #[arg(long = "chain")]
-        chain: Option<Chain>,
+        /// A chain without a `[chains.<name>.trading]` table is refused.
+        #[arg(long = "network", value_enum)]
+        network: Option<TokenizationNetwork>,
     },
     /// Transfer tokenized equity between trading venues (Raindex <-> Alpaca)
     ///
@@ -1238,7 +1243,7 @@ fn parse_usdc_reconcile_reason(reason: &str) -> anyhow::Result<ReconcileReasonAr
 enum ProviderCommand {
     ProcessTx {
         tx_hash: TxHash,
-        chain: Option<Chain>,
+        network: Option<TokenizationNetwork>,
     },
     TransferUsdc {
         direction: TransferDirection,
@@ -1465,8 +1470,8 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
         Commands::AlpacaTokenizationRequests => {
             CommandRoute::Provider(ProviderCommand::AlpacaTokenizationRequests)
         }
-        Commands::ProcessTx { tx_hash, chain } => {
-            CommandRoute::Provider(ProviderCommand::ProcessTx { tx_hash, chain })
+        Commands::ProcessTx { tx_hash, network } => {
+            CommandRoute::Provider(ProviderCommand::ProcessTx { tx_hash, network })
         }
         Commands::TransferUsdc { direction, amount } => {
             CommandRoute::Provider(ProviderCommand::TransferUsdc { direction, amount })
@@ -2115,24 +2120,14 @@ async fn run_provider_command<W: Write + Send>(
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     match command {
-        ProviderCommand::ProcessTx { tx_hash, chain } => {
-            let chain = chain.unwrap_or_else(|| ctx.chains.primary().chain);
-            let trading_chain = ctx.chains.hedged_chain(chain).ok_or_else(|| {
-                anyhow::anyhow!("process-tx chain {chain} is not configured as a hedged chain")
-            })?;
+        ProviderCommand::ProcessTx { tx_hash, network } => {
+            let trading_chain = process_tx::resolve_chain(ctx, network.map(Chain::from))?;
+            let chain = trading_chain.chain;
             // Bound the RPC transport so a hung endpoint surfaces as an error
             // instead of parking the process-tx call indefinitely, with the
             // same timeouts as the bot's own chain providers.
-            let rpc_url = trading_chain.rpc_url.clone();
-            let http_client = reqwest::Client::builder()
-                .connect_timeout(st0x_hedge::operator::conductor::RPC_CONNECT_TIMEOUT)
-                .timeout(st0x_hedge::operator::conductor::RPC_REQUEST_TIMEOUT)
-                .build()?;
-            let is_local = alloy::transports::utils::guess_local_url(rpc_url.as_str());
-            let transport = alloy::transports::http::Http::with_client(http_client, rpc_url);
-            let rpc_client =
-                alloy::rpc::client::ClientBuilder::default().transport(transport, is_local);
-            let provider = ProviderBuilder::new().connect_client(rpc_client);
+            let provider = ProviderBuilder::new()
+                .connect_client(bounded_rpc_client(trading_chain.rpc_url.clone())?);
             info!("Processing transaction: tx_hash={tx_hash}, chain={chain}");
             let cache = SymbolCache::default();
             trading::process_tx_with_provider(
@@ -2851,12 +2846,12 @@ mod tests {
     fn classify_process_tx_command_as_provider() {
         let command = Commands::ProcessTx {
             tx_hash: TxHash::ZERO,
-            chain: Some(Chain::Ethereum),
+            network: Some(TokenizationNetwork::Ethereum),
         };
 
         match classified_route(command) {
-            Err(ProviderCommand::ProcessTx { chain, .. }) => {
-                assert_eq!(chain, Some(Chain::Ethereum));
+            Err(ProviderCommand::ProcessTx { network, .. }) => {
+                assert_eq!(network, Some(TokenizationNetwork::Ethereum));
             }
             Err(
                 ProviderCommand::TransferUsdc { .. }
@@ -2873,10 +2868,42 @@ mod tests {
         }
     }
 
+    /// `process-tx` selects its chain with `--network` like every other command
+    /// that touches a chain. Leaving it out yields `None`, so the command falls
+    /// back to the configured primary chain rather than to Base, and the
+    /// `--chain` spelling is refused.
     #[test]
-    fn process_tx_command_parses_optional_chain() {
+    fn process_tx_command_parses_optional_network() {
         let tx_hash = TxHash::repeat_byte(0x11);
         let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "process-tx",
+            "--tx-hash",
+            &tx_hash.to_string(),
+            "--network",
+            "ethereum",
+        ])
+        .unwrap();
+
+        let Commands::ProcessTx {
+            tx_hash: parsed_hash,
+            network,
+        } = cli.command
+        else {
+            panic!("expected process-tx command");
+        };
+        assert_eq!(parsed_hash, tx_hash);
+        assert_eq!(network, Some(TokenizationNetwork::Ethereum));
+
+        let cli =
+            Cli::try_parse_from(["st0x-cli", "process-tx", "--tx-hash", &tx_hash.to_string()])
+                .unwrap();
+        let Commands::ProcessTx { network, .. } = cli.command else {
+            panic!("expected process-tx command");
+        };
+        assert_eq!(network, None);
+
+        let error = Cli::try_parse_from([
             "st0x-cli",
             "process-tx",
             "--tx-hash",
@@ -2884,17 +2911,8 @@ mod tests {
             "--chain",
             "ethereum",
         ])
-        .unwrap();
-
-        let Commands::ProcessTx {
-            tx_hash: parsed_hash,
-            chain,
-        } = cli.command
-        else {
-            panic!("expected process-tx command");
-        };
-        assert_eq!(parsed_hash, tx_hash);
-        assert_eq!(chain, Some(Chain::Ethereum));
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

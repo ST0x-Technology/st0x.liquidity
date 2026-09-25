@@ -85,6 +85,8 @@ pub enum DatabaseFileLockError {
     },
     #[error("Timed out acquiring lock file {path}")]
     TimedOut { path: PathBuf },
+    #[error("Timed out waiting for the in process fill accounting lock")]
+    InProcessTimedOut,
 }
 
 /// Acquires `lock` for the database behind `pool`. Fill accounting takes the
@@ -118,9 +120,7 @@ async fn acquire_database_file_lock_with_timeout(
         DatabaseFileLock::FillAccounting => Some(
             tokio::time::timeout_at(deadline, FILL_ACCOUNTING_IN_PROCESS.lock())
                 .await
-                .map_err(|_| DatabaseFileLockError::TimedOut {
-                    path: lock_path.clone(),
-                })?,
+                .map_err(|_| DatabaseFileLockError::InProcessTimedOut)?,
         ),
         DatabaseFileLock::CounterTradeSubmission => None,
     };
@@ -226,7 +226,7 @@ mod tests {
     async fn file_locks_are_independent_of_each_other() {
         let (_directory, first_pool, second_pool) = two_pools_on_one_file("locks.sqlite").await;
 
-        let _submission =
+        let submission =
             acquire_database_file_lock(&first_pool, DatabaseFileLock::CounterTradeSubmission)
                 .await
                 .unwrap();
@@ -242,6 +242,24 @@ mod tests {
         .await
         .expect("the fill accounting lock must not wait on the submission lock")
         .expect("the fill accounting lock is free while only the submission lock is held");
+        drop(submission);
+
+        let _fill_accounting =
+            acquire_database_file_lock(&first_pool, DatabaseFileLock::FillAccounting)
+                .await
+                .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_database_file_lock_with_timeout(
+                &second_pool,
+                DatabaseFileLock::CounterTradeSubmission,
+                Duration::from_millis(25),
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("the submission lock must not wait on the fill accounting lock")
+        .expect("the submission lock is free while only the fill accounting lock is held");
     }
 
     #[tokio::test]
@@ -313,7 +331,7 @@ mod tests {
         else {
             panic!("a second fill accounting holder must wait while the first holds it");
         };
-        assert!(matches!(error, DatabaseFileLockError::TimedOut { .. }));
+        assert!(matches!(error, DatabaseFileLockError::InProcessTimedOut));
 
         drop(first_guard);
         tokio::time::timeout(

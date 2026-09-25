@@ -1396,49 +1396,101 @@ mod tests {
 
     /// Shutdown must not return while detached request work (a
     /// process-tx mid placement) is still running: returning lets the runtime
-    /// drop it between the broker call and its `Submitted` event.
+    /// drop it between the broker call and its `Submitted` event. Each trigger
+    /// drains the detached tasks at its own call site, so every trigger is
+    /// pinned on its own: the other two sources stay pending in each case.
     #[tokio::test]
     async fn shutdown_waits_for_detached_request_tasks() {
-        let detached_tasks = TaskTracker::new();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let finished = Arc::new(AtomicBool::new(false));
-        detached_tasks.spawn({
-            let finished = Arc::clone(&finished);
-            async move {
-                let _ = release_rx.await;
-                finished.store(true, Ordering::SeqCst);
+        #[derive(Debug, Clone, Copy)]
+        enum Trigger {
+            Signal,
+            BotExit,
+            ServerExit,
+        }
+
+        for trigger in [Trigger::Signal, Trigger::BotExit, Trigger::ServerExit] {
+            let detached_tasks = TaskTracker::new();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let finished = Arc::new(AtomicBool::new(false));
+            detached_tasks.spawn({
+                let finished = Arc::clone(&finished);
+                async move {
+                    let _ = release_rx.await;
+                    finished.store(true, Ordering::SeqCst);
+                }
+            });
+
+            let shutdown_token = CancellationToken::new();
+            let supervisor = SupervisorBuilder::default().build().run();
+            // The sender stays alive until the end of the iteration unless the
+            // signal case consumes it, so the signal stays pending otherwise.
+            let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+            let signal_fut = async move {
+                let _ = signal_rx.await;
+            };
+
+            let bot_task = match trigger {
+                Trigger::BotExit => tokio::spawn(async { Ok(()) }),
+                Trigger::Signal | Trigger::ServerExit => {
+                    let token = shutdown_token.clone();
+                    tokio::spawn(async move {
+                        token.cancelled().await;
+                        Ok(())
+                    })
+                }
+            };
+            match trigger {
+                Trigger::Signal => signal_tx.send(()).unwrap(),
+                Trigger::ServerExit => {
+                    let supervisor_for_external_shutdown = supervisor.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        let _ = supervisor_for_external_shutdown.shutdown();
+                    });
+                }
+                Trigger::BotExit => {}
             }
-        });
 
-        let shutdown = tokio::spawn({
-            let detached_tasks = detached_tasks.clone();
-            async move {
-                await_shutdown(
-                    SupervisorBuilder::default().build().run(),
-                    None,
-                    tokio::spawn(async { Ok(()) }),
-                    &detached_tasks,
-                    CancellationToken::new(),
-                    std::future::ready(()),
-                    Duration::from_secs(5),
-                )
-                .await
-            }
-        });
+            let shutdown = tokio::spawn({
+                let detached_tasks = detached_tasks.clone();
+                async move {
+                    await_shutdown(
+                        supervisor,
+                        None,
+                        bot_task,
+                        &detached_tasks,
+                        shutdown_token,
+                        signal_fut,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                }
+            });
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !shutdown.is_finished(),
-            "shutdown must wait for the detached task"
-        );
-
-        release_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            // `drain_detached_tasks` closes the tracker first, so once it is
+            // closed the drain has started and shutdown must still be waiting.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !detached_tasks.is_closed() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
             .await
-            .expect("shutdown must finish once the detached task does")
-            .unwrap()
-            .unwrap();
-        assert!(finished.load(Ordering::SeqCst));
+            .unwrap_or_else(|_| panic!("{trigger:?} shutdown must start the detached drain"));
+            assert!(
+                !shutdown.is_finished(),
+                "{trigger:?} shutdown must wait for the detached task"
+            );
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{trigger:?} shutdown must finish once the detached task does")
+                })
+                .unwrap()
+                .unwrap();
+            assert!(finished.load(Ordering::SeqCst), "{trigger:?}");
+        }
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use reqwest::StatusCode;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use st0x_config::{BrokerCtx, Ctx, HedgedChain};
@@ -19,11 +19,13 @@ use st0x_execution::{
     OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
+use st0x_hedge::operator::OperatorError;
 use st0x_hedge::operator::offchain::order::{
     BrokerOrderPlacement, OrderPlacementResult, OrderPlacer,
 };
 use st0x_hedge::operator::process_tx::{
     PlacedHedgeDisposition, ProcessTxChainContext, ProcessTxOutcome, ProcessTxReport,
+    ProcessTxStores, process_tx,
 };
 use st0x_registry::SymbolCache;
 
@@ -672,13 +674,8 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
 ) -> anyhow::Result<()> {
     // The CLI runs outside the bot: no reactors to reach, so standalone stores.
     // Their trading schedule flag is derived from the same config the bot uses.
-    let stores = st0x_hedge::operator::process_tx::ProcessTxStores::standalone(
-        pool,
-        ctx,
-        order_placer.clone(),
-    )
-    .await?;
-    let report = st0x_hedge::operator::process_tx::process_tx(
+    let stores = ProcessTxStores::standalone(pool, ctx, order_placer.clone()).await?;
+    let result = process_tx(
         tx_hash,
         ctx,
         pool,
@@ -688,7 +685,25 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         None,
         None,
     )
-    .await?;
+    .await;
+
+    let report = match result {
+        Ok(report) => report,
+        Err(failure) => {
+            let chain = trading_chain.chain;
+            match &failure {
+                OperatorError::Rejected(reason) => {
+                    warn!(%tx_hash, %chain, %reason, "process-tx rejected");
+                }
+                other => error!(%tx_hash, %chain, error = %other, "process-tx failed"),
+            }
+            writeln!(
+                stdout,
+                "❌ Failed to process transaction {tx_hash}: {failure}"
+            )?;
+            return Err(failure.into());
+        }
+    };
     render_process_tx_report(tx_hash, &report, stdout)
 }
 
@@ -772,10 +787,10 @@ fn render_process_tx_outcome<W: Write>(
                 "Placement for {symbol} was rejected by the position's current state (a pending order, an equity transfer, or a changed net). Settled the fill."
             )?;
         }
-        ProcessTxOutcome::PreflightDeferred { symbol } => {
+        ProcessTxOutcome::PreflightDeferred { symbol, reason } => {
             writeln!(
                 stdout,
-                "Trade accumulated but the placement preflight deferred the hedge for {symbol}: buying power could not cover a buy, or the equity reservation blocked a sell. Settled the fill."
+                "Trade accumulated but the placement preflight deferred the hedge for {symbol}: {reason}. Settled the fill."
             )?;
         }
         ProcessTxOutcome::HedgePlaced {
@@ -1029,9 +1044,8 @@ mod tests {
         SupportedExecutor, Usd,
     };
     use st0x_hedge::operator::offchain::order::OffchainOrderId;
-    use st0x_hedge::operator::process_tx::ProcessTxFill;
     use st0x_hedge::operator::test_utils::{
-        mock_alpaca_broker_ctx, try_positive_shares, try_setup_test_db,
+        mock_alpaca_broker_ctx, try_positive_shares, try_process_tx_fill_fixture, try_setup_test_db,
     };
 
     use super::*;
@@ -2861,16 +2875,7 @@ mod tests {
         let tx_hash = TxHash::repeat_byte(0x11);
         let not_found = TxHash::repeat_byte(0x22);
         let symbol = || Symbol::new("MSTR").expect("test symbol must be valid");
-        let fill = || ProcessTxFill {
-            tx_hash,
-            log_index: 7,
-            symbol: symbol(),
-            direction: Direction::Sell,
-            quantity: FractionalShares::new(
-                Float::parse("1.5".to_owned()).expect("test quantity must be valid"),
-            ),
-            price: Float::parse("123.45".to_owned()).expect("test price must be valid"),
-        };
+        let fill = || try_process_tx_fill_fixture(tx_hash, "MSTR").unwrap();
         let fill_summary = format!(
             "✅ Found opposite-side trade opportunity:\n\
              \x20  Transaction: {tx_hash}\n\
@@ -3000,10 +3005,13 @@ mod tests {
         cases.push((
             ProcessTxReport {
                 fill: Some(fill()),
-                outcome: ProcessTxOutcome::PreflightDeferred { symbol: symbol() },
+                outcome: ProcessTxOutcome::PreflightDeferred {
+                    symbol: symbol(),
+                    reason: "fractional order notional is below the $1 minimum".to_owned(),
+                },
             },
             format!(
-                "{fill_summary}Trade accumulated but the placement preflight deferred the hedge for {}: buying power could not cover a buy, or the equity reservation blocked a sell. Settled the fill.\n",
+                "{fill_summary}Trade accumulated but the placement preflight deferred the hedge for {}: fractional order notional is below the $1 minimum. Settled the fill.\n",
                 symbol()
             ),
         ));
