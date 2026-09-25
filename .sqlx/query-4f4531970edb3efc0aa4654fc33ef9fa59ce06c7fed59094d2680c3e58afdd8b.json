@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT detail FROM skipped_fills WHERE chain = ? AND tx_hash = ? AND log_index = ? AND reason = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "detail",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skipped_fills",
+            "name": "detail"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4f4531970edb3efc0aa4654fc33ef9fa59ce06c7fed59094d2680c3e58afdd8b"
+}

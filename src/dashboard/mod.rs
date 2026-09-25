@@ -777,6 +777,7 @@ mod tests {
             pnl_report_admission: pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
             health: crate::startup::HealthGate::default(),
+            detached_tasks: tokio_util::task::TaskTracker::new(),
         }
     }
 

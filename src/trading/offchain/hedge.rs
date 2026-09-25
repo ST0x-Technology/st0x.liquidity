@@ -5,8 +5,6 @@
 //! these; the apalis worker processes them with retry semantics.
 
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +31,9 @@ use crate::conductor::job::{
     BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome, BackpressureStreak,
     DEFAULT_PERFORM_TIMEOUT, Job, JobQueue, Label, advance_backpressure, apply_backpressure_step,
     find_backpressure, find_permanence,
+};
+use crate::database_file_lock::{
+    DatabaseFileGuard, DatabaseFileLock, DatabaseFileLockError, acquire_database_file_lock,
 };
 #[cfg(test)]
 use crate::offchain::order::PollOrderStatus;
@@ -113,109 +114,15 @@ pub(crate) fn apply_slippage(
 /// Persistent job queue for hedge placement.
 pub type HedgeJobQueue = JobQueue<PlaceHedge>;
 static ANCHOR_RECOVERY_JOB_PUSH_LOCK: Mutex<()> = Mutex::const_new(());
-const COUNTER_TRADE_SUBMISSION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Cross-process half of the account-wide broker submission lock.
+/// Acquires the cross process half of the account wide broker submission lock.
 ///
-/// The daemon's Tokio mutex serializes its own tasks, while this advisory file
-/// lock also serializes operator CLI processes using the same SQLite database.
-/// The kernel releases it if a process exits, so a crash cannot strand a lease.
-pub struct CounterTradeSubmissionFileGuard {
-    _file: Option<File>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum CounterTradeSubmissionLockError {
-    #[error("Failed to resolve the SQLite database path for the broker submission lock")]
-    ResolveDatabasePath(#[source] sqlx::Error),
-    #[error("Failed to join the broker submission lock task")]
-    Join(#[source] tokio::task::JoinError),
-    #[error("Failed to open broker submission lock file {path}")]
-    Open {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("Failed to acquire broker submission lock file {path}")]
-    Acquire {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("Timed out acquiring broker submission lock file {path}")]
-    TimedOut { path: PathBuf },
-}
-
-/// Acquires the account-wide broker submission lock shared by the daemon and
-/// operator CLI processes attached to `pool`'s database.
-pub async fn acquire_counter_trade_submission_file_lock(
+/// The daemon's Tokio mutex serializes its own tasks; this file lock also
+/// serializes operator CLI processes attached to `pool`'s database.
+pub(crate) async fn acquire_counter_trade_submission_file_lock(
     pool: &SqlitePool,
-) -> Result<CounterTradeSubmissionFileGuard, CounterTradeSubmissionLockError> {
-    acquire_counter_trade_submission_file_lock_with_timeout(
-        pool,
-        DEFAULT_PERFORM_TIMEOUT,
-        COUNTER_TRADE_SUBMISSION_LOCK_RETRY_INTERVAL,
-    )
-    .await
-}
-
-async fn acquire_counter_trade_submission_file_lock_with_timeout(
-    pool: &SqlitePool,
-    timeout: Duration,
-    retry_interval: Duration,
-) -> Result<CounterTradeSubmissionFileGuard, CounterTradeSubmissionLockError> {
-    let database_path: String =
-        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
-            .fetch_one(pool)
-            .await
-            .map_err(CounterTradeSubmissionLockError::ResolveDatabasePath)?;
-    if database_path.is_empty() {
-        return Ok(CounterTradeSubmissionFileGuard { _file: None });
-    }
-
-    let mut lock_path = PathBuf::from(database_path).into_os_string();
-    lock_path.push(".counter-trade.lock");
-    let lock_path = PathBuf::from(lock_path);
-    let file = tokio::task::spawn_blocking({
-        let lock_path = lock_path.clone();
-        move || {
-            let file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-                .map_err(|source| CounterTradeSubmissionLockError::Open {
-                    path: lock_path.clone(),
-                    source,
-                })?;
-            Ok::<File, CounterTradeSubmissionLockError>(file)
-        }
-    })
-    .await
-    .map_err(CounterTradeSubmissionLockError::Join)??;
-
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    return Err(CounterTradeSubmissionLockError::TimedOut { path: lock_path });
-                }
-                tokio::time::sleep(retry_interval.min(deadline - now)).await;
-            }
-            Err(source) => {
-                return Err(CounterTradeSubmissionLockError::Acquire {
-                    path: lock_path,
-                    source: source.into(),
-                });
-            }
-        }
-    }
-
-    Ok(CounterTradeSubmissionFileGuard { _file: Some(file) })
+) -> Result<DatabaseFileGuard, DatabaseFileLockError> {
+    acquire_database_file_lock(pool, DatabaseFileLock::CounterTradeSubmission).await
 }
 
 /// Enqueues one live failed-anchor recovery per symbol.
@@ -2285,88 +2192,6 @@ mod tests {
     use crate::test_utils::TEST_POLL_INTERVAL;
 
     type CapturedPlacements = Arc<StdMutex<Vec<(ClientOrderId, Positive<FractionalShares>)>>>;
-
-    #[tokio::test]
-    async fn submission_file_lock_serializes_independent_database_pools() {
-        let directory = tempfile::tempdir().unwrap();
-        let database_path = directory.path().join("submission-lock.sqlite");
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&database_path)
-            .create_if_missing(true);
-        let first_pool = SqlitePool::connect_with(options.clone()).await.unwrap();
-        let second_pool = SqlitePool::connect_with(options).await.unwrap();
-
-        let first_guard = acquire_counter_trade_submission_file_lock(&first_pool)
-            .await
-            .unwrap();
-        let waiter = tokio::spawn(async move {
-            acquire_counter_trade_submission_file_lock(&second_pool)
-                .await
-                .unwrap()
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !waiter.is_finished(),
-            "a second process-equivalent pool must wait for the account lock"
-        );
-
-        drop(first_guard);
-        tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("the waiter must acquire after release")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn submission_file_lock_timeout_does_not_strand_later_acquisitions() {
-        let directory = tempfile::tempdir().unwrap();
-        let database_path = directory.path().join("submission-lock-timeout.sqlite");
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&database_path)
-            .create_if_missing(true);
-        let first_pool = SqlitePool::connect_with(options.clone()).await.unwrap();
-        let second_pool = SqlitePool::connect_with(options).await.unwrap();
-
-        let first_guard = acquire_counter_trade_submission_file_lock(&first_pool)
-            .await
-            .unwrap();
-        let Err(error) = acquire_counter_trade_submission_file_lock_with_timeout(
-            &second_pool,
-            Duration::from_millis(25),
-            Duration::from_millis(5),
-        )
-        .await
-        else {
-            panic!("the second pool must time out while the lock is held");
-        };
-        assert!(matches!(
-            error,
-            CounterTradeSubmissionLockError::TimedOut { .. }
-        ));
-
-        drop(first_guard);
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            acquire_counter_trade_submission_file_lock(&second_pool),
-        )
-        .await
-        .expect("a timed-out waiter must not strand the file lock")
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn submission_file_lock_skips_shared_in_memory_databases() {
-        let database_name = format!("submission-lock-memory-{}", Uuid::new_v4());
-        let database_url = format!("file:{database_name}?mode=memory&cache=shared");
-        let lock_path = PathBuf::from(format!("file:{database_name}.counter-trade.lock"));
-        let pool = SqlitePool::connect(&database_url).await.unwrap();
-
-        let _guard = acquire_counter_trade_submission_file_lock(&pool)
-            .await
-            .unwrap();
-
-        assert!(!lock_path.exists());
-    }
 
     /// Builds an [`HedgingAssets`] with a single equity whose extended-hours
     /// counter-trading flag is set as given. Used to drive the per-symbol
