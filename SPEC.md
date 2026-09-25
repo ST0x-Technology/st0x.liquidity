@@ -3981,8 +3981,10 @@ A cash transfer service serves one corridor, fixed by what the build wires
 (today Base via CCTP), whether or not USDC mode is enabled, so in-flight
 transfers always recover. A fresh transfer must ask for that corridor and
 records it on its originating command. A resume or recheck of a transfer
-recorded on another corridor fails closed before any send and pages the operator
-with "USDC transfer corridor mismatch", naming both corridors.
+recorded on another corridor, or a fresh transfer asking for another corridor,
+fails closed before any send and leaves the transfer untouched. The error names
+both corridors and starts with "USDC transfer corridor mismatch"; a recheck
+returns it to the operator, and a job pages with it when its retries are spent.
 
 - `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
   (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
