@@ -727,8 +727,9 @@ impl<
 
     /// Refuses, before any call, a transfer this service's corridor does not
     /// carry: one recorded on another corridor, or a fresh one asking for
-    /// another. The transfer is left untouched; the job ends without a retry
-    /// and the rebalancing sweep pages once.
+    /// another. The transfer is left untouched. A recorded one ends its job
+    /// without a retry and the rebalancing service pages once; a fresh one
+    /// retries and dead-letters, which pages once.
     fn require_served_corridor(
         &self,
         id: &UsdcRebalanceId,

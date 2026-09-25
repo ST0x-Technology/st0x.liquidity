@@ -860,15 +860,17 @@ before the startup token approvals.
   and reconcile it with `--kind usdc`.
 - **"USDC transfer corridor mismatch: transfer <id> runs on the <corridor>
   corridor, which this build does not serve"** (`operational_alert`, once per
-  transfer): the transfer was recorded on a USDC corridor this build does not
-  carry, for example after a rollback from a build that served it, or after the
-  corridor config changed. This build cannot move its funds. The bot holds the
-  transfer and its guard: the job ends without a retry, and startup and the
-  timeout sweep do not re-arm it. `transfer resume` is refused with the same
-  "USDC transfer corridor mismatch" text, and `transfer recheck` too;
-  `transfer reconcile` does not accept the pre-burn states such a transfer is
-  usually in. Do not try them. Deploy a build (and config) that serves the named
-  corridor; that build resumes the transfer where it stopped.
+  transfer per run: a restart pages again): the transfer was recorded on a USDC
+  corridor this build does not carry, for example after a rollback from a build
+  that served it, or after the corridor config changed. This build cannot move
+  its funds. The bot holds the transfer and its guard: its job ends without a
+  retry, and startup and the timeout sweep do not re-arm it. A job for a fresh
+  transfer asking for that corridor (nothing recorded yet) dead-letters instead,
+  and its dead-letter alert carries the same text. `transfer resume` is refused
+  with the same "USDC transfer corridor mismatch" text, and `transfer recheck`
+  too; `transfer reconcile` does not accept the pre-burn states such a transfer
+  is usually in. Do not try them. Deploy a build (and config) that serves the
+  named corridor; that build resumes the transfer where it stopped.
 
 ### Clearing a dropped pending burn (`BridgingSubmitting` latch)
 
