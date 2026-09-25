@@ -432,6 +432,10 @@ enum RepeatingMintFailure {
     /// The consumed nonce's mint is not in the bounded scan and can lie below
     /// its floor.
     MintOutsideScanWindow,
+    /// The consumed nonce's mint was found but cannot be adopted: its log body
+    /// differs from the recorded message (e.g. a relayer minted a re-attested
+    /// body), its tx reverted, or it lacks `MintAndWithdraw`.
+    MintNotAdoptable,
 }
 
 /// Whether the mint of a used nonce can lie below its scan floor. A missing
@@ -473,6 +477,12 @@ fn repeating_mint_failure(
                 .then_some(RepeatingMintFailure::MintOutsideScanWindow)
         }
 
+        CctpError::RecoveredMintMessageMismatch { .. }
+        | CctpError::RecoveredMintReceiptReverted { .. }
+        | CctpError::RecoveredMintAndWithdrawEventNotFound { .. } => {
+            Some(RepeatingMintFailure::MintNotAdoptable)
+        }
+
         CctpError::Evm(_)
         | CctpError::Contract(_)
         | CctpError::RpcTransport(_)
@@ -487,10 +497,7 @@ fn repeating_mint_failure(
         | CctpError::UsdcCreditOverflow { .. }
         | CctpError::UsdcTransferLogDecode { .. }
         | CctpError::AlreadyMintedMessageNotFound { .. }
-        | CctpError::RecoveredMintMessageMismatch { .. }
         | CctpError::RecoveredMintLogMissingTxHash { .. }
-        | CctpError::RecoveredMintReceiptReverted { .. }
-        | CctpError::RecoveredMintAndWithdrawEventNotFound { .. }
         | CctpError::MintScanFloorBlockMissing { .. }
         | CctpError::MintRecoveryInconclusive { .. }
         | CctpError::FeeCalculationOverflow
@@ -3105,9 +3112,10 @@ impl<
     /// can never succeed latches `BridgingFailed`, which keeps the burn and
     /// nonce, so `transfer reconcile --kind usdc` can settle it: a message that
     /// cannot mint on this chain via [`Self::latch_unmintable_message`], a
-    /// consumed nonce whose mint can lie below the bounded scan's floor via
-    /// [`Self::latch_mint_outside_scan_window`]. A floor mined before the
-    /// transfer started covers the mint, so a missing log there redrives.
+    /// consumed nonce whose mint can lie below the bounded scan's floor, or
+    /// whose found mint never matches the recorded message, via
+    /// [`Self::latch_unadoptable_mint`]. A floor mined before the transfer
+    /// started covers the mint, so a missing log there redrives.
     async fn handle_mint_scan_failure(
         &self,
         id: &UsdcRebalanceId,
@@ -3145,8 +3153,9 @@ impl<
                 self.latch_unmintable_message(id, mint_direction, burn_tx, reason, error)
                     .await
             }
-            RepeatingMintFailure::MintOutsideScanWindow => {
-                self.latch_mint_outside_scan_window(id, mint_direction, reason, error)
+            RepeatingMintFailure::MintOutsideScanWindow
+            | RepeatingMintFailure::MintNotAdoptable => {
+                self.latch_unadoptable_mint(id, mint_direction, reason, error)
                     .await
             }
         }
@@ -3200,11 +3209,11 @@ impl<
     }
 
     /// Latches a post-burn `BridgingFailed` (burn and nonce kept) for a
-    /// consumed nonce whose mint can lie below the bounded scan, and pages in both
-    /// directions: only an operator can find that mint. A BaseToAlpaca job ends
-    /// here, since its `BridgingFailed` recovery scans no wider and can only
-    /// page again and park.
-    async fn latch_mint_outside_scan_window(
+    /// consumed nonce whose mint the bot cannot adopt (it can lie below the
+    /// bounded scan, or its log or receipt never matches), and pages in both
+    /// directions: only an operator can settle that mint. A BaseToAlpaca job
+    /// ends here, since its `BridgingFailed` recovery can only page again.
+    async fn latch_unadoptable_mint(
         &self,
         id: &UsdcRebalanceId,
         mint_direction: BridgeDirection,
