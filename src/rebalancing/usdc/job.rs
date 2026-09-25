@@ -5013,8 +5013,11 @@ mod tests {
     }
 
     /// Runs one hedging attempt whose signed deposit send is not confirmed
-    /// yet, returning the pages sent and the redrive's delay in seconds.
-    async fn run_deposit_send_pending(prepared_at: DateTime<Utc>) -> (Vec<String>, i64) {
+    /// yet, returning the pages sent, the redrive's delay in seconds and the
+    /// transfer id.
+    async fn run_deposit_send_pending(
+        prepared_at: DateTime<Utc>,
+    ) -> (Vec<String>, i64, UsdcRebalanceId) {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
@@ -5042,14 +5045,14 @@ mod tests {
             rescheduled.revert_redrive_attempts, job.revert_redrive_attempts,
             "a rebroadcast redrive must not consume the redrive budget"
         );
-        (notifier.messages(), run_at - before)
+        (notifier.messages(), run_at - before, job.id)
     }
 
     /// A signed deposit send not confirmed yet is rebroadcast after a short
     /// delay, silently, and never fails the transfer.
     #[tokio::test]
     async fn hedging_job_redrives_a_pending_deposit_send_silently_before_the_deadline() {
-        let (messages, delay) = run_deposit_send_pending(Utc::now()).await;
+        let (messages, delay, _) = run_deposit_send_pending(Utc::now()).await;
 
         assert!(messages.is_empty(), "got: {messages:?}");
         let expected = i64::try_from(DEPOSIT_SEND_RECONCILIATION_REDRIVE_DELAY.as_secs()).unwrap();
@@ -5063,15 +5066,40 @@ mod tests {
     /// down but never stops: the send may still confirm.
     #[tokio::test]
     async fn hedging_job_pages_a_pending_deposit_send_past_the_deadline() {
-        let (messages, delay) =
+        let (messages, delay, id) =
             run_deposit_send_pending(Utc::now() - chrono::Duration::hours(5)).await;
 
         let [message] = messages.as_slice() else {
             panic!("expected one page, got: {messages:?}");
         };
-        assert!(
-            message.contains("transfer reconcile --kind usdc"),
-            "got: {message}"
+        let tx = TxHash::from([0xDD; 32]);
+        // Only the elapsed time between the two parts varies.
+        let (before_elapsed, after_elapsed) = message
+            .split_once(". It has stayed unconfirmed for ")
+            .unwrap_or_else(|| panic!("got: {message}"));
+        assert_eq!(
+            before_elapsed,
+            format!(
+                "USDC rebalance {id}: signed deposit send {tx} is not confirmed yet: it was \
+                 dropped from the mempool"
+            )
+        );
+        let (_, guidance) = after_elapsed
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("got: {message}"));
+        assert_eq!(
+            guidance,
+            format!(
+                "(>14400s). The send is never re-signed or fee-bumped, so later sends from the \
+                 Ethereum wallet queue behind its nonce. Automatic rebroadcast continues at a \
+                 slower cadence (guard held). A send that will not confirm at its current fee \
+                 can still mine when fees drop: do not move the minted USDC or reconcile until \
+                 a different tx is mined at the send's nonce (cancel it with a higher-fee \
+                 0-value self-transfer at that nonce from the bot wallet, see \
+                 docs/cli-ops.md). Only then settle the minted USDC, reconcile the transfer \
+                 (`transfer reconcile --kind usdc --id {id}`) and restart the bot to release \
+                 the send's nonce."
+            )
         );
         let expected =
             i64::try_from(DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY.as_secs())
