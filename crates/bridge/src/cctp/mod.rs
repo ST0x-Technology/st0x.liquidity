@@ -408,8 +408,8 @@ pub struct CctpBridge<EthWallet: Wallet, BaseWallet: Wallet> {
 /// read from `usedNonces()` at the block below the floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MintScanFloorCheck {
-    /// Unused below the floor: the mint is in the scan window, so a missing
-    /// log is index lag.
+    /// Unused below the floor (or the floor is genesis): the mint is in the
+    /// scan window, so a missing log is index lag.
     MintInScanWindow,
     /// Already used below the floor: the mint is below the scan window.
     MintBelowScanFloor,
@@ -4892,6 +4892,76 @@ mod tests {
             from_block - 1,
             "the nonce must be read at the block below the floor"
         );
+    }
+
+    /// A nonce already used below the floor places the mint below the scan
+    /// window, which no redrive widens.
+    #[tokio::test]
+    async fn find_existing_mint_places_the_mint_below_the_floor_when_used_below_it() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(2_100_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // The floor block's state is the real one after the mint, which the
+        // lookback leaves below the scan.
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let after_mint = base_provider.get_block_number().await.unwrap();
+
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(1_000_000)
+        .with_historical_reads_at(after_mint);
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { floor_check, .. } = error else {
+            panic!("a mint below the lookback must name its floor: {error:?}");
+        };
+        assert_eq!(floor_check, MintScanFloorCheck::MintBelowScanFloor);
     }
 
     /// Burns name no destination caller, so a relayer can mint between Circle

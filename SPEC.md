@@ -3899,25 +3899,29 @@ already-submitted action instead of re-issuing it:
   current head (a relayer can mint before that head is captured), or at the
   fixed lookback alone for a transfer recorded before that head was captured.
   The bot never scans back to genesis. A consumed nonce whose log is not found
-  in that window is judged by the floor block's timestamp. A mint lands after
-  its transfer starts, so if the floor was mined before the transfer started,
-  the window covers the mint and the missing log is index lag: resume redrives
-  like any other lookup failure (deadline-gated alert). Otherwise the mint can
-  lie below the floor, and resume marks `BridgingFailed` (keeping the burn tx
-  and nonce), so `transfer reconcile --kind usdc` can settle it; a message that
-  can never mint on the destination chain does the same. A mint that can lie
-  below the floor pages the operator in both directions with "the CCTP mint
-  cannot be resolved automatically": only the operator can find that mint. A
-  BaseToAlpaca job ends there, since its post-burn `BridgingFailed` recovery
-  scans no wider; if that recovery runs again (a restart) and cannot find the
-  mint of a used nonce, it applies the same floor rule: it redrives when its
-  scan covers the transfer, and otherwise pages the same way and stops. A
-  message that can never mint pages only for AlpacaToBase, with "the recorded
-  CCTP message cannot mint on Base" (the nonce is not read, so the operator gets
-  the attestation for the burn tx and mints it); an AlpacaToBase retry finds the
-  transfer failed and does not alert. That BaseToAlpaca latch does not page: its
-  recovery re-polls Circle and may still mint and send the deposit, and the
-  job's dead-letter alert covers a give-up. Other lookup failures redrive.
+  in that window is placed by a `usedNonces` read at the block below the floor:
+  unused there, the window covers the mint and the missing log is index lag, so
+  resume redrives like any other lookup failure (deadline-gated alert); used
+  there, the mint lies below the floor. When that read fails (for example a node
+  without state that old), the floor block's timestamp decides instead: a mint
+  lands after its transfer starts, so a floor mined before the transfer started
+  covers the mint (redrive), and a newer floor can have the mint below it. For a
+  mint below the floor, or one that can lie below it, resume marks
+  `BridgingFailed` (keeping the burn tx and nonce), so
+  `transfer reconcile --kind usdc` can settle it; a message that can never mint
+  on the destination chain does the same. Such a mint pages the operator in both
+  directions with "the CCTP mint cannot be resolved automatically": only the
+  operator can find that mint. A BaseToAlpaca job ends there, since its
+  post-burn `BridgingFailed` recovery scans no wider; if that recovery runs
+  again (a restart) and cannot find the mint of a used nonce, it applies the
+  same floor rule: it redrives when the rule places the mint inside its scan,
+  and otherwise pages the same way and stops. A message that can never mint
+  pages only for AlpacaToBase, with "the recorded CCTP message cannot mint on
+  Base" (the nonce is not read, so the operator gets the attestation for the
+  burn tx and mints it); an AlpacaToBase retry finds the transfer failed and
+  does not alert. That BaseToAlpaca latch does not page: its recovery re-polls
+  Circle and may still mint and send the deposit, and the job's dead-letter
+  alert covers a give-up. Other lookup failures redrive.
 
 ##### Commands
 

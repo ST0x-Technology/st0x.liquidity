@@ -942,9 +942,9 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// The log scan for a consumed nonce is floored at the lower of
     /// `scan_from_block` and [`MINT_SCAN_LOOKBACK_CHUNKS`] below the head.
     /// A log still missing after the lag retries is
-    /// [`CctpError::MintNotFoundInScanWindow`], which carries the floor
-    /// block's timestamp so the caller can tell index lag from a mint below
-    /// the floor. The scan never walks to genesis.
+    /// [`CctpError::MintNotFoundInScanWindow`], which carries whether the
+    /// nonce was used below the floor so the caller can tell index lag from a
+    /// mint below the floor. The scan never walks to genesis.
     pub(super) async fn find_existing_mint<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
@@ -973,7 +973,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         let from_block =
             scan_from_block.map_or(lookback_floor, |captured| captured.min(lookback_floor));
 
-        self.locate_mint_in_scan_window(&received_message, from_block)
+        self.locate_mint_in_scan_window::<Registry>(&received_message, from_block)
             .await
             .map(Some)
     }
@@ -1101,7 +1101,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// [`CctpError::MintRecoveryInconclusive`] rather than a false "never
     /// minted" terminal failure, since the authoritative nonce read already
     /// proved the mint landed.
-    async fn reconstruct_existing_mint(
+    async fn reconstruct_existing_mint<Registry: IntoErrorRegistry>(
         &self,
         received_message: &CctpReceivedMessage<'_>,
     ) -> Result<MintReceipt, CctpError> {
@@ -1109,16 +1109,14 @@ impl<W: Wallet> CctpEndpoint<W> {
             CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS),
         );
 
-        self.locate_mint_in_scan_window(received_message, min_block)
+        self.locate_mint_in_scan_window::<Registry>(received_message, min_block)
             .await
     }
 
     /// [`locate_mint_receipt_with_lag_retries`](Self::locate_mint_receipt_with_lag_retries),
     /// reporting a log still missing as [`CctpError::MintNotFoundInScanWindow`]
-    /// with the timestamp of `from_block`. A mint cannot land before its
-    /// transfer starts, so a floor mined earlier than that start proves the
-    /// scan covers the mint and the missing log is index lag.
-    async fn locate_mint_in_scan_window(
+    /// with the [`check_mint_scan_floor`](Self::check_mint_scan_floor) result.
+    async fn locate_mint_in_scan_window<Registry: IntoErrorRegistry>(
         &self,
         received_message: &CctpReceivedMessage<'_>,
         from_block: u64,
@@ -1131,29 +1129,73 @@ impl<W: Wallet> CctpEndpoint<W> {
             located => return located,
         };
 
-        let from_block_timestamp = self
-            .wallet
-            .provider()
-            .get_block_by_number(from_block.into())
-            .await?
-            .ok_or(CctpError::MintScanFloorBlockMissing { block: from_block })?
-            .header
-            .timestamp;
+        let floor_check = self
+            .check_mint_scan_floor::<Registry>(nonce, from_block)
+            .await?;
 
         warn!(
             target: "bridge",
             %nonce,
             from_block,
-            from_block_timestamp,
+            ?floor_check,
             "CCTP nonce consumed but its mint is not in the scan window"
         );
         Err(CctpError::MintNotFoundInScanWindow {
             nonce,
             from_block,
-            floor_check: MintScanFloorCheck::Unverified {
-                from_block_timestamp,
-            },
+            floor_check,
         })
+    }
+
+    /// Where the mint of the consumed `nonce` lies relative to a scan floored
+    /// at `from_block`, from a `usedNonces()` read at the block below it. A
+    /// failed read (e.g. a node without state that old) falls back to the
+    /// floor block's timestamp rather than failing the lookup.
+    async fn check_mint_scan_floor<Registry: IntoErrorRegistry>(
+        &self,
+        nonce: B256,
+        from_block: u64,
+    ) -> Result<MintScanFloorCheck, CctpError> {
+        // A scan from genesis covers every block.
+        let Some(below_floor) = from_block.checked_sub(1) else {
+            return Ok(MintScanFloorCheck::MintInScanWindow);
+        };
+
+        match self
+            .wallet
+            .call_at::<Registry, _>(
+                self.message_transmitter_address,
+                MessageTransmitterV2::usedNoncesCall(nonce),
+                below_floor,
+            )
+            .await
+        {
+            Ok(nonce_used) if nonce_used.is_zero() => Ok(MintScanFloorCheck::MintInScanWindow),
+            Ok(_) => Ok(MintScanFloorCheck::MintBelowScanFloor),
+            Err(historical_read_error) => {
+                warn!(
+                    target: "bridge",
+                    %nonce,
+                    below_floor,
+                    ?historical_read_error,
+                    "usedNonces() read below the mint scan floor failed; \
+                     falling back to the floor block's timestamp"
+                );
+
+                let from_block_timestamp = self
+                    .wallet
+                    .provider()
+                    .get_block_by_number(from_block.into())
+                    .await?
+                    .ok_or(CctpError::MintScanFloorBlockMissing { block: from_block })?
+                    .header
+                    .timestamp;
+
+                Ok(MintScanFloorCheck::Unverified {
+                    from_block_timestamp,
+                })
+            }
+        }
     }
 
     /// [`locate_mint_receipt`](Self::locate_mint_receipt), retrying only
@@ -1304,7 +1346,7 @@ impl<W: Wallet> CctpEndpoint<W> {
                     // negative exactly like the case this function exists to
                     // prevent.
                     return self
-                        .reconstruct_existing_mint(&received_message)
+                        .reconstruct_existing_mint::<Registry>(&received_message)
                         .await
                         .map_err(|reconstruction_error| CctpError::MintRecoveryInconclusive {
                             recovery_error: Box::new(reconstruction_error),
