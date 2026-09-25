@@ -801,13 +801,25 @@ impl<W: Wallet> CctpEndpoint<W> {
     }
 
     /// Like [`usdc_credited_in_tx`](Self::usdc_credited_in_tx), counting only
-    /// the `Transfer` logs from `sender`.
+    /// the `Transfer` logs from `sender`. The hash comes from an operator, so
+    /// one with no receipt yet is refused at once (`TxNotMined`) instead of
+    /// waiting out the receipt wait's drop grace or timeout.
     pub(super) async fn usdc_sent_in_tx(
         &self,
         tx_hash: TxHash,
         sender: Address,
         recipient: Address,
     ) -> Result<U256, CctpError> {
+        if self
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .is_none()
+        {
+            return Err(CctpError::TxNotMined { tx_hash });
+        }
+
         let receipt = self.wallet.await_receipt(tx_hash).await?;
 
         usdc_credit_in_receipt(&receipt, self.usdc_address, Some(sender), recipient)

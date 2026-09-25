@@ -1767,8 +1767,8 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
 fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String) {
     use UsdcRecheckError::{
         Alpaca, AlpacaToBaseDeposit, DepositTxAmountMismatch, DepositTxConflict, DepositTxLookup,
-        DepositTxRead, DepositTxRecordedElsewhere, DepositTxUnchecked, NoOnchainDepositRef,
-        NotDepositFailed, NotFound, Transfer,
+        DepositTxNotMined, DepositTxRead, DepositTxRecordedElsewhere, DepositTxUnchecked,
+        NoOnchainDepositRef, NotDepositFailed, NotFound, Transfer,
     };
 
     match error {
@@ -1778,6 +1778,7 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         | NotDepositFailed { .. }
         | DepositTxConflict { .. }
         | DepositTxRecordedElsewhere { .. }
+        | DepositTxNotMined { .. }
         | DepositTxAmountMismatch { .. } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
         DepositTxRead { .. } => (
             StatusCode::BAD_GATEWAY,
@@ -2871,6 +2872,7 @@ mod tests {
     use tower::ServiceExt;
     use uuid::uuid;
 
+    use st0x_bridge::cctp::CctpError;
     use st0x_config::{
         BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
         create_test_ctx_with_order_owner,
@@ -6220,6 +6222,29 @@ mod tests {
             state: "Withdrawing",
         });
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let tx = TxHash::repeat_byte(0x42);
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::DepositTxNotMined {
+            id: id.clone(),
+            tx,
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            message,
+            format!(
+                "deposit tx {tx} is not mined on Ethereum (unknown hash, or still pending); \
+                 it is not attached to rebalance {id}. Check the hash, or retry once the tx \
+                 is mined"
+            )
+        );
+
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::DepositTxRead {
+            id: id.clone(),
+            tx,
+            source: Box::new(CctpError::TxReceiptMissingBlock { tx_hash: tx }),
+        });
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "Ethereum RPC unavailable; retry later");
 
         let (status, message) =
             usdc_recheck_error_response(&UsdcRecheckError::Alpaca(AlpacaWalletError::ApiError {

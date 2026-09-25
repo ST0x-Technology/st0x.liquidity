@@ -1253,7 +1253,8 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     }
 
     /// Returns the USDC that `tx_hash` moved from `sender` to `recipient` on
-    /// Ethereum, once the tx has the wallet's required confirmations.
+    /// Ethereum, once the tx has the wallet's required confirmations. A tx
+    /// that is not mined yet is `TxNotMined`, returned without waiting.
     pub async fn ethereum_usdc_sent(
         &self,
         tx_hash: TxHash,

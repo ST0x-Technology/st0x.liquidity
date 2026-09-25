@@ -3880,10 +3880,16 @@ impl<
             .cctp_bridge
             .ethereum_usdc_sent(send_tx, self.market_maker_wallet, deposit_address)
             .await
-            .map_err(|source| UsdcRecheckError::DepositTxRead {
-                id: id.clone(),
-                tx: send_tx,
-                source: Box::new(source),
+            .map_err(|source| match source {
+                CctpError::TxNotMined { tx_hash } => UsdcRecheckError::DepositTxNotMined {
+                    id: id.clone(),
+                    tx: tx_hash,
+                },
+                source => UsdcRecheckError::DepositTxRead {
+                    id: id.clone(),
+                    tx: send_tx,
+                    source: Box::new(source),
+                },
             })?;
         if sent != expected {
             return Err(UsdcRecheckError::DepositTxAmountMismatch {
@@ -6152,6 +6158,12 @@ pub(crate) enum UsdcRecheckError {
         tx: TxHash,
         recorded_by: String,
     },
+    #[error(
+        "deposit tx {tx} is not mined on Ethereum (unknown hash, or still \
+         pending); it is not attached to rebalance {id}. Check the hash, or \
+         retry once the tx is mined"
+    )]
+    DepositTxNotMined { id: UsdcRebalanceId, tx: TxHash },
     #[error(
         "deposit tx {tx} moved {sent} USDC units from the bot wallet to the \
          Alpaca deposit address, but rebalance {id} failed with {expected}; \

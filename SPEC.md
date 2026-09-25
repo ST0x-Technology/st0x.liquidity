@@ -6890,5 +6890,6 @@ operator finds this transfer's own send on chain and Alpaca credited it: the bot
 attaches the tx (`AttachDepositSend`) only if it moved exactly the transfer's
 `amount_received` from the bot wallet to Alpaca's deposit address, has the
 required confirmations, and no other `UsdcRebalance` recorded it, then rechecks
-as for a recorded send. Otherwise `transfer reconcile --kind usdc`, which does
-not convert the USDC to USD.
+as for a recorded send. A hash with no receipt is refused at once, without the
+receipt wait, so a wrong hash fails within the CLI's request timeout. Otherwise
+`transfer reconcile --kind usdc`, which does not convert the USDC to USD.
