@@ -97,9 +97,9 @@ const CAPTURED_FLOOR_MARGIN: Duration = Duration::from_secs(10 * 60);
 /// by the chain's fastest block cadence, rounded up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScanWindow {
-    pub(crate) floor_margin_blocks: u64,
-    pub(crate) mint_lookback_blocks: u64,
-    pub(crate) reconstruction_lookback_blocks: u64,
+    pub(crate) floor_margin: u64,
+    pub(crate) mint_lookback: u64,
+    pub(crate) reconstruction_lookback: u64,
 }
 
 impl ScanWindow {
@@ -107,10 +107,9 @@ impl ScanWindow {
         let interval = whole_millis(chain.min_block_interval());
 
         Self {
-            floor_margin_blocks: whole_millis(CAPTURED_FLOOR_MARGIN).div_ceil(interval),
-            mint_lookback_blocks: whole_millis(MINT_SCAN_LOOKBACK).div_ceil(interval),
-            reconstruction_lookback_blocks: whole_millis(RECONSTRUCTION_SCAN_LOOKBACK)
-                .div_ceil(interval),
+            floor_margin: whole_millis(CAPTURED_FLOOR_MARGIN).div_ceil(interval),
+            mint_lookback: whole_millis(MINT_SCAN_LOOKBACK).div_ceil(interval),
+            reconstruction_lookback: whole_millis(RECONSTRUCTION_SCAN_LOOKBACK).div_ceil(interval),
         }
     }
 }
@@ -1086,7 +1085,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         let lookback_floor = self
             .current_block()
             .await?
-            .saturating_sub(self.scan_window.mint_lookback_blocks);
+            .saturating_sub(self.scan_window.mint_lookback);
 
         // A relayer can mint before the floor was captured (burns name no
         // destination caller), so a captured floor is lowered by a margin and
@@ -1094,7 +1093,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         // a lower floor cannot adopt another mint.
         let from_block = scan_from_block.map_or(lookback_floor, |captured| {
             captured
-                .saturating_sub(self.scan_window.floor_margin_blocks)
+                .saturating_sub(self.scan_window.floor_margin)
                 .min(lookback_floor)
         });
 
@@ -1233,7 +1232,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         let min_block = self
             .current_block()
             .await?
-            .saturating_sub(self.scan_window.reconstruction_lookback_blocks);
+            .saturating_sub(self.scan_window.reconstruction_lookback);
 
         self.locate_mint_in_scan_window::<Registry>(received_message, min_block)
             .await
@@ -2139,17 +2138,17 @@ mod tests {
         assert_eq!(
             ScanWindow::for_chain(Chain::Base),
             ScanWindow {
-                floor_margin_blocks: 300,
-                mint_lookback_blocks: 60_000,
-                reconstruction_lookback_blocks: 60_000,
+                floor_margin: 300,
+                mint_lookback: 60_000,
+                reconstruction_lookback: 60_000,
             }
         );
         assert_eq!(
             ScanWindow::for_chain(Chain::Ethereum),
             ScanWindow {
-                floor_margin_blocks: 50,
-                mint_lookback_blocks: 10_000,
-                reconstruction_lookback_blocks: 10_000,
+                floor_margin: 50,
+                mint_lookback: 10_000,
+                reconstruction_lookback: 10_000,
             }
         );
     }
