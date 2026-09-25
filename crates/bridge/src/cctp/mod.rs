@@ -1858,6 +1858,7 @@ mod tests {
         remaining_revert_failures: AtomicU32,
         remaining_call_failures: AtomicU32,
         remaining_stale_unused_reads: AtomicU32,
+        fail_historical_reads: bool,
         call_count: Arc<AtomicU32>,
     }
 
@@ -1896,6 +1897,7 @@ mod tests {
                 remaining_revert_failures: AtomicU32::new(0),
                 remaining_call_failures: AtomicU32::new(failures.call_failures),
                 remaining_stale_unused_reads: AtomicU32::new(0),
+                fail_historical_reads: false,
                 call_count,
             }
         }
@@ -1929,6 +1931,12 @@ mod tests {
         /// Reports the chain `head_offset` blocks above the real one.
         fn with_reported_head_offset(mut self, head_offset: u64) -> Self {
             self.provider.head_offset = head_offset;
+            self
+        }
+
+        /// Fails every `call_at`, as a node without state that old would.
+        fn with_failing_historical_reads(mut self) -> Self {
+            self.fail_historical_reads = true;
             self
         }
 
@@ -2013,6 +2021,36 @@ mod tests {
             }
 
             self.inner.call::<Registry, Call>(contract, call).await
+        }
+
+        /// Reads the real block `head_offset` below `block_number`, matching
+        /// the provider's shifted head.
+        async fn call_at<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+            &self,
+            contract: Address,
+            call: Call,
+            block_number: u64,
+        ) -> Result<Call::Return, EvmError>
+        where
+            Self: Sized,
+        {
+            if self.fail_historical_reads {
+                return Err(EvmError::Contract(ContractError::TransportError(
+                    RpcError::ErrorResp(ErrorPayload {
+                        code: -32000,
+                        message: Cow::Borrowed("missing trie node (synthetic pruned state)"),
+                        data: None,
+                    }),
+                )));
+            }
+
+            self.inner
+                .call_at::<Registry, Call>(
+                    contract,
+                    call,
+                    block_number.saturating_sub(self.provider.head_offset),
+                )
+                .await
         }
     }
 
@@ -4613,7 +4651,8 @@ mod tests {
 
     /// A nonce the chain reports consumed whose `MessageReceived` log the
     /// queried node never returns (log-index lag, pruned logs) must not send
-    /// the resume lookup walking back to genesis on every redrive.
+    /// the resume lookup walking back to genesis on every redrive. The node
+    /// has no state at the floor, so the error falls back to its timestamp.
     #[tokio::test]
     async fn find_existing_mint_scan_stays_bounded_when_the_used_nonce_log_is_invisible() {
         let cctp = LocalCctp::new().await.unwrap();
@@ -4669,7 +4708,8 @@ mod tests {
             },
             Arc::new(AtomicU32::new(0)),
         )
-        .with_reported_head_offset(head_offset);
+        .with_reported_head_offset(head_offset)
+        .with_failing_historical_reads();
         let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
         let flaky_endpoint = CctpEndpoint::new(
             cctp.base.usdc,
@@ -4748,6 +4788,73 @@ mod tests {
         };
         assert_eq!(from_block, old_floor);
         assert_eq!(lowest_scanned_block.load(Ordering::SeqCst), old_floor);
+    }
+
+    /// A transfer older than the lookback has a floor mined after it started,
+    /// so the floor's age cannot place its mint. The nonce read unused below
+    /// the floor does: the mint is in the window and the missing log is lag.
+    #[tokio::test]
+    async fn find_existing_mint_places_the_mint_in_the_window_when_unused_below_the_floor() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_900_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // The floor maps to genesis, where the nonce is unused.
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(1_000_000);
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { floor_check, .. } = error else {
+            panic!("a consumed nonce with no visible log must name its floor: {error:?}");
+        };
+        assert_eq!(floor_check, MintScanFloorCheck::MintInScanWindow);
     }
 
     /// Burns name no destination caller, so a relayer can mint between Circle
