@@ -3250,6 +3250,7 @@ mod tests {
     use alloy::primitives::{Address, IntoLogData, TxHash, address, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
+    use alloy::sol_types::SolCall;
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
@@ -3302,7 +3303,7 @@ mod tests {
         PortfolioBalanceRowWithMark, PortfolioSnapshot, PortfolioSnapshotCommand,
         PortfolioSnapshotId, PortfolioSnapshotProjection, et_day,
     };
-    use crate::position::{Position, PositionCommand, TradeId};
+    use crate::position::{NormalizedOnChainFillCommand, Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
     use crate::rebalancing::usdc::{UsdcDriverGate, UsdcTransferError, usdc_driver_pause};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
@@ -4501,7 +4502,7 @@ mod tests {
         position
             .send(
                 symbol,
-                PositionCommand::AcknowledgeOnChainFillAt {
+                PositionCommand::AcknowledgeNormalizedOnChainFill(NormalizedOnChainFillCommand {
                     symbol: symbol.clone(),
                     threshold,
                     trade_id: TradeId {
@@ -4514,8 +4515,8 @@ mod tests {
                     price_usdc: float!(10),
                     block_timestamp,
                     block_number: None,
-                    seen_at: block_timestamp,
-                },
+                    underlying_per_wrapped: st0x_wrapper::RATIO_ONE,
+                }),
             )
             .await
             .unwrap();
@@ -8165,6 +8166,11 @@ mod tests {
         });
         let asserter = Asserter::new();
         asserter.push_success(&receipt);
+        asserter.push_success(
+            &<crate::bindings::IERC4626::convertToAssetsCall as SolCall>::abi_encode_returns(
+                &st0x_wrapper::RATIO_ONE,
+            ),
+        );
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let cache = SymbolCache::default();

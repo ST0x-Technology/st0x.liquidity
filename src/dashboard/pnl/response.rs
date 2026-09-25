@@ -52,6 +52,9 @@ pub(crate) struct PnlResponse {
     pub(crate) costs: PnlCostSummary,
     pub(crate) capital: PnlCapitalSummary,
     pub(crate) symbols: Vec<PnlSymbolSummary>,
+    /// Symbols omitted because at least one legacy wrapped fill has no proven
+    /// underlying conversion ratio.
+    pub(crate) unavailable_symbols: Vec<Symbol>,
     pub(crate) symbol_universe: Vec<Symbol>,
     pub(crate) entries: Vec<PnlEntry>,
     pub(crate) cost_entries: Vec<PnlCostEntry>,

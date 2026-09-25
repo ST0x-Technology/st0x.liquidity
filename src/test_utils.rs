@@ -635,6 +635,7 @@ impl OnchainTradeBuilder {
                 amount: FractionalShares::new(st0x_float_macro::float!(1)),
                 direction: Direction::Buy,
                 price: Usdc::new(st0x_float_macro::float!(150))?,
+                underlying_per_wrapped: Some(st0x_wrapper::RATIO_ONE),
                 block_number: Some(1),
                 block_timestamp: Some(Utc::now()),
             },
