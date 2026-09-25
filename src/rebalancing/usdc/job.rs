@@ -2150,7 +2150,7 @@ mod tests {
     use reqwest::StatusCode;
     use uuid::{Uuid, uuid};
 
-    use st0x_bridge::corridor::UsdcCorridor;
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_evm::{Chain, EvmError};
     use st0x_execution::{
         AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, DeadlineCancel,
@@ -2438,6 +2438,8 @@ mod tests {
         DepositSendUnresolved,
         /// `FailBridging` is committed; the tx belongs to another transfer.
         WithdrawalTxAlreadyRecorded,
+        /// Permanent for this build; the rebalancing sweep pages once.
+        CorridorMismatch,
     }
 
     impl TerminalOutcome {
@@ -2517,6 +2519,14 @@ mod tests {
                         recorded_by: "00000000-0000-0000-0000-000000000001".to_string(),
                     }
                 }
+                Self::CorridorMismatch => UsdcTransferError::CorridorMismatch {
+                    id: id.clone(),
+                    recorded: UsdcCorridor::HubRouted {
+                        chain: Chain::Robinhood,
+                        hop: HopKind::Relay,
+                    },
+                    served: UsdcCorridor::BASE_CCTP,
+                },
             }
         }
     }
@@ -6660,5 +6670,57 @@ mod tests {
 
         assert_eq!(hedging.corridor, UsdcCorridor::BASE_CCTP);
         assert_eq!(market_making.corridor, UsdcCorridor::BASE_CCTP);
+    }
+
+    /// A transfer on a corridor this build does not serve cannot progress;
+    /// retrying and dead-lettering would page on every sweep. The job ends
+    /// quietly and the rebalancing sweep pages once.
+    #[tokio::test]
+    async fn jobs_end_quietly_on_a_corridor_this_build_does_not_serve() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let hedging = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(TerminalBaseToAlpaca(TerminalOutcome::CorridorMismatch)),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let market_making = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::CorridorMismatch)),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = Usdc::new(float!(100));
+
+        TransferUsdcToHedging {
+            id: id.clone(),
+            amount,
+            corridor: UsdcCorridor::BASE_CCTP,
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .perform(&hedging)
+        .await
+        .unwrap();
+        TransferUsdcToMarketMaking {
+            id,
+            amount,
+            corridor: UsdcCorridor::BASE_CCTP,
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        }
+        .perform(&market_making)
+        .await
+        .unwrap();
+
+        assert_eq!(pending_job_count::<TransferUsdcToHedging>(&pool).await, 0);
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0
+        );
+        assert_eq!(notifier.messages(), Vec::<String>::new());
     }
 }
