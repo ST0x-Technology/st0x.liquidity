@@ -35092,4 +35092,125 @@ mod tests {
             notifier.messages()
         );
     }
+
+    async fn make_unserved_corridor_trigger(
+        pool: &SqlitePool,
+        store: Arc<Store<UsdcRebalance>>,
+        notifier: Arc<dyn crate::alerts::Notifier>,
+    ) -> Arc<RebalancingService> {
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier,
+        )
+        .await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store,
+            )
+            .await;
+        trigger
+    }
+
+    /// A corridor page that fails at startup is retried by the sweep until it
+    /// is delivered, then never sent again.
+    #[tokio::test]
+    async fn startup_corridor_page_that_fails_is_retried_by_the_sweep() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier.clone()).await;
+
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+
+        for _ in 0..2 {
+            trigger
+                .expire_stuck_usdc_rebalances(Utc::now())
+                .await
+                .unwrap();
+        }
+
+        let delivered = notifier.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "got {delivered:?}");
+        assert!(
+            delivered[0].starts_with("USDC transfer corridor mismatch"),
+            "only the corridor page, got {delivered:?}"
+        );
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    /// An operator reconcile of a held transfer on an unserved corridor
+    /// releases the guard on the next sweep, as for any reconciled transfer.
+    #[tokio::test]
+    async fn reconciled_unserved_corridor_transfer_releases_the_guard_on_the_next_sweep() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &id, usdc(400), ROBINHOOD_RELAY).await;
+        for command in [
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "withdrawn funds need the operator".to_string(),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier.clone()).await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a reconciled transfer must release the guard"
+        );
+        assert_eq!(corridor_pages(&notifier).len(), 1);
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "no page besides the corridor one: {:?}",
+            notifier.messages()
+        );
+    }
 }
