@@ -3078,6 +3078,7 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_finance::Positive;
     use st0x_float_macro::float;
 
@@ -11405,5 +11406,147 @@ mod tests {
             matches!(error, CtxError::ZeroPollingInterval { .. }),
             "Expected ZeroPollingInterval, got {error:?}"
         );
+    }
+
+    fn prod_config() -> Config {
+        toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap()
+    }
+
+    fn corridor_chain_error(config: &Config) -> CtxError {
+        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
+            .unwrap_err()
+    }
+
+    fn cash_mut(config: &mut Config, chain: Chain) -> &mut crate::ChainCashAsset {
+        config
+            .chains
+            .get_mut(&chain)
+            .and_then(|chain_config| chain_config.trading.as_mut())
+            .and_then(|trading| trading.assets.cash.as_mut())
+            .unwrap()
+    }
+
+    #[test]
+    fn prod_config_resolves_the_base_cctp_corridor() {
+        let config = prod_config();
+        let rebalancing = config.rebalancing.as_ref().unwrap();
+
+        let usdc = RebalancingCtx::new(rebalancing).unwrap().usdc.unwrap();
+
+        assert_eq!(
+            usdc.corridor,
+            UsdcCorridor::HubRouted {
+                chain: Chain::Base,
+                hop: HopKind::Cctp,
+            }
+        );
+        assert!(usdc.threshold.target.eq(float!(0.6)).unwrap());
+        assert!(usdc.threshold.deviation.eq(float!(0.05)).unwrap());
+        validate_usdc_corridor_chains(&rebalancing.usdc, &config.chains).unwrap();
+    }
+
+    #[test]
+    fn corridor_on_an_unconfigured_chain_is_refused() {
+        let mut config = prod_config();
+        config.chains.remove(&Chain::Base);
+
+        let error = corridor_chain_error(&config);
+
+        assert!(
+            matches!(
+                error,
+                CtxError::CorridorChainNotConfigured { chain: Chain::Base }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn corridor_on_a_disabled_chain_is_refused() {
+        let mut config = prod_config();
+        config.chains.get_mut(&Chain::Base).unwrap().lifecycle = ChainLifecycle::Disabled;
+
+        let error = corridor_chain_error(&config);
+
+        assert!(
+            matches!(
+                error,
+                CtxError::CorridorChainDisabled { chain: Chain::Base }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn corridor_chain_without_a_cash_vault_is_refused() {
+        let mut config = prod_config();
+        cash_mut(&mut config, Chain::Base).vault_ids.clear();
+
+        let error = corridor_chain_error(&config);
+
+        assert!(
+            matches!(
+                error,
+                CtxError::CorridorChainWithoutCashVault { chain: Chain::Base }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn cash_rebalancing_chain_without_a_corridor_is_refused() {
+        let mut config = prod_config();
+        cash_mut(&mut config, Chain::Robinhood).rebalancing = OperationMode::Enabled;
+
+        let error = corridor_chain_error(&config);
+
+        assert!(
+            matches!(
+                error,
+                CtxError::CashRebalancingWithoutCorridor {
+                    chain: Chain::Robinhood
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// The cash path still runs on the primary chain, so a corridor elsewhere
+    /// would size and guard transfers off the wrong vault.
+    #[test]
+    fn corridor_chain_other_than_primary_is_refused() {
+        let mut config = prod_config();
+        for (chain, primary) in [(Chain::Base, false), (Chain::Robinhood, true)] {
+            config
+                .chains
+                .get_mut(&chain)
+                .and_then(|chain_config| chain_config.trading.as_mut())
+                .unwrap()
+                .primary = primary;
+        }
+
+        let error = corridor_chain_error(&config);
+
+        assert!(
+            matches!(
+                error,
+                CtxError::CorridorChainNotPrimary {
+                    chain: Chain::Base,
+                    primary: Chain::Robinhood,
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_usdc_mode_needs_no_corridor_for_a_rebalancing_cash_chain() {
+        let mut config = prod_config();
+        let usdc = &mut config.rebalancing.as_mut().unwrap().usdc;
+        usdc.mode = OperationMode::Disabled;
+        usdc.corridors.clear();
+
+        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
+            .unwrap();
     }
 }

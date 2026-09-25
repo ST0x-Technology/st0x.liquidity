@@ -405,11 +405,12 @@ impl std::fmt::Debug for RebalancingCtx {
 
 #[cfg(test)]
 mod tests {
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_evm::{Chain, USDC_BASE, USDC_ETHEREUM};
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::AllocationConfigError;
+    use crate::{AllocationConfigError, InvalidImbalanceThreshold};
 
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
@@ -1261,5 +1262,352 @@ mod tests {
             matches!(error, RebalancingCtxError::MissingAllocation),
             "expected the missing allocation section named, got {error:?}"
         );
+    }
+
+    /// The valid config with its `[usdc]` table (and any tables under it)
+    /// replaced by `usdc`.
+    fn with_usdc(usdc: &str) -> RebalancingConfig {
+        let (head, _) = valid_rebalancing_config_toml()
+            .split_once("[usdc]")
+            .unwrap();
+
+        toml::from_str(&format!("{head}{usdc}")).unwrap()
+    }
+
+    fn corridor_error(usdc: &str) -> RebalancingCtxError {
+        RebalancingCtx::new(&with_usdc(usdc)).unwrap_err()
+    }
+
+    #[test]
+    fn corridor_table_resolves_the_base_cctp_corridor() {
+        let ctx = RebalancingCtx::new(&with_usdc(
+            r#"
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = 0.6
+            deviation = 0.05
+            "#,
+        ))
+        .unwrap();
+
+        let usdc = ctx.usdc.unwrap();
+        assert_eq!(usdc.corridor, UsdcCorridor::BASE_CCTP);
+        assert!(usdc.threshold.target.eq(float!(0.6)).unwrap());
+        assert!(usdc.threshold.deviation.eq(float!(0.05)).unwrap());
+    }
+
+    #[test]
+    fn usdc_enabled_without_a_corridor_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "enabled"
+            "#,
+        );
+
+        assert!(
+            matches!(error, RebalancingCtxError::UsdcEnabledWithoutCorridor),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn relay_hop_is_refused_by_this_build() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.robinhood]
+            hop = "relay"
+            target = 0.5
+            deviation = 0.05
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayHopNotBuilt {
+                    chain: Chain::Robinhood
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn cctp_corridor_on_robinhood_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.robinhood]
+            hop = "cctp"
+            target = 0.5
+            deviation = 0.05
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::CctpHopStableNotUsdc {
+                    chain: Chain::Robinhood,
+                    source: CorridorStableNotUsdc {
+                        chain: Chain::Robinhood,
+                        stable: "USDG",
+                    },
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn cctp_corridor_on_hyperevm_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.hyperevm]
+            hop = "cctp"
+            target = 0.5
+            deviation = 0.05
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::NoCctpDomain {
+                    chain: Chain::HyperEvm
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn ethereum_corridor_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.ethereum]
+            hop = "cctp"
+            target = 0.5
+            deviation = 0.05
+            "#,
+        );
+
+        assert!(
+            matches!(error, RebalancingCtxError::EthereumCorridor),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn corridor_target_out_of_range_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = 1.5
+            deviation = 0.05
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::CorridorThreshold {
+                    chain: Chain::Base,
+                    source: InvalidImbalanceThreshold::TargetOutOfRange { .. },
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn corridor_table_without_hop_is_refused() {
+        let (head, _) = valid_rebalancing_config_toml()
+            .split_once("[usdc]")
+            .unwrap();
+
+        let error = toml::from_str::<RebalancingConfig>(&format!(
+            r#"{head}
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.base]
+            target = 0.6
+            deviation = 0.05
+            "#
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("hop"),
+            "expected the missing hop named, got: {error}"
+        );
+    }
+
+    #[test]
+    fn corridor_table_with_an_unknown_key_is_refused() {
+        let (head, _) = valid_rebalancing_config_toml()
+            .split_once("[usdc]")
+            .unwrap();
+
+        let error = toml::from_str::<RebalancingConfig>(&format!(
+            r#"{head}
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = 0.6
+            deviation = 0.05
+            slippage_bps = 10
+            "#
+        ))
+        .unwrap_err();
+
+        assert!(
+            error.message().contains("slippage_bps"),
+            "expected the unknown key named, got: {error}"
+        );
+    }
+
+    /// The released image reads the old `[rebalancing.usdc]` target and band,
+    /// so while they are set they must say what the corridor says.
+    #[test]
+    fn legacy_target_differing_from_the_corridor_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "enabled"
+            target = 0.5
+            deviation = 0.05
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = 0.6
+            deviation = 0.05
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::LegacyUsdcThresholdMismatch { chain: Chain::Base }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_deviation_differing_from_the_corridor_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "enabled"
+            target = 0.6
+            deviation = 0.1
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = 0.6
+            deviation = 0.05
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::LegacyUsdcThresholdMismatch { chain: Chain::Base }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_threshold_equal_to_the_corridor_is_accepted() {
+        let ctx = RebalancingCtx::new(&with_usdc(
+            r#"
+            [usdc]
+            mode = "enabled"
+            target = 0.6
+            deviation = "0.05"
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = "0.6"
+            deviation = 0.05
+            "#,
+        ))
+        .unwrap();
+
+        assert_eq!(ctx.usdc.unwrap().corridor, UsdcCorridor::BASE_CCTP);
+    }
+
+    /// A typo in a corridor table fails the day it is written, not the day
+    /// someone enables USDC mode.
+    #[test]
+    fn disabled_mode_still_validates_corridor_tables() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "disabled"
+
+            [usdc.corridors.robinhood]
+            hop = "relay"
+            target = 0.5
+            deviation = 0.05
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayHopNotBuilt {
+                    chain: Chain::Robinhood
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_mode_with_a_valid_corridor_starts_no_transfers() {
+        let ctx = RebalancingCtx::new(&with_usdc(
+            r#"
+            [usdc]
+            mode = "disabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = 0.6
+            deviation = 0.05
+            "#,
+        ))
+        .unwrap();
+
+        let None = ctx.usdc else {
+            panic!(
+                "a disabled mode must start no transfers, got {:?}",
+                ctx.usdc
+            );
+        };
     }
 }
