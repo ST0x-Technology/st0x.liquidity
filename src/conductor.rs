@@ -19102,6 +19102,7 @@ mod tests {
         async fn verify_deposit_send_superseded(
             &self,
             _prepared: &PreparedTransaction,
+            _superseding_tx: Option<TxHash>,
         ) -> Result<(), DepositSendNotSuperseded> {
             Ok(())
         }

@@ -1509,11 +1509,13 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     Ok(())
 }
 
-/// Proves on the configured Ethereum wallet that `prepared` can never mine,
-/// with the confirmation depth the bot's USDC transfers use.
+/// Proves on the configured Ethereum wallet that `prepared` can never mine:
+/// `superseding_tx` is the wallet's tx at its nonce, with the confirmation
+/// depth the bot's USDC transfers use.
 pub(super) async fn verify_deposit_send_superseded_on_chain(
     ctx: &Ctx,
     prepared: &PreparedTransaction,
+    superseding_tx: Option<TxHash>,
 ) -> anyhow::Result<()> {
     let wallet_ctx = ctx.wallet()?;
     let bridge = CctpBridge::try_from_ctx(CctpCtx {
@@ -1531,6 +1533,8 @@ pub(super) async fn verify_deposit_send_superseded_on_chain(
     Ok(verify_deposit_send_superseded(
         &bridge,
         prepared,
+        superseding_tx,
+        wallet_ctx.ethereum_wallet().address(),
         ctx.chains.primary().required_confirmations,
     )
     .await?)
@@ -3325,10 +3329,9 @@ mod tests {
             &pool,
             async |checked: &PreparedTransaction| {
                 assert_eq!(checked, &prepared, "the chain check reads the signed send");
-                Err(DepositSendNotSuperseded::NonceFree {
+                Err(DepositSendNotSuperseded::NoSupersedingTx {
                     tx: checked.tx_hash(),
                     nonce: checked.nonce(),
-                    confirmed_next_nonce: checked.nonce(),
                 }
                 .into())
             },
@@ -3341,10 +3344,9 @@ mod tests {
             format!(
                 "transfer reconcile: refusing to reconcile USDC transfer {}: {}",
                 UsdcRebalanceId(id),
-                DepositSendNotSuperseded::NonceFree {
+                DepositSendNotSuperseded::NoSupersedingTx {
                     tx: prepared.tx_hash(),
                     nonce: 9,
-                    confirmed_next_nonce: 9,
                 },
             )
         );

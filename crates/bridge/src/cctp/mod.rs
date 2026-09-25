@@ -432,6 +432,15 @@ pub enum UsdcTransferStatus {
     Dropped,
 }
 
+/// A mined Ethereum transaction: who sent it, at which nonce, and how deep
+/// it is (the inclusion block counts as confirmation 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinedTx {
+    pub from: Address,
+    pub nonce: u64,
+    pub confirmations: u64,
+}
+
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
@@ -1230,10 +1239,10 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self.ethereum.tx_confirmations(tx_hash).await
     }
 
-    /// Returns the Ethereum wallet's next nonce as of the block that is
-    /// `confirmations` deep, so a nonce below it is taken by a settled tx.
-    pub async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
-        self.ethereum.confirmed_nonce(confirmations).await
+    /// Returns the sender, nonce and confirmations of `tx_hash` on Ethereum,
+    /// or `None` while the node shows no receipt for it.
+    pub async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+        self.ethereum.mined_tx(tx_hash).await
     }
 
     /// Returns the block in which `tx_hash` was mined on Ethereum, the chain
