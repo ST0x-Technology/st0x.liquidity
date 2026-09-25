@@ -86,6 +86,7 @@ use st0x_evm::{
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
 use crate::BridgeDirection;
+use crate::corridor::UsdcCorridor;
 use evm::CctpEndpoint;
 
 // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
@@ -111,6 +112,15 @@ const ETHEREUM_DOMAIN: u32 = 0;
 
 /// CCTP domain identifier for Base
 const BASE_DOMAIN: u32 = 6;
+
+/// The CCTP domain this build knows for `chain`, `None` where it has none.
+pub const fn cctp_domain(chain: Chain) -> Option<u32> {
+    match chain {
+        Chain::Ethereum => Some(ETHEREUM_DOMAIN),
+        Chain::Base => Some(BASE_DOMAIN),
+        Chain::HyperEvm | Chain::Robinhood => None,
+    }
+}
 
 impl BridgeDirection {
     /// Returns the source CCTP domain for this bridge direction.
@@ -375,6 +385,11 @@ impl CctpCorridor {
 
     pub const fn usdc_base(self) -> Address {
         self.usdc_base
+    }
+
+    /// The cash corridor this CCTP pair carries: Base via CCTP.
+    pub const fn usdc_corridor(self) -> UsdcCorridor {
+        UsdcCorridor::BASE_CCTP
     }
 }
 
@@ -1580,6 +1595,7 @@ mod tests {
 
     use super::evm::MintRecoveryConfig;
     use super::*;
+    use crate::corridor::HopKind;
     use crate::{Attestation, Bridge};
 
     #[test]
@@ -1588,6 +1604,23 @@ mod tests {
 
         assert_eq!(corridor.usdc_ethereum(), USDC_ETHEREUM);
         assert_eq!(corridor.usdc_base(), USDC_BASE);
+        assert_eq!(
+            corridor.usdc_corridor(),
+            UsdcCorridor::HubRouted {
+                chain: Chain::Base,
+                hop: HopKind::Cctp,
+            }
+        );
+    }
+
+    /// Circle's domain numbers, pinned as literals: a burn names its
+    /// destination by domain, so a wrong number mints on another chain.
+    #[test]
+    fn cctp_domains_exist_for_ethereum_and_base_only() {
+        assert_eq!(cctp_domain(Chain::Ethereum), Some(0));
+        assert_eq!(cctp_domain(Chain::Base), Some(6));
+        assert_eq!(cctp_domain(Chain::HyperEvm), None);
+        assert_eq!(cctp_domain(Chain::Robinhood), None);
     }
 
     /// Robinhood settles in USDG, which CCTP neither burns nor mints: that end
