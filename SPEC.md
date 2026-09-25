@@ -4365,10 +4365,12 @@ enum BridgeStage { Burn, Attestation, Mint }
   WITHOUT crediting `available` (the USDC was already burned via CCTP, so the
   funds genuinely left the source venue; this is NOT a cancel, which would
   wrongly credit `available`). See "Operator reconciliation of a stranded
-  post-burn failure" under Failure Handling. For a signed send, the API and CLI
-  read on chain before the command and refuse unless a different tx took its
-  nonce: the wallet nonce at the required confirmations is past the send's, and
-  the send itself has no receipt.
+  post-burn failure" under Failure Handling. For a signed send, the operator
+  names the tx that took its nonce, and the API and CLI read it on chain before
+  the command: they refuse unless it is mined from the bot's Ethereum wallet at
+  the send's nonce, is not the send itself, and has the required confirmations.
+  A missing receipt for the send is never proof, since a lagging node shows none
+  for a send that mined.
 
 ##### Integration Points
 
@@ -6875,9 +6877,10 @@ therefore performs an explicit fund-moving send:
      different tx is mined at the send's nonce does the operator settle the
      minted USDC and run `transfer reconcile --kind usdc`, which accepts a
      BaseToAlpaca `Bridged` with a signed send, then restart the bot to release
-     the send's nonce. Reconcile reads the chain first and refuses while the
-     wallet nonce at the required confirmations is not past the send's nonce, or
-     when the send itself is mined.
+     the send's nonce. Reconcile takes that different tx's hash
+     (`--superseding-tx`) and refuses unless the chain shows it mined from the
+     bot wallet at the send's nonce, distinct from the send, with the required
+     confirmations.
    - Mined reverted: it moved no USDC. The bot does not sign another send; it
      emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
      (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job
@@ -6885,14 +6888,15 @@ therefore performs an explicit fund-moving send:
    - At startup, before any job, startup approval or stale-allowance revoke can
      send from the Ethereum wallet, the bot reserves the nonce of every signed
      send still on `Bridged`, so no other send takes it. A failure to read those
-     transfers pages and does not stop startup; the rebroadcast reserves the
-     nonce again when the transfer resumes. Startup then rebroadcasts each
-     restored send without waiting for a confirmation, so no later send waits
-     behind a send no node holds. A failed startup rebroadcast pages and keeps
-     the nonce reserved. A restored send that is not mined after the rebroadcast
-     (or whose rebroadcast failed) skips the Ethereum startup approvals and
-     revokes on that start, with a warning; the transfer's resume broadcasts the
-     send again.
+     transfers pages and does not stop startup, but skips the Ethereum startup
+     approvals and revokes on that start; the rebroadcast reserves the nonce
+     again when the transfer resumes. Startup then rebroadcasts each restored
+     send without waiting for a confirmation, so no later send waits behind a
+     send no node holds. A failed startup rebroadcast pages and keeps the nonce
+     reserved. A restored send that is not mined after the rebroadcast (or whose
+     rebroadcast failed) skips the Ethereum startup approvals and revokes on
+     that start, with a warning; the transfer's resume broadcasts the send
+     again.
 3. **Resume from `Bridged`.**
    - **Signed send persisted:** broadcast the same bytes and continue as in
      step 2. Other transfers send the same amount to the same deposit address

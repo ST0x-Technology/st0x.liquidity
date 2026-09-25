@@ -1,5 +1,6 @@
 //! Single-chain CCTP operations.
 
+use alloy::consensus::Transaction as _;
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
@@ -18,8 +19,8 @@ use st0x_evm::{
 };
 
 use super::{
-    CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt,
-    MintScanFloorCheck, TokenMessengerV2, UsdcTransferStatus, parse_received_message,
+    CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MinedTx,
+    MintReceipt, MintScanFloorCheck, TokenMessengerV2, UsdcTransferStatus, parse_received_message,
 };
 use crate::BridgeDirection;
 
@@ -788,19 +789,30 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(Some(head.saturating_sub(tx_block).saturating_add(1)))
     }
 
-    /// Returns this endpoint wallet's next nonce as of the block that is
-    /// `confirmations` deep (the head counts as confirmation 1): every nonce
-    /// below it is taken by a tx with at least that many confirmations.
-    pub(super) async fn confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
-        let head = self.wallet.provider().get_block_number().await?;
-        let block = head.saturating_sub(confirmations.saturating_sub(1));
+    /// Returns the sender, nonce and confirmations of `tx_hash`, or `None`
+    /// while this endpoint's node shows no receipt or no transaction for it.
+    /// Confirmations follow [`tx_confirmations`](Self::tx_confirmations).
+    pub(super) async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+        let provider = self.wallet.provider();
+        let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+            return Ok(None);
+        };
 
-        Ok(self
-            .wallet
-            .provider()
-            .get_transaction_count(self.wallet.address())
-            .number(block)
-            .await?)
+        let Some(tx_block) = receipt.block_number else {
+            return Ok(None);
+        };
+
+        let Some(tx) = provider.get_transaction_by_hash(tx_hash).await? else {
+            return Ok(None);
+        };
+
+        let head = provider.get_block_number().await?;
+
+        Ok(Some(MinedTx {
+            from: receipt.from,
+            nonce: tx.nonce(),
+            confirmations: head.saturating_sub(tx_block).saturating_add(1),
+        }))
     }
 
     /// Sums the USDC `Transfer` logs in `tx_hash`'s receipt that pay `recipient`:

@@ -15,7 +15,7 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{
-    AttestationResponse, CctpBridge, CctpError, MintScanFloorCheck, UsdcTransferStatus,
+    AttestationResponse, CctpBridge, CctpError, MinedTx, MintScanFloorCheck, UsdcTransferStatus,
 };
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER};
@@ -142,9 +142,9 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
     /// Returns the block in which `tx_hash` was mined on Ethereum.
     async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError>;
 
-    /// Returns the bot Ethereum wallet's next nonce as of the block that is
-    /// `confirmations` deep.
-    async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError>;
+    /// Returns the sender, nonce and confirmations of `tx_hash` on Ethereum,
+    /// or `None` while it has no receipt.
+    async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError>;
 
     /// Returns the USDC balance of `holder` on Ethereum.
     async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError>;
@@ -214,8 +214,8 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
         self.ethereum_tx_block(tx_hash).await
     }
 
-    async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
-        self.ethereum_confirmed_nonce(confirmations).await
+    async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+        self.ethereum_mined_tx(tx_hash).await
     }
 
     async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
@@ -6276,66 +6276,118 @@ pub(crate) enum UsdcRecheckError {
 #[derive(Debug, thiserror::Error)]
 pub enum DepositSendNotSuperseded {
     #[error(
-        "deposit send {tx} can still mine: its nonce {nonce} is not taken at the \
-         required confirmations (the bot wallet's confirmed next nonce is \
-         {confirmed_next_nonce}). Wait for it to mine, or cancel it at its nonce and \
-         retry once the cancel has the required confirmations"
+        "deposit send {tx} is signed at nonce {nonce}: name the tx that took that nonce \
+         with --superseding-tx (API: supersedingTx) once it has the required confirmations"
     )]
-    NonceFree {
-        tx: TxHash,
-        nonce: u64,
-        confirmed_next_nonce: u64,
+    NoSupersedingTx { tx: TxHash, nonce: u64 },
+    #[error(
+        "superseding tx {tx} is the deposit send itself: if it is mined, the deposit went \
+         through, so do not reconcile; use `transfer recheck --kind usdc` once the \
+         transfer is DepositFailed"
+    )]
+    SupersedingTxIsTheSend { tx: TxHash },
+    #[error(
+        "superseding tx {superseding} is not mined on Ethereum (unknown hash, or still \
+         pending); retry once it is mined"
+    )]
+    SupersedingTxNotMined { superseding: TxHash },
+    #[error(
+        "superseding tx {superseding} was sent by {from}, not the bot's Ethereum wallet \
+         {bot_wallet}"
+    )]
+    SupersedingTxFromAnotherSender {
+        superseding: TxHash,
+        from: Address,
+        bot_wallet: Address,
     },
     #[error(
-        "deposit send {tx} is mined, so the deposit went through: do not reconcile. \
-         The transfer's redrive continues the deposit; once it is DepositFailed, use \
-         `transfer recheck --kind usdc`"
+        "superseding tx {superseding} is at nonce {superseding_nonce}, not the deposit \
+         send's nonce {nonce}"
     )]
-    Mined { tx: TxHash },
+    SupersedingTxAtAnotherNonce {
+        superseding: TxHash,
+        superseding_nonce: u64,
+        nonce: u64,
+    },
+    #[error(
+        "superseding tx {superseding} has {confirmations} of the {required} required \
+         confirmations; retry once it has them"
+    )]
+    SupersedingTxUnconfirmed {
+        superseding: TxHash,
+        confirmations: u64,
+        required: u64,
+    },
     /// Reading Ethereum failed -- transient, retry later.
-    #[error("could not read deposit send {tx} or the bot wallet's nonce on Ethereum; retry")]
+    #[error("could not read superseding tx {superseding} on Ethereum; retry")]
     Read {
-        tx: TxHash,
+        superseding: TxHash,
         #[source]
         source: Box<CctpError>,
     },
 }
 
-/// Proves that `prepared` can never mine: a tx with `required_confirmations`
-/// took its nonce, and that tx is not `prepared` itself.
+/// Proves that `prepared` can never mine.
+///
+/// The operator-named `superseding_tx` must be a different tx from
+/// `bot_wallet` at the send's nonce with `required_confirmations`. Only a tx
+/// the node shows as mined counts, so a node that lags refuses rather than
+/// proves.
 pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
     bridge: &Helper,
     prepared: &PreparedTransaction,
+    superseding_tx: Option<TxHash>,
+    bot_wallet: Address,
     required_confirmations: u64,
 ) -> Result<(), DepositSendNotSuperseded> {
     let tx = prepared.tx_hash();
     let nonce = prepared.nonce();
-    let read = |source| DepositSendNotSuperseded::Read {
-        tx,
-        source: Box::new(source),
+    let Some(superseding) = superseding_tx else {
+        return Err(DepositSendNotSuperseded::NoSupersedingTx { tx, nonce });
     };
 
-    // The nonce is read before the receipt, so a send that mines between the
-    // reads is seen as mined rather than as another tx at its nonce.
-    let confirmed_next_nonce = bridge
-        .ethereum_confirmed_nonce(required_confirmations)
+    if superseding == tx {
+        return Err(DepositSendNotSuperseded::SupersedingTxIsTheSend { tx });
+    }
+
+    let mined = bridge
+        .ethereum_mined_tx(superseding)
         .await
-        .map_err(read)?;
-    if confirmed_next_nonce <= nonce {
-        return Err(DepositSendNotSuperseded::NonceFree {
-            tx,
-            nonce,
-            confirmed_next_nonce,
+        .map_err(|source| DepositSendNotSuperseded::Read {
+            superseding,
+            source: Box::new(source),
+        })?;
+    let Some(MinedTx {
+        from,
+        nonce: superseding_nonce,
+        confirmations,
+    }) = mined
+    else {
+        return Err(DepositSendNotSuperseded::SupersedingTxNotMined { superseding });
+    };
+
+    if from != bot_wallet {
+        return Err(DepositSendNotSuperseded::SupersedingTxFromAnotherSender {
+            superseding,
+            from,
+            bot_wallet,
         });
     }
 
-    if bridge
-        .ethereum_tx_confirmations(tx)
-        .await
-        .map_err(read)?
-        .is_some()
-    {
-        return Err(DepositSendNotSuperseded::Mined { tx });
+    if superseding_nonce != nonce {
+        return Err(DepositSendNotSuperseded::SupersedingTxAtAnotherNonce {
+            superseding,
+            superseding_nonce,
+            nonce,
+        });
+    }
+
+    if confirmations < required_confirmations {
+        return Err(DepositSendNotSuperseded::SupersedingTxUnconfirmed {
+            superseding,
+            confirmations,
+            required: required_confirmations,
+        });
     }
 
     Ok(())
@@ -6357,6 +6409,7 @@ pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
     async fn verify_deposit_send_superseded(
         &self,
         prepared: &PreparedTransaction,
+        superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded>;
 }
 
@@ -6404,9 +6457,16 @@ where
     async fn verify_deposit_send_superseded(
         &self,
         prepared: &PreparedTransaction,
+        superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded> {
-        verify_deposit_send_superseded(&*self.cctp_bridge, prepared, self.required_confirmations)
-            .await
+        verify_deposit_send_superseded(
+            &*self.cctp_bridge,
+            prepared,
+            superseding_tx,
+            self.market_maker_wallet,
+            self.required_confirmations,
+        )
+        .await
     }
 }
 
@@ -6528,7 +6588,6 @@ mod tests {
         usdc_discarded: Mutex<Vec<TxHash>>,
         usdc_restored: Mutex<Vec<TxHash>>,
         mined_usdc_sends: Mutex<Vec<TxHash>>,
-        confirmed_nonce: Option<u64>,
         // Opt-in: the mint block lookup and the pre-send scan find nothing,
         // as a scan of mined logs does while a send is still unmined.
         empty_usdc_scan: bool,
@@ -6567,7 +6626,6 @@ mod tests {
                 usdc_discarded: Mutex::new(Vec::new()),
                 usdc_restored: Mutex::new(Vec::new()),
                 mined_usdc_sends: Mutex::new(Vec::new()),
-                confirmed_nonce: None,
                 empty_usdc_scan: false,
                 ledger_probe: None,
                 empty_burn_scan: false,
@@ -6655,12 +6713,6 @@ mod tests {
         /// Reports `tx_hash` as mined to `ethereum_tx_confirmations`.
         fn with_mined_usdc_send(self, tx_hash: TxHash) -> Self {
             self.mined_usdc_sends.lock().unwrap().push(tx_hash);
-            self
-        }
-
-        /// Reports `nonce` as the wallet's confirmed next nonce.
-        fn with_confirmed_nonce(mut self, nonce: u64) -> Self {
-            self.confirmed_nonce = Some(nonce);
             self
         }
 
@@ -6858,12 +6910,8 @@ mod tests {
             unimplemented!("MockBridge: ethereum_tx_block not used in this test")
         }
 
-        async fn ethereum_confirmed_nonce(&self, _confirmations: u64) -> Result<u64, CctpError> {
-            let Some(nonce) = self.confirmed_nonce else {
-                unimplemented!("MockBridge: ethereum_confirmed_nonce not used in this test")
-            };
-
-            Ok(nonce)
+        async fn ethereum_mined_tx(&self, _tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+            unimplemented!("MockBridge: ethereum_mined_tx not used in this test")
         }
 
         async fn ethereum_usdc_balance(&self, _holder: Address) -> Result<U256, CctpError> {
@@ -7111,8 +7159,8 @@ mod tests {
             self.inner.ethereum_tx_block(tx_hash).await
         }
 
-        async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
-            self.inner.ethereum_confirmed_nonce(confirmations).await
+        async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+            self.inner.ethereum_mined_tx(tx_hash).await
         }
 
         async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
@@ -7312,8 +7360,8 @@ mod tests {
             self.inner.ethereum_tx_block(tx_hash).await
         }
 
-        async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
-            self.inner.ethereum_confirmed_nonce(confirmations).await
+        async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+            self.inner.ethereum_mined_tx(tx_hash).await
         }
 
         async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
@@ -7512,8 +7560,8 @@ mod tests {
             self.inner.ethereum_tx_block(tx_hash).await
         }
 
-        async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
-            self.inner.ethereum_confirmed_nonce(confirmations).await
+        async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+            self.inner.ethereum_mined_tx(tx_hash).await
         }
 
         async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
@@ -15495,42 +15543,29 @@ mod tests {
         assert_eq!(recorded_by, other.to_string());
     }
 
-    /// A signed send nobody broadcast leaves its nonce free, so it can still
-    /// mine and must not be reconciled.
+    /// A nonce read past the send and no receipt for it can come from two
+    /// nodes at different heights, so they do not prove the send can never
+    /// mine: only a tx the operator names at the send's nonce does.
     #[tokio::test]
-    async fn deposit_send_with_a_free_nonce_is_not_superseded() {
-        let chain = deploy_ethereum_usdc_chain().await;
-        let server = MockServer::start();
-        let manager = build_deposit_manager(
-            &chain,
-            &server,
-            Arc::new(create_short_poll_wallet_service(&server)),
-            create_test_store_instance().await,
-        )
-        .await;
-        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
-        let prepared = sign_usdc_to_alpaca(&wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
+    async fn deposit_send_is_not_superseded_by_a_nonce_read_past_it_and_no_receipt() {
+        let bridge = MockBridge::new();
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 3);
 
-        let error = manager
-            .verify_deposit_send_superseded(&prepared)
+        let error = verify_deposit_send_superseded(&bridge, &prepared, None, Address::ZERO, 3)
             .await
-            .unwrap_err();
+            .expect_err("a lagging receipt read is no proof that another tx took the nonce");
 
-        let DepositSendNotSuperseded::NonceFree {
-            tx,
-            nonce,
-            confirmed_next_nonce,
-        } = error
-        else {
-            panic!("expected NonceFree, got: {error:?}");
-        };
-        assert_eq!(tx, prepared.tx_hash());
-        assert_eq!(nonce, prepared.nonce());
-        assert_eq!(confirmed_next_nonce, prepared.nonce());
+        assert!(
+            matches!(
+                error,
+                DepositSendNotSuperseded::NoSupersedingTx { tx, nonce: 3 } if tx == prepared.tx_hash()
+            ),
+            "got: {error:?}"
+        );
     }
 
-    /// A different tx mined at the send's nonce proves the send can never
-    /// mine, once that tx has the required confirmations.
+    /// A tx the bot wallet mined at the send's nonce proves the send can
+    /// never mine, once that tx has the required confirmations.
     #[tokio::test]
     async fn deposit_send_whose_nonce_another_tx_took_is_superseded_once_confirmed() {
         let chain = deploy_ethereum_usdc_chain().await;
@@ -15544,62 +15579,41 @@ mod tests {
         .await;
         let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
         let prepared = sign_usdc_to_alpaca(&wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
+        let bot_provider = bot_provider(&chain).await;
 
         // The runbook's cancel: a 0-value self transfer at the send's nonce.
-        let bot_provider = ProviderBuilder::new()
-            .wallet(alloy::network::EthereumWallet::from(
-                PrivateKeySigner::from_bytes(&chain.bot_key).unwrap(),
-            ))
-            .connect(&chain.endpoint)
-            .await
-            .unwrap();
-        bot_provider
-            .send_transaction(
-                TransactionRequest::default()
-                    .to(chain.bot_address)
-                    .value(U256::ZERO)
-                    .nonce(prepared.nonce()),
-            )
-            .await
-            .unwrap()
-            .get_receipt()
-            .await
-            .unwrap();
+        let cancel =
+            send_self_transfer(&bot_provider, chain.bot_address, Some(prepared.nonce())).await;
 
         let error = manager
-            .verify_deposit_send_superseded(&prepared)
+            .verify_deposit_send_superseded(&prepared, Some(cancel))
             .await
             .unwrap_err();
         assert!(
-            matches!(error, DepositSendNotSuperseded::NonceFree { .. }),
+            matches!(
+                error,
+                DepositSendNotSuperseded::SupersedingTxUnconfirmed {
+                    confirmations: 1,
+                    required: 3,
+                    ..
+                }
+            ),
             "a cancel with fewer than the required confirmations is no proof yet, got: {error:?}"
         );
 
         bot_provider.anvil_mine(Some(2), None).await.unwrap();
 
         manager
-            .verify_deposit_send_superseded(&prepared)
+            .verify_deposit_send_superseded(&prepared, Some(cancel))
             .await
             .unwrap();
     }
 
-    /// A nonce read past the send and no receipt for it can come from two
-    /// nodes at different heights, so they do not prove the send can never
-    /// mine.
+    /// A named tx proves nothing unless the bot wallet mined it at the send's
+    /// nonce: the send itself, an unknown hash, another sender's tx and the
+    /// bot's tx at another nonce are all refused.
     #[tokio::test]
-    async fn deposit_send_is_not_superseded_by_a_nonce_read_past_it_and_no_receipt() {
-        let bridge = MockBridge::new().with_confirmed_nonce(4);
-        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 3);
-
-        verify_deposit_send_superseded(&bridge, &prepared, 3)
-            .await
-            .expect_err("a lagging receipt read is no proof that another tx took the nonce");
-    }
-
-    /// A mined send moved the USDC to Alpaca, so reconciling it would move
-    /// the funds twice.
-    #[tokio::test]
-    async fn mined_deposit_send_is_not_superseded() {
+    async fn deposit_send_is_not_superseded_by_a_tx_that_did_not_take_its_nonce() {
         let chain = deploy_ethereum_usdc_chain().await;
         let server = MockServer::start();
         let manager = build_deposit_manager(
@@ -15612,17 +15626,114 @@ mod tests {
         let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
         let prepared = sign_usdc_to_alpaca(&wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
         broadcast_signed(&wallet, &prepared).await;
-        wallet.provider().anvil_mine(Some(2), None).await.unwrap();
-
-        let error = manager
-            .verify_deposit_send_superseded(&prepared)
+        let bot_provider = bot_provider(&chain).await;
+        let later = send_self_transfer(&bot_provider, chain.bot_address, None).await;
+        // Anvil signs for its unlocked dev accounts, so a provider without a
+        // wallet sends from another sender.
+        let node = ProviderBuilder::new()
+            .connect(&chain.endpoint)
             .await
-            .unwrap_err();
+            .unwrap();
+        let other = node.get_accounts().await.unwrap()[1];
+        let foreign = node
+            .send_transaction(
+                TransactionRequest::default()
+                    .from(other)
+                    .to(other)
+                    .value(U256::ZERO),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash;
+        bot_provider.anvil_mine(Some(3), None).await.unwrap();
 
-        let DepositSendNotSuperseded::Mined { tx } = error else {
-            panic!("expected Mined, got: {error:?}");
+        let refusals = [
+            (prepared.tx_hash(), "the send itself"),
+            (TxHash::repeat_byte(0xEE), "an unknown hash"),
+            (foreign, "another sender's tx"),
+            (later, "the bot's tx at another nonce"),
+        ];
+        let mut errors = Vec::new();
+        for (superseding, case) in refusals {
+            let error = manager
+                .verify_deposit_send_superseded(&prepared, Some(superseding))
+                .await
+                .unwrap_err();
+            errors.push((case, error));
+        }
+
+        let [
+            (_, is_send),
+            (_, unknown),
+            (_, other_sender),
+            (_, other_nonce),
+        ] = &errors[..]
+        else {
+            panic!("one error per case, got: {errors:?}");
         };
-        assert_eq!(tx, prepared.tx_hash());
+        assert!(
+            matches!(is_send, DepositSendNotSuperseded::SupersedingTxIsTheSend { tx } if *tx == prepared.tx_hash()),
+            "got: {is_send:?}"
+        );
+        assert!(
+            matches!(
+                unknown,
+                DepositSendNotSuperseded::SupersedingTxNotMined { .. }
+            ),
+            "got: {unknown:?}"
+        );
+        assert!(
+            matches!(
+                other_sender,
+                DepositSendNotSuperseded::SupersedingTxFromAnotherSender { from, bot_wallet, .. }
+                    if *from == other && *bot_wallet == chain.bot_address
+            ),
+            "got: {other_sender:?}"
+        );
+        assert!(
+            matches!(
+                other_nonce,
+                DepositSendNotSuperseded::SupersedingTxAtAnotherNonce { superseding_nonce, nonce, .. }
+                    if *superseding_nonce == prepared.nonce() + 1 && *nonce == prepared.nonce()
+            ),
+            "got: {other_nonce:?}"
+        );
+    }
+
+    /// Connects a provider that signs with the bot wallet's key.
+    async fn bot_provider(chain: &EthereumUsdcChain) -> impl Provider + use<> {
+        ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(
+                PrivateKeySigner::from_bytes(&chain.bot_key).unwrap(),
+            ))
+            .connect(&chain.endpoint)
+            .await
+            .unwrap()
+    }
+
+    /// Mines a 0-value transfer from `address` to itself, at `nonce` if given.
+    async fn send_self_transfer(
+        provider: &impl Provider,
+        address: Address,
+        nonce: Option<u64>,
+    ) -> TxHash {
+        let request = TransactionRequest::default().to(address).value(U256::ZERO);
+        let request = match nonce {
+            Some(nonce) => request.nonce(nonce),
+            None => request,
+        };
+
+        provider
+            .send_transaction(request)
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash
     }
 
     /// Signs a send of `amount` USDC from `wallet` to the Alpaca deposit

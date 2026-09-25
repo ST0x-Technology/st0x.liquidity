@@ -1347,8 +1347,8 @@ impl TransferUsdcToHedging {
                  the minted USDC or reconcile until a different tx is mined at the send's nonce \
                  (cancel it with a higher-fee 0-value self-transfer at that nonce from the bot \
                  wallet, see docs/cli-ops.md). Only then settle the minted USDC, reconcile the \
-                 transfer (`transfer reconcile --kind usdc --id {id}`) and restart the bot to \
-                 release the send's nonce."
+                 transfer (`transfer reconcile --kind usdc --id {id} --superseding-tx \
+                 <that tx>`) and restart the bot to release the send's nonce."
             );
             if let Err(notify_error) = ctx.notifier.notify(&message).await {
                 warn!(target: "rebalance", ?notify_error, "Failed to deliver deposit-send reconciliation deadline alert");
@@ -5096,8 +5096,8 @@ mod tests {
                  a different tx is mined at the send's nonce (cancel it with a higher-fee \
                  0-value self-transfer at that nonce from the bot wallet, see \
                  docs/cli-ops.md). Only then settle the minted USDC, reconcile the transfer \
-                 (`transfer reconcile --kind usdc --id {id}`) and restart the bot to release \
-                 the send's nonce."
+                 (`transfer reconcile --kind usdc --id {id} --superseding-tx <that tx>`) and \
+                 restart the bot to release the send's nonce."
             )
         );
         let expected =

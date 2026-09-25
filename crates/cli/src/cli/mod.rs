@@ -917,7 +917,9 @@ pub enum TransferCommand {
     /// `BridgingFailed`, any `AlpacaToBase` `BridgingFailed` -- its
     /// withdrawal completed, so the funds are off Alpaca even without burn
     /// evidence -- or a `BaseToAlpaca` `ConversionFailed`) to the clearing
-    /// terminal `Reconciled` state (the funds were handled out-of-band).
+    /// terminal `Reconciled` state (the funds were handled out-of-band). A
+    /// Base->Alpaca `Bridged` with a signed deposit send also reconciles, once
+    /// `--superseding-tx` names a tx the bot wallet mined at that send's nonce.
     /// `--kind mint` / `--kind redemption` mark an equity transfer stuck in
     /// `Failed` as `Reconciled` once its residue was handled out-of-band (e.g.
     /// via wrap-equity/vault-deposit) -- a pure bookkeeping resolution. Rejects
@@ -937,6 +939,12 @@ pub enum TransferCommand {
         /// `deposit-credited-offline`; for `mint`/`redemption` it is free text.
         #[arg(short = 'r', long = "reason")]
         reason: AuditReason,
+        /// usdc only, required for a transfer with a signed deposit send: the
+        /// tx that took the send's nonce (e.g. the cancel). The bot checks that
+        /// it is from the bot's Ethereum wallet, at the send's nonce, not the
+        /// send itself, and has the required confirmations.
+        #[arg(long = "superseding-tx")]
+        superseding_tx: Option<TxHash>,
     },
 
     /// Manually fail a stuck mint or redemption transfer.
@@ -1205,6 +1213,7 @@ enum TransferRecoveryCommand {
     ReconcileUsdcTransfer {
         id: Uuid,
         reason: ReconcileReasonArg,
+        superseding_tx: Option<TxHash>,
     },
     FailUsdcTransfer {
         id: Uuid,
@@ -1573,7 +1582,12 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                 // invoking classify directly must pass clap-parsed input.
                 unreachable!("clap `required_if_eq(\"kind\",\"usdc\")` guarantees id and direction")
             }
-            TransferCommand::Reconcile { kind, id, reason } => match kind {
+            TransferCommand::Reconcile {
+                kind,
+                id,
+                reason,
+                superseding_tx,
+            } => match kind {
                 ReconcileKind::Usdc => {
                     let id = id.parse::<Uuid>().map_err(|error| {
                         let context =
@@ -1584,8 +1598,17 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                     let reason = parse_usdc_reconcile_reason(reason.as_ref())?;
 
                     CommandRoute::Simple(SimpleCommand::Transfer {
-                        command: TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason },
+                        command: TransferRecoveryCommand::ReconcileUsdcTransfer {
+                            id,
+                            reason,
+                            superseding_tx,
+                        },
                     })
+                }
+                ReconcileKind::Mint | ReconcileKind::Redemption if superseding_tx.is_some() => {
+                    anyhow::bail!(
+                        "transfer reconcile: --superseding-tx applies only to --kind usdc"
+                    )
                 }
                 ReconcileKind::Mint => CommandRoute::Simple(SimpleCommand::Transfer {
                     command: TransferRecoveryCommand::ReconcileEquityTransfer {
@@ -1861,14 +1884,23 @@ async fn run_transfer_command<W: Write>(
         TransferRecoveryCommand::ResumeInterruptedTransfers => {
             rebalancing::resume_interrupted_transfers_command(stdout, ctx).await
         }
-        TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason } => {
+        TransferRecoveryCommand::ReconcileUsdcTransfer {
+            id,
+            reason,
+            superseding_tx,
+        } => {
             let result = rebalancing::reconcile_usdc_transfer_command(
                 stdout,
                 id,
                 reason.into(),
                 pool,
                 async |prepared: &PreparedTransaction| {
-                    rebalancing::verify_deposit_send_superseded_on_chain(ctx, prepared).await
+                    rebalancing::verify_deposit_send_superseded_on_chain(
+                        ctx,
+                        prepared,
+                        superseding_tx,
+                    )
+                    .await
                 },
             )
             .await;
@@ -3820,6 +3852,8 @@ mod tests {
             &id.to_string(),
             "--reason",
             "deposit-credited-offline",
+            "--superseding-tx",
+            &TxHash::repeat_byte(0xcc).to_string(),
         ])
         .unwrap();
 
@@ -3829,10 +3863,12 @@ mod tests {
                     TransferRecoveryCommand::ReconcileUsdcTransfer {
                         id: parsed_id,
                         reason,
+                        superseding_tx,
                     },
             }) => {
                 assert_eq!(parsed_id, id);
                 assert!(matches!(reason, ReconcileReasonArg::DepositCreditedOffline));
+                assert_eq!(superseding_tx, Some(TxHash::repeat_byte(0xcc)));
             }
             _ => panic!("expected reconcile usdc simple command"),
         }
@@ -3868,6 +3904,32 @@ mod tests {
             }
             _ => panic!("expected reconcile equity (mint) simple command"),
         }
+    }
+
+    #[test]
+    fn transfer_reconcile_mint_refuses_a_superseding_tx() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "reconcile",
+            "--kind",
+            "mint",
+            "--id",
+            "ISS001",
+            "--reason",
+            "wrapped manually via wrap-equity",
+            "--superseding-tx",
+            &TxHash::repeat_byte(0xcc).to_string(),
+        ])
+        .unwrap();
+
+        let Err(error) = classify_command(cli.command) else {
+            panic!("a superseding tx on an equity reconcile must be refused");
+        };
+        assert_eq!(
+            error.to_string(),
+            "transfer reconcile: --superseding-tx applies only to --kind usdc"
+        );
     }
 
     #[test]

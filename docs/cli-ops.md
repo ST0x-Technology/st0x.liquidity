@@ -749,22 +749,20 @@ the startup token approvals.
        to the wallet itself at that nonce, with `maxFeePerGas` and
        `maxPriorityFeePerGas` at least 10% above `<tx>`'s and `maxFeePerGas`
        above the current base fee.
-    3. Wait until the cancel has the required confirmations, then check that
-       `<tx>` has no receipt and the wallet's `latest` nonce is past the send's
-       nonce. If `<tx>` mined instead, do nothing: the next redrive continues
-       the deposit.
+    3. Wait until the cancel has the required confirmations. If `<tx>` mined
+       instead, do nothing: the next redrive continues the deposit.
   - To settle, only once a different tx is mined at the send's nonce: move the
     minted USDC to Alpaca by hand if needed, then
-    `stox transfer reconcile --kind usdc --id <id> --reason <reason>` (valid for
-    a Base->Alpaca `Bridged` with a signed send), then restart the bot to
-    release the send's nonce so later sends from the wallet proceed. Reconcile
-    reads the bot's Ethereum wallet first and refuses (the API with `409`) while
-    the send can still mine: "deposit send <tx> can still mine: its nonce
-    <n> is not taken at the required confirmations" (wait for the send, or for
-    the cancel to reach the required confirmations), or "deposit send <tx> is
-    mined, so the deposit went through: do not reconcile" (the next redrive
-    continues the deposit). "could not read deposit send <tx> or the bot
-    wallet's nonce on Ethereum" (the API: `502`) is transient; retry.
+    `stox transfer reconcile --kind usdc --id <id> --reason <reason> --superseding-tx <cancel>`
+    (valid for a Base->Alpaca `Bridged` with a signed send; the API takes
+    `supersedingTx` in the body), then restart the bot to release the send's
+    nonce so later sends from the wallet proceed. `<cancel>` is the hash of the
+    tx that took the send's nonce. Reconcile reads it on the bot's Ethereum node
+    and refuses (the API with `409`) unless it is mined from the bot wallet, at
+    the send's nonce, is not `<tx>` itself, and has the required confirmations;
+    each refusal names the failed check. No receipt for `<tx>` is not proof: a
+    lagging node shows none for a send that did mine. "could not read
+    superseding tx" (the API: `502`) is transient; retry.
 - **"Could not list signed Alpaca deposit sends at startup"** or **"Could not
   load a transfer with a signed Alpaca deposit send at startup"**
   (`operational_alert`): the bot started without reserving that send's nonce, so

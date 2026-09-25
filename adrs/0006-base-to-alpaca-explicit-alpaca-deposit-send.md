@@ -124,8 +124,10 @@ with a `PreparedTransaction`, RAI-2485):
    fees drop, so the operator settles the transfer only once a different tx is
    mined at its nonce (another send took it, or the operator cancels it with a
    higher-fee 0-value self-transfer at that nonce), with
-   `transfer reconcile --kind usdc`, which accepts a BaseToAlpaca `Bridged` with
-   a signed send. A mined revert -> `FailDeposit` for reconciliation, paged.
+   `transfer reconcile --kind usdc --superseding-tx <hash>`, which accepts a
+   BaseToAlpaca `Bridged` with a signed send once the chain shows that tx mined
+   from the bot wallet at the send's nonce with the required confirmations. A
+   mined revert -> `FailDeposit` for reconciliation, paged.
 4. At startup the bot reserves the nonce of every signed send still on `Bridged`
    (`restore_prepared`) and rebroadcasts its exact bytes (`broadcast_prepared`,
    no confirmation wait) before any job, startup approval or stale-allowance

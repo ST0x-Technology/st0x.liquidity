@@ -2050,11 +2050,14 @@ async fn performance_infra(
 }
 
 /// Wire contract for the USDC reconcile route: the operator-supplied reason,
-/// constrained to the same fixed vocabulary the CLI accepts.
+/// constrained to the same fixed vocabulary the CLI accepts, and for a
+/// transfer with a signed deposit send the tx that took that send's nonce.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReconcileUsdcRequest {
     reason: ReconcileReasonWire,
+    #[serde(default)]
+    superseding_tx: Option<TxHash>,
 }
 
 /// The fixed `--reason` vocabulary for a USDC reconcile, kebab-cased on the
@@ -2151,8 +2154,9 @@ fn ops_command_error<Entity: EventSourced>(
 /// Mirrors `stox transfer reconcile --kind usdc`; the precondition matches the
 /// aggregate command's accepted set so the operator gets a clear `400` before
 /// any write. A Base->Alpaca `Bridged` with a signed deposit send reconciles
-/// only once the bot reads on chain that the send can never mine (`409`
-/// while it still can, `503` before the bot is ready).
+/// only once the bot reads on chain the operator's `supersedingTx`: a tx from
+/// the bot wallet at the send's nonce with the required confirmations (`409`
+/// until it proves that, `503` before the bot is ready).
 async fn reconcile_usdc_transfer(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2205,7 +2209,7 @@ async fn reconcile_usdc_transfer(
 
         handle
             .usdc_recheck
-            .verify_deposit_send_superseded(prepared)
+            .verify_deposit_send_superseded(prepared, request.superseding_tx)
             .await
             .map_err(|error| {
                 warn!(?error, %id, "Refused to reconcile a USDC transfer with a signed deposit send");
@@ -2229,15 +2233,20 @@ async fn reconcile_usdc_transfer(
     }))
 }
 
-/// Maps a refused deposit-send chain check to an HTTP status: the send can
-/// still mine, or already did, is a `409` naming why; a failed chain read is
-/// a transient `502`.
+/// Maps a refused deposit-send chain check to an HTTP status: a missing or
+/// unproven superseding tx is a `409` naming why; a failed chain read is a
+/// transient `502`.
 fn deposit_send_not_superseded_response(
     id: &UsdcRebalanceId,
     error: &DepositSendNotSuperseded,
 ) -> (StatusCode, String) {
     match error {
-        DepositSendNotSuperseded::NonceFree { .. } | DepositSendNotSuperseded::Mined { .. } => (
+        DepositSendNotSuperseded::NoSupersedingTx { .. }
+        | DepositSendNotSuperseded::SupersedingTxIsTheSend { .. }
+        | DepositSendNotSuperseded::SupersedingTxNotMined { .. }
+        | DepositSendNotSuperseded::SupersedingTxFromAnotherSender { .. }
+        | DepositSendNotSuperseded::SupersedingTxAtAnotherNonce { .. }
+        | DepositSendNotSuperseded::SupersedingTxUnconfirmed { .. } => (
             StatusCode::CONFLICT,
             format!("Transfer {id}: refusing to reconcile: {error}"),
         ),
@@ -6644,6 +6653,7 @@ mod tests {
             Path(id.to_string()),
             Json(ReconcileUsdcRequest {
                 reason: ReconcileReasonWire::FundsMovedManually,
+                superseding_tx: None,
             }),
         )
         .await;
@@ -6676,6 +6686,7 @@ mod tests {
             Path(id.to_string()),
             Json(ReconcileUsdcRequest {
                 reason: ReconcileReasonWire::FundsMovedManually,
+                superseding_tx: None,
             }),
         )
         .await;
@@ -6700,6 +6711,7 @@ mod tests {
             Path(id.to_string()),
             Json(ReconcileUsdcRequest {
                 reason: ReconcileReasonWire::FundsMovedManually,
+                superseding_tx: None,
             }),
         )
         .await;
@@ -6722,28 +6734,28 @@ mod tests {
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         let tx = TxHash::repeat_byte(0x66);
 
-        let mined = DepositSendNotSuperseded::Mined { tx };
+        let unconfirmed = DepositSendNotSuperseded::SupersedingTxUnconfirmed {
+            superseding: tx,
+            confirmations: 1,
+            required: 3,
+        };
         assert_eq!(
-            deposit_send_not_superseded_response(&id, &mined),
+            deposit_send_not_superseded_response(&id, &unconfirmed),
             (
                 StatusCode::CONFLICT,
-                format!("Transfer {id}: refusing to reconcile: {mined}")
+                format!("Transfer {id}: refusing to reconcile: {unconfirmed}")
             ),
         );
         let (status, _) = deposit_send_not_superseded_response(
             &id,
-            &DepositSendNotSuperseded::NonceFree {
-                tx,
-                nonce: 7,
-                confirmed_next_nonce: 7,
-            },
+            &DepositSendNotSuperseded::NoSupersedingTx { tx, nonce: 7 },
         );
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             deposit_send_not_superseded_response(
                 &id,
                 &DepositSendNotSuperseded::Read {
-                    tx,
+                    superseding: tx,
                     source: Box::new(CctpError::TxNotMined { tx_hash: tx }),
                 },
             ),
@@ -6765,6 +6777,7 @@ mod tests {
             Path(id.to_string()),
             Json(ReconcileUsdcRequest {
                 reason: ReconcileReasonWire::FundsMovedManually,
+                superseding_tx: None,
             }),
         )
         .await;
