@@ -96,7 +96,7 @@ and confusing.
   with offsetting broker orders. The Rust type is `HedgedChain`; the registry
   hands them out through `ChainRegistry::hedged`. The TOML key stays `trading`.
 - **Transport chain**: a chain with no trading table -- RPC and confirmations
-  only, used as a cash corridor endpoint.
+  only, used as a cash corridor's hub (see USDC Corridor).
 - **Primary chain**: THE hedged chain that sets `primary = true`. It is the
   chain the bot rebalances automatically and the endpoint of the cash corridor.
   Its vault inventory is polled like every hedged chain's.
@@ -167,6 +167,24 @@ Ethereum and HyperEVM; USDG on Robinhood. Circle's USDC is exposed separately
 (`Chain::cctp_usdc`, `Some` only where the stable is that USDC) and read only by
 the bridge's `CctpCorridor`, which resolves both corridor ends at config load
 and refuses an end settling in another stable by chain and symbol.
+
+### USDC Corridor
+
+The route a cash transfer takes between Alpaca and one chain's cash vault
+(`UsdcCorridor`, in `st0x-bridge`). Every corridor today is hub-routed: chain
+vault <-> hop <-> Ethereum wallet <-> Alpaca.
+
+- **Hub**: the bot's Ethereum wallet, where Alpaca deposits and withdraws USDC.
+  Pinned, never configured.
+- **Hop**: the leg that moves USDC between the corridor chain and the hub.
+- **Hop kind** (`HopKind`): how the hop moves it. `Cctp` is Circle's burn and
+  mint; `Relay` is reserved for Robinhood and no build wires it yet.
+
+A corridor is configured under `[rebalancing.usdc.corridors.<chain>]` and
+recorded on each `UsdcRebalance` when it starts. Not to be confused with the
+bridge's `CctpCorridor`, which only resolves Circle's USDC on the two ends of a
+CCTP pair (Ethereum and Base): one CCTP hop inside a `UsdcCorridor`, not the
+route itself.
 
 ### Retired Symbol
 
