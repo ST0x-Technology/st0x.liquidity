@@ -701,6 +701,8 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::AttestationRetryDeadlineOverflow { .. }
         | UsdcTransferError::AttestationNonceMismatch { .. }
         | UsdcTransferError::PreviouslyFailedAggregate { .. }
+        | UsdcTransferError::CorridorMismatch { .. }
+        | UsdcTransferError::CorridorNotServed { .. }
         | UsdcTransferError::DepositRefMustBeOnchain { .. }
         | UsdcTransferError::ResumeDirectionMismatch { .. }
         | UsdcTransferError::AdoptedWithdrawalAmountMismatch { .. }
@@ -978,6 +980,8 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let rebalancing_ctx = &ctx.rebalancing;
     let gas_readiness = usdc_gas_readiness(ctx, wallet_ctx)?;
+    // The corridor the CCTP bridge built above carries.
+    let corridor = rebalancing_ctx.cctp_corridor.usdc_corridor();
 
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
@@ -985,11 +989,7 @@ async fn run_usdc_transfer<Writer: Write>(
         bridge,
         vault_service,
         usdc_store,
-        MarketMakingUsdcEndpoints::new(
-            ctx.rebalancing.cctp_corridor.usdc_corridor(),
-            owner,
-            RaindexVaultId(usdc_vault_id),
-        ),
+        MarketMakingUsdcEndpoints::new(corridor, owner, RaindexVaultId(usdc_vault_id)),
         &UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
@@ -1029,10 +1029,14 @@ async fn run_usdc_transfer<Writer: Write>(
         || async {
             match direction {
                 TransferDirection::ToRaindex => {
-                    rebalance_manager.resume_alpaca_to_base(&id, amount).await
+                    rebalance_manager
+                        .resume_alpaca_to_base(&id, amount, corridor)
+                        .await
                 }
                 TransferDirection::ToAlpaca => {
-                    rebalance_manager.resume_base_to_alpaca(&id, amount).await
+                    rebalance_manager
+                        .resume_base_to_alpaca(&id, amount, corridor)
+                        .await
                 }
             }
         },

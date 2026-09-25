@@ -3001,7 +3001,7 @@ fn build_rebalancing_service(
         RebalancingServiceConfig {
             poll_freshness: deps.poll_freshness.clone(),
             inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
-            usdc: rebalancing_ctx.usdc.map(|usdc| usdc.threshold),
+            usdc: rebalancing_ctx.usdc,
             transfer_timeout: rebalancing_ctx.transfer_timeout,
             chains,
             allocation,
@@ -6421,10 +6421,11 @@ mod tests {
     use url::Url;
     use uuid::uuid;
 
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{
         AllocationCtx, BotGasValuationConfig, ChainAssets, ChainEquities, ChainEquityAsset,
-        ExecutionThreshold, OperationMode, OrchestratorConfig, create_test_ctx_with_order_owner,
-        test_issuance_status_ctx,
+        ExecutionThreshold, OperationMode, OrchestratorConfig, UsdcCorridorCtx,
+        create_test_ctx_with_order_owner, test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
@@ -14052,9 +14053,12 @@ mod tests {
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
+                usdc: Some(UsdcCorridorCtx {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.5),
+                        deviation: float!(0.2),
+                    },
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(
@@ -14192,7 +14196,10 @@ mod tests {
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(threshold),
+                usdc: Some(UsdcCorridorCtx {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    threshold,
+                }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -14354,9 +14361,12 @@ mod tests {
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
+                usdc: Some(UsdcCorridorCtx {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.5),
+                        deviation: float!(0.2),
+                    },
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(
@@ -14517,9 +14527,12 @@ mod tests {
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
+                usdc: Some(UsdcCorridorCtx {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.5),
+                        deviation: float!(0.2),
+                    },
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(

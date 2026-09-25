@@ -725,6 +725,34 @@ impl<
         }
     }
 
+    /// Refuses, before any call, a transfer this service's corridor does not
+    /// carry: one recorded on another corridor, or a fresh one asking for
+    /// another. Pages the operator; the transfer is left untouched.
+    fn require_served_corridor(
+        &self,
+        id: &UsdcRebalanceId,
+        requested: UsdcCorridor,
+        state: Option<&UsdcRebalance>,
+    ) -> Result<(), UsdcTransferError> {
+        let served = self.corridor;
+        let error = match state.map(UsdcRebalance::corridor) {
+            Some(recorded) if recorded != served => UsdcTransferError::CorridorMismatch {
+                id: id.clone(),
+                recorded,
+                served,
+            },
+            None if requested != served => UsdcTransferError::CorridorNotServed {
+                id: id.clone(),
+                requested,
+                served,
+            },
+            Some(_) | None => return Ok(()),
+        };
+
+        error!(target: "operational_alert", alert = true, %id, "{error}");
+        Err(error)
+    }
+
     /// Checks the Ethereum wallet against the credits of the open transfers in
     /// `pool` before each burn or deposit send.
     #[must_use]
@@ -1818,11 +1846,13 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
+        corridor: UsdcCorridor,
     ) -> Result<(), UsdcTransferError> {
         use RebalanceDirection::*;
         use UsdcRebalance::*;
 
         let state = self.cqrs.load(id).await?;
+        self.require_served_corridor(id, corridor, state.as_ref())?;
 
         info!(
             target: "rebalance",
@@ -3763,6 +3793,14 @@ impl<
         id: &UsdcRebalanceId,
         operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError> {
+        let recorded = self
+            .cqrs
+            .load(id)
+            .await
+            .map_err(|error| Box::new(UsdcTransferError::from(error)))?;
+        self.require_served_corridor(id, self.corridor, recorded.as_ref())
+            .map_err(Box::new)?;
+
         if let Some(send_tx) = operator_deposit_tx {
             self.attach_operator_deposit_tx(id, send_tx).await?;
         }
@@ -3803,7 +3841,7 @@ impl<
                 // Past the failed deposit but the conversion leg is still
                 // owed -- continue it rather than reporting a false
                 // already-done.
-                self.resume_base_to_alpaca(id, amount)
+                self.resume_base_to_alpaca(id, amount, self.corridor)
                     .await
                     .map_err(Box::new)?;
                 return Ok(RecheckOutcome::Resumed);
@@ -3882,7 +3920,7 @@ impl<
             .await
             .map_err(|error| Box::new(UsdcTransferError::from(error)))?;
 
-        self.resume_base_to_alpaca(id, amount)
+        self.resume_base_to_alpaca(id, amount, self.corridor)
             .await
             .map_err(Box::new)?;
 
@@ -4030,8 +4068,10 @@ impl<
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
+        corridor: UsdcCorridor,
     ) -> Result<(), UsdcTransferError> {
         let state = self.cqrs.load(id).await?;
+        self.require_served_corridor(id, corridor, state.as_ref())?;
 
         info!(
             target: "rebalance",
@@ -8543,7 +8583,7 @@ mod tests {
 
         let alpaca_to_base_id = UsdcRebalanceId(Uuid::new_v4());
         let alpaca_to_base_error = manager
-            .resume_alpaca_to_base(&alpaca_to_base_id, usdc("100"))
+            .resume_alpaca_to_base(&alpaca_to_base_id, usdc("100"), UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -8557,7 +8597,7 @@ mod tests {
 
         let base_to_alpaca_id = UsdcRebalanceId(Uuid::new_v4());
         let base_to_alpaca_error = manager
-            .resume_base_to_alpaca(&base_to_alpaca_id, usdc("100"))
+            .resume_base_to_alpaca(&base_to_alpaca_id, usdc("100"), UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -9995,7 +10035,7 @@ mod tests {
         );
 
         let resume_error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -10861,7 +10901,7 @@ mod tests {
         );
 
         let resume_error = manager
-            .resume_base_to_alpaca(&id, rebalance_amount)
+            .resume_base_to_alpaca(&id, rebalance_amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -11282,7 +11322,7 @@ mod tests {
                 .await;
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -11315,7 +11355,7 @@ mod tests {
                 .await;
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -11397,7 +11437,7 @@ mod tests {
                 .await;
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -11438,7 +11478,7 @@ mod tests {
                 .await;
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -11501,7 +11541,7 @@ mod tests {
                 .await;
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -11700,7 +11740,7 @@ mod tests {
         );
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -12056,7 +12096,7 @@ mod tests {
         .unwrap();
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
         assert!(
@@ -12115,7 +12155,7 @@ mod tests {
         });
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -12197,7 +12237,7 @@ mod tests {
         .unwrap();
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -12300,7 +12340,10 @@ mod tests {
                 .json_body(transfer_body.clone());
         });
 
-        let error = manager.resume_alpaca_to_base(&id, exact).await.unwrap_err();
+        let error = manager
+            .resume_alpaca_to_base(&id, exact, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap_err();
 
         withdrawal_mock.assert();
         assert!(
@@ -12450,7 +12493,7 @@ mod tests {
         // Unmocked past the whitelist lookup; the assertion is that the
         // re-check let the boundary amount through to the withdrawal.
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -12717,7 +12760,10 @@ mod tests {
         .unwrap();
 
         // No mocks for Alpaca or CCTP services — a no-op resume must NOT call them.
-        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+        manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -12749,7 +12795,10 @@ mod tests {
         // re-placement would 501 and fail the test loud).
         let lookup_mock = mock_conversion_lookup(&server, &correlation_id, "filled", "99.99");
 
-        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+        manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
 
         lookup_mock.assert();
         let state = cqrs.load(&id).await.unwrap();
@@ -12798,7 +12847,7 @@ mod tests {
         });
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -12834,7 +12883,10 @@ mod tests {
         let lookup_mock = mock_conversion_lookup(&server, &correlation_id, "new", "0");
         let poll_mock = mock_get_crypto_order(&server, "filled", "99.99");
 
-        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+        manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
 
         lookup_mock.assert();
         poll_mock.assert();
@@ -12869,7 +12921,7 @@ mod tests {
         let poll_mock = mock_get_crypto_order(&server, "canceled", "0");
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -12920,7 +12972,7 @@ mod tests {
 
         let clock = tokio::spawn(skip_conversion_poll_deadlines());
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
         clock.abort();
@@ -12967,7 +13019,10 @@ mod tests {
         let lookup_mock = mock_conversion_lookup(&server, &correlation_id, "suspended", "0");
         let poll_mock = mock_get_crypto_order(&server, "filled", "99.99");
 
-        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+        manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
 
         lookup_mock.assert();
         poll_mock.assert();
@@ -13002,7 +13057,7 @@ mod tests {
         let lookup_mock = mock_conversion_lookup(&server, &correlation_id, "rejected", "0");
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -13039,7 +13094,7 @@ mod tests {
         let lookup_mock = mock_conversion_lookup(&server, &correlation_id, "canceled", "42.5");
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -13086,7 +13141,7 @@ mod tests {
         });
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -13163,7 +13218,10 @@ mod tests {
             "99.99",
         );
 
-        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+        manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
 
         let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
@@ -13228,7 +13286,10 @@ mod tests {
             "99.99",
         );
 
-        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+        manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
 
         let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
@@ -13713,7 +13774,7 @@ mod tests {
         });
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -13770,7 +13831,7 @@ mod tests {
         // No Alpaca/CCTP mocks: the direction guard must reject before any
         // side-effecting call.
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
         assert!(
@@ -14059,7 +14120,7 @@ mod tests {
         // mint leg. A re-mint would revert on the already-used nonce and latch
         // `BridgingFailed`; `Bridged` with the landed mint proves it was adopted.
         manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -14217,7 +14278,7 @@ mod tests {
         // No Alpaca deposit address is mocked, so resume stops right after the
         // mint leg; only the mint it recorded matters here.
         manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -14779,7 +14840,7 @@ mod tests {
         .unwrap();
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -14957,7 +15018,7 @@ mod tests {
         // No Alpaca deposit address is mocked, so the resume stops right after
         // the un-fail: the transfer must recover to `Bridged`, not stay failed.
         manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -15227,7 +15288,7 @@ mod tests {
         // No deposit transfer is mocked, so the leg sends, then fails at the poll
         // (short timeout). The send is what we assert on.
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
         assert!(
@@ -15311,7 +15372,7 @@ mod tests {
         advance_to_deposit_initiated_alpaca_to_base(&cqrs, &id, amount, deposit_tx).await;
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -15370,7 +15431,10 @@ mod tests {
         // state must be a pure no-op: re-running any side effect (re-deposit,
         // re-mint) would double-spend. It returns Ok and leaves the aggregate
         // exactly where it was.
-        manager.resume_alpaca_to_base(&id, amount).await.unwrap();
+        manager
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
 
         let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
@@ -15403,7 +15467,7 @@ mod tests {
         );
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -15459,7 +15523,7 @@ mod tests {
         );
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -15551,7 +15615,7 @@ mod tests {
         drop(anvil);
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -15783,7 +15847,7 @@ mod tests {
             .unwrap();
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -16437,7 +16501,10 @@ mod tests {
         // it polls by that tx.
         mock_completed_alpaca_deposit(&server, chain.bot_address, signed_tx);
 
-        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+        manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
 
         assert_eq!(
             bridge_wallet
@@ -16516,7 +16583,7 @@ mod tests {
         .unwrap();
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -16688,7 +16755,7 @@ mod tests {
             .unwrap();
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -16864,14 +16931,16 @@ mod tests {
 
         let Err(_elapsed) = tokio::time::timeout(
             Duration::from_millis(100),
-            manager.resume_base_to_alpaca(&id, amount),
+            manager.resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP),
         )
         .await
         else {
             panic!("the attempt must time out while the send is broadcasting");
         };
 
-        let _redrive = manager.resume_base_to_alpaca(&id, amount).await;
+        let _redrive = manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await;
 
         assert_eq!(
             bridge.usdc_prepare_calls(),
@@ -16912,7 +16981,7 @@ mod tests {
 
         for _ in 0..2 {
             let error = manager
-                .resume_base_to_alpaca(&id, amount)
+                .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
                 .await
                 .unwrap_err();
 
@@ -17504,7 +17573,7 @@ mod tests {
         drop(chain);
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
         assert!(
@@ -18222,7 +18291,7 @@ mod tests {
             .await;
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -18272,7 +18341,7 @@ mod tests {
         advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -18319,7 +18388,7 @@ mod tests {
             .await;
 
         let error = manager
-            .resume_alpaca_to_base(&id, nominal)
+            .resume_alpaca_to_base(&id, nominal, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -19382,7 +19451,7 @@ mod tests {
             .await;
 
         let error = manager
-            .resume_alpaca_to_base(&id, nominal)
+            .resume_alpaca_to_base(&id, nominal, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -19468,7 +19537,7 @@ mod tests {
             .await;
 
         let error = manager
-            .resume_alpaca_to_base(&id, nominal)
+            .resume_alpaca_to_base(&id, nominal, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -20829,7 +20898,7 @@ mod tests {
         // Call resume_alpaca_to_base (the full path, not just poll_and_confirm_withdrawal).
         // This is the path that destructures initiated_at from the aggregate.
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -21120,7 +21189,7 @@ mod tests {
         // ResumeDirectionMismatch fires before any chain access, so no live chain is
         // needed -- the mismatch is detected purely from the aggregate state.
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -21318,7 +21387,7 @@ mod tests {
         drop(chain);
 
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -21459,7 +21528,7 @@ mod tests {
         // WithdrawalComplete, not Withdrawing), but the durable re-check in
         // continue_alpaca_to_base_from_withdrawal_complete fires.
         let error = manager
-            .resume_alpaca_to_base(&id, amount)
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -22373,7 +22442,7 @@ mod tests {
         );
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -22498,7 +22567,7 @@ mod tests {
         };
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
@@ -22704,8 +22773,16 @@ mod tests {
         );
 
         let error = match direction {
-            RebalanceDirection::AlpacaToBase => manager.resume_alpaca_to_base(&id, amount).await,
-            RebalanceDirection::BaseToAlpaca => manager.resume_base_to_alpaca(&id, amount).await,
+            RebalanceDirection::AlpacaToBase => {
+                manager
+                    .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
+                    .await
+            }
+            RebalanceDirection::BaseToAlpaca => {
+                manager
+                    .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+                    .await
+            }
         }
         .unwrap_err();
 
@@ -23848,7 +23925,10 @@ mod tests {
         let (manager, apalis_pool, _server) =
             manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
 
-        manager.resume_alpaca_to_base(&id, amount).await.unwrap();
+        manager
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
 
         let jobs = pending_bot_gas_jobs(&apalis_pool).await;
         assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");

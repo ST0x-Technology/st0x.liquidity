@@ -1655,6 +1655,7 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use alloy::providers::{ProviderBuilder, RootProvider};
     use async_trait::async_trait;
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{
         ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
         create_test_ctx_with_order_owner,
@@ -2343,6 +2344,7 @@ mod tests {
             &self,
             id: &UsdcRebalanceId,
             _amount: Usdc,
+            _corridor: UsdcCorridor,
         ) -> Result<(), UsdcTransferError> {
             if id == &self.poison_id {
                 return Err(UsdcTransferError::WithdrawalFailed {
@@ -2361,6 +2363,7 @@ mod tests {
             &self,
             id: &UsdcRebalanceId,
             _amount: Usdc,
+            _corridor: UsdcCorridor,
         ) -> Result<(), UsdcTransferError> {
             if id == &self.poison_id {
                 return Err(UsdcTransferError::DepositFailed {
@@ -2569,6 +2572,7 @@ mod tests {
 
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: poison_id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -2603,6 +2607,7 @@ mod tests {
         wait_for_terminal_job::<TransferUsdcToHedging>(&apalis_pool).await;
         push_queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(uuid::Uuid::new_v4()),
                 amount,
                 revert_redrive_attempts: 0,
@@ -2654,6 +2659,7 @@ mod tests {
 
         queue
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: poison_id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -2686,6 +2692,7 @@ mod tests {
         wait_for_terminal_job::<TransferUsdcToMarketMaking>(&apalis_pool).await;
         push_queue
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(uuid::Uuid::new_v4()),
                 amount,
                 revert_redrive_attempts: 0,
