@@ -8114,6 +8114,14 @@ mod tests {
             self.inner.poll_attestation(direction, burn_tx).await
         }
 
+        async fn fetch_attestation(
+            &self,
+            direction: BridgeDirection,
+            burn_tx: TxHash,
+        ) -> Result<AttestationResponse, CctpError> {
+            self.inner.fetch_attestation(direction, burn_tx).await
+        }
+
         async fn mint(
             &self,
             direction: BridgeDirection,
