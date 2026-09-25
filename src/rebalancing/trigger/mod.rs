@@ -6405,6 +6405,16 @@ impl RebalancingService {
         let mut rearm_candidates = Vec::new();
         for id in candidate_ids {
             match usdc_store.load(&id).await {
+                // No job or re-arm can move it here, live job or not: hold
+                // the guard and page before any other classification.
+                Ok(Some(entity))
+                    if entity.holds_rebalance_guard()
+                        && entity.corridor() != self.config.served_usdc_corridor =>
+                {
+                    self.page_unserved_corridor_once(&id, entity.corridor())
+                        .await;
+                    held_ids.push(id);
+                }
                 Ok(Some(entity)) => {
                     if entity.holds_rebalance_guard() {
                         held_ids.push(id.clone());
@@ -6764,12 +6774,6 @@ impl RebalancingService {
             policy,
         } in candidates
         {
-            if corridor != self.config.served_usdc_corridor {
-                self.usdc_in_progress.store(true, Ordering::SeqCst);
-                self.page_unserved_corridor_once(&id, corridor).await;
-                continue;
-            }
-
             let blocked = match policy {
                 RearmPolicy::RecoverableFailure | RearmPolicy::AlpacaToBaseIdempotentRedrive => {
                     self.transfer_live_job_for_id(&id).await?
