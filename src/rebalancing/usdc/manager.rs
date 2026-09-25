@@ -16398,6 +16398,67 @@ mod tests {
         );
     }
 
+    /// The deposit address is shared, so another transfer's own recorded
+    /// deposit send can take the send's nonce: it paid the deposit address,
+    /// but it is not a copy of this send, so it supersedes it.
+    #[tokio::test]
+    async fn deposit_send_is_superseded_by_another_transfers_recorded_send_at_its_nonce() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            cqrs.clone(),
+        )
+        .await
+        .with_credit_ledger(pool);
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let prepared = sign_usdc_to_alpaca(&wallet, usdc_to_u256(usdc("99.99")).unwrap()).await;
+        let bot_provider = bot_provider(&chain).await;
+
+        let other_amount = usdc_to_u256(usdc("50")).unwrap();
+        let other_send = bot_provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(USDC_ADDRESS)
+                    .input(
+                        Bytes::from(
+                            IERC20::transferCall {
+                                to: ALPACA_DEPOSIT_ADDRESS,
+                                amount: other_amount,
+                            }
+                            .abi_encode(),
+                        )
+                        .into(),
+                    )
+                    .nonce(prepared.nonce()),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash;
+        bot_provider.anvil_mine(Some(2), None).await.unwrap();
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &other, usdc("50.01"), usdc("50"), chain.mint_tx).await;
+        record_signed_deposit_send(
+            &cqrs,
+            &other,
+            PreparedTransaction::for_test(other_send, prepared.nonce()),
+        )
+        .await;
+
+        manager
+            .verify_deposit_send_superseded(&prepared, Some(other_send))
+            .await
+            .unwrap();
+    }
+
     /// Connects a provider that signs with the bot wallet's key.
     async fn bot_provider(chain: &EthereumUsdcChain) -> impl Provider + use<> {
         ProviderBuilder::new()
