@@ -3567,6 +3567,9 @@ impl<
     /// Ethereum wallet takes that nonce or waits behind a send no node holds
     /// after a restart. Never fails startup: a send that cannot be restored
     /// or rebroadcast is paged, and the transfer's resume broadcasts it again.
+    /// A failed listing, a failed load or an unparseable id counts as unmined,
+    /// so startup skips the Ethereum approvals and revokes that could take the
+    /// nonce of a send it did not reserve.
     pub(crate) async fn restore_prepared_deposit_sends(
         &self,
         pool: &SqlitePool,
@@ -3575,12 +3578,14 @@ impl<
         let (ids, unparseable) = match prepared_deposit_send_ids(pool).await {
             Ok(found) => found,
             Err(error) => {
-                error!(target: "operational_alert", alert = true, ?error, "Could not list signed Alpaca deposit sends at startup; their nonces are not reserved until each transfer resumes");
+                error!(target: "operational_alert", alert = true, ?error, "Could not list signed Alpaca deposit sends at startup; their nonces are not reserved until each transfer resumes, so startup skips Ethereum token approvals and allowance revokes");
+                outcome.unmined += 1;
                 return outcome;
             }
         };
         if !unparseable.is_empty() {
-            error!(target: "operational_alert", alert = true, ?unparseable, "Signed Alpaca deposit sends with unparseable transfer ids were not restored at startup");
+            error!(target: "operational_alert", alert = true, ?unparseable, "Signed Alpaca deposit sends with unparseable transfer ids were not restored at startup, so startup skips Ethereum token approvals and allowance revokes");
+            outcome.unmined += unparseable.len();
         }
 
         for id in ids {
@@ -3602,7 +3607,8 @@ impl<
                     warn!(target: "rebalance", %id, ?state, "Transfer left Bridged before its signed deposit send was restored");
                 }
                 Err(error) => {
-                    error!(target: "operational_alert", alert = true, %id, ?error, "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce is not reserved until it resumes");
+                    error!(target: "operational_alert", alert = true, %id, ?error, "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce is not reserved until it resumes, so startup skips Ethereum token approvals and allowance revokes");
+                    outcome.unmined += 1;
                 }
             }
         }
@@ -6361,6 +6367,7 @@ pub(crate) struct RestoredDepositSends {
     pub(crate) restored: usize,
     /// Restored sends with no receipt after the startup rebroadcast, or
     /// whose rebroadcast failed: later sends from the wallet wait behind them.
+    /// Sends that could not be listed, loaded or identified count too.
     pub(crate) unmined: usize,
 }
 
@@ -16450,27 +16457,6 @@ mod tests {
         assert_eq!(broadcasts, vec![mined.tx_hash(), pending.tx_hash()]);
     }
 
-    /// A listing that fails may hide a signed send whose nonce is then not
-    /// reserved, so it counts as unmined and startup skips the Ethereum
-    /// wallet's approvals and revokes.
-    #[tokio::test]
-    async fn startup_restore_counts_a_failed_listing_as_unmined() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        let cqrs = Arc::new(test_store(pool, ()));
-        let bridge = Arc::new(MockBridge::new());
-        let (manager, _server, _anvil) = deposit_send_manager(cqrs, Arc::clone(&bridge)).await;
-        let unmigrated = SqlitePool::connect(":memory:").await.unwrap();
-
-        assert_eq!(
-            manager.restore_prepared_deposit_sends(&unmigrated).await,
-            RestoredDepositSends {
-                restored: 0,
-                unmined: 1,
-            }
-        );
-    }
-
     /// A restored send whose rebroadcast fails keeps its nonce, pages, and is
     /// counted so startup skips the Ethereum wallet's approvals.
     #[tracing_test::traced_test]
@@ -16553,8 +16539,8 @@ mod tests {
         .unwrap();
     }
 
-    /// A startup list failure pages and startup continues with nothing
-    /// restored.
+    /// A startup list failure pages, and counts as unmined so startup skips
+    /// the Ethereum approvals and revokes that could take a hidden send's nonce.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn startup_restore_pages_when_signed_deposit_sends_cannot_be_listed() {
@@ -16573,7 +16559,7 @@ mod tests {
             manager.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 0,
-                unmined: 0,
+                unmined: 1,
             }
         );
 
@@ -16582,13 +16568,14 @@ mod tests {
             paged(
                 lines,
                 "Could not list signed Alpaca deposit sends at startup; their nonces are not \
-                 reserved until each transfer resumes",
+                 reserved until each transfer resumes, so startup skips Ethereum token approvals \
+                 and allowance revokes",
             )
         });
     }
 
-    /// A signed send under an unparseable transfer id pages, and the others
-    /// are still restored.
+    /// A signed send under an unparseable transfer id pages and counts as
+    /// unmined, and the others are still restored.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn startup_restore_pages_an_unparseable_transfer_id_and_restores_the_rest() {
@@ -16625,7 +16612,7 @@ mod tests {
             manager.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 1,
-                unmined: 1,
+                unmined: 2,
             }
         );
 
@@ -16634,14 +16621,14 @@ mod tests {
             paged(
                 lines,
                 "Signed Alpaca deposit sends with unparseable transfer ids were not restored at \
-                 startup",
+                 startup, so startup skips Ethereum token approvals and allowance revokes",
             )
         });
         assert!(logs_contain("not-a-transfer-id"));
     }
 
-    /// A transfer that fails to load pages with its id, and the others are
-    /// still restored.
+    /// A transfer that fails to load pages with its id and counts as unmined,
+    /// and the others are still restored.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn startup_restore_pages_a_transfer_that_fails_to_load_and_restores_the_rest() {
@@ -16675,7 +16662,7 @@ mod tests {
             manager.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 1,
-                unmined: 1,
+                unmined: 2,
             }
         );
 
@@ -16684,7 +16671,8 @@ mod tests {
             paged(
                 lines,
                 "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce \
-                 is not reserved until it resumes",
+                 is not reserved until it resumes, so startup skips Ethereum token approvals and \
+                 allowance revokes",
             )
         });
         assert!(logs_contain(&format!("id={broken}")));

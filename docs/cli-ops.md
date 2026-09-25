@@ -768,15 +768,18 @@ the startup token approvals.
 - **"Could not list signed Alpaca deposit sends at startup"** or **"Could not
   load a transfer with a signed Alpaca deposit send at startup"**
   (`operational_alert`): the bot started without reserving that send's nonce, so
-  another send can take it. The transfer's rebroadcast reserves it again when it
+  it skipped the Ethereum startup token approvals and stale-allowance revokes on
+  that start (the **"Startup token approvals deferred"** warning below). A job
+  can still take the nonce; the transfer's rebroadcast reserves it again when it
   resumes. Fix the database read and restart; if the page above fires later,
   follow it.
 - **"Signed Alpaca deposit sends with unparseable transfer ids were not restored
   at startup"** (`operational_alert`, the raw ids in `unparseable`): a
   `UsdcRebalance` event row with a signed send has an `aggregate_id` that is not
   a transfer id. No job or CLI command can drive it, so its nonce is never
-  reserved, and no rebroadcast reserves it later. Read the signed send from the
-  row:
+  reserved, and no rebroadcast reserves it later. Startup skips the Ethereum
+  token approvals and stale-allowance revokes while the row is there. Read the
+  signed send from the row:
 
   ```sql
   SELECT sequence, event_type, payload
