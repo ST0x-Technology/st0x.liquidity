@@ -99,6 +99,67 @@ fn remove_tokenization_fee_overlaps(
     Ok(retained)
 }
 
+/// Warns about symbols whose P&L in the queried range includes onchain fills
+/// recorded before per-fill wrapper ratios were stored. Those fills count 1:1
+/// in wrapped shares, which is exact for a wrapper whose ratio is 1 and
+/// approximate for one above 1, such as SGOV. A symbol whose recorded ratios
+/// are all exactly 1 is left out, and so is one with no legacy fill in range.
+fn warn_on_fills_without_wrapper_ratio(
+    event_rows: &[PositionLedgerRow],
+    query: &PnlQuery,
+    warnings: &mut Vec<String>,
+) {
+    let bound = |date: Option<&String>| {
+        date.map(String::as_str)
+            .filter(|date| !date.trim().is_empty())
+            .map(date_key)
+    };
+    let (from, to) = (
+        bound(query.from_date.as_ref()),
+        bound(query.to_date.as_ref()),
+    );
+    let in_range = |executed_at: &str| {
+        let day = date_key(executed_at);
+        from.as_ref().is_none_or(|from| &day >= from) && to.as_ref().is_none_or(|to| &day <= to)
+    };
+
+    let ratio_one = st0x_wrapper::RATIO_ONE.to_string();
+    let mut legacy_in_range = BTreeSet::new();
+    let mut proven_one_to_one = BTreeSet::new();
+    let mut ratio_above_one = BTreeSet::new();
+    for row in event_rows {
+        let PositionLedgerRow::OnchainFill(fill) = row else {
+            continue;
+        };
+        match fill.underlying_per_wrapped_fixed18.as_deref() {
+            None if in_range(&fill.executed_at) => {
+                legacy_in_range.insert(fill.symbol.as_str());
+            }
+            None => {}
+            Some(ratio) if ratio == ratio_one => {
+                proven_one_to_one.insert(fill.symbol.as_str());
+            }
+            Some(_) => {
+                ratio_above_one.insert(fill.symbol.as_str());
+            }
+        }
+    }
+    let affected: Vec<&str> = legacy_in_range
+        .into_iter()
+        .filter(|symbol| ratio_above_one.contains(symbol) || !proven_one_to_one.contains(symbol))
+        .collect();
+    if affected.is_empty() {
+        return;
+    }
+
+    warnings.push(format!(
+        "Onchain fills for {} in this range were recorded before per-fill wrapper ratios and \
+         count 1:1 in wrapped shares. That is exact for a wrapper whose ratio is 1 and \
+         approximate for one above 1, such as SGOV.",
+        affected.join(", ")
+    ));
+}
+
 /// Builds the `/pnl` response from already-loaded rows and returns net realized
 /// PnL bucketed by ET accounting day for the aligned capital calculation.
 pub(crate) fn build_pnl_response_from_rows(
@@ -119,6 +180,7 @@ pub(crate) fn build_pnl_response_from_rows(
             .filter(|row| symbols.contains(row.symbol()))
             .collect()
     };
+    warn_on_fills_without_wrapper_ratio(&event_rows, query, &mut warnings);
     let (position_nets, position_symbols) = parse_position_view(position_rows, &mut warnings)?;
     let available_range = build_available_range(&event_rows, &mut warnings);
     let sample_stats = build_sample_stats(&event_rows, query, &mut warnings);

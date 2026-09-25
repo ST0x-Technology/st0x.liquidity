@@ -148,6 +148,42 @@ describe('TradeHistoryPanel', () => {
     target.remove()
   })
 
+  it('marks onchain fill quantities as wrapped next to broker hedges', async () => {
+    const raindexFill: Trade = {
+      id: '0x28a364eaa0fc6d505ddd0702cd9949853193bb28c92cdfef68bcd5a803f1806b:7',
+      occurredAt: '2026-07-31T12:00:00Z',
+      venue: 'raindex',
+      direction: 'sell',
+      symbol: 'SGOV',
+      shares: '2',
+      outcome: { status: 'filled' }
+    }
+    const hedge: Trade = {
+      id: 'counter-trade-sgov',
+      occurredAt: '2026-07-31T12:00:05Z',
+      venue: 'alpaca',
+      direction: 'buy',
+      symbol: 'SGOV',
+      shares: '2.02',
+      outcome: { status: 'filled' }
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(tradeResponse([hedge, raindexFill], 2)))
+    )
+
+    const { target } = mountPanel()
+
+    await vi.waitFor(() => expect(target.textContent).toContain('2 of 2'))
+    const rows = [...target.querySelectorAll('tbody tr')]
+    const raindexRow = rows.find((row) => row.textContent.includes('Raindex'))
+    const alpacaRow = rows.find((row) => row.textContent.includes('Alpaca'))
+    expect(raindexRow?.textContent).toContain('wrapped')
+    expect(alpacaRow?.textContent).not.toContain('wrapped')
+
+    target.remove()
+  })
+
   it('renders Bebop fills and removes Bebop from the v3 venue filter', async () => {
     const bebopTrade: Trade = {
       id: '0x28a364eaa0fc6d505ddd0702cd9949853193bb28c92cdfef68bcd5a803f1806b:194',

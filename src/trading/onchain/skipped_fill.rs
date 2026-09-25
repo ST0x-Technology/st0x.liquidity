@@ -38,6 +38,10 @@ pub(crate) enum SkipReason {
     /// is kept out of the hedged `Position` and never counter traded. Its
     /// delta is exposure an operator covers by hand.
     TradingDisabled,
+    /// The wrapped quantity converts to zero underlying shares at the ratio
+    /// read at the fill block, for example a dust fill at a ratio below 1.
+    /// That ratio never changes, so no retry can account the fill.
+    ZeroUnderlyingAmount,
 }
 
 impl SkipReason {
@@ -50,6 +54,7 @@ impl SkipReason {
             Self::UnrecognizedInventoryToken => "unrecognized_inventory_token",
             Self::UnrepresentableCashAmount => "unrepresentable_cash_amount",
             Self::TradingDisabled => "trading_disabled",
+            Self::ZeroUnderlyingAmount => "zero_underlying_amount",
         }
     }
 }
@@ -70,9 +75,10 @@ pub(crate) enum SkippedFillError {
 ///
 /// The first write wins, except that a `trading_disabled` record supersedes an
 /// earlier row for another reason: it is the durable decision not to hedge the
-/// fill, which [`trading_disabled_detail`] must find and whose cover side the
-/// operator reconciles from. The earlier reason, event type, time and detail
-/// are kept in its detail.
+/// fill, which [`recorded_skip_detail`] must find and whose cover side the
+/// operator reconciles from. A `zero_underlying_amount` record supersedes an
+/// earlier decode-time row the same way, but never a `trading_disabled` one.
+/// The earlier reason, event type, time and detail are kept in its detail.
 pub(crate) async fn record_skipped_fill(
     pool: &SqlitePool,
     chain: Chain,
@@ -88,7 +94,42 @@ pub(crate) async fn record_skipped_fill(
         i64::try_from(log_index).map_err(|_| SkippedFillError::LogIndexOutOfRange { log_index })?;
     let skipped_at = Utc::now().to_rfc3339();
     let is_trading_disabled = reason == SkipReason::TradingDisabled;
+    let is_zero_underlying = reason == SkipReason::ZeroUnderlyingAmount;
+    let trading_disabled = SkipReason::TradingDisabled.as_str();
     let reason = reason.as_str();
+
+    // A zero-underlying skip is final for the fill, like a trading-disabled
+    // exclusion, so it replaces an earlier decode-time row (keeping its detail)
+    // that a re-scan decoded differently. It never replaces a trading-disabled
+    // row, the durable decision not to hedge the fill.
+    if is_zero_underlying {
+        sqlx::query(
+            "INSERT INTO skipped_fills \
+             (chain, tx_hash, log_index, event_type, reason, detail, skipped_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (chain, tx_hash, log_index) DO UPDATE SET \
+             event_type = excluded.event_type, \
+             reason = excluded.reason, \
+             detail = excluded.detail || ' (earlier skipped as ' || skipped_fills.reason \
+             || ' on ' || skipped_fills.event_type || ' at ' || skipped_fills.skipped_at \
+             || ': ' || skipped_fills.detail || ')', \
+             skipped_at = excluded.skipped_at \
+             WHERE skipped_fills.reason <> excluded.reason \
+             AND skipped_fills.reason <> ?",
+        )
+        .bind(&chain)
+        .bind(&tx_hash)
+        .bind(log_index)
+        .bind(event_type)
+        .bind(reason)
+        .bind(detail)
+        .bind(&skipped_at)
+        .bind(trading_disabled)
+        .execute(pool)
+        .await?;
+
+        return Ok(());
+    }
 
     if is_trading_disabled {
         sqlx::query!(
@@ -136,23 +177,26 @@ pub(crate) async fn record_skipped_fill(
     Ok(())
 }
 
-/// The recorded detail when the fill is excluded because trading was
-/// disabled on its chain. That record is the durable decision not to hedge
-/// the fill: an operator covers its delta by hand from it, so the hedged path
-/// must not hedge the same fill when a redrive runs after trading was enabled
-/// again, and every surface reporting it repeats the detail and cover side.
-pub(crate) async fn trading_disabled_detail(
+/// The recorded detail of a fill skipped for `reason`, if one exists. A
+/// `TradingDisabled` record is the durable decision not to hedge the fill: an
+/// operator covers its delta by hand from it, so the hedged path must not
+/// hedge the same fill when a redrive runs after trading was enabled again,
+/// and every surface reporting it repeats the detail and cover side. A
+/// `ZeroUnderlyingAmount` record is equally final, because the fill-block
+/// ratio never changes.
+pub(crate) async fn recorded_skip_detail(
     pool: &SqlitePool,
     chain: Chain,
     tx_hash: TxHash,
     log_index: u64,
+    reason: SkipReason,
 ) -> Result<Option<String>, SkippedFillError> {
     let log_index =
         i64::try_from(log_index).map_err(|_| SkippedFillError::LogIndexOutOfRange { log_index })?;
 
     let chain = chain.to_string();
     let tx_hash = tx_hash.to_string();
-    let reason = SkipReason::TradingDisabled.as_str();
+    let reason = reason.as_str();
 
     Ok(sqlx::query_scalar!(
         "SELECT detail FROM skipped_fills \
@@ -263,6 +307,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_underlying_record_supersedes_a_decode_time_skip_but_not_trading_disabled() {
+        let (pool, _apalis) = setup_test_pools().await;
+        let decoded_later =
+            b256!("0xdeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let excluded = b256!("0xceeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        record_skipped_fill(
+            &pool,
+            Chain::Base,
+            decoded_later,
+            7,
+            "InventoryTrade",
+            SkipReason::UnrecognizedInventoryToken,
+            "token 0xabc",
+        )
+        .await
+        .unwrap();
+        record_skipped_fill(
+            &pool,
+            Chain::Base,
+            decoded_later,
+            7,
+            "ClearV3",
+            SkipReason::ZeroUnderlyingAmount,
+            "converts to zero",
+        )
+        .await
+        .unwrap();
+        let detail = recorded_skip_detail(
+            &pool,
+            Chain::Base,
+            decoded_later,
+            7,
+            SkipReason::ZeroUnderlyingAmount,
+        )
+        .await
+        .unwrap()
+        .expect("the zero-underlying record must replace the decode-time row");
+        assert!(
+            detail.starts_with(
+                "converts to zero (earlier skipped as unrecognized_inventory_token on \
+                 InventoryTrade at "
+            ) && detail.ends_with(": token 0xabc)"),
+            "the detail must keep the earlier record: {detail}"
+        );
+
+        record_skipped_fill(
+            &pool,
+            Chain::Base,
+            excluded,
+            7,
+            "process-tx",
+            SkipReason::TradingDisabled,
+            "cover by BUY 3 COIN",
+        )
+        .await
+        .unwrap();
+        record_skipped_fill(
+            &pool,
+            Chain::Base,
+            excluded,
+            7,
+            "ClearV3",
+            SkipReason::ZeroUnderlyingAmount,
+            "converts to zero",
+        )
+        .await
+        .unwrap();
+        let kept =
+            recorded_skip_detail(&pool, Chain::Base, excluded, 7, SkipReason::TradingDisabled)
+                .await
+                .unwrap();
+        assert_eq!(kept.as_deref(), Some("cover by BUY 3 COIN"));
+    }
+
+    #[tokio::test]
     async fn trading_disabled_record_supersedes_an_earlier_skip_and_keeps_it() {
         let (pool, _apalis) = setup_test_pools().await;
         let tx_hash = b256!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
@@ -285,10 +405,11 @@ mod tests {
         .await
         .unwrap();
 
-        let detail = trading_disabled_detail(&pool, Chain::Base, tx_hash, 7)
-            .await
-            .unwrap()
-            .expect("the trading_disabled decision must be retrievable");
+        let detail =
+            recorded_skip_detail(&pool, Chain::Base, tx_hash, 7, SkipReason::TradingDisabled)
+                .await
+                .unwrap()
+                .expect("the trading_disabled decision must be retrievable");
         assert!(
             detail.starts_with(
                 "cover by BUY 3 COIN (earlier skipped as unrecognized_inventory_token on \

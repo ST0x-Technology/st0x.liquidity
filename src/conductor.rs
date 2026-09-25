@@ -50,8 +50,8 @@ use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, BuyingPowerReservationCents,
     ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-    Direction, ExecutionError, Executor, FractionalShares, MarketOrder, MarketSession, Positive,
-    SupportedExecutor, Symbol, TryIntoExecutor, Usd,
+    Direction, ExecutionError, Executor, FractionalShares, HasZero, MarketOrder, MarketSession,
+    Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
 };
 use st0x_issuance_client::IssuanceClient;
 use st0x_issuance_dto::VaultModeTag;
@@ -59,7 +59,7 @@ use st0x_raindex::{RaindexService, RaindexVaultId, RevokeOutcome};
 use st0x_registry::SymbolCache;
 use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
-use st0x_wrapper::{Wrapper, WrapperError, WrapperService};
+use st0x_wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError, WrapperService};
 
 use crate::alerts::{LogNotifier, Notifier};
 use crate::bindings::IERC4626;
@@ -109,8 +109,8 @@ use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::portfolio_snapshot::{PortfolioSnapshot, PortfolioSnapshotProjection};
 use crate::position::{
-    AnchorDisposition, EquityTransferReservationId, Position, PositionCommand, PositionError,
-    PositionEvent, TradeId,
+    AnchorDisposition, EquityTransferReservationId, NormalizedOnChainFillCommand, Position,
+    PositionCommand, PositionError, PositionEvent, TradeId,
 };
 use crate::position_check::{
     FailedAnchorRecoveryAction, HedgeScanSkipReason, failed_anchor_recovery_action,
@@ -148,9 +148,11 @@ use crate::trading::offchain::hedge::{
 };
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::skipped_fill::{
-    SkipReason, record_skipped_fill, trading_disabled_detail,
+    SkipReason, record_skipped_fill, recorded_skip_detail,
 };
-use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
+use crate::trading::onchain::trade_accountant::{
+    DexTradeAccountingJobQueue, NormalizedFillEconomicsError, TradeAccountingError,
+};
 use crate::unwrapped_equity_recovery::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::{
@@ -2508,7 +2510,7 @@ where
     // fail-loud beats a green /health hiding a dead chain; degraded start
     // arrives with chain-disable). The primary uses the main provider;
     // secondaries their own.
-    for (role, hedged) in ctx.chains.hedged_with_roles() {
+    for hedged in ctx.chains.hedged() {
         let chain_provider = if hedged.chain == ctx.chains.primary().chain {
             provider
         } else {
@@ -2540,7 +2542,7 @@ where
             CutoffProbe::Supported | CutoffProbe::NotYetAvailable => {}
         }
 
-        confirm_configured_assets_respond(chain_provider, role, hedged).await?;
+        confirm_configured_assets_respond(chain_provider, hedged).await?;
     }
 
     confirm_transport_chain_ids(ctx).await?;
@@ -2571,10 +2573,9 @@ where
 /// the cash side: USDC is 6 decimals and is not probed.
 async fn confirm_configured_assets_respond<P: Provider + Clone + 'static>(
     provider: &P,
-    role: ChainRole,
     hedged: &HedgedChain,
 ) -> anyhow::Result<()> {
-    let probes = asset_read_probes(role, &hedged.assets);
+    let probes = asset_read_probes(&hedged.assets);
 
     if probes.is_empty() {
         info!(
@@ -2673,7 +2674,7 @@ enum ProbedToken {
     /// configured unwrapped token, which the vault's `asset()` must report.
     WrappedShare { underlying: Address },
     /// The unwrapped token that mint, redeem, wrap, unwrap and wrapped-equity
-    /// recovery move.
+    /// recovery move, and whose precision fill normalization depends on.
     UnwrappedEquity,
 }
 
@@ -2688,19 +2689,14 @@ impl ProbedToken {
     }
 }
 
-/// The token reads one chain owes at startup, matching the roles each address
-/// plays there: every equity's wrapped share, because every fill on any hedged
-/// chain resolves through it, then the unwrapped token of each equity the
-/// chain's role rebalances or that opts into wrapped-equity recovery, because
-/// those are the equities whose unwrapped token is minted, redeemed, wrapped,
-/// unwrapped or polled. Recovery is independent of rebalancing, so a
-/// recovery-only equity owes the unwrapped read that its role alone would not
-/// ask for. Both halves run in symbol order, so which read fails first is
-/// deterministic.
-fn asset_read_probes(
-    role: ChainRole,
-    assets: &ChainAssets,
-) -> Vec<(&Symbol, ProbedToken, Address)> {
+/// The token reads one chain owes at startup: every equity's wrapped share,
+/// because every fill on any hedged chain resolves through it, then every
+/// equity's unwrapped token. Fill accounting normalizes wrapped fills through
+/// `convertToAssets`, whose result is only a fixed-18 ratio when the unwrapped
+/// token has 18 decimals, so a hedge-only listing owes that read too, not just
+/// the equities a chain mints, redeems, wraps, unwraps or recovers. Both halves
+/// run in symbol order, so which read fails first is deterministic.
+fn asset_read_probes(assets: &ChainAssets) -> Vec<(&Symbol, ProbedToken, Address)> {
     let mut wrapped = assets
         .equities
         .symbols
@@ -2717,18 +2713,10 @@ fn asset_read_probes(
         .collect::<Vec<_>>();
     wrapped.sort_by_key(|(symbol, _, _)| *symbol);
 
-    // Collected through a map so an equity that both rebalances and opts into
-    // recovery is read once, in symbol order.
-    let unwrapped = role
-        .rebalanced_equities(assets)
-        .into_iter()
-        .chain(
-            assets
-                .equities
-                .symbols
-                .iter()
-                .filter(|(symbol, _)| assets.is_wrapped_equity_recovery_enabled(symbol)),
-        )
+    let unwrapped = assets
+        .equities
+        .symbols
+        .iter()
         .map(|(symbol, equity)| (symbol, equity.tokenized_equity))
         .collect::<BTreeMap<_, _>>()
         .into_iter()
@@ -4942,7 +4930,51 @@ async fn execute_attribute_trade_source(
     }
 }
 
-/// Drives `Position::AcknowledgeOnChainFill`, treating the idempotent
+/// A wrapped-share fill restated in broker-share units at its exact-block
+/// wrapper ratio, preserving the fill's USDC notional.
+pub(crate) struct NormalizedFillEconomics {
+    pub(crate) amount: FractionalShares,
+    pub(crate) price_usdc: rain_math_float::Float,
+    pub(crate) underlying_per_wrapped: alloy::primitives::U256,
+}
+
+pub(crate) fn normalized_fill_economics(
+    trade: &OnchainTrade,
+) -> Result<NormalizedFillEconomics, NormalizedFillEconomicsError> {
+    let trade_id = TradeId {
+        chain: trade.chain,
+        tx_hash: trade.tx_hash,
+        log_index: trade.log_index,
+    };
+    let ratio = trade.underlying_per_wrapped.ok_or_else(|| {
+        NormalizedFillEconomicsError::MissingWrapperRatio {
+            trade_id: trade_id.clone(),
+        }
+    })?;
+    // A zero ratio at a past block never changes, so like a zero converted
+    // amount it takes the per-fill skip instead of failing every retry.
+    if ratio.is_zero() {
+        return Err(NormalizedFillEconomicsError::ZeroUnderlyingAmount { trade_id });
+    }
+    let underlying_per_wrapped = UnderlyingPerWrapped::new(ratio)?;
+    let amount = underlying_per_wrapped.to_underlying_fractional(trade.amount)?;
+    if amount.is_zero()? {
+        return Err(NormalizedFillEconomicsError::ZeroUnderlyingAmount { trade_id });
+    }
+    // From the exact ratio, not from the notional over the floored amount: a
+    // few-wei fill floors its amount a long way, and that error must not land
+    // in the price that sets `last_price` and the P&L price.
+    let ratio_per_share = rain_math_float::Float::from_fixed_decimal(ratio, 18)?;
+    let price_usdc = (trade.price.value() / ratio_per_share)?;
+
+    Ok(NormalizedFillEconomics {
+        amount,
+        price_usdc,
+        underlying_per_wrapped: ratio,
+    })
+}
+
+/// Drives `Position::AcknowledgeNormalizedOnChainFill`, treating the idempotent
 /// re-drive as success rather than an error.
 ///
 /// Returns `Ok(())` when the position reflects the fill -- either this call
@@ -4955,13 +4987,16 @@ pub async fn execute_acknowledge_fill(
     trade: &OnchainTrade,
     threshold: ExecutionThreshold,
     block_timestamp: DateTime<Utc>,
-) -> Result<(), SendError<Position>> {
+) -> Result<(), TradeAccountingError> {
     let base_symbol = trade.symbol.base();
 
-    let amount = trade.amount.inner();
-    let price_usdc = trade.price.value();
+    let NormalizedFillEconomics {
+        amount,
+        price_usdc,
+        underlying_per_wrapped,
+    } = normalized_fill_economics(trade)?;
 
-    let command = PositionCommand::AcknowledgeOnChainFill {
+    let command = PositionCommand::AcknowledgeNormalizedOnChainFill(NormalizedOnChainFillCommand {
         symbol: base_symbol.clone(),
         threshold,
         trade_id: TradeId {
@@ -4969,12 +5004,14 @@ pub async fn execute_acknowledge_fill(
             tx_hash: trade.tx_hash,
             log_index: trade.log_index,
         },
-        amount: FractionalShares::new(amount),
+        amount,
+        wrapped_amount: trade.amount,
         direction: trade.direction,
         price_usdc,
         block_timestamp,
         block_number: trade.block_number,
-    };
+        underlying_per_wrapped,
+    });
 
     match position.send(base_symbol, command).await {
         Ok(()) => {
@@ -4982,7 +5019,7 @@ pub async fn execute_acknowledge_fill(
                 tx_hash = ?trade.tx_hash,
                 log_index = trade.log_index,
                 symbol = %trade.symbol,
-                "Successfully executed Position::AcknowledgeOnChainFill command"
+                "Successfully executed Position::AcknowledgeNormalizedOnChainFill command"
             );
             Ok(())
         }
@@ -4998,7 +5035,7 @@ pub async fn execute_acknowledge_fill(
             );
             Ok(())
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -5109,6 +5146,27 @@ pub(crate) async fn position_fill_already_recorded(
     Ok(count > 0)
 }
 
+/// Whether an interrupted attempt already made this fill's accounting
+/// durable, as a `Position` fill, a trading-disabled exclusion record, or a
+/// zero-underlying skip record.
+/// Resuming either writes no new fill economics, so it needs no historical
+/// wrapper ratio.
+pub(crate) async fn fill_accounting_already_durable(
+    pool: &SqlitePool,
+    trade: &OnchainTrade,
+    trade_id: &OnChainTradeId,
+) -> Result<bool, TradeAccountingError> {
+    Ok(
+        position_fill_already_recorded(pool, trade.symbol.base(), trade_id).await?
+            || recorded_fill_skip_detail(pool, trade, SkipReason::TradingDisabled)
+                .await?
+                .is_some()
+            || recorded_fill_skip_detail(pool, trade, SkipReason::ZeroUnderlyingAmount)
+                .await?
+                .is_some(),
+    )
+}
+
 pub enum FillAccountingOutcome {
     AlreadyAcknowledged,
     /// Recorded in `skipped_fills` because trading was disabled on its chain
@@ -5123,13 +5181,14 @@ pub enum FillAccountingOutcome {
     },
 }
 
-/// The recorded detail when `trade` is excluded because trading was disabled
-/// on its chain.
-pub(crate) async fn recorded_trading_disabled_detail(
+/// The recorded detail when `trade` was skipped for `reason`, for example
+/// excluded because trading was disabled on its chain.
+pub(crate) async fn recorded_fill_skip_detail(
     pool: &SqlitePool,
     trade: &OnchainTrade,
+    reason: SkipReason,
 ) -> Result<Option<String>, TradeAccountingError> {
-    trading_disabled_detail(pool, trade.chain, trade.tx_hash, trade.log_index)
+    recorded_skip_detail(pool, trade.chain, trade.tx_hash, trade.log_index, reason)
         .await
         .map_err(|error| TradeAccountingError::ExcludedFillRecord {
             trade_id: OnChainTradeId {
@@ -5141,8 +5200,86 @@ pub(crate) async fn recorded_trading_disabled_detail(
         })
 }
 
+/// Skips a fill whose wrapped quantity converts to zero underlying shares at
+/// its fill-block ratio, for example a dust fill at a ratio below 1. That
+/// ratio never changes, so propagating the error would fail every retry and
+/// trip the conductor-wide fail-stop. The fill is recorded in `skipped_fills`
+/// for manual reconciliation and then acknowledged, so a redelivery does
+/// nothing. An existing record finishes the skip on a resume or a rerun,
+/// with no ratio read. Returns the recorded detail when the fill is skipped.
+pub(crate) async fn skip_zero_underlying_fill(
+    pool: &SqlitePool,
+    onchain_trade: &Store<OnChainTrade>,
+    trade: &OnchainTrade,
+    event_type: &str,
+    witnessed: &WitnessedFill,
+) -> Result<Option<String>, TradeAccountingError> {
+    if let Some(detail) =
+        recorded_fill_skip_detail(pool, trade, SkipReason::ZeroUnderlyingAmount).await?
+    {
+        match witnessed {
+            WitnessedFill::Pending { trade_id, .. } => {
+                execute_mark_acknowledged(onchain_trade, trade_id).await?;
+            }
+            WitnessedFill::AlreadyAcknowledged => {}
+        }
+        return Ok(Some(detail));
+    }
+
+    let WitnessedFill::Pending { trade_id, .. } = witnessed else {
+        return Ok(None);
+    };
+    // A pending fill whose accounting is already durable resumes without a
+    // ratio; it has nothing new to convert.
+    if trade.underlying_per_wrapped.is_none() {
+        return Ok(None);
+    }
+
+    let error = match normalized_fill_economics(trade) {
+        Ok(_) => return Ok(None),
+        Err(error @ NormalizedFillEconomicsError::ZeroUnderlyingAmount { .. }) => error,
+        Err(
+            error @ (NormalizedFillEconomicsError::Ratio(_)
+            | NormalizedFillEconomicsError::Float(_)
+            | NormalizedFillEconomicsError::MissingWrapperRatio { .. }),
+        ) => return Err(error.into()),
+    };
+    let detail = error.to_string();
+
+    error!(
+        target: "hedge",
+        event_type,
+        ?trade_id,
+        symbol = %trade.symbol,
+        wrapped_amount = %trade.amount,
+        %error,
+        "Skipping fill that converts to zero underlying shares; it is left unhedged and \
+         must be reconciled manually"
+    );
+    // Unlike the decode-time skips, this fill is acknowledged next, so a lost
+    // record could never be written again: propagate its failure and leave
+    // the fill pending for the retry.
+    record_skipped_fill(
+        pool,
+        trade.chain,
+        trade.tx_hash,
+        trade.log_index,
+        event_type,
+        SkipReason::ZeroUnderlyingAmount,
+        &detail,
+    )
+    .await
+    .map_err(|source| TradeAccountingError::ExcludedFillRecord {
+        trade_id: trade_id.clone(),
+        source: Box::new(source),
+    })?;
+    execute_mark_acknowledged(onchain_trade, trade_id).await?;
+
+    Ok(Some(detail))
+}
+
 /// Where a fill stands once it is witnessed into its `OnChainTrade` log.
-enum WitnessedFill {
+pub(crate) enum WitnessedFill {
     /// An earlier attempt already acknowledged it.
     AlreadyAcknowledged,
     /// Witnessed but not acknowledged yet: this attempt finishes it.
@@ -5155,7 +5292,7 @@ enum WitnessedFill {
 /// Witnesses `trade` into its `OnChainTrade` log, the step every fill takes
 /// whether or not it is hedged. The acknowledged marker it reads back is the
 /// dedupe guard that makes a redrive do nothing.
-async fn witness_onchain_fill(
+pub(crate) async fn witness_onchain_fill(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
     block_number: u64,
@@ -5243,10 +5380,23 @@ pub async fn account_for_onchain_fill(
     block_number: u64,
     threshold: ExecutionThreshold,
 ) -> Result<FillAccountingOutcome, TradeAccountingError> {
+    let witnessed = witness_onchain_fill(onchain_trade, trade, block_number).await?;
+    account_for_witnessed_onchain_fill(pool, onchain_trade, position, trade, threshold, witnessed)
+        .await
+}
+
+pub(crate) async fn account_for_witnessed_onchain_fill(
+    pool: &SqlitePool,
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    trade: &OnchainTrade,
+    threshold: ExecutionThreshold,
+    witnessed: WitnessedFill,
+) -> Result<FillAccountingOutcome, TradeAccountingError> {
     let WitnessedFill::Pending {
         trade_id,
         block_timestamp,
-    } = witness_onchain_fill(onchain_trade, trade, block_number).await?
+    } = witnessed
     else {
         // Self-heal a marker-without-settle leak (ADR 0010): a crash between
         // MARK and SETTLE leaves the trade marked but still in the pending
@@ -5255,7 +5405,9 @@ pub async fn account_for_onchain_fill(
         execute_settle_fill(position, trade).await?;
         // A fill excluded while trading was disabled is also acknowledged;
         // report it as excluded so no caller promises the pipeline hedges it.
-        if let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? {
+        if let Some(detail) =
+            recorded_fill_skip_detail(pool, trade, SkipReason::TradingDisabled).await?
+        {
             return Ok(FillAccountingOutcome::ExcludedFromHedging { detail });
         }
         return Ok(FillAccountingOutcome::AlreadyAcknowledged);
@@ -5277,7 +5429,9 @@ pub async fn account_for_onchain_fill(
     // Excluded while trading was disabled, then interrupted before its
     // marker: the `skipped_fills` record already tells the operator to cover
     // the delta by hand, so finish the exclusion instead of hedging it too.
-    if let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? {
+    if let Some(detail) =
+        recorded_fill_skip_detail(pool, trade, SkipReason::TradingDisabled).await?
+    {
         execute_mark_acknowledged(onchain_trade, &trade_id).await?;
         warn!(
             ?trade_id,
@@ -5325,13 +5479,33 @@ pub async fn account_for_fill_excluded_from_hedging(
     block_number: u64,
     event_type: &str,
 ) -> Result<ExcludedFillOutcome, TradeAccountingError> {
-    let WitnessedFill::Pending { trade_id, .. } =
-        witness_onchain_fill(onchain_trade, trade, block_number).await?
-    else {
+    let witnessed = witness_onchain_fill(onchain_trade, trade, block_number).await?;
+    account_for_witnessed_fill_excluded_from_hedging(
+        pool,
+        onchain_trade,
+        position,
+        trade,
+        event_type,
+        witnessed,
+    )
+    .await
+}
+
+pub(crate) async fn account_for_witnessed_fill_excluded_from_hedging(
+    pool: &SqlitePool,
+    onchain_trade: &Store<OnChainTrade>,
+    position: &Store<Position>,
+    trade: &OnchainTrade,
+    event_type: &str,
+    witnessed: WitnessedFill,
+) -> Result<ExcludedFillOutcome, TradeAccountingError> {
+    let WitnessedFill::Pending { trade_id, .. } = witnessed else {
         // Same self heal as `account_for_onchain_fill`, for a fill accounted
         // into the position before trading was disabled. Does nothing otherwise.
         execute_settle_fill(position, trade).await?;
-        if let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? {
+        if let Some(detail) =
+            recorded_fill_skip_detail(pool, trade, SkipReason::TradingDisabled).await?
+        {
             return Ok(ExcludedFillOutcome::AlreadyExcluded { detail });
         }
         return Ok(ExcludedFillOutcome::AlreadyAcknowledged);
@@ -5353,20 +5527,41 @@ pub async fn account_for_fill_excluded_from_hedging(
         return Ok(ExcludedFillOutcome::AlreadyAcknowledged);
     }
 
+    // Recorded as excluded, then interrupted before its marker: finish the
+    // exclusion from the durable record, which needs no wrapper ratio.
+    if let Some(detail) =
+        recorded_fill_skip_detail(pool, trade, SkipReason::TradingDisabled).await?
+    {
+        execute_mark_acknowledged(onchain_trade, &trade_id).await?;
+        warn!(
+            ?trade_id,
+            symbol = %trade.symbol,
+            %detail,
+            "Fill on a trading disabled asset excluded from the hedged position; \
+             finished its interrupted exclusion"
+        );
+        return Ok(ExcludedFillOutcome::Excluded { detail });
+    }
+
     // The cover is the opposite side of the onchain fill: an onchain sell
     // leaves the book short, which a broker buy covers.
     let cover = match trade.direction {
         Direction::Buy => Direction::Sell,
         Direction::Sell => Direction::Buy,
     };
+    let NormalizedFillEconomics {
+        amount,
+        price_usdc: _,
+        underlying_per_wrapped: _,
+    } = normalized_fill_economics(trade)?;
     let detail = format!(
-        "onchain fill {direction} {amount} {symbol} at {price} USDC on {chain}, \
+        "onchain fill {direction} {wrapped_amount} wrapped {symbol} at {wrapped_price} USDC on {chain}, \
          cover by {cover} {amount} {symbol} at the broker: trading is disabled \
          for {symbol} on {chain}, so the fill is not counter traded",
         direction = trade.direction,
-        amount = trade.amount,
+        wrapped_amount = trade.amount,
+        wrapped_price = trade.price,
         symbol = trade.symbol.base(),
-        price = trade.price,
         chain = trade.chain,
     );
     // Recorded before the marker: a crash in between redrives this step,
@@ -5407,6 +5602,7 @@ pub async fn account_for_fill_excluded_from_hedging(
 /// as excluded (redelivered after trading was enabled again) stays excluded
 /// and returns `Ok(None)` without a hedge.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn process_queued_trade<E: Executor>(
     executor: &E,
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
@@ -5417,13 +5613,28 @@ pub async fn process_queued_trade<E: Executor>(
 where
     TradeAccountingError: From<E::Error>,
 {
-    let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
+    let witnessed =
+        witness_onchain_fill(&cqrs.onchain_trade, &trade, trade_event.block_number).await?;
+    process_witnessed_queued_trade(executor, trade, cqrs, assets, witnessed).await
+}
+
+pub(crate) async fn process_witnessed_queued_trade<E: Executor>(
+    executor: &E,
+    trade: OnchainTrade,
+    cqrs: &TradeProcessingCqrs,
+    assets: &ChainAssets,
+    witnessed: WitnessedFill,
+) -> Result<Option<OffchainOrderId>, TradeAccountingError>
+where
+    TradeAccountingError: From<E::Error>,
+{
+    let FillAccountingOutcome::Accounted { trade_id } = account_for_witnessed_onchain_fill(
         &cqrs.pool,
         &cqrs.onchain_trade,
         &cqrs.position,
         &trade,
-        trade_event.block_number,
         cqrs.execution_threshold,
+        witnessed,
     )
     .await?
     else {
@@ -6833,6 +7044,44 @@ mod tests {
     use crate::vault_lookup::MockVaultLookup;
     use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
     use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
+
+    /// A few-wei fill floors its underlying amount a long way at a ratio far
+    /// from 1. The price must still be the wrapped price over the exact ratio,
+    /// not the notional over the floored amount.
+    #[test]
+    fn dust_fill_price_uses_the_exact_ratio() {
+        let mut trade = crate::test_utils::OnchainTradeBuilder::new()
+            .with_block_number(42)
+            .build();
+        trade.amount = FractionalShares::new(
+            rain_math_float::Float::from_fixed_decimal(alloy::primitives::U256::from(3), 18)
+                .unwrap(),
+        );
+        trade.price = crate::onchain::io::Usdc::new(float!(100)).unwrap();
+        trade.underlying_per_wrapped =
+            Some(alloy::primitives::U256::from(600_000_000_000_000_000u64));
+
+        let economics = normalized_fill_economics(&trade).unwrap();
+
+        let expected = (float!(100) / float!(0.6)).unwrap();
+        assert!(
+            economics.price_usdc.eq(expected).unwrap(),
+            "price must be 100 / 0.6, not the floored-amount price"
+        );
+        assert!(
+            economics
+                .amount
+                .inner()
+                .eq(rain_math_float::Float::from_fixed_decimal(
+                    alloy::primitives::U256::from(1),
+                    18
+                )
+                .unwrap())
+                .unwrap(),
+            "3 wei at 0.6 floors to 1 wei of underlying"
+        );
+    }
+
     #[test]
     fn stale_hedge_request_is_an_expected_placement_rejection() {
         let shares = Positive::new(FractionalShares::new(float!(1))).unwrap();
@@ -6953,7 +7202,7 @@ mod tests {
             address!("0x2222222222222222222222222222222222222222"),
         )]);
 
-        confirm_configured_assets_respond(&provider, ChainRole::Primary, &trading)
+        confirm_configured_assets_respond(&provider, &trading)
             .await
             .unwrap();
     }
@@ -6972,7 +7221,7 @@ mod tests {
             address!("0x2222222222222222222222222222222222222222"),
         )]);
 
-        let error = confirm_configured_assets_respond(&provider, ChainRole::Primary, &trading)
+        let error = confirm_configured_assets_respond(&provider, &trading)
             .await
             .unwrap_err();
 
@@ -7007,7 +7256,7 @@ mod tests {
             wrapped,
         )]);
 
-        let error = confirm_configured_assets_respond(&provider, ChainRole::Secondary, &hedge_only)
+        let error = confirm_configured_assets_respond(&provider, &hedge_only)
             .await
             .expect_err("a 6-decimal equity token must refuse startup");
         let message = error.to_string();
@@ -7044,7 +7293,7 @@ mod tests {
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
         let hedge_only = hedged_chain_with_equities([("AAPL", unwrapped, wrapped)]);
 
-        let error = confirm_configured_assets_respond(&provider, ChainRole::Secondary, &hedge_only)
+        let error = confirm_configured_assets_respond(&provider, &hedge_only)
             .await
             .expect_err("a wrapped share reporting another asset() must refuse startup");
         let message = error.to_string();
@@ -7071,7 +7320,7 @@ mod tests {
             .primary()
             .clone();
 
-        confirm_configured_assets_respond(&provider, ChainRole::Primary, &trading)
+        confirm_configured_assets_respond(&provider, &trading)
             .await
             .unwrap();
 
@@ -7285,12 +7534,9 @@ mod tests {
         asserter.push_failure_msg("connection reset by peer");
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let error =
-            confirm_configured_assets_respond(&provider, ChainRole::Primary, &recovery_only)
-                .await
-                .expect_err(
-                    "a recovery-only equity with a dead unwrapped token must refuse startup",
-                );
+        let error = confirm_configured_assets_respond(&provider, &recovery_only)
+            .await
+            .expect_err("a recovery-only equity with a dead unwrapped token must refuse startup");
         let message = error.to_string();
 
         assert!(
@@ -7304,11 +7550,12 @@ mod tests {
     }
 
     /// Every equity on the chain is probed, not just the first by symbol, and
-    /// a hedge-only chain reads no unwrapped token at all: nothing there mints,
-    /// redeems, wraps or unwraps, so that address plays no part.
+    /// a hedge-only chain reads every unwrapped token too: fill normalization
+    /// reads `convertToAssets`, which is only a fixed-18 ratio when that token
+    /// has 18 decimals.
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn asset_canary_reads_every_wrapped_share_and_no_unwrapped_token_when_hedge_only() {
+    async fn asset_canary_reads_every_wrapped_share_and_unwrapped_token_when_hedge_only() {
         let apple_unwrapped = Address::repeat_byte(0x11);
         let apple_wrapped = Address::repeat_byte(0x22);
         let microsoft_unwrapped = Address::repeat_byte(0x33);
@@ -7323,12 +7570,16 @@ mod tests {
 
         let provider =
             ProviderBuilder::new().connect_mocked_client(hedged_chain_asserter(Chain::Base));
-        // Two wrapped shares and nothing else: a further read would find the
-        // queue empty and fail startup, which is the assertion that no
-        // unwrapped token is read here.
         let secondary_asserter = hedged_chain_asserter(Chain::Ethereum);
         push_wrapped_share_reads(&secondary_asserter, apple_unwrapped);
         push_wrapped_share_reads(&secondary_asserter, microsoft_unwrapped);
+        for _ in 0..2 {
+            secondary_asserter.push_success(
+                &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                    &TOKENIZED_EQUITY_DECIMALS,
+                ),
+            );
+        }
         let watch_providers = BTreeMap::from([(
             Chain::Ethereum,
             ProviderBuilder::new().connect_mocked_client(secondary_asserter),
@@ -7338,17 +7589,47 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            logs_contain(&apple_wrapped.to_string()),
-            "the first equity's wrapped share must be read and logged"
+        for token in [
+            apple_wrapped,
+            microsoft_wrapped,
+            apple_unwrapped,
+            microsoft_unwrapped,
+        ] {
+            assert!(
+                logs_contain(&format!("token={token}")),
+                "every wrapped share and unwrapped token must be read and logged: {token}"
+            );
+        }
+    }
+
+    /// A hedge-only listing whose unwrapped token is not 18 decimals would
+    /// normalize every fill with a mis-scaled wrapper ratio, so startup must
+    /// refuse it.
+    #[tokio::test]
+    async fn asset_canary_refuses_a_hedge_only_unwrapped_token_that_is_not_18_decimals() {
+        let unwrapped = address!("0x1111111111111111111111111111111111111111");
+        let asserter = Asserter::new();
+        push_wrapped_share_reads(&asserter, unwrapped);
+        asserter.push_success(
+            &<st0x_evm::IERC20::decimalsCall as alloy::sol_types::SolCall>::abi_encode_returns(
+                &6u8,
+            ),
         );
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let hedge_only = hedged_chain_with_equities([(
+            "AAPL",
+            unwrapped,
+            address!("0x2222222222222222222222222222222222222222"),
+        )]);
+
+        let error = confirm_configured_assets_respond(&provider, &hedge_only)
+            .await
+            .expect_err("a 6-decimal unwrapped token must refuse startup");
+        let message = error.to_string();
+
         assert!(
-            logs_contain(&microsoft_wrapped.to_string()),
-            "the second equity's wrapped share must be read and logged"
-        );
-        assert!(
-            !logs_contain(&apple_unwrapped.to_string()),
-            "a hedge-only chain must not read an unwrapped token"
+            message.contains("tokenized_equity at") && message.contains("reports 6 decimals"),
+            "the refusal must name the unwrapped token's precision: {message}"
         );
     }
 
@@ -11404,6 +11685,7 @@ mod tests {
         let event = PositionEvent::OnChainOrderFilled {
             trade_id: trade_id.clone(),
             amount: FractionalShares::new(float!(1)),
+            wrapped_amount: None,
             direction: Direction::Buy,
             price_usdc: float!(100),
             block_timestamp: Utc::now(),
@@ -12863,6 +13145,72 @@ mod tests {
             Some(4242),
             "the persisted fill event must retain the trade's block number"
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledge_fill_normalizes_wrapped_shares_and_preserves_notional() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let mut trade = test_trade_with_amount(float!(2), 61);
+        trade.price = crate::onchain::io::Usdc::new(float!(101)).unwrap();
+        trade.underlying_per_wrapped = Some(U256::from(1_010_000_000_000_000_000u64));
+        let block_timestamp = trade.block_timestamp.unwrap();
+
+        execute_acknowledge_fill(
+            &cqrs.position,
+            &trade,
+            cqrs.execution_threshold,
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+
+        let payloads: Vec<String> = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_id = 'AAPL' ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let events = payloads
+            .iter()
+            .map(|payload| serde_json::from_str::<PositionEvent>(payload).unwrap())
+            .collect::<Vec<_>>();
+        let fill = events
+            .iter()
+            .find_map(|event| match event {
+                PositionEvent::OnChainOrderFilled {
+                    amount,
+                    wrapped_amount,
+                    price_usdc,
+                    ..
+                } => Some((*amount, *wrapped_amount, *price_usdc)),
+                _ => None,
+            })
+            .expect("normalized fill event must be persisted");
+        assert!(fill.0.inner().eq(float!(2.02)).unwrap());
+        assert_eq!(fill.1, Some(FractionalShares::new(float!(2))));
+        assert!(fill.2.eq(float!(100)).unwrap());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PositionEvent::OnChainFillApplied {
+                underlying_per_wrapped: Some(ratio),
+                ..
+            } if *ratio == U256::from(1_010_000_000_000_000_000u64)
+        )));
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(position.net.inner().eq(float!(2.02)).unwrap());
     }
 
     /// A fill missing its block timestamp can be neither witnessed nor

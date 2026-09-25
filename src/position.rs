@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use alloy::primitives::TxHash;
+use alloy::primitives::{TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use metrics::gauge;
@@ -333,7 +333,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 10;
+    const SCHEMA_VERSION: u64 = 11;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -552,6 +552,7 @@ impl EventSourced for Position {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use PositionCommand::*;
         match command {
+            #[cfg(any(test, feature = "test-support"))]
             AcknowledgeOnChainFill {
                 symbol,
                 threshold,
@@ -564,16 +565,24 @@ impl EventSourced for Position {
             } => Ok(Self::acknowledge_on_chain_fill_init_events(
                 symbol,
                 threshold,
-                OnChainFillFacts {
+                OnChainFillFacts::legacy(
                     trade_id,
                     amount,
                     direction,
                     price_usdc,
                     block_timestamp,
                     block_number,
-                },
+                ),
                 Utc::now(),
+                None,
             )),
+
+            AcknowledgeNormalizedOnChainFill(command) => Ok(command.initialize(Utc::now())),
+
+            #[cfg(any(test, feature = "test-support"))]
+            AcknowledgeNormalizedOnChainFillAt { command, seen_at } => {
+                Ok(command.initialize(seen_at))
+            }
 
             #[cfg(any(test, feature = "test-support"))]
             AcknowledgeOnChainFillAt {
@@ -589,15 +598,16 @@ impl EventSourced for Position {
             } => Ok(Self::acknowledge_on_chain_fill_init_events(
                 symbol,
                 threshold,
-                OnChainFillFacts {
+                OnChainFillFacts::legacy(
                     trade_id,
                     amount,
                     direction,
                     price_usdc,
                     block_timestamp,
                     block_number,
-                },
+                ),
                 seen_at,
+                None,
             )),
 
             ReserveEquityTransfer {
@@ -702,6 +712,7 @@ impl EventSourced for Position {
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use PositionCommand::*;
         match command {
+            #[cfg(any(test, feature = "test-support"))]
             AcknowledgeOnChainFill {
                 trade_id,
                 amount,
@@ -711,16 +722,24 @@ impl EventSourced for Position {
                 block_number,
                 ..
             } => self.acknowledge_on_chain_fill_transition_events(
-                OnChainFillFacts {
+                OnChainFillFacts::legacy(
                     trade_id,
                     amount,
                     direction,
                     price_usdc,
                     block_timestamp,
                     block_number,
-                },
+                ),
                 Utc::now(),
+                None,
             ),
+
+            AcknowledgeNormalizedOnChainFill(command) => command.transition(self, Utc::now()),
+
+            #[cfg(any(test, feature = "test-support"))]
+            AcknowledgeNormalizedOnChainFillAt { command, seen_at } => {
+                command.transition(self, seen_at)
+            }
 
             #[cfg(any(test, feature = "test-support"))]
             AcknowledgeOnChainFillAt {
@@ -733,15 +752,16 @@ impl EventSourced for Position {
                 seen_at,
                 ..
             } => self.acknowledge_on_chain_fill_transition_events(
-                OnChainFillFacts {
+                OnChainFillFacts::legacy(
                     trade_id,
                     amount,
                     direction,
                     price_usdc,
                     block_timestamp,
                     block_number,
-                },
+                ),
                 seen_at,
+                None,
             ),
 
             ReserveEquityTransfer { reservation_id, .. } => {
@@ -815,18 +835,14 @@ impl EventSourced for Position {
                 executor_order_id,
                 price,
                 broker_timestamp,
-            } => {
-                self.validate_pending_execution(offchain_order_id)?;
-
-                Ok(vec![PositionEvent::OffChainOrderFilled {
-                    offchain_order_id,
-                    shares_filled,
-                    direction,
-                    executor_order_id,
-                    price,
-                    broker_timestamp,
-                }])
-            }
+            } => self.complete_offchain_order_events(
+                offchain_order_id,
+                shares_filled,
+                direction,
+                executor_order_id,
+                price,
+                broker_timestamp,
+            ),
 
             FailOffChainOrder {
                 offchain_order_id,
@@ -888,41 +904,7 @@ impl EventSourced for Position {
                 expected_net,
                 price_usdc,
                 ..
-            } => {
-                self.validate_operator_mutation_allowed()?;
-
-                if let Some(pending) = self.pending_offchain_order_id {
-                    return Err(PositionError::ManualAdjustmentBlockedByPendingExecution {
-                        offchain_order_id: pending,
-                    });
-                }
-
-                Self::validate_manual_adjustment(
-                    expected_net,
-                    self.net,
-                    target_net,
-                    &self.threshold,
-                    self.last_price.map(|observation| observation.price),
-                    price_usdc,
-                )?;
-
-                warn!(
-                    target: "hedge",
-                    symbol = %self.symbol,
-                    previous_net = %self.net,
-                    target_net = %target_net,
-                    %reason,
-                    "Manually adjusted position"
-                );
-
-                Ok(vec![PositionEvent::ManualPositionAdjusted {
-                    previous_net: self.net,
-                    target_net,
-                    reason,
-                    price_usdc,
-                    adjusted_at: Utc::now(),
-                }])
-            }
+            } => self.manually_adjust_position_events(target_net, reason, expected_net, price_usdc),
         }
     }
 }
@@ -934,10 +916,33 @@ impl EventSourced for Position {
 struct OnChainFillFacts {
     trade_id: TradeId,
     amount: FractionalShares,
+    wrapped_amount: Option<FractionalShares>,
     direction: Direction,
     price_usdc: Float,
     block_timestamp: DateTime<Utc>,
     block_number: Option<u64>,
+}
+
+impl OnChainFillFacts {
+    #[cfg(any(test, feature = "test-support"))]
+    fn legacy(
+        trade_id: TradeId,
+        amount: FractionalShares,
+        direction: Direction,
+        price_usdc: Float,
+        block_timestamp: DateTime<Utc>,
+        block_number: Option<u64>,
+    ) -> Self {
+        Self {
+            trade_id,
+            amount,
+            wrapped_amount: None,
+            direction,
+            price_usdc,
+            block_timestamp,
+            block_number,
+        }
+    }
 }
 
 impl Position {
@@ -987,6 +992,48 @@ impl Position {
         }])
     }
 
+    fn manually_adjust_position_events(
+        &self,
+        target_net: FractionalShares,
+        reason: String,
+        expected_net: Option<FractionalShares>,
+        price_usdc: Option<Float>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        self.validate_operator_mutation_allowed()?;
+
+        if let Some(pending) = self.pending_offchain_order_id {
+            return Err(PositionError::ManualAdjustmentBlockedByPendingExecution {
+                offchain_order_id: pending,
+            });
+        }
+
+        Self::validate_manual_adjustment(
+            expected_net,
+            self.net,
+            target_net,
+            &self.threshold,
+            self.last_price.map(|observation| observation.price),
+            price_usdc,
+        )?;
+
+        warn!(
+            target: "hedge",
+            symbol = %self.symbol,
+            previous_net = %self.net,
+            target_net = %target_net,
+            %reason,
+            "Manually adjusted position"
+        );
+
+        Ok(vec![PositionEvent::ManualPositionAdjusted {
+            previous_net: self.net,
+            target_net,
+            reason,
+            price_usdc,
+            adjusted_at: Utc::now(),
+        }])
+    }
+
     fn release_failed_order_anchor_events(
         &self,
         expected_offchain_order_id: OffchainOrderId,
@@ -1019,16 +1066,17 @@ impl Position {
         threshold: ExecutionThreshold,
         fill: OnChainFillFacts,
         seen_at: DateTime<Utc>,
+        underlying_per_wrapped: Option<U256>,
     ) -> Vec<PositionEvent> {
         let OnChainFillFacts {
             trade_id,
             amount,
+            wrapped_amount,
             direction,
             price_usdc,
             block_timestamp,
             block_number,
         } = fill;
-
         vec![
             PositionEvent::Initialized {
                 symbol,
@@ -1038,6 +1086,7 @@ impl Position {
             PositionEvent::OnChainOrderFilled {
                 trade_id: trade_id.clone(),
                 amount,
+                wrapped_amount,
                 direction,
                 price_usdc,
                 block_timestamp,
@@ -1046,6 +1095,7 @@ impl Position {
             },
             PositionEvent::OnChainFillApplied {
                 trade_id,
+                underlying_per_wrapped,
                 applied_at: seen_at,
             },
         ]
@@ -1055,10 +1105,12 @@ impl Position {
         &self,
         fill: OnChainFillFacts,
         seen_at: DateTime<Utc>,
+        underlying_per_wrapped: Option<U256>,
     ) -> Result<Vec<PositionEvent>, PositionError> {
         let OnChainFillFacts {
             trade_id,
             amount,
+            wrapped_amount,
             direction,
             price_usdc,
             block_timestamp,
@@ -1080,6 +1132,7 @@ impl Position {
             PositionEvent::OnChainOrderFilled {
                 trade_id: trade_id.clone(),
                 amount,
+                wrapped_amount,
                 direction,
                 price_usdc,
                 block_timestamp,
@@ -1088,6 +1141,7 @@ impl Position {
             },
             PositionEvent::OnChainFillApplied {
                 trade_id,
+                underlying_per_wrapped,
                 applied_at: seen_at,
             },
         ])
@@ -1437,6 +1491,27 @@ impl Position {
         Ok(())
     }
 
+    fn complete_offchain_order_events(
+        &self,
+        offchain_order_id: OffchainOrderId,
+        shares_filled: Positive<FractionalShares>,
+        direction: Direction,
+        executor_order_id: ExecutorOrderId,
+        price: Usd,
+        broker_timestamp: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        self.validate_pending_execution(offchain_order_id)?;
+
+        Ok(vec![PositionEvent::OffChainOrderFilled {
+            offchain_order_id,
+            shares_filled,
+            direction,
+            executor_order_id,
+            price,
+            broker_timestamp,
+        }])
+    }
+
     /// Validates a manual position adjustment before emitting events.
     ///
     /// Enforces optimistic concurrency (the live net must still match what the
@@ -1689,7 +1764,83 @@ impl From<FloatError> for PositionError {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct NormalizedOnChainFillCommand {
+    pub symbol: Symbol,
+    pub threshold: ExecutionThreshold,
+    pub trade_id: TradeId,
+    pub amount: FractionalShares,
+    pub wrapped_amount: FractionalShares,
+    pub direction: Direction,
+    #[serde(
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+    )]
+    pub price_usdc: Float,
+    pub block_timestamp: DateTime<Utc>,
+    pub block_number: Option<u64>,
+    pub underlying_per_wrapped: U256,
+}
+
+impl NormalizedOnChainFillCommand {
+    fn fill(&self) -> OnChainFillFacts {
+        OnChainFillFacts {
+            trade_id: self.trade_id.clone(),
+            amount: self.amount,
+            wrapped_amount: Some(self.wrapped_amount),
+            direction: self.direction,
+            price_usdc: self.price_usdc,
+            block_timestamp: self.block_timestamp,
+            block_number: self.block_number,
+        }
+    }
+
+    fn initialize(self, seen_at: DateTime<Utc>) -> Vec<PositionEvent> {
+        Position::acknowledge_on_chain_fill_init_events(
+            self.symbol.clone(),
+            self.threshold,
+            self.fill(),
+            seen_at,
+            Some(self.underlying_per_wrapped),
+        )
+    }
+
+    fn transition(
+        self,
+        position: &Position,
+        seen_at: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        position.acknowledge_on_chain_fill_transition_events(
+            self.fill(),
+            seen_at,
+            Some(self.underlying_per_wrapped),
+        )
+    }
+}
+
+impl std::fmt::Debug for NormalizedOnChainFillCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcknowledgeNormalizedOnChainFill")
+            .field("symbol", &self.symbol)
+            .field("threshold", &self.threshold)
+            .field("trade_id", &self.trade_id)
+            .field("amount", &self.amount)
+            .field("wrapped_amount", &self.wrapped_amount)
+            .field("direction", &self.direction)
+            .field("price_usdc", &DebugFloat(&self.price_usdc))
+            .field("block_timestamp", &self.block_timestamp)
+            .field("block_number", &self.block_number)
+            .field("underlying_per_wrapped", &self.underlying_per_wrapped)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub enum PositionCommand {
+    /// Test/fixture-only legacy fill command. It takes the amount as given
+    /// and records no wrapper-ratio evidence; production accounting uses
+    /// `AcknowledgeNormalizedOnChainFill`.
+    #[cfg(any(test, feature = "test-support"))]
     AcknowledgeOnChainFill {
         symbol: Symbol,
         threshold: ExecutionThreshold,
@@ -1704,10 +1855,21 @@ pub enum PositionCommand {
         /// against the onchain snapshot block watermark (ADR 0018).
         block_number: Option<u64>,
     },
-    /// Test/fixture-only: identical to `AcknowledgeOnChainFill` but takes
-    /// `seen_at` explicitly instead of stamping `Utc::now()`, so fixture
-    /// seeding (e.g. `nix run .#simulate-14d`) can backdate synthetic
-    /// history to build a realistic-looking trend.
+    /// Production fill command after the wrapped quantity and price have been
+    /// normalized into broker-share units at the confirmed block.
+    AcknowledgeNormalizedOnChainFill(NormalizedOnChainFillCommand),
+    /// Test/fixture-only: `AcknowledgeNormalizedOnChainFill` with an
+    /// explicit `seen_at` instead of `Utc::now()`, so fixture seeding (for
+    /// example `nix run .#simulate-14d`) can backdate synthetic history that
+    /// still carries proven wrapper-ratio evidence for P&L.
+    #[cfg(any(test, feature = "test-support"))]
+    AcknowledgeNormalizedOnChainFillAt {
+        command: NormalizedOnChainFillCommand,
+        seen_at: DateTime<Utc>,
+    },
+    /// Test/fixture-only: the legacy `AcknowledgeOnChainFill` with an
+    /// explicit `seen_at`. It records no wrapper-ratio evidence, so P&L treats
+    /// its fills as having unknown basis.
     #[cfg(any(test, feature = "test-support"))]
     AcknowledgeOnChainFillAt {
         symbol: Symbol,
@@ -1842,6 +2004,12 @@ pub enum PositionEvent {
     },
     OnChainOrderFilled {
         trade_id: TradeId,
+        /// Exact ERC-4626 vault shares moved onchain. New normalized fills set
+        /// this separately from `amount`, which is in broker-share units;
+        /// legacy events deserialize as `None` and retain their original 1:1
+        /// inventory behavior.
+        #[serde(default)]
+        wrapped_amount: Option<FractionalShares>,
         amount: FractionalShares,
         direction: Direction,
         #[serde(
@@ -1865,6 +2033,10 @@ pub enum PositionEvent {
     /// empty on full replay instead of re-accumulating every trade id.
     OnChainFillApplied {
         trade_id: TradeId,
+        /// Exact ERC-4626 conversion basis used to normalize this wrapped
+        /// fill into underlying shares. Legacy events deserialize as `None`.
+        #[serde(default)]
+        underlying_per_wrapped: Option<U256>,
         applied_at: DateTime<Utc>,
     },
     /// Prunes `trade_id` from the pending-acknowledgement set once its
@@ -2031,6 +2203,7 @@ impl PartialEq for PositionEvent {
                 Self::OnChainOrderFilled {
                     trade_id: t1,
                     amount: a1,
+                    wrapped_amount: wa1,
                     direction: d1,
                     price_usdc: p1,
                     block_timestamp: bt1,
@@ -2040,6 +2213,7 @@ impl PartialEq for PositionEvent {
                 Self::OnChainOrderFilled {
                     trade_id: t2,
                     amount: a2,
+                    wrapped_amount: wa2,
                     direction: d2,
                     price_usdc: p2,
                     block_timestamp: bt2,
@@ -2049,6 +2223,7 @@ impl PartialEq for PositionEvent {
             ) => {
                 t1 == t2
                     && a1 == a2
+                    && wa1 == wa2
                     && d1 == d2
                     && bn1 == bn2
                     && p1.eq(*p2).unwrap_or(false)
@@ -2058,13 +2233,15 @@ impl PartialEq for PositionEvent {
             (
                 Self::OnChainFillApplied {
                     trade_id: t1,
+                    underlying_per_wrapped: upw1,
                     applied_at: a1,
                 },
                 Self::OnChainFillApplied {
                     trade_id: t2,
+                    underlying_per_wrapped: upw2,
                     applied_at: a2,
                 },
-            ) => t1 == t2 && a1 == a2,
+            ) => t1 == t2 && upw1 == upw2 && a1 == a2,
             (
                 Self::OnChainFillSettled {
                     trade_id: t1,
@@ -2320,6 +2497,7 @@ impl Eq for TriggerReason {}
 impl std::fmt::Debug for PositionCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(any(test, feature = "test-support"))]
             Self::AcknowledgeOnChainFill {
                 symbol,
                 threshold,
@@ -2339,6 +2517,13 @@ impl std::fmt::Debug for PositionCommand {
                 .field("price_usdc", &DebugFloat(price_usdc))
                 .field("block_timestamp", block_timestamp)
                 .field("block_number", block_number)
+                .finish(),
+            Self::AcknowledgeNormalizedOnChainFill(command) => command.fmt(f),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::AcknowledgeNormalizedOnChainFillAt { command, seen_at } => f
+                .debug_struct("AcknowledgeNormalizedOnChainFillAt")
+                .field("command", command)
+                .field("seen_at", seen_at)
                 .finish(),
             #[cfg(any(test, feature = "test-support"))]
             Self::AcknowledgeOnChainFillAt {
@@ -2527,6 +2712,7 @@ impl std::fmt::Debug for PositionEvent {
             Self::OnChainOrderFilled {
                 trade_id,
                 amount,
+                wrapped_amount,
                 direction,
                 price_usdc,
                 block_timestamp,
@@ -2536,6 +2722,7 @@ impl std::fmt::Debug for PositionEvent {
                 .debug_struct("OnChainOrderFilled")
                 .field("trade_id", trade_id)
                 .field("amount", amount)
+                .field("wrapped_amount", wrapped_amount)
                 .field("direction", direction)
                 .field("price_usdc", &DebugFloat(price_usdc))
                 .field("block_timestamp", block_timestamp)
@@ -2544,10 +2731,12 @@ impl std::fmt::Debug for PositionEvent {
                 .finish(),
             Self::OnChainFillApplied {
                 trade_id,
+                underlying_per_wrapped,
                 applied_at,
             } => f
                 .debug_struct("OnChainFillApplied")
                 .field("trade_id", trade_id)
+                .field("underlying_per_wrapped", underlying_per_wrapped)
                 .field("applied_at", applied_at)
                 .finish(),
             Self::OnChainFillSettled {
@@ -2737,6 +2926,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(100),
                 block_timestamp: Utc::now(),
@@ -2833,6 +3023,7 @@ mod tests {
                 log_index: 2,
             },
             amount: FractionalShares::new(float!(1)),
+            wrapped_amount: None,
             direction: Direction::Sell,
             price_usdc: float!(100),
             block_timestamp: Utc::now(),
@@ -3098,6 +3289,7 @@ mod tests {
                 PositionEvent::OnChainOrderFilled {
                     trade_id: trade_id.clone(),
                     amount: FractionalShares::new(float!(0.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -3160,6 +3352,7 @@ mod tests {
                 PositionEvent::OnChainOrderFilled {
                     trade_id: trade_a.clone(),
                     amount: FractionalShares::new(float!(0.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: now,
@@ -3168,11 +3361,13 @@ mod tests {
                 },
                 PositionEvent::OnChainFillApplied {
                     trade_id: trade_a.clone(),
+                    underlying_per_wrapped: None,
                     applied_at: now,
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id: trade_b.clone(),
                     amount: FractionalShares::new(float!(0.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: now,
@@ -3181,6 +3376,7 @@ mod tests {
                 },
                 PositionEvent::OnChainFillApplied {
                     trade_id: trade_b,
+                    underlying_per_wrapped: None,
                     applied_at: now,
                 },
             ])
@@ -3230,6 +3426,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(0.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: now,
@@ -3243,6 +3440,7 @@ mod tests {
                     log_index: 2,
                 },
                 amount: FractionalShares::new(float!(0.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: now,
@@ -3288,6 +3486,7 @@ mod tests {
             PositionEvent::OnChainOrderFilled {
                 trade_id: trade_a.clone(),
                 amount: FractionalShares::new(float!(0.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: now,
@@ -3296,6 +3495,7 @@ mod tests {
             },
             PositionEvent::OnChainFillApplied {
                 trade_id: trade_a.clone(),
+                underlying_per_wrapped: None,
                 applied_at: now,
             },
             PositionEvent::OnChainFillSettled {
@@ -3305,6 +3505,7 @@ mod tests {
             PositionEvent::OnChainOrderFilled {
                 trade_id: trade_b.clone(),
                 amount: FractionalShares::new(float!(0.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: now,
@@ -3313,6 +3514,7 @@ mod tests {
             },
             PositionEvent::OnChainFillApplied {
                 trade_id: trade_b.clone(),
+                underlying_per_wrapped: None,
                 applied_at: now,
             },
         ])
@@ -3347,6 +3549,7 @@ mod tests {
                 PositionEvent::OnChainOrderFilled {
                     trade_id: trade_id.clone(),
                     amount: FractionalShares::new(float!(0.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: now,
@@ -3355,6 +3558,7 @@ mod tests {
                 },
                 PositionEvent::OnChainFillApplied {
                     trade_id: trade_id.clone(),
+                    underlying_per_wrapped: None,
                     applied_at: now,
                 },
             ])
@@ -3418,6 +3622,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(0.6)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -3431,6 +3636,7 @@ mod tests {
                         log_index: 2,
                     },
                     amount: FractionalShares::new(float!(0.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(151),
                     block_timestamp: Utc::now(),
@@ -3474,6 +3680,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(1)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -3519,6 +3726,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(2)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -3584,6 +3792,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(0.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -3625,6 +3834,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(1)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -3664,6 +3874,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(1)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -4047,6 +4258,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(1.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -4100,6 +4312,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(1.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -4151,6 +4364,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(1.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -4200,6 +4414,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(1.5)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -4281,6 +4496,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -4398,6 +4614,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(2.5)),
+                    wrapped_amount: None,
                     direction: Direction::Sell,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -4453,6 +4670,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(2)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -4507,6 +4725,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -4562,6 +4781,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -4763,6 +4983,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(2)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -4815,6 +5036,7 @@ mod tests {
                         log_index: 1,
                     },
                     amount: FractionalShares::new(float!(2)),
+                    wrapped_amount: None,
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_timestamp: Utc::now(),
@@ -4858,6 +5080,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(2)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -4912,6 +5135,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(2)),
+                wrapped_amount: None,
                 direction: Direction::Sell,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -4968,6 +5192,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -5029,6 +5254,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -5103,6 +5329,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -5174,6 +5401,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -5253,6 +5481,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -5327,6 +5556,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp: Utc::now(),
@@ -5408,6 +5638,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
@@ -5449,6 +5680,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1)),
+                wrapped_amount: None,
                 direction: Direction::Sell,
                 price_usdc: float!(150),
                 block_timestamp,
@@ -5501,6 +5733,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1.5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
@@ -5597,6 +5830,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(5)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
@@ -5657,6 +5891,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
@@ -5708,6 +5943,7 @@ mod tests {
                     log_index: 1,
                 },
                 amount: FractionalShares::new(float!(1)),
+                wrapped_amount: None,
                 direction: Direction::Buy,
                 price_usdc: float!(150),
                 block_timestamp,
@@ -5750,6 +5986,7 @@ mod tests {
             },
             direction: Direction::Buy,
             amount: FractionalShares::new(float!(10)),
+            wrapped_amount: None,
             price_usdc: float!(150),
             block_timestamp: Utc::now(),
             block_number: None,
@@ -5783,6 +6020,7 @@ mod tests {
                 log_index: 0,
             },
             amount: FractionalShares::new(float!(1)),
+            wrapped_amount: None,
             direction: Direction::Buy,
             price_usdc: float!(150),
             block_timestamp,

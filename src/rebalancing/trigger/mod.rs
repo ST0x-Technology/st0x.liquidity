@@ -3413,12 +3413,17 @@ impl RebalancingService {
             OnChainOrderFilled {
                 trade_id,
                 amount,
+                wrapped_amount,
                 direction,
                 price_usdc,
                 block_number,
                 ..
             } => {
                 let equity_op: Operator = (*direction).into();
+                // Vault slots hold wrapped shares. Legacy fills predate the
+                // wrapped quantity and were recorded 1:1, so their amount is
+                // already in wrapped shares.
+                let inventory_amount = wrapped_amount.unwrap_or(*amount);
                 let quantity: Float = (*amount).into();
                 let usdc_value = (*price_usdc * quantity)?;
 
@@ -3489,14 +3494,14 @@ impl RebalancingService {
                     // zero, but never manufacture zero for an absent slot.
                     let equity_delta = if apply_equity_leg && equity_op == Operator::Remove {
                         match inventory.onchain_equity_available_at(&symbol, trade_id.chain) {
-                            Some(available) if available.inner().lt(amount.inner())? => {
+                            Some(available) if available.inner().lt(inventory_amount.inner())? => {
                                 equity_reconciled = false;
                                 warn!(
                                     target: "rebalance",
                                     %symbol,
                                     chain = %trade_id.chain,
                                     ?block_number,
-                                    requested = %amount,
+                                    requested = %inventory_amount,
                                     available = %available,
                                     "Onchain fill arrived after inventory had already \
                                      moved below its equity delta; consuming the \
@@ -3505,15 +3510,15 @@ impl RebalancingService {
                                 );
                                 available
                             }
-                            Some(_) => *amount,
+                            Some(_) => inventory_amount,
                             None => {
                                 apply_equity_leg = false;
                                 equity_reconciled = false;
-                                *amount
+                                inventory_amount
                             }
                         }
                     } else {
-                        *amount
+                        inventory_amount
                     };
                     let usdc_delta = if apply_usdc_leg && equity_op.inverse() == Operator::Remove {
                         match inventory.onchain_usdc_available_at(trade_id.chain) {
@@ -12424,6 +12429,7 @@ mod tests {
                 log_index: 0,
             },
             amount,
+            wrapped_amount: None,
             direction,
             price_usdc: float!(150),
             block_timestamp,
@@ -12444,6 +12450,7 @@ mod tests {
                 log_index: 0,
             },
             amount,
+            wrapped_amount: None,
             direction,
             price_usdc: float!(150),
             block_timestamp: Utc::now(),
@@ -12464,6 +12471,7 @@ mod tests {
                 log_index: 0,
             },
             amount,
+            wrapped_amount: None,
             direction,
             price_usdc: float!(150),
             block_timestamp: Utc::now(),
@@ -15161,6 +15169,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(onchain_usdc, usdc(11500));
+    }
+
+    #[tokio::test]
+    async fn normalized_onchain_fill_updates_inventory_in_wrapped_shares() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(usdc(10000), usdc(10000))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor);
+        let mut event = make_onchain_fill(FractionalShares::new(float!(10.1)), Direction::Sell);
+        let PositionEvent::OnChainOrderFilled { wrapped_amount, .. } = &mut event else {
+            unreachable!("make_onchain_fill always returns an onchain fill");
+        };
+        *wrapped_amount = Some(shares(10));
+
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(90)),
+            "inventory vault slots must apply the raw wrapped-share delta"
+        );
     }
 
     /// A fill on a hedged secondary chain belongs to that chain: it moves

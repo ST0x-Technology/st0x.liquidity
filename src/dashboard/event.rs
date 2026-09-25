@@ -3181,6 +3181,7 @@ mod tests {
                         log_index: 0,
                     },
                     amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(1)),
+                    wrapped_amount: None,
                     direction: st0x_execution::Direction::Buy,
                     price_usdc: st0x_float_macro::float!(150),
                     block_timestamp: now,

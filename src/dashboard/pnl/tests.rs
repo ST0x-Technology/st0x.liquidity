@@ -76,6 +76,7 @@ fn onchain_fill(
         direction,
         price_usd: price.to_owned(),
         executed_at: timestamp.to_owned(),
+        underlying_per_wrapped_fixed18: Some(st0x_wrapper::RATIO_ONE.to_string()),
     })
 }
 
@@ -533,25 +534,38 @@ fn exec_direction(direction: Direction) -> st0x_execution::Direction {
     }
 }
 
-fn onchain_fill_event(
+fn normalized_onchain_fill(
     direction: Direction,
     price: &str,
     shares: &str,
     timestamp: &str,
-) -> PositionEvent {
-    PositionEvent::OnChainOrderFilled {
-        trade_id: TradeId {
-            chain: Chain::Base,
-            tx_hash: TxHash::random(),
-            log_index: 0,
+) -> SeedEvent {
+    let trade_id = TradeId {
+        chain: Chain::Base,
+        tx_hash: TxHash::random(),
+        log_index: 0,
+    };
+    let recorded_at = parse_timestamp(timestamp).unwrap();
+    SeedEvent::NormalizedPositionFill(
+        "RKLB",
+        PositionEvent::OnChainOrderFilled {
+            trade_id: trade_id.clone(),
+            amount: FractionalShares::new(Float::parse(shares.to_owned()).unwrap()),
+            wrapped_amount: Some(FractionalShares::new(
+                Float::parse(shares.to_owned()).unwrap(),
+            )),
+            direction: exec_direction(direction),
+            price_usdc: Float::parse(price.to_owned()).unwrap(),
+            block_timestamp: recorded_at,
+            block_number: None,
+            seen_at: recorded_at,
         },
-        amount: FractionalShares::new(Float::parse(shares.to_owned()).unwrap()),
-        direction: exec_direction(direction),
-        price_usdc: Float::parse(price.to_owned()).unwrap(),
-        block_timestamp: parse_timestamp(timestamp).unwrap(),
-        block_number: None,
-        seen_at: parse_timestamp(timestamp).unwrap(),
-    }
+        PositionEvent::OnChainFillApplied {
+            trade_id,
+            underlying_per_wrapped: Some(st0x_wrapper::RATIO_ONE),
+            applied_at: recorded_at,
+        },
+    )
 }
 
 fn offchain_fill_event(
@@ -640,6 +654,7 @@ fn bot_gas_cost(usd_cost: Float) -> BotGasReceiptCost {
 /// rowid order the ledger ingests and watermarks by.
 enum SeedEvent {
     Position(&'static str, PositionEvent),
+    NormalizedPositionFill(&'static str, PositionEvent, PositionEvent),
     Mint(String, TokenizedEquityMintEvent),
     Rebalance(String, UsdcRebalanceEvent),
     BotGas(String, BotGasReceiptCostEvent),
@@ -755,6 +770,10 @@ async fn pnl_test_pool(seed: Vec<SeedEvent>, positions: Vec<PositionViewRow>) ->
             SeedEvent::Position(symbol, event) => {
                 persist_event::<Position>(&pool, symbol, next_sequence(symbol), &event).await;
             }
+            SeedEvent::NormalizedPositionFill(symbol, fill, applied) => {
+                persist_event::<Position>(&pool, symbol, next_sequence(symbol), &fill).await;
+                persist_event::<Position>(&pool, symbol, next_sequence(symbol), &applied).await;
+            }
             SeedEvent::Mint(id, event) => {
                 persist_event::<TokenizedEquityMint>(&pool, &id, next_sequence(&id), &event).await;
             }
@@ -851,6 +870,158 @@ fn maps_prompt_counter_trades_into_counter_trade_pnl() {
     assert_eq!(report.summary.total_pnl_usd, "2");
     assert_eq!(report.entries[0].pnl_bucket, PnlBucket::CounterTrade);
     assert!(!report.entries[0].delayed_counter_trade);
+}
+
+#[test]
+fn legacy_fill_without_wrapper_ratio_counts_one_to_one_with_a_warning() {
+    let mut legacy_fill = onchain_sell(1, "100", "2026-05-15T14:00:00Z");
+    let PositionLedgerRow::OnchainFill(fill) = &mut legacy_fill else {
+        unreachable!("onchain_sell always returns an onchain fill");
+    };
+    fill.underlying_per_wrapped_fixed18 = None;
+
+    let report = report(vec![
+        legacy_fill,
+        offchain_buy(2, "2026-05-15T14:01:00Z", "99", "1"),
+    ]);
+
+    assert_eq!(report.summary.counter_trade_pnl_usd, "1");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("Onchain fills for RKLB in this range")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn legacy_fill_outside_the_range_raises_no_warning() {
+    let mut legacy_fill = onchain_sell(1, "100", "2026-05-14T14:00:00Z");
+    let PositionLedgerRow::OnchainFill(fill) = &mut legacy_fill else {
+        unreachable!("onchain_sell always returns an onchain fill");
+    };
+    fill.underlying_per_wrapped_fixed18 = None;
+
+    let report = report(vec![
+        legacy_fill,
+        onchain_sell(2, "100", "2026-05-15T14:00:00Z"),
+        offchain_buy(3, "2026-05-15T14:01:00Z", "99", "1"),
+    ]);
+
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("before per-fill wrapper ratios")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn legacy_fill_on_a_proven_one_to_one_wrapper_raises_no_warning() {
+    let mut legacy_fill = onchain_sell(1, "100", "2026-05-15T13:00:00Z");
+    let PositionLedgerRow::OnchainFill(fill) = &mut legacy_fill else {
+        unreachable!("onchain_sell always returns an onchain fill");
+    };
+    fill.underlying_per_wrapped_fixed18 = None;
+
+    let report = report(vec![
+        legacy_fill,
+        onchain_sell(2, "100", "2026-05-15T14:00:00Z"),
+        offchain_buy(3, "2026-05-15T14:01:00Z", "99", "2"),
+    ]);
+
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("before per-fill wrapper ratios")),
+        "a symbol whose recorded ratios are all 1 is exact: {:?}",
+        report.warnings
+    );
+}
+
+/// The case the 1:1 legacy treatment accepts on purpose: a legacy lot in
+/// wrapped shares at a per-wrapped price, matched in the same book against a
+/// new fill in underlying shares at a per-underlying price.
+#[test]
+fn legacy_wrapped_lot_matches_a_new_underlying_fill_at_ratio_above_one() {
+    let mut legacy_buy = onchain_fill(
+        1,
+        "SGOV",
+        Direction::Buy,
+        "100.5",
+        "10",
+        "2026-05-15T13:00:00Z",
+    );
+    let PositionLedgerRow::OnchainFill(fill) = &mut legacy_buy else {
+        unreachable!("onchain_fill always returns an onchain fill");
+    };
+    fill.underlying_per_wrapped_fixed18 = None;
+    let mut new_sell = onchain_fill(
+        2,
+        "SGOV",
+        Direction::Sell,
+        "100",
+        "10.1",
+        "2026-05-15T14:00:00Z",
+    );
+    let PositionLedgerRow::OnchainFill(fill) = &mut new_sell else {
+        unreachable!("onchain_fill always returns an onchain fill");
+    };
+    fill.underlying_per_wrapped_fixed18 = Some("1010000000000000000".to_owned());
+
+    let report = report_with(
+        vec![legacy_buy, new_sell],
+        &[position_row("SGOV", "-0.1")],
+        &[],
+        &[],
+        &query(),
+        &BTreeSet::new(),
+    );
+
+    let sgov = symbol_summary(&report, "SGOV");
+    assert_eq!(
+        sgov.onchain_netting_pnl_usd, "-5",
+        "10 matched shares at 100 against 100.5"
+    );
+    assert_eq!(sgov.open_short_shares, "0.1");
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("Reconciliation note")),
+        "the replay net must still agree with the Position view: {:?}",
+        report.warnings
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("Onchain fills for SGOV in this range")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn fills_with_a_wrapper_ratio_raise_no_legacy_warning() {
+    let report = report(vec![
+        onchain_sell(1, "100", "2026-05-15T14:00:00Z"),
+        offchain_buy(2, "2026-05-15T14:01:00Z", "99", "1"),
+    ]);
+
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("before per-fill wrapper ratios")),
+        "{:?}",
+        report.warnings
+    );
 }
 
 #[test]
@@ -1046,10 +1217,7 @@ fn corrupt_manual_adjustment_decimals_fail_the_report() {
 async fn source_loader_includes_manual_position_adjustments() {
     let pool = pnl_test_pool(
         vec![
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T13:00:00Z"),
-            ),
+            normalized_onchain_fill(Direction::Sell, "10", "1", "2026-05-15T13:00:00Z"),
             SeedEvent::Position(
                 "RKLB",
                 manual_adjustment_event("0", None, "2026-05-15T13:30:00Z"),
@@ -1155,10 +1323,7 @@ async fn source_loader_includes_persisted_cost_events() {
 async fn source_loader_includes_persisted_bot_gas_costs() {
     let pool = pnl_test_pool(
         vec![
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
-            ),
+            normalized_onchain_fill(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
             SeedEvent::Position(
                 "RKLB",
                 offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
@@ -1190,10 +1355,7 @@ async fn source_loader_includes_persisted_bot_gas_costs() {
 async fn source_loader_excludes_bot_gas_recorded_after_snapshot() {
     let pool = pnl_test_pool(
         vec![
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
-            ),
+            normalized_onchain_fill(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
             SeedEvent::Position(
                 "RKLB",
                 offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
@@ -1207,7 +1369,7 @@ async fn source_loader_excludes_bot_gas_recorded_after_snapshot() {
     let report = build_pnl_report(
         &pool,
         &PnlQuery {
-            as_of_rowid: Some(2),
+            as_of_rowid: Some(3),
             ..query()
         },
         Vec::new(),
@@ -1216,10 +1378,47 @@ async fn source_loader_excludes_bot_gas_recorded_after_snapshot() {
     .await
     .unwrap();
 
-    assert_eq!(report.as_of_rowid, 2);
+    assert_eq!(report.as_of_rowid, 3);
     assert_eq!(report.costs.bot_gas_usd, "0");
     assert_eq!(cost_coverage_status(&report, "Bot gas"), "not_ingested");
     assert!(report.cost_entries.is_empty());
+}
+
+#[tokio::test]
+async fn source_loader_does_not_expose_ratio_recorded_after_snapshot() {
+    let pool = pnl_test_pool(
+        vec![
+            normalized_onchain_fill(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
+            SeedEvent::Position(
+                "RKLB",
+                offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
+            ),
+        ],
+        position_rows(),
+    )
+    .await;
+
+    let report = build_pnl_report(
+        &pool,
+        &PnlQuery {
+            as_of_rowid: Some(1),
+            ..query()
+        },
+        Vec::new(),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.as_of_rowid, 1);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("Onchain fills for RKLB in this range")),
+        "a ratio recorded after the snapshot must not be visible to it: {:?}",
+        report.warnings
+    );
 }
 
 #[tokio::test]
@@ -1248,18 +1447,12 @@ async fn source_loader_respects_as_of_rowid_for_position_and_cost_events() {
     let mint_id = Uuid::new_v4().to_string();
     let pool = pnl_test_pool(
         vec![
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
-            ),
+            normalized_onchain_fill(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
             SeedEvent::Position(
                 "RKLB",
                 offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
             ),
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(Direction::Sell, "20", "1", "2026-05-15T15:00:00Z"),
-            ),
+            normalized_onchain_fill(Direction::Sell, "20", "1", "2026-05-15T15:00:00Z"),
             SeedEvent::Position(
                 "RKLB",
                 offchain_fill_event(Direction::Buy, "17", "1", "2026-05-15T15:01:00Z"),
@@ -1280,7 +1473,7 @@ async fn source_loader_respects_as_of_rowid_for_position_and_cost_events() {
     let report = build_pnl_report(
         &pool,
         &PnlQuery {
-            as_of_rowid: Some(2),
+            as_of_rowid: Some(3),
             ..query()
         },
         Vec::new(),
@@ -1289,7 +1482,7 @@ async fn source_loader_respects_as_of_rowid_for_position_and_cost_events() {
     .await
     .unwrap();
 
-    assert_eq!(report.as_of_rowid, 2);
+    assert_eq!(report.as_of_rowid, 3);
     assert_eq!(report.total, 1);
     assert_eq!(report.summary.gross_realized_pnl_usd, "2");
     assert_eq!(report.summary.tracked_costs_usd, "0");
@@ -1299,9 +1492,11 @@ async fn source_loader_respects_as_of_rowid_for_position_and_cost_events() {
 #[tokio::test]
 async fn source_loader_rejects_future_as_of_rowid() {
     let pool = pnl_test_pool(
-        vec![SeedEvent::Position(
-            "RKLB",
-            onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
+        vec![normalized_onchain_fill(
+            Direction::Sell,
+            "10",
+            "1",
+            "2026-05-15T14:00:00Z",
         )],
         position_rows(),
     )
@@ -1310,7 +1505,7 @@ async fn source_loader_rejects_future_as_of_rowid() {
     let error = build_pnl_report(
         &pool,
         &PnlQuery {
-            as_of_rowid: Some(2),
+            as_of_rowid: Some(3),
             ..query()
         },
         Vec::new(),
@@ -1319,7 +1514,7 @@ async fn source_loader_rejects_future_as_of_rowid() {
     .await
     .unwrap_err();
 
-    assert!(matches!(error, PnlError::InvalidSnapshotRowid { value: 2 }));
+    assert!(matches!(error, PnlError::InvalidSnapshotRowid { value: 3 }));
 }
 
 #[test]
@@ -2943,26 +3138,17 @@ async fn build_pnl_report_populates_capital_when_snapshots_exist() {
 async fn return_uses_only_pnl_from_days_with_usable_capital() {
     let pool = pnl_test_pool(
         vec![
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
-            ),
+            normalized_onchain_fill(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
             SeedEvent::Position(
                 "RKLB",
                 offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
             ),
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(Direction::Sell, "110", "1", "2026-05-16T14:00:00Z"),
-            ),
+            normalized_onchain_fill(Direction::Sell, "110", "1", "2026-05-16T14:00:00Z"),
             SeedEvent::Position(
                 "RKLB",
                 offchain_fill_event(Direction::Buy, "10", "1", "2026-05-16T14:01:00Z"),
             ),
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-17T14:00:00Z"),
-            ),
+            normalized_onchain_fill(Direction::Sell, "10", "1", "2026-05-17T14:00:00Z"),
             SeedEvent::Position(
                 "RKLB",
                 offchain_fill_event(Direction::Buy, "8", "1", "2026-05-17T14:01:00Z"),
@@ -3023,14 +3209,11 @@ async fn high_precision_derived_prices_do_not_break_the_capital_calculation() {
 
     let pool = pnl_test_pool(
         vec![
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(
-                    Direction::Sell,
-                    DERIVED_PRICE,
-                    "0.029847962456751639",
-                    "2026-05-15T14:00:00Z",
-                ),
+            normalized_onchain_fill(
+                Direction::Sell,
+                DERIVED_PRICE,
+                "0.029847962456751639",
+                "2026-05-15T14:00:00Z",
             ),
             SeedEvent::Position(
                 "RKLB",
@@ -3290,10 +3473,7 @@ async fn build_pnl_report_empty_symbol_param_preserves_capital() {
 async fn build_pnl_report_as_of_rowid_non_current_omits_capital_with_warning() {
     let pool = pnl_test_pool(
         vec![
-            SeedEvent::Position(
-                "RKLB",
-                onchain_fill_event(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
-            ),
+            normalized_onchain_fill(Direction::Sell, "10", "1", "2026-05-15T14:00:00Z"),
             SeedEvent::Position(
                 "RKLB",
                 offchain_fill_event(Direction::Buy, "8", "1", "2026-05-15T14:01:00Z"),
