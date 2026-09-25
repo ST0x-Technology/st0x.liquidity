@@ -140,7 +140,7 @@ use futures::lock::Mutex;
 use std::cmp::Ordering;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::inflight_nonces::{InFlightNonces, NonceOwnership};
 use crate::nonce::ResettableNonceManager;
@@ -458,12 +458,20 @@ pub(crate) async fn discard_prepared(
     tx_hash: TxHash,
 ) {
     let _guard = send_lock.lock().await;
-    in_flight.release_durable_by_hash(address, tx_hash).await;
-    warn!(
-        target: "wallet",
-        %tx_hash,
-        "Discarding withdrawal and releasing its nonce reservation"
-    );
+    if in_flight.release_durable_by_hash(address, tx_hash).await {
+        warn!(
+            target: "wallet",
+            %tx_hash,
+            "Discarding withdrawal and releasing its nonce reservation"
+        );
+    } else {
+        debug!(
+            target: "wallet",
+            %tx_hash,
+            "Discarding withdrawal that no longer holds a nonce reservation \
+             (already released or its nonce reallocated)"
+        );
+    }
 }
 
 /// Re-reserve the nonce of a persisted prepared transaction after restart and
