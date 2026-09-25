@@ -219,9 +219,8 @@ impl UsdcRebalanceStage {
             | BridgingSubmitting { .. }
             | PendingBurnRecorded { .. }
             | PendingBurnCleared { .. }
-            | DepositSendSubmitting { .. }
+            | DepositSendPrepared { .. }
             | PendingDepositRecorded { .. }
-            | DepositSendAborted { .. }
             | DepositSendAttached { .. }
             | AttestationTimedOut { .. }
             | ConversionConfirmed { .. }
@@ -893,9 +892,8 @@ impl RebalancingService {
             | BridgingSubmitting { .. }
             | PendingBurnRecorded { .. }
             | PendingBurnCleared { .. }
-            | DepositSendSubmitting { .. }
+            | DepositSendPrepared { .. }
             | PendingDepositRecorded { .. }
-            | DepositSendAborted { .. }
             | DepositSendAttached { .. }
             | AttestationTimedOut { .. } => UsdcSettlementOutcome::Reconciled,
             // Withdrawal failure is always pre-burn -> reconcile to source.

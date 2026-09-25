@@ -13,8 +13,8 @@ use tracing::{debug, info, trace, warn};
 #[cfg(test)]
 use st0x_evm::Evm;
 use st0x_evm::{
-    BroadcastError, EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
-    Wallet, wait_for_node_sync,
+    EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    PreparedTransaction, Wallet, wait_for_node_sync,
 };
 
 use super::{
@@ -813,21 +813,21 @@ impl<W: Wallet> CctpEndpoint<W> {
         usdc_credit_in_receipt(&receipt, self.usdc_address, Some(sender), recipient)
     }
 
-    /// Broadcasts a transfer of `amount` of this endpoint's USDC from the
-    /// wallet to `to` and returns its tx hash without awaiting the receipt.
+    /// Signs a transfer of `amount` of this endpoint's USDC from the wallet to
+    /// `to` without broadcasting it, reserving its nonce.
     ///
     /// This is the fund-moving leg of a BaseToAlpaca deposit: the CCTP mint
     /// credits the bot wallet, and this transfer forwards the minted USDC to
-    /// Alpaca's deposit address. The caller records the hash before
-    /// [`confirm_usdc`](Self::confirm_usdc) awaits the receipt. A failure
-    /// tells whether the transfer may have reached the network.
-    pub(super) async fn submit_usdc(
+    /// Alpaca's deposit address. The caller persists the signed transfer
+    /// before [`broadcast_usdc`](Self::broadcast_usdc) sends it, so every
+    /// retry sends the same bytes and no second transfer can exist.
+    pub(super) async fn prepare_usdc(
         &self,
         to: Address,
         amount: U256,
-    ) -> Result<TxHash, BroadcastError> {
+    ) -> Result<PreparedTransaction, EvmError> {
         self.wallet
-            .send_pending_classified(
+            .prepare_pending(
                 self.usdc_address,
                 Bytes::from(IERC20::transferCall { to, amount }.abi_encode()),
                 "USDC deposit to Alpaca",
@@ -835,8 +835,28 @@ impl<W: Wallet> CctpEndpoint<W> {
             .await
     }
 
+    /// Broadcasts a transfer signed by [`prepare_usdc`](Self::prepare_usdc).
+    /// Idempotent: a repeat sends the same bytes, and "already known" is
+    /// success.
+    pub(super) async fn broadcast_usdc(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, EvmError> {
+        self.wallet
+            .broadcast_prepared(prepared, "USDC deposit to Alpaca")
+            .await
+    }
+
+    pub(super) async fn discard_usdc(&self, prepared: &PreparedTransaction) {
+        self.wallet.discard_prepared(prepared).await;
+    }
+
+    pub(super) async fn restore_usdc(&self, prepared: &PreparedTransaction) {
+        self.wallet.restore_prepared(prepared).await;
+    }
+
     /// Awaits the receipt of a transfer broadcast by
-    /// [`submit_usdc`](Self::submit_usdc) to the wallet's confirmation depth.
+    /// [`broadcast_usdc`](Self::broadcast_usdc) to the wallet's confirmation depth.
     /// A revert (decoded via `Registry`) and a drop are reported as statuses;
     /// any other error leaves the outcome unknown.
     pub(super) async fn confirm_usdc<Registry: IntoErrorRegistry>(
