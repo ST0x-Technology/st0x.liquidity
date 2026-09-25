@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use alloy::primitives::TxHash;
+use alloy::primitives::{TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use metrics::gauge;
@@ -333,7 +333,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 10;
+    const SCHEMA_VERSION: u64 = 11;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -573,7 +573,10 @@ impl EventSourced for Position {
                     block_number,
                 },
                 Utc::now(),
+                None,
             )),
+
+            AcknowledgeNormalizedOnChainFill(command) => Ok(command.initialize(Utc::now())),
 
             #[cfg(any(test, feature = "test-support"))]
             AcknowledgeOnChainFillAt {
@@ -598,6 +601,7 @@ impl EventSourced for Position {
                     block_number,
                 },
                 seen_at,
+                None,
             )),
 
             ReserveEquityTransfer {
@@ -720,7 +724,10 @@ impl EventSourced for Position {
                     block_number,
                 },
                 Utc::now(),
+                None,
             ),
+
+            AcknowledgeNormalizedOnChainFill(command) => command.transition(self, Utc::now()),
 
             #[cfg(any(test, feature = "test-support"))]
             AcknowledgeOnChainFillAt {
@@ -742,6 +749,7 @@ impl EventSourced for Position {
                     block_number,
                 },
                 seen_at,
+                None,
             ),
 
             ReserveEquityTransfer { reservation_id, .. } => {
@@ -815,18 +823,14 @@ impl EventSourced for Position {
                 executor_order_id,
                 price,
                 broker_timestamp,
-            } => {
-                self.validate_pending_execution(offchain_order_id)?;
-
-                Ok(vec![PositionEvent::OffChainOrderFilled {
-                    offchain_order_id,
-                    shares_filled,
-                    direction,
-                    executor_order_id,
-                    price,
-                    broker_timestamp,
-                }])
-            }
+            } => self.complete_offchain_order_events(
+                offchain_order_id,
+                shares_filled,
+                direction,
+                executor_order_id,
+                price,
+                broker_timestamp,
+            ),
 
             FailOffChainOrder {
                 offchain_order_id,
@@ -1019,6 +1023,7 @@ impl Position {
         threshold: ExecutionThreshold,
         fill: OnChainFillFacts,
         seen_at: DateTime<Utc>,
+        underlying_per_wrapped: Option<U256>,
     ) -> Vec<PositionEvent> {
         let OnChainFillFacts {
             trade_id,
@@ -1028,7 +1033,6 @@ impl Position {
             block_timestamp,
             block_number,
         } = fill;
-
         vec![
             PositionEvent::Initialized {
                 symbol,
@@ -1046,6 +1050,7 @@ impl Position {
             },
             PositionEvent::OnChainFillApplied {
                 trade_id,
+                underlying_per_wrapped,
                 applied_at: seen_at,
             },
         ]
@@ -1055,6 +1060,7 @@ impl Position {
         &self,
         fill: OnChainFillFacts,
         seen_at: DateTime<Utc>,
+        underlying_per_wrapped: Option<U256>,
     ) -> Result<Vec<PositionEvent>, PositionError> {
         let OnChainFillFacts {
             trade_id,
@@ -1088,6 +1094,7 @@ impl Position {
             },
             PositionEvent::OnChainFillApplied {
                 trade_id,
+                underlying_per_wrapped,
                 applied_at: seen_at,
             },
         ])
@@ -1437,6 +1444,27 @@ impl Position {
         Ok(())
     }
 
+    fn complete_offchain_order_events(
+        &self,
+        offchain_order_id: OffchainOrderId,
+        shares_filled: Positive<FractionalShares>,
+        direction: Direction,
+        executor_order_id: ExecutorOrderId,
+        price: Usd,
+        broker_timestamp: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        self.validate_pending_execution(offchain_order_id)?;
+
+        Ok(vec![PositionEvent::OffChainOrderFilled {
+            offchain_order_id,
+            shares_filled,
+            direction,
+            executor_order_id,
+            price,
+            broker_timestamp,
+        }])
+    }
+
     /// Validates a manual position adjustment before emitting events.
     ///
     /// Enforces optimistic concurrency (the live net must still match what the
@@ -1689,6 +1717,75 @@ impl From<FloatError> for PositionError {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct NormalizedOnChainFillCommand {
+    pub symbol: Symbol,
+    pub threshold: ExecutionThreshold,
+    pub trade_id: TradeId,
+    pub amount: FractionalShares,
+    pub direction: Direction,
+    #[serde(
+        serialize_with = "st0x_float_serde::serialize_float_as_string",
+        deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+    )]
+    pub price_usdc: Float,
+    pub block_timestamp: DateTime<Utc>,
+    pub block_number: Option<u64>,
+    pub underlying_per_wrapped: U256,
+}
+
+impl NormalizedOnChainFillCommand {
+    fn fill(&self) -> OnChainFillFacts {
+        OnChainFillFacts {
+            trade_id: self.trade_id.clone(),
+            amount: self.amount,
+            direction: self.direction,
+            price_usdc: self.price_usdc,
+            block_timestamp: self.block_timestamp,
+            block_number: self.block_number,
+        }
+    }
+
+    fn initialize(self, seen_at: DateTime<Utc>) -> Vec<PositionEvent> {
+        Position::acknowledge_on_chain_fill_init_events(
+            self.symbol.clone(),
+            self.threshold,
+            self.fill(),
+            seen_at,
+            Some(self.underlying_per_wrapped),
+        )
+    }
+
+    fn transition(
+        self,
+        position: &Position,
+        seen_at: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        position.acknowledge_on_chain_fill_transition_events(
+            self.fill(),
+            seen_at,
+            Some(self.underlying_per_wrapped),
+        )
+    }
+}
+
+impl std::fmt::Debug for NormalizedOnChainFillCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcknowledgeNormalizedOnChainFill")
+            .field("symbol", &self.symbol)
+            .field("threshold", &self.threshold)
+            .field("trade_id", &self.trade_id)
+            .field("amount", &self.amount)
+            .field("direction", &self.direction)
+            .field("price_usdc", &DebugFloat(&self.price_usdc))
+            .field("block_timestamp", &self.block_timestamp)
+            .field("block_number", &self.block_number)
+            .field("underlying_per_wrapped", &self.underlying_per_wrapped)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub enum PositionCommand {
     AcknowledgeOnChainFill {
         symbol: Symbol,
@@ -1704,6 +1801,9 @@ pub enum PositionCommand {
         /// against the onchain snapshot block watermark (ADR 0018).
         block_number: Option<u64>,
     },
+    /// Production fill command after the wrapped quantity and price have been
+    /// normalized into broker-share units at the confirmed block.
+    AcknowledgeNormalizedOnChainFill(NormalizedOnChainFillCommand),
     /// Test/fixture-only: identical to `AcknowledgeOnChainFill` but takes
     /// `seen_at` explicitly instead of stamping `Utc::now()`, so fixture
     /// seeding (e.g. `nix run .#simulate-14d`) can backdate synthetic
@@ -1865,6 +1965,10 @@ pub enum PositionEvent {
     /// empty on full replay instead of re-accumulating every trade id.
     OnChainFillApplied {
         trade_id: TradeId,
+        /// Exact ERC-4626 conversion basis used to normalize this wrapped
+        /// fill into underlying shares. Legacy events deserialize as `None`.
+        #[serde(default)]
+        underlying_per_wrapped: Option<U256>,
         applied_at: DateTime<Utc>,
     },
     /// Prunes `trade_id` from the pending-acknowledgement set once its
@@ -2058,13 +2162,15 @@ impl PartialEq for PositionEvent {
             (
                 Self::OnChainFillApplied {
                     trade_id: t1,
+                    underlying_per_wrapped: upw1,
                     applied_at: a1,
                 },
                 Self::OnChainFillApplied {
                     trade_id: t2,
+                    underlying_per_wrapped: upw2,
                     applied_at: a2,
                 },
-            ) => t1 == t2 && a1 == a2,
+            ) => t1 == t2 && upw1 == upw2 && a1 == a2,
             (
                 Self::OnChainFillSettled {
                     trade_id: t1,
@@ -2340,6 +2446,7 @@ impl std::fmt::Debug for PositionCommand {
                 .field("block_timestamp", block_timestamp)
                 .field("block_number", block_number)
                 .finish(),
+            Self::AcknowledgeNormalizedOnChainFill(command) => command.fmt(f),
             #[cfg(any(test, feature = "test-support"))]
             Self::AcknowledgeOnChainFillAt {
                 symbol,
@@ -2544,10 +2651,12 @@ impl std::fmt::Debug for PositionEvent {
                 .finish(),
             Self::OnChainFillApplied {
                 trade_id,
+                underlying_per_wrapped,
                 applied_at,
             } => f
                 .debug_struct("OnChainFillApplied")
                 .field("trade_id", trade_id)
+                .field("underlying_per_wrapped", underlying_per_wrapped)
                 .field("applied_at", applied_at)
                 .finish(),
             Self::OnChainFillSettled {
@@ -3168,6 +3277,7 @@ mod tests {
                 },
                 PositionEvent::OnChainFillApplied {
                     trade_id: trade_a.clone(),
+                    underlying_per_wrapped: None,
                     applied_at: now,
                 },
                 PositionEvent::OnChainOrderFilled {
@@ -3181,6 +3291,7 @@ mod tests {
                 },
                 PositionEvent::OnChainFillApplied {
                     trade_id: trade_b,
+                    underlying_per_wrapped: None,
                     applied_at: now,
                 },
             ])
@@ -3296,6 +3407,7 @@ mod tests {
             },
             PositionEvent::OnChainFillApplied {
                 trade_id: trade_a.clone(),
+                underlying_per_wrapped: None,
                 applied_at: now,
             },
             PositionEvent::OnChainFillSettled {
@@ -3313,6 +3425,7 @@ mod tests {
             },
             PositionEvent::OnChainFillApplied {
                 trade_id: trade_b.clone(),
+                underlying_per_wrapped: None,
                 applied_at: now,
             },
         ])
@@ -3355,6 +3468,7 @@ mod tests {
                 },
                 PositionEvent::OnChainFillApplied {
                     trade_id: trade_id.clone(),
+                    underlying_per_wrapped: None,
                     applied_at: now,
                 },
             ])

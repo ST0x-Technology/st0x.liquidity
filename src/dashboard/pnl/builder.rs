@@ -99,6 +99,43 @@ fn remove_tokenization_fee_overlaps(
     Ok(retained)
 }
 
+/// Removes every event for symbols whose historical wrapped-share basis cannot
+/// be proven, preventing later broker fills from matching against wrong units.
+fn exclude_symbols_without_wrapped_fill_basis(
+    event_rows: &mut Vec<PositionLedgerRow>,
+    warnings: &mut Vec<String>,
+) -> BTreeSet<Symbol> {
+    let unavailable_symbols: BTreeSet<Symbol> = event_rows
+        .iter()
+        .filter_map(|row| match row {
+            PositionLedgerRow::OnchainFill(fill)
+                if fill.underlying_per_wrapped_fixed18.is_none() =>
+            {
+                Symbol::new(fill.symbol.clone()).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    if !unavailable_symbols.is_empty() {
+        let joined = unavailable_symbols
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(format!(
+            "P&L is unavailable for {joined}: legacy wrapped fills have no proven \
+             underlying-per-wrapped ratio"
+        ));
+        event_rows.retain(|row| {
+            Symbol::new(row.symbol().to_owned())
+                .map(|symbol| !unavailable_symbols.contains(&symbol))
+                .unwrap_or(true)
+        });
+    }
+
+    unavailable_symbols
+}
+
 /// Builds the `/pnl` response from already-loaded rows and returns net realized
 /// PnL bucketed by ET accounting day for the aligned capital calculation.
 pub(crate) fn build_pnl_response_from_rows(
@@ -111,7 +148,7 @@ pub(crate) fn build_pnl_response_from_rows(
     symbols: &BTreeSet<String>,
     mut warnings: Vec<String>,
 ) -> Result<(PnlResponse, BTreeMap<NaiveDate, Float>), PnlError> {
-    let event_rows = if symbols.is_empty() {
+    let mut event_rows = if symbols.is_empty() {
         event_rows
     } else {
         event_rows
@@ -119,6 +156,8 @@ pub(crate) fn build_pnl_response_from_rows(
             .filter(|row| symbols.contains(row.symbol()))
             .collect()
     };
+    let unavailable_symbols =
+        exclude_symbols_without_wrapped_fill_basis(&mut event_rows, &mut warnings);
     let (position_nets, position_symbols) = parse_position_view(position_rows, &mut warnings)?;
     let available_range = build_available_range(&event_rows, &mut warnings);
     let sample_stats = build_sample_stats(&event_rows, query, &mut warnings);
@@ -221,6 +260,12 @@ pub(crate) fn build_pnl_response_from_rows(
         .entries
         .into_iter()
         .filter(|entry| matches_cost_symbol_filter(entry, symbols))
+        .filter(|entry| {
+            entry
+                .symbol
+                .as_ref()
+                .is_none_or(|symbol| !unavailable_symbols.contains(symbol))
+        })
         .filter(|entry| matches_cost_date_filter(entry, query))
         .collect();
     let filtered_alpaca_entry_count = filtered_cost_entries
@@ -301,6 +346,7 @@ pub(crate) fn build_pnl_response_from_rows(
             costs: cost_summary,
             capital: PnlCapitalSummary::default(),
             symbols: symbols_with_costs,
+            unavailable_symbols: unavailable_symbols.into_iter().collect(),
             symbol_universe,
             entries: page_entries,
             cost_entries,

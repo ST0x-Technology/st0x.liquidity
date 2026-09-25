@@ -22,6 +22,7 @@ use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::{ExecutionError, Executor, Permanence, Symbol};
 use st0x_raindex::RaindexContracts;
 use st0x_registry::{SymbolCache, get_symbol_lock};
+use st0x_wrapper::RatioError;
 
 use super::inclusion::EmittedOnChain;
 use super::skipped_fill::{SkipReason, record_skipped_fill};
@@ -503,7 +504,7 @@ async fn decode_trade_event<Node: Provider + Clone + 'static>(
 
     let order_owner = chain_ctx.trading.vault_owner;
 
-    match &trade_event.event {
+    let mut trade = match &trade_event.event {
         ClearV3(clear_event) => {
             OnchainTrade::try_from_clear_v3(
                 &chain_ctx.trading,
@@ -545,7 +546,12 @@ async fn decode_trade_event<Node: Provider + Clone + 'static>(
             )
             .await
         }
+    }?;
+    if let Some(trade) = &mut trade {
+        trade.load_underlying_per_wrapped(&chain_ctx.evm).await?;
     }
+
+    Ok(trade)
 }
 
 fn reconstruct_log(contracts: RaindexContracts, trade: &EmittedOnChain<RaindexTradeEvent>) -> Log {
@@ -603,6 +609,14 @@ pub enum TradeAccountingError {
     OffchainOrderPlacement(#[from] PlaceOffchainOrderError),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
+    #[error("Wrapper ratio conversion failed: {0}")]
+    Ratio(#[from] RatioError),
+    #[error("Wrapped-fill arithmetic failed: {0}")]
+    Float(#[from] rain_math_float::FloatError),
+    #[error("Fill {trade_id} has no exact-block wrapper ratio")]
+    MissingWrapperRatio { trade_id: crate::position::TradeId },
+    #[error("Fill {trade_id} converts to zero underlying shares")]
+    ZeroUnderlyingAmount { trade_id: crate::position::TradeId },
     // TODO: TradeAccountingError should not be coupled to a concrete executor error type.
     #[error("Alpaca broker API error: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
@@ -898,6 +912,10 @@ impl TradeAccountingError {
             | Self::OffchainOrderCommand(_)
             | Self::OffchainOrderPlacement(_)
             | Self::Execution(_)
+            | Self::Ratio(_)
+            | Self::Float(_)
+            | Self::MissingWrapperRatio { .. }
+            | Self::ZeroUnderlyingAmount { .. }
             | Self::AlpacaBrokerApi(_)
             | Self::EnqueueJob(_)
             | Self::PositionFillLookup(_)
@@ -946,6 +964,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::bindings::IERC4626;
     use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
     use crate::bindings::IRaindexV6;
     use crate::bindings::IRaindexV6::{
@@ -961,6 +980,14 @@ mod tests {
     use crate::test_utils::{
         TEST_POLL_INTERVAL, get_test_log, get_test_order, panic_revert_payload, setup_test_pools,
     };
+
+    fn push_identity_wrapper_ratio(asserter: &Asserter) {
+        asserter.push_success(
+            &<IERC4626::convertToAssetsCall as SolCall>::abi_encode_returns(
+                &st0x_wrapper::RATIO_ONE,
+            ),
+        );
+    }
 
     /// Builds the CQRS stores, job queue, and `AccountantCtx` shared by every
     /// `perform()` test in this module -- callers supply only what actually
@@ -1366,7 +1393,9 @@ mod tests {
         };
         // Both symbols are preloaded below and TakeOrderV3 amounts are already
         // Float-encoded, so no token introspection reaches either provider.
-        let secondary_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let secondary_asserter = Asserter::new();
+        push_identity_wrapper_ratio(&secondary_asserter);
+        let secondary_provider = ProviderBuilder::new().connect_mocked_client(secondary_asserter);
         let primary_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let cache = SymbolCache::default();
@@ -2051,6 +2080,7 @@ mod tests {
 
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
+        push_identity_wrapper_ratio(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
@@ -2207,6 +2237,7 @@ mod tests {
         for _ in 0..3 {
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+            push_identity_wrapper_ratio(&asserter);
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2377,6 +2408,7 @@ mod tests {
 
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+            push_identity_wrapper_ratio(&asserter);
             let provider = ProviderBuilder::new().connect_mocked_client(asserter);
             let executor = MockExecutorCtx.try_into_executor().await.unwrap();
             let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
@@ -2606,6 +2638,7 @@ mod tests {
 
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        push_identity_wrapper_ratio(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = RateLimitedPreflightExecutor;
@@ -2737,6 +2770,7 @@ mod tests {
 
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC
+        push_identity_wrapper_ratio(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();

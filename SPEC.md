@@ -2487,6 +2487,25 @@ This means blockchain fills are recorded in both OnChainTradeEvent::Filled
 (audit trail) and PositionEvent::OnChainOrderFilled (position tracking), but
 they serve different purposes in different bounded contexts.
 
+Raindex settles equity in ERC-4626 wrapped shares while the broker, Position,
+inventory, and P&L domains use underlying shares. `OnChainTradeEvent::Filled`
+therefore retains the wrapped quantity and wrapped-share price as the immutable
+chain facts. Before acknowledging the fill on Position, accounting reads the
+wrapper's underlying-per-wrapped ratio on the fill's chain at the fill's
+confirmed block. `PositionEvent::OnChainOrderFilled` stores the resulting
+underlying-equivalent quantity and price, while the same atomic Position
+acknowledgement stores the proven ratio on its fill-application event; quantity
+times price must preserve the original cash notional. A missing block,
+unavailable historical state, invalid ratio, or zero converted quantity fails
+accounting closed before a Position write or broker hedge. It never falls back
+to the latest ratio or assumes 1:1.
+
+Position events written before ratio evidence was persisted remain replayable,
+but their accounting basis is unknown. A P&L range containing one marks that
+symbol unavailable instead of matching later broker fills against nominal
+wrapped quantities. A persisted ratio of exactly 1 proves a real 1:1 wrapper and
+retains the existing economic behavior.
+
 ### Aggregate Design
 
 #### EventSourced Trait

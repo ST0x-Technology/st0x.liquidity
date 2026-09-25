@@ -50,8 +50,8 @@ use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, BuyingPowerReservationCents,
     ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-    Direction, ExecutionError, Executor, FractionalShares, MarketOrder, MarketSession, Positive,
-    SupportedExecutor, Symbol, TryIntoExecutor, Usd,
+    Direction, ExecutionError, Executor, FractionalShares, HasZero, MarketOrder, MarketSession,
+    Positive, SupportedExecutor, Symbol, TryIntoExecutor, Usd,
 };
 use st0x_issuance_client::IssuanceClient;
 use st0x_issuance_dto::VaultModeTag;
@@ -59,7 +59,7 @@ use st0x_raindex::{RaindexService, RaindexVaultId, RevokeOutcome};
 use st0x_registry::SymbolCache;
 use st0x_tokenization::AlpacaTokenizationService;
 use st0x_tokenization::Tokenizer;
-use st0x_wrapper::{Wrapper, WrapperError, WrapperService};
+use st0x_wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError, WrapperService};
 
 use crate::alerts::{LogNotifier, Notifier};
 use crate::bindings::IERC4626;
@@ -108,8 +108,8 @@ use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::performance::reliability::LifecycleFailureProjection;
 use crate::portfolio_snapshot::{PortfolioSnapshot, PortfolioSnapshotProjection};
 use crate::position::{
-    AnchorDisposition, EquityTransferReservationId, Position, PositionCommand, PositionError,
-    PositionEvent, TradeId,
+    AnchorDisposition, EquityTransferReservationId, NormalizedOnChainFillCommand, Position,
+    PositionCommand, PositionError, PositionEvent, TradeId,
 };
 use crate::position_check::{
     FailedAnchorRecoveryAction, HedgeScanSkipReason, failed_anchor_recovery_action,
@@ -4786,13 +4786,34 @@ pub async fn execute_acknowledge_fill(
     trade: &OnchainTrade,
     threshold: ExecutionThreshold,
     block_timestamp: DateTime<Utc>,
-) -> Result<(), SendError<Position>> {
+) -> Result<(), TradeAccountingError> {
     let base_symbol = trade.symbol.base();
 
-    let amount = trade.amount.inner();
-    let price_usdc = trade.price.value();
+    let ratio =
+        trade
+            .underlying_per_wrapped
+            .ok_or_else(|| TradeAccountingError::MissingWrapperRatio {
+                trade_id: TradeId {
+                    chain: trade.chain,
+                    tx_hash: trade.tx_hash,
+                    log_index: trade.log_index,
+                },
+            })?;
+    let underlying_per_wrapped = UnderlyingPerWrapped::new(ratio)?;
+    let amount = underlying_per_wrapped.to_underlying_fractional(trade.amount)?;
+    if amount.is_zero()? {
+        return Err(TradeAccountingError::ZeroUnderlyingAmount {
+            trade_id: TradeId {
+                chain: trade.chain,
+                tx_hash: trade.tx_hash,
+                log_index: trade.log_index,
+            },
+        });
+    }
+    let wrapped_notional = (trade.amount.inner() * trade.price.value())?;
+    let price_usdc = (wrapped_notional / amount.inner())?;
 
-    let command = PositionCommand::AcknowledgeOnChainFill {
+    let command = PositionCommand::AcknowledgeNormalizedOnChainFill(NormalizedOnChainFillCommand {
         symbol: base_symbol.clone(),
         threshold,
         trade_id: TradeId {
@@ -4800,12 +4821,13 @@ pub async fn execute_acknowledge_fill(
             tx_hash: trade.tx_hash,
             log_index: trade.log_index,
         },
-        amount: FractionalShares::new(amount),
+        amount,
         direction: trade.direction,
         price_usdc,
         block_timestamp,
         block_number: trade.block_number,
-    };
+        underlying_per_wrapped: ratio,
+    });
 
     match position.send(base_symbol, command).await {
         Ok(()) => {
@@ -4829,7 +4851,7 @@ pub async fn execute_acknowledge_fill(
             );
             Ok(())
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -12554,6 +12576,68 @@ mod tests {
             Some(4242),
             "the persisted fill event must retain the trade's block number"
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledge_fill_normalizes_wrapped_shares_and_preserves_notional() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let mut trade = test_trade_with_amount(float!(2), 61);
+        trade.price = crate::onchain::io::Usdc::new(float!(101)).unwrap();
+        trade.underlying_per_wrapped = Some(U256::from(1_010_000_000_000_000_000u64));
+        let block_timestamp = trade.block_timestamp.unwrap();
+
+        execute_acknowledge_fill(
+            &cqrs.position,
+            &trade,
+            cqrs.execution_threshold,
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+
+        let payloads: Vec<String> = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_id = 'AAPL' ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let events = payloads
+            .iter()
+            .map(|payload| serde_json::from_str::<PositionEvent>(payload).unwrap())
+            .collect::<Vec<_>>();
+        let fill = events
+            .iter()
+            .find_map(|event| match event {
+                PositionEvent::OnChainOrderFilled {
+                    amount, price_usdc, ..
+                } => Some((*amount, *price_usdc)),
+                _ => None,
+            })
+            .expect("normalized fill event must be persisted");
+        assert!(fill.0.inner().eq(float!(2.02)).unwrap());
+        assert!(fill.1.eq(float!(100)).unwrap());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PositionEvent::OnChainFillApplied {
+                underlying_per_wrapped: Some(ratio),
+                ..
+            } if *ratio == U256::from(1_010_000_000_000_000_000u64)
+        )));
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(position.net.inner().eq(float!(2.02)).unwrap());
     }
 
     /// A fill missing its block timestamp can be neither witnessed nor

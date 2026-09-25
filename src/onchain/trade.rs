@@ -19,7 +19,9 @@ use st0x_evm::{Chain, Evm, EvmError, IERC20, OpenChainErrorRegistry};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_registry::SymbolCache;
+use st0x_wrapper::RATIO_ONE;
 
+use crate::bindings::IERC4626;
 use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
 use crate::bindings::IRaindexV6::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::OnChainError;
@@ -206,6 +208,9 @@ pub struct OnchainTrade {
     pub amount: FractionalShares,
     pub direction: Direction,
     pub(crate) price: Usdc,
+    /// Fixed-18 ERC-4626 assets per wrapped share, populated by the accounting
+    /// boundary from the fill's confirmed block.
+    pub underlying_per_wrapped: Option<U256>,
     /// Block the fill was confirmed in. Needed to witness the fill into the
     /// `OnChainTrade` log (the `Witness` command requires it). Absent only when
     /// neither the log nor the receipt carried a block number.
@@ -220,6 +225,25 @@ impl OnchainTrade {
 
     pub fn price(&self) -> Float {
         self.price.value()
+    }
+
+    pub async fn load_underlying_per_wrapped<E: Evm>(
+        &mut self,
+        evm: &E,
+    ) -> Result<(), OnChainError> {
+        let block_number = self
+            .block_number
+            .ok_or(TradeValidationError::NoBlockNumber)?;
+        let ratio = evm
+            .call_at::<OpenChainErrorRegistry, _>(
+                self.equity_token,
+                IERC4626::convertToAssetsCall { shares: RATIO_ONE },
+                block_number,
+            )
+            .await?;
+        self.underlying_per_wrapped = Some(ratio);
+
+        Ok(())
     }
 }
 
@@ -806,6 +830,7 @@ async fn finalize_onchain_trade<P: Provider>(
         amount: equity_amount,
         direction,
         price,
+        underlying_per_wrapped: None,
         block_timestamp,
         block_number,
     }))
@@ -1006,8 +1031,9 @@ pub enum TradeValidationError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
-    use alloy::primitives::{Address, IntoLogData, U256, address, b256, fixed_bytes, uint};
+    use alloy::primitives::{Address, IntoLogData, TxHash, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{Provider, ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::{Block, Transaction};
     use alloy::sol_types::SolCall;
@@ -1021,7 +1047,7 @@ mod tests {
     use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::ReadOnlyEvm;
     use st0x_evm::{Chain, IntoErrorRegistry, USDC_BASE};
-    use st0x_execution::Symbol;
+    use st0x_execution::{Direction, FractionalShares, Symbol};
     use st0x_float_macro::float;
     use st0x_registry::SymbolCache;
 
@@ -1041,6 +1067,37 @@ mod tests {
 
     struct CapturedTokenMetadataEvm<ProviderImpl> {
         provider: ProviderImpl,
+    }
+
+    struct CapturedWrapperRatioEvm<ProviderImpl> {
+        provider: ProviderImpl,
+        calls: Arc<Mutex<Vec<(Address, u64)>>>,
+        ratio: U256,
+    }
+
+    #[async_trait]
+    impl<ProviderImpl> Evm for CapturedWrapperRatioEvm<ProviderImpl>
+    where
+        ProviderImpl: Provider + Clone + Send + Sync + 'static,
+    {
+        type Provider = ProviderImpl;
+
+        fn provider(&self) -> &Self::Provider {
+            &self.provider
+        }
+
+        async fn call_at<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+            &self,
+            contract: Address,
+            _call: Call,
+            block_number: u64,
+        ) -> Result<Call::Return, EvmError> {
+            self.calls.lock().unwrap().push((contract, block_number));
+            Call::abi_decode_returns(&IERC4626::convertToAssetsCall::abi_encode_returns(
+                &self.ratio,
+            ))
+            .map_err(EvmError::from)
+        }
     }
 
     #[async_trait]
@@ -1068,6 +1125,61 @@ mod tests {
             Call::abi_decode_returns(&decimalsCall::abi_encode_returns(&decimals))
                 .map_err(EvmError::from)
         }
+    }
+
+    fn wrapper_ratio_trade(block_number: Option<u64>) -> OnchainTrade {
+        OnchainTrade {
+            source: OnChainTradeSource::Raindex,
+            tx_hash: TxHash::ZERO,
+            log_index: 7,
+            chain: Chain::Base,
+            symbol: TokenizedSymbol::<WrappedTokenizedShares>::parse("wtSGOV").unwrap(),
+            equity_token: Address::repeat_byte(0x11),
+            amount: FractionalShares::new(float!(2)),
+            direction: Direction::Sell,
+            price: Usdc::new(float!(101)).unwrap(),
+            underlying_per_wrapped: None,
+            block_timestamp: Some(Utc::now()),
+            block_number,
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapper_ratio_is_loaded_from_the_fill_token_at_the_fill_block() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let evm = CapturedWrapperRatioEvm {
+            provider: ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            calls: Arc::clone(&calls),
+            ratio: U256::from(1_010_000_000_000_000_000u64),
+        };
+        let mut trade = wrapper_ratio_trade(Some(12_345));
+
+        trade.load_underlying_per_wrapped(&evm).await.unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(Address::repeat_byte(0x11), 12_345)]
+        );
+        assert_eq!(trade.underlying_per_wrapped, Some(evm.ratio));
+    }
+
+    #[tokio::test]
+    async fn wrapper_ratio_loading_fails_without_a_fill_block() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let evm = CapturedWrapperRatioEvm {
+            provider: ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            calls: Arc::clone(&calls),
+            ratio: RATIO_ONE,
+        };
+        let mut trade = wrapper_ratio_trade(None);
+
+        let error = trade.load_underlying_per_wrapped(&evm).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            OnChainError::Validation(TradeValidationError::NoBlockNumber)
+        ));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

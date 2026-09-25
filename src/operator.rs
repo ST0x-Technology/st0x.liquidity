@@ -1863,12 +1863,16 @@ pub mod process_tx {
 
         match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await
         {
-            Ok(Some(onchain_trade)) => {
+            Ok(Some(mut onchain_trade)) => {
                 // The decoder is fed the requested chain, so a decoded fill on a
                 // different chain is an invariant break: refuse rather than hedge
                 // a fill from a chain the operator did not select.
                 ensure_decoded_chain_matches(onchain_trade.chain, trading_chain.chain)
                     .map_err(|mismatch| OperatorError::Operational(mismatch.into()))?;
+                onchain_trade
+                    .load_underlying_per_wrapped(&read_evm)
+                    .await
+                    .map_err(|error| OperatorError::Operational(anyhow::Error::new(error)))?;
                 let fill = ProcessTxFill::from(&onchain_trade);
                 let outcome = process_found_trade(
                     onchain_trade,

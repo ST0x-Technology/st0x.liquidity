@@ -38,7 +38,7 @@ use st0x_execution::Direction;
 use st0x_float_serde::format_float;
 
 use crate::bot_gas::{BotGasReceiptCost, BotGasReceiptCostEvent};
-use crate::position::{Position, PositionEvent};
+use crate::position::{Position, PositionEvent, TradeId};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent};
 
@@ -46,7 +46,7 @@ use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent};
 /// mismatch against the persisted `pnl_ledger_checkpoint.ledger_version`
 /// truncates every ledger table and resets the checkpoint to zero, making
 /// rebuild the same code path as first-deploy backfill.
-pub(crate) const LEDGER_VERSION: i64 = 1;
+pub(crate) const LEDGER_VERSION: i64 = 2;
 
 /// Rows fetched per entity per ingest batch. Bounds peak memory during
 /// backfill; each batch's rows and checkpoint advance commit atomically, so
@@ -81,6 +81,8 @@ pub(crate) enum PnlLedgerError {
     Float(#[from] rain_math_float::FloatError),
     #[error("onchain fill log_index does not fit in i64")]
     LogIndex(#[from] std::num::TryFromIntError),
+    #[error("wrapped fill basis has no matching onchain fill for {trade_id}")]
+    MissingOnchainFillBasisTarget { trade_id: TradeId },
     #[error(transparent)]
     InvalidBotGasCost(#[from] crate::bot_gas::BotGasReceiptCostError),
 }
@@ -369,8 +371,8 @@ async fn ingest_position(
             sqlx::query(
                 "INSERT INTO pnl_onchain_fill \
                  (event_rowid, symbol, chain, tx_hash, log_index, shares, direction, price_usd, \
-                  executed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                  executed_at, underlying_per_wrapped_fixed18) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
                  ON CONFLICT(event_rowid) DO NOTHING",
             )
             .bind(rowid)
@@ -382,8 +384,36 @@ async fn ingest_position(
             .bind(direction_text(direction))
             .bind(format_float(&price_usdc)?)
             .bind(canonical_timestamp(&block_timestamp))
+            .bind(Option::<String>::None)
             .execute(&mut **tx)
             .await?;
+        }
+        PositionEvent::OnChainFillApplied {
+            trade_id,
+            underlying_per_wrapped: Some(underlying_per_wrapped),
+            applied_at: _,
+        } => {
+            let result = sqlx::query(
+                "UPDATE pnl_onchain_fill \
+                 SET underlying_per_wrapped_fixed18 = ?1, \
+                     underlying_per_wrapped_event_rowid = ?2 \
+                 WHERE event_rowid = ( \
+                     SELECT MAX(event_rowid) FROM pnl_onchain_fill \
+                     WHERE symbol = ?3 AND chain = ?4 AND tx_hash = ?5 AND log_index = ?6 \
+                       AND event_rowid < ?2 \
+                 )",
+            )
+            .bind(underlying_per_wrapped.to_string())
+            .bind(rowid)
+            .bind(symbol.to_string())
+            .bind(trade_id.chain.to_string())
+            .bind(trade_id.tx_hash.to_string())
+            .bind(i64::try_from(trade_id.log_index)?)
+            .execute(&mut **tx)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(PnlLedgerError::MissingOnchainFillBasisTarget { trade_id });
+            }
         }
         PositionEvent::OffChainOrderPlaced {
             offchain_order_id,
@@ -906,6 +936,46 @@ mod tests {
 
         assert_eq!(first_head, second_head);
         assert_eq!(count(&pool, "pnl_onchain_fill").await, 1);
+    }
+
+    #[tokio::test]
+    async fn records_wrapped_fill_basis_on_the_matching_ledger_row() {
+        let pool = setup_test_db().await;
+        let ratio = U256::from(1_010_000_000_000_000_000u64);
+        let fill = onchain_fill(7, 0);
+        let PositionEvent::OnChainOrderFilled { trade_id, .. } = &fill else {
+            unreachable!("onchain_fill returns an onchain fill event");
+        };
+        persist_event::<Position>(&pool, "AAPL", 1, &fill).await;
+        persist_event::<Position>(
+            &pool,
+            "AAPL",
+            2,
+            &PositionEvent::OnChainFillApplied {
+                trade_id: trade_id.clone(),
+                underlying_per_wrapped: Some(ratio),
+                applied_at: timestamp(1),
+            },
+        )
+        .await;
+
+        PnlLedger::new(pool.clone()).catch_up().await.unwrap();
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT underlying_per_wrapped_fixed18 FROM pnl_onchain_fill WHERE symbol = 'AAPL'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, Some(ratio.to_string()));
+
+        let evidence_rowid: Option<i64> = sqlx::query_scalar(
+            "SELECT underlying_per_wrapped_event_rowid FROM pnl_onchain_fill WHERE symbol = 'AAPL'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(evidence_rowid, Some(2));
     }
 
     /// Interleaved multi-entity history ingested with a batch size smaller

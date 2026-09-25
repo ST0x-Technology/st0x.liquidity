@@ -676,7 +676,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         };
 
         let evm = ReadOnlyEvm::new(self.provider.clone());
-        let trade = OnchainTrade::try_from_take_order_if_target_owner(
+        let mut trade = OnchainTrade::try_from_take_order_if_target_owner(
             Chain::Base,
             &self.symbol_cache,
             &evm,
@@ -687,6 +687,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         .await
         .unwrap()
         .expect("Pipeline should produce an OnchainTrade");
+        trade.underlying_per_wrapped = Some(st0x_wrapper::RATIO_ONE);
 
         let tx_hash = trade.tx_hash;
         let log_index = trade.log_index;
