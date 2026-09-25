@@ -185,9 +185,9 @@ pub trait Bridge: Send + Sync + 'static {
     ///
     /// The log scan for a consumed nonce starts at the lower of
     /// `scan_from_block` (the [`Bridge::destination_block`] captured before the
-    /// mint) and a fixed lookback from the head, since a relayer can mint
-    /// before that head is captured. `None`, for a transfer that predates it,
-    /// scans the lookback alone. A consumed nonce whose mint is not found in
+    /// mint) less a small margin and a fixed lookback from the head, since a
+    /// relayer can mint before that head is captured. `None`, for a transfer
+    /// that predates it, scans the lookback alone. A consumed nonce whose mint is not found in
     /// that window is an error carrying the floor block's timestamp, never a
     /// scan to genesis: a floor mined before the transfer started covers its
     /// mint, so the log is lagging; a later floor may be above the mint.
@@ -212,7 +212,7 @@ pub trait Bridge: Send + Sync + 'static {
     /// Returns the current head of the mint destination chain for `direction`.
     /// Captured when the attestation is recorded -- before the mint -- as the
     /// `scan_from_block` of [`Bridge::find_attested_mint`], whose scan starts
-    /// at the lower of it and a fixed lookback from the head.
+    /// at the lower of it less a small margin and a fixed lookback from the head.
     async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error>;
 
     /// Returns the current head of the burn source chain for `direction`.

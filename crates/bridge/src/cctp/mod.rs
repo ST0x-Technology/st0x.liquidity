@@ -1136,8 +1136,9 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// minted".
     ///
     /// The log scan for a consumed nonce starts at the lower of
-    /// `scan_from_block` and a fixed lookback from the head; `None` scans the
-    /// lookback alone (see [`crate::Bridge::find_attested_mint`]).
+    /// `scan_from_block` less a small margin and a fixed lookback from the
+    /// head; `None` scans the lookback alone (see
+    /// [`crate::Bridge::find_attested_mint`]).
     pub async fn find_existing_mint(
         &self,
         direction: BridgeDirection,
@@ -4803,8 +4804,8 @@ mod tests {
         assert_eq!(from_block, head - lookback);
         assert!(lowest_scanned_block.load(Ordering::SeqCst) >= head - lookback);
 
-        // A captured floor below the lookback floor wins: a transfer older than
-        // the lookback can still find its own mint.
+        // A captured floor below the lookback floor wins, less its 300-block
+        // margin: a transfer older than the lookback can still find its own mint.
         let old_floor = head - lookback - 10_000;
         let old_floor_error = flaky_endpoint
             .find_existing_mint::<NoOpErrorRegistry>(
@@ -4818,8 +4819,8 @@ mod tests {
         let CctpError::MintNotFoundInScanWindow { from_block, .. } = old_floor_error else {
             panic!("a consumed nonce outside the window must fail: {old_floor_error:?}");
         };
-        assert_eq!(from_block, old_floor);
-        assert_eq!(lowest_scanned_block.load(Ordering::SeqCst), old_floor);
+        assert_eq!(from_block, old_floor - 300);
+        assert_eq!(lowest_scanned_block.load(Ordering::SeqCst), old_floor - 300);
     }
 
     /// A transfer older than the lookback has a floor mined after it started,

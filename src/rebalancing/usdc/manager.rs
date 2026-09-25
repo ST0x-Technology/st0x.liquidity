@@ -1114,8 +1114,8 @@ impl<
         response: &AttestationResponse,
     ) -> Result<(), UsdcTransferError> {
         // Capture the destination head before minting: the resume lookup for
-        // the mint of this nonce starts at the lower of it and a fixed lookback,
-        // so a crash before `ConfirmBridging` never scans back to genesis. A
+        // the mint of this nonce starts at the lower of it (less a margin) and a
+        // fixed lookback, so a crash before `ConfirmBridging` never scans back to genesis. A
         // lookup failure here is transient (a destination RPC/read hiccup):
         // the aggregate is still in `Bridging`/`AwaitingAttestation` with no
         // attestation recorded yet, and both directions have resume entry points
