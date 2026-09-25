@@ -14781,6 +14781,157 @@ mod tests {
         assert_eq!(mint_tx_hash, mint_receipt.tx);
     }
 
+    /// A transfer recovered from a post-burn `BridgingFailed` never reached
+    /// `Bridged`, so it cannot have sent: a same-amount send another transfer
+    /// made after its mint is not this transfer's, and the recovery signs and
+    /// sends its own deposit instead of failing it.
+    #[tokio::test]
+    async fn bridging_failed_recovery_sends_its_deposit_despite_an_unrelated_same_amount_send() {
+        let chains = deploy_dual_chain_cctp().await;
+        let attestation = CctpAttestationMock::start().await;
+        let _watcher = attestation
+            .start_watcher(
+                ProviderBuilder::new()
+                    .connect(&chains.ethereum_endpoint)
+                    .await
+                    .unwrap(),
+                ProviderBuilder::new()
+                    .connect(&chains.base_endpoint)
+                    .await
+                    .unwrap(),
+                chains.attester_key,
+            )
+            .await
+            .unwrap();
+        let ethereum_wallet = create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key);
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                corridor: CctpCorridor::with_tokens(USDC_ADDRESS, USDC_ADDRESS),
+                ethereum_wallet: ethereum_wallet.clone(),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: attestation.base_url(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        let amount = usdc("100");
+        let burn_receipt = cctp_bridge
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                usdc_to_u256(amount).unwrap(),
+                chains.bot_address,
+            )
+            .await
+            .unwrap();
+        let attestation_response = cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn_receipt.tx)
+            .await
+            .unwrap();
+        let mint_receipt = cctp_bridge
+            .mint(BridgeDirection::BaseToEthereum, &attestation_response)
+            .await
+            .unwrap();
+
+        // Another transfer's send of the same amount, after the mint, from the
+        // shared wallet to the Alpaca deposit address.
+        ethereum_wallet
+            .send(
+                USDC_ADDRESS,
+                Bytes::from(
+                    TestMintBurnToken::mintCall {
+                        to: chains.bot_address,
+                        amount: mint_receipt.amount,
+                    }
+                    .abi_encode(),
+                ),
+                "fund the unrelated send",
+            )
+            .await
+            .unwrap();
+        ethereum_wallet
+            .send(
+                USDC_ADDRESS,
+                Bytes::from(
+                    IERC20::transferCall {
+                        to: ALPACA_DEPOSIT_ADDRESS,
+                        amount: mint_receipt.amount,
+                    }
+                    .abi_encode(),
+                ),
+                "unrelated deposit send",
+            )
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let _address_mock = mock_alpaca_deposit_address(&server);
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            InstrumentedAlpacaBroker::new(
+                create_test_broker_service(&server).await,
+                TelemetrySender::disabled(),
+            ),
+            Arc::new(create_short_poll_wallet_service(&server)),
+            Arc::clone(&cctp_bridge),
+            Arc::new(RaindexService::new(
+                create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                RaindexContracts {
+                    inventory: ORDERBOOK_ADDRESS,
+                    orderbook: ORDERBOOK_ADDRESS,
+                },
+                chains.bot_address,
+            )),
+            cqrs.clone(),
+            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            &test_settlement_params(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        );
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_receipt.tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: burn_receipt.tx,
+            },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "transient receipt error while the mint actually landed".into(),
+            },
+        ] {
+            cqrs.send(&id, command).await.unwrap();
+        }
+
+        // No Alpaca deposit is mocked, so the leg stops at the Alpaca poll,
+        // after its own send.
+        manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::DepositInitiated { .. }),
+            "the recovered transfer sends its own deposit, got: {state:?}"
+        );
+        let balance: U256 = ethereum_wallet
+            .call::<NoOpErrorRegistry, _>(
+                USDC_ADDRESS,
+                IERC20::balanceOfCall {
+                    account: ALPACA_DEPOSIT_ADDRESS,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(balance, mint_receipt.amount * U256::from(2));
+    }
+
     /// A persisted envelope must actually mint, not merely reconstruct. Rebuild
     /// the `AttestationResponse` from the stored message + attestation bytes
     /// (exactly as an `Attested` resume does via `from_parts`) and mint it
