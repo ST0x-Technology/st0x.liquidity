@@ -886,14 +886,13 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// Scans for a USDC `Transfer(from, to, value == amount)` at or after
     /// `from_block`, returning the most recent matching transaction hash.
     ///
-    /// Crash-safe deposit-send recovery: the BaseToAlpaca deposit leg records the
-    /// mint block before sending USDC to Alpaca, so on resume this detects an
-    /// already-submitted send instead of re-sending (which would forward the
-    /// minted USDC twice). The deposit send lands at or after the mint, so the
-    /// match is bounded to `from_block` (the mint's block) onward. Matching on the
-    /// indexed `(from, to)` topics plus the exact `value` -- combined with the
-    /// single-USDC-rebalance-in-flight invariant -- guarantees an adopted transfer
-    /// is this deposit's, not an unrelated same-amount transfer.
+    /// Detects a legacy unrecorded deposit send: a BaseToAlpaca transfer that
+    /// reached `Bridged` without a persisted signed send may already have sent
+    /// the minted USDC, so resume refuses to send again when this finds a match.
+    /// The send lands at or after the mint, so the match is bounded to
+    /// `from_block` (the mint's block) onward. Matching on `(from, to, value)`
+    /// cannot tell this transfer's send from another transfer's same-amount
+    /// send, so a match is never adopted.
     ///
     /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
     /// `from_block` and repeated scans agree the transfer is absent; a node that
