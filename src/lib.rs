@@ -69,6 +69,7 @@ mod portfolio_snapshot;
 mod position;
 mod position_check;
 mod pricing_identity;
+mod quiesce;
 mod rebalancing;
 mod startup;
 mod telemetry;

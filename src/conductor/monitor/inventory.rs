@@ -1,24 +1,39 @@
 //! Supervised inventory poller.
 //!
-//! [`InventoryMonitor`] is a long-running [`SupervisedTask`] that ticks
-//! on a fixed interval and drives the underlying [`Poller`] to refresh
-//! the inventory snapshot. Polling failures are transient (RPC blips,
-//! vault contention) -- they are logged and swallowed so a hiccup never
-//! halts the monitor; the supervisor restarts the task only if the
-//! tick loop itself panics.
+//! [`InventoryMonitor`] is a long-running [`SupervisedTask`] that ticks on a
+//! fixed interval and drives the underlying [`Poller`] to refresh the inventory
+//! snapshot. Each poll holds the projection gate because snapshot processing can
+//! synchronously fail timed-out operations and update their projections. Polling
+//! failures are transient (RPC blips, vault contention) -- they are logged and
+//! swallowed so a hiccup never halts the monitor; the supervisor restarts the
+//! task only if the tick loop itself panics.
 
 use std::sync::Arc;
 use std::time::Duration;
+
 use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
+use crate::conductor::projection_pause::enter_projection_gate;
 use crate::inventory::Poller;
+use crate::quiesce;
 
 #[derive(Clone)]
 pub(crate) struct InventoryMonitor {
     pub(crate) poller: Arc<dyn Poller>,
     pub(crate) interval: Duration,
+}
+
+impl InventoryMonitor {
+    async fn poll_once(&self, projection_slot: Option<quiesce::InFlight>) {
+        let result = self.poller.poll().await;
+        drop(projection_slot);
+
+        if let Err(error) = result {
+            warn!(target: "inventory", ?error, "Inventory polling failed");
+        }
+    }
 }
 
 impl SupervisedTask for InventoryMonitor {
@@ -31,9 +46,11 @@ impl SupervisedTask for InventoryMonitor {
         loop {
             interval.tick().await;
 
-            if let Err(error) = self.poller.poll().await {
-                warn!(target: "inventory", ?error, "Inventory polling failed");
-            }
+            // Snapshot processing runs its reactors inline and can write failure
+            // projections for timed-out operations. Keep the slot through the
+            // whole poll so a rebuild drains those writes before replaying rows.
+            let projection_slot = enter_projection_gate().await;
+            self.poll_once(projection_slot).await;
         }
     }
 }
@@ -41,11 +58,12 @@ impl SupervisedTask for InventoryMonitor {
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
+    use tokio::sync::Notify;
     use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-
-    use crate::inventory::{Poller, PollerError};
+    use tokio::time::timeout;
 
     use super::*;
+    use crate::inventory::{Poller, PollerError};
 
     /// Test poller that sends on `tx` each time it is polled and optionally
     /// returns an error. Using a channel lets the test deterministically
@@ -73,6 +91,87 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    struct BlockingPoller {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Poller for BlockingPoller {
+        async fn poll(&self) -> Result<(), PollerError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_holds_projection_slot_until_snapshot_processing_finishes() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let poll_started = started.notified();
+        let monitor = InventoryMonitor {
+            poller: Arc::new(BlockingPoller {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+            interval: Duration::from_secs(10),
+        };
+        let (control, gate) = quiesce::quiesce(Duration::from_secs(1));
+
+        let poll = tokio::spawn(async move {
+            let projection_slot = Some(gate.enter().await);
+            monitor.poll_once(projection_slot).await;
+        });
+        poll_started.await;
+
+        match timeout(Duration::from_millis(20), control.pause()).await {
+            Err(_) => {}
+            Ok(_) => panic!("the pause must wait for snapshot processing to finish"),
+        }
+
+        release.notify_one();
+        poll.await.expect("the inventory poll must finish");
+
+        let guard = control
+            .pause()
+            .await
+            .expect("the pause must succeed after snapshot processing finishes");
+        drop(guard);
+    }
+
+    /// Drives the real `run` loop through the process global projection gate
+    /// that `init_projection_gate` wires at startup: while a rebuild
+    /// holds the pause the monitor must not poll, and it polls once the pause
+    /// is released. Pausing the global gate is process scoped, so this relies
+    /// on nextest running each test in its own process.
+    #[tokio::test]
+    async fn run_parks_on_the_global_projection_gate_while_a_rebuild_is_paused() {
+        let rebuild = crate::conductor::projection_pause::pause_projection_gate_for_test().await;
+
+        let (tx, mut rx) = unbounded_channel();
+        let mut monitor = InventoryMonitor {
+            poller: Arc::new(NotifyingPoller { tx, fail: false }),
+            interval: Duration::from_secs(10),
+        };
+        let handle = tokio::spawn(async move { monitor.run().await });
+
+        assert!(
+            timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "the monitor must not poll while a rebuild holds the projection gate"
+        );
+
+        drop(rebuild);
+        timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the monitor must poll once the rebuild releases the gate")
+            .expect("the poller channel must stay open");
+
+        handle.abort();
     }
 
     #[tokio::test(start_paused = true)]
