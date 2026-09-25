@@ -24990,13 +24990,22 @@ mod tests {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
+        seed_withdrawing_alpaca_to_base_on(store, id, amount, UsdcCorridor::BASE_CCTP).await;
+    }
+
+    async fn seed_withdrawing_alpaca_to_base_on(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         store
             .send(
                 id,
                 UsdcRebalanceCommand::InitiateConversion {
-                    corridor: UsdcCorridor::BASE_CCTP,
+                    corridor,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -25017,7 +25026,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
-                    corridor: UsdcCorridor::BASE_CCTP,
+                    corridor,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -25052,6 +25061,27 @@ mod tests {
         stage: usdc::UsdcRebalanceStage,
         now: DateTime<Utc>,
     ) -> Arc<RebalancingService> {
+        make_trigger_with_timed_out_alpaca_to_base_tracking_and_notifier(
+            pool,
+            store,
+            id,
+            amount,
+            stage,
+            now,
+            Arc::new(LogNotifier),
+        )
+        .await
+    }
+
+    async fn make_trigger_with_timed_out_alpaca_to_base_tracking_and_notifier(
+        pool: &SqlitePool,
+        store: Arc<Store<UsdcRebalance>>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        stage: usdc::UsdcRebalanceStage,
+        now: DateTime<Utc>,
+        notifier: Arc<dyn crate::alerts::Notifier>,
+    ) -> Arc<RebalancingService> {
         let inventory = InventoryView::default()
             .with_usdc(usdc(500), usdc(900))
             .update_usdc(
@@ -25060,9 +25090,10 @@ mod tests {
             )
             .unwrap()
             .set_active_usdc_rebalance(id.clone());
-        let trigger = make_trigger_with_inventory_config(
+        let trigger = make_trigger_with_inventory_config_and_notifier(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
+            notifier,
         )
         .await;
 
@@ -34801,5 +34832,115 @@ mod tests {
 
         let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
         assert_eq!(job.corridor, corridor);
+    }
+
+    const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Robinhood,
+        hop: HopKind::Relay,
+    };
+
+    fn corridor_pages(notifier: &CapturingNotifier) -> Vec<String> {
+        notifier
+            .messages()
+            .into_iter()
+            .filter(|message| message.starts_with("USDC transfer corridor mismatch"))
+            .collect()
+    }
+
+    /// A transfer on a corridor this build does not serve cannot progress:
+    /// re-arming it would dead-letter and page on every sweep. The sweep
+    /// holds it (guard kept) and pages once instead.
+    #[tokio::test]
+    async fn sweep_holds_a_transfer_on_a_corridor_this_build_does_not_serve() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        seed_withdrawing_alpaca_to_base_on(&store, &id, amount, ROBINHOOD_RELAY).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_trigger_with_timed_out_alpaca_to_base_tracking_and_notifier(
+            &pool,
+            store,
+            &id,
+            amount,
+            usdc::UsdcRebalanceStage::Initiated,
+            now,
+            notifier.clone(),
+        )
+        .await;
+
+        for _ in 0..3 {
+            trigger
+                .expire_stuck_usdc_rebalances(Utc::now())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0,
+            "a transfer on a corridor this build does not serve must not be re-armed"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "the guard stays held for the operator"
+        );
+        assert!(trigger.usdc_tracking.read().await.contains_key(&id));
+        let pages = corridor_pages(&notifier);
+        assert_eq!(pages.len(), 1, "one page across sweeps, got {pages:?}");
+        assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+        assert!(pages[0].contains("robinhood via relay"), "{}", pages[0]);
+        assert!(pages[0].contains("base via cctp"), "{}", pages[0]);
+    }
+
+    #[tokio::test]
+    async fn startup_holds_a_transfer_on_a_corridor_this_build_does_not_serve() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &id, usdc(400), ROBINHOOD_RELAY).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let service = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            0,
+            "a transfer on a corridor this build does not serve must not be re-armed"
+        );
+        assert!(service.usdc_in_progress.load(Ordering::SeqCst));
+        let pages = corridor_pages(&notifier);
+        assert_eq!(pages.len(), 1, "got {pages:?}");
+        assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+    }
+
+    #[tokio::test]
+    async fn manual_resume_refuses_a_transfer_on_a_corridor_this_build_does_not_serve() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &id, usdc(400), ROBINHOOD_RELAY).await;
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("USDC transfer corridor mismatch"),
+            "got {error}"
+        );
+        assert!(
+            market_making_job_rows(&trigger).await.is_empty(),
+            "a refused resume must not enqueue anything"
+        );
     }
 }
