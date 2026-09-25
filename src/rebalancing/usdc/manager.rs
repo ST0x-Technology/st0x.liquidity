@@ -19749,6 +19749,67 @@ mod tests {
         )));
     }
 
+    /// A relayer minted the used nonce with a re-attested body (a new
+    /// `expirationBlock`), so its `MessageReceived` log never equals the
+    /// recorded message and every redrive gets the same mismatch.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn attested_used_nonce_minted_with_a_reattested_body_latches_base_to_alpaca() {
+        let (error, id, _, state) =
+            resume_attested_with_failing_mint_lookup(RebalanceDirection::BaseToAlpaca, || {
+                CctpError::RecoveredMintMessageMismatch {
+                    nonce: valid_message_nonce(),
+                }
+            })
+            .await;
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::PreviouslyFailedAggregate { id: failed_id } if *failed_id == id
+            ),
+            "a mint that can never be adopted must latch; got: {error:?}"
+        );
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. })
+                && state.is_reconcilable_failure(),
+            "`transfer reconcile --kind usdc` must accept the latched state, got: {state:?}"
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn attested_used_nonce_minted_with_a_reattested_body_latches_alpaca_to_base() {
+        let (error, id, _, state) =
+            resume_attested_with_failing_mint_lookup(RebalanceDirection::AlpacaToBase, || {
+                CctpError::RecoveredMintMessageMismatch {
+                    nonce: valid_message_nonce(),
+                }
+            })
+            .await;
+
+        let UsdcTransferError::Cctp(cctp_error) = error else {
+            panic!("a mint that can never be adopted must not redrive; got: {error:?}");
+        };
+        assert!(
+            matches!(*cctp_error, CctpError::RecoveredMintMessageMismatch { .. }),
+            "got: {cctp_error:?}"
+        );
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. })
+                && state.is_reconcilable_failure(),
+            "`transfer reconcile --kind usdc` must accept the latched state, got: {state:?}"
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
+    }
+
     /// Builds a `CrossVenueCashTransfer` wired to a real (anvil-backed)
     /// `RaindexService` -- required for the `Signer` type parameter even
     /// though none of these bot-gas convergence tests call into it -- and an
