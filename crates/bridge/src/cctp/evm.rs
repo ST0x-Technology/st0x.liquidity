@@ -101,6 +101,12 @@ const RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS: u64 = 3;
 /// Only a transfer that started before the floor block was mined can have one.
 const MINT_SCAN_LOOKBACK_CHUNKS: u64 = 3;
 
+/// Blocks [`CctpEndpoint::find_existing_mint`] scans below a captured floor,
+/// for a relayer mint between Circle's attestation and the floor capture.
+/// The bot polls attestations every 5s; 300 blocks is 10 minutes on Base
+/// (~2s blocks), many polls and job retries, and tiny against the lookback.
+const CAPTURED_FLOOR_MARGIN_BLOCKS: u64 = 300;
+
 /// Delay between the `usedNonces()` probes that
 /// [`CctpEvm::recover_already_minted`] runs after a failed `receiveMessage`.
 ///
@@ -940,7 +946,8 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// this directly -- see its own doc for why.
     ///
     /// The log scan for a consumed nonce is floored at the lower of
-    /// `scan_from_block` and [`MINT_SCAN_LOOKBACK_CHUNKS`] below the head.
+    /// `scan_from_block` less [`CAPTURED_FLOOR_MARGIN_BLOCKS`] and
+    /// [`MINT_SCAN_LOOKBACK_CHUNKS`] below the head.
     /// A log still missing after the lag retries is
     /// [`CctpError::MintNotFoundInScanWindow`], which carries whether the
     /// nonce was used below the floor so the caller can tell index lag from a
@@ -967,11 +974,14 @@ impl<W: Wallet> CctpEndpoint<W> {
         );
 
         // A relayer can mint before the floor was captured (burns name no
-        // destination caller), so a captured floor never scans less than the
-        // bounded lookback. Matching is by nonce, so a lower floor cannot adopt
-        // another mint.
-        let from_block =
-            scan_from_block.map_or(lookback_floor, |captured| captured.min(lookback_floor));
+        // destination caller), so a captured floor is lowered by a margin and
+        // never scans less than the bounded lookback. Matching is by nonce, so
+        // a lower floor cannot adopt another mint.
+        let from_block = scan_from_block.map_or(lookback_floor, |captured| {
+            captured
+                .saturating_sub(CAPTURED_FLOOR_MARGIN_BLOCKS)
+                .min(lookback_floor)
+        });
 
         self.locate_mint_in_scan_window::<Registry>(&received_message, from_block)
             .await

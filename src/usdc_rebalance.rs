@@ -436,7 +436,7 @@ pub enum UsdcRebalanceCommand {
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
     /// `mint_scan_from_block` is the destination chain head captured before the mint.
     /// The resume lookup for the mint of this transfer's nonce starts at the lower of
-    /// it and a fixed lookback from the head.
+    /// it less a small margin and a fixed lookback from the head.
     ReceiveAttestation {
         attestation: Vec<u8>,
         cctp_nonce: B256,
@@ -618,7 +618,7 @@ pub enum UsdcRebalanceEvent {
     /// The cctp_nonce is extracted from the attested message (the real nonce, not the placeholder).
     /// `mint_scan_from_block` is the destination chain head captured before the mint.
     /// The resume lookup for the mint of this transfer's nonce starts at the lower of
-    /// it and a fixed lookback from the head. It is `None` for events persisted
+    /// it less a small margin and a fixed lookback from the head. It is `None` for events persisted
     /// before this field existed: such a resume scans the lookback alone instead of
     /// scanning from genesis.
     BridgeAttestationReceived {
@@ -873,8 +873,8 @@ pub enum UsdcRebalance {
         /// this field: such a resume falls back to re-polling Circle.
         message: Option<Vec<u8>>,
         /// Destination chain head captured before the mint. The resume lookup
-        /// for the mint of this transfer's nonce starts at the lower of it and a
-        /// fixed lookback from the head. `None` for transfers whose
+        /// for the mint of this transfer's nonce starts at the lower of it less a
+        /// small margin and a fixed lookback from the head. `None` for transfers whose
         /// `BridgeAttestationReceived` predates this field.
         mint_scan_from_block: Option<u64>,
         initiated_at: DateTime<Utc>,

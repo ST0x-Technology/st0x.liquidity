@@ -3801,8 +3801,8 @@ enum UsdcRebalance {
         // transfers whose BridgeAttestationReceived predates this field.
         message: Option<Vec<u8>>,
         // Destination chain head captured before the mint: the resume lookup
-        // for this nonce's mint starts at the lower of it and a fixed lookback
-        // from the head. None for transfers whose
+        // for this nonce's mint starts at the lower of it less a small margin
+        // and a fixed lookback from the head. None for transfers whose
         // BridgeAttestationReceived predates this field.
         mint_scan_from_block: Option<u64>,
         initiated_at: DateTime<Utc>,
@@ -3895,19 +3895,19 @@ already-submitted action instead of re-issuing it:
   -- before attempting a fresh mint. The match is by nonce, never by recipient
   or amount: other transfers mint to the same wallet, possibly the same amount.
   The log scan is bounded: it starts at the lower of the destination head
-  captured when the attestation is recorded and a fixed lookback from the
-  current head (a relayer can mint before that head is captured), or at the
-  fixed lookback alone for a transfer recorded before that head was captured.
-  The bot never scans back to genesis. A consumed nonce whose log is not found
-  in that window is placed by a `usedNonces` read at the block below the floor:
-  unused there, the window covers the mint and the missing log is index lag, so
-  resume redrives like any other lookup failure (deadline-gated alert); used
-  there, the mint lies below the floor. When that read fails (for example a node
-  without state that old), the floor block's timestamp decides instead: a mint
-  lands after its transfer starts, so a floor mined before the transfer started
-  covers the mint (redrive), and a newer floor can have the mint below it. For a
-  mint below the floor, or one that can lie below it, resume marks
-  `BridgingFailed` (keeping the burn tx and nonce), so
+  captured when the attestation is recorded, less a margin of a few minutes of
+  blocks, and a fixed lookback from the current head (a relayer can mint before
+  that head is captured), or at the fixed lookback alone for a transfer recorded
+  before that head was captured. The bot never scans back to genesis. A consumed
+  nonce whose log is not found in that window is placed by a `usedNonces` read
+  at the block below the floor: unused there, the window covers the mint and the
+  missing log is index lag, so resume redrives like any other lookup failure
+  (deadline-gated alert); used there, the mint lies below the floor. When that
+  read fails (for example a node without state that old), the floor block's
+  timestamp decides instead: a mint lands after its transfer starts, so a floor
+  mined before the transfer started covers the mint (redrive), and a newer floor
+  can have the mint below it. For a mint below the floor, or one that can lie
+  below it, resume marks `BridgingFailed` (keeping the burn tx and nonce), so
   `transfer reconcile --kind usdc` can settle it; a message that can never mint
   on the destination chain does the same. Such a mint pages the operator in both
   directions with "the CCTP mint cannot be resolved automatically": only the
