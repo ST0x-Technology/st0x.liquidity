@@ -1230,6 +1230,12 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self.ethereum.tx_confirmations(tx_hash).await
     }
 
+    /// Returns the Ethereum wallet's next nonce as of the block that is
+    /// `confirmations` deep, so a nonce below it is taken by a settled tx.
+    pub async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
+        self.ethereum.confirmed_nonce(confirmations).await
+    }
+
     /// Returns the block in which `tx_hash` was mined on Ethereum, the chain
     /// where BaseToEthereum mints land.
     ///

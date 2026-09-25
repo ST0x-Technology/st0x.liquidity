@@ -14,7 +14,9 @@ use uuid::Uuid;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold, HedgedChain, OnchainWalletCtx};
 use st0x_event_sorcery::{Store, StoreBuilder};
-use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
+use st0x_evm::{
+    Chain, Evm, IERC20, OpenChainErrorRegistry, PreparedTransaction, ReadOnlyEvm, Wallet,
+};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Executor,
     FractionalShares, Positive, Symbol, TimeInForce,
@@ -34,6 +36,7 @@ use st0x_hedge::operator::rebalancing::equity::{
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_hedge::operator::rebalancing::usdc::{
     CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams, UsdcTransferError,
+    verify_deposit_send_superseded,
 };
 use st0x_hedge::operator::telemetry::TelemetrySender;
 use st0x_hedge::operator::telemetry::broker::InstrumentedAlpacaBroker;
@@ -1432,12 +1435,15 @@ pub(super) async fn clear_pending_burn_command<Writer: Write>(
 /// loads and sends. Rejects an unknown id (refusing to act on the wrong
 /// transfer/database) and an aggregate that is not a guard-stranding post-burn
 /// failure (the command itself rejects the latter, but the preflight gives a
-/// clearer operator-facing error first).
+/// clearer operator-facing error first). A Base->Alpaca `Bridged` with a
+/// signed deposit send reconciles only once `verify_deposit_send` proves on
+/// chain that the send can never mine.
 pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
     reason: ReconcileReason,
     pool: &SqlitePool,
+    verify_deposit_send: impl AsyncFnOnce(&PreparedTransaction) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let id = UsdcRebalanceId(id);
     writeln!(stdout, "Reconciling stuck USDC transfer id: {id}")?;
@@ -1464,6 +1470,14 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
              ConversionFailed), nor a Base->Alpaca Bridged with a signed deposit send. \
              Refusing to act."
         );
+    }
+
+    // The aggregate command is pure, so the chain proof that the signed send
+    // can never mine is read here, before the command.
+    if let Some(prepared) = state.prepared_deposit_send() {
+        verify_deposit_send(prepared).await.with_context(|| {
+            format!("transfer reconcile: refusing to reconcile USDC transfer {id}")
+        })?;
     }
 
     usdc_store
@@ -1493,6 +1507,33 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     }
 
     Ok(())
+}
+
+/// Proves on the configured Ethereum wallet that `prepared` can never mine,
+/// with the confirmation depth the bot's USDC transfers use.
+pub(super) async fn verify_deposit_send_superseded_on_chain(
+    ctx: &Ctx,
+    prepared: &PreparedTransaction,
+) -> anyhow::Result<()> {
+    let wallet_ctx = ctx.wallet()?;
+    let bridge = CctpBridge::try_from_ctx(CctpCtx {
+        corridor: ctx.rebalancing.cctp_corridor,
+        ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
+        base_wallet: wallet_ctx.base_wallet().clone(),
+        #[cfg(any(test, feature = "test-support"))]
+        circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+        #[cfg(any(test, feature = "test-support"))]
+        token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+        #[cfg(any(test, feature = "test-support"))]
+        message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+    })?;
+
+    Ok(verify_deposit_send_superseded(
+        &bridge,
+        prepared,
+        ctx.chains.primary().required_confirmations,
+    )
+    .await?)
 }
 
 /// Resolves the tokenized-equity (tStock) address for a tokenization
