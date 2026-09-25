@@ -127,8 +127,9 @@ with a `PreparedTransaction`, RAI-2485):
    `transfer reconcile --kind usdc`, which accepts a BaseToAlpaca `Bridged` with
    a signed send. A mined revert -> `FailDeposit` for reconciliation, paged.
 4. At startup the bot reserves the nonce of every signed send still on `Bridged`
-   (`restore_prepared`) before any job can send from the wallet. A failure to
-   read them pages and does not stop startup.
+   (`restore_prepared`) before any job, startup approval or stale-allowance
+   revoke can send from the wallet. A failure to read them pages and does not
+   stop startup.
 5. Resume with no signed send still scans from the mint block (for transfers
    that reached `Bridged` before this change), but a match is never adopted: it
    fails the transfer for reconciliation. An empty scan signs and sends.
