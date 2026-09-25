@@ -15,25 +15,34 @@
 //! indeterminate failure that leaves the aggregate mid-flight (e.g. stalled at
 //! `WithdrawalSubmitting`/`BridgingSubmitting`), keeps the guard latched so
 //! automation does not re-arm a fresh transfer on top of a partial one.
+//!
+//! The exceptions are the pre-flight refusals (`WalletUsdcAmbientPreflight`,
+//! `WalletUsdcAmbientPreflightUnrepresentable`, and
+//! `PreflightBalanceUnavailable`): they happen before the first aggregate
+//! event, so no terminal event can ever clear the guard for them. Those arms
+//! -- and only those arms -- release the guard from the worker.
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use alloy::primitives::U256;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use thiserror::Error;
 use tracing::{error, warn};
 
 use st0x_bridge::cctp::CctpError;
+use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
 use st0x_execution::{AlpacaWalletError, Backpressure};
 use st0x_finance::Usdc;
 
 use super::UsdcTransferError;
-use super::driver_pause::UsdcDriverGate;
 use super::manager::CrossVenueCashTransfer;
 use crate::alerts::Notifier;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -42,7 +51,7 @@ use crate::conductor::job::{
     BackpressureStep, BackpressureStreak, Job, JobQueue, Label, QueuePushError,
     advance_backpressure, apply_backpressure_step, find_backpressure,
 };
-use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId, any_rebalance_holds_guard};
 
 const ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
 
@@ -124,22 +133,6 @@ const MINT_RECOVERY_REDRIVE_DELAY: Duration = Duration::from_secs(30);
 /// operational alert stream, while the guard stays held and the re-probe --
 /// idempotent against the same CCTP nonce -- keeps running.
 const MINT_RECOVERY_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
-
-/// Duration after which repeated `WithdrawalScanTransient` redrives page the
-/// operator via the notifier. Mirrors `WITHDRAWAL_POLL_ALERT_DEADLINE` /
-/// `MINT_RECOVERY_ALERT_DEADLINE`: the deadline is durable, derived from
-/// `WithdrawalSubmitting.initiated_at`, so the countdown survives restarts. An
-/// inconclusive vault-withdrawal scan self-heals as the chain advances, so
-/// before the deadline the redrive is silent; the deadline only guards against
-/// a scan that stays inconclusive long enough to signal a real problem
-/// (RPC/backend degradation, or a withdrawal that never mined).
-const WITHDRAWAL_SCAN_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
-
-/// Redrive delay used AFTER the withdrawal-scan alert deadline has elapsed.
-/// Mirrors `WITHDRAWAL_POLL_POST_DEADLINE_REDRIVE_DELAY`: slows the cadence from
-/// `SETTLEMENT_REDRIVE_DELAY` to prevent alert fatigue while the guard stays
-/// held and the idempotent re-scan keeps running.
-const WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
 
 /// Returns the warn-threshold attempt count at which an early operator alert
 /// fires, or `None` when there is no room for a distinct early warning.
@@ -499,27 +492,14 @@ async fn alert_withdrawal_poll_deadline_elapsed(
     source: &AlpacaWalletError,
     notifier: &Arc<dyn Notifier>,
 ) {
-    // Alpaca answered for a Complete withdrawal with no tx hash, so the
-    // connectivity diagnosis below would be wrong.
-    let message = if let AlpacaWalletError::CompletedTransferMissingTx { transfer_id } = source {
-        format!(
-            "Alpaca->Base USDC transfer {id}: Alpaca reports withdrawal {transfer_id} \
-             complete with no tx hash for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). \
-             The USDC has likely reached the Ethereum wallet, but the transfer is credited \
-             only from its tx. Aggregate stays in Withdrawing (guard held) and keeps \
-             re-polling for the hash; at the settlement retry deadline it fails to \
-             BridgingFailed for `stox transfer reconcile --kind usdc`."
-        )
-    } else {
-        format!(
-            "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
-             for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). Alpaca may \
-             be unreachable or credentials may have changed ({source}). Aggregate stays in \
-             Withdrawing (guard held). Use `stox transfer resume --kind usdc --id \
-             {id} --direction to-raindex` to manually re-poll, or investigate \
-             Alpaca connectivity."
-        )
-    };
+    let message = format!(
+        "Alpaca->Base USDC transfer {id}: withdrawal polling inconclusive \
+         for {elapsed:?} (>{WITHDRAWAL_POLL_ALERT_DEADLINE:?}). Alpaca may \
+         be unreachable or credentials may have changed ({source}). Aggregate stays in \
+         Withdrawing (guard held). Use `stox transfer resume --kind usdc --id \
+         {id} --direction to-raindex` to manually re-poll, or investigate \
+         Alpaca connectivity."
+    );
     if let Err(notify_err) = notifier.notify(&message).await {
         warn!(
             target: "rebalance",
@@ -599,9 +579,6 @@ pub(crate) struct TransferUsdcToHedgingCtx {
     pub(crate) max_burn_revert_redrives: u32,
     /// Alerting channel: structured operational-alert logs in production.
     pub(crate) notifier: Arc<dyn Notifier>,
-    /// Pause gate shared with the API: an operator operation quiesces the
-    /// driver through it before mutating a transfer this worker could advance.
-    pub(crate) driver_gate: UsdcDriverGate,
 }
 
 /// Errors emitted by [`TransferUsdcToHedging::perform`].
@@ -681,12 +658,6 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
     }
 
     async fn perform(&self, ctx: &TransferUsdcToHedgingCtx) -> Result<Self::Output, Self::Error> {
-        // Park while an operator operation holds the driver quiesced, and hold
-        // the in-flight claim for the whole attempt so a pause requested mid
-        // attempt waits for it. Claimed before the per-attempt timeout so time
-        // spent parked is not charged to the attempt.
-        let _in_flight = ctx.driver_gate.enter().await;
-
         // Per-attempt timeout wrapper (hedging only): abort a hung resume so the
         // attempt fails and retries instead of wedging the single-concurrency
         // worker. The inner result is then classified for redrive/terminal
@@ -754,14 +725,6 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                     "Base->Alpaca USDC transfer already in a terminal failed state; \
                      nothing to redrive, leaving for operator reconciliation"
                 );
-            }
-            Err(UsdcTransferError::WithdrawalScanTransient {
-                id,
-                initiated_at,
-                source,
-            }) => {
-                self.handle_withdrawal_scan_inconclusive(ctx, id, initiated_at, source)
-                    .await?;
             }
             // Settlement-phase transient: the Base burn scan was inconclusive
             // (chain head not yet far enough past the scan lower bound) or another
@@ -1207,68 +1170,6 @@ impl TransferUsdcToHedging {
         .await?;
         Ok(())
     }
-
-    /// Reschedules a `WithdrawalSubmitting` transfer whose vault-withdrawal scan
-    /// stayed inconclusive, paging the operator once the durable
-    /// `WITHDRAWAL_SCAN_ALERT_DEADLINE` (anchored on `initiated_at`) elapses
-    /// while continuing to redrive at the slower post-deadline cadence. Mirrors
-    /// [`Self::handle_mint_recovery_inconclusive`]: the guard stays held and the
-    /// idempotent re-scan keeps running because the withdrawal may still be
-    /// genuinely pending.
-    async fn handle_withdrawal_scan_inconclusive(
-        &self,
-        ctx: &TransferUsdcToHedgingCtx,
-        id: UsdcRebalanceId,
-        initiated_at: DateTime<Utc>,
-        source: Box<st0x_raindex::RaindexError>,
-    ) -> Result<(), TransferUsdcToHedgingJobError> {
-        // Mirror the `.ok()` pattern used for the mint-recovery / withdrawal-poll
-        // deadlines: a future `initiated_at` (clock skew after restart) makes
-        // `to_std()` return `Err`, treated as `None` so no spurious alert fires.
-        let elapsed = Utc::now().signed_duration_since(initiated_at).to_std().ok();
-        let alert_deadline_elapsed = deadline_elapsed(elapsed, WITHDRAWAL_SCAN_ALERT_DEADLINE);
-        let redrive_delay = if alert_deadline_elapsed.is_some() {
-            WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY
-        } else {
-            SETTLEMENT_REDRIVE_DELAY
-        };
-        warn!(
-            target: "rebalance",
-            %id,
-            delay = ?redrive_delay,
-            ?elapsed,
-            ?source,
-            "Rescheduling Base->Alpaca USDC transfer after transient or \
-             inconclusive vault-withdrawal scan (guard held, redrive continues)"
-        );
-        if let Some(elapsed) = alert_deadline_elapsed {
-            let message = format!(
-                "USDC transfer {id}: vault-withdrawal scan has stayed inconclusive for \
-                 {elapsed:?} since the transfer started (>{WITHDRAWAL_SCAN_ALERT_DEADLINE:?}); \
-                 the withdrawal's on-chain fate is still unknown ({source}). Transfer stays \
-                 latched at WithdrawalSubmitting (guard held); automatic redrive continues at a \
-                 slower cadence. Verify the vault withdrawal on-chain; use `stox transfer resume \
-                 --kind usdc --id {id} --direction to-alpaca` if the automatic redrive appears \
-                 stuck."
-            );
-            if let Err(notify_err) = ctx.notifier.notify(&message).await {
-                warn!(target: "rebalance", ?notify_err, "Failed to deliver withdrawal-scan-deadline-elapsed alert");
-            }
-        }
-        // A non-429 self-heal redrive breaks the consecutive-429 streak, so reset
-        // it (mirrors the burn-revert / withdrawal-poll-inconclusive redrives);
-        // carrying a stale streak could otherwise fire a premature backpressure
-        // page on a later genuine 429.
-        let redriven = Self {
-            backpressure_streak: BackpressureStreak::default(),
-            ..self.clone()
-        };
-        ctx.job_queue
-            .clone()
-            .push_with_delay(redriven, redrive_delay)
-            .await?;
-        Ok(())
-    }
 }
 
 /// Dependencies the Alpaca->Base job needs. Symmetric to
@@ -1280,9 +1181,206 @@ pub(crate) struct TransferUsdcToMarketMakingCtx {
     pub(crate) max_burn_revert_redrives: u32,
     /// Alerting channel: structured operational-alert logs in production.
     pub(crate) notifier: Arc<dyn Notifier>,
-    /// Pause gate shared with the API: an operator operation quiesces the
-    /// driver through it before mutating a transfer this worker could advance.
-    pub(crate) driver_gate: UsdcDriverGate,
+    /// Release-only handle for the trigger's single-rebalance guard, for the
+    /// pre-flight refusals that emit no aggregate event (see
+    /// [`UsdcGuardRelease`]). Every other outcome keeps the guard
+    /// deliberately or clears it event-driven via the reactor.
+    pub(crate) usdc_guard: Arc<dyn UsdcGuardRelease>,
+    /// Cross-attempt pacing for the pre-flight alerts (see
+    /// [`PreflightAlertGate`]): shared by every attempt through this ctx so
+    /// refusals that repeat on every rebalancing check do not page once per
+    /// check.
+    pub(crate) preflight_alerts: Arc<PreflightAlertGate>,
+}
+
+/// A single balance-read blip is warn-only, but a sustained RPC outage halts
+/// Alpaca->Base rebalancing silently; page on every N-th consecutive
+/// pre-flight balance-read failure so the outage surfaces at a bounded rate.
+const PREFLIGHT_UNAVAILABLE_ALERT_STREAK: u32 = 5;
+
+/// Alert pacing for the pre-flight refusals. Both pre-flight outcomes repeat
+/// on every rebalancing check (one check per fill and per snapshot) until an
+/// operator acts, because the guard release lets each check re-arm and
+/// refuse again -- unlike the settlement-time ambient failure, whose
+/// aggregate holds the guard and therefore alerts exactly once. The ambient
+/// refusal re-pages only when the observed balance changes; the balance-read
+/// failure pages on every [`PREFLIGHT_UNAVAILABLE_ALERT_STREAK`]-th
+/// consecutive failure. Any outcome past the pre-flight resets both gates. An
+/// ambient refusal resets only the read-failure streak (its read succeeded)
+/// while keeping the ambient balance key, so consecutive refusals still page
+/// once per balance.
+#[derive(Default)]
+pub(crate) struct PreflightAlertGate {
+    last_paged_ambient: tokio::sync::Mutex<Option<Usdc>>,
+    unavailable_streak: AtomicU32,
+}
+
+impl PreflightAlertGate {
+    /// Whether this ambient refusal should page: the first one, or one whose
+    /// balance differs from the last paged balance (the wallet was swept and
+    /// re-dusted, or received more funds).
+    async fn should_page_ambient(&self, balance: Usdc) -> bool {
+        let mut last = self.last_paged_ambient.lock().await;
+        if *last == Some(balance) {
+            return false;
+        }
+        *last = Some(balance);
+        true
+    }
+
+    /// Counts a consecutive balance-read failure; true on every
+    /// [`PREFLIGHT_UNAVAILABLE_ALERT_STREAK`]-th so a sustained outage pages
+    /// at a bounded rate.
+    fn count_unavailable(&self) -> bool {
+        let streak = self.unavailable_streak.fetch_add(1, Ordering::SeqCst) + 1;
+        streak.is_multiple_of(PREFLIGHT_UNAVAILABLE_ALERT_STREAK)
+    }
+
+    /// Clears only the balance-read failure streak. Called when the
+    /// pre-flight read SUCCEEDS but refuses (the ambient refusals observed a
+    /// real balance), so the streak keeps meaning CONSECUTIVE failed reads.
+    /// The ambient page dedup deliberately survives: consecutive ambient
+    /// refusals on one balance must still page only once.
+    fn reset_unavailable_streak(&self) {
+        self.unavailable_streak.store(0, Ordering::SeqCst);
+    }
+
+    /// Clears both gates. Called on any outcome past the pre-flight: the
+    /// pre-flight passed, so the next refusal is a new incident.
+    async fn reset(&self) {
+        *self.last_paged_ambient.lock().await = None;
+        self.reset_unavailable_streak();
+    }
+}
+
+/// Settles the ambient pre-flight refusal (`WalletUsdcAmbientPreflight`):
+/// warn on every attempt, page through the balance-keyed gate (the refusal
+/// repeats on every rebalancing check until the wallet is swept), and
+/// release the guard -- no aggregate exists to clear it event-driven.
+async fn settle_preflight_ambient(
+    ctx: &TransferUsdcToMarketMakingCtx,
+    id: &UsdcRebalanceId,
+    balance: Usdc,
+    nominal: Usdc,
+) {
+    warn!(
+        target: "rebalance",
+        %id,
+        %balance,
+        %nominal,
+        "Alpaca->Base USDC transfer refused pre-flight: ambient USDC in \
+         market-maker wallet; no Alpaca call was made and no aggregate exists"
+    );
+    if ctx.preflight_alerts.should_page_ambient(balance).await {
+        let message = format!(
+            "USDC transfer {id} refused before start: market-maker wallet already \
+             holds {balance} USDC (nominal {nominal}). No cash left Alpaca. \
+             Sweep the wallet to unblock USDC rebalancing."
+        );
+        deliver_market_making_alert(&ctx.notifier, &message, "pre-flight-ambient").await;
+    }
+    ctx.usdc_guard.release_unless_durably_held().await;
+}
+
+/// Settles the ambient sibling for a balance too large to represent
+/// (`WalletUsdcAmbientPreflightUnrepresentable`): the wallet provably holds
+/// USDC, so this pages and releases like the ambient refusal. Not deduped --
+/// the case is near-impossible, and when it fires the loudest response is
+/// the right one.
+async fn settle_preflight_unrepresentable(
+    ctx: &TransferUsdcToMarketMakingCtx,
+    id: &UsdcRebalanceId,
+    raw: U256,
+    error: &UsdcTransferError,
+) {
+    error!(
+        target: "rebalance",
+        %id,
+        %raw,
+        "Alpaca->Base USDC transfer refused pre-flight: ambient USDC in \
+         market-maker wallet with an unrepresentable balance; no Alpaca \
+         call was made and no aggregate exists"
+    );
+    let message = format!("{error}");
+    deliver_market_making_alert(&ctx.notifier, &message, "pre-flight-ambient").await;
+    ctx.usdc_guard.release_unless_durably_held().await;
+}
+
+/// Settles the pre-flight balance-read failure
+/// (`PreflightBalanceUnavailable`): warn-only for a transient blip, but a
+/// sustained outage halts Alpaca->Base rebalancing, so every
+/// [`PREFLIGHT_UNAVAILABLE_ALERT_STREAK`]-th consecutive failure pages.
+/// Releases the guard; the trigger's next cycle is the retry.
+async fn settle_preflight_unavailable(
+    ctx: &TransferUsdcToMarketMakingCtx,
+    id: &UsdcRebalanceId,
+    source: &UsdcTransferError,
+) {
+    warn!(
+        target: "rebalance",
+        %id,
+        ?source,
+        "Alpaca->Base USDC transfer refused pre-flight: wallet balance \
+         could not be determined; the trigger retries on its next cycle"
+    );
+    if ctx.preflight_alerts.count_unavailable() {
+        let message = format!(
+            "USDC transfer pre-flight balance read has failed \
+             {PREFLIGHT_UNAVAILABLE_ALERT_STREAK} consecutive times (latest \
+             transfer {id}: {source}). Alpaca->Base USDC rebalancing is \
+             halted until the RPC recovers."
+        );
+        deliver_market_making_alert(&ctx.notifier, &message, "pre-flight-outage").await;
+    }
+    ctx.usdc_guard.release_unless_durably_held().await;
+}
+
+/// Release-only handle for the trigger's single-rebalance guard, given to the
+/// worker for the outcomes that cannot clear it event-driven: pre-flight
+/// refusals, which emit no aggregate event, so no terminal event will ever
+/// clear the guard for them. Deliberately NOT the raw atomic: the guard is
+/// process-global and startup recovery re-latches it for OTHER aggregates
+/// (e.g. a post-burn failure awaiting manual reconciliation), so a blind
+/// release could drop a latch that still protects funds. The durable check
+/// covers exactly the persisted holders; a claim armed for a transfer that
+/// has not persisted its first event yet is invisible to it. That window is
+/// closed one layer up: every enqueue passes the trigger's
+/// `in_flight_usdc_transfer` gate, which refuses to arm a new transfer while
+/// any USDC transfer job row is still live, so a stale job's release cannot
+/// admit a second concurrent transfer. The release-only trait also keeps any
+/// future arm from claiming or blindly flipping the guard.
+#[async_trait]
+pub(crate) trait UsdcGuardRelease: Send + Sync + 'static {
+    async fn release_unless_durably_held(&self);
+}
+
+/// Production [`UsdcGuardRelease`]: clears the guard only when no persisted
+/// rebalance still holds it, keeping the latch on any doubt (fail closed,
+/// mirroring startup guard recovery).
+pub(crate) struct DurableCheckedGuardRelease {
+    pub(crate) pool: SqlitePool,
+    pub(crate) store: Arc<Store<UsdcRebalance>>,
+    pub(crate) usdc_in_progress: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl UsdcGuardRelease for DurableCheckedGuardRelease {
+    async fn release_unless_durably_held(&self) {
+        match any_rebalance_holds_guard(&self.pool, &self.store, None).await {
+            Ok(false) => self.usdc_in_progress.store(false, Ordering::SeqCst),
+            Ok(true) => warn!(
+                target: "rebalance",
+                "Guard stays latched after a pre-flight refusal: another \
+                 persisted USDC rebalance still holds it"
+            ),
+            Err(error) => warn!(
+                target: "rebalance",
+                ?error,
+                "Could not verify durable guard holders after a pre-flight \
+                 refusal; keeping the guard latched (fail closed)"
+            ),
+        }
+    }
 }
 
 /// Errors emitted by [`TransferUsdcToMarketMaking::perform`].
@@ -1374,10 +1472,6 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
         // as an `Err` that the redrive/retry paths handle. A phase-gated
         // perform-level timeout (safe only post-`Converting`) remains a
         // follow-up; it is deliberately not the blanket bound here.
-        // Park while an operator operation holds the driver quiesced, holding
-        // the in-flight claim for the whole attempt.
-        let _in_flight = ctx.driver_gate.enter().await;
-
         let result = ctx
             .transfer
             .resume_alpaca_to_base(&self.id, self.amount)
@@ -1398,15 +1492,21 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
 
 impl TransferUsdcToMarketMaking {
     /// Routes the transfer outcome to its recovery or terminal handling: the
-    /// redrive waits (attestation, settlement), the fail-closed burn-safety
-    /// latches, backpressure, and the terminal failures. One arm per error
-    /// contract. The match ends in a catch-all that routes to the
-    /// terminal/backpressure handler, which latches the guard.
+    /// redrive waits (attestation, settlement), the pre-flight guard
+    /// releases, the fail-closed burn-safety latches, backpressure, and the
+    /// terminal failures. One arm per error contract. The match ends in a
+    /// catch-all that routes to the terminal/backpressure handler, which
+    /// latches the guard -- so any NEW pre-aggregate variant MUST get an
+    /// explicit guard-releasing arm here, or its guard is latched with no
+    /// terminal event to ever clear it. The compiler cannot flag that; the
+    /// error type's docs mark the pre-aggregate variants.
     async fn settle_transfer_outcome(
         &self,
         ctx: &TransferUsdcToMarketMakingCtx,
         result: Result<(), UsdcTransferError>,
     ) -> Result<(), TransferUsdcToMarketMakingJobError> {
+        Self::reset_preflight_alerts_after_outcome(ctx, &result).await;
+
         match result {
             Ok(()) => {}
             Err(UsdcTransferError::AttestationTimedOut { id }) => {
@@ -1422,9 +1522,10 @@ impl TransferUsdcToMarketMaking {
                     .await?;
             }
             // Settlement-wait errors: the withdrawal tx has not yet reached the
-            // required on-chain confirmation depth, or an RPC call in the
-            // settlement phase (confirmation re-check, credit read, or burn scan)
-            // failed transiently. These are all safe to delayed-redrive because the
+            // required on-chain confirmation depth, the Ethereum wallet has not yet
+            // received the withdrawn USDC, or an RPC call in the settlement phase
+            // (confirmation re-check, balance read, or burn scan) failed
+            // transiently. These are all safe to delayed-redrive because the
             // aggregate is in a durable state (WithdrawalComplete or
             // BridgingSubmitting) -- they must NOT consume apalis retry budget
             // (only 3 retries, ~7 s total). Re-enqueue with
@@ -1438,6 +1539,15 @@ impl TransferUsdcToMarketMaking {
                     settlement_err,
                     id,
                     "withdrawal tx not yet sufficiently confirmed",
+                )
+                .await?;
+            }
+            Err(ref settlement_err @ UsdcTransferError::WalletUsdcInsufficient { ref id, .. }) => {
+                self.handle_settlement_wait_redrive(
+                    ctx,
+                    settlement_err,
+                    id,
+                    "market-maker wallet has insufficient USDC (withdrawal not yet settled)",
                 )
                 .await?;
             }
@@ -1510,60 +1620,66 @@ impl TransferUsdcToMarketMaking {
                      nothing to redrive, leaving for operator reconciliation"
                 );
             }
-            // The withdrawal tx did not pay this withdrawal (nothing, or more
-            // than nominal). The aggregate has already moved to BridgingFailed
-            // via FailBridging.
-            Err(UsdcTransferError::WithdrawalCreditMismatch {
+            // USDC arriving after the persisted preflight baseline made the
+            // attributable increase exceed the nominal withdrawal. The aggregate
+            // has already moved to BridgingFailed via FailBridging.
+            Err(UsdcTransferError::WalletUsdcAmbientBalance {
                 id,
-                tx,
-                credited,
+                balance,
                 nominal,
             }) => {
                 warn!(
                     target: "rebalance",
                     %id,
-                    %tx,
-                    %credited,
+                    %balance,
                     %nominal,
-                    "Alpaca->Base USDC transfer failed: withdrawal tx credit does not match \
-                     the withdrawal; bridge marked failed for operator reconciliation"
-                );
-                let message = format!(
-                    "USDC transfer {id} failed: withdrawal tx {tx} credited {credited} base \
-                     units to the market-maker wallet against nominal {nominal}. Bridge \
-                     marked failed; manual operator reconciliation required."
-                );
-                deliver_market_making_alert(&ctx.notifier, &message, "withdrawal-credit").await;
-            }
-            Err(UsdcTransferError::WithdrawalCreditUnreadable { id, tx, source }) => {
-                error!(
-                    target: "rebalance",
-                    %id,
-                    %tx,
-                    error = ?source,
-                    "Alpaca->Base USDC transfer failed: withdrawal tx credit cannot be \
-                     computed; bridge marked failed for operator reconciliation"
-                );
-                let message = format!(
-                    "USDC transfer {id} failed: the USDC credit of withdrawal tx {tx} cannot \
-                     be computed ({source}). Bridge marked failed; manual operator \
-                     reconciliation required."
-                );
-                deliver_market_making_alert(&ctx.notifier, &message, "withdrawal-credit").await;
-            }
-            Err(UsdcTransferError::WithdrawalTxMissing { id }) => {
-                error!(
-                    target: "rebalance",
-                    %id,
-                    "Alpaca->Base USDC transfer failed: no recorded withdrawal tx hash; \
+                    "Alpaca->Base USDC transfer failed: wallet increase exceeded nominal; \
                      bridge marked failed for operator reconciliation"
                 );
                 let message = format!(
-                    "USDC transfer {id} has no recorded withdrawal tx hash, so no Ethereum \
-                     USDC can be credited to it. Bridge marked failed; manual operator \
-                     reconciliation required."
+                    "USDC transfer {id} failed: wallet balance {balance} increased by more \
+                     than nominal {nominal} after preflight. Bridge marked failed; manual \
+                     operator reconciliation required."
                 );
-                deliver_market_making_alert(&ctx.notifier, &message, "missing-withdrawal-tx").await;
+                deliver_market_making_alert(&ctx.notifier, &message, "ambient-balance").await;
+            }
+            Err(UsdcTransferError::MissingPreflightBalance { id }) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    "Alpaca->Base USDC transfer failed: persisted preflight wallet \
+                     balance missing; bridge marked failed for operator reconciliation"
+                );
+                let message = format!(
+                    "USDC transfer {id} has no persisted preflight wallet balance, so the \
+                     Alpaca withdrawal cannot be distinguished from ambient dust. Bridge \
+                     marked failed; manual operator reconciliation required."
+                );
+                deliver_market_making_alert(&ctx.notifier, &message, "missing-preflight-baseline")
+                    .await;
+            }
+            // Pre-flight refusals (see the variants' docs): no aggregate
+            // exists, so each settles worker-side -- log, page through its
+            // alert gate, and release the guard -- and never redrives; the
+            // trigger re-attempts on its own schedule.
+            Err(UsdcTransferError::WalletUsdcAmbientPreflight {
+                id,
+                balance,
+                nominal,
+            }) => {
+                settle_preflight_ambient(ctx, &id, balance, nominal).await;
+            }
+            Err(
+                ref error @ UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable {
+                    ref id,
+                    raw,
+                    ..
+                },
+            ) => {
+                settle_preflight_unrepresentable(ctx, id, raw, error).await;
+            }
+            Err(UsdcTransferError::PreflightBalanceUnavailable { id, source }) => {
+                settle_preflight_unavailable(ctx, &id, &source).await;
             }
             // Indeterminate withdrawal poll: the Alpaca poll timed out or returned
             // a transport/API error without observing a terminal status. The
@@ -1654,6 +1770,25 @@ impl TransferUsdcToMarketMaking {
         }
 
         Ok(())
+    }
+
+    /// Resets pre-flight alert pacing once an outcome proves the pre-flight
+    /// balance read succeeded or the transfer advanced beyond pre-flight.
+    async fn reset_preflight_alerts_after_outcome(
+        ctx: &TransferUsdcToMarketMakingCtx,
+        result: &Result<(), UsdcTransferError>,
+    ) {
+        // Ambient refusals reset only the read-failure streak while retaining
+        // the last paged balance for deduplication. A failed read retains its
+        // streak. Every other outcome proves pre-flight passed and resets both.
+        match result {
+            Err(UsdcTransferError::PreflightBalanceUnavailable { .. }) => {}
+            Err(
+                UsdcTransferError::WalletUsdcAmbientPreflight { .. }
+                | UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable { .. },
+            ) => ctx.preflight_alerts.reset_unavailable_streak(),
+            _ => ctx.preflight_alerts.reset().await,
+        }
     }
 
     /// Ends the attempt without a retry for the two conversion outcomes that
@@ -2021,12 +2156,10 @@ impl TransferUsdcToMarketMaking {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use alloy::primitives::{Address, TxHash, U256};
+    use alloy::transports::TransportErrorKind;
     use chrono::{DateTime, Utc};
     use reqwest::StatusCode;
-    use tokio::sync::Notify;
     use uuid::{Uuid, uuid};
 
     use st0x_evm::{Chain, EvmError};
@@ -2038,7 +2171,6 @@ mod tests {
     use super::*;
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::native_gas::GasReadinessFailure;
-    use crate::rebalancing::usdc::{DriverNotQuiesced, UsdcDriverPause, usdc_driver_pause};
     use crate::test_utils::setup_test_apalis_pool;
 
     /// Builds a `QueuePushError` without touching a pool. The classification
@@ -2158,7 +2290,6 @@ mod tests {
         pool: &apalis_sqlite::SqlitePool,
     ) -> TransferUsdcToHedgingCtx {
         TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer,
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(pool),
@@ -2190,6 +2321,115 @@ mod tests {
             _amount: Usdc,
         ) -> Result<(), UsdcTransferError> {
             Err(UsdcTransferError::AttestationTimedOut { id: id.clone() })
+        }
+    }
+
+    struct NoopGuardRelease;
+
+    #[async_trait]
+    impl UsdcGuardRelease for NoopGuardRelease {
+        async fn release_unless_durably_held(&self) {}
+    }
+
+    /// Records whether the worker asked for a guard release, standing in for
+    /// the durable-state-checked production impl.
+    #[derive(Default)]
+    struct RecordingGuardRelease {
+        released: AtomicBool,
+    }
+
+    #[async_trait]
+    impl UsdcGuardRelease for RecordingGuardRelease {
+        async fn release_unless_durably_held(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct AmbientPreflightAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for AmbientPreflightAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WalletUsdcAmbientPreflight {
+                id: id.clone(),
+                balance: Usdc::new(float!(50)),
+                nominal: amount,
+            })
+        }
+    }
+
+    /// Ambient pre-flight refusal with a caller-chosen balance, for the
+    /// alert-dedup tests that need the observed balance to change.
+    struct AmbientPreflightWithBalance(Usdc);
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for AmbientPreflightWithBalance {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WalletUsdcAmbientPreflight {
+                id: id.clone(),
+                balance: self.0,
+                nominal: amount,
+            })
+        }
+    }
+
+    struct UnrepresentableAmbientAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for UnrepresentableAmbientAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(
+                UsdcTransferError::WalletUsdcAmbientPreflightUnrepresentable {
+                    id: id.clone(),
+                    raw: alloy::primitives::U256::MAX,
+                    source: Box::new(UsdcTransferError::Cctp(Box::new(CctpError::RpcTransport(
+                        TransportErrorKind::backend_gone(),
+                    )))),
+                },
+            )
+        }
+    }
+
+    struct OkAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for OkAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Ok(())
+        }
+    }
+
+    struct BalanceUnavailableAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for BalanceUnavailableAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::PreflightBalanceUnavailable {
+                id: id.clone(),
+                source: Box::new(UsdcTransferError::Cctp(Box::new(CctpError::RpcTransport(
+                    TransportErrorKind::backend_gone(),
+                )))),
+            })
         }
     }
 
@@ -2287,9 +2527,7 @@ mod tests {
         /// the job pages and must not redrive.
         SettlementDeadlineElapsed,
         PreviouslyFailed,
-        WithdrawalCreditMismatch,
-        WithdrawalCreditUnreadable,
-        WithdrawalTxMissing,
+        AmbientBalance,
         /// Fail-closed burn-submission terminals: a burn may be in flight, so the
         /// job must NOT auto-redrive (a redrive could reburn).
         BurnSubmitInconclusive,
@@ -2320,22 +2558,11 @@ mod tests {
                 Self::PreviouslyFailed => {
                     UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }
                 }
-                Self::WithdrawalCreditMismatch => UsdcTransferError::WithdrawalCreditMismatch {
+                Self::AmbientBalance => UsdcTransferError::WalletUsdcAmbientBalance {
                     id: id.clone(),
-                    tx: TxHash::from([0xEF; 32]),
-                    credited: U256::ZERO,
+                    balance: Usdc::new(float!(1)),
                     nominal: Usdc::new(float!(1)),
                 },
-                Self::WithdrawalCreditUnreadable => UsdcTransferError::WithdrawalCreditUnreadable {
-                    id: id.clone(),
-                    tx: TxHash::from([0xEF; 32]),
-                    source: Box::new(CctpError::UsdcCreditOverflow {
-                        tx_hash: TxHash::from([0xEF; 32]),
-                    }),
-                },
-                Self::WithdrawalTxMissing => {
-                    UsdcTransferError::WithdrawalTxMissing { id: id.clone() }
-                }
                 Self::BurnSubmitInconclusive => {
                     UsdcTransferError::BurnSubmitInconclusive { id: id.clone() }
                 }
@@ -2778,7 +3005,6 @@ mod tests {
         // Short timeout to make the test fast. hedging_ctx uses 3600s by
         // default so override inline.
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -2831,7 +3057,6 @@ mod tests {
     async fn hedging_job_hits_redrive_limit_on_repeated_timeout() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -2868,198 +3093,13 @@ mod tests {
         pool: &apalis_sqlite::SqlitePool,
     ) -> TransferUsdcToMarketMakingCtx {
         TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer,
             job_queue: TransferUsdcToMarketMakingJobQueue::new(pool),
             max_burn_revert_redrives: 5,
             notifier: Arc::new(LogNotifier),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         }
-    }
-
-    /// Records whether a fund-moving resume ran, in either direction, so a test
-    /// can assert a worker moved no funds while the driver was paused.
-    #[derive(Clone, Default)]
-    struct FundMovementRecorder {
-        moved: Arc<AtomicBool>,
-    }
-
-    impl FundMovementRecorder {
-        fn record(&self) {
-            self.moved.store(true, Ordering::SeqCst);
-        }
-
-        fn moved(&self) -> bool {
-            self.moved.load(Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait]
-    impl ResumeBaseToAlpaca for FundMovementRecorder {
-        async fn resume_base_to_alpaca(
-            &self,
-            _id: &UsdcRebalanceId,
-            _amount: Usdc,
-        ) -> Result<(), UsdcTransferError> {
-            self.record();
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl ResumeAlpacaToBase for FundMovementRecorder {
-        async fn resume_alpaca_to_base(
-            &self,
-            _id: &UsdcRebalanceId,
-            _amount: Usdc,
-        ) -> Result<(), UsdcTransferError> {
-            self.record();
-            Ok(())
-        }
-    }
-
-    /// Holds `pause` while `execution` runs and asserts the worker parks at the
-    /// driver gate without moving funds, then releases the pause and asserts it
-    /// completes and moves them.
-    async fn assert_worker_parks_while_paused_then_moves_funds<E>(
-        pause: &UsdcDriverPause,
-        recorder: &FundMovementRecorder,
-        execution: impl Future<Output = Result<(), E>> + Send + 'static,
-    ) where
-        E: std::fmt::Debug + Send + 'static,
-    {
-        let pause_guard = pause.pause().await.unwrap();
-
-        let mut worker = tokio::spawn(execution);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut worker)
-                .await
-                .is_err(),
-            "the worker must park at the gate while the driver is paused"
-        );
-        assert!(!recorder.moved(), "a paused worker must move no funds");
-
-        drop(pause_guard);
-
-        tokio::time::timeout(Duration::from_secs(5), worker)
-            .await
-            .expect("the worker must resume once the pause releases")
-            .expect("the worker task must not panic")
-            .expect("the resumed worker must complete its transfer");
-        assert!(recorder.moved(), "the resumed worker must move funds");
-    }
-
-    /// Signals when its resume has entered (holding the in-flight claim) and
-    /// blocks there until released, so a test can observe a live worker
-    /// execution making an operator pause wait.
-    struct BlockingBaseToAlpaca {
-        entered: Arc<Notify>,
-        release: Arc<Notify>,
-    }
-
-    #[async_trait]
-    impl ResumeBaseToAlpaca for BlockingBaseToAlpaca {
-        async fn resume_base_to_alpaca(
-            &self,
-            _id: &UsdcRebalanceId,
-            _amount: Usdc,
-        ) -> Result<(), UsdcTransferError> {
-            self.entered.notify_one();
-            self.release.notified().await;
-            Ok(())
-        }
-    }
-
-    /// Production integration for the Base->Alpaca worker's driver-gate call:
-    /// while an operator holds the driver paused the worker must park at the
-    /// gate and move no funds, then proceed once the pause releases. Deleting
-    /// or moving the `ctx.driver_gate.enter().await` in `perform` lets the
-    /// worker move funds while paused, failing the paused assertion.
-    #[tokio::test]
-    async fn base_to_alpaca_worker_parks_while_paused_then_moves_funds_after_resume() {
-        let pool = setup_queue_pool().await;
-        let recorder = FundMovementRecorder::default();
-        let (pause, gate) = usdc_driver_pause();
-        let mut ctx = hedging_ctx(Arc::new(recorder.clone()), &pool);
-        ctx.driver_gate = gate;
-        let job = TransferUsdcToHedging {
-            id: UsdcRebalanceId(Uuid::new_v4()),
-            amount: Usdc::new(float!(100)),
-            revert_redrive_attempts: 0,
-            backpressure_streak: BackpressureStreak::default(),
-        };
-
-        assert_worker_parks_while_paused_then_moves_funds(&pause, &recorder, async move {
-            Job::perform(&job, &ctx).await
-        })
-        .await;
-    }
-
-    /// Alpaca->Base sibling of the test above, covering the second worker entry
-    /// point (`TransferUsdcToMarketMaking::perform`).
-    #[tokio::test]
-    async fn alpaca_to_base_worker_parks_while_paused_then_moves_funds_after_resume() {
-        let pool = setup_queue_pool().await;
-        let recorder = FundMovementRecorder::default();
-        let (pause, gate) = usdc_driver_pause();
-        let mut ctx = market_making_ctx(Arc::new(recorder.clone()), &pool);
-        ctx.driver_gate = gate;
-        let job = TransferUsdcToMarketMaking {
-            id: UsdcRebalanceId(Uuid::new_v4()),
-            amount: Usdc::new(float!(100)),
-            revert_redrive_attempts: 0,
-            backpressure_streak: BackpressureStreak::default(),
-        };
-
-        assert_worker_parks_while_paused_then_moves_funds(&pause, &recorder, async move {
-            Job::perform(&job, &ctx).await
-        })
-        .await;
-    }
-
-    /// Production integration for "an active execution makes a pause wait": a
-    /// live worker execution holds the in-flight claim through
-    /// `ctx.driver_gate.enter().await`, so an operator pause requested while it
-    /// runs must refuse (`DriverNotQuiesced`) rather than quiesce over the top
-    /// of moving funds. Removing the worker's gate call lets the pause quiesce
-    /// immediately, failing this assertion.
-    #[tokio::test]
-    async fn operator_pause_waits_for_an_in_flight_worker_execution() {
-        let pool = setup_queue_pool().await;
-        let (pause, gate) = usdc_driver_pause();
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let mut ctx = hedging_ctx(
-            Arc::new(BlockingBaseToAlpaca {
-                entered: entered.clone(),
-                release: release.clone(),
-            }),
-            &pool,
-        );
-        ctx.driver_gate = gate;
-        let job = TransferUsdcToHedging {
-            id: UsdcRebalanceId(Uuid::new_v4()),
-            amount: Usdc::new(float!(100)),
-            revert_redrive_attempts: 0,
-            backpressure_streak: BackpressureStreak::default(),
-        };
-
-        let worker = tokio::spawn(async move { Job::perform(&job, &ctx).await });
-        entered.notified().await;
-        // Pause only after the DB pool is built and the worker holds the
-        // in-flight claim, so the quiesce window's timer auto-advances instead
-        // of waiting five real seconds.
-        tokio::time::pause();
-
-        assert!(
-            matches!(pause.pause().await, Err(DriverNotQuiesced)),
-            "a pause must refuse while a worker execution holds the driver"
-        );
-
-        release.notify_one();
-        worker
-            .await
-            .expect("the worker task must not panic")
-            .expect("the released worker must complete its transfer");
     }
 
     #[tokio::test]
@@ -3119,7 +3159,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedBaseToAlpaca),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -3162,7 +3201,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedBaseToAlpaca),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -3205,7 +3243,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedBaseToAlpaca),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -3268,16 +3305,433 @@ mod tests {
         assert_eq!(job.backpressure_streak, BackpressureStreak::default());
     }
 
+    /// Hypothesis: a pre-flight ambient refusal requests the durable-checked
+    /// guard release from the worker. The refusal emits NO aggregate event,
+    /// so no terminal event will ever clear the guard event-driven; without
+    /// this release the trigger stays wedged ("already in progress") until
+    /// restart. The job must also alert the operator to sweep the wallet and
+    /// must NOT redrive (a retry cannot remove the ambient balance; the
+    /// trigger re-attempts on its own schedule).
+    #[tokio::test]
+    async fn market_making_job_releases_guard_and_alerts_on_preflight_ambient_refusal() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let guard_release = Arc::new(RecordingGuardRelease::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(AmbientPreflightAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: guard_release.clone(),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert!(
+            guard_release.released.load(Ordering::SeqCst),
+            "the pre-flight refusal must request the guard release: no \
+             aggregate event exists to clear the guard event-driven"
+        );
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "a pre-flight refusal must NOT redrive: retrying cannot remove \
+             the ambient balance"
+        );
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly one operator alert must fire; got: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("Sweep the wallet"),
+            "the alert must tell the operator to sweep the wallet; got: {}",
+            messages[0]
+        );
+    }
+
+    /// The production release clears the latch when no persisted rebalance
+    /// holds the guard: the pre-flight refusal wrote nothing durable, so the
+    /// guard must reflect durable state alone.
+    #[tokio::test]
+    async fn durable_checked_release_clears_guard_when_no_holder() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = st0x_event_sorcery::test_store::<UsdcRebalance>(pool.clone(), ());
+        let latch = Arc::new(AtomicBool::new(true));
+
+        DurableCheckedGuardRelease {
+            pool,
+            store: Arc::new(store),
+            usdc_in_progress: latch.clone(),
+        }
+        .release_unless_durably_held()
+        .await;
+
+        assert!(
+            !latch.load(Ordering::SeqCst),
+            "with no durable holder the release must clear the latch"
+        );
+    }
+
+    /// The production release must NOT clear the latch while a persisted
+    /// rebalance still holds the guard: a stale pre-crash job row can reach
+    /// the pre-flight refusal while startup recovery has re-latched the
+    /// guard for a different, unreconciled aggregate.
+    #[tokio::test]
+    async fn durable_checked_release_keeps_guard_for_post_burn_holder() {
+        use crate::usdc_rebalance::UsdcRebalanceCommand::*;
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = st0x_event_sorcery::test_store::<UsdcRebalance>(pool.clone(), ());
+        let burn_tx = TxHash::repeat_byte(0x11);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            Initiate {
+                direction: crate::usdc_rebalance::RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(400.0)),
+                withdrawal: crate::usdc_rebalance::TransferRef::OnchainTx(burn_tx),
+            },
+            ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            InitiateBridging { burn_tx },
+            FailBridging {
+                reason: "x".to_string(),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let latch = Arc::new(AtomicBool::new(true));
+        DurableCheckedGuardRelease {
+            pool,
+            store: Arc::new(store),
+            usdc_in_progress: latch.clone(),
+        }
+        .release_unless_durably_held()
+        .await;
+
+        assert!(
+            latch.load(Ordering::SeqCst),
+            "the release must keep the latch while a persisted rebalance \
+             still holds the guard (fail closed)"
+        );
+    }
+
+    /// Hypothesis: a pre-flight balance-read failure releases the guard and
+    /// does NOT redrive or page: nothing started, no aggregate exists, and
+    /// the trigger's next cycle is the retry (a transient RPC blip must not
+    /// alert-spam the operator).
+    #[tokio::test]
+    async fn market_making_job_releases_guard_without_alert_on_preflight_balance_failure() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let guard_release = Arc::new(RecordingGuardRelease::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(BalanceUnavailableAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: guard_release.clone(),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert!(
+            guard_release.released.load(Ordering::SeqCst),
+            "a pre-flight balance failure must request the guard release: \
+             nothing started and no aggregate exists"
+        );
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "a pre-flight balance failure must NOT redrive; the trigger's \
+             next cycle is the retry"
+        );
+        assert!(
+            notifier.messages().is_empty(),
+            "a transient balance-read failure must not page the operator; \
+             got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    /// The ambient refusal repeats on every rebalancing check until the
+    /// wallet is swept, so the page dedups on the observed balance: same
+    /// balance pages once, a changed balance pages again.
+    #[tokio::test]
+    async fn market_making_preflight_ambient_alert_pages_once_per_balance() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let gate = Arc::new(PreflightAlertGate::default());
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let ctx_with_balance = |balance: Usdc| TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(AmbientPreflightWithBalance(balance)),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: gate.clone(),
+        };
+
+        let dusted = ctx_with_balance(Usdc::new(float!(50)));
+        job.perform(&dusted).await.unwrap();
+        job.perform(&dusted).await.unwrap();
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "a repeated refusal on the same balance must page exactly once"
+        );
+
+        let more_dust = ctx_with_balance(Usdc::new(float!(75)));
+        job.perform(&more_dust).await.unwrap();
+        assert_eq!(
+            notifier.messages().len(),
+            2,
+            "a changed ambient balance is a new incident and must page again"
+        );
+    }
+
+    /// A single balance-read blip stays warn-only, but a sustained outage
+    /// halts Alpaca->Base rebalancing: every
+    /// `PREFLIGHT_UNAVAILABLE_ALERT_STREAK`-th consecutive failure pages.
+    #[tokio::test]
+    async fn market_making_preflight_outage_pages_on_streak_threshold() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(BalanceUnavailableAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        for _ in 0..4 {
+            job.perform(&ctx).await.unwrap();
+        }
+        assert!(
+            notifier.messages().is_empty(),
+            "below the streak threshold the outage must stay warn-only; \
+             got: {:?}",
+            notifier.messages()
+        );
+
+        job.perform(&ctx).await.unwrap();
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the fifth consecutive failure must page the operator"
+        );
+        assert!(
+            messages[0].contains("halted until the RPC recovers"),
+            "the page must state that rebalancing is halted; got: {}",
+            messages[0]
+        );
+    }
+
+    /// A successful pre-flight between failures proves the outage ended, so
+    /// the streak resets and the next failures start counting from zero.
+    #[tokio::test]
+    async fn market_making_preflight_outage_streak_resets_on_success() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let gate = Arc::new(PreflightAlertGate::default());
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let failing = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(BalanceUnavailableAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: gate.clone(),
+        };
+        let succeeding = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(OkAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: gate.clone(),
+        };
+
+        for _ in 0..3 {
+            job.perform(&failing).await.unwrap();
+        }
+        job.perform(&succeeding).await.unwrap();
+        for _ in 0..4 {
+            job.perform(&failing).await.unwrap();
+        }
+
+        assert!(
+            notifier.messages().is_empty(),
+            "a success between failures must reset the streak; got: {:?}",
+            notifier.messages()
+        );
+    }
+
+    /// An ambient refusal between read failures is a SUCCESSFUL read (it
+    /// observed a balance), so it must reset the read-failure streak: the
+    /// outage alert counts consecutive failed reads, and letting the streak
+    /// survive an interleaved successful read would page "5 consecutive
+    /// failed reads" that never happened. The ambient page dedup is
+    /// unaffected and still pages once for its own refusal.
+    #[tokio::test]
+    async fn market_making_preflight_outage_streak_resets_on_ambient_refusal() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let gate = Arc::new(PreflightAlertGate::default());
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let failing = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(BalanceUnavailableAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: gate.clone(),
+        };
+        let ambient = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(AmbientPreflightWithBalance(Usdc::new(float!(50)))),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: gate.clone(),
+        };
+
+        for _ in 0..3 {
+            job.perform(&failing).await.unwrap();
+        }
+        job.perform(&ambient).await.unwrap();
+        for _ in 0..4 {
+            job.perform(&failing).await.unwrap();
+        }
+
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "only the ambient refusal itself may page; the read-failure \
+             streak must restart after its successful read; got: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("already holds"),
+            "the single page must be the ambient refusal, not the outage \
+             alert; got: {}",
+            messages[0]
+        );
+
+        job.perform(&failing).await.unwrap();
+        let messages = notifier.messages();
+        assert_eq!(
+            messages.len(),
+            2,
+            "the fifth consecutive failure after the reset must page the \
+             outage afresh; got: {messages:?}"
+        );
+        assert!(
+            messages[1].contains("halted until the RPC recovers"),
+            "the second page must be the outage alert; got: {}",
+            messages[1]
+        );
+    }
+
+    /// The unrepresentable-balance refusal is the ambient sibling: page the
+    /// operator with the raw balance, release the guard, never redrive.
+    #[tokio::test]
+    async fn market_making_job_pages_and_releases_on_unrepresentable_ambient() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let guard_release = Arc::new(RecordingGuardRelease::default());
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(UnrepresentableAmbientAlpacaToBase),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            usdc_guard: guard_release.clone(),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(1000)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert!(
+            guard_release.released.load(Ordering::SeqCst),
+            "the unrepresentable ambient refusal is pre-aggregate and must \
+             release the guard"
+        );
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "the refusal must NOT redrive: retrying cannot shrink the balance"
+        );
+        let messages = notifier.messages();
+        assert_eq!(messages.len(), 1, "the refusal must page the operator");
+        assert!(
+            messages[0].contains("raw balance"),
+            "the page must carry the raw balance; got: {}",
+            messages[0]
+        );
+    }
+
     #[tokio::test]
     async fn market_making_job_429_reschedules_with_incremented_streak() {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // See the hedging-direction sibling test: a nonzero, distinct
         // `revert_redrive_attempts` closes the swap-risk gap between the two
@@ -3312,11 +3766,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3352,11 +3807,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3412,11 +3868,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(InconclusiveAlpacaToBase::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // `backpressure_streak` starts nonzero: this non-429 inconclusive
         // poll error routes through `handle_withdrawal_poll_inconclusive`
@@ -3490,11 +3947,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3549,11 +4007,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3593,11 +4052,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3628,11 +4088,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(RateLimitedWithdrawalPollAlpacaToBase::after_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3673,11 +4134,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(InconclusiveAlpacaToBase::future_initiated_at()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3717,38 +4179,6 @@ mod tests {
         );
     }
 
-    /// A withdrawal Alpaca reports Complete with no tx hash reached Alpaca fine,
-    /// so its deadline alert must not blame Alpaca connectivity.
-    #[tokio::test]
-    async fn missing_tx_hash_alert_does_not_blame_alpaca_connectivity() {
-        let notifier = Arc::new(CapturingNotifier::default());
-        let notifier_dyn: Arc<dyn Notifier> = notifier.clone();
-        let id = UsdcRebalanceId(Uuid::new_v4());
-
-        alert_withdrawal_poll_deadline_elapsed(
-            &id,
-            WITHDRAWAL_POLL_ALERT_DEADLINE,
-            &AlpacaWalletError::CompletedTransferMissingTx {
-                transfer_id: AlpacaTransferId::from(Uuid::new_v4()),
-            },
-            &notifier_dyn,
-        )
-        .await;
-
-        let messages = notifier.messages();
-        assert_eq!(messages.len(), 1, "got: {messages:?}");
-        let alert = &messages[0];
-        assert!(alert.contains(&id.to_string()), "got: {alert:?}");
-        assert!(
-            !alert.contains("unreachable"),
-            "Alpaca answered, so the alert must not blame connectivity; got: {alert:?}"
-        );
-        assert!(
-            alert.contains("no tx hash"),
-            "the alert must name the missing tx hash; got: {alert:?}"
-        );
-    }
-
     /// `WithdrawalPollInconclusive` at or after the alert deadline must fire an
     /// operator alert via the notifier while STILL scheduling the delayed redrive
     /// and returning `Ok`. The guard stays held and re-polling continues.
@@ -3757,11 +4187,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(InconclusiveAlpacaToBase::after_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3832,11 +4263,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(InconclusiveAlpacaToBase::at_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3891,11 +4323,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintRecoveryInconclusiveStub::before_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -3950,11 +4383,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintRecoveryInconclusiveStub::after_deadline()),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -4037,7 +4471,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintRecoveryInconclusiveStub::before_deadline()),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -4092,7 +4525,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintRecoveryInconclusiveStub::after_deadline()),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -4259,12 +4691,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_making_job_treats_withdrawal_credit_mismatch_as_clean_terminal() {
+    async fn market_making_job_treats_ambient_balance_as_clean_terminal() {
         let pool = setup_queue_pool().await;
         let ctx = market_making_ctx(
-            Arc::new(TerminalAlpacaToBase(
-                TerminalOutcome::WithdrawalCreditMismatch,
-            )),
+            Arc::new(TerminalAlpacaToBase(TerminalOutcome::AmbientBalance)),
             &pool,
         );
         let job = TransferUsdcToMarketMaking {
@@ -4276,12 +4706,12 @@ mod tests {
 
         job.perform(&ctx)
             .await
-            .expect("a credit mismatch must be a clean terminal outcome, not a job error");
+            .expect("ambient balance must be a clean terminal outcome, not a job error");
 
         assert_eq!(
             pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
             0,
-            "a credit-mismatch failure must not be redriven and must not trip the breaker"
+            "an ambient-balance failure must not be redriven and must not trip the breaker"
         );
     }
 
@@ -4299,7 +4729,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalBaseToAlpaca(outcome)),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -4351,11 +4780,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalAlpacaToBase(outcome)),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -4734,6 +5164,24 @@ mod tests {
         }
     }
 
+    struct InsufficientUsdcBalance;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for InsufficientUsdcBalance {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WalletUsdcInsufficient {
+                id: id.clone(),
+                nominal: Usdc::new(float!(1)),
+                current: U256::ZERO,
+                baseline: U256::ZERO,
+            })
+        }
+    }
+
     /// Hypothesis: WithdrawalTxUnderconfirmed re-enqueues with
     /// SETTLEMENT_REDRIVE_DELAY and returns Ok (job stays alive, no apalis
     /// retry budget consumed).
@@ -4756,6 +5204,50 @@ mod tests {
             pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
             1,
             "WithdrawalTxUnderconfirmed must re-enqueue a delayed replacement job"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            rescheduled.amount.eq(&job.amount).unwrap(),
+            "the rescheduled job must carry the same amount, got {} vs {}",
+            rescheduled.amount,
+            job.amount
+        );
+        assert!(
+            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    /// Hypothesis: WalletUsdcInsufficient re-enqueues with
+    /// SETTLEMENT_REDRIVE_DELAY and returns Ok (job stays alive, no apalis
+    /// retry budget consumed).
+    #[tokio::test]
+    async fn market_making_job_reschedules_insufficient_usdc_balance() {
+        let pool = setup_queue_pool().await;
+        let ctx = market_making_ctx(Arc::new(InsufficientUsdcBalance), &pool);
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "WalletUsdcInsufficient must re-enqueue a delayed replacement job"
         );
 
         let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
@@ -4872,7 +5364,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(SettlementRpcFailureBaseToAlpaca),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -4923,144 +5414,6 @@ mod tests {
                 && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
             "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
              run_at={run_at} before={before} after={after}"
-        );
-    }
-
-    struct WithdrawalScanFailureBaseToAlpaca {
-        initiated_at: DateTime<Utc>,
-    }
-
-    #[async_trait]
-    impl ResumeBaseToAlpaca for WithdrawalScanFailureBaseToAlpaca {
-        async fn resume_base_to_alpaca(
-            &self,
-            id: &UsdcRebalanceId,
-            _amount: Usdc,
-        ) -> Result<(), UsdcTransferError> {
-            Err(UsdcTransferError::WithdrawalScanTransient {
-                id: id.clone(),
-                initiated_at: self.initiated_at,
-                source: Box::new(st0x_raindex::RaindexError::ScanInconclusive { from_block: 42 }),
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn hedging_job_delayed_redrives_transient_withdrawal_scan() {
-        let pool = setup_queue_pool().await;
-        let notifier = Arc::new(CapturingNotifier::default());
-        let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
-            transfer: Arc::new(WithdrawalScanFailureBaseToAlpaca {
-                initiated_at: Utc::now(),
-            }),
-            timeout: Duration::from_secs(3600),
-            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
-            max_burn_revert_redrives: 5,
-            notifier: notifier.clone(),
-        };
-        let job = TransferUsdcToHedging {
-            id: UsdcRebalanceId(Uuid::new_v4()),
-            amount: Usdc::new(float!(100)),
-            revert_redrive_attempts: 3,
-            backpressure_streak: BackpressureStreak(4),
-        };
-
-        let before = Utc::now().timestamp();
-        Job::perform(&job, &ctx).await.unwrap();
-        let after = Utc::now().timestamp();
-
-        assert_eq!(
-            pending_job_count::<TransferUsdcToHedging>(&pool).await,
-            1,
-            "a transient withdrawal scan must enqueue one delayed replacement"
-        );
-        assert!(
-            notifier.messages().is_empty(),
-            "a transient withdrawal scan must not fire a terminal alert"
-        );
-        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
-        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(rescheduled.id, job.id);
-        assert_eq!(
-            rescheduled.revert_redrive_attempts, job.revert_redrive_attempts,
-            "withdrawal-scan redrive must not consume the burn-redrive budget"
-        );
-        assert_eq!(
-            rescheduled.backpressure_streak,
-            BackpressureStreak::default(),
-            "a non-429 inconclusive withdrawal-scan redrive is unrelated to \
-             backpressure and must reset the streak"
-        );
-        assert!(
-            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
-                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
-            "redrive must be delayed by approximately {SETTLEMENT_REDRIVE_DELAY:?}"
-        );
-    }
-
-    /// A withdrawal scan that stays inconclusive past
-    /// `WITHDRAWAL_SCAN_ALERT_DEADLINE` must page the operator exactly once while
-    /// STILL redriving (at the slower post-deadline cadence, guard held): the
-    /// withdrawal may still be genuinely pending, so redrive never stops.
-    #[tokio::test]
-    async fn hedging_job_pages_on_withdrawal_scan_deadline_elapsed() {
-        let pool = setup_queue_pool().await;
-        let notifier = Arc::new(CapturingNotifier::default());
-        let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
-            transfer: Arc::new(WithdrawalScanFailureBaseToAlpaca {
-                initiated_at: Utc::now() - chrono::Duration::hours(5),
-            }),
-            timeout: Duration::from_secs(3600),
-            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
-            max_burn_revert_redrives: 5,
-            notifier: notifier.clone(),
-        };
-        let job = TransferUsdcToHedging {
-            id: UsdcRebalanceId(Uuid::new_v4()),
-            amount: Usdc::new(float!(100)),
-            revert_redrive_attempts: 3,
-            backpressure_streak: BackpressureStreak::default(),
-        };
-
-        let before = Utc::now().timestamp();
-        Job::perform(&job, &ctx).await.unwrap();
-        let after = Utc::now().timestamp();
-
-        let messages = notifier.messages();
-        assert_eq!(
-            messages.len(),
-            1,
-            "a withdrawal scan inconclusive past the alert deadline must page the \
-             operator exactly once, got: {messages:?}"
-        );
-        assert!(
-            messages[0].contains(&job.id.to_string()),
-            "the deadline alert must include the transfer id; got: {:?}",
-            messages[0]
-        );
-        assert_eq!(
-            pending_job_count::<TransferUsdcToHedging>(&pool).await,
-            1,
-            "the guard stays held and redrive continues past the deadline"
-        );
-        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
-        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(rescheduled.id, job.id);
-        assert!(
-            run_at
-                >= before
-                    + i64::try_from(WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY.as_secs()).unwrap()
-                    - 5
-                && run_at
-                    <= after
-                        + i64::try_from(WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY.as_secs())
-                            .unwrap()
-                        + 5,
-            "past the deadline the redrive must slow to \
-             ~{WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY:?} -- run_at={run_at} \
-             before={before} after={after}"
         );
     }
 
@@ -5180,7 +5533,6 @@ mod tests {
         let closed_queue = TransferUsdcToHedgingJobQueue::new(&closed_pool);
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BotGasEnqueueFailureBaseToAlpaca(closed_queue)),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5250,7 +5602,6 @@ mod tests {
     async fn hedging_job_failing_notifier_does_not_abort_job() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5283,13 +5634,14 @@ mod tests {
     async fn market_making_job_failing_notifier_does_not_abort_job() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalAlpacaToBase(
                 TerminalOutcome::SettlementDeadlineElapsed,
             )),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: Arc::new(FailingNotifier),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -5317,14 +5669,16 @@ mod tests {
     async fn market_making_settlement_deadline_alert_instructs_reconcile() {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
+        let guard_release = Arc::new(RecordingGuardRelease::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalAlpacaToBase(
                 TerminalOutcome::SettlementDeadlineElapsed,
             )),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: guard_release.clone(),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -5350,6 +5704,12 @@ mod tests {
             messages[0].contains("guard stays held"),
             "the alert must state the guard is retained; got: {:?}",
             messages[0]
+        );
+        assert!(
+            !guard_release.released.load(Ordering::SeqCst),
+            "the settlement-deadline terminal must keep the rebalance guard \
+             held until operator reconciliation; releasing it would let a new \
+             USDC rebalance start over unverified funds"
         );
     }
 
@@ -5460,7 +5820,6 @@ mod tests {
     async fn hedging_job_hits_redrive_limit_on_revert() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5524,7 +5883,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(NonRevertBurnErrorResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5555,7 +5913,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5603,7 +5960,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5650,7 +6006,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5694,7 +6049,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5737,7 +6091,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertResume),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5775,7 +6128,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5822,7 +6174,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5865,7 +6216,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -5980,11 +6330,12 @@ mod tests {
     async fn market_making_job_hits_redrive_limit_on_revert() {
         let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: Arc::new(LogNotifier),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -6017,11 +6368,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // attempts=2 -> next=3 == 5/2+1: exactly at threshold
         let job = TransferUsdcToMarketMaking {
@@ -6063,11 +6415,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // attempts=2 -> next=3 == max=3: last allowed redrive, alert fires
         let job = TransferUsdcToMarketMaking {
@@ -6109,11 +6462,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(BurnRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         // attempts=3 -> next=4 > max=3: over-limit, Err, no alert
         let job = TransferUsdcToMarketMaking {
@@ -6165,11 +6519,12 @@ mod tests {
         }
 
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(NonRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -6194,7 +6549,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalBaseToAlpaca(TerminalOutcome::DeadlineElapsed)),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6231,11 +6585,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::DeadlineElapsed)),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -6291,7 +6646,6 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintPathRevert),
             timeout: Duration::from_secs(3600),
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
@@ -6348,11 +6702,12 @@ mod tests {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(MintPathRevertAlpacaToBase),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: Arc::new(NoopGuardRelease),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -6379,22 +6734,23 @@ mod tests {
         );
     }
 
-    /// WithdrawalCreditMismatch (market-making) must fire a notifier alert
+    /// WalletUsdcAmbientBalance (market-making) must fire a notifier alert
     /// because it leaves the aggregate in an operator-reconciliation-bound
-    /// state. The failure already emitted `FailBridging`, so the guard follows
-    /// the aggregate event-driven.
+    /// state. The failure already emitted `FailBridging`, so the reactor
+    /// clears the guard event-driven -- the worker must NOT release it, or a
+    /// second rebalance could start on top of the unreconciled one.
     #[tokio::test]
-    async fn market_making_job_fires_alert_on_withdrawal_credit_mismatch() {
+    async fn market_making_job_fires_alert_on_ambient_balance() {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
+        let guard_release = Arc::new(RecordingGuardRelease::default());
         let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
-            transfer: Arc::new(TerminalAlpacaToBase(
-                TerminalOutcome::WithdrawalCreditMismatch,
-            )),
+            transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::AmbientBalance)),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            usdc_guard: guard_release.clone(),
+            preflight_alerts: Arc::new(PreflightAlertGate::default()),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -6405,101 +6761,23 @@ mod tests {
 
         job.perform(&ctx)
             .await
-            .expect("a credit mismatch is a clean terminal outcome");
+            .expect("ambient balance is a clean terminal outcome");
 
         let messages = notifier.messages();
         assert_eq!(
             messages.len(),
             1,
-            "a credit mismatch must fire exactly one alert"
+            "ambient balance must fire exactly one alert"
         );
         assert!(
             messages[0].contains(&job.id.to_string()),
             "alert must include the transfer id; got: {:?}",
             messages[0]
         );
-    }
-
-    #[tokio::test]
-    async fn market_making_job_pages_without_redrive_on_withdrawal_tx_missing() {
-        let pool = setup_queue_pool().await;
-        let notifier = Arc::new(CapturingNotifier::default());
-        let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
-            transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::WithdrawalTxMissing)),
-            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
-            max_burn_revert_redrives: 5,
-            notifier: notifier.clone(),
-        };
-        let job = TransferUsdcToMarketMaking {
-            id: UsdcRebalanceId(Uuid::new_v4()),
-            amount: Usdc::new(float!(100)),
-            revert_redrive_attempts: 0,
-            backpressure_streak: BackpressureStreak::default(),
-        };
-
-        job.perform(&ctx)
-            .await
-            .expect("a missing withdrawal tx hash is a clean terminal outcome");
-
-        assert_eq!(
-            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
-            0,
-            "a transfer with no withdrawal tx hash must not be redriven"
-        );
-        let messages = notifier.messages();
-        assert_eq!(
-            messages.len(),
-            1,
-            "exactly one alert expected; got: {messages:?}"
-        );
         assert!(
-            messages[0].contains(&job.id.to_string())
-                && messages[0].contains("no recorded withdrawal tx hash"),
-            "alert must name the transfer and the missing tx hash; got: {:?}",
-            messages[0]
-        );
-    }
-
-    #[tokio::test]
-    async fn market_making_job_pages_without_redrive_on_withdrawal_credit_unreadable() {
-        let pool = setup_queue_pool().await;
-        let notifier = Arc::new(CapturingNotifier::default());
-        let ctx = TransferUsdcToMarketMakingCtx {
-            driver_gate: UsdcDriverGate::unpaused(),
-            transfer: Arc::new(TerminalAlpacaToBase(
-                TerminalOutcome::WithdrawalCreditUnreadable,
-            )),
-            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
-            max_burn_revert_redrives: 5,
-            notifier: notifier.clone(),
-        };
-        let job = TransferUsdcToMarketMaking {
-            id: UsdcRebalanceId(Uuid::new_v4()),
-            amount: Usdc::new(float!(100)),
-            revert_redrive_attempts: 0,
-            backpressure_streak: BackpressureStreak::default(),
-        };
-
-        job.perform(&ctx)
-            .await
-            .expect("an uncomputable withdrawal credit is a clean terminal outcome");
-
-        assert_eq!(
-            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
-            0,
-            "an uncomputable withdrawal credit must not be redriven"
-        );
-        let messages = notifier.messages();
-        assert_eq!(
-            messages.len(),
-            1,
-            "exactly one alert expected; got: {messages:?}"
-        );
-        assert!(
-            messages[0].contains(&job.id.to_string()) && messages[0].contains("cannot be computed"),
-            "alert must name the transfer and the uncomputable credit; got: {:?}",
-            messages[0]
+            !guard_release.released.load(Ordering::SeqCst),
+            "a post-flight ambient failure must leave the guard for the \
+             event-driven reactor, never release it from the worker"
         );
     }
 }

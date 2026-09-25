@@ -7563,7 +7563,6 @@ dependencies = [
  "async-trait",
  "proptest",
  "rain-math-float",
- "serde",
  "serde_json",
  "st0x-evm",
  "st0x-execution",

@@ -23,12 +23,10 @@ pub struct ExecutionCtx {
 /// Checks whether a position is ready for offchain execution.
 ///
 /// Loads the position from the CQRS view and checks if the net exposure
-/// exceeds the configured threshold. Also verifies the market is open. The
-/// Position aggregate already tracks pending executions and equity transfers
-/// -- `is_ready_for_execution` returns `None` while either owns the symbol.
-///
-/// Callers pass only symbols whose trading is enabled: fills on a disabled
-/// asset never reach the position, so its net is exposure to hedge.
+/// exceeds the configured threshold. Also verifies the market is open
+/// and the asset is enabled. The Position aggregate already tracks pending
+/// executions and equity transfers -- `is_ready_for_execution` returns `None`
+/// while either owns the symbol.
 pub async fn check_execution_readiness<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,
@@ -36,7 +34,12 @@ pub async fn check_execution_readiness<E: Executor>(
     executor_type: SupportedExecutor,
     assets: &ChainAssets,
     hedging: &HedgingAssets,
+    asset_enabled: bool,
 ) -> Result<Option<ExecutionCtx>, OnChainError> {
+    if !check_asset_enabled(asset_enabled, symbol) {
+        return Ok(None);
+    }
+
     let Some(position) = position_projection.load(symbol).await? else {
         debug!(target: "hedge", %symbol, "Position aggregate not found, skipping");
         return Ok(None);
@@ -65,6 +68,14 @@ pub async fn check_execution_readiness<E: Executor>(
         executor: executor_type,
         market_session,
     }))
+}
+
+fn check_asset_enabled(asset_enabled: bool, symbol: &Symbol) -> bool {
+    if !asset_enabled {
+        debug!(target: "hedge", %symbol, "asset disabled, skipping execution readiness check");
+    }
+
+    asset_enabled
 }
 
 /// Returns `Some(session)` when execution is allowed (regular hours, or
@@ -284,6 +295,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &ChainAssets::default(),
             &HedgingAssets::default(),
+            true,
         )
         .await
         .unwrap();
@@ -313,6 +325,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &ChainAssets::default(),
             &HedgingAssets::default(),
+            true,
         )
         .await
         .unwrap();
@@ -342,6 +355,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &ChainAssets::default(),
             &HedgingAssets::default(),
+            true,
         )
         .await
         .unwrap()
@@ -434,6 +448,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &ChainAssets::default(),
             &HedgingAssets::default(),
+            true,
         )
         .await
         .unwrap();
@@ -471,6 +486,7 @@ mod tests {
             // `Overnight if overnight_enabled` readiness guard must not
             // inherit the extended-hours flag.
             &hedged_with_extended_hours(&symbol, true),
+            true,
         )
         .await
         .unwrap();
@@ -505,6 +521,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &listed(&symbol),
             &hedged_with_extended_hours(&symbol, false),
+            true,
         )
         .await
         .unwrap();
@@ -538,6 +555,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &listed(&symbol),
             &hedged_with_extended_hours(&symbol, true),
+            true,
         )
         .await
         .unwrap()
@@ -571,6 +589,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &ChainAssets::default(),
             &HedgingAssets::default(),
+            true,
         )
         .await
         .unwrap()
@@ -608,6 +627,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &ChainAssets::default(),
             &HedgingAssets::default(),
+            true,
         )
         .await
         .unwrap();
@@ -642,6 +662,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &ChainAssets::default(),
             &HedgingAssets::default(),
+            true,
         )
         .await
         .unwrap();
@@ -660,6 +681,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &ChainAssets::default(),
             &HedgingAssets::default(),
+            true,
         )
         .await
         .unwrap()
@@ -717,6 +739,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &assets,
             &HedgingAssets::default(),
+            true,
         )
         .await
         .unwrap()
@@ -727,6 +750,39 @@ mod tests {
             params.shares,
             Positive::new(FractionalShares::new(float!(3.0))).unwrap(),
             "Shares should be capped by operational limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_asset_skips_execution() {
+        let pool = setup_test_db().await;
+        let (store, query) = create_test_position_infra(&pool).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let executor = MockExecutor::new();
+
+        initialize_position_with_fill(
+            &store,
+            &symbol,
+            FractionalShares::new(float!(5.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let result = check_execution_readiness(
+            &executor,
+            &query,
+            &symbol,
+            SupportedExecutor::DryRun,
+            &ChainAssets::default(),
+            &HedgingAssets::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "Disabled asset should not trigger execution even with large position"
         );
     }
 

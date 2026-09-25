@@ -16,17 +16,14 @@
 //! `Wallet::submit` (write transactions), so consumers get
 //! human-readable revert reasons without manual wiring.
 
-use alloy::consensus::{Transaction, TxEnvelope};
+use alloy::consensus::Transaction;
 use alloy::eips::BlockId;
-#[cfg(any(feature = "turnkey", feature = "local-signer"))]
-use alloy::eips::eip2718::Encodable2718;
-use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -39,9 +36,7 @@ pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorReg
 use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
 pub use rain_error_decoding::AbiDecodedErrorType;
 
-#[cfg(any(feature = "turnkey", feature = "local-signer"))]
 pub mod nonce;
-#[cfg(any(feature = "turnkey", feature = "local-signer"))]
 pub use nonce::ResettableNonceManager;
 
 mod bindings;
@@ -49,21 +44,6 @@ pub use bindings::IERC20;
 
 mod chain;
 pub use chain::{Chain, ParseChainError, SettlementStable};
-
-/// `true` only for RPC failures that may clear on a later redrive.
-///
-/// Those are a transport-level failure (the backend becomes reachable again)
-/// or a null response (the awaited value becomes visible on another node).
-/// Every other `RpcError` is deterministic and fails identically on every
-/// redrive, so a caller must surface it for operator action instead of
-/// redriving forever: a formal `ErrorResp` rejection, a serialization or
-/// deserialization failure, a local usage error, or an unsupported feature.
-pub fn is_transient_rpc(
-    error: &alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
-) -> bool {
-    use alloy::transports::RpcError;
-    matches!(error, RpcError::Transport(_) | RpcError::NullResp)
-}
 
 mod tokens;
 pub use tokens::{USDC_BASE, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, USDC_HYPEREVM, USDG_ROBINHOOD};
@@ -215,17 +195,6 @@ pub enum EvmError {
         tx_hash: alloy::primitives::TxHash,
         timeout_secs: u64,
     },
-    /// A persisted transaction was rejected as nonce-too-low or replacement-
-    /// underpriced after restart, but the serving RPC could not yet find its
-    /// locally known hash. The transaction may already be mined or visible on
-    /// another backend, so the caller must durably redrive reconciliation
-    /// rather than prepare a new transaction.
-    #[error(
-        "prepared transaction {tx_hash} was rejected by nonce reconciliation \
-         but is not yet visible by hash"
-    )]
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    PreparedTransactionReconciliationPending { tx_hash: alloy::primitives::TxHash },
     /// Transaction was dropped from the mempool (not found via
     /// `eth_getTransactionByHash` after initial propagation window).
     #[error(
@@ -249,12 +218,6 @@ pub enum EvmError {
     )]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     ReplacementUnderpriced { attempts: u32 },
-    /// The configured filler chain returned without producing a signed
-    /// transaction envelope. Broadcasting is impossible, and no transaction
-    /// reached the RPC.
-    #[error("transaction fillers did not produce a signed envelope")]
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    TransactionPreparation,
     /// Bumping the EIP-1559 fee for a replacement transaction overflowed
     /// `u128`. Only reachable if the RPC returns an absurd fee estimate;
     /// surfaced as a hard error rather than silently wrapping a financial
@@ -319,13 +282,9 @@ impl EvmError {
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReceiptTimeout { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::PreparedTransactionReconciliationPending { .. } => false,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::TransactionDropped { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => false,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::TransactionPreparation => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
             #[cfg(feature = "local-signer")]
@@ -355,11 +314,7 @@ impl EvmError {
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReceiptTimeout { .. } => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::PreparedTransactionReconciliationPending { .. } => false,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => false,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::TransactionPreparation => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => false,
             #[cfg(feature = "local-signer")]
@@ -367,44 +322,6 @@ impl EvmError {
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => false,
             Self::NodeBehindRequiredBlock { .. } => false,
-        }
-    }
-
-    /// `true` when a prepared or known transaction may still have reached the
-    /// network, or may confirm once RPC visibility catches up. Callers should
-    /// durably reschedule reconciliation rather than exhaust a finite generic
-    /// retry budget.
-    pub fn is_confirmation_pending(&self) -> bool {
-        match self {
-            // Only a transport-level failure (connection reset, timeout) or a
-            // null response may still reach the network or confirm once RPC
-            // visibility catches up. Every deterministic RPC error, a formal
-            // rejection included, is terminal.
-            Self::Transport(error) => is_transient_rpc(error),
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::ReceiptTimeout { .. } => true,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::PreparedTransactionReconciliationPending { .. } => true,
-            Self::NodeBehindRequiredBlock { .. } => true,
-            Self::Transaction(_)
-            | Self::Contract(_)
-            | Self::AbiDecode(_)
-            | Self::DecodedRevert(_)
-            | Self::Reverted { .. }
-            | Self::WalletConfigParse(_)
-            | Self::Signer(_) => false,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::TransactionDropped { .. } => false,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::ReplacementUnderpriced { .. } => false,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::TransactionPreparation => false,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::ReplacementFeeOverflow => false,
-            #[cfg(feature = "local-signer")]
-            Self::InvalidPrivateKey(_) => false,
-            #[cfg(feature = "turnkey")]
-            Self::Turnkey(_) => false,
         }
     }
 
@@ -439,13 +356,9 @@ impl EvmError {
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReceiptTimeout { .. } => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::PreparedTransactionReconciliationPending { .. } => None,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::TransactionDropped { .. } => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementUnderpriced { .. } => None,
-            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-            Self::TransactionPreparation => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReplacementFeeOverflow => None,
             #[cfg(feature = "local-signer")]
@@ -533,25 +446,6 @@ impl EvmError {
         }
 
         token.parse().ok().map(NextNonceHint)
-    }
-
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    pub fn is_already_known(&self) -> bool {
-        self.already_known_payload().is_some()
-    }
-
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    fn already_known_payload(&self) -> Option<&alloy::rpc::json_rpc::ErrorPayload> {
-        let Self::Transport(rpc_error) = self else {
-            return None;
-        };
-
-        let payload = rpc_error.as_error_resp()?;
-        payload
-            .message
-            .to_ascii_lowercase()
-            .contains("already known")
-            .then_some(payload)
     }
 
     /// Returns `true` if this is a "replacement transaction underpriced"
@@ -648,115 +542,6 @@ pub trait Evm: Send + Sync + 'static {
         Ok(self.provider().get_block_number().await?)
     }
 }
-/// A fully signed transaction whose identity is durable before broadcast.
-///
-/// Persisting this value closes the crash window between an irreversible
-/// submission and recording its hash: recovery rebroadcasts these exact bytes,
-/// so every attempt has the same nonce, signature, and transaction hash.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct PreparedTransaction {
-    tx_hash: TxHash,
-    nonce: u64,
-    raw: Bytes,
-}
-
-#[derive(Deserialize)]
-struct PersistedPreparedTransaction {
-    tx_hash: TxHash,
-    nonce: u64,
-    raw: Bytes,
-}
-
-impl PreparedTransaction {
-    /// Builds a prepared transaction from exact signed EIP-2718 bytes.
-    ///
-    /// Both identity fields are derived from the decoded envelope. Malformed
-    /// bytes, including trailing data, are rejected.
-    pub fn from_raw(raw: Bytes) -> Result<Self, Eip2718Error> {
-        let envelope = TxEnvelope::decode_2718_exact(raw.as_ref())?;
-        Ok(Self {
-            tx_hash: alloy::primitives::keccak256(&raw),
-            nonce: envelope.nonce(),
-            raw,
-        })
-    }
-
-    /// Builds a prepared transaction from an envelope already decoded by the
-    /// signing path, avoiding a redundant decode.
-    // Reached only from the feature-gated signing path, so it is compiled under
-    // the same features rather than carried as dead code elsewhere.
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    pub(crate) fn from_envelope(envelope: &TxEnvelope) -> Self {
-        let raw = Bytes::from(envelope.encoded_2718());
-        Self {
-            tx_hash: alloy::primitives::keccak256(&raw),
-            nonce: envelope.nonce(),
-            raw,
-        }
-    }
-
-    /// Constructs a prepared identity for test doubles that do not broadcast
-    /// real signed envelopes.
-    #[cfg(any(test, feature = "test-support"))]
-    pub const fn for_test(tx_hash: TxHash, nonce: u64) -> Self {
-        Self {
-            tx_hash,
-            nonce,
-            raw: Bytes::new(),
-        }
-    }
-
-    pub const fn tx_hash(&self) -> TxHash {
-        self.tx_hash
-    }
-
-    pub const fn nonce(&self) -> u64 {
-        self.nonce
-    }
-
-    pub fn raw(&self) -> &Bytes {
-        &self.raw
-    }
-}
-
-impl<'de> Deserialize<'de> for PreparedTransaction {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let persisted = PersistedPreparedTransaction::deserialize(deserializer)?;
-
-        // Test doubles deliberately have no signed envelope. This escape hatch
-        // is unavailable in production builds and accepts only the exact empty
-        // representation created by `for_test`.
-        #[cfg(any(test, feature = "test-support"))]
-        if persisted.raw.is_empty() {
-            return Ok(Self {
-                tx_hash: persisted.tx_hash,
-                nonce: persisted.nonce,
-                raw: persisted.raw,
-            });
-        }
-
-        let prepared = Self::from_raw(persisted.raw).map_err(|error| {
-            serde::de::Error::custom(format!("invalid signed transaction: {error}"))
-        })?;
-        if persisted.tx_hash != prepared.tx_hash {
-            return Err(serde::de::Error::custom(format!(
-                "prepared transaction hash mismatch: persisted {}, signed bytes {}",
-                persisted.tx_hash, prepared.tx_hash
-            )));
-        }
-        if persisted.nonce != prepared.nonce {
-            return Err(serde::de::Error::custom(format!(
-                "prepared transaction nonce mismatch: persisted {}, signed bytes {}",
-                persisted.nonce, prepared.nonce
-            )));
-        }
-
-        Ok(prepared)
-    }
-}
 
 /// Signing wallet on an EVM chain.
 ///
@@ -799,37 +584,6 @@ pub trait Wallet: Evm {
         payload_json: String,
         expected_digest: B256,
     ) -> Result<Signature, EvmError>;
-    /// Fill and sign a transaction without broadcasting it.
-    ///
-    /// The returned bytes are safe to persist as the transaction's durable
-    /// identity before crossing an irreversible broadcast boundary.
-    async fn prepare_pending(
-        &self,
-        contract: Address,
-        calldata: Bytes,
-        note: &str,
-    ) -> Result<PreparedTransaction, EvmError>;
-
-    /// Broadcast a previously prepared transaction.
-    ///
-    /// Repeated calls are idempotent because they submit the exact same signed
-    /// envelope. An RPC "already known" response is treated as success.
-    async fn broadcast_prepared(
-        &self,
-        prepared: &PreparedTransaction,
-        note: &str,
-    ) -> Result<TxHash, EvmError>;
-    /// Releases this prepared transaction's nonce reservation after persistence
-    /// failed and the transaction will never be broadcast.
-    async fn discard_prepared(&self, prepared: &PreparedTransaction);
-
-    /// Restores allocator and ownership state for an exact transaction loaded
-    /// from durable storage before any new transaction can allocate its nonce.
-    async fn restore_prepared(&self, prepared: &PreparedTransaction);
-
-    /// Restores ownership for a legacy durable submission that retained only
-    /// its transaction hash. Absence is inconclusive and must fail closed.
-    async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError>;
 
     /// Submit a signed transaction and return the tx hash immediately,
     /// without waiting for confirmation.
@@ -1053,37 +807,8 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
         (**self).send_pending(contract, calldata, note).await
     }
 
-    async fn prepare_pending(
-        &self,
-        contract: Address,
-        calldata: Bytes,
-        note: &str,
-    ) -> Result<PreparedTransaction, EvmError> {
-        (**self).prepare_pending(contract, calldata, note).await
-    }
-
-    async fn broadcast_prepared(
-        &self,
-        prepared: &PreparedTransaction,
-        note: &str,
-    ) -> Result<TxHash, EvmError> {
-        (**self).broadcast_prepared(prepared, note).await
-    }
-
-    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
-        (**self).discard_prepared(prepared).await;
-    }
-
-    async fn restore_prepared(&self, prepared: &PreparedTransaction) {
-        (**self).restore_prepared(prepared).await;
-    }
-
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
         (**self).await_receipt(tx_hash).await
-    }
-
-    async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
-        (**self).restore_transaction(tx_hash).await
     }
 
     async fn send(
@@ -1571,14 +1296,11 @@ where
 mod tests {
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
-    use alloy::consensus::{SignableTransaction, TxEip1559};
-    use alloy::eips::eip2718::Encodable2718;
-    use alloy::eips::eip2930::AccessList;
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::primitives::Bloom;
-    use alloy::primitives::{Address, TxKind, U256};
+    use alloy::primitives::{Address, U256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -1588,80 +1310,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    const PREPARED_NONCE: u64 = 7;
-
-    fn signed_transaction_bytes() -> Bytes {
-        let transaction = TxEip1559 {
-            chain_id: 1,
-            nonce: PREPARED_NONCE,
-            gas_limit: 21_000,
-            max_fee_per_gas: 30_000_000_000,
-            max_priority_fee_per_gas: 1_000_000_000,
-            to: TxKind::Call(Address::ZERO),
-            value: U256::ZERO,
-            access_list: AccessList::default(),
-            input: Bytes::new(),
-        };
-        let signature = Signature::new(U256::from(1), U256::from(2), false);
-        let envelope = TxEnvelope::from(transaction.into_signed(signature));
-        Bytes::from(envelope.encoded_2718())
-    }
-
-    #[test]
-    fn is_confirmation_pending_only_for_transient_rpc_failures() {
-        use alloy::transports::{RpcError, TransportErrorKind};
-        assert!(
-            !EvmError::Transport(RpcError::UnsupportedFeature("deterministic"))
-                .is_confirmation_pending(),
-            "a deterministic RPC error must be terminal rather than an uncapped redrive"
-        );
-        assert!(
-            EvmError::Transport(RpcError::NullResp).is_confirmation_pending(),
-            "a null response may resolve once RPC visibility catches up"
-        );
-        assert!(
-            EvmError::Transport(TransportErrorKind::backend_gone()).is_confirmation_pending(),
-            "a transport failure may recover once a backend becomes visible"
-        );
-    }
-
-    #[test]
-    fn prepared_transaction_derives_identity_from_signed_bytes() {
-        let raw = signed_transaction_bytes();
-        let prepared = PreparedTransaction::from_raw(raw.clone()).unwrap();
-
-        assert_eq!(prepared.nonce(), PREPARED_NONCE);
-        assert_eq!(prepared.tx_hash(), alloy::primitives::keccak256(&raw));
-        assert_eq!(prepared.raw(), &raw);
-    }
-
-    #[test]
-    fn prepared_transaction_rejects_inconsistent_persisted_identity() {
-        let prepared = PreparedTransaction::from_raw(signed_transaction_bytes()).unwrap();
-
-        let mut wrong_nonce = serde_json::to_value(&prepared).unwrap();
-        wrong_nonce["nonce"] = serde_json::json!(PREPARED_NONCE + 1);
-        let nonce_error = serde_json::from_value::<PreparedTransaction>(wrong_nonce).unwrap_err();
-        assert!(nonce_error.to_string().contains("nonce mismatch"));
-
-        let mut wrong_hash = serde_json::to_value(&prepared).unwrap();
-        wrong_hash["tx_hash"] = serde_json::to_value(TxHash::repeat_byte(0xa5)).unwrap();
-        let hash_error = serde_json::from_value::<PreparedTransaction>(wrong_hash).unwrap_err();
-        assert!(hash_error.to_string().contains("hash mismatch"));
-    }
-
-    #[test]
-    fn prepared_transaction_rejects_malformed_signed_bytes() {
-        let malformed = PreparedTransaction {
-            tx_hash: TxHash::repeat_byte(0xb6),
-            nonce: PREPARED_NONCE,
-            raw: Bytes::from_static(&[0xff]),
-        };
-        let persisted = serde_json::to_value(malformed).unwrap();
-
-        let error = serde_json::from_value::<PreparedTransaction>(persisted).unwrap_err();
-        assert!(error.to_string().contains("invalid signed transaction"));
-    }
 
     /// Build a mock provider whose `eth_blockNumber` returns the given sequence
     /// of block numbers in order, one per call.

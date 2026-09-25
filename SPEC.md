@@ -1856,30 +1856,14 @@ event position).
   authentication
 - Graceful shutdown handling to complete in-flight trades before stopping
 - Per-asset market enable/disable: individual equity markets can be disabled via
-  `trading = "disabled"` on the asset's entry in its chain's assets table. The
-  flag is the hedge kill switch for that asset on that chain, and it holds for
-  every fill accounted while it is disabled: such a fill is never counter
-  traded, inline or by the periodic position scan. `Position` holds one net per
-  symbol across all hedged chains, so the fill is kept out of it entirely;
-  otherwise the scan would hedge it for any other chain that enables the symbol.
-  Disabling does not unwind a net the symbol already accumulated on that chain
-  while it was enabled: that net stays in `Position`, and the scan keeps hedging
-  it for as long as any hedged chain enables the symbol, so flipping the switch
-  mid incident does not stop the bot hedging exposure it already accounted. An
-  excluded fill is still witnessed on its `OnChainTrade` and recorded in
-  `skipped_fills` with reason `trading_disabled`, and it raises a deduplicated
-  critical operational alert (once per process per chain and symbol), so the
-  exposure it leaves is never silent. The flag is read when the bot accounts the
-  fill, not when the fill lands on chain. Enabling the asset again therefore
-  hedges every fill the bot accounts from the restart on, including fills that
-  landed earlier but were not accounted yet: still queued, not yet backfilled
-  past the ingestion cutoff, or landing during the restart itself. Only fills
-  already recorded in `skipped_fills` with reason `trading_disabled` stay
-  excluded and are never hedged later; an operator covers that delta by hand
-  from those records. Excluded fills also never reach the PnL ledger, which
-  replays `Position` events, so PnL is incomplete for them and a manual cover
-  must be reconciled outside the ledger. Rebalancing is governed separately by
-  the asset's `rebalancing` flag.
+  `trading = "disabled"` on the asset's entry in its chain's assets table.
+  Disabled assets accumulate position changes but do not trigger counter-trades
+  or rebalancing operations. When re-enabled (`trading = "enabled"`), the system
+  resumes both executing accumulated counter-trade positions and evaluating
+  rebalancing triggers for any resulting inventory imbalances (same semantics as
+  market close/open behavior). A fill landing on a disabled asset raises a
+  deduplicated critical operational alert (once per process per chain and
+  symbol): the delta exposure it accumulates is deliberate, but never silent
 
 ### Infrastructure and Deployment
 
@@ -3358,9 +3342,7 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 
 ```mermaid
 stateDiagram-v2
-    [*] --> VaultWithdrawSubmitting: Redeem (persists signed transaction)
-    VaultWithdrawSubmitting --> VaultWithdrawSubmitted: RecordWithdrawSubmission
-    VaultWithdrawSubmitted --> WithdrawnFromRaindex: ConfirmWithdraw
+    [*] --> WithdrawnFromRaindex: Withdraw
     WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
     WithdrawnFromRaindex --> Failed
     TokensUnwrapped --> TokensSent: Send
@@ -3371,22 +3353,14 @@ stateDiagram-v2
     Pending --> Failed
 ```
 
-- the orchestrator prepares and signs the withdrawal before `Redeem`, which
-  persists `VaultWithdrawSubmitting` with the chain, token, vault ID, target
-  amount, and exact transaction bytes before any broadcast
-- the orchestrator broadcasts that persisted transaction outside the aggregate
-  transition and records its hash with `RecordWithdrawSubmission`
-- resume rebroadcasts the same signed bytes; it never creates a second
-  withdrawal transaction
-- `VaultWithdrawSubmitted` tracks the known transaction hash until
-  `ConfirmWithdraw` confirms the receipt
-- `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but are not
+- `Withdraw` command withdraws wrapped tokens from Raindex vault to wallet
+- `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but aren't
   yet unwrapped
-- `Unwrap` converts ERC-4626 wrapped tokens to unwrapped tokens; confirmation
-  records the token the vault reports as its `asset()` at the redeem block as a
-  typed `UnwrappedToken`
+- `Unwrap` command converts ERC-4626 wrapped tokens to unwrapped tokens;
+  confirmation records the token the vault reports as its `asset()` at the
+  redeem block as a typed `UnwrappedToken`
 - `TokensUnwrapped` tracks the attested `UnwrappedToken` ready to send
-- `Send` sends unwrapped tokens to Alpaca and polls until terminal
+- `Send` command sends unwrapped tokens to Alpaca and polls until terminal
 - `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
 - `Pending` indicates Alpaca detected the transfer
 - `Completed` and `Failed` are terminal states
@@ -3395,31 +3369,6 @@ stateDiagram-v2
 
 ```rust
 enum EquityRedemption {
-    VaultWithdrawSubmitting {
-        symbol: Symbol,
-        chain: Chain,
-        quantity: Decimal,
-        token: Address,
-        vault_id: RaindexVaultId,
-        wrapped_amount: U256,
-        // Version-7 scan lower bound; zero for prepared transactions.
-        from_block: u64,
-        prepared: PreparedTransaction,
-        submitting_at: DateTime<Utc>,
-    },
-    VaultWithdrawSubmitted {
-        symbol: Symbol,
-        chain: Chain,
-        quantity: Decimal,
-        token: Address,
-        wrapped_amount: U256,
-        tx_hash: TxHash,
-        // Retained so restart can restore nonce ownership before any wallet send.
-        // None only when replaying an event from before version 9; the nonce
-        // restores by transaction hash, but the exact bytes cannot be rebroadcast.
-        prepared: Option<PreparedTransaction>,
-        submitted_at: DateTime<Utc>,
-    },
     WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
@@ -3483,22 +3432,13 @@ enum EquityRedemption {
 
 ```rust
 enum EquityRedemptionCommand {
-    // Initialize: persists the exact signed withdrawal without broadcasting it.
+    // Withdraws wrapped tokens from Raindex vault to wallet
     Redeem {
         symbol: Symbol,
-        chain: Chain,
         quantity: Decimal,
         token: Address,
-        vault_id: RaindexVaultId,
         amount: U256,
-        // Version-7 compatibility field; zero for new commands.
-        from_block: u64,
-        prepared: PreparedTransaction,
     },
-    // Records the persisted transaction's hash after broadcast.
-    RecordWithdrawSubmission { tx_hash: TxHash },
-    // Confirms the recorded transaction.
-    ConfirmWithdraw,
     // Unwraps ERC-4626 wrapped tokens after Raindex withdrawal
     UnwrapTokens,
     // Sends unwrapped tokens to Alpaca's redemption wallet
@@ -3520,32 +3460,6 @@ enum EquityRedemptionCommand {
 
 ```rust
 enum EquityRedemptionEvent {
-    VaultWithdrawSubmitting {
-        symbol: Symbol,
-        chain: Chain,
-        quantity: Decimal,
-        token: Address,
-        vault_id: RaindexVaultId,
-        wrapped_amount: U256,
-        // Version-7 scan lower bound; zero for prepared transactions.
-        from_block: u64,
-        // None only when replaying a version-7 event; such an aggregate
-        // fails closed into the legacy operator-reconciliation state.
-        prepared: Option<PreparedTransaction>,
-        submitting_at: DateTime<Utc>,
-    },
-    VaultWithdrawSubmitted {
-        symbol: Symbol,
-        quantity: Decimal,
-        token: Address,
-        wrapped_amount: U256,
-        tx_hash: TxHash,
-        // Retained so restart can restore nonce ownership before any wallet send.
-        // None only when replaying an event from before version 9; the nonce
-        // restores by transaction hash, but the exact bytes cannot be rebroadcast.
-        prepared: Option<PreparedTransaction>,
-        submitted_at: DateTime<Utc>,
-    },
     WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
@@ -3613,31 +3527,6 @@ state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
 the replayed `Failed` state materializes the operator's reason.
 
-Vault withdrawal submission is an irreversible uncertainty boundary. The
-orchestrator prepares and signs the transaction, then the pure aggregate
-transition creates `VaultWithdrawSubmitting` with its exact hash, nonce, and raw
-bytes before any broadcast. The orchestrator broadcasts only those persisted
-bytes. If broadcast or recording the returned hash fails, the aggregate remains
-`VaultWithdrawSubmitting`; no failure event may erase the prepared transaction.
-
-Every later invocation rebroadcasts the same raw transaction. A crash before the
-first broadcast and an RPC response lost after acceptance therefore enter the
-same idempotent recovery path: neither can allocate a new nonce or create a
-second withdrawal. An RPC `already known` response is accepted as evidence that
-the identical signed transaction reached a node and returns the locally computed
-transaction hash.
-
-Receipt timeout, a node lagging the required block, or otherwise inconclusive
-withdrawal reconciliation is not bounded by Apalis's ordinary retry budget. The
-resume job returns success only after durably enqueueing a delayed replacement
-with no attempt cap, and retains the position reservation while the transaction
-remains unresolved.
-
-Legacy `VaultWithdrawPending` aggregates and version-7 `VaultWithdrawSubmitting`
-events without prepared transaction bytes are never automatically submitted;
-replay places them in the operator-reconciliation state so an operator must
-resolve them conservatively.
-
 ##### Aggregate Services
 
 The aggregate uses domain service traits directly as its Services:
@@ -3656,14 +3545,10 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
 
 ##### Business Rules
 
-- `Redeem` only from uninitialized state; emits only the durable
-  `VaultWithdrawSubmitting` transaction and never broadcasts it
-- `RecordWithdrawSubmission` only from `VaultWithdrawSubmitting`
-- `ConfirmWithdraw` only from `VaultWithdrawSubmitted`
-- a resume from `VaultWithdrawSubmitting` always rebroadcasts the exact
-  persisted bytes; retries never sign or submit a different withdrawal
-- if a later transfer step fails after withdrawal, the aggregate retains the
-  withdrawal transaction for recovery and audit
+- `Withdraw` only from uninitialized state; emits `WithdrawnFromRaindex`
+- `Redeem` only from `WithdrawnFromRaindex` state; polls Alpaca until terminal
+- If send fails after withdraw, aggregate stays in `WithdrawnFromRaindex`
+  (tokens in wallet, not stranded)
 - `ConfirmUnwrap` records the token the vault reports as its `asset()` at the
   redeem block, typed `UnwrappedToken`, and requires the redeem receipt to show
   that token transferred to the withdraw receiver for the withdrawn amount
@@ -3732,11 +3617,13 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: Uuid,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     ConversionComplete {
         direction: RebalanceDirection,
         amount: Usdc,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
         converted_at: DateTime<Utc>,
     },
@@ -3754,11 +3641,13 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         withdrawal_ref: TransferRef,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     WithdrawalComplete {
         direction: RebalanceDirection,
         amount: Usdc,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
     },
@@ -3874,13 +3763,10 @@ action that already succeeded. Each phase records its intent (and the relevant
 chain head) before the action, so resume can scan the chain to adopt an
 already-submitted action instead of re-issuing it:
 
-- `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
-  (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
-  log scan is not proof of absence because the submission may still be pending
-  or hidden by a load-balanced RPC backend; it remains unresolved and must never
-  trigger another withdrawal.
-- `BridgingSubmitting`: scan for an already-submitted burn (`find_recent_burn`)
-  and adopt it rather than burning twice.
+- `WithdrawalSubmitting` / `BridgingSubmitting`: scan the source chain for an
+  already-submitted withdrawal / burn (`find_recent_withdrawal` /
+  `find_recent_burn`) from the captured head and adopt it rather than
+  withdrawing / burning twice.
 - `Attested`: the CCTP mint is irreversible -- re-calling `receiveMessage`
   reverts on the already-used nonce, which would otherwise turn a successfully
   minted transfer into a terminal `BridgingFailed`. Resume must scan the
@@ -3899,6 +3785,7 @@ enum UsdcRebalanceCommand {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: Uuid,
+        preflight_balance: U256,
     },
     ConfirmConversion,
     FailConversion { reason: String },
@@ -3950,6 +3837,7 @@ enum UsdcRebalanceEvent {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: Uuid,
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     // direction: Required for incremental dispatch terminal detection
@@ -4396,10 +4284,26 @@ race the same allowance.
 
 Alpaca to Base:
 
-0. **No pre-flight wallet check.** The Ethereum wallet is shared, so USDC in it
-   that no open transfer is credited with (dust, an operator top-up, a late
-   refund) does not stop a transfer from starting. The credit ledger check
-   (below) reports it.
+0. **Pre-flight wallet balance check**: read the market-maker Ethereum wallet
+   USDC balance before any Alpaca call. A balance at or below 0.01 USDC is
+   accepted; the exact value is persisted in `ConversionInitiated` and carried
+   through the Alpaca-to-Base conversion and withdrawal states as the settlement
+   baseline. A balance above 0.01 USDC shows ambient or residual USDC that makes
+   attribution too operationally risky, so the transfer refuses before
+   conversion. Only an operator sweep clears that refusal. No aggregate event is
+   emitted and no cash leaves Alpaca. The refusal surfaces
+   `WalletUsdcAmbientPreflight`. The worker alerts the operator to sweep the
+   wallet and releases the in-progress guard, because no terminal event exists
+   to clear it. The release checks durable state first: while a persisted
+   rebalance still holds the guard, the latch stays fail closed. If the balance
+   read itself fails, the transfer stops with `PreflightBalanceUnavailable`
+   using the same guard release. A single failure only warns, and a sustained
+   outage pages the operator at a bounded rate (every fifth consecutive failure,
+   with the streak in the message). The trigger retries on its next cycle. The
+   transfer remains a true no-op with nothing to resume or reconcile. The
+   0.01-USDC threshold raises the cost of pre-flight nuisance dusting; it does
+   not prevent hostile transfers after the baseline read. Settlement subtracts
+   the persisted baseline and burns only the later wallet increase.
 1. **Convert USD to USDC**: Place market sell order on USDC/USD pair (buy USDC)
 2. Poll Alpaca until conversion order is filled
 3. Initiate USDC withdrawal from Alpaca (get transfer_id)
@@ -4432,33 +4336,18 @@ Alpaca to Base:
      4-hour threshold gives headroom above the 30-minute internal poll timeout
      while ensuring a permanent failure (rotated credentials, Alpaca API shape
      change) surfaces well before it becomes a multi-day outage.
-   - **Withdrawal tx hash required:** Alpaca can report a withdrawal Complete
-     with `tx_hash` still null. The transfer is credited only from the
-     transaction that delivered its USDC, so `ConfirmWithdrawal` waits for the
-     hash: Complete without a hash is treated like an inconclusive poll (stays
-     `Withdrawing`, delayed redrive, the same 4-hour operator alert, whose text
-     names the missing hash instead of Alpaca connectivity). The wait is bounded
-     by the settlement retry deadline, counted from `Withdrawing.initiated_at`.
-     A Complete without a hash seen past the deadline (for example, Alpaca held
-     the withdrawal Pending that long) first gets a grace: the bot re-reads the
-     transfer for the hash for one Alpaca polling timeout (30 minutes). If the
-     hash is still missing, the bot confirms the withdrawal with no hash and
-     emits `FailBridging` (a pre-burn `BridgingFailed` that `transfer reconcile`
-     settles, since the funds left Alpaca). This stops the redrive and pages the
-     operator (`WithdrawalTxMissing`); the guard is released when
-     `transfer reconcile --kind usdc` settles the transfer.
    - **Settlement gate (before proceeding):** wait for the withdrawal tx to
      reach the required confirmations on Ethereum. Alpaca marks a withdrawal
      "Complete" before the on-chain tx is settled network-wide on load-balanced
      RPC nodes; burning against an unconfirmed balance causes an ERC20
      transfer-exceeds-balance revert. This gate is retryable.
-   - **Settlement retry deadline:** the retryable settlement wait (an
-     under-confirmed withdrawal tx, or a withdrawal tx receipt that cannot be
-     read) is bounded. The deadline is `confirmed_at` (the durable
-     `WithdrawalComplete` timestamp) plus the
-     `[rebalancing] settlement_retry_deadline_secs` config value. The value
-     defaults to 24 hours when absent so binaries remain compatible with configs
-     from before this setting existed. The bound also covers persistent
+   - **Settlement retry deadline:** the retryable settlement wait
+     (under-confirmed tx, or a wallet balance that has not increased above the
+     persisted pre-flight baseline after a confirmed withdrawal) is bounded. The
+     deadline is `confirmed_at` (the durable `WithdrawalComplete` timestamp)
+     plus the `[rebalancing] settlement_retry_deadline_secs` config value. The
+     value defaults to 24 hours when absent so binaries remain compatible with
+     configs from before this setting existed. The bound also covers persistent
      settlement-check RPC failures (for example a malformed tx hash from
      Alpaca), not only clean not-settled answers. At or after the deadline, the
      redrive emits `FailBridging` instead of re-enqueueing, and the worker pages
@@ -4473,32 +4362,23 @@ Alpaca to Base:
      so the funds are provably off Alpaca. Without this deadline, a withdrawal
      that never settles on-chain redrives every 30 seconds forever, with the
      guard latched and no operator signal.
-   - **Per-transfer credit:** after confirmation, read the withdrawal tx
-     receipt. The credit is the sum of that transaction's USDC `Transfer` logs
-     to the market-maker wallet, exact in USDC base units. The wallet balance is
-     never used for attribution. Two cases:
-     - **0 < credit <= nominal**: burn exactly the credit and persist it in
-       `BridgingSubmitting.burn_amount`, so a crash-resume scan targets the
-       exact burned amount. Alpaca deducts its network fee and fees from a
-       withdrawal and reports them on the transfer (`network_fee`, `fees`), so a
-       credit below nominal is expected. The bot reads the transfer again by its
-       Alpaca id: a shortfall up to the reported fees is logged at info; a
-       larger shortfall pages the operator (`operational_alert`, ERROR) with the
-       requested, shortfall and reported-fee amounts, since it may be a partial
-       or wrong transaction. If the fees cannot be read (Alpaca omits them, the
-       read fails, or the aggregate predates the recorded transfer id), the
-       shortfall is logged at info without a page.
-     - **credit = 0 or credit > nominal**: the reported transaction did not pay
-       this withdrawal. Emit `FailBridging` without attempting a burn and
-       surface `WithdrawalCreditMismatch` for operator reconciliation. The job
-       treats this as a clean terminal with no redrive. A legacy
-       `WithdrawalComplete` with no recorded tx hash also fails closed with
-       `WithdrawalTxMissing`; it never falls back to the wallet balance.
-     - **credit cannot be computed** (an undecodable USDC `Transfer` log, or a
-       sum that overflows): a reread cannot change the receipt, so emit
-       `FailBridging` at once and surface `WithdrawalCreditUnreadable`, paged
-       with no redrive. Only receipt-read (RPC) failures stay on the
-       deadline-gated transient path.
+   - **Balance attribution:** after confirmation, read the market-maker Ethereum
+     wallet USDC balance and compare it with the exact persisted pre-flight
+     baseline. Three cases:
+     - **balance <= baseline**: delayed redrive. The tolerated pre-existing dust
+       alone is not evidence that a withdrawal with no transaction hash reached
+       Ethereum. A lower balance likewise cannot prove arrival.
+     - **0 < balance - baseline <= nominal**: burn exactly the increase, leaving
+       the pre-flight balance untouched. This accounts for Alpaca withdrawal
+       fees and persists the actual amount in `BridgingSubmitting.burn_amount`,
+       so a crash-resume scan targets the exact burned amount.
+     - **balance - baseline > nominal**: funds arriving after pre-flight cannot
+       be distinguished from the withdrawal. Emit `FailBridging` without
+       attempting a burn and surface `WalletUsdcAmbientBalance` for operator
+       reconciliation. The job treats this as a clean terminal with no redrive.
+       A legacy aggregate with no persisted baseline also fails closed with
+       `MissingPreflightBalance`; it never assumes zero and never burns an
+       unattributable balance.
 5. Ensure standing allowance to TokenMessenger (see above)
 6. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee (after
    allowance step to keep fee fresh across the cold-path ~30 s node-sync wait)
@@ -4527,43 +4407,13 @@ Base to Alpaca:
 8. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
    (mints USDC to the bot's own Ethereum wallet)
 9. Wait for mint tx confirmation (~20 seconds on Ethereum)
-10. Send exactly the transfer's credit to Alpaca's deposit address: the amount
-    the mint tx paid the bot wallet (`Bridged.amount_received`, from the
-    `MintAndWithdraw` event), never the wallet balance (see "BaseToAlpaca
-    deposit send"; fresh sends directly, resume adopts an existing send)
+10. Send the minted USDC from the bot wallet to Alpaca's deposit address (see
+    "BaseToAlpaca deposit send"; fresh sends directly, resume adopts an existing
+    send)
 11. Poll Alpaca API by the send tx until deposit status is COMPLETE
 12. **Convert USDC to USD**: Place market sell order on USDC/USD pair (sell
     USDC)
 13. Poll Alpaca until conversion order is filled
-
-###### Ethereum wallet credit ledger
-
-The ledger is derived from open `UsdcRebalance` aggregates, never stored
-separately. It loads only the aggregates whose latest event leaves them in a
-state that can hold credit, so finished transfers are never replayed. A transfer
-is credited-not-yet-sent (held) while its credited USDC sits in the Ethereum
-wallet: a BaseToAlpaca `Bridged`, or an AlpacaToBase `WithdrawalComplete` whose
-withdrawal tx has reached the required confirmations (its credit is read from
-the receipt before the balance; until then, or if the read fails, it is in
-flight up to the nominal amount). An AlpacaToBase `BridgingSubmitting` with a
-`burn_amount` is in flight: its burn may be unsent, unmined, or broadcast with
-its hash lost (`BurnRecordFailed`, an inconclusive submit), and the state cannot
-tell these apart. In-flight credit never pages a shortfall; it only raises the
-amount above which wallet USDC is reported unattributed. Right before an
-AlpacaToBase burn (including a reburn after a burn reverted, on resume or in
-process after a confirm-time revert; the reverted hash stays recorded during the
-check so a restart there still reburns) or a BaseToAlpaca deposit send, the bot
-reads the wallet's USDC balance and compares it with the held total. The sending
-transfer's own credit is passed to the check, not read from its state. The first
-burn's check runs before `BeginBridging`, while the transfer is still
-`WithdrawalComplete`: a restart there redrives safely, and no awaited work sits
-between `BeginBridging` and the burn. A balance below the held total pages the
-operator (`operational_alert`), naming the transfers that hold credit; a balance
-above held plus in flight is logged as unattributed USDC. If an open aggregate
-cannot be read (unparseable id, failed load), the ledger cannot be derived and
-that pages too, naming the aggregate, because the shortfall check is off until
-it is fixed. A failed wallet balance read only warns. The check never blocks or
-fails a transfer.
 
 ###### Fast Transfer Benefits
 
@@ -5725,11 +5575,7 @@ named exemptions defined after the list:**
   `not_detected_yet`, changes nothing, and the operator retries later. Other
   USDC states keep their existing paths (`resume` while non-terminal,
   `reconcile` for funds handled out-of-band rather than settled by the
-  provider). Because the USDC recheck sends from the rebalancing wallet and
-  advances the aggregate on the request task, it first quiesces the USDC
-  rebalancing driver and holds it paused for the whole recheck, refusing with
-  `503` when the driver cannot quiesce (see "Both bot-routed USDC recovery
-  routes quiesce the rebalancing driver first" below).
+  provider).
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
 - `reconcile` -- declare an already-terminal-failed operation resolved
@@ -5762,8 +5608,44 @@ effect rather than a generic intent:
   the same `witness -> enrich -> acknowledge -> mark -> settle` exactly-once
   sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two
   commands above it belongs to no object group -- there is no stuck aggregate to
-  recover, only a missing fill to backfill. Its accounting, execution paths, and
-  hedge placement rules are in the `process-tx` standing rule below.
+  recover, only a missing fill to backfill. It **fails closed on a fill already
+  acknowledged** in the `OnChainTrade` log, since applying it again would double
+  count the position; a fill that was witnessed but not yet acknowledged is
+  resumed from where the earlier run stopped. It has two execution paths. The
+  **CLI** runs it in direct-DB mode, in a separate process from the bot: because
+  no in-process lock can serialize across processes, the persisted
+  pending-acknowledgement set (see ADR 0010), not process isolation, is what
+  makes a cross-process re-drive reject as a duplicate rather than double-count,
+  so the CLI path **must not run while the bot is concurrently accounting the
+  same symbol**. The **in-bot REST route**
+  (`POST /liquidity-write/transactions/{tx_hash}/process`) instead runs inside
+  the live bot and serializes its position claim and broker placement against
+  the trading loop through the shared counter-trade submission lock (ADR 0014),
+  so it does **not** require stopping the bot; it gates on full startup
+  readiness (503 until then), selects the hedged chain from the `chain` query
+  (defaulting to the primary), returns the decoded fill alongside its outcome,
+  and runs the accounting and placement on a detached task so a client
+  disconnect cannot strand a placed order before its Submitted event persists.
+  **Broker admission runs before the claim** (ADR 0022). On an admission
+  deferral process-tx persists nothing: it settles the fill and returns
+  `ProcessTxOutcome::HedgePlacementDeferred`, and the standing periodic position
+  check hedges the exposure again from a fresh preflight. An admission error at
+  that check likewise claims nothing; it surfaces to the caller (500 from the
+  REST route, nonzero exit from the CLI) with the fill left unsettled, so a
+  rerun resumes it. The placement runs admission again after the claim; **if
+  admission changed in between**, a deferral or an admission error there fails
+  the order, releases its id, clears the claim, and settles the fill, reporting
+  `HedgePlacementDeferred` for a deferral and surfacing an error. **On broker
+  backpressure**, the broker call did run, so process-tx preserves the failed
+  order id as the idempotency anchor, clears the claim, settles the fill, and
+  surfaces the error; the standing position check then runs anchor recovery
+  under that client id. None of these cases retain a Pending intent. This
+  behavior lives in the shared process-tx placement path used by both the CLI
+  and the REST route. **Before placement**, a Pending claim already held by the
+  live pipeline is settled against and reported as a deferral
+  (PendingHedgeDeferred) when the schedule is enabled, and rejected (after
+  settling the fill) as RetainedPendingWithoutSchedule when the schedule is
+  disabled.
 
 **Standing rules:**
 
@@ -5793,41 +5675,21 @@ effect rather than a generic intent:
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a
   fresh burn; a direction mismatch refuses; a clean terminal refuses), then
-  quiesces the USDC rebalancing driver (see "Both bot-routed USDC recovery
-  routes quiesce the rebalancing driver first" below) and holds it paused for
-  the whole operation before it applies the single-flight gates and enqueues a
-  transfer job keyed by the EXISTING id for the apalis worker to drive: any live
-  or retryable USDC job row in either direction refuses with 409 (a terminal
-  `Failed` row does NOT -- re-enqueueing it is the recovery case), and a durable
-  guard holder other than the requested id refuses with 409. The worker uses the
-  aggregate's persisted amount. Routing through the bot closes the CLI-vs-server
-  race: the CLI process never drives an aggregate the bot's worker may also
-  drive. The manual `transfer-usdc` command still starts a fresh transfer
-  directly, but hands off to this endpoint at the FIRST bot-resumable wait
-  (attestation timeout, settlement lag, inconclusive poll); when the bot is
-  unreachable, the transfer is durable -- a bot restart re-arms it
-  automatically. Like the whole `server_port` recovery surface
-  (`/transfers/resume`, `/transfers/recheck`, `/transfers/fail`), its bare path
-  is restricted to loopback callers for the in-container CLI. Network operators
-  use the IAP-verified `/liquidity-write/transfers/*` mounts.
-- **Both bot-routed USDC recovery routes quiesce the rebalancing driver first.**
-  `transfer resume --kind usdc` and `transfer recheck --kind usdc` send
-  transactions from the rebalancing wallet or advance the `UsdcRebalance`
-  aggregate on the request task, so before either mutates, it pauses the USDC
-  rebalancing driver -- the two apalis workers (`TransferUsdcToHedging`,
-  `TransferUsdcToMarketMaking`) plus the trigger's own queued USDC check and
-  inline stuck-transfer sweep -- meaning every worker execution already in
-  flight has finished and none can start, and holds it paused for the whole
-  operation, resuming it on every exit path (success, error, or panic). The
-  pause waits up to a 5-second quiesce window; if a transfer is still executing
-  when that window elapses, the route refuses with `503` ("A USDC transfer is
-  executing; retry once it is not in flight") and leaves the driver running.
-  This `503` sits AFTER the shared resume/recheck single-in-progress lock
-  (`409`) and the conductor-not-ready gate (`503`) but BEFORE the single-flight
-  job-row and guard-holder gates (`409`): the driver is quiesced before those
-  gates read the job rows and the durable guard, so their reads and the
-  subsequent enqueue or aggregate command cannot straddle a live worker
-  execution driving the same aggregate.
+  applies the single-flight gates before it enqueues a transfer job keyed by the
+  EXISTING id for the apalis worker to drive: any live or retryable USDC job row
+  in either direction refuses with 409 (a terminal `Failed` row does NOT --
+  re-enqueueing it is the recovery case), and a durable guard holder other than
+  the requested id refuses with 409. The worker uses the aggregate's persisted
+  amount. Routing through the bot closes the CLI-vs-server race: the CLI process
+  never drives an aggregate the bot's worker may also drive. The manual
+  `transfer-usdc` command still starts a fresh transfer directly, but hands off
+  to this endpoint at the FIRST bot-resumable wait (attestation timeout,
+  settlement lag, inconclusive poll); when the bot is unreachable, the transfer
+  is durable -- a bot restart re-arms it automatically. Like the whole
+  `server_port` recovery surface (`/transfers/resume`, `/transfers/recheck`,
+  `/transfers/fail`), its bare path is restricted to loopback callers for the
+  in-container CLI. Network operators use the IAP-verified
+  `/liquidity-write/transfers/*` mounts.
 - **`--reason` MUST be required, with no default, on every event-emitting
   destructive verb** (`fail`, `reconcile`, `set`, and `position release-hedge`).
   A defaulted reason is an audit-hostile record and violates the
@@ -5847,95 +5709,23 @@ effect rather than a generic intent:
   `ReconcileStuckRebalance` command (see above) is the first realization of the
   `reconcile` verb.
 - **`process-tx` implements the ADR-0005 exactly-once fill accounting
-  protocol.** It **does not repeat fill accounting or hedging for a fill already
-  acknowledged** in the `OnChainTrade` log, since applying it again would double
-  count the position: it reports `AlreadyAccounted`, or `AlreadyExcluded` for a
-  fill kept out of hedging. It may still repair bookkeeping on that fill: it
-  records a missing source attribution on the `OnChainTrade`, and settles the
-  fill if a crash between mark and settle left it pending (ADR 0010). A fill
-  that was witnessed but not yet acknowledged is resumed from where the earlier
-  run stopped (crash recovery window), and a genuinely missed fill gets the full
-  witness/acknowledge record, so every subsequent re-delivery, whether from
-  another CLI run or the normal pipeline, hits the dedup guard and skips
-  cleanly. A decoded fill with no block number cannot be witnessed and fails as
-  an operational error (a 500 on the REST route). **Concurrent accounting of the
-  same fill is serialized on every path.** The durable dedup check and the CQRS
-  apply are separate transactions, and the Position guard rejects only a fill
-  whose trade id is still in `pending_acknowledged_trade_ids` or equals
-  `last_acknowledged_trade_id` (`DuplicateTrade`, ADR 0010). Without one guard
-  spanning both, a second actor could pass the check, then apply the fill after
-  the first actor settled it and a newer fill replaced it in
-  `last_acknowledged_trade_id`, counting it twice. `account_for_onchain_fill`
-  therefore holds the fill accounting file lock
-  (`<database>.fill-accounting.lock`) from its `skipped_fills` check through the
-  acknowledge, and `account_for_fill_excluded_from_hedging` holds it from its
-  position check through the exclusion record, so two actors that disagree on
-  the trading flag cannot both count the fill and record it as excluded. Every
-  accounting caller takes it (the apalis accounting job, the REST route, and the
-  CLI), and the kernel lock also serializes separate processes. Within one
-  process, callers first queue on a process wide mutex, so the lock file only
-  arbitrates between processes; on an in memory database, which only its own
-  process can attach to, that mutex alone is the lock. Like the bot, process-tx
-  keeps a fill on an asset whose trading is disabled on the fill's chain out of
-  the position (see Risk Management) and reports its cover detail; a fill
-  excluded earlier stays excluded and is reported as such. It is independent of
-  the submission lock, which is taken after accounting and serializes only the
-  position claim and broker placement.
-
-  It has two execution paths. The **CLI** runs it in direct-DB mode, in a
-  separate process from the bot, and selects the hedged chain with `--network`,
-  defaulting to the primary chain and rejecting a chain not configured as
-  hedged. No in process lock can serialize across processes, so the fill
-  accounting file lock above is what lets a concurrent actor on the same fill
-  find it recorded instead of counting it twice. **Operational precondition (CLI
-  direct database path)**: stop the live bot. The CLI's standalone stores reach
-  none of the bot's live reactors, and its placer has no admission gate (see
-  below). The file locks are defense in depth, not a supported concurrent mode.
-  The **in bot REST route**
-  (`POST /liquidity-write/transactions/{tx_hash}/process`) removes that
-  requirement: it runs inside the live bot and serializes its position claim and
-  broker placement against the trading loop through the shared counter trade
-  submission lock (ADR 0014), so it does **not** require stopping the bot. It
-  gates on full startup readiness (503 until then), selects the hedged chain
-  from the `chain` query (defaulting to the primary), returns the decoded fill
-  alongside its outcome, and runs the accounting and placement on a detached
-  task so a client disconnect cannot strand a placed order before its Submitted
-  event persists. Graceful shutdown stops the server and waits for that task, up
-  to the drain timeout; a request that still reaches the handler after the drain
-  began is refused with 503, and a task still running at the timeout is dropped
-  when the process exits.
-
-  The claim, placement, and settlement behavior lives in the shared process-tx
-  placement path used by both the CLI and the REST route; only the admission
-  outcomes depend on the placer. **Before placement**, a Pending claim already
-  held by the live pipeline is settled against and reported as a deferral
-  (`ProcessTxOutcome::PendingHedgeDeferred`) when the schedule is enabled, and
-  rejected (after settling the fill) as
-  `RejectionReason::RetainedPendingWithoutSchedule` when the schedule is
-  disabled. A preserved failed order anchor is then reconciled with the broker:
-  when the broker still holds that order, the fill is settled and the placement
-  rejected (`RejectionReason::FailedAnchorStillAtBroker`), while an operational
-  failure of that reconciliation leaves the fill unsettled so a rerun resumes
-  it. A placement preflight that skips the hedge settles the fill and reports
-  `ProcessTxOutcome::PreflightDeferred` with the skip reason. **Broker admission
-  runs before the claim** (ADR 0022) on the REST route, whose placer applies the
-  trading schedule. The CLI placer has no admission gate: it places with session
-  validation bypassed, so it never defers and never reports
-  `HedgePlacementDeferred`. On an admission deferral process-tx writes no claim,
-  no Pending intent, and no anchor for this placement: it settles the accounted
-  fill and returns `ProcessTxOutcome::HedgePlacementDeferred` (a reconciliation
-  of an earlier claim or anchor that ran before admission stays recorded), and
-  the standing periodic position check hedges the exposure again from a fresh
-  preflight. An admission error at that check likewise claims nothing; it
-  surfaces to the caller as a 500 with the fill left unsettled, so a rerun
-  resumes it. The placement runs admission again after the claim; **if admission
-  changed in between**, a deferral or an admission error there fails the order,
-  releases its id, clears the claim, and settles the fill, reporting
-  `HedgePlacementDeferred` for a deferral and surfacing an error. **On broker
-  backpressure**, the broker call did run, so process-tx preserves the failed
-  order id as the idempotency anchor, clears the claim, settles the fill, and
-  surfaces the error; the standing position check then runs anchor recovery
-  under that client id. None of these cases retain a Pending intent.
+  protocol.** It fails closed (with a clear operator message) if the fill is
+  already acknowledged, resumes if it was witnessed but not yet acknowledged
+  (crash- recovery window), and creates the full witness/acknowledge record for
+  genuinely missed fills — so every subsequent re-delivery, whether from another
+  CLI run or the normal pipeline, hits the dedup guard and skips cleanly.
+  **Operational precondition (CLI direct-DB path)**: run with exclusive
+  processing for that fill: stop the live bot, drain any apalis accounting job
+  for the fill, and do not run another `process-tx` for the same
+  `(tx_hash, log_index)` concurrently. The durable dedup guard and the CQRS
+  apply are separate transactions, so any concurrent actor processing the same
+  fill can slip through the TOCTOU window. The **in-bot REST route lifts this
+  precondition**: the durable dedup guard plus the serialization of each
+  Position aggregate instance and its duplicate fill and pending state checks
+  make concurrent accounting of the same fill safe, while the shared submission
+  lock (acquired after accounting returns) serializes only the position claim
+  and broker placement, so it runs safely against the live pipeline without
+  stopping the bot.
 
 ### Event Processing Flow
 
