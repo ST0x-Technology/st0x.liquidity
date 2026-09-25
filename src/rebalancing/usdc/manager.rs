@@ -5720,8 +5720,8 @@ mod tests {
 
     use st0x_bridge::Bridge;
     use st0x_bridge::cctp::{
-        CctpAttestationMock, CctpBridge, CctpCorridor, CctpCtx, TestMintBurnToken,
-        deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
+        AttestationError, CctpAttestationMock, CctpBridge, CctpCorridor, CctpCtx,
+        TestMintBurnToken, deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
     };
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -13353,6 +13353,60 @@ mod tests {
             ),
             "a transient re-poll failure on a consumed nonce must redrive, got: {error:?}"
         );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "got: {state:?}"
+        );
+    }
+
+    /// A legacy `Attested` re-poll that times out on a consumed nonce may
+    /// never get an answer from Circle, so it redrives via
+    /// `MintRecoveryInconclusive`, whose deadline alert pages, instead of
+    /// rescheduling silently with the guard held.
+    #[tokio::test]
+    async fn legacy_attested_repoll_timeout_on_a_consumed_nonce_redrives_with_a_deadline() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_attested_base_to_alpaca(&cqrs, &id, usdc("1")).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let bridge = MockBridge::new().with_failing_repoll_on_consumed_nonce(|| {
+            CctpError::AttestationTimeout {
+                attempts: 3,
+                source: AttestationError::NoMessages,
+            }
+        });
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet, bridge).await;
+        let initiated_at = Utc::now();
+
+        let error = manager
+            .repoll_attested_attestation(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                TxHash::from([7u8; 32]),
+                B256::repeat_byte(0x07),
+                initiated_at,
+            )
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::MintRecoveryInconclusive {
+            id: error_id,
+            initiated_at: error_initiated_at,
+            ..
+        } = error
+        else {
+            panic!(
+                "a re-poll timeout on a consumed nonce must redrive with a deadline, got: {error:?}"
+            );
+        };
+        assert_eq!(error_id, id);
+        assert_eq!(error_initiated_at, initiated_at);
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert!(
             matches!(state, UsdcRebalance::Attested { .. }),
