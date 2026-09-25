@@ -3938,7 +3938,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xA70B)),
-                preflight_balance: U256::ZERO,
             },
             UsdcRebalanceCommand::ConfirmConversion {
                 conversion: ConversionAmounts::new(amount, amount),

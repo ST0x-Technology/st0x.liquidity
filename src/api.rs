@@ -7187,7 +7187,6 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: st0x_execution::ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
-                    preflight_balance: U256::ZERO,
                 },
             )
             .await
