@@ -2,20 +2,24 @@
 
 #[cfg(feature = "test-support")]
 use alloy::primitives::Address;
+use rain_math_float::{Float, FloatError};
+use serde::Deserialize;
+use serde::de::IgnoredAny;
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use rain_math_float::Float;
-use serde::Deserialize;
-use serde::de::IgnoredAny;
-use st0x_bridge::cctp::{CctpCorridor, CorridorStableNotUsdc};
+use st0x_bridge::cctp::{CctpCorridor, CorridorStableNotUsdc, cctp_domain};
+use st0x_bridge::corridor::{HopKind, UsdcCorridor};
+use st0x_evm::Chain;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
 
 use crate::{
-    AllocationConfig, AllocationConfigError, AllocationCtx, ImbalanceThreshold, OperationMode,
+    AllocationConfig, AllocationConfigError, AllocationCtx, ImbalanceThreshold,
+    InvalidImbalanceThreshold, OperationMode,
 };
 
 /// Minimum USDC amount for Alpaca withdrawals.
@@ -59,6 +63,39 @@ pub enum RebalancingCtxError {
     #[error("[rebalancing] cash corridor: {0}")]
     CctpCorridor(#[from] CorridorStableNotUsdc),
     #[error(
+        "[rebalancing.usdc] mode is enabled but no [rebalancing.usdc.corridors.<chain>] \
+         table is set"
+    )]
+    UsdcEnabledWithoutCorridor,
+    #[error("[rebalancing.usdc.corridors.ethereum]: the direct Ethereum corridor is not built")]
+    EthereumCorridor,
+    #[error("[rebalancing.usdc.corridors.{chain}] hop = \"relay\": this build has no Relay hop")]
+    RelayHopNotBuilt { chain: Chain },
+    #[error("[rebalancing.usdc.corridors.{chain}] hop = \"cctp\": {source}")]
+    CctpHopStableNotUsdc {
+        chain: Chain,
+        #[source]
+        source: CorridorStableNotUsdc,
+    },
+    #[error(
+        "[rebalancing.usdc.corridors.{chain}] hop = \"cctp\": this build has no CCTP domain \
+             for {chain}"
+    )]
+    NoCctpDomain { chain: Chain },
+    #[error("[rebalancing.usdc.corridors.{chain}]: {source}")]
+    CorridorThreshold {
+        chain: Chain,
+        #[source]
+        source: InvalidImbalanceThreshold,
+    },
+    #[error(
+        "[rebalancing.usdc] target and deviation are kept only for older releases and must \
+         equal [rebalancing.usdc.corridors.{chain}]'s while they are set"
+    )]
+    LegacyUsdcThresholdMismatch { chain: Chain },
+    #[error(transparent)]
+    FloatComparison(#[from] FloatError),
+    #[error(
         "[rebalancing.equity] was replaced by [rebalancing.allocation]: move target to \
          targets.<chain> and deviation to deviation, and add alpaca_floor, \
          min_operation_usd and cooldown_secs"
@@ -77,17 +114,123 @@ pub enum RebalancingCtxError {
     Evm(#[from] st0x_evm::EvmError),
 }
 
-/// USDC rebalancing configuration with explicit enable/disable.
+/// `[rebalancing.usdc]`: the switch for new cash transfers and one table per
+/// cash corridor.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsdcRebalancing {
+    pub mode: OperationMode,
+    /// Keyed by the chain whose cash vault the corridor serves. Absent is
+    /// legitimate while `mode` is disabled.
+    #[serde(default)]
+    pub corridors: BTreeMap<Chain, UsdcCorridorConfig>,
+    /// Transitional: the released image reads these two and ignores
+    /// `corridors`, so they stay in the deployed config, equal to the
+    /// corridor's, until a release that reads corridors is live.
+    #[serde(
+        default,
+        deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
+    )]
+    pub target: Option<Float>,
+    #[serde(
+        default,
+        deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
+    )]
+    pub deviation: Option<Float>,
+}
+
+/// One `[rebalancing.usdc.corridors.<chain>]` table. Every key is required.
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub enum UsdcRebalancing {
-    Enabled {
-        #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
-        target: Float,
-        #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
-        deviation: Float,
-    },
-    Disabled,
+#[serde(deny_unknown_fields)]
+pub struct UsdcCorridorConfig {
+    pub hop: HopKind,
+    /// The chain vault's share of (that vault's USDC + Alpaca cash).
+    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
+    pub target: Float,
+    /// The band around `target` inside which nothing moves.
+    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
+    pub deviation: Float,
+}
+
+/// A validated cash corridor: its route and its trigger band.
+#[derive(Debug, Clone, Copy)]
+pub struct UsdcCorridorCtx {
+    pub corridor: UsdcCorridor,
+    pub threshold: ImbalanceThreshold,
+}
+
+impl UsdcRebalancing {
+    /// Validates every corridor table, whatever the mode, and returns the
+    /// corridor new transfers run on: `None` while the mode is disabled.
+    fn corridor_ctx(&self) -> Result<Option<UsdcCorridorCtx>, RebalancingCtxError> {
+        let mut validated = self
+            .corridors
+            .iter()
+            .map(|(chain, config)| self.validate_corridor(*chain, config))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter();
+
+        match self.mode {
+            OperationMode::Enabled => validated
+                .next()
+                .map(Some)
+                .ok_or(RebalancingCtxError::UsdcEnabledWithoutCorridor),
+            OperationMode::Disabled => Ok(None),
+        }
+    }
+
+    fn validate_corridor(
+        &self,
+        chain: Chain,
+        config: &UsdcCorridorConfig,
+    ) -> Result<UsdcCorridorCtx, RebalancingCtxError> {
+        if chain == Chain::Ethereum {
+            return Err(RebalancingCtxError::EthereumCorridor);
+        }
+
+        match config.hop {
+            HopKind::Relay => return Err(RebalancingCtxError::RelayHopNotBuilt { chain }),
+            HopKind::Cctp => {
+                if chain.cctp_usdc().is_none() {
+                    return Err(RebalancingCtxError::CctpHopStableNotUsdc {
+                        chain,
+                        source: CorridorStableNotUsdc {
+                            chain,
+                            stable: chain.settlement_stable().symbol,
+                        },
+                    });
+                }
+
+                if cctp_domain(chain).is_none() {
+                    return Err(RebalancingCtxError::NoCctpDomain { chain });
+                }
+            }
+        }
+
+        let threshold = ImbalanceThreshold::new(config.target, config.deviation)
+            .map_err(|source| RebalancingCtxError::CorridorThreshold { chain, source })?;
+
+        let legacy_differs = match (self.target, self.deviation) {
+            (None, None) => false,
+            (Some(target), None) => !target.eq(config.target)?,
+            (None, Some(deviation)) => !deviation.eq(config.deviation)?,
+            (Some(target), Some(deviation)) => {
+                !(target.eq(config.target)? && deviation.eq(config.deviation)?)
+            }
+        };
+
+        if legacy_differs {
+            return Err(RebalancingCtxError::LegacyUsdcThresholdMismatch { chain });
+        }
+
+        Ok(UsdcCorridorCtx {
+            corridor: UsdcCorridor::HubRouted {
+                chain,
+                hop: config.hop,
+            },
+            threshold,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -199,7 +342,9 @@ fn default_settlement_retry_deadline_secs() -> u64 {
 pub struct RebalancingCtx {
     /// The validated `[rebalancing.allocation]` section.
     pub allocation: AllocationCtx,
-    pub usdc: Option<ImbalanceThreshold>,
+    /// The corridor new cash transfers run on; `None` while USDC mode is
+    /// disabled.
+    pub usdc: Option<UsdcCorridorCtx>,
     pub transfer_timeout: Duration,
     /// Staleness bound for per-chain inventory snapshots. See
     /// [`RebalancingConfig::inventory_staleness_bound_secs`].
@@ -255,12 +400,7 @@ impl RebalancingCtx {
             return Err(RebalancingCtxError::ZeroTransferAttemptTimeout);
         }
 
-        let usdc = match config.usdc {
-            UsdcRebalancing::Enabled { target, deviation } => {
-                Some(ImbalanceThreshold { target, deviation })
-            }
-            UsdcRebalancing::Disabled => None,
-        };
+        let usdc = config.usdc.corridor_ctx()?;
 
         if usdc.is_some() && config.max_burn_revert_redrives == 0 {
             return Err(RebalancingCtxError::ZeroMaxBurnRevertRedrives);
@@ -309,7 +449,7 @@ impl RebalancingCtx {
     ) -> Self {
         Self {
             allocation,
-            usdc,
+            usdc: usdc.map(base_cctp_corridor),
             transfer_timeout,
             inventory_staleness_bound,
             transfer_attempt_timeout,
@@ -336,7 +476,7 @@ impl RebalancingCtx {
     #[builder]
     pub fn with_wallets(
         #[builder(default = AllocationCtx::base_test())] allocation: AllocationCtx,
-        usdc: UsdcRebalancing,
+        usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
@@ -346,16 +486,9 @@ impl RebalancingCtx {
         #[builder(default = 5)] max_burn_revert_redrives: u32,
         #[builder(default = OperationMode::Enabled)] freeze_check: OperationMode,
     ) -> Self {
-        let usdc = match usdc {
-            UsdcRebalancing::Enabled { target, deviation } => {
-                Some(ImbalanceThreshold { target, deviation })
-            }
-            UsdcRebalancing::Disabled => None,
-        };
-
         Self {
             allocation,
-            usdc,
+            usdc: usdc.map(base_cctp_corridor),
             transfer_timeout,
             inventory_staleness_bound,
             transfer_attempt_timeout,
@@ -389,6 +522,15 @@ impl RebalancingCtx {
         self.token_messenger = token_messenger;
         self.message_transmitter = message_transmitter;
         self
+    }
+}
+
+/// Test corridor: the threshold on Base via CCTP, the corridor tests run.
+#[cfg(any(test, feature = "test-support"))]
+const fn base_cctp_corridor(threshold: ImbalanceThreshold) -> UsdcCorridorCtx {
+    UsdcCorridorCtx {
+        corridor: UsdcCorridor::BASE_CCTP,
+        threshold,
     }
 }
 
@@ -431,6 +573,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#
@@ -468,9 +613,13 @@ mod tests {
                 .unwrap()
         );
 
-        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("expected UsdcRebalancing::Enabled");
-        };
+        assert_eq!(config.usdc.mode, OperationMode::Enabled);
+        let UsdcCorridorConfig {
+            hop,
+            target,
+            deviation,
+        } = config.usdc.corridors[&Chain::Base];
+        assert_eq!(hop, HopKind::Cctp);
         assert!(target.eq(float!(0.5)).unwrap());
         assert!(deviation.eq(float!(0.3)).unwrap());
         assert_eq!(config.transfer_timeout_secs, 1800);
@@ -532,6 +681,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -564,15 +716,22 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.4"
             deviation = "0.15"
         "#,
         )
         .unwrap();
 
-        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("expected UsdcRebalancing::Enabled");
-        };
+        assert_eq!(config.usdc.mode, OperationMode::Enabled);
+        let UsdcCorridorConfig {
+            hop,
+            target,
+            deviation,
+        } = config.usdc.corridors[&Chain::Base];
+        assert_eq!(hop, HopKind::Cctp);
         assert!(target.eq(float!(0.4)).unwrap());
         assert!(deviation.eq(float!(0.15)).unwrap());
         assert_eq!(config.attestation_retry_deadline_secs, 7200);
@@ -597,6 +756,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -627,6 +789,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -683,6 +848,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -715,6 +883,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -746,6 +917,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -775,6 +949,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -809,6 +986,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -864,6 +1044,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#;
@@ -896,6 +1079,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -930,6 +1116,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -991,6 +1180,9 @@ mod tests {
 
             [usdc]
             mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#;

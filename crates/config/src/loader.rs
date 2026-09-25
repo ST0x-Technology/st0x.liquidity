@@ -34,10 +34,10 @@ use crate::pricing::PricingSecrets;
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
     AlertsConfig, AlertsCtx, AllocationConfigError, BotGasValuationConfig, ChainConfig,
-    ChainEquityAsset, ChainRegistry, ChainSecrets, ExecutionThreshold, HedgingAssets,
-    InvalidThresholdError, OperationMode, OrchestratorConfig, PricingConfig, PricingCtx,
-    PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig,
-    TelemetryCtx,
+    ChainEquityAsset, ChainLifecycle, ChainRegistry, ChainSecrets, ExecutionThreshold,
+    HedgingAssets, InvalidThresholdError, OperationMode, OrchestratorConfig, PricingConfig,
+    PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError,
+    TelemetryConfig, TelemetryCtx, UsdcRebalancing,
 };
 
 /// Alpaca minimum execution threshold: $2.
@@ -1799,6 +1799,7 @@ fn validate_config(
         };
         RebalancingCtx::new(rebalancing)?;
         rebalancing.allocation()?.validate(&config.chains)?;
+        validate_usdc_corridor_chains(&rebalancing.usdc, &config.chains)?;
 
         let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
 
@@ -1864,6 +1865,67 @@ fn validate_config(
         travel_rule,
         hedge_floor,
     })
+}
+
+/// Checks the cash corridors against the chain tables: each corridor's chain
+/// is configured, enabled, holds a cash vault and is the primary (the cash
+/// path still runs there), and with USDC mode enabled every chain whose cash
+/// rebalances has a corridor.
+fn validate_usdc_corridor_chains(
+    usdc: &UsdcRebalancing,
+    chains: &BTreeMap<Chain, ChainConfig>,
+) -> Result<(), CtxError> {
+    let primary = chains.iter().find_map(|(chain, config)| {
+        config
+            .trading
+            .as_ref()
+            .is_some_and(|trading| trading.primary)
+            .then_some(*chain)
+    });
+
+    for chain in usdc.corridors.keys().copied() {
+        let Some(chain_config) = chains.get(&chain) else {
+            return Err(CtxError::CorridorChainNotConfigured { chain });
+        };
+
+        if chain_config.lifecycle == ChainLifecycle::Disabled {
+            return Err(CtxError::CorridorChainDisabled { chain });
+        }
+
+        let has_cash_vault = chain_config
+            .trading
+            .as_ref()
+            .and_then(|trading| trading.assets.cash.as_ref())
+            .is_some_and(|cash| !cash.vault_ids.is_empty());
+
+        if !has_cash_vault {
+            return Err(CtxError::CorridorChainWithoutCashVault { chain });
+        }
+
+        if let Some(primary) = primary
+            && primary != chain
+        {
+            return Err(CtxError::CorridorChainNotPrimary { chain, primary });
+        }
+    }
+
+    if usdc.mode == OperationMode::Disabled {
+        return Ok(());
+    }
+
+    let uncovered = chains.iter().find(|(chain, config)| {
+        config
+            .trading
+            .as_ref()
+            .and_then(|trading| trading.assets.cash.as_ref())
+            .is_some_and(|cash| cash.rebalancing == OperationMode::Enabled)
+            && !usdc.corridors.contains_key(chain)
+    });
+
+    match uncovered {
+        Some((chain, _)) => Err(CtxError::CashRebalancingWithoutCorridor { chain: *chain }),
+        None => Ok(()),
+    }
 }
 
 /// Single validation path shared by [`Ctx::load_files`] and
@@ -2739,6 +2801,25 @@ pub enum CtxError {
          smallest Alpaca-to-Base transfer that can complete, {minimum}"
     )]
     CashOperationalLimitBelowMinimumTransfer { configured: Usdc, minimum: Usdc },
+    #[error("[rebalancing.usdc.corridors.{chain}]: [chains.{chain}] is not configured")]
+    CorridorChainNotConfigured { chain: Chain },
+    #[error("[rebalancing.usdc.corridors.{chain}]: [chains.{chain}] is disabled")]
+    CorridorChainDisabled { chain: Chain },
+    #[error(
+        "[rebalancing.usdc.corridors.{chain}]: [chains.{chain}.trading.assets.cash] has no \
+         vault id"
+    )]
+    CorridorChainWithoutCashVault { chain: Chain },
+    #[error(
+        "[chains.{chain}.trading.assets.cash] enables rebalancing and USDC mode is enabled, \
+         but [rebalancing.usdc.corridors.{chain}] is not set"
+    )]
+    CashRebalancingWithoutCorridor { chain: Chain },
+    #[error(
+        "[rebalancing.usdc.corridors.{chain}]: cash transfers still run on the primary \
+         chain, {primary}"
+    )]
+    CorridorChainNotPrimary { chain: Chain, primary: Chain },
     #[error(
         "vault_ids in [chains.<name>.trading.assets.cash] is required for rebalancing \
          but not configured"
@@ -2843,6 +2924,11 @@ impl CtxError {
             Self::CashOperationalLimitBelowMinimumTransfer { .. } => {
                 "cash operational limit below minimum transfer"
             }
+            Self::CorridorChainNotConfigured { .. } => "USDC corridor chain not configured",
+            Self::CorridorChainDisabled { .. } => "USDC corridor chain disabled",
+            Self::CorridorChainWithoutCashVault { .. } => "USDC corridor chain without cash vault",
+            Self::CashRebalancingWithoutCorridor { .. } => "cash rebalancing without USDC corridor",
+            Self::CorridorChainNotPrimary { .. } => "USDC corridor chain not primary",
             Self::MissingCashVaultId => "missing cash vault_ids",
             Self::ListedSymbolIsNotHedged { .. } => "listed symbol has no hedging policy",
             Self::HedgedSymbolIsNotListed { .. } => "hedged symbol is listed on no chain",
@@ -2970,7 +3056,12 @@ pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
                 .unwrap_or_else(|_| unreachable!("one dollar is positive")),
             cooldown_secs: 1,
         }),
-        usdc: crate::UsdcRebalancing::Disabled,
+        usdc: UsdcRebalancing {
+            mode: OperationMode::Disabled,
+            corridors: BTreeMap::new(),
+            target: None,
+            deviation: None,
+        },
         inventory_staleness_bound_secs: 300,
         transfer_timeout_secs: 1800,
         transfer_attempt_timeout_secs: 3600,
@@ -5360,6 +5451,7 @@ mod tests {
             [chains.base.trading.assets.equities]
 
             [chains.base.trading.assets.cash]
+            vault_id = "0xfab"
             rebalancing = "enabled"
             operational_limit = 52
 
@@ -5424,6 +5516,9 @@ mod tests {
 
             [rebalancing.usdc]
             mode = "enabled"
+
+            [rebalancing.usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -5689,6 +5784,10 @@ mod tests {
             [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
+            [chains.base.trading.assets.cash]
+            vault_id = "0xfab"
+            rebalancing = "disabled"
+
             [rebalancing]
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
@@ -5716,6 +5815,9 @@ mod tests {
 
             [rebalancing.usdc]
             mode = "enabled"
+
+            [rebalancing.usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -6258,6 +6360,10 @@ mod tests {
             extended_hours_reprice_timeout_secs = 300
             close_flatten_reprice_timeout_secs = 60
             extended_hours_close_flatten_window_secs = 900
+            [chains.base.trading.assets.cash]
+            vault_id = "0xfab"
+            rebalancing = "disabled"
+
             [rebalancing]
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
@@ -6281,6 +6387,9 @@ mod tests {
 
             [rebalancing.usdc]
             mode = "enabled"
+
+            [rebalancing.usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
 
@@ -6378,6 +6487,10 @@ mod tests {
 
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
+            [chains.base.trading.assets.cash]
+            vault_id = "0xfab"
+            rebalancing = "disabled"
+
             [rebalancing]
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
@@ -6401,6 +6514,9 @@ mod tests {
 
             [rebalancing.usdc]
             mode = "enabled"
+
+            [rebalancing.usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
 
@@ -6511,6 +6627,10 @@ mod tests {
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
 
+            [chains.base.trading.assets.cash]
+            vault_id = "0xfab"
+            rebalancing = "disabled"
+
             [rebalancing]
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
@@ -6534,6 +6654,9 @@ mod tests {
 
             [rebalancing.usdc]
             mode = "enabled"
+
+            [rebalancing.usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#,
@@ -6641,6 +6764,10 @@ mod tests {
             beneficiary_entity_name = "Test Corp"
             {bot_gas_valuation_section}
 
+            [chains.base.trading.assets.cash]
+            vault_id = "0xfab"
+            rebalancing = "disabled"
+
             [rebalancing]
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
@@ -6664,6 +6791,9 @@ mod tests {
 
             [rebalancing.usdc]
             mode = "enabled"
+
+            [rebalancing.usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
             "#
@@ -8692,6 +8822,10 @@ mod tests {
             [chains.robinhood]
             lifecycle = "observe-only"
             required_confirmations = 1
+            [chains.base.trading.assets.cash]
+            vault_id = "0xfab"
+            rebalancing = "disabled"
+
             [rebalancing]
             transfer_timeout_secs = 1800
             inventory_staleness_bound_secs = 300
@@ -8719,6 +8853,9 @@ mod tests {
 
             [rebalancing.usdc]
             mode = "enabled"
+
+            [rebalancing.usdc.corridors.base]
+            hop = "cctp"
             target = "0.5"
             deviation = "0.3"
         "#,

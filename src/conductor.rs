@@ -3001,7 +3001,7 @@ fn build_rebalancing_service(
         RebalancingServiceConfig {
             poll_freshness: deps.poll_freshness.clone(),
             inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
-            usdc: rebalancing_ctx.usdc,
+            usdc: rebalancing_ctx.usdc.map(|usdc| usdc.threshold),
             transfer_timeout: rebalancing_ctx.transfer_timeout,
             chains,
             allocation,
