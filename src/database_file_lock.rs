@@ -4,12 +4,13 @@
 //! across tasks within one process. The kernel releases a lock when its process
 //! exits, so a crash cannot strand a lease.
 //!
-//! An in memory database has no file to lock beside, and only the process that
-//! created it can attach to it. Fill accounting then falls back to one process
-//! wide mutex, because two in process callers (the live accounting job and the
-//! process-tx route) share no other guard across the dedup check and the
-//! acknowledge. The submission lock needs no fallback: every in process
-//! placement already holds the shared counter trade submission mutex.
+//! Fill accounting takes one process wide mutex before its lock file, so callers
+//! inside the bot (the live accounting jobs and the process-tx route) queue in
+//! order instead of polling the file, and the file lock only arbitrates between
+//! processes. An in memory database has no file to lock beside, and only the
+//! process that created it can attach to it, so there the mutex alone is the
+//! lock. The submission lock needs no mutex here: every in process placement
+//! already holds the shared counter trade submission mutex.
 
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
@@ -42,18 +43,25 @@ impl DatabaseFileLock {
     }
 }
 
-/// Serializes fill accounting on in memory databases, which have no lock file.
-static IN_MEMORY_FILL_ACCOUNTING: Mutex<()> = Mutex::const_new(());
+/// Serializes fill accounting within this process; taken before the lock file.
+static FILL_ACCOUNTING_IN_PROCESS: Mutex<()> = Mutex::const_new(());
 
 /// Held for the critical section; dropping it releases the lock.
 pub(crate) struct DatabaseFileGuard {
     _held: Held,
 }
 
-/// Each variant holds its lock only to release it on drop.
+/// Each variant holds its lock only to release it on drop. Fields drop in
+/// declaration order, so `File` releases the lock file before the in process
+/// mutex: the next in process waiter then finds the file already free.
 enum Held {
-    File { _file: File },
-    InMemory { _guard: MutexGuard<'static, ()> },
+    File {
+        _file: File,
+        _in_process: Option<MutexGuard<'static, ()>>,
+    },
+    InMemory {
+        _in_process: MutexGuard<'static, ()>,
+    },
     Nothing,
 }
 
@@ -79,9 +87,9 @@ pub enum DatabaseFileLockError {
     TimedOut { path: PathBuf },
 }
 
-/// Acquires `lock` for the database behind `pool`. On an in memory database,
-/// fill accounting takes the process wide fallback mutex and the submission
-/// lock holds nothing (see the module docs).
+/// Acquires `lock` for the database behind `pool`. Fill accounting takes the
+/// process wide mutex first, then the lock file; on an in memory database the
+/// mutex alone, and the submission lock nothing (see the module docs).
 pub(crate) async fn acquire_database_file_lock(
     pool: &SqlitePool,
     lock: DatabaseFileLock,
@@ -96,28 +104,32 @@ async fn acquire_database_file_lock_with_timeout(
     timeout: Duration,
     retry_interval: Duration,
 ) -> Result<DatabaseFileGuard, DatabaseFileLockError> {
+    let deadline = tokio::time::Instant::now() + timeout;
     let database_path: String =
         sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
             .fetch_one(pool)
             .await
             .map_err(DatabaseFileLockError::ResolveDatabasePath)?;
+    let mut lock_path = PathBuf::from(&database_path).into_os_string();
+    lock_path.push(lock.file_suffix());
+    let lock_path = PathBuf::from(lock_path);
+
+    let in_process = match lock {
+        DatabaseFileLock::FillAccounting => Some(
+            tokio::time::timeout_at(deadline, FILL_ACCOUNTING_IN_PROCESS.lock())
+                .await
+                .map_err(|_| DatabaseFileLockError::TimedOut {
+                    path: lock_path.clone(),
+                })?,
+        ),
+        DatabaseFileLock::CounterTradeSubmission => None,
+    };
+
     if database_path.is_empty() {
-        let held = match lock {
-            DatabaseFileLock::FillAccounting => Held::InMemory {
-                _guard: tokio::time::timeout(timeout, IN_MEMORY_FILL_ACCOUNTING.lock())
-                    .await
-                    .map_err(|_| DatabaseFileLockError::TimedOut {
-                        path: PathBuf::from("<in memory database>"),
-                    })?,
-            },
-            DatabaseFileLock::CounterTradeSubmission => Held::Nothing,
-        };
+        let held = in_process.map_or(Held::Nothing, |guard| Held::InMemory { _in_process: guard });
         return Ok(DatabaseFileGuard { _held: held });
     }
 
-    let mut lock_path = PathBuf::from(database_path).into_os_string();
-    lock_path.push(lock.file_suffix());
-    let lock_path = PathBuf::from(lock_path);
     let file = tokio::task::spawn_blocking({
         let lock_path = lock_path.clone();
         move || {
@@ -137,7 +149,6 @@ async fn acquire_database_file_lock_with_timeout(
     .await
     .map_err(DatabaseFileLockError::Join)??;
 
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match file.try_lock() {
             Ok(()) => break,
@@ -158,7 +169,10 @@ async fn acquire_database_file_lock_with_timeout(
     }
 
     Ok(DatabaseFileGuard {
-        _held: Held::File { _file: file },
+        _held: Held::File {
+            _file: file,
+            _in_process: in_process,
+        },
     })
 }
 
