@@ -1319,13 +1319,13 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// Scans Ethereum for a USDC `Transfer(from, to, value == amount)` at or
     /// after `from_block`, returning the most recent matching tx hash.
     ///
-    /// Pre-send idempotency guard for the BaseToAlpaca deposit leg: a crash
-    /// between the deposit send and recording it lands the aggregate back in
-    /// `Bridged`, and this detects the already-submitted send so resume adopts it
-    /// instead of forwarding the minted USDC a second time. Returns a retryable
-    /// [`CctpError::ScanInconclusive`] rather than `Ok(None)` when the queried node
-    /// is not confirmations-deep past `from_block`, so the caller never re-sends
-    /// off a stale empty scan.
+    /// Detects a legacy unrecorded deposit send: a BaseToAlpaca transfer that
+    /// reached `Bridged` without a persisted signed send may already have sent,
+    /// so resume refuses to send again when this finds a match. A match can be
+    /// another transfer's same-amount send, so it is never adopted. Returns a
+    /// retryable [`CctpError::ScanInconclusive`] rather than `Ok(None)` when the
+    /// queried node is not confirmations-deep past `from_block`, so the caller
+    /// never sends off a stale empty scan.
     pub async fn find_recent_usdc_transfer(
         &self,
         from: Address,
