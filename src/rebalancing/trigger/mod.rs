@@ -35033,4 +35033,59 @@ mod tests {
             "a refused resume must not enqueue anything"
         );
     }
+
+    /// A live job cannot move a transfer on a corridor this build does not
+    /// serve (it ends without a retry), so startup pages for it even though
+    /// a job still owns it.
+    #[tokio::test]
+    async fn startup_pages_for_a_live_job_on_a_corridor_this_build_does_not_serve() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        let notifier = Arc::new(CapturingNotifier::default());
+        let service = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                corridor: ROBINHOOD_RELAY,
+                id: id.clone(),
+                amount,
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(service.usdc_in_progress.load(Ordering::SeqCst));
+        let pages = corridor_pages(&notifier);
+        assert_eq!(pages.len(), 1, "got {pages:?}");
+        assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "only the corridor page, not the generic latched page: {:?}",
+            notifier.messages()
+        );
+    }
 }
