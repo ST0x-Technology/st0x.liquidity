@@ -446,14 +446,6 @@ pub enum CctpError {
     MintAndWithdrawEventNotFound,
     #[error("transaction {tx_hash} receipt has no block number")]
     TxReceiptMissingBlock { tx_hash: TxHash },
-    #[error("USDC credited by transaction {tx_hash} overflows U256")]
-    UsdcCreditOverflow { tx_hash: TxHash },
-    #[error("USDC Transfer log in transaction {tx_hash} does not decode: {source}")]
-    UsdcTransferLogDecode {
-        tx_hash: TxHash,
-        #[source]
-        source: alloy::sol_types::Error,
-    },
     #[error("Message too short for nonce extraction: got {length} bytes, need at least 44")]
     MessageTooShort { length: usize },
     #[error("Message too short for receiveMessage recovery: got {length} bytes, need at least 148")]
@@ -571,8 +563,6 @@ impl CctpError {
             | Self::MessageSentEventNotFound { .. }
             | Self::MintAndWithdrawEventNotFound
             | Self::TxReceiptMissingBlock { .. }
-            | Self::UsdcCreditOverflow { .. }
-            | Self::UsdcTransferLogDecode { .. }
             | Self::MessageTooShort { .. }
             | Self::MessageTooShortForRecovery { .. }
             | Self::MessageDestinationDomainMismatch { .. }
@@ -1126,8 +1116,9 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// Returns `holder`'s USDC balance on Ethereum, the source chain for
     /// AlpacaToBase burns.
     ///
-    /// The credit ledger compares it with the USDC credited to open transfers
-    /// before each burn or deposit send. Delegates to the Ethereum endpoint,
+    /// Used as a fallback settlement gate before executing the CCTP burn:
+    /// verifies that withdrawn USDC is present in the market-maker wallet
+    /// before attempting to burn it. Delegates to the Ethereum endpoint,
     /// not Base.
     pub async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
         self.ethereum
@@ -1161,17 +1152,6 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// the mint's block is the scan lower bound.
     pub async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
         self.ethereum.tx_block(tx_hash).await
-    }
-
-    /// Returns the USDC that `tx_hash` paid `recipient` on Ethereum: the sum of
-    /// its USDC `Transfer` logs to `recipient`. Credits a transfer from the
-    /// transaction that delivered its USDC rather than from a balance change.
-    pub async fn ethereum_usdc_credit(
-        &self,
-        tx_hash: TxHash,
-        recipient: Address,
-    ) -> Result<U256, CctpError> {
-        self.ethereum.usdc_credited_in_tx(tx_hash, recipient).await
     }
 
     /// Sends `amount` (USDC smallest unit, 6 decimals) of Ethereum USDC from the
@@ -1425,11 +1405,11 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
+    use st0x_evm::AbiDecodedErrorType;
+    use st0x_evm::Evm;
+    use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{
-        AbiDecodedErrorType, Chain, Evm, NoOpErrorRegistry, PreparedTransaction, USDC_BASE,
-        USDC_ETHEREUM,
-    };
+    use st0x_evm::{Chain, USDC_BASE, USDC_ETHEREUM};
 
     use super::evm::MintRecoveryConfig;
     use super::*;
@@ -1873,35 +1853,6 @@ mod tests {
             self.inner
                 .sign_typed_data(payload_json, expected_digest)
                 .await
-        }
-
-        async fn prepare_pending(
-            &self,
-            contract: Address,
-            calldata: Bytes,
-            note: &str,
-        ) -> Result<PreparedTransaction, EvmError> {
-            self.inner.prepare_pending(contract, calldata, note).await
-        }
-
-        async fn broadcast_prepared(
-            &self,
-            prepared: &PreparedTransaction,
-            note: &str,
-        ) -> Result<TxHash, EvmError> {
-            self.inner.broadcast_prepared(prepared, note).await
-        }
-
-        async fn discard_prepared(&self, prepared: &PreparedTransaction) {
-            self.inner.discard_prepared(prepared).await;
-        }
-
-        async fn restore_prepared(&self, prepared: &PreparedTransaction) {
-            self.inner.restore_prepared(prepared).await;
-        }
-
-        async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
-            self.inner.restore_transaction(tx_hash).await
         }
 
         async fn send_pending(

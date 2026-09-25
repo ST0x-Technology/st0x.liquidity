@@ -499,7 +499,6 @@ fn equity_redemption_failure(
             Some((FailureEventType::RedemptionRejected, *rejected_at))
         }
         EquityRedemptionEvent::VaultWithdrawPending { .. }
-        | EquityRedemptionEvent::VaultWithdrawSubmitting { .. }
         | EquityRedemptionEvent::VaultWithdrawSubmitted { .. }
         | EquityRedemptionEvent::WithdrawnFromRaindex { .. }
         | EquityRedemptionEvent::TokensUnwrapped { .. }

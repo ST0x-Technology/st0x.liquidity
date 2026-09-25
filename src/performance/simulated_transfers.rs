@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 
 use st0x_config::ChainEquities;
 use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
-use st0x_evm::{Chain, IERC20, PreparedTransaction};
+use st0x_evm::{Chain, IERC20};
 use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Network, Symbol};
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
@@ -427,6 +427,7 @@ async fn seed_alpaca_to_base(
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: requested,
                 order_id,
+                preflight_balance: U256::ZERO,
                 initiated_at: t0,
             },
         )
@@ -783,11 +784,11 @@ fn transfer_log(token: Address, to: Address, amount: U256) -> Log {
 
 /// Minimal [`Raindex`] for one [`seed_simulated_equity_redemption_history`]
 /// cycle. Scoped to a single redemption (a fresh instance per day, not
-/// shared across the seeding loop), so `prepare_withdraw`'s single-slot
+/// shared across the seeding loop), so `submit_withdraw`'s single-slot
 /// `pending_withdraw` is always populated by the time `confirm_tx_receipt`
 /// reads it -- the redemption fixture always calls them in that order.
 /// `withdraw`/`submit_deposit` are unreachable from `EquityRedemption`'s
-/// happy path.
+/// happy path (it only ever calls `submit_withdraw`/`confirm_tx_receipt`).
 struct FixtureRaindex {
     /// Recipient the synthetic withdrawal's `Transfer` log credits -- must
     /// match `FixtureWrapper::owner()`, since `ConfirmWithdraw`'s handler
@@ -795,7 +796,7 @@ struct FixtureRaindex {
     recipient: Address,
     block_number: u64,
     pending_withdraw: Mutex<Option<(Address, U256)>>,
-    /// Feeds `prepare_withdraw`'s synthetic tx hash through
+    /// Feeds `submit_withdraw`'s synthetic tx hash through
     /// `simulated_transfer_uuid`, keeping it deterministic across runs like
     /// every other id in this module.
     day: u32,
@@ -834,78 +835,17 @@ impl Raindex for FixtureRaindex {
         unimplemented!("FixtureRaindex: redemption fixture never calls submit_deposit")
     }
 
-    async fn prepare_withdraw(
+    async fn submit_withdraw(
         &self,
         token: Address,
         _vault_id: RaindexVaultId,
         target_amount: U256,
         _decimals: u8,
-    ) -> Result<PreparedTransaction, RaindexError> {
+    ) -> Result<TxHash, RaindexError> {
         *self.pending_withdraw.lock().await = Some((token, target_amount));
-        Ok(PreparedTransaction::for_test(
-            TxHash::left_padding_from(
-                simulated_transfer_uuid("redeem-withdraw-tx", self.day).as_bytes(),
-            ),
-            0,
+        Ok(TxHash::left_padding_from(
+            simulated_transfer_uuid("redeem-withdraw-tx", self.day).as_bytes(),
         ))
-    }
-
-    async fn broadcast_prepared_withdraw(
-        &self,
-        prepared: &PreparedTransaction,
-    ) -> Result<TxHash, RaindexError> {
-        assert_ne!(
-            prepared,
-            &crate::equity_redemption::prepared_withdrawal_for_test()
-        );
-        Ok(prepared.tx_hash())
-    }
-
-    async fn discard_prepared_withdraw(&self, _prepared: &PreparedTransaction) {}
-
-    async fn restore_submitted_withdrawal(
-        &self,
-        _tx_hash: TxHash,
-        _prepared: Option<&PreparedTransaction>,
-    ) -> Result<(), RaindexError> {
-        Ok(())
-    }
-
-    async fn submit_withdraw(
-        &self,
-        token: Address,
-        vault_id: RaindexVaultId,
-        target_amount: U256,
-        decimals: u8,
-    ) -> Result<TxHash, RaindexError> {
-        let prepared = self
-            .prepare_withdraw(token, vault_id, target_amount, decimals)
-            .await?;
-        self.broadcast_prepared_withdraw(&prepared).await
-    }
-
-    async fn current_block(&self) -> Result<u64, RaindexError> {
-        Ok(self.block_number.saturating_sub(1))
-    }
-
-    async fn find_recent_withdrawal(
-        &self,
-        _token: Address,
-        _vault_id: RaindexVaultId,
-        from_block: u64,
-    ) -> Result<(TxHash, U256), RaindexError> {
-        self.pending_withdraw
-            .lock()
-            .await
-            .map(|(_, amount)| {
-                (
-                    TxHash::left_padding_from(
-                        simulated_transfer_uuid("redeem-withdraw-tx", self.day).as_bytes(),
-                    ),
-                    amount,
-                )
-            })
-            .ok_or(RaindexError::ScanInconclusive { from_block })
     }
 
     async fn confirm_tx_receipt(
@@ -1092,16 +1032,19 @@ impl Wrapper for FixtureWrapper {
 /// simulation.
 ///
 /// Drives the `EquityRedemption` aggregate's happy path (`RedeemAt` ->
-/// direct Raindex submission -> `RecordWithdrawSubmissionAt` ->
-/// `ConfirmWithdrawAt` -> `UnwrapTokensAt` -> `SubmitUnwrapAt` ->
-/// `ConfirmUnwrapAt` -> `PrepareSendAt` -> `SendTokensAt` -> `DetectAt` ->
-/// `CompleteAt`), one redemption per day alternating between the same
-/// dedicated fixture symbols (`AAPL.SIM`/`TSLA.SIM`) used by
-/// [`super::seed_simulated_hedge_latency_history`].
+/// `SubmitWithdrawAt` -> `ConfirmWithdrawAt` -> `UnwrapTokensAt` ->
+/// `SubmitUnwrapAt` -> `ConfirmUnwrapAt` -> `PrepareSendAt` ->
+/// `SendTokensAt` -> `DetectAt` -> `CompleteAt`), one redemption per day
+/// alternating between the same dedicated fixture symbols
+/// (`AAPL.SIM`/`TSLA.SIM`) used by [`super::seed_simulated_hedge_latency_history`].
 ///
-/// A fresh, single-cycle-scoped `FixtureRaindex`/`FixtureVaultLookup`/
-/// `FixtureWrapper` triple is built for every redemption so the explicit
-/// submission can feed the subsequent confirmation step deterministically.
+/// Unlike the mint/USDC fixtures, `EquityRedemption`'s service-calling
+/// commands (`SubmitWithdraw`/`ConfirmWithdraw`/`SubmitUnwrap`/
+/// `ConfirmUnwrap`/`SendTokens`) drive the side effect FROM WITHIN
+/// `transition()` itself (mint's analogous commands take the service
+/// result as command input instead), so a fresh, single-cycle-scoped
+/// `FixtureRaindex`/`FixtureVaultLookup`/`FixtureWrapper` triple is
+/// built for every redemption.
 pub async fn seed_simulated_equity_redemption_history(
     pool: &SqlitePool,
     now: DateTime<Utc>,
@@ -1127,14 +1070,13 @@ pub async fn seed_simulated_equity_redemption_history(
         ));
         let withdraw_block = 4_000_000_u64 + u64::from(day) * 10;
         let unwrap_block = withdraw_block + 5;
-        let raindex = Arc::new(FixtureRaindex::new(owner, withdraw_block, day));
 
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainEquityServices {
                     wallet: Address::ZERO,
-                    raindex: raindex.clone(),
+                    raindex: Arc::new(FixtureRaindex::new(owner, withdraw_block, day)),
                     vault_lookup: Arc::new(FixtureVaultLookup::new(vault_id)),
                     tokenizer: Arc::new(FixtureTokenizer::new(redemption_wallet, day)),
                     wrapper: Arc::new(FixtureWrapper::new(
@@ -1162,9 +1104,6 @@ pub async fn seed_simulated_equity_redemption_history(
         let id = RedemptionAggregateId(simulated_transfer_uuid("redemption", day));
         let quantity = Float::parse("5".to_string())?;
         let wrapped_amount = quantity.to_fixed_decimal(TOKENIZED_EQUITY_DECIMALS)?;
-        let prepared = raindex
-            .prepare_withdraw(token, vault_id, wrapped_amount, TOKENIZED_EQUITY_DECIMALS)
-            .await?;
 
         let pending_at = range_start + Duration::days(i64::from(day)) + Duration::hours(11);
         let submitted_at = pending_at + Duration::seconds(20);
@@ -1185,23 +1124,16 @@ pub async fn seed_simulated_equity_redemption_history(
                     chain: Chain::Base,
                     quantity,
                     token,
-                    vault_id,
                     amount: wrapped_amount,
-                    from_block: withdraw_block.saturating_sub(1),
-                    submitting_at: pending_at,
-                    prepared: prepared.clone(),
+                    pending_at,
                 },
             )
             .await?;
 
-        let withdraw_tx = raindex.broadcast_prepared_withdraw(&prepared).await?;
         redemption
             .send(
                 &id,
-                EquityRedemptionCommand::RecordWithdrawSubmissionAt {
-                    tx_hash: withdraw_tx,
-                    submitted_at,
-                },
+                EquityRedemptionCommand::SubmitWithdrawAt { submitted_at },
             )
             .await?;
 

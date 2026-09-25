@@ -477,9 +477,9 @@ pub enum OnChainTradeCommand {
         block_timestamp: DateTime<Utc>,
         filled_at: DateTime<Utc>,
     },
-    /// Marks the fill as fully accounted: either applied to `Position` or,
-    /// when trading is disabled on its chain, recorded in `skipped_fills`.
-    /// The dedupe guard treats either as done.
+    /// Marks the fill as acknowledged by the `Position` aggregate.
+    /// Sent only after `AcknowledgeOnChainFill` succeeded, so the
+    /// dedupe guard can distinguish "witnessed" from "fully accounted".
     Acknowledge,
 }
 

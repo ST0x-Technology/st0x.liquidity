@@ -72,7 +72,7 @@
 //!
 //! [`AlpacaWalletService`]: st0x_execution::AlpacaWalletService
 
-use alloy::primitives::{B256, TxHash};
+use alloy::primitives::{B256, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -83,7 +83,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
-use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Store, Table};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Usdc};
 
@@ -305,6 +305,8 @@ pub enum UsdcRebalanceCommand {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: ClientOrderId,
+        /// Exact Ethereum wallet USDC balance observed before any Alpaca call.
+        preflight_balance: U256,
     },
     /// Test/fixture-only: identical to `InitiateConversion` but takes
     /// `initiated_at` explicitly instead of stamping `Utc::now()`, so
@@ -315,6 +317,7 @@ pub enum UsdcRebalanceCommand {
         amount: Usdc,
         order_id: ClientOrderId,
         initiated_at: DateTime<Utc>,
+        preflight_balance: U256,
     },
     /// Confirm successful conversion. Valid only from `Converting` state.
     /// Contains the source amount sold and the destination amount received.
@@ -541,6 +544,10 @@ pub enum UsdcRebalanceEvent {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: ClientOrderId,
+        /// Exact Ethereum wallet USDC balance observed before any Alpaca call.
+        /// `None` for legacy events and BaseToAlpaca post-deposit conversions.
+        #[serde(default)]
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     /// Conversion completed successfully.
@@ -758,6 +765,9 @@ pub enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: ClientOrderId,
+        /// Ethereum wallet USDC balance before the Alpaca leg.
+        #[serde(default)]
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     /// Conversion has completed, ready for next phase
@@ -766,6 +776,8 @@ pub enum UsdcRebalance {
         /// Originally requested amount
         amount: Usdc,
         conversion: ConversionAmounts,
+        #[serde(default)]
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
         converted_at: DateTime<Utc>,
     },
@@ -785,6 +797,8 @@ pub enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         from_block: u64,
+        #[serde(default)]
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     /// Withdrawal from source has been initiated
@@ -792,6 +806,8 @@ pub enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         withdrawal_ref: TransferRef,
+        #[serde(default)]
+        preflight_balance: Option<U256>,
         initiated_at: DateTime<Utc>,
     },
     /// Withdrawal from source has been confirmed, ready for bridging
@@ -799,16 +815,14 @@ pub enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         initiated_at: DateTime<Utc>,
+        #[serde(default)]
+        preflight_balance: Option<U256>,
         confirmed_at: DateTime<Utc>,
         /// Persisted so the confirmation-depth gate can re-run on apalis redrive.
         /// `#[serde(default)]` ensures backward-compat with snapshots persisted
         /// before this field was added.
         #[serde(default)]
         withdrawal_tx: Option<TxHash>,
-        /// Carried from `Withdrawing` so the fees Alpaca reported for the
-        /// withdrawal can be read again. `None` in snapshots from before it.
-        #[serde(default)]
-        withdrawal_ref: Option<TransferRef>,
     },
     /// Withdrawal from source has failed (terminal state)
     WithdrawalFailed {
@@ -1273,56 +1287,6 @@ impl UsdcRebalance {
             started_at,
             updated_at,
         })
-    }
-
-    /// USDC this transfer was credited with that may still sit in the shared
-    /// Ethereum wallet: credited from its delivering tx and not yet sent on.
-    /// A BaseToAlpaca credit leaves with the Alpaca deposit send
-    /// (`DepositInitiated`). An AlpacaToBase credit arrives with the withdrawal
-    /// tx Alpaca reported and leaves with the burn, and
-    /// `BridgingSubmitting` cannot tell whether it has: a recorded burn may
-    /// be unmined, and with no recorded hash the burn may be unsent or
-    /// broadcast with its hash lost (`BurnRecordFailed`, an inconclusive
-    /// submit).
-    pub(crate) fn ethereum_wallet_credit(&self) -> Option<EthereumWalletCredit> {
-        match self {
-            Self::WithdrawalComplete {
-                direction: RebalanceDirection::AlpacaToBase,
-                amount,
-                withdrawal_tx: Some(withdrawal_tx),
-                ..
-            } => Some(EthereumWalletCredit::Delivering {
-                withdrawal_tx: *withdrawal_tx,
-                nominal: *amount,
-            }),
-            Self::BridgingSubmitting {
-                direction: RebalanceDirection::AlpacaToBase,
-                burn_amount,
-                ..
-            } => burn_amount.map(EthereumWalletCredit::InFlight),
-            Self::Bridged {
-                direction: RebalanceDirection::BaseToAlpaca,
-                amount_received,
-                ..
-            } => Some(EthereumWalletCredit::Held(*amount_received)),
-            Self::BridgingSubmitting { .. }
-            | Self::Bridged { .. }
-            | Self::Converting { .. }
-            | Self::ConversionComplete { .. }
-            | Self::ConversionFailed { .. }
-            | Self::WithdrawalSubmitting { .. }
-            | Self::Withdrawing { .. }
-            | Self::WithdrawalComplete { .. }
-            | Self::WithdrawalFailed { .. }
-            | Self::Bridging { .. }
-            | Self::AwaitingAttestation { .. }
-            | Self::Attested { .. }
-            | Self::BridgingFailed { .. }
-            | Self::DepositInitiated { .. }
-            | Self::DepositConfirmed { .. }
-            | Self::DepositFailed { .. }
-            | Self::Reconciled { .. } => None,
-        }
     }
 
     /// Whether an aggregate in this state should hold the single-rebalance
@@ -1848,108 +1812,6 @@ pub(crate) async fn any_rebalance_holds_guard(
     Ok(false)
 }
 
-/// What one open transfer has in the shared Ethereum wallet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EthereumWalletCredit {
-    /// Credited and not yet sent: in the wallet.
-    Held(Usdc),
-    /// Being sent: up to this amount may still be in the wallet.
-    InFlight(Usdc),
-    /// Credited by `withdrawal_tx`, which may not be mined yet: up to
-    /// `nominal` may be in the wallet until the receipt is read.
-    Delivering {
-        withdrawal_tx: TxHash,
-        nominal: Usdc,
-    },
-}
-
-/// Why the Ethereum wallet credit ledger could not be derived.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum EthereumCreditLedgerError {
-    #[error("failed to list open USDC rebalances: {0}")]
-    Query(#[from] sqlx::Error),
-    #[error("open USDC rebalance ids could not be parsed: {unparseable:?}")]
-    UnparseableIds { unparseable: Vec<String> },
-    #[error("failed to load USDC rebalance {id}: {source}")]
-    Load {
-        id: UsdcRebalanceId,
-        #[source]
-        source: Box<SendError<UsdcRebalance>>,
-    },
-    #[error("USDC rebalance {id} has events but no materialized state")]
-    MissingState { id: UsdcRebalanceId },
-}
-
-/// The credited-not-yet-sent USDC of every open transfer in the shared
-/// Ethereum wallet, derived from the persisted aggregates (never stored).
-pub(crate) async fn open_ethereum_credits(
-    pool: &SqlitePool,
-    store: &Store<UsdcRebalance>,
-) -> Result<Vec<(UsdcRebalanceId, EthereumWalletCredit)>, EthereumCreditLedgerError> {
-    let mut ids = Vec::new();
-    let mut unparseable = Vec::new();
-    for raw in ethereum_credit_candidate_ids(pool).await? {
-        match raw.parse::<UsdcRebalanceId>() {
-            Ok(id) => ids.push(id),
-            Err(_) => unparseable.push(raw),
-        }
-    }
-
-    if !unparseable.is_empty() {
-        return Err(EthereumCreditLedgerError::UnparseableIds { unparseable });
-    }
-
-    let mut credits = Vec::new();
-    for id in ids {
-        let entity = store
-            .load(&id)
-            .await
-            .map_err(|source| EthereumCreditLedgerError::Load {
-                id: id.clone(),
-                source: Box::new(source),
-            })?
-            .ok_or_else(|| EthereumCreditLedgerError::MissingState { id: id.clone() })?;
-
-        if let Some(credit) = entity.ethereum_wallet_credit() {
-            credits.push((id, credit));
-        }
-    }
-
-    Ok(credits)
-}
-
-/// The `UsdcRebalance` aggregates whose latest event leaves them in a state
-/// that can hold Ethereum wallet credit (`WithdrawalComplete`,
-/// `BridgingSubmitting`, `Bridged`), so the credit ledger does not replay
-/// finished transfers.
-async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(
-        "WITH latest AS ( \
-             SELECT aggregate_id, MAX(sequence) AS max_seq \
-             FROM events \
-             WHERE aggregate_type = 'UsdcRebalance' \
-             GROUP BY aggregate_id \
-         ) \
-         SELECT latest.aggregate_id \
-         FROM events last_ev \
-         INNER JOIN latest \
-             ON last_ev.aggregate_id = latest.aggregate_id \
-            AND last_ev.sequence = latest.max_seq \
-         WHERE last_ev.aggregate_type = 'UsdcRebalance' \
-           AND last_ev.event_type IN ( \
-               'UsdcRebalanceEvent::WithdrawalConfirmed', \
-               'UsdcRebalanceEvent::BridgingSubmitting', \
-               'UsdcRebalanceEvent::PendingBurnRecorded', \
-               'UsdcRebalanceEvent::PendingBurnCleared', \
-               'UsdcRebalanceEvent::Bridged', \
-               'UsdcRebalanceEvent::BridgingCompletionRecovered' \
-           ) \
-         ORDER BY latest.aggregate_id",
-    )
-    .fetch_all(pool)
-    .await
-}
-
 #[async_trait]
 impl EventSourced for UsdcRebalance {
     type Id = UsdcRebalanceId;
@@ -2004,12 +1866,7 @@ impl EventSourced for UsdcRebalance {
     // balance so settlement can distinguish tolerated ambient dust from the
     // later Alpaca withdrawal. Legacy events and snapshots default to `None`
     // and fail closed if settlement cannot otherwise attribute the balance.
-    // v10: the preflight balance is gone again. Settlement credits each
-    // transfer from its withdrawal tx receipt, so the field was removed from
-    // the command, event and states; serde ignores it in legacy payloads.
-    // `WithdrawalComplete` also carries `withdrawal_ref` now, so the reported
-    // withdrawal fees can be read again.
-    const SCHEMA_VERSION: u64 = 10;
+    const SCHEMA_VERSION: u64 = 9;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -2018,11 +1875,13 @@ impl EventSourced for UsdcRebalance {
                 direction,
                 amount,
                 order_id,
+                preflight_balance,
                 initiated_at,
             } => Some(Self::Converting {
                 direction: *direction,
                 amount: *amount,
                 order_id: order_id.clone(),
+                preflight_balance: *preflight_balance,
                 initiated_at: *initiated_at,
             }),
 
@@ -2035,6 +1894,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 amount: *amount,
                 from_block: *from_block,
+                preflight_balance: None,
                 initiated_at: *submitting_at,
             }),
 
@@ -2047,6 +1907,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
+                preflight_balance: None,
                 initiated_at: *initiated_at,
             }),
 
@@ -2067,6 +1928,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     amount,
                     order_id,
+                    preflight_balance,
                     ..
                 },
                 Self::DepositConfirmed { initiated_at, .. },
@@ -2074,6 +1936,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 amount: *amount,
                 order_id: order_id.clone(),
+                preflight_balance: *preflight_balance,
                 initiated_at: *initiated_at,
             },
 
@@ -2086,6 +1949,7 @@ impl EventSourced for UsdcRebalance {
                 Self::Converting {
                     direction,
                     amount,
+                    preflight_balance,
                     initiated_at,
                     ..
                 },
@@ -2093,6 +1957,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 amount: *amount,
                 conversion: *conversion,
+                preflight_balance: *preflight_balance,
                 initiated_at: *initiated_at,
                 converted_at: *converted_at,
             },
@@ -2120,6 +1985,7 @@ impl EventSourced for UsdcRebalance {
                 Self::ConversionComplete {
                     direction,
                     conversion,
+                    preflight_balance,
                     initiated_at,
                     ..
                 },
@@ -2127,6 +1993,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 amount: conversion.received_amount,
                 from_block: *from_block,
+                preflight_balance: *preflight_balance,
                 initiated_at: *initiated_at,
             },
 
@@ -2137,12 +2004,16 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
                 Self::WithdrawalSubmitting {
-                    direction, amount, ..
+                    direction,
+                    amount,
+                    preflight_balance,
+                    ..
                 },
             ) => Self::Withdrawing {
                 direction: *direction,
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
+                preflight_balance: *preflight_balance,
                 // Use the event's initiated_at (set by transition_initiate_withdrawal to
                 // Utc::now() at the moment the Alpaca withdrawal is initiated), NOT the
                 // prior state's initiated_at which tracks the overall rebalance start.
@@ -2159,12 +2030,14 @@ impl EventSourced for UsdcRebalance {
                 Self::ConversionComplete {
                     direction,
                     conversion,
+                    preflight_balance,
                     ..
                 },
             ) => Self::Withdrawing {
                 direction: *direction,
                 amount: conversion.received_amount,
                 withdrawal_ref: withdrawal_ref.clone(),
+                preflight_balance: *preflight_balance,
                 initiated_at: *withdrawal_initiated_at,
             },
 
@@ -2176,16 +2049,17 @@ impl EventSourced for UsdcRebalance {
                 Self::Withdrawing {
                     direction,
                     amount,
-                    withdrawal_ref,
+                    preflight_balance,
                     initiated_at,
+                    ..
                 },
             ) => Self::WithdrawalComplete {
                 direction: *direction,
                 amount: *amount,
+                preflight_balance: *preflight_balance,
                 initiated_at: *initiated_at,
                 confirmed_at: *confirmed_at,
                 withdrawal_tx: *withdrawal_tx,
-                withdrawal_ref: Some(withdrawal_ref.clone()),
             },
 
             (
@@ -2652,10 +2526,12 @@ impl EventSourced for UsdcRebalance {
                 direction,
                 amount,
                 order_id,
+                preflight_balance,
             } => Ok(vec![ConversionInitiated {
                 direction,
                 amount,
                 order_id,
+                preflight_balance: Some(preflight_balance),
                 initiated_at: Utc::now(),
             }]),
 
@@ -2665,10 +2541,12 @@ impl EventSourced for UsdcRebalance {
                 amount,
                 order_id,
                 initiated_at,
+                preflight_balance,
             } => Ok(vec![ConversionInitiated {
                 direction,
                 amount,
                 order_id,
+                preflight_balance: Some(preflight_balance),
                 initiated_at,
             }]),
 
@@ -2997,6 +2875,7 @@ impl UsdcRebalance {
             direction: *direction,
             amount: *amount,
             order_id,
+            preflight_balance: None,
             initiated_at,
         }])
     }
@@ -5636,6 +5515,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount,
             conversion: par_conversion(Usdc::new(float!(999))),
+            preflight_balance: None,
             initiated_at: now,
             converted_at: now,
         };
@@ -5697,6 +5577,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: requested,
             conversion: par_conversion(Usdc::new(float!(319))),
+            preflight_balance: None,
             initiated_at: now,
             converted_at: now,
         };
@@ -5754,6 +5635,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: requested,
             order_id: ClientOrderId::from_uuid(Uuid::from_u128(12)),
+            preflight_balance: None,
             initiated_at: now,
         };
         assert_eq!(
@@ -7584,6 +7466,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(99.99)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                preflight_balance: None,
                 initiated_at: Utc::now(),
             },
             UsdcRebalanceEvent::ConversionFailed {
@@ -7683,6 +7566,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                preflight_balance: None,
                 initiated_at: Utc::now(),
             },
             UsdcRebalanceEvent::ConversionConfirmed {
@@ -8113,6 +7997,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100.00)),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    preflight_balance: None,
                     initiated_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::ConversionFailed {
@@ -8305,6 +8190,7 @@ mod tests {
     #[tokio::test]
     async fn test_initiate_conversion_from_uninitialized() {
         let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+        let preflight_balance = U256::from(12_345u64);
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
@@ -8312,6 +8198,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id: order_id.clone(),
+                preflight_balance,
             })
             .await
             .events();
@@ -8321,6 +8208,7 @@ mod tests {
             direction,
             amount,
             order_id: event_order_id,
+            preflight_balance: event_preflight_balance,
             ..
         } = &events[0]
         else {
@@ -8330,6 +8218,7 @@ mod tests {
         assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(*amount, Usdc::new(float!(1000.00)));
         assert_eq!(*event_order_id, order_id);
+        assert_eq!(*event_preflight_balance, Some(preflight_balance));
     }
 
     #[tokio::test]
@@ -8341,12 +8230,14 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
+                preflight_balance: None,
                 initiated_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::InitiateConversion {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(500.00)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                preflight_balance: U256::ZERO,
             })
             .await
             .then_expect_error();
@@ -8367,6 +8258,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
+                preflight_balance: None,
                 initiated_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::ConfirmConversion { conversion })
@@ -8406,6 +8298,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
+                    preflight_balance: None,
                     initiated_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
@@ -8435,6 +8328,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
+                preflight_balance: None,
                 initiated_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::FailConversion {
@@ -8476,6 +8370,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
+                    preflight_balance: None,
                     initiated_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
@@ -8508,6 +8403,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
+                    preflight_balance: None,
                     initiated_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
@@ -8540,6 +8436,7 @@ mod tests {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
+                    preflight_balance: None,
                     initiated_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::ConversionConfirmed {
@@ -8789,6 +8686,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
+                preflight_balance: U256::ZERO,
                 initiated_at,
             })
             .await
@@ -8816,6 +8714,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
+                preflight_balance: None,
                 initiated_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::ConfirmConversionAt {
@@ -9325,6 +9224,7 @@ mod tests {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
+                    preflight_balance: None,
                     initiated_at: Utc::now(),
                 },
             ])
@@ -9395,6 +9295,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(999.99)),
                 order_id,
+                preflight_balance: None,
                 initiated_at: original_initiated_at + chrono::Duration::seconds(180),
             },
         ])
@@ -9435,6 +9336,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
+                preflight_balance: None,
                 initiated_at: original_initiated_at,
             },
             UsdcRebalanceEvent::ConversionConfirmed {
@@ -9496,6 +9398,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                preflight_balance: None,
                 initiated_at: Utc::now(),
             },
         ])
@@ -9512,6 +9415,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(500)),
             order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            preflight_balance: None,
             initiated_at,
         };
 
@@ -9654,6 +9558,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(500)),
             conversion: conversion(Usdc::new(float!(500)), Usdc::new(float!(499))),
+            preflight_balance: None,
             initiated_at,
             converted_at,
         };
@@ -9678,6 +9583,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(500)),
             conversion: conversion(Usdc::new(float!(500)), Usdc::new(float!(499))),
+            preflight_balance: None,
             initiated_at,
             converted_at,
         };
@@ -9980,6 +9886,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            preflight_balance: None,
             initiated_at,
         };
 
@@ -10006,10 +9913,10 @@ mod tests {
         let state = UsdcRebalance::WithdrawalComplete {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(800)),
+            preflight_balance: None,
             initiated_at,
             confirmed_at,
             withdrawal_tx: None,
-            withdrawal_ref: None,
         };
 
         let dto = state.to_dto(&id);
@@ -10131,86 +10038,6 @@ mod tests {
     const MINT_TX: TxHash =
         fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000bb");
 
-    /// A transfer's Ethereum wallet credit is outstanding only between the
-    /// credit and the send: a BaseToAlpaca mint not yet forwarded to Alpaca is
-    /// held, an AlpacaToBase withdrawal with its tx is delivering, and an
-    /// AlpacaToBase burn intent is in flight whether or not a burn hash is
-    /// recorded.
-    #[test]
-    fn ethereum_wallet_credit_covers_only_credited_unsent_usdc() {
-        use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
-        use UsdcRebalance::*;
-
-        let now = Utc::now();
-        let amount = Usdc::new(float!(100));
-        let credited = Usdc::new(float!(99.99));
-        let burn_intent = |direction, pending_burn_tx| BridgingSubmitting {
-            direction,
-            amount,
-            from_block: 1,
-            initiated_at: now,
-            burn_amount: Some(credited),
-            pending_burn_tx,
-        };
-        let minted = |direction| Bridged {
-            direction,
-            amount,
-            amount_received: credited,
-            fee_collected: Usdc::new(float!(0.01)),
-            burn_tx_hash: BURN_TX,
-            mint_tx_hash: MINT_TX,
-            initiated_at: now,
-            minted_at: now,
-        };
-
-        assert_eq!(
-            burn_intent(AlpacaToBase, None).ethereum_wallet_credit(),
-            Some(EthereumWalletCredit::InFlight(credited))
-        );
-        assert_eq!(
-            burn_intent(AlpacaToBase, Some(BURN_TX)).ethereum_wallet_credit(),
-            Some(EthereumWalletCredit::InFlight(credited))
-        );
-        assert_eq!(
-            burn_intent(BaseToAlpaca, None).ethereum_wallet_credit(),
-            None
-        );
-        assert_eq!(
-            minted(BaseToAlpaca).ethereum_wallet_credit(),
-            Some(EthereumWalletCredit::Held(credited))
-        );
-        assert_eq!(minted(AlpacaToBase).ethereum_wallet_credit(), None);
-        let withdrawn = |withdrawal_tx| WithdrawalComplete {
-            direction: AlpacaToBase,
-            amount,
-            initiated_at: now,
-            confirmed_at: now,
-            withdrawal_tx,
-            withdrawal_ref: None,
-        };
-        assert_eq!(
-            withdrawn(Some(MINT_TX)).ethereum_wallet_credit(),
-            Some(EthereumWalletCredit::Delivering {
-                withdrawal_tx: MINT_TX,
-                nominal: amount,
-            })
-        );
-        assert_eq!(withdrawn(None).ethereum_wallet_credit(), None);
-        assert_eq!(
-            DepositInitiated {
-                direction: BaseToAlpaca,
-                amount,
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
-                deposit_ref: TransferRef::OnchainTx(BURN_TX),
-                initiated_at: now,
-                deposit_initiated_at: now,
-            }
-            .ethereum_wallet_credit(),
-            None
-        );
-    }
-
     #[test]
     fn holds_rebalance_guard_holds_for_in_progress_and_post_burn_failure() {
         use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
@@ -10227,6 +10054,7 @@ mod tests {
                 direction: AlpacaToBase,
                 amount,
                 order_id,
+                preflight_balance: None,
                 initiated_at: now,
             }
             .holds_rebalance_guard()
@@ -10236,6 +10064,7 @@ mod tests {
                 direction: BaseToAlpaca,
                 amount,
                 withdrawal_ref: withdrawal_ref.clone(),
+                preflight_balance: None,
                 initiated_at: now,
             }
             .holds_rebalance_guard()
@@ -10244,10 +10073,10 @@ mod tests {
             WithdrawalComplete {
                 direction: AlpacaToBase,
                 amount,
+                preflight_balance: None,
                 initiated_at: now,
                 confirmed_at: now,
                 withdrawal_tx: None,
-                withdrawal_ref: None,
             }
             .holds_rebalance_guard()
         );
@@ -10372,6 +10201,7 @@ mod tests {
                 direction: AlpacaToBase,
                 amount,
                 conversion: par_conversion(amount),
+                preflight_balance: None,
                 initiated_at: now,
                 converted_at: now,
             }
@@ -10382,6 +10212,7 @@ mod tests {
                 direction: BaseToAlpaca,
                 amount,
                 conversion: par_conversion(amount),
+                preflight_balance: None,
                 initiated_at: now,
                 converted_at: now,
             }
@@ -10563,6 +10394,7 @@ mod tests {
                 direction: AlpacaToBase,
                 amount,
                 order_id: order_id.clone(),
+                preflight_balance: None,
                 initiated_at: now,
             }
             .guard_recovery_tracking_data(),
@@ -10574,6 +10406,7 @@ mod tests {
                 direction: BaseToAlpaca,
                 amount,
                 order_id: order_id.clone(),
+                preflight_balance: None,
                 initiated_at: now,
             }
             .guard_recovery_tracking_data(),
@@ -10585,6 +10418,7 @@ mod tests {
                 direction: BaseToAlpaca,
                 amount,
                 withdrawal_ref: withdrawal_ref.clone(),
+                preflight_balance: None,
                 initiated_at: now,
             }
             .guard_recovery_tracking_data(),
@@ -10698,6 +10532,7 @@ mod tests {
                 direction: BaseToAlpaca,
                 amount,
                 conversion: par_conversion(amount),
+                preflight_balance: None,
                 initiated_at: now,
                 converted_at: now,
             }
@@ -10710,6 +10545,7 @@ mod tests {
                 direction: BaseToAlpaca,
                 amount,
                 from_block: 1,
+                preflight_balance: None,
                 initiated_at: now,
             }
             .guard_recovery_tracking_data(),
@@ -10720,10 +10556,10 @@ mod tests {
             WithdrawalComplete {
                 direction: BaseToAlpaca,
                 amount,
+                preflight_balance: None,
                 initiated_at: now,
                 confirmed_at: now,
                 withdrawal_tx: None,
-                withdrawal_ref: None,
             }
             .guard_recovery_tracking_data(),
             None,
@@ -11287,10 +11123,10 @@ mod tests {
         let mut snapshot = to_value(UsdcRebalance::WithdrawalComplete {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100.00)),
+            preflight_balance: None,
             initiated_at: Utc::now(),
             confirmed_at: Utc::now(),
             withdrawal_tx: Some(tx_hash),
-            withdrawal_ref: None,
         })
         .expect("WithdrawalComplete state serializes");
 
@@ -11309,38 +11145,6 @@ mod tests {
         };
 
         assert_eq!(withdrawal_tx, None);
-    }
-
-    /// A `ConversionInitiated` event persisted while the preflight balance
-    /// existed (schema v9) must still replay after the field was removed.
-    #[test]
-    fn conversion_initiated_event_with_legacy_preflight_balance_deserializes() {
-        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
-        let legacy_event = json!({
-            "ConversionInitiated": {
-                "direction": "AlpacaToBase",
-                "amount": "1000",
-                "order_id": order_id,
-                "preflight_balance": "0x2710",
-                "initiated_at": "2026-01-01T00:00:00Z"
-            }
-        });
-
-        let event: UsdcRebalanceEvent =
-            from_value(legacy_event).expect("legacy ConversionInitiated must still deserialize");
-
-        let UsdcRebalanceEvent::ConversionInitiated {
-            direction,
-            amount,
-            order_id: event_order_id,
-            ..
-        } = event
-        else {
-            panic!("Expected ConversionInitiated, got {event:?}");
-        };
-        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc::new(float!(1000)));
-        assert_eq!(event_order_id, order_id);
     }
 
     /// A `BridgingSubmitting` event persisted before `burn_amount` existed must
@@ -11552,6 +11356,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
             from_block: 1,
+            preflight_balance: None,
             initiated_at: Utc::now(),
         }
     }
@@ -11561,6 +11366,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100)),
             from_block: 1,
+            preflight_balance: None,
             initiated_at: Utc::now(),
         }
     }
@@ -11618,6 +11424,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount,
             withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            preflight_balance: None,
             initiated_at: Utc::now(),
         };
 
@@ -11637,6 +11444,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100)),
             withdrawal_ref: TransferRef::OnchainTx(alloy::primitives::TxHash::ZERO),
+            preflight_balance: None,
             initiated_at: Utc::now(),
         };
 
@@ -11657,10 +11465,10 @@ mod tests {
         let state = UsdcRebalance::WithdrawalComplete {
             direction: RebalanceDirection::AlpacaToBase,
             amount,
+            preflight_balance: None,
             initiated_at: Utc::now(),
             confirmed_at: Utc::now(),
             withdrawal_tx: None,
-            withdrawal_ref: None,
         };
 
         assert_eq!(
@@ -11679,6 +11487,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
             withdrawal_ref: TransferRef::OnchainTx(alloy::primitives::TxHash::ZERO),
+            preflight_balance: None,
             initiated_at: Utc::now(),
         };
 
@@ -11696,10 +11505,10 @@ mod tests {
         let state = UsdcRebalance::WithdrawalComplete {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
+            preflight_balance: None,
             initiated_at: Utc::now(),
             confirmed_at: Utc::now(),
             withdrawal_tx: Some(alloy::primitives::TxHash::ZERO),
-            withdrawal_ref: None,
         };
 
         assert_eq!(
@@ -11743,6 +11552,7 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                preflight_balance: None,
                 initiated_at: old_rebalance_start,
             },
             UsdcRebalanceEvent::ConversionConfirmed {

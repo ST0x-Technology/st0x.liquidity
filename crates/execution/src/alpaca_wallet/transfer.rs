@@ -6,7 +6,7 @@
 
 use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
-use rain_math_float::{Float, FloatError};
+use rain_math_float::Float;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -110,30 +110,6 @@ pub struct Transfer {
     pub to: Address,
     pub status: TransferStatus,
     pub created_at: DateTime<Utc>,
-    /// Network fee Alpaca deducts from the transfer, in the asset.
-    #[serde(default)]
-    network_fee: Option<AlpacaAmount>,
-    /// Alpaca's own fee on the transfer, in the asset.
-    #[serde(default)]
-    fees: Option<AlpacaAmount>,
-}
-
-impl Transfer {
-    /// The network fee plus Alpaca's fees this transfer reports, or `None`
-    /// when Alpaca omits either one.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the sum overflows.
-    pub fn reported_fees(&self) -> Result<Option<Usdc>, FloatError> {
-        let (Some(network_fee), Some(fees)) = (self.network_fee, self.fees) else {
-            return Ok(None);
-        };
-
-        Ok(Some(
-            (Usdc::new(network_fee.into_normalized()) + Usdc::new(fees.into_normalized()))?,
-        ))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1169,50 +1145,6 @@ mod tests {
     fn complete_and_failed_are_not_pending() {
         assert!(!TransferStatus::Complete.is_pending());
         assert!(!TransferStatus::Failed.is_pending());
-    }
-
-    #[test]
-    fn reported_fees_sum_the_network_fee_and_fees() {
-        let transfer: Transfer = serde_json::from_value(json!({
-            "id": Uuid::new_v4(),
-            "direction": "OUTGOING",
-            "amount": "1000",
-            "usd_value": "1000",
-            "chain": "ETH",
-            "asset": "USDC",
-            "from_address": Address::ZERO,
-            "to_address": Address::ZERO,
-            "status": "COMPLETE",
-            "created_at": "2025-01-01T00:00:00Z",
-            "network_fee": "20",
-            "fees": "0.3025"
-        }))
-        .unwrap();
-
-        assert_eq!(
-            transfer.reported_fees().unwrap(),
-            Some(Usdc::new(float!(20.3025)))
-        );
-    }
-
-    #[test]
-    fn reported_fees_are_none_when_alpaca_omits_a_fee() {
-        let transfer: Transfer = serde_json::from_value(json!({
-            "id": Uuid::new_v4(),
-            "direction": "OUTGOING",
-            "amount": "1000",
-            "usd_value": "1000",
-            "chain": "ETH",
-            "asset": "USDC",
-            "from_address": Address::ZERO,
-            "to_address": Address::ZERO,
-            "status": "COMPLETE",
-            "created_at": "2025-01-01T00:00:00Z",
-            "network_fee": "20"
-        }))
-        .unwrap();
-
-        assert_eq!(transfer.reported_fees().unwrap(), None);
     }
 
     #[test]

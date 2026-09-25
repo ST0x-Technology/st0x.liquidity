@@ -12,7 +12,7 @@ use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 
-use st0x_evm::{EvmError, PreparedTransaction, is_transient_rpc};
+use st0x_evm::EvmError;
 
 #[cfg(feature = "rain")]
 mod service;
@@ -20,7 +20,7 @@ mod service;
 pub use service::RaindexService;
 
 /// Vault identifier for Rain OrderBook vaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RaindexVaultId(pub B256);
 
 /// The two Raindex contract addresses a [`RaindexService`] talks to.
@@ -66,15 +66,11 @@ pub enum RaindexError {
     RpcTransport(#[from] RpcError<TransportErrorKind>),
     #[error("ABI decode error: {0}")]
     SolType(#[from] alloy::sol_types::Error),
-    /// A withdrawal scan did not find a matching mined transaction. An empty
-    /// log result cannot prove that no submission exists because the
-    /// transaction may still be pending or hidden by a load-balanced RPC
-    /// backend. Retryable -- the caller must NOT re-execute the irreversible
-    /// withdraw on this.
-    #[error(
-        "withdrawal scan found no matching mined transaction after block {from_block}; \
-         submission remains unresolved"
-    )]
+    /// A withdrawal scan could not confirm presence or absence: the queried node
+    /// is not confirmations-deep past `from_block`, so an empty result may be RPC
+    /// lag rather than a true absence. Retryable -- the caller must NOT re-execute
+    /// the irreversible withdraw on this.
+    #[error("withdrawal scan inconclusive: node not caught up past block {from_block}")]
     ScanInconclusive { from_block: u64 },
     /// A log the withdrawal scan matched on address + topic0 was anomalous
     /// (see [`ScanAnomaly`]). Impossible under the current contracts, so it
@@ -155,36 +151,6 @@ impl RaindexError {
             | Self::MissingOperatorRole { .. } => false,
         }
     }
-
-    /// `true` when reconciliation may succeed after the transaction or RPC
-    /// backend becomes visible. These errors require durable redrive rather
-    /// than a finite worker retry budget. Deterministic RPC failures are
-    /// terminal: a formal JSON-RPC rejection, an encoding or decoding error,
-    /// or a local usage error fails identically on every redrive, so repeating
-    /// it cannot improve visibility (see `is_transient_rpc`).
-    pub fn is_reconciliation_pending(&self) -> bool {
-        match self {
-            Self::ScanInconclusive { .. } => true,
-            Self::RpcTransport(error) => is_transient_rpc(error),
-            Self::Evm(error) => error.is_confirmation_pending(),
-            // A contract-layer error can carry the same transient transport
-            // failure as `RpcTransport` (connection reset/timeout with no formal
-            // JSON-RPC error response); classify it identically so a call routed
-            // through the contract layer is not silently treated as terminal.
-            // Any other contract error shape (revert, unknown function) is
-            // terminal.
-            Self::Contract(alloy::contract::Error::TransportError(error)) => {
-                is_transient_rpc(error)
-            }
-            Self::Contract(_)
-            | Self::Float(_)
-            | Self::ZeroAmount
-            | Self::SolType(_)
-            | Self::ScanAnomalousLog { .. }
-            | Self::InsufficientVaultLiquidity { .. }
-            | Self::MissingOperatorRole { .. } => false,
-        }
-    }
 }
 
 /// Abstraction for Raindex (Rain OrderBook) operations.
@@ -215,39 +181,6 @@ pub trait Raindex: Send + Sync {
         decimals: u8,
     ) -> Result<TxHash, RaindexError>;
 
-    /// Fill and sign a vault withdrawal without broadcasting it.
-    ///
-    /// Persist the returned identity before calling
-    /// [`broadcast_prepared_withdraw`](Raindex::broadcast_prepared_withdraw).
-    async fn prepare_withdraw(
-        &self,
-        token: Address,
-        vault_id: RaindexVaultId,
-        target_amount: U256,
-        decimals: u8,
-    ) -> Result<PreparedTransaction, RaindexError>;
-
-    /// Broadcast an exact withdrawal transaction prepared earlier.
-    ///
-    /// Repeated calls submit identical signed bytes and therefore cannot create
-    /// a second withdrawal at another nonce.
-    async fn broadcast_prepared_withdraw(
-        &self,
-        prepared: &PreparedTransaction,
-    ) -> Result<TxHash, RaindexError>;
-    /// Releases the wallet-local reservation when a prepared withdrawal could
-    /// not be persisted and will never be broadcast.
-    async fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction);
-
-    /// Restores wallet-local ownership for a durably submitted withdrawal
-    /// before any other wallet operation can allocate its nonce. Legacy
-    /// records recover the nonce by exact transaction hash.
-    async fn restore_submitted_withdrawal(
-        &self,
-        tx_hash: TxHash,
-        prepared: Option<&PreparedTransaction>,
-    ) -> Result<(), RaindexError>;
-
     /// Submit a vault withdrawal without waiting for confirmation.
     ///
     /// Returns the tx hash immediately. Use
@@ -260,22 +193,6 @@ pub trait Raindex: Send + Sync {
         decimals: u8,
     ) -> Result<TxHash, RaindexError>;
 
-    /// Returns the current chain head for an irreversible-action intent.
-    async fn current_block(&self) -> Result<u64, RaindexError>;
-
-    /// Finds the newest matching withdrawal strictly after `from_block`.
-    ///
-    /// An empty mined-log scan is never evidence that the irreversible
-    /// submission did not happen: it may still be pending, or the queried RPC
-    /// backend may not have observed it. Implementations must therefore return
-    /// [`RaindexError::ScanInconclusive`] rather than representing absence.
-    async fn find_recent_withdrawal(
-        &self,
-        token: Address,
-        vault_id: RaindexVaultId,
-        from_block: u64,
-    ) -> Result<(TxHash, U256), RaindexError>;
-
     /// Wait for a previously submitted transaction to be confirmed.
     async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {
         self.confirm_tx_receipt(tx_hash).await.map(|_| ())
@@ -284,110 +201,4 @@ pub trait Raindex: Send + Sync {
     /// Wait for a previously submitted transaction to be confirmed and return the receipt.
     async fn confirm_tx_receipt(&self, tx_hash: TxHash)
     -> Result<TransactionReceipt, RaindexError>;
-}
-
-#[cfg(test)]
-mod tests {
-    use alloy::rpc::json_rpc::ErrorPayload;
-
-    use super::*;
-
-    #[test]
-    fn formal_rpc_rejection_is_not_reconciliation_pending() {
-        let error = RaindexError::RpcTransport(RpcError::ErrorResp(ErrorPayload {
-            code: -32602,
-            message: "invalid params".into(),
-            data: None,
-        }));
-
-        assert!(
-            !error.is_reconciliation_pending(),
-            "a node that processed and rejected the request will not become \
-             successful through uncapped reconciliation redrive"
-        );
-    }
-
-    #[test]
-    fn transient_rpc_transport_failure_remains_reconciliation_pending() {
-        let error = RaindexError::RpcTransport(TransportErrorKind::backend_gone());
-
-        assert!(
-            error.is_reconciliation_pending(),
-            "a transport failure provides no formal rejection and may recover \
-             when another backend becomes visible"
-        );
-    }
-
-    #[test]
-    fn contract_layer_formal_rpc_rejection_is_not_reconciliation_pending() {
-        let error = RaindexError::Contract(alloy::contract::Error::TransportError(
-            RpcError::ErrorResp(ErrorPayload {
-                code: -32602,
-                message: "invalid params".into(),
-                data: None,
-            }),
-        ));
-
-        assert!(
-            !error.is_reconciliation_pending(),
-            "a formal rejection routed through the contract layer is as terminal \
-             as the identical RpcTransport rejection"
-        );
-    }
-
-    #[test]
-    fn contract_layer_transient_transport_failure_is_reconciliation_pending() {
-        let error = RaindexError::Contract(alloy::contract::Error::TransportError(
-            TransportErrorKind::backend_gone(),
-        ));
-
-        assert!(
-            error.is_reconciliation_pending(),
-            "a transient transport failure reaching the caller through the \
-             contract layer is retryable, matching the RpcTransport path"
-        );
-    }
-
-    #[test]
-    fn deterministic_deser_error_is_not_reconciliation_pending() {
-        let deser = serde_json::from_str::<u64>("\"not a number\"").unwrap_err();
-        let error = RaindexError::RpcTransport(RpcError::DeserError {
-            err: deser,
-            text: "\"not a number\"".to_string(),
-        });
-
-        assert!(
-            !error.is_reconciliation_pending(),
-            "a deserialization failure is deterministic: the response has the \
-             wrong shape on every redrive, so uncapped reconciliation can never \
-             make it succeed"
-        );
-    }
-
-    #[test]
-    fn evm_transport_deser_error_is_not_reconciliation_pending() {
-        let deser = serde_json::from_str::<u64>("\"not a number\"").unwrap_err();
-        let error = RaindexError::Evm(EvmError::Transport(RpcError::DeserError {
-            err: deser,
-            text: "\"not a number\"".to_string(),
-        }));
-
-        assert!(
-            !error.is_reconciliation_pending(),
-            "the withdrawal path surfaces failures as `Evm(Transport(..))`; a \
-             deterministic deserialization failure there must be terminal rather \
-             than an uncapped redrive"
-        );
-    }
-
-    #[test]
-    fn evm_transport_backend_gone_is_reconciliation_pending() {
-        let error = RaindexError::Evm(EvmError::Transport(TransportErrorKind::backend_gone()));
-
-        assert!(
-            error.is_reconciliation_pending(),
-            "a transport failure on the wallet path may recover once a backend \
-             becomes visible, so it stays reconciliation pending"
-        );
-    }
 }

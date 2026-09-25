@@ -166,6 +166,7 @@ impl AnvilTrade {
             self.trade.clone(),
             cqrs,
             assets,
+            true,
         )
         .await
     }

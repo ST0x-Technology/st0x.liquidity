@@ -1029,6 +1029,7 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(1082.711862)),
                 order_id: ClientOrderId::from_uuid(Uuid::from_u128(1)),
+                preflight_balance: None,
                 initiated_at: Utc::now(),
             })
             .unwrap(),

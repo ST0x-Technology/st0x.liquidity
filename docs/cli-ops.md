@@ -503,25 +503,10 @@ Alpaca dashboard. The resume enqueues only when no live row exists (for example,
 after the job's retries are exhausted and the row is terminal `Failed`).
 
 When the resume does enqueue, the bot's worker re-polls Alpaca for the recorded
-transfer and proceeds normally if the withdrawal has completed with a tx hash
-(the common case), or emits `FailWithdrawal` if Alpaca reports Failed with no tx
-hash. If Alpaca reports Failed with a tx hash, polling stays inconclusive and
-the guard remains held. The `--direction` must be `to-raindex` for AlpacaToBase.
-
-**Complete with no tx hash**: the transfer is credited only from the tx that
-delivered its USDC, so a Complete withdrawal whose `tx_hash` is still null is
-also inconclusive and re-polled. The same 4-hour alert fires, but its text says
-Alpaca reports the withdrawal complete with no tx hash, not that Alpaca may be
-unreachable. The wait is bounded by
-`[rebalancing] settlement_retry_deadline_secs`, counted from
-`Withdrawing.initiated_at`. Past it, the bot re-reads the transfer for the hash
-for up to 30 minutes (the Alpaca polling timeout), then fails the bridge
-(`BridgingFailed`, no burn), stops re-polling, and pages with "has no recorded
-withdrawal tx hash". The USDC is then in the Ethereum wallet but not credited to
-any transfer. Like every AlpacaToBase `BridgingFailed`, the guard stays held
-until `transfer reconcile --kind usdc` settles the transfer (see "Reconciling
-Stuck Failed Transfers" below): find the withdrawal tx on Etherscan (the Alpaca
-transfer UUID is in the log), move the funds by hand, then reconcile.
+transfer and proceeds normally if the withdrawal has completed (the common
+case), or emits `FailWithdrawal` if Alpaca reports Failed with no tx hash. If
+Alpaca reports Failed with a tx hash, polling stays inconclusive and the guard
+remains held. The `--direction` must be `to-raindex` for AlpacaToBase.
 
 **Known limitation -- permanent `TransferNotFound`**: if `transfer resume`
 consistently reports inconclusive and Alpaca's dashboard confirms the withdrawal
@@ -551,6 +536,10 @@ time. Who touches it, and when:
   reaches a clearable terminal. Guard-holding terminals (post-burn failures, any
   AlpacaToBase `BridgingFailed`, `DepositFailed`) keep it latched until
   `transfer reconcile` settles them.
+- **Clear (worker)**: exactly one worker path releases it -- a pre-flight
+  refusal (`WalletUsdcAmbientPreflight` / `PreflightBalanceUnavailable`) emits
+  no aggregate event, so the worker releases through a durable-checked handle
+  that keeps the latch whenever any persisted rebalance still holds the guard.
 - **Restart**: the atomic resets to false; `recover_usdc_guard` re-derives it
   from durable state (`holds_rebalance_guard`) and re-arms resumable jobs.
 - **Single-flight for manual commands**: the resume endpoint refuses while any
@@ -602,9 +591,8 @@ that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
   `transfer resume --kind usdc`: its `find_recent_burn` scan adopts the orphan
   burn, persists `BridgingInitiated`, and the transfer continues normally.
 
-`transfer reconcile` is the path for persisted terminal failures whose funds
-left the source venue (e.g. `DepositFailed`, `BridgingFailed` with a burn tx
-recorded, any `AlpacaToBase` `BridgingFailed`).
+`transfer reconcile` is the path for persisted post-burn terminal failures (e.g.
+`DepositFailed`, `BridgingFailed` with a burn tx recorded).
 
     stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn not attempted"
 
@@ -630,17 +618,13 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   --reason "redeemed manually"
 ```
 
-- `--kind usdc` drives a stuck USDC rebalance whose funds already left the
-  source venue to the clearing terminal `Reconciled` state, releasing the
-  rebalancing guard. It is accepted from: `DepositFailed` (any direction), a
+- `--kind usdc` drives a stuck post-burn USDC rebalance to the clearing terminal
+  `Reconciled` state, releasing the rebalancing guard. It is accepted from any
+  of the post-burn terminal failures: `DepositFailed` (any direction), a
   post-burn `BridgingFailed` (one carrying a `burn_tx_hash` or `cctp_nonce`),
-  any `AlpacaToBase` `BridgingFailed` (the withdrawal completed, so the funds
-  left Alpaca even with no burn, e.g. the settlement deadline, a missing
-  withdrawal tx hash, or a withdrawal credit mismatch), and a `BaseToAlpaca`
-  `ConversionFailed`. Its `--reason` must be one of `funds-moved-manually` or
-  `deposit-credited-offline`; any other value is rejected. Every other state is
-  rejected, including `WithdrawalFailed` and an `AlpacaToBase`
-  `ConversionFailed`, whose funds never left Alpaca.
+  and a `BaseToAlpaca` `ConversionFailed`. Its `--reason` must be one of
+  `funds-moved-manually` or `deposit-credited-offline`; any other value is
+  rejected. Valid only from a post-burn terminal failure.
 - `--kind mint` / `--kind redemption` mark an equity transfer stuck in `Failed`
   as terminal `Reconciled`. This is a pure bookkeeping transition: it emits no
   reactor effect and dispatches no inventory update. One nuance for redemptions
