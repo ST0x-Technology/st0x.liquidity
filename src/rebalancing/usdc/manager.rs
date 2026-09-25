@@ -15963,7 +15963,10 @@ mod tests {
     /// After a restart the wallet's nonce cache is empty. Startup reserves
     /// the nonce of a signed send that was persisted but not broadcast and
     /// rebroadcasts it, so the next send takes the nonce after it instead of
-    /// replacing it, and does not wait behind a send no node holds.
+    /// replacing it, and does not wait behind a send no node holds. Automine
+    /// is off so the rebroadcast send is still pending when startup reads its
+    /// receipt: anvil mines a pooled tx asynchronously, so with automine on
+    /// that read races the block.
     #[tokio::test]
     async fn startup_reserves_the_nonce_of_a_persisted_signed_send() {
         let chain = deploy_ethereum_usdc_chain_head_at_mint().await;
@@ -15989,6 +15992,11 @@ mod tests {
         .await
         .unwrap();
 
+        before_restart
+            .provider()
+            .anvil_set_auto_mine(false)
+            .await
+            .unwrap();
         let restarted = build_deposit_manager(
             &chain,
             &server,
@@ -16000,18 +16008,24 @@ mod tests {
             restarted.restore_prepared_deposit_sends(&pool).await,
             RestoredDepositSends {
                 restored: 1,
-                unmined: 0,
+                unmined: 1,
             }
         );
 
+        before_restart
+            .provider()
+            .anvil_mine(Some(1), None)
+            .await
+            .unwrap();
+        let receipt = before_restart
+            .provider()
+            .get_transaction_receipt(signed.tx_hash())
+            .await
+            .unwrap()
+            .expect("startup must rebroadcast the persisted signed send");
         assert!(
-            before_restart
-                .provider()
-                .get_transaction_by_hash(signed.tx_hash())
-                .await
-                .unwrap()
-                .is_some(),
-            "startup must rebroadcast the persisted signed send",
+            receipt.status(),
+            "the rebroadcast send must mine: {receipt:?}"
         );
 
         let next = restarted
