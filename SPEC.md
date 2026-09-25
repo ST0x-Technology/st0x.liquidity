@@ -3833,9 +3833,9 @@ enum UsdcRebalance {
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
-        // BaseToAlpaca deposit send: NotStarted, Prepared (signed and
-        // persisted) or Recorded (broadcast at least once). NotStarted for
-        // snapshots taken before this field existed.
+        // BaseToAlpaca deposit send: NotStarted or Prepared (signed and
+        // persisted, maybe broadcast). NotStarted for snapshots taken before
+        // this field existed.
         deposit_send: DepositSend,
     },
     BridgingFailed {
@@ -3910,10 +3910,10 @@ already-submitted action instead of re-issuing it:
   CCTP destination domain, and one cash guard per corridor allows one burn per
   corridor at a time, so a match is this transfer's burn.
 - `Bridged` (BaseToAlpaca): the deposit send is signed and persisted
-  (`PrepareDepositSend`) before it is broadcast, and its hash is recorded
-  (`RecordPendingDeposit`) after the broadcast, before the receipt is awaited.
-  Resume broadcasts the persisted bytes again and confirms them: the same tx, so
-  it never sends twice and never adopts another send. With no signed send, a
+  (`PrepareDepositSend`) before it is broadcast; once it is confirmed,
+  `InitiateDeposit` records its hash, which must equal the signed send's. Resume
+  broadcasts the persisted bytes again and confirms them: the same tx, so it
+  never sends twice and never adopts another send. With no signed send, a
   same-amount send from the wallet to the deposit address after the mint can
   belong to another transfer, so resume fails the transfer for reconciliation
   instead of adopting it (see "BaseToAlpaca deposit send").
@@ -3997,10 +3997,6 @@ enum UsdcRebalanceCommand {
     // Persists the signed BaseToAlpaca deposit send on `Bridged`, before its
     // first broadcast. Refused when a send was already signed.
     PrepareDepositSend { prepared: PreparedTransaction },
-    // Records that the signed deposit send was broadcast, before its receipt
-    // is awaited. `send_tx` must be the signed send's hash; recording it
-    // again is a no-op.
-    RecordPendingDeposit { send_tx: TxHash },
     InitiateDeposit { deposit: TransferRef },
     ConfirmDeposit,
     // Valid from `DepositInitiated`, and from a BaseToAlpaca `Bridged` whose
@@ -4079,8 +4075,6 @@ enum UsdcRebalanceEvent {
     // BaseToAlpaca deposit send signed and persisted, before its first
     // broadcast.
     DepositSendPrepared { prepared: PreparedTransaction, prepared_at: DateTime<Utc> },
-    // The signed deposit send was broadcast; its receipt is not awaited yet.
-    PendingDepositRecorded { send_tx: TxHash, recorded_at: DateTime<Utc> },
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<B256>,
@@ -6863,9 +6857,9 @@ therefore performs an explicit fund-moving send:
    the nonce is released and nothing is sent; if the reload fails, the nonce
    stays reserved and the bot pages, since the bytes may be persisted. A failure
    to sign sends nothing, and the job retries. Then it broadcasts the persisted
-   bytes ("already known" counts as success), records the hash with
-   `RecordPendingDeposit` (it must equal the signed send's hash), and waits for
-   the send to reach the required confirmations.
+   bytes ("already known" counts as success) and waits for the send to reach the
+   required confirmations; `InitiateDeposit` then records its hash, which must
+   equal the signed send's.
    - Broadcast refused or failed, receipt not known yet, or the send dropped
      from the mempool: the outcome is not known yet
      (`DepositSendReconciliationPending`). The aggregate stays `Bridged` and the

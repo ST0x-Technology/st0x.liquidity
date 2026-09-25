@@ -717,10 +717,10 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
 
 The bot signs the Alpaca deposit send and persists the signed tx
 (`DepositSendPrepared`) before it broadcasts it, and records the send tx
-(`PendingDepositRecorded`) right after. Every retry broadcasts those same bytes,
-so it never sends a second time for the same transfer. At startup it reserves
-the nonce of every signed send still on `Bridged` and rebroadcasts it, before
-the startup token approvals.
+(`DepositInitiated`) once it is confirmed. Every retry broadcasts those same
+bytes, so it never sends a second time for the same transfer. At startup it
+reserves the nonce of every signed send still on `Bridged` and rebroadcasts it,
+before the startup token approvals.
 
 - **"signed deposit send <tx> is not confirmed yet ... It has stayed unconfirmed
   for ..."** (`DepositSendReconciliationPending`, paged every 30 minutes once 4

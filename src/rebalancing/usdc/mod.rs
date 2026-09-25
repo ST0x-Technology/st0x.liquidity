@@ -532,18 +532,6 @@ pub enum UsdcTransferError {
     /// and the retry signs one; nothing was broadcast.
     #[error("USDC rebalance {id}: the deposit send prepare task panicked; nothing was broadcast")]
     DepositSendTaskPanicked { id: UsdcRebalanceId },
-    /// The broadcast of the signed deposit send returned a hash other than
-    /// the persisted one, so the recorded identity would not be the tx that
-    /// confirms.
-    #[error(
-        "USDC rebalance {id}: signed deposit send hash mismatch: expected {expected}, \
-         broadcast returned {actual}"
-    )]
-    PreparedDepositHashMismatch {
-        id: UsdcRebalanceId,
-        expected: TxHash,
-        actual: TxHash,
-    },
 }
 
 /// Why a signed Base->Alpaca deposit send is not confirmed yet.
@@ -648,8 +636,7 @@ impl UsdcTransferError {
             | Self::BurnTxDropped { .. }
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
-            | Self::DepositSendTaskPanicked { .. }
-            | Self::PreparedDepositHashMismatch { .. } => None,
+            | Self::DepositSendTaskPanicked { .. } => None,
         }
     }
 }
@@ -709,8 +696,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::BurnTxDropped { .. }
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
-            | Self::DepositSendTaskPanicked { .. }
-            | Self::PreparedDepositHashMismatch { .. } => false,
+            | Self::DepositSendTaskPanicked { .. } => false,
         }
     }
 }

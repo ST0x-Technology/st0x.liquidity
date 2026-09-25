@@ -281,9 +281,6 @@ pub enum UsdcRebalanceError {
     /// could send the minted USDC twice.
     #[error("a deposit send was already started for this transfer")]
     DepositSendAlreadyStarted,
-    /// No deposit send was started, so there is no send to record.
-    #[error("no deposit send was started for this transfer")]
-    DepositSendNotStarted,
     /// A deposit tx other than the persisted signed send's, which is the only
     /// send this transfer can make.
     #[error("deposit tx {recorded} does not match the prepared deposit send hash {prepared}")]
@@ -499,9 +496,6 @@ pub enum UsdcRebalanceCommand {
     /// broadcast. Pure: the orchestrator signs, then broadcasts only once this
     /// is durable. Valid only from a BaseToAlpaca `Bridged` with no send.
     PrepareDepositSend { prepared: PreparedTransaction },
-    /// Record that the prepared deposit send was broadcast. `send_tx` must be
-    /// the prepared send's hash; recording it again is a no-op.
-    RecordPendingDeposit { send_tx: TxHash },
     /// Start deposit to destination. Valid only from `Bridged` state.
     InitiateDeposit { deposit: TransferRef },
     /// Test/fixture-only: identical to `InitiateDeposit` but takes
@@ -684,12 +678,6 @@ pub enum UsdcRebalanceEvent {
         prepared: PreparedTransaction,
         prepared_at: DateTime<Utc>,
     },
-    /// The prepared deposit send was broadcast and its tx recorded while still
-    /// in `Bridged`, before its receipt was awaited.
-    PendingDepositRecorded {
-        send_tx: TxHash,
-        recorded_at: DateTime<Utc>,
-    },
     /// Bridging failed. Preserves burn data when available for debugging.
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
@@ -775,7 +763,6 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::AttestationTimedOut { .. } => "UsdcRebalanceEvent::AttestationTimedOut",
             Self::Bridged { .. } => "UsdcRebalanceEvent::Bridged",
             Self::DepositSendPrepared { .. } => "UsdcRebalanceEvent::DepositSendPrepared",
-            Self::PendingDepositRecorded { .. } => "UsdcRebalanceEvent::PendingDepositRecorded",
             Self::BridgingFailed { .. } => "UsdcRebalanceEvent::BridgingFailed",
             Self::BridgingCompletionRecovered { .. } => {
                 "UsdcRebalanceEvent::BridgingCompletionRecovered"
@@ -806,13 +793,9 @@ pub enum DepositSend {
     /// No send was signed.
     #[default]
     NotStarted,
-    /// Signed and persisted; it may not have been broadcast yet.
+    /// Signed and persisted; it may not have been broadcast yet. Its tx is
+    /// `prepared.tx_hash()`.
     Prepared {
-        prepared: PreparedTransaction,
-        prepared_at: DateTime<Utc>,
-    },
-    /// Broadcast at least once; its tx is `prepared.tx_hash()`.
-    Recorded {
         prepared: PreparedTransaction,
         prepared_at: DateTime<Utc>,
     },
@@ -824,10 +807,6 @@ impl DepositSend {
         match self {
             Self::NotStarted => None,
             Self::Prepared {
-                prepared,
-                prepared_at,
-            }
-            | Self::Recorded {
                 prepared,
                 prepared_at,
             } => Some((prepared, *prepared_at)),
@@ -1441,9 +1420,7 @@ impl UsdcRebalance {
             } => Some(match deposit_send {
                 DepositSend::NotStarted => EthereumWalletCredit::Held(*amount_received),
                 // A signed send may be on chain, mined or not yet.
-                DepositSend::Prepared { .. } | DepositSend::Recorded { .. } => {
-                    EthereumWalletCredit::InFlight(*amount_received)
-                }
+                DepositSend::Prepared { .. } => EthereumWalletCredit::InFlight(*amount_received),
             }),
             Self::BridgingSubmitting { .. }
             | Self::Bridged { .. }
@@ -1894,7 +1871,6 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::AttestationTimedOut', \
                'UsdcRebalanceEvent::Bridged', \
                'UsdcRebalanceEvent::DepositSendPrepared', \
-               'UsdcRebalanceEvent::PendingDepositRecorded', \
                'UsdcRebalanceEvent::BridgingFailed', \
                'UsdcRebalanceEvent::BridgingCompletionRecovered', \
                'UsdcRebalanceEvent::DepositInitiated', \
@@ -1929,7 +1905,7 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
 }
 
 /// The `UsdcRebalance` aggregates whose latest event leaves a signed deposit
-/// send in `Bridged` (`DepositSendPrepared`, `PendingDepositRecorded`), so
+/// send in `Bridged` (`DepositSendPrepared`), so
 /// startup can reserve those sends' nonces before any other send takes them.
 /// Unparseable ids are returned apart, for the caller to page.
 pub(crate) async fn prepared_deposit_send_ids(
@@ -1948,10 +1924,7 @@ pub(crate) async fn prepared_deposit_send_ids(
              ON last_ev.aggregate_id = latest.aggregate_id \
             AND last_ev.sequence = latest.max_seq \
          WHERE last_ev.aggregate_type = 'UsdcRebalance' \
-           AND last_ev.event_type IN ( \
-               'UsdcRebalanceEvent::DepositSendPrepared', \
-               'UsdcRebalanceEvent::PendingDepositRecorded' \
-           ) \
+           AND last_ev.event_type = 'UsdcRebalanceEvent::DepositSendPrepared' \
          ORDER BY latest.aggregate_id",
     )
     .fetch_all(pool)
@@ -2134,8 +2107,6 @@ pub(crate) async fn deposit_send_recorded_elsewhere(
            AND ( \
                (event_type = 'UsdcRebalanceEvent::DepositSendPrepared' \
                 AND json_extract(payload, '$.DepositSendPrepared.prepared.tx_hash') = ?) \
-               OR (event_type = 'UsdcRebalanceEvent::PendingDepositRecorded' \
-                AND json_extract(payload, '$.PendingDepositRecorded.send_tx') = ?) \
                OR (event_type = 'UsdcRebalanceEvent::DepositSendAttached' \
                 AND json_extract(payload, '$.DepositSendAttached.send_tx') = ?) \
                OR (event_type = 'UsdcRebalanceEvent::DepositInitiated' \
@@ -2147,7 +2118,6 @@ pub(crate) async fn deposit_send_recorded_elsewhere(
          LIMIT 1",
     )
     .bind(id.to_string())
-    .bind(&send_tx)
     .bind(&send_tx)
     .bind(&send_tx)
     .bind(&send_tx)
@@ -2181,7 +2151,6 @@ async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>,
                'UsdcRebalanceEvent::PendingBurnCleared', \
                'UsdcRebalanceEvent::Bridged', \
                'UsdcRebalanceEvent::DepositSendPrepared', \
-               'UsdcRebalanceEvent::PendingDepositRecorded', \
                'UsdcRebalanceEvent::BridgingCompletionRecovered' \
            ) \
          ORDER BY latest.aggregate_id",
@@ -2250,9 +2219,9 @@ impl EventSourced for UsdcRebalance {
     // `WithdrawalComplete` also carries `withdrawal_ref` now, so the reported
     // withdrawal fees can be read again.
     // v11: `Bridged` carries `deposit_send`, the BaseToAlpaca deposit send
-    // progress set by the new `DepositSendPrepared` (the signed send, persisted
-    // before broadcast) and `PendingDepositRecorded` events. Legacy events and
-    // snapshots default it to `NotStarted`.
+    // progress set by the new `DepositSendPrepared` event (the signed send,
+    // persisted before broadcast). Legacy events and snapshots default it to
+    // `NotStarted`.
     const SCHEMA_VERSION: u64 = 11;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -2739,39 +2708,6 @@ impl EventSourced for UsdcRebalance {
                 },
             },
 
-            // Only the prepared send's own hash is ever recorded.
-            (
-                PendingDepositRecorded { send_tx, .. },
-                Self::Bridged {
-                    direction,
-                    amount,
-                    amount_received,
-                    fee_collected,
-                    burn_tx_hash,
-                    mint_tx_hash,
-                    initiated_at,
-                    minted_at,
-                    deposit_send:
-                        DepositSend::Prepared {
-                            prepared,
-                            prepared_at,
-                        },
-                },
-            ) if *send_tx == prepared.tx_hash() => Self::Bridged {
-                direction: *direction,
-                amount: *amount,
-                amount_received: *amount_received,
-                fee_collected: *fee_collected,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
-                initiated_at: *initiated_at,
-                minted_at: *minted_at,
-                deposit_send: DepositSend::Recorded {
-                    prepared: prepared.clone(),
-                    prepared_at: *prepared_at,
-                },
-            },
-
             (
                 DepositInitiated {
                     deposit_ref,
@@ -3100,7 +3036,7 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             ConfirmBridgingAt { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
 
-            InitiateDeposit { .. } | PrepareDepositSend { .. } | RecordPendingDeposit { .. } => {
+            InitiateDeposit { .. } | PrepareDepositSend { .. } => {
                 Err(UsdcRebalanceError::BridgingNotCompleted)
             }
             #[cfg(any(test, feature = "test-support"))]
@@ -3207,7 +3143,6 @@ impl EventSourced for UsdcRebalance {
 
             RecordPendingBurn { burn_tx } => self.transition_record_pending_burn(burn_tx),
             PrepareDepositSend { prepared } => self.transition_prepare_deposit_send(prepared),
-            RecordPendingDeposit { send_tx } => self.transition_record_pending_deposit(send_tx),
             ClearPendingBurn => self.transition_clear_pending_burn(),
 
             ReceiveAttestation {
@@ -3939,36 +3874,7 @@ impl UsdcRebalance {
                 prepared,
                 prepared_at: Utc::now(),
             }]),
-            DepositSend::Prepared { .. } | DepositSend::Recorded { .. } => {
-                Err(UsdcRebalanceError::DepositSendAlreadyStarted)
-            }
-        }
-    }
-
-    /// Records the broadcast of the prepared deposit send. Recording it again
-    /// is a no-op; any other hash is refused.
-    fn transition_record_pending_deposit(
-        &self,
-        send_tx: TxHash,
-    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
-        use UsdcRebalanceEvent::*;
-        let deposit_send = self.base_to_alpaca_deposit_send("RecordPendingDeposit")?;
-        let Some((prepared, _)) = deposit_send.prepared() else {
-            return Err(UsdcRebalanceError::DepositSendNotStarted);
-        };
-        if send_tx != prepared.tx_hash() {
-            return Err(UsdcRebalanceError::PreparedDepositHashMismatch {
-                recorded: send_tx,
-                prepared: prepared.tx_hash(),
-            });
-        }
-
-        match deposit_send {
-            DepositSend::Prepared { .. } => Ok(vec![PendingDepositRecorded {
-                send_tx,
-                recorded_at: Utc::now(),
-            }]),
-            DepositSend::Recorded { .. } | DepositSend::NotStarted => Ok(vec![]),
+            DepositSend::Prepared { .. } => Err(UsdcRebalanceError::DepositSendAlreadyStarted),
         }
     }
 
@@ -10701,7 +10607,7 @@ mod tests {
             Some(EthereumWalletCredit::Held(credited))
         );
         assert_eq!(minted(AlpacaToBase).ethereum_wallet_credit(), None);
-        // A signed or recorded deposit send may already have left the wallet.
+        // A signed deposit send may already have left the wallet.
         let sending = |deposit_send| Bridged {
             direction: BaseToAlpaca,
             amount,
@@ -10713,18 +10619,9 @@ mod tests {
             minted_at: now,
             deposit_send,
         };
-        let prepared = PreparedTransaction::for_test(BURN_TX, 0);
         assert_eq!(
             sending(DepositSend::Prepared {
-                prepared: prepared.clone(),
-                prepared_at: now,
-            })
-            .ethereum_wallet_credit(),
-            Some(EthereumWalletCredit::InFlight(credited))
-        );
-        assert_eq!(
-            sending(DepositSend::Recorded {
-                prepared,
+                prepared: PreparedTransaction::for_test(BURN_TX, 0),
                 prepared_at: now,
             })
             .ethereum_wallet_credit(),
@@ -12441,13 +12338,6 @@ mod tests {
         }
     }
 
-    fn deposit_send_recorded(send_tx: TxHash) -> UsdcRebalanceEvent {
-        UsdcRebalanceEvent::PendingDepositRecorded {
-            send_tx,
-            recorded_at: Utc::now(),
-        }
-    }
-
     fn bridged_with(extra: Vec<UsdcRebalanceEvent>) -> Vec<UsdcRebalanceEvent> {
         [bridged_events(RebalanceDirection::BaseToAlpaca), extra].concat()
     }
@@ -12493,26 +12383,18 @@ mod tests {
     /// USDC twice.
     #[tokio::test]
     async fn prepare_deposit_send_refuses_a_second_send() {
-        for started in [
-            vec![deposit_send_prepared()],
-            vec![
-                deposit_send_prepared(),
-                deposit_send_recorded(DEPOSIT_SEND_TX),
-            ],
-        ] {
-            let error = TestHarness::<UsdcRebalance>::with(())
-                .given(bridged_with(started))
-                .when(UsdcRebalanceCommand::PrepareDepositSend {
-                    prepared: PreparedTransaction::for_test(TxHash::with_last_byte(0xdd), 8),
-                })
-                .await
-                .then_expect_error();
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![deposit_send_prepared()]))
+            .when(UsdcRebalanceCommand::PrepareDepositSend {
+                prepared: PreparedTransaction::for_test(TxHash::with_last_byte(0xdd), 8),
+            })
+            .await
+            .then_expect_error();
 
-            assert!(matches!(
-                error,
-                LifecycleError::Apply(UsdcRebalanceError::DepositSendAlreadyStarted)
-            ));
-        }
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositSendAlreadyStarted)
+        ));
     }
 
     /// The signed send is the only send this transfer can make, so the
@@ -12540,136 +12422,12 @@ mod tests {
         assert_eq!(prepared, DEPOSIT_SEND_TX);
     }
 
-    #[tokio::test]
-    async fn record_pending_deposit_refuses_a_send_that_was_not_started() {
-        let error = TestHarness::<UsdcRebalance>::with(())
-            .given(bridged_events(RebalanceDirection::BaseToAlpaca))
-            .when(UsdcRebalanceCommand::RecordPendingDeposit {
-                send_tx: DEPOSIT_SEND_TX,
-            })
-            .await
-            .then_expect_error();
-
-        assert!(matches!(
-            error,
-            LifecycleError::Apply(UsdcRebalanceError::DepositSendNotStarted)
-        ));
-    }
-
-    /// The prepared send is the only send this transfer can make, before and
-    /// after its hash is recorded.
-    #[tokio::test]
-    async fn record_pending_deposit_refuses_a_hash_other_than_the_prepared_send() {
-        let other_send =
-            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000dd");
-
-        for started in [
-            vec![deposit_send_prepared()],
-            vec![
-                deposit_send_prepared(),
-                deposit_send_recorded(DEPOSIT_SEND_TX),
-            ],
-        ] {
-            let error = TestHarness::<UsdcRebalance>::with(())
-                .given(bridged_with(started))
-                .when(UsdcRebalanceCommand::RecordPendingDeposit {
-                    send_tx: other_send,
-                })
-                .await
-                .then_expect_error();
-
-            let LifecycleError::Apply(UsdcRebalanceError::PreparedDepositHashMismatch {
-                recorded,
-                prepared,
-            }) = error
-            else {
-                panic!("Expected PreparedDepositHashMismatch, got {error:?}");
-            };
-            assert_eq!(recorded, other_send);
-            assert_eq!(prepared, DEPOSIT_SEND_TX);
-        }
-    }
-
-    #[tokio::test]
-    async fn record_pending_deposit_of_the_recorded_send_is_a_no_op() {
-        let events = TestHarness::<UsdcRebalance>::with(())
-            .given(bridged_with(vec![
-                deposit_send_prepared(),
-                deposit_send_recorded(DEPOSIT_SEND_TX),
-            ]))
-            .when(UsdcRebalanceCommand::RecordPendingDeposit {
-                send_tx: DEPOSIT_SEND_TX,
-            })
-            .await
-            .events();
-
-        assert_eq!(events, vec![]);
-    }
-
-    #[tokio::test]
-    async fn record_pending_deposit_keeps_the_prepared_send_on_bridged() {
-        let staged = bridged_with(vec![deposit_send_prepared()]);
-        let UsdcRebalanceEvent::DepositSendPrepared { prepared_at, .. } = staged[5] else {
-            panic!("staged the prepared send last");
-        };
-
-        let events = TestHarness::<UsdcRebalance>::with(())
-            .given(staged.clone())
-            .when(UsdcRebalanceCommand::RecordPendingDeposit {
-                send_tx: DEPOSIT_SEND_TX,
-            })
-            .await
-            .events();
-
-        let [UsdcRebalanceEvent::PendingDepositRecorded { send_tx, .. }] = events.as_slice() else {
-            panic!("Expected one PendingDepositRecorded event, got {events:?}");
-        };
-        assert_eq!(*send_tx, DEPOSIT_SEND_TX);
-
-        let state = replay::<UsdcRebalance>([staged, events].concat()).unwrap();
-        let Some(UsdcRebalance::Bridged {
-            deposit_send,
-            amount_received,
-            ..
-        }) = state
-        else {
-            panic!("Expected Bridged, got {state:?}");
-        };
-        assert_eq!(
-            deposit_send,
-            DepositSend::Recorded {
-                prepared: prepared_send(),
-                prepared_at,
-            }
-        );
-        assert_eq!(amount_received, Usdc::new(float!(99.99)));
-    }
-
-    #[tokio::test]
-    async fn record_pending_deposit_rejects_an_alpaca_to_base_transfer() {
-        let error = TestHarness::<UsdcRebalance>::with(())
-            .given(bridged_events(RebalanceDirection::AlpacaToBase))
-            .when(UsdcRebalanceCommand::RecordPendingDeposit {
-                send_tx: DEPOSIT_SEND_TX,
-            })
-            .await
-            .then_expect_error();
-
-        assert!(matches!(
-            error,
-            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
-        ));
-    }
-
     /// A BaseToAlpaca deposit send that cannot be resolved fails from
     /// `Bridged` into a reconcilable, guard-holding `DepositFailed` that keeps
     /// the signed send, so `transfer recheck` can poll Alpaca by it.
     #[tokio::test]
     async fn fail_deposit_from_bridged_keeps_the_signed_send() {
-        let staged = bridged_with(vec![
-            deposit_send_prepared(),
-            deposit_send_recorded(DEPOSIT_SEND_TX),
-        ]);
+        let staged = bridged_with(vec![deposit_send_prepared()]);
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(staged.clone())
@@ -12827,7 +12585,6 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(bridged_with(vec![
                 deposit_send_prepared(),
-                deposit_send_recorded(DEPOSIT_SEND_TX),
                 UsdcRebalanceEvent::DepositFailed {
                     deposit_ref: Some(TransferRef::OnchainTx(DEPOSIT_SEND_TX)),
                     reason: "recorded send reverted".to_string(),
@@ -12859,7 +12616,7 @@ mod tests {
             mint_tx_hash: MINT_TX,
             initiated_at: now,
             minted_at: now,
-            deposit_send: DepositSend::Recorded {
+            deposit_send: DepositSend::Prepared {
                 prepared: prepared_send(),
                 prepared_at: now,
             },
@@ -12890,10 +12647,6 @@ mod tests {
                 UsdcRebalanceEvent::DepositSendPrepared {
                     prepared: PreparedTransaction::for_test(send_tx, 7),
                     prepared_at: now,
-                },
-                UsdcRebalanceEvent::PendingDepositRecorded {
-                    send_tx,
-                    recorded_at: now,
                 },
                 UsdcRebalanceEvent::DepositSendAttached {
                     send_tx,

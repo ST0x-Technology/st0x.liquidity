@@ -474,7 +474,6 @@ fn usdc_rebalance_failure(event: &UsdcRebalanceEvent) -> Option<(FailureEventTyp
         | UsdcRebalanceEvent::PendingBurnRecorded { .. }
         | UsdcRebalanceEvent::PendingBurnCleared { .. }
         | UsdcRebalanceEvent::DepositSendPrepared { .. }
-        | UsdcRebalanceEvent::PendingDepositRecorded { .. }
         | UsdcRebalanceEvent::DepositSendAttached { .. }
         | UsdcRebalanceEvent::BridgingInitiated { .. }
         | UsdcRebalanceEvent::BridgeAttestationReceived { .. }

@@ -112,9 +112,8 @@ with a `PreparedTransaction`, RAI-2485):
    bot pages: releasing a nonce whose bytes may be persisted could send two txs
    at it.
 2. The persisted bytes are broadcast (`broadcast_prepared`; "already known" is
-   success), the hash is recorded (`RecordPendingDeposit` ->
-   `PendingDepositRecorded`, which must equal the signed send's hash), and the
-   receipt is awaited.
+   success) and the receipt is awaited. Once confirmed, `InitiateDeposit`
+   records the send's tx, which must equal the signed send's hash.
 3. Resume with a signed send broadcasts the same bytes again and confirms them:
    the same tx, so it can never send twice, with no "maybe broadcast" state. A
    refused broadcast, an unknown receipt or a drop redrives after 30 s with no

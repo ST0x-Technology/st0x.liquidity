@@ -3664,9 +3664,9 @@ impl<
     /// 5. Execute CCTP mint on Ethereum (credits the bot wallet)
     ///    -> `ConfirmBridging` command
     /// 6. Sign the send of the minted USDC from the bot wallet to Alpaca's
-    ///    deposit address and persist it -> `PrepareDepositSend`; broadcast it
-    ///    -> `RecordPendingDeposit`; once confirmed -> `InitiateDeposit`. A
-    ///    resume with a signed send broadcasts the same bytes again
+    ///    deposit address and persist it -> `PrepareDepositSend`; broadcast it,
+    ///    and once confirmed -> `InitiateDeposit` with its tx. A resume with a
+    ///    signed send broadcasts the same bytes again
     /// 7. Poll Alpaca by the send tx until deposit credited -> `ConfirmDeposit`
     ///
     /// On errors, sends appropriate `Fail*` command to transition
@@ -4946,25 +4946,10 @@ impl<
             cause,
         };
 
-        let actual = self
-            .cctp_bridge
+        self.cctp_bridge
             .broadcast_usdc_on_ethereum(prepared)
             .await
             .map_err(|error| pending(DepositSendPending::Broadcast(Box::new(error))))?;
-        if actual != expected {
-            return Err(UsdcTransferError::PreparedDepositHashMismatch {
-                id: id.clone(),
-                expected,
-                actual,
-            });
-        }
-
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::RecordPendingDeposit { send_tx: expected },
-            )
-            .await?;
 
         let status = self
             .cctp_bridge
@@ -16120,18 +16105,13 @@ mod tests {
         wallet.await_receipt(prepared.tx_hash()).await.unwrap();
     }
 
-    /// Persists `prepared` as the transfer's signed deposit send and records
-    /// its broadcast.
+    /// Persists `prepared` as the transfer's signed deposit send.
     async fn record_signed_deposit_send(
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
         prepared: PreparedTransaction,
     ) {
-        let send_tx = prepared.tx_hash();
         cqrs.send(id, UsdcRebalanceCommand::PrepareDepositSend { prepared })
-            .await
-            .unwrap();
-        cqrs.send(id, UsdcRebalanceCommand::RecordPendingDeposit { send_tx })
             .await
             .unwrap();
     }
@@ -16271,9 +16251,9 @@ mod tests {
         assert_eq!(deposit_ref_tx(&state), reverting_tx);
     }
 
-    /// The fresh send persists the signed send, then records its broadcast,
-    /// before the deposit is initiated, so a crash while the receipt is
-    /// awaited resumes on it.
+    /// The fresh send persists the signed send before the deposit is
+    /// initiated with its tx, so a crash while the receipt is awaited resumes
+    /// on it.
     #[tokio::test]
     async fn fresh_deposit_send_persists_the_signed_send_before_the_deposit() {
         let chain = deploy_ethereum_usdc_chain_head_at_mint().await;
@@ -16311,29 +16291,21 @@ mod tests {
             .position(|event_type| event_type == "UsdcRebalanceEvent::DepositSendPrepared")
             .expect("the signed send must be persisted");
         assert_eq!(
-            event_types[prepared_at + 1..=prepared_at + 2],
-            [
-                "UsdcRebalanceEvent::PendingDepositRecorded".to_string(),
-                "UsdcRebalanceEvent::DepositInitiated".to_string(),
-            ],
+            event_types[prepared_at + 1],
+            "UsdcRebalanceEvent::DepositInitiated",
         );
 
-        let (prepared, recorded): (String, String) = sqlx::query_as(
-            "SELECT \
-                 (SELECT json_extract(payload, '$.DepositSendPrepared.prepared.tx_hash') \
-                  FROM events WHERE aggregate_id = ?1 \
-                    AND event_type = 'UsdcRebalanceEvent::DepositSendPrepared'), \
-                 (SELECT json_extract(payload, '$.PendingDepositRecorded.send_tx') \
-                  FROM events WHERE aggregate_id = ?1 \
-                    AND event_type = 'UsdcRebalanceEvent::PendingDepositRecorded')",
+        let prepared: String = sqlx::query_scalar(
+            "SELECT json_extract(payload, '$.DepositSendPrepared.prepared.tx_hash') \
+             FROM events WHERE aggregate_id = ? \
+               AND event_type = 'UsdcRebalanceEvent::DepositSendPrepared'",
         )
         .bind(id.to_string())
         .fetch_one(&pool)
         .await
         .unwrap();
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
-        assert_eq!(prepared, recorded);
-        assert_eq!(TxHash::from_str(&recorded).unwrap(), deposit_ref_tx(&state));
+        assert_eq!(TxHash::from_str(&prepared).unwrap(), deposit_ref_tx(&state));
     }
 
     /// With the chain unreachable the send fails while it is signed, before
@@ -16371,9 +16343,9 @@ mod tests {
         );
     }
 
-    /// A crash after the broadcast but before `RecordPendingDeposit` resumes
-    /// by broadcasting the persisted bytes again: the same tx, so the minted
-    /// USDC moves once.
+    /// A crash after the broadcast but before `InitiateDeposit` records the
+    /// send resumes by broadcasting the persisted bytes again: the same tx, so
+    /// the minted USDC moves once.
     #[tokio::test]
     async fn a_crash_between_broadcast_and_record_rebroadcasts_the_same_send() {
         let chain = deploy_ethereum_usdc_chain_head_at_mint().await;
@@ -16393,7 +16365,7 @@ mod tests {
 
         sqlx::query(
             "CREATE TRIGGER refuse_deposit_record BEFORE INSERT ON events \
-             WHEN NEW.event_type = 'UsdcRebalanceEvent::PendingDepositRecorded' \
+             WHEN NEW.event_type = 'UsdcRebalanceEvent::DepositInitiated' \
              BEGIN SELECT RAISE(ABORT, 'injected write failure'); END",
         )
         .execute(&pool)
