@@ -762,6 +762,25 @@ the nonce of every signed send still on `Bridged`.
   another send can take it. The transfer's rebroadcast reserves it again when it
   resumes. Fix the database read and restart; if the page above fires later,
   follow it.
+- **"Signed Alpaca deposit sends with unparseable transfer ids were not restored
+  at startup"** (`operational_alert`, the raw ids in `unparseable`): a
+  `UsdcRebalance` event row with a signed send has an `aggregate_id` that is not
+  a transfer id. No job or CLI command can drive it, so its nonce is never
+  reserved, and no rebroadcast reserves it later. Read the signed send from the
+  row:
+
+  ```sql
+  SELECT sequence, event_type, payload
+  FROM events
+  WHERE aggregate_type = 'UsdcRebalance' AND aggregate_id = '<raw id>'
+  ORDER BY sequence;
+  ```
+
+  Check its tx hash on chain. If it mined, the minted USDC went to Alpaca:
+  account for it by hand. If it has no receipt and the wallet's `latest` nonce
+  is past its nonce, it can never mine and nothing moved. If it is pending, or
+  its nonce is still free, cancel it at its nonce as in the steps above so it
+  cannot move USDC later. Every restart pages again while the row is there.
 - **"Cannot tell whether a signed Alpaca deposit send was persisted"**
   (`operational_alert`): a `PrepareDepositSend` write failed and the reload that
   checks it failed too. The bot keeps the send's nonce reserved, so later sends
