@@ -26,8 +26,10 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use rain_math_float::Float;
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode, TargetShare,
+    UsdcCorridorCtx,
 };
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, SendError,
@@ -56,8 +58,8 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryDivergenceGate, InventoryError,
-    InventoryScope, InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
+    BroadcastingInventory, Inventory, InventoryDivergenceGate, InventoryError, InventoryScope,
+    InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
     PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
     Venue,
 };
@@ -269,7 +271,9 @@ pub(crate) struct RebalancingServiceConfig {
     /// Bound on the age of a chain's inventory snapshot before that chain's
     /// imbalance evaluations are skipped as stale.
     pub(crate) inventory_staleness_bound: Duration,
-    pub(crate) usdc: Option<ImbalanceThreshold>,
+    /// The corridor new cash transfers run on and its band; `None` while
+    /// USDC mode is disabled.
+    pub(crate) usdc: Option<UsdcCorridorCtx>,
     pub(crate) transfer_timeout: Duration,
     /// Every hedged chain's asset table and minimum. The planner slots a
     /// symbol on each chain that rebalances it; the USDC trigger reads the
@@ -944,6 +948,7 @@ enum UsdcTimeoutCleanup {
     ReArmAlpacaToBaseWithdrawal {
         tracking: usdc::UsdcRebalanceTracking,
         elapsed: Duration,
+        corridor: UsdcCorridor,
         amount: Usdc,
     },
 }
@@ -997,6 +1002,7 @@ enum RearmPolicy {
 struct RearmCandidate {
     id: UsdcRebalanceId,
     direction: RebalanceDirection,
+    corridor: UsdcCorridor,
     amount: Usdc,
     policy: RearmPolicy,
 }
@@ -1904,6 +1910,7 @@ impl RebalancingService {
                 UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
                     tracking,
                     elapsed,
+                    corridor,
                     amount,
                 } => {
                     // An Alpaca-to-Base pre-burn state timed out with no live job:
@@ -1923,6 +1930,7 @@ impl RebalancingService {
                         .push(TransferUsdcToMarketMaking {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         })
@@ -2394,11 +2402,13 @@ impl RebalancingService {
                 Ok(Some(
                     UsdcRebalance::Withdrawing {
                         direction: RebalanceDirection::AlpacaToBase,
+                        corridor,
                         amount,
                         ..
                     }
                     | UsdcRebalance::WithdrawalComplete {
                         direction: RebalanceDirection::AlpacaToBase,
+                        corridor,
                         amount,
                         ..
                     },
@@ -2407,6 +2417,7 @@ impl RebalancingService {
                     return Ok(Some(UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
                         tracking,
                         elapsed,
+                        corridor,
                         amount,
                     }));
                 }
@@ -4747,8 +4758,8 @@ impl RebalancingService {
     fn usdc_rebalancing_params(
         &self,
         chain: Chain,
-    ) -> Option<(ImbalanceThreshold, Option<Usdc>, Option<Usd>)> {
-        let threshold = self.config.usdc.as_ref()?;
+    ) -> Option<(UsdcCorridorCtx, Option<Usdc>, Option<Usd>)> {
+        let usdc = self.config.usdc?;
 
         let cash = self.config.chains.get(&chain)?.assets.cash.as_ref()?;
         if cash.rebalancing != OperationMode::Enabled {
@@ -4758,7 +4769,7 @@ impl RebalancingService {
         let usdc_limit = cash.operational_limit.map(Positive::inner);
         let reserved = self.config.cash_reserved.map(Positive::inner);
 
-        Some((*threshold, usdc_limit, reserved))
+        Some((usdc, usdc_limit, reserved))
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
@@ -4773,7 +4784,7 @@ impl RebalancingService {
         self.expire_stuck_operations_with_logging().await;
 
         let chain = self.inventory.read().await.primary_chain();
-        let Some((threshold, usdc_limit, reserved)) = self.usdc_rebalancing_params(chain) else {
+        let Some((usdc, usdc_limit, reserved)) = self.usdc_rebalancing_params(chain) else {
             return;
         };
 
@@ -4829,7 +4840,7 @@ impl RebalancingService {
         };
 
         let Ok(operation) = usdc::check_imbalance_and_build_operation(
-            &threshold,
+            &usdc.threshold,
             &self.inventory,
             usdc_limit,
             reserved,
@@ -4859,10 +4870,12 @@ impl RebalancingService {
 
         let dispatched = match operation {
             UsdcRebalanceOperation::BaseToAlpaca { amount } => {
-                self.enqueue_transfer_usdc_to_hedging(amount).await
+                self.enqueue_transfer_usdc_to_hedging(amount, usdc.corridor)
+                    .await
             }
             UsdcRebalanceOperation::AlpacaToBase { amount } => {
-                self.enqueue_transfer_usdc_to_market_making(amount).await
+                self.enqueue_transfer_usdc_to_market_making(amount, usdc.corridor)
+                    .await
             }
         };
 
@@ -5089,7 +5102,7 @@ impl RebalancingService {
     /// check a crash between `queue.push` and the first persisted
     /// `UsdcRebalance` event would let the next imbalance check enqueue a second
     /// job for the same imbalance.
-    async fn enqueue_transfer_usdc_to_hedging(&self, amount: Usdc) -> bool {
+    async fn enqueue_transfer_usdc_to_hedging(&self, amount: Usdc, corridor: UsdcCorridor) -> bool {
         // A non-terminal row in flight longer than this is treated as likely
         // stuck: the suppression is logged at warn (with the row id and age) so
         // it is actionable, rather than silently starving the hedge side with
@@ -5143,6 +5156,7 @@ impl RebalancingService {
             .push(TransferUsdcToHedging {
                 id: id.clone(),
                 amount,
+                corridor,
                 revert_redrive_attempts: 0,
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -5179,7 +5193,11 @@ impl RebalancingService {
     /// a crash between `queue.push` and the first persisted
     /// `UsdcRebalance` event would let the next imbalance check enqueue a
     /// second job for the same rebalance.
-    async fn enqueue_transfer_usdc_to_market_making(&self, amount: Usdc) -> bool {
+    async fn enqueue_transfer_usdc_to_market_making(
+        &self,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) -> bool {
         let queue = self.transfer_usdc_to_market_making_queue.clone();
         let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
 
@@ -5214,6 +5232,7 @@ impl RebalancingService {
             .push(TransferUsdcToMarketMaking {
                 id: id.clone(),
                 amount,
+                corridor,
                 revert_redrive_attempts: 0,
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -5365,6 +5384,7 @@ impl RebalancingService {
         let idempotency_key = resume_idempotency_key(id, existing_rows);
 
         let amount = state.amount();
+        let corridor = state.corridor();
         let push = match direction {
             RebalanceDirection::AlpacaToBase => {
                 self.transfer_usdc_to_market_making_queue
@@ -5374,6 +5394,7 @@ impl RebalancingService {
                         TransferUsdcToMarketMaking {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         },
@@ -5388,6 +5409,7 @@ impl RebalancingService {
                         TransferUsdcToHedging {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         },
@@ -6432,6 +6454,7 @@ impl RebalancingService {
                         rearm_candidates.push(RearmCandidate {
                             id,
                             direction,
+                            corridor: entity.corridor(),
                             amount,
                             policy,
                         });
@@ -6524,6 +6547,7 @@ impl RebalancingService {
                         rearm_candidates.push(RearmCandidate {
                             id,
                             direction,
+                            corridor: entity.corridor(),
                             amount,
                             policy,
                         });
@@ -6696,6 +6720,7 @@ impl RebalancingService {
         for RearmCandidate {
             id,
             direction,
+            corridor,
             amount,
             policy,
         } in candidates
@@ -6738,6 +6763,7 @@ impl RebalancingService {
                         .push(TransferUsdcToHedging {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         })
@@ -6749,6 +6775,7 @@ impl RebalancingService {
                         .push(TransferUsdcToMarketMaking {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         })
@@ -7941,9 +7968,10 @@ mod tests {
     use futures_util::poll;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
-    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
+    use st0x_bridge::corridor::HopKind;
     use st0x_config::{
-        ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode,
+        ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, ImbalanceThreshold,
+        OperationMode,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
@@ -8073,9 +8101,12 @@ mod tests {
             cash_reserved: None,
             hedge_floor: HedgeFloor::default(),
             allocation: AllocationCtx::base_test(),
-            usdc: Some(ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
+            usdc: Some(UsdcCorridorCtx {
+                corridor: UsdcCorridor::BASE_CCTP,
+                threshold: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             chains: BTreeMap::from([(
@@ -17011,6 +17042,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(50),
                 revert_redrive_attempts: 0,
@@ -17115,6 +17147,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -17215,6 +17248,7 @@ mod tests {
                 .push_idempotent(
                     &resume_idempotency_key(&id, 0),
                     TransferUsdcToMarketMaking {
+                        corridor: UsdcCorridor::BASE_CCTP,
                         id: id.clone(),
                         amount: usdc(400),
                         revert_redrive_attempts: 0,
@@ -19920,6 +19954,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20051,6 +20086,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20086,6 +20122,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20116,6 +20153,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20176,6 +20214,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20235,6 +20274,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20275,6 +20315,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20288,7 +20329,7 @@ mod tests {
         // guard resets on restart, so running them concurrently would churn
         // capital and pay fees twice.
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20306,6 +20347,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20314,7 +20356,9 @@ mod tests {
             .await
             .unwrap();
 
-        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+        let enqueued = service
+            .enqueue_transfer_usdc_to_hedging(usdc(100), UsdcCorridor::BASE_CCTP)
+            .await;
 
         assert!(
             !enqueued,
@@ -20334,6 +20378,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20352,7 +20397,7 @@ mod tests {
         .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20371,6 +20416,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20386,7 +20432,7 @@ mod tests {
             .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(!enqueued, "a Running USDC transfer must block enqueue");
@@ -20470,6 +20516,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20487,7 +20534,9 @@ mod tests {
         .unwrap();
         attach_stores(&service, pool, usdc_store).await;
 
-        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+        let enqueued = service
+            .enqueue_transfer_usdc_to_hedging(usdc(100), UsdcCorridor::BASE_CCTP)
+            .await;
 
         assert!(
             enqueued,
@@ -20519,6 +20568,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20537,7 +20587,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20571,6 +20621,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20589,7 +20640,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20615,6 +20666,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20633,7 +20685,7 @@ mod tests {
 
         // Do NOT call set_stores: usdc_store stays None.
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20655,6 +20707,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20673,7 +20726,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20699,6 +20752,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20720,7 +20774,9 @@ mod tests {
 
         attach_stores(&service, pool, usdc_store).await;
 
-        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+        let enqueued = service
+            .enqueue_transfer_usdc_to_hedging(usdc(100), UsdcCorridor::BASE_CCTP)
+            .await;
 
         assert!(
             !enqueued,
@@ -20746,6 +20802,7 @@ mod tests {
                 .transfer_usdc_to_hedging_queue
                 .clone()
                 .push(TransferUsdcToHedging {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     id: zombie_id.clone(),
                     amount: usdc(100),
                     revert_redrive_attempts: 0,
@@ -20765,7 +20822,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(enqueued, "all zombies cleared: enqueue must succeed");
@@ -20790,6 +20847,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20808,7 +20866,7 @@ mod tests {
         .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20825,6 +20883,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20843,7 +20902,7 @@ mod tests {
         .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(enqueued, "a Done job must NOT suppress a new transfer");
@@ -20857,6 +20916,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20875,7 +20935,7 @@ mod tests {
         .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(enqueued, "a Killed job must NOT suppress a new transfer");
@@ -20893,6 +20953,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: zombie_id,
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20932,7 +20993,7 @@ mod tests {
         attach_stores(&service, aggregate_pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20959,6 +21020,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: zombie_id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20983,6 +21045,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: live_id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20994,7 +21057,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -21025,6 +21088,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -21080,6 +21144,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -22893,6 +22958,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_market_making_queue.clone();
         queue
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -24103,6 +24169,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25304,6 +25371,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25346,6 +25414,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25396,6 +25465,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25448,6 +25518,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25774,6 +25845,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25811,6 +25883,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25864,6 +25937,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25935,6 +26009,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -26009,6 +26084,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -26068,6 +26144,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -26335,6 +26412,7 @@ mod tests {
         let mut queue = service.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26384,6 +26462,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26482,6 +26561,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26535,6 +26615,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26582,6 +26663,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26631,6 +26713,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,

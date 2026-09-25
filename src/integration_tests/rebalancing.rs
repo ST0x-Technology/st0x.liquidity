@@ -20,9 +20,10 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use rain_math_float::Float;
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, DeviationBand,
-    ExecutionThreshold, OperationMode, TargetShare,
+    ExecutionThreshold, OperationMode, TargetShare, UsdcCorridorCtx,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
@@ -259,9 +260,12 @@ fn test_trigger_config() -> RebalancingServiceConfig {
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
         allocation: allocation(&[(Chain::Base, "0.5")], "0", "0.2"),
-        usdc: Some(ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
+        usdc: Some(UsdcCorridorCtx {
+            corridor: UsdcCorridor::BASE_CCTP,
+            threshold: ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
+            },
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         chains: BTreeMap::from([(
@@ -2425,9 +2429,12 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
         allocation: test_trigger_config().allocation,
-        usdc: Some(ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
+        usdc: Some(UsdcCorridorCtx {
+            corridor: UsdcCorridor::BASE_CCTP,
+            threshold: ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
+            },
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
@@ -2559,9 +2566,12 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
         allocation: test_trigger_config().allocation,
-        usdc: Some(ImbalanceThreshold {
-            target: float!(0.5),
-            deviation: float!(0.2),
+        usdc: Some(UsdcCorridorCtx {
+            corridor: UsdcCorridor::BASE_CCTP,
+            threshold: ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
+            },
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
@@ -2657,9 +2667,12 @@ async fn threshold_config_controls_trigger_sensitivity() {
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
             allocation: test_trigger_config().allocation,
-            usdc: Some(ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.4),
+            usdc: Some(UsdcCorridorCtx {
+                corridor: UsdcCorridor::BASE_CCTP,
+                threshold: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.4),
+                },
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             chains: BTreeMap::from([(
@@ -2725,9 +2738,12 @@ async fn threshold_config_controls_trigger_sensitivity() {
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
             allocation: test_trigger_config().allocation,
-            usdc: Some(ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.1),
+            usdc: Some(UsdcCorridorCtx {
+                corridor: UsdcCorridor::BASE_CCTP,
+                threshold: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.1),
+                },
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             chains: BTreeMap::from([(

@@ -368,7 +368,7 @@ mod tests {
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
             allocation: ctx.allocation.clone(),
-            usdc: ctx.usdc.map(|usdc| usdc.threshold),
+            usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
             chains: BTreeMap::new(),
         };
@@ -399,14 +399,14 @@ mod tests {
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
             allocation: ctx.allocation.clone(),
-            usdc: ctx.usdc.map(|usdc| usdc.threshold),
+            usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
             chains: BTreeMap::new(),
         };
 
         let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
-        assert!(usdc_threshold.target.eq(float!(0.6)).unwrap());
-        assert!(usdc_threshold.deviation.eq(float!(0.15)).unwrap());
+        assert!(usdc_threshold.threshold.target.eq(float!(0.6)).unwrap());
+        assert!(usdc_threshold.threshold.deviation.eq(float!(0.15)).unwrap());
     }
 
     async fn make_services_with_mock_wallet(
