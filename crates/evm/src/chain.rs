@@ -323,4 +323,26 @@ mod tests {
     fn unknown_chain_name_is_rejected() {
         assert_eq!("solana".parse::<Chain>().unwrap_err(), ParseChainError);
     }
+
+    /// Scan windows are time spans turned into blocks by this cadence, so a
+    /// changed value moves every window on that chain.
+    #[test]
+    fn min_block_intervals_are_pinned_literals() {
+        assert_eq!(
+            Chain::Ethereum.min_block_interval(),
+            std::time::Duration::from_secs(12)
+        );
+        assert_eq!(
+            Chain::Base.min_block_interval(),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            Chain::HyperEvm.min_block_interval(),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            Chain::Robinhood.min_block_interval(),
+            std::time::Duration::from_millis(100)
+        );
+    }
 }

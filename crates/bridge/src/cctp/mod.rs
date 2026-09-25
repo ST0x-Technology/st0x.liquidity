@@ -7366,4 +7366,93 @@ mod tests {
             tx_count_after.saturating_sub(tx_count_before)
         );
     }
+
+    /// The mint scan floor follows the endpoint's chain: an Ethereum endpoint
+    /// looks back 10,000 blocks (33 h 20 min of 12 s blocks), not Base's
+    /// 60,000, and keeps a 50-block margin below a captured floor.
+    #[tokio::test]
+    async fn find_existing_mint_floors_at_the_ethereum_lookback_on_an_ethereum_endpoint() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_400_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let head_offset = 1_000_000;
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let head = base_provider.get_block_number().await.unwrap() + head_offset;
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(head_offset)
+        .with_failing_historical_reads();
+        let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
+        // The contracts are the local Base ones; the chain only sets the
+        // window, which is what this checks.
+        let ethereum_endpoint = CctpEndpoint::new(
+            Chain::Ethereum,
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let error = ethereum_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { from_block, .. } = error else {
+            panic!("a consumed nonce outside the window must fail: {error:?}");
+        };
+        assert_eq!(from_block, head - 10_000);
+        assert!(lowest_scanned_block.load(Ordering::SeqCst) >= head - 10_000);
+
+        let old_floor = head - 20_000;
+        let old_floor_error = ethereum_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(old_floor),
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { from_block, .. } = old_floor_error else {
+            panic!("a consumed nonce outside the window must fail: {old_floor_error:?}");
+        };
+        assert_eq!(from_block, old_floor - 50);
+    }
 }

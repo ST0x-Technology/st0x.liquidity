@@ -1831,6 +1831,8 @@ mod tests {
     use alloy::primitives::{Bloom, Log as PrimitiveLog};
     use alloy::rpc::types::Log;
 
+    use st0x_evm::Chain;
+
     use super::*;
 
     /// Guards the values of the allowance constants against accidental change.
@@ -2109,5 +2111,27 @@ mod tests {
         let sync_result: Result<(), CctpError> = Ok(());
 
         apply_sync_result(original, sync_result).unwrap();
+    }
+
+    /// Base keeps the block counts it had before the windows became time
+    /// spans; Ethereum's 12 s blocks give the same spans in fewer blocks.
+    #[test]
+    fn scan_windows_in_blocks_per_chain() {
+        assert_eq!(
+            ScanWindow::for_chain(Chain::Base),
+            ScanWindow {
+                floor_margin_blocks: 300,
+                mint_lookback_blocks: 60_000,
+                reconstruction_lookback_blocks: 60_000,
+            }
+        );
+        assert_eq!(
+            ScanWindow::for_chain(Chain::Ethereum),
+            ScanWindow {
+                floor_margin_blocks: 50,
+                mint_lookback_blocks: 10_000,
+                reconstruction_lookback_blocks: 10_000,
+            }
+        );
     }
 }
