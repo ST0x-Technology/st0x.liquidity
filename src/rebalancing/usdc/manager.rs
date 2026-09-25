@@ -6688,12 +6688,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::{SignableTransaction as _, TxEip1559};
     use alloy::eips::eip2718::Encodable2718;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, Bytes, address, b256, fixed_bytes};
+    use alloy::primitives::{B256, Bytes, TxKind, address, b256, fixed_bytes};
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::types::TransactionRequest;
+    use alloy::signers::SignerSync as _;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{self, SolCall, SolEvent};
     use alloy::transports::{RpcError, TransportErrorKind};
@@ -16530,6 +16532,70 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// Nonces are per sender, so a tx the configured wallet mined at the
+    /// send's nonce proves nothing about a send another key signed (a key
+    /// rotated since): that send can still mine.
+    #[tokio::test]
+    async fn deposit_send_signed_by_another_wallet_is_not_superseded_by_the_configured_wallet() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            create_test_store_instance().await,
+        )
+        .await;
+        let bot_provider = bot_provider(&chain).await;
+        let nonce = bot_provider
+            .get_transaction_count(chain.bot_address)
+            .await
+            .unwrap();
+        let rotated_key = PrivateKeySigner::random();
+        let prepared =
+            sign_usdc_to_alpaca_offline(&rotated_key, nonce, usdc_to_u256(usdc("99.99")).unwrap());
+        let cancel = send_self_transfer(&bot_provider, chain.bot_address, Some(nonce)).await;
+        bot_provider.anvil_mine(Some(2), None).await.unwrap();
+
+        manager
+            .verify_deposit_send_superseded(
+                &UsdcRebalanceId(Uuid::new_v4()),
+                &prepared,
+                Some(cancel),
+            )
+            .await
+            .expect_err("the configured wallet's nonce does not supersede another key's send");
+    }
+
+    /// Signs a send of `amount` USDC to the Alpaca deposit address with
+    /// `signer` at `nonce`, with no node involved.
+    fn sign_usdc_to_alpaca_offline(
+        signer: &PrivateKeySigner,
+        nonce: u64,
+        amount: U256,
+    ) -> PreparedTransaction {
+        let unsigned = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit: 100_000,
+            max_fee_per_gas: 100_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(USDC_ADDRESS),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::from(
+                IERC20::transferCall {
+                    to: ALPACA_DEPOSIT_ADDRESS,
+                    amount,
+                }
+                .abi_encode(),
+            ),
+        };
+        let signature = signer.sign_hash_sync(&unsigned.signature_hash()).unwrap();
+        let envelope = TxEnvelope::from(unsigned.into_signed(signature));
+        PreparedTransaction::from_raw(Bytes::from(envelope.encoded_2718())).unwrap()
     }
 
     /// Connects a provider that signs with the bot wallet's key.
