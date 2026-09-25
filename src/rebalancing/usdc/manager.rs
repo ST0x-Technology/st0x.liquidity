@@ -16057,6 +16057,41 @@ mod tests {
         assert_eq!(restored, vec![prepared_only.tx_hash(), recorded.tx_hash()]);
     }
 
+    /// Startup rebroadcasts each restored signed send, so a later startup
+    /// send from the Ethereum wallet never queues behind a nonce whose
+    /// transaction no node holds.
+    #[tokio::test]
+    async fn startup_restore_rebroadcasts_each_signed_deposit_send() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let bridge = Arc::new(MockBridge::new());
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let mut signed = Vec::new();
+        for (byte, nonce) in [(0xA1, 3), (0xA2, 4)] {
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99"), TxHash::ZERO).await;
+            let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(byte), nonce);
+            cqrs.send(
+                &id,
+                UsdcRebalanceCommand::PrepareDepositSend {
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            signed.push(prepared.tx_hash());
+        }
+
+        manager.restore_prepared_deposit_sends(&pool).await;
+
+        let mut broadcasts = bridge.usdc_broadcasts();
+        broadcasts.sort();
+        assert_eq!(broadcasts, signed);
+    }
+
     /// Passes when one captured log line is an `operational_alert` page
     /// holding `message`.
     fn paged(lines: &[&str], message: &str) -> Result<(), String> {
