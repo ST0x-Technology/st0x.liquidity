@@ -636,8 +636,10 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   post-burn `BridgingFailed` (one carrying a `burn_tx_hash` or `cctp_nonce`),
   any `AlpacaToBase` `BridgingFailed` (the withdrawal completed, so the funds
   left Alpaca even with no burn, e.g. the settlement deadline, a missing
-  withdrawal tx hash, or a withdrawal credit mismatch), and a `BaseToAlpaca`
-  `ConversionFailed`. Its `--reason` must be one of `funds-moved-manually` or
+  withdrawal tx hash, or a withdrawal credit mismatch), a `BaseToAlpaca`
+  `ConversionFailed`, and a `BaseToAlpaca` `Bridged` with a signed deposit send
+  that you verified on chain will never confirm (see "Base->Alpaca deposit send
+  pages"). Its `--reason` must be one of `funds-moved-manually` or
   `deposit-credited-offline`; any other value is rejected. Every other state is
   rejected, including `WithdrawalFailed` and an `AlpacaToBase`
   `ConversionFailed`, whose funds never left Alpaca.
@@ -713,44 +715,47 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
 
 ### Base->Alpaca deposit send pages
 
-The bot marks the Alpaca deposit send started (`DepositSendSubmitting`) before
-it broadcasts it and records the send tx (`PendingDepositRecorded`) right after.
-It never sends a second time for the same transfer. When it cannot tell what
-happened to a send, it pages and stops.
+The bot signs the Alpaca deposit send and persists the signed tx
+(`DepositSendPrepared`) before it broadcasts it, and records the send tx
+(`PendingDepositRecorded`) right after. Every retry broadcasts those same bytes,
+so it never sends a second time for the same transfer. At startup it reserves
+the nonce of every signed send still on `Bridged`.
 
+- **"signed deposit send <tx> is not confirmed yet ... It has stayed unconfirmed
+  for ..."** (`DepositSendReconciliationPending`, paged every 30 minutes once 4
+  hours have passed since the send was signed): the transfer stays `Bridged`,
+  holds the guard, and the job keeps broadcasting the same bytes. Check `<tx>`
+  on chain. Pending with a low fee, or absent while the bot wallet's nonce has
+  moved past it (another tx took its nonce): it will never confirm, because the
+  bot never re-signs or fee-bumps it. Move the minted USDC by hand if needed,
+  then `stox transfer reconcile --kind usdc --id <id> --reason <reason>` (valid
+  for a Base->Alpaca `Bridged` with a signed send), then restart the bot to
+  release the send's nonce so later sends from the wallet proceed. If it
+  confirmed, do nothing: the next redrive continues the deposit.
+- **"Could not list signed Alpaca deposit sends at startup"** or **"Could not
+  load a transfer with a signed Alpaca deposit send at startup"**
+  (`operational_alert`): the bot started without reserving that send's nonce, so
+  another send can take it. The transfer's rebroadcast reserves it again when it
+  resumes. Fix the database read and restart; if the page above fires later,
+  follow it.
 - **"deposit marked failed for operator reconciliation"**
   (`DepositSendUnresolved`): the transfer is `DepositFailed`, holds the guard,
   and the job does not retry. The page names the cause and the step:
   - "the recorded deposit send <tx> was mined reverted": the send moved nothing.
     The minted USDC is still in the Ethereum wallet. Move it by hand, then
     `transfer reconcile --kind usdc`.
-  - "the recorded deposit send <tx> was dropped from the mempool": check `<tx>`
-    on chain. If it was mined and Alpaca credited it,
-    `stox transfer recheck --kind usdc --id <id>` (the tx is the transfer's
-    `deposit_ref`). Otherwise move the USDC by hand and
-    `transfer reconcile --kind usdc`.
-  - "no deposit send was recorded, but send <tx> of the same amount ...", "the
-    deposit send broadcast failed or timed out and may still be on chain", or "a
-    deposit send was started but its tx was not recorded; it may be on chain":
-    the transfer has no `deposit_ref`. Find this transfer's own send on chain
-    (from the bot wallet to Alpaca's deposit address, `amount_received`, after
-    the mint; the logs carry the hash when one was returned). A same-amount send
-    can belong to another open transfer: check that no other transfer recorded
-    it. If Alpaca credited it, run
+  - "no deposit send was recorded, but send <tx> of the same amount ...": only a
+    transfer that reached `Bridged` before the bot persisted signed sends. The
+    transfer has no `deposit_ref`. Find this transfer's own send on chain (from
+    the bot wallet to Alpaca's deposit address, `amount_received`, after the
+    mint). A same-amount send can belong to another open transfer: check that no
+    other transfer recorded it. If Alpaca credited it, run
     `stox transfer recheck --kind usdc --id <id> --deposit-tx <hash>`. The bot
     attaches the tx only if it moved exactly the transfer's amount from the bot
     wallet to the deposit address, is confirmed, and no other transfer recorded
     it; then it confirms the deposit and runs the USDC->USD conversion. If no
     send landed, move the USDC by hand and `transfer reconcile --kind usdc`
     (reconcile does not convert USDC to USD).
-- **"deposit send may be broadcast but its tx was not recorded"**
-  (`DepositSendRecordFailed`): the send tx (or "unknown" if the task panicked)
-  is in the page. The transfer stays `Bridged` with the send started and holds
-  the guard. A restart does not re-arm a `Bridged` transfer. Check the tx on
-  chain, then run
-  `stox transfer resume --kind usdc --id <id> --direction to-alpaca`: it fails
-  the deposit for reconciliation without sending (the page above, "a deposit
-  send was started ..."). Then follow that entry.
 - **"withdrawal tx <tx> is already recorded by USDC rebalance <other>"**
   (`WithdrawalTxAlreadyRecorded`, Alpaca->Base): Alpaca reported a withdrawal tx
   that another transfer already recorded, so it did not pay this one. The
