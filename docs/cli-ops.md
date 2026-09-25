@@ -762,6 +762,11 @@ the nonce of every signed send still on `Bridged`.
   another send can take it. The transfer's rebroadcast reserves it again when it
   resumes. Fix the database read and restart; if the page above fires later,
   follow it.
+- **"Cannot tell whether a signed Alpaca deposit send was persisted"**
+  (`operational_alert`): a `PrepareDepositSend` write failed and the reload that
+  checks it failed too. The bot keeps the send's nonce reserved, so later sends
+  from the Ethereum wallet wait behind it. Fix the database, then restart the
+  bot: startup reserves the nonce again only if the send was persisted.
 - **"deposit marked failed for operator reconciliation"**
   (`DepositSendUnresolved`): the transfer is `DepositFailed`, holds the guard,
   and the job does not retry. The page names the cause and the step:
