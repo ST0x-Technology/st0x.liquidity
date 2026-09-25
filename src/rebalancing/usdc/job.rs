@@ -777,18 +777,6 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                      nothing to redrive, leaving for operator reconciliation"
                 );
             }
-            // Refused before any send and already paged; a retry would be
-            // refused the same way.
-            Err(
-                error @ (UsdcTransferError::CorridorMismatch { .. }
-                | UsdcTransferError::CorridorNotServed { .. }),
-            ) => {
-                warn!(
-                    target: "rebalance",
-                    %error,
-                    "Base->Alpaca USDC transfer left for the operator: corridor not served"
-                );
-            }
             Err(UsdcTransferError::WithdrawalScanTransient {
                 id,
                 initiated_at,
@@ -1625,18 +1613,6 @@ impl TransferUsdcToMarketMaking {
                     %id,
                     "Alpaca->Base USDC transfer already in a terminal failed state; \
                      nothing to redrive, leaving for operator reconciliation"
-                );
-            }
-            // Refused before any send and already paged; a retry would be
-            // refused the same way.
-            Err(
-                error @ (UsdcTransferError::CorridorMismatch { .. }
-                | UsdcTransferError::CorridorNotServed { .. }),
-            ) => {
-                warn!(
-                    target: "rebalance",
-                    %error,
-                    "Alpaca->Base USDC transfer left for the operator: corridor not served"
                 );
             }
             // The withdrawal tx did not pay this withdrawal (nothing, or more

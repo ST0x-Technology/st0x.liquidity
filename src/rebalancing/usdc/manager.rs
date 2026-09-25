@@ -727,7 +727,8 @@ impl<
 
     /// Refuses, before any call, a transfer this service's corridor does not
     /// carry: one recorded on another corridor, or a fresh one asking for
-    /// another. Pages the operator; the transfer is left untouched.
+    /// another. The transfer is left untouched; the job's dead-letter alert
+    /// pages with this error once its retries are spent.
     fn require_served_corridor(
         &self,
         id: &UsdcRebalanceId,
@@ -749,7 +750,7 @@ impl<
             Some(_) | None => return Ok(()),
         };
 
-        error!(target: "operational_alert", alert = true, %id, "{error}");
+        error!(target: "rebalance", %id, "{error}");
         Err(error)
     }
 
