@@ -23,6 +23,7 @@ tracing = { workspace = true, optional = true }
 alloy-primitives.workspace = true
 rain-math-float.workspace = true
 serde_json.workspace = true
+st0x-evm = { workspace = true, features = ["test-support"] }
 st0x-float-macro.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tower = "0.5.3"

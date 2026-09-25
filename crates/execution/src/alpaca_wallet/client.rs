@@ -45,6 +45,8 @@ pub enum AlpacaWalletError {
         transfer_id: AlpacaTransferId,
         tx_hash: TxHash,
     },
+    #[error("Transfer {transfer_id} is complete but reports no on-chain tx hash yet")]
+    CompletedTransferMissingTx { transfer_id: AlpacaTransferId },
     #[error("Transfer {transfer_id} timed out after {elapsed:?}")]
     TransferTimeout {
         transfer_id: AlpacaTransferId,
@@ -111,6 +113,7 @@ impl AlpacaWalletError {
             | Self::FromHex(_)
             | Self::TransferNotFound { .. }
             | Self::FailedTransferHasTx { .. }
+            | Self::CompletedTransferMissingTx { .. }
             | Self::TransferTimeout { .. }
             | Self::InvalidStatusTransition { .. }
             | Self::AddressNotWhitelisted { .. }

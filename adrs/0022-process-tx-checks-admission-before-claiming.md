@@ -1,14 +1,14 @@
 # ADR 0022: process-tx checks broker admission before claiming the position
 
-- Status: Accepted
+- Status: Proposed
 - Date: 2026-09-24
 
 ## Context
 
 The `process-tx` operator verb accounts a decoded onchain fill and, when the
-position still needs a hedge, places one under the shared submission lock. Under
-the schedule aware close flatten policy broker admission can defer a placement
-outside the regular session.
+position still needs a hedge, places one under the shared submission lock (ADR
+0014). Under the schedule aware close flatten policy broker admission can defer
+a placement outside the regular session.
 
 `place_offchain_order_at_broker` records the placement intent (`PlaceReserved`,
 leaving the order `Pending`) before it runs admission, and `process-tx` claims
@@ -16,9 +16,10 @@ the position (`PlaceOffChainOrder`) before calling it. A deferral therefore
 arrived after the claim and the `Pending` intent were already durable. Retaining
 that intent handed the standing pipeline a `Pending` order whose recovery paths
 (`recover_pending_poll_status` and `recover_single_orphaned_order`) replay the
-stored shares and reservation terms without rerunning preflight, so changed
-cash, equity, hedge floor, or whole share eligibility could make the
-resubmission unsafe.
+stored shares and reservation terms without rerunning preflight
+([ADR 0021](0021-durable-buying-power-reservations.md)), so changed cash,
+equity, hedge floor, or whole share eligibility could make the resubmission
+unsafe.
 
 Unwinding the intent after the fact instead needed durable machinery: a failure
 kind on the order and position failure events so a deferral would not count as a
@@ -33,12 +34,16 @@ first.
 
 `process-tx` asks the order placer for admission (`prepare_placement`) after the
 placement preflight and before claiming the position, while holding the same
-submission guards as the claim and the placement.
+submission guards as the claim and the placement. Admission is the placer's: the
+in bot REST route's placer applies the trading schedule, while the standalone
+CLI placer has no admission gate and always admits, so only the REST route can
+defer.
 
-- **Deferred:** nothing is persisted. The fill is settled and the verb reports
-  `HedgePlacementDeferred`. The position carries no claim and no anchor, so the
-  standing `CheckPositions` pipeline sees the exposure again and hedges it from
-  a fresh preflight.
+- **Deferred:** the verb writes no claim, no `Pending` intent, and no anchor for
+  this placement; it settles the accounted fill and reports
+  `HedgePlacementDeferred`. With no claim on the position, the standing
+  `CheckPositions` pipeline sees the exposure again and hedges it from a fresh
+  preflight.
 - **Admission error:** nothing is claimed, so the error surfaces with the fill
   left unsettled and a rerun resumes it, the same as a preflight error.
 - **Admitted or recovered:** the verb claims the position and places the order.
@@ -53,14 +58,16 @@ still reports `HedgePlacementDeferred`.
 
 ## Consequences
 
-- A `process-tx` deferral at the check before the claim leaves no durable state
-  behind: no claim, no `Pending` intent, no terminal order, and no anchor.
-  Either way the next hedge is sized by a fresh preflight.
+- A `process-tx` deferral at the check before the claim leaves no state behind
+  for this placement: no claim, no `Pending` intent, no terminal order, and no
+  anchor. Besides accounting and settling the fill, the only writes are
+  reconciling an earlier claim and releasing an earlier anchor, both of which
+  run before admission. Either way the next hedge is sized by a fresh preflight.
 - No new persisted fields, projection columns, or migrations are needed, and
   trade history, reliability, and latency projections are untouched.
-- Admission runs twice on the admitted path, adding one broker lookup by client
-  order id and one market session read to each `process-tx` placement while the
-  schedule is enabled.
+- Admission runs twice on the admitted path of the REST route, adding one broker
+  lookup by client order id and one market session read to each placement while
+  the schedule is enabled. The CLI's admission is a no op.
 - A deferral that only appears after the claim is recorded as an ordinary failed
   placement, so it counts as a hedge failure in the reliability report. It
   requires the session boundary to fall between two checks made moments apart
@@ -70,8 +77,9 @@ still reports `HedgePlacementDeferred`.
   `Pending` already carries. Closing that for every placement path is left to a
   separate change.
 - Recovery that drives a `Pending` through the broker again holds the cross
-  process submission file lock, so it never races a placement a standalone
-  `process-tx` CLI still has in flight.
+  process submission file lock, so even a standalone `process-tx` CLI run
+  against a live bot, which the operator procedure forbids, cannot race its
+  placement. The lock is defense in depth, not a supported concurrent mode.
 
 ## Alternatives considered
 

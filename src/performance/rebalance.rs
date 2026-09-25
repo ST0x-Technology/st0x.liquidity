@@ -1026,7 +1026,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: None,
                 initiated_at: timestamp(0),
             },
             UsdcRebalanceEvent::ConversionConfirmed {
@@ -1893,7 +1892,6 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: None,
                 initiated_at: timestamp(110),
             },
             UsdcRebalanceEvent::ConversionConfirmed {
@@ -2077,7 +2075,6 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: None,
                 initiated_at: timestamp(0),
             },
             UsdcRebalanceEvent::ConversionFailed {
@@ -2384,7 +2381,6 @@ mod tests {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: None,
                 initiated_at: timestamp(0),
             },
             UsdcRebalanceEvent::DepositInitiated {
@@ -2502,7 +2498,6 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: None,
                 initiated_at: timestamp(110),
             },
             UsdcRebalanceEvent::ConversionConfirmed {
@@ -2767,7 +2762,6 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(999)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
-                preflight_balance: None,
                 initiated_at: timestamp(210),
             },
             UsdcRebalanceEvent::ConversionConfirmed {

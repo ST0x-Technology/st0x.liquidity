@@ -20,6 +20,7 @@ use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use st0x_config::{BrokerCtx, Ctx, HedgedChain, OpsApiConfig};
@@ -1064,7 +1065,9 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
         };
 
         match event {
-            VaultWithdrawPending { quantity, .. } | VaultWithdrawSubmitted { quantity, .. } => {
+            VaultWithdrawPending { quantity, .. }
+            | VaultWithdrawSubmitting { quantity, .. }
+            | VaultWithdrawSubmitted { quantity, .. } => {
                 requested_quantity = requested_quantity
                     .or_else(|| Some(FractionalShares::new(quantity).to_string()));
             }
@@ -1605,6 +1608,7 @@ fn fail_transfer_error_response(error: &FailTransferError) -> (StatusCode, Strin
         InvalidMintId, InvalidReason, InvalidRedemptionId, MintAlreadyCompleted, MintAlreadyFailed,
         MintAlreadyReconciled, MintNotFound, MintStore, RedemptionAlreadyCompleted,
         RedemptionAlreadyFailed, RedemptionAlreadyReconciled, RedemptionNotFound, RedemptionStore,
+        RedemptionSubmissionUnresolved,
     };
 
     match error {
@@ -1617,7 +1621,10 @@ fn fail_transfer_error_response(error: &FailTransferError) -> (StatusCode, Strin
         | MintAlreadyReconciled(_)
         | RedemptionAlreadyCompleted(_)
         | RedemptionAlreadyFailed(_)
-        | RedemptionAlreadyReconciled(_) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        | RedemptionAlreadyReconciled(_)
+        | RedemptionSubmissionUnresolved(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
         MintStore(source) if is_failure_command_refusal(source) => {
             (StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
         }
@@ -2141,6 +2148,12 @@ fn parse_usdc_rebalance_id(id: &str) -> Result<UsdcRebalanceId, (StatusCode, Jso
 /// same internal-failure treatment used elsewhere in this module.
 fn ops_store_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
     error!(%error, "Operator write command failed");
+    ops_write_failure()
+}
+
+/// The generic `500` for an operator write failure, without logging it. Callers
+/// that have not already recorded the failure go through `ops_store_error`.
+fn ops_write_failure() -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
@@ -2417,13 +2430,13 @@ async fn reconcile_equity_transfer(
                         }),
                     )
                 })?;
-            if !entity.is_failed() {
+            if !entity.is_operator_reconcilable() {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
                         error: format!(
-                            "Redemption {id} is not in the Failed state; reconcile only resolves \
-                             a Failed terminal."
+                            "Redemption {id} is not reconcilable; reconcile resolves a \
+                             Failed terminal or an unresolved vault-withdrawal submission."
                         ),
                     }),
                 ));
@@ -2473,6 +2486,17 @@ fn ops_precondition_error(error: impl std::fmt::Display) -> (StatusCode, Json<Er
 /// logged `500` carrying the full error chain.
 fn ops_operator_error(error: OperatorError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
+        OperatorError::Operational(error) => ops_store_error(format!("{error:#}")),
+        other => operator_error_response(other),
+    }
+}
+
+/// Renders an operator command failure with the same statuses and bodies as
+/// `ops_operator_error`, without logging it. For callers that already recorded
+/// the failure, such as the detached process-tx task, which logs its own
+/// outcome so the record survives a client disconnect.
+fn operator_error_response(error: OperatorError) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
         OperatorError::Rejected(reason) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -2485,7 +2509,7 @@ fn ops_operator_error(error: OperatorError) -> (StatusCode, Json<ErrorResponse>)
                 error: mismatch.to_string(),
             }),
         ),
-        OperatorError::Operational(error) => ops_store_error(format!("{error:#}")),
+        OperatorError::Operational(_) => ops_write_failure(),
     }
 }
 
@@ -2619,24 +2643,13 @@ struct ProcessTxResponse {
     outcome: ProcessTxOutcomeResponse,
 }
 
-/// Maps a hedge direction to its stable wire form. Serializing `Direction`
-/// directly would emit the dashboard's snake_case (`"buy"`/`"sell"`), so the
-/// process-tx wire keeps its own explicit `"Buy"`/`"Sell"` mapping rather than a
-/// Debug rendering that could drift if the enum's Debug output changed.
-fn process_tx_direction_wire(direction: st0x_execution::Direction) -> &'static str {
-    match direction {
-        st0x_execution::Direction::Buy => "Buy",
-        st0x_execution::Direction::Sell => "Sell",
-    }
-}
-
 /// Operator-relevant identity and economics of the decoded on-chain fill.
 #[derive(Debug, Serialize)]
 struct ProcessTxFillResponse {
     tx_hash: String,
     log_index: u64,
     symbol: String,
-    direction: &'static str,
+    direction: st0x_execution::Direction,
     quantity: String,
     price: String,
 }
@@ -2649,7 +2662,7 @@ impl TryFrom<ProcessTxFill> for ProcessTxFillResponse {
             tx_hash: fill.tx_hash.to_string(),
             log_index: fill.log_index,
             symbol: fill.symbol.to_string(),
-            direction: process_tx_direction_wire(fill.direction),
+            direction: fill.direction,
             quantity: fill.quantity.to_string(),
             price: format_float(&fill.price)?,
         })
@@ -2669,20 +2682,26 @@ enum ProcessTxOutcomeResponse {
     AlreadyAccounted,
     PendingHedgeInFlight,
     BelowExecutionThreshold,
-    TradingDisabled {
+    ExcludedFromHedging {
         symbol: String,
+        chain: String,
+        detail: String,
+    },
+    AlreadyExcluded {
+        detail: String,
     },
     PlacementRejected {
         symbol: String,
     },
     PreflightDeferred {
         symbol: String,
+        reason: String,
     },
     HedgePlaced {
         symbol: String,
         offchain_order_id: String,
         shares: String,
-        direction: &'static str,
+        direction: st0x_execution::Direction,
         disposition: PlacedHedgeDisposition,
     },
     HedgePlacementCleared {
@@ -2708,14 +2727,22 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
             ProcessTxOutcome::AlreadyAccounted => Self::AlreadyAccounted,
             ProcessTxOutcome::PendingHedgeInFlight => Self::PendingHedgeInFlight,
             ProcessTxOutcome::BelowExecutionThreshold => Self::BelowExecutionThreshold,
-            ProcessTxOutcome::TradingDisabled { symbol } => Self::TradingDisabled {
+            ProcessTxOutcome::ExcludedFromHedging {
+                symbol,
+                chain,
+                detail,
+            } => Self::ExcludedFromHedging {
                 symbol: symbol.to_string(),
+                chain: chain.to_string(),
+                detail,
             },
+            ProcessTxOutcome::AlreadyExcluded { detail } => Self::AlreadyExcluded { detail },
             ProcessTxOutcome::PlacementRejected { symbol } => Self::PlacementRejected {
                 symbol: symbol.to_string(),
             },
-            ProcessTxOutcome::PreflightDeferred { symbol } => Self::PreflightDeferred {
+            ProcessTxOutcome::PreflightDeferred { symbol, reason } => Self::PreflightDeferred {
                 symbol: symbol.to_string(),
+                reason,
             },
             ProcessTxOutcome::HedgePlaced {
                 symbol,
@@ -2727,7 +2754,7 @@ impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
                 symbol: symbol.to_string(),
                 offchain_order_id: offchain_order_id.to_string(),
                 shares: shares.to_string(),
-                direction: process_tx_direction_wire(direction),
+                direction,
                 disposition,
             },
             ProcessTxOutcome::HedgePlacementCleared { symbol } => Self::HedgePlacementCleared {
@@ -2767,26 +2794,6 @@ struct ProcessTransactionQuery {
     chain: Option<Chain>,
 }
 
-fn resolve_process_tx_chain(
-    state: &AppState,
-    requested: Option<Chain>,
-) -> Result<HedgedChain, (StatusCode, Json<ErrorResponse>)> {
-    let chain = requested.unwrap_or_else(|| state.ctx.chains.primary().chain);
-    state
-        .ctx
-        .chains
-        .hedged_chain(chain)
-        .cloned()
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("process-tx chain {chain} is not configured as a hedged chain"),
-                }),
-            )
-        })
-}
-
 /// Runs the process-tx workload on a detached `tokio` task and awaits its
 /// result, mapping a task-join failure and the operator error to HTTP
 /// responses.
@@ -2805,13 +2812,29 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
     provider: ChainProvider,
     cache: SymbolCache,
     handle: &ProcessTxHandle,
+    detached_tasks: &TaskTracker,
 ) -> Result<ProcessTxReport, (StatusCode, Json<ErrorResponse>)> {
     let stores = handle.stores.clone();
     let order_placer = Arc::clone(&handle.order_placer);
     let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
     let poll_status_queue = handle.poll_status_queue.clone();
     let poll_interval = handle.poll_interval;
-    tokio::spawn(async move {
+    // Tracked so graceful shutdown waits for a placement already under way
+    // instead of dropping it with the runtime. The token is taken before the
+    // closed check: the drain closes the tracker and then checks it is empty,
+    // so either the drain sees this request as running or the request sees the
+    // tracker closed and refuses. Spawning into a drained tracker would let the
+    // task be dropped at exit.
+    let admission = detached_tasks.token();
+    if detached_tasks.is_closed() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "process-tx is unavailable while the bot shuts down".to_string(),
+            }),
+        ));
+    }
+    let task = detached_tasks.spawn(async move {
         let result = process_tx::process_tx(
             tx_hash,
             &ctx,
@@ -2828,21 +2851,27 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
         // it is rendered into a response.
         match &result {
             Ok(report) => debug!(%tx_hash, outcome = ?report.outcome, "process-tx finished"),
+            Err(OperatorError::Rejected(reason)) => {
+                warn!(%tx_hash, %reason, "process-tx rejected");
+            }
             Err(error) => error!(%tx_hash, %error, "process-tx failed"),
         }
         result
-    })
-    .await
-    .map_err(|error| {
-        error!(%error, "process-tx worker task failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("process-tx worker task failed: {error}"),
-            }),
-        )
-    })?
-    .map_err(ops_operator_error)
+    });
+    drop(admission);
+    task.await
+        .map_err(|error| {
+            error!(%tx_hash, %error, "process-tx worker task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("process-tx worker task failed: {error}"),
+                }),
+            )
+        })?
+        // The detached task above already logged the failure, so render it
+        // without logging it a second time.
+        .map_err(operator_error_response)
 }
 
 /// Accounts a missed on-chain fill and places the opposite hedge inside the
@@ -2853,15 +2882,11 @@ async fn process_transaction(
     Path(tx_hash): Path<String>,
     Query(query): Query<ProcessTransactionQuery>,
 ) -> Result<Json<ProcessTxResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tx_hash = TxHash::from_str(&tx_hash).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("invalid transaction hash: {error}"),
-            }),
-        )
-    })?;
-    let trading_chain = resolve_process_tx_chain(&state, query.chain)?;
+    let tx_hash = TxHash::from_str(&tx_hash)
+        .map_err(|error| ops_precondition_error(format!("invalid transaction hash: {error}")))?;
+    let trading_chain = process_tx::resolve_chain(&state.ctx, query.chain)
+        .map_err(ops_precondition_error)?
+        .clone();
 
     // process-tx places a live broker hedge, so require FULL startup readiness,
     // not just the published handle: the handle is set when the conductor's own
@@ -2895,6 +2920,10 @@ async fn process_transaction(
         .get(&trading_chain.chain)
         .cloned()
         .ok_or_else(|| {
+            error!(
+                chain = %trading_chain.chain,
+                "no RPC provider is wired for the process-tx chain"
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -2910,11 +2939,12 @@ async fn process_transaction(
         provider,
         SymbolCache::default(),
         handle,
+        &state.detached_tasks,
     )
     .await?;
 
     let response = ProcessTxResponse::try_from(report).map_err(|error| {
-        error!(%error, "failed to format the process-tx response");
+        error!(%tx_hash, %error, "failed to format the process-tx response");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -3214,12 +3244,11 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::providers::ProviderBuilder;
     use std::net::SocketAddr;
     use std::sync::Arc;
 
     use alloy::primitives::{Address, IntoLogData, TxHash, address, fixed_bytes, uint};
-    use alloy::providers::mock::Asserter;
+    use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
@@ -3234,8 +3263,8 @@ mod tests {
     use uuid::uuid;
 
     use st0x_config::{
-        BrokerCtx, ChainEquityAsset, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel,
-        OperationMode, RestApiCtx, create_test_ctx_with_order_owner,
+        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
+        create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
@@ -3309,6 +3338,7 @@ mod tests {
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
             health: crate::startup::HealthGate::default(),
+            detached_tasks: TaskTracker::new(),
         }
     }
 
@@ -6983,7 +7013,7 @@ mod tests {
     }
 
     /// Seeds an `EquityRedemption` into the terminal `Failed` state via
-    /// `Redeem` then `FailTransfer`.
+    /// `Redeem`, `RecordWithdrawSubmission`, then `FailTransfer`.
     async fn seed_redemption_failed(pool: &SqlitePool, id: &RedemptionAggregateId) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
@@ -6997,7 +7027,19 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(10),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1000u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
@@ -7013,9 +7055,9 @@ mod tests {
             .unwrap();
     }
 
-    /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawPending`
-    /// state (redeem requested but not failed).
-    async fn seed_redemption_pending(pool: &SqlitePool, id: &RedemptionAggregateId) {
+    /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawSubmitting`
+    /// origin (exact withdrawal signed and persisted, not yet broadcast).
+    async fn seed_redemption_submitting(pool: &SqlitePool, id: &RedemptionAggregateId) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
             .await
@@ -7028,7 +7070,29 @@ mod tests {
                     chain: Chain::Base,
                     quantity: float!(10),
                     token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1000u64),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seeds an `EquityRedemption` into the non-terminal, non-reconcilable
+    /// `VaultWithdrawSubmitted` state (withdrawal broadcast, awaiting confirmation).
+    async fn seed_redemption_submitted(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        seed_redemption_submitting(pool, id).await;
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
@@ -7280,25 +7344,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_equity_transfer_rejects_a_non_failed_redemption() {
+    async fn reconcile_equity_transfer_reconciles_a_submitting_redemption() {
+        // The one in-flight state with no automatic exit: an operator who
+        // verified the withdrawal's on-chain fate reconciles it out-of-band.
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
-        let id = redemption_aggregate_id("api-redemption-non-failed");
-        seed_redemption_pending(&state.pool, &id).await;
+        let id = redemption_aggregate_id("api-redemption-submitting");
+        seed_redemption_submitting(&state.pool, &id).await;
 
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
-                reason: "handled out-of-band".to_string(),
+                reason: "withdrawal never broadcast; verified on-chain".to_string(),
             }),
         )
         .await;
 
-        let Err((status, _)) = resp else {
-            panic!("expected an error response");
+        let Ok(Json(_)) = resp else {
+            panic!("a stuck submitting redemption must reconcile");
         };
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "the redemption must land in the Reconciled terminal, got {entity:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_reconciles_a_submitted_redemption() {
+        // A broadcast withdrawal (`VaultWithdrawSubmitted`) may still be live
+        // onchain and is never failed automatically, so an operator who verified
+        // it will never land reconciles it out of band, like the submitting origin.
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = redemption_aggregate_id("api-redemption-submitted-reconcile");
+        seed_redemption_submitted(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "withdrawal outrun by fees; verified dead onchain".to_string(),
+            }),
+        )
+        .await;
+
+        let Ok(Json(_)) = resp else {
+            panic!("a stuck submitted redemption must reconcile");
+        };
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "the redemption must land in the Reconciled terminal, got {entity:?}",
+        );
     }
 
     #[tokio::test]
@@ -7436,28 +7541,45 @@ mod tests {
     }
 
     #[test]
-    fn operator_error_maps_rejection_to_400_and_operational_to_500() {
-        assert_eq!(
-            ops_operator_error(OperatorError::Rejected(RejectionReason::BlankReason)).0,
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            ops_operator_error(OperatorError::Operational(anyhow::anyhow!("db down"))).0,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+    fn operator_error_maps_each_variant_to_its_status() {
+        fn mismatch() -> process_tx::PreflightReservationMismatch {
+            process_tx::PreflightReservationMismatch::SellReservedOtherSymbol {
+                symbol: Symbol::new("AAPL").unwrap(),
+                reserved: Symbol::new("MSTR").unwrap(),
+            }
+        }
 
-        let mismatch = process_tx::PreflightReservationMismatch::SellReservedOtherSymbol {
-            symbol: Symbol::new("AAPL").unwrap(),
-            reserved: Symbol::new("MSTR").unwrap(),
-        };
-        let expected = mismatch.to_string();
-        let (status, Json(body)) =
-            ops_operator_error(OperatorError::PreflightReservationMismatch(mismatch));
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            body.error, expected,
-            "the body must carry the typed mismatch reason, not a generic message"
-        );
+        type MakeError = fn() -> OperatorError;
+        let cases: [(MakeError, StatusCode, String); 3] = [
+            (
+                || OperatorError::Rejected(RejectionReason::BlankReason),
+                StatusCode::BAD_REQUEST,
+                RejectionReason::BlankReason.to_string(),
+            ),
+            (
+                || OperatorError::Operational(anyhow::anyhow!("db down")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Operator write command failed".to_string(),
+            ),
+            (
+                || OperatorError::PreflightReservationMismatch(mismatch()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                // The body carries the typed mismatch reason, not a generic message.
+                mismatch().to_string(),
+            ),
+        ];
+
+        for (error, expected_status, expected_body) in cases {
+            // The logging mapping and the unlogged one the process-tx route uses
+            // must render every variant identically.
+            for (status, Json(body)) in [
+                ops_operator_error(error()),
+                operator_error_response(error()),
+            ] {
+                assert_eq!(status, expected_status);
+                assert_eq!(body.error, expected_body);
+            }
+        }
     }
 
     #[test]
@@ -7699,23 +7821,59 @@ mod tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
+    /// A fill kept out of hedging must reach the operator with its cover
+    /// detail, whether this run excluded it or an earlier one did.
+    #[test]
+    fn process_tx_response_serializes_the_exclusion_outcomes() {
+        let cases = [
+            (
+                ProcessTxOutcome::ExcludedFromHedging {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
+                    detail: "cover by SELL".to_string(),
+                },
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "excluded_from_hedging",
+                    "symbol": "AAPL",
+                    "chain": "base",
+                    "detail": "cover by SELL",
+                }),
+            ),
+            (
+                ProcessTxOutcome::AlreadyExcluded {
+                    detail: "cover by SELL".to_string(),
+                },
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "already_excluded",
+                    "detail": "cover by SELL",
+                }),
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            let report = ProcessTxReport {
+                fill: None,
+                outcome,
+            };
+            assert_eq!(
+                serde_json::to_value(ProcessTxResponse::try_from(report).unwrap()).unwrap(),
+                expected,
+            );
+        }
+    }
+
     /// Every domain report must retain its fill identity and outcome across the API boundary.
     #[test]
     fn process_tx_response_serializes_each_mapped_outcome() {
         let tx_hash = TxHash::repeat_byte(0x11);
-        let fill = || ProcessTxFill {
-            tx_hash,
-            log_index: 7,
-            symbol: Symbol::new("AAPL").unwrap(),
-            direction: st0x_execution::Direction::Sell,
-            quantity: FractionalShares::new(Float::parse("1.5".to_owned()).unwrap()),
-            price: Float::parse("123.45".to_owned()).unwrap(),
-        };
+        let fill = || crate::test_utils::process_tx_fill_fixture(tx_hash, "AAPL");
         let fill_json = serde_json::json!({
             "tx_hash": tx_hash.to_string(),
             "log_index": 7,
             "symbol": "AAPL",
-            "direction": "Sell",
+            "direction": "sell",
             "quantity": "1.5",
             "price": "123.45",
         });
@@ -7778,19 +7936,6 @@ mod tests {
             (
                 ProcessTxReport {
                     fill: Some(fill()),
-                    outcome: ProcessTxOutcome::TradingDisabled {
-                        symbol: Symbol::new("AAPL").unwrap(),
-                    },
-                },
-                serde_json::json!({
-                    "fill": fill_json,
-                    "outcome": "trading_disabled",
-                    "symbol": "AAPL",
-                }),
-            ),
-            (
-                ProcessTxReport {
-                    fill: Some(fill()),
                     outcome: ProcessTxOutcome::PlacementRejected {
                         symbol: Symbol::new("AAPL").unwrap(),
                     },
@@ -7826,7 +7971,7 @@ mod tests {
                     "symbol": "AAPL",
                     "offchain_order_id": "11111111-1111-4111-8111-111111111111",
                     "shares": "1.5",
-                    "direction": "Buy",
+                    "direction": "buy",
                     "disposition": wire,
                 }),
             ));
@@ -7837,12 +7982,14 @@ mod tests {
                 fill: Some(fill()),
                 outcome: ProcessTxOutcome::PreflightDeferred {
                     symbol: Symbol::new("AAPL").unwrap(),
+                    reason: "market closed".to_string(),
                 },
             },
             serde_json::json!({
                 "fill": fill_json,
                 "outcome": "preflight_deferred",
                 "symbol": "AAPL",
+                "reason": "market closed",
             }),
         ));
 
@@ -7952,40 +8099,21 @@ mod tests {
         }
     }
 
-    /// Aborting the HTTP request future after the broker placement has begun
-    /// must NOT cancel that placement: `process_transaction` runs the process-tx
-    /// workload on a detached task, so a live broker order completes even when
-    /// nobody awaits the response. This drives the real handler path
-    /// -- a mocked provider decodes a tradeable fill, and the published
-    /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify` -- aborts
-    /// the request once placement has begun, and asserts the placement still
-    /// finishes and that the detached task records its own outcome. Awaiting
-    /// the workload inline instead of the detached `tokio::spawn(...).await`
-    /// would cancel the parked placement and hang `finished`, which is the
-    /// regression this test guards.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn process_tx_task_survives_request_cancellation() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let finished = Arc::new(Notify::new());
-        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ParkedOrderPlacer {
-            started: Arc::clone(&started),
-            release: Arc::clone(&release),
-            finished: Arc::clone(&finished),
-        });
-
-        // A `TakeOrderV3` fill against the bot's own order (`get_test_order`),
-        // with the equity token on the input leg and USDC on the output leg, so
-        // the decoder classifies a 1-share on-chain BUY at 150 USDC. The
-        // opposite hedge is a market SELL, which reaches the parked placer
-        // without a buy preflight.
+    /// A `TakeOrderV3` fill in `tx_hash` against the bot's own order
+    /// (`get_test_order`), with the equity token on the input leg and USDC on
+    /// the output leg, so the decoder classifies a 1 share onchain BUY of AAPL at
+    /// 150 USDC; the opposite hedge is a market SELL. Returns a provider mocked
+    /// to answer the transaction receipt, a symbol cache seeded for the order's
+    /// tokens, and a context whose primary chain points at the fill's orderbook
+    /// and enables AAPL for trading.
+    fn aapl_buy_fill_fixture(
+        tx_hash: TxHash,
+    ) -> (
+        impl alloy::providers::Provider + Clone + 'static,
+        SymbolCache,
+        Ctx,
+    ) {
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let order_owner = get_test_order().owner;
-        let tx_hash =
-            fixed_bytes!("0x4545454545454545454545454545454545454545454545454545454545454545");
         let take_order = TakeOrderV3 {
             sender: address!("0x2222222222222222222222222222222222222222"),
             config: TakeOrderConfigV4 {
@@ -8042,38 +8170,84 @@ mod tests {
         let cache = SymbolCache::default();
         seed_get_test_order_token_symbols(&cache);
 
-        let mut ctx = create_test_ctx_with_order_owner(order_owner);
+        let mut ctx = create_test_ctx_with_order_owner(get_test_order().owner);
         ctx.chains.primary_mut().orderbook = orderbook;
         ctx.chains.primary_mut().assets.equities.symbols.insert(
             Symbol::new("AAPL").unwrap(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
+            crate::test_utils::trading_enabled_equity(),
         );
-        let trading_chain = ctx.chains.primary().clone();
 
-        let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
+        (provider, cache, ctx)
+    }
+
+    /// A `ProcessTxHandle` over standalone stores for `ctx`, with a fresh
+    /// submission lock, the test poll queue and interval, and no wired
+    /// providers (the seam tests pass their provider directly).
+    async fn process_tx_handle(
+        pool: &SqlitePool,
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        ctx: &Ctx,
+        order_placer: Arc<dyn OrderPlacer>,
+    ) -> ProcessTxHandle {
+        let stores = ProcessTxStores::standalone(pool, ctx, Arc::clone(&order_placer))
             .await
             .expect("standalone stores must build");
-        let handle = ProcessTxHandle {
+        ProcessTxHandle {
             order_placer,
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             stores,
-            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
             providers: std::collections::BTreeMap::new(),
-        };
+        }
+    }
+
+    /// Aborting the HTTP request future after the broker placement has begun
+    /// must NOT cancel that placement: `process_transaction` runs the process-tx
+    /// workload on a detached task, so a live broker order completes even when
+    /// nobody awaits the response. This drives the `spawn_and_join_process_tx`
+    /// seam (a mocked provider decodes a tradeable fill, and the
+    /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify`), aborts
+    /// the request once placement has begun, and asserts the placement still
+    /// finishes and that the detached task records its own outcome. Awaiting
+    /// the workload inline instead of the tracked `detached_tasks.spawn(...).await`
+    /// would cancel the parked placement and hang `finished`, which is the
+    /// regression this test guards.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn process_tx_task_survives_request_cancellation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ParkedOrderPlacer {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            finished: Arc::clone(&finished),
+        });
+
+        // The fixture's opposite hedge is a market SELL, which reaches the
+        // parked placer without a buy preflight.
+        let tx_hash =
+            fixed_bytes!("0x4545454545454545454545454545454545454545454545454545454545454545");
+        let (provider, cache, ctx) = aapl_buy_fill_fixture(tx_hash);
+        let trading_chain = ctx.chains.primary().clone();
+
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
 
         let request = tokio::spawn(async move {
-            spawn_and_join_process_tx(tx_hash, ctx, pool, trading_chain, provider, cache, &handle)
-                .await
+            spawn_and_join_process_tx(
+                tx_hash,
+                ctx,
+                pool,
+                trading_chain,
+                provider,
+                cache,
+                &handle,
+                &TaskTracker::new(),
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), started.notified())
@@ -8112,17 +8286,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
-        let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
-            .await
-            .expect("standalone stores must build");
-        let handle = ProcessTxHandle {
-            order_placer,
-            counter_trade_submission_lock: Arc::new(Mutex::new(())),
-            stores,
-            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
-            poll_interval: TEST_POLL_INTERVAL,
-            providers: std::collections::BTreeMap::new(),
-        };
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
 
         let Err((status, Json(_body))) = spawn_and_join_process_tx(
             TxHash::repeat_byte(0x33),
@@ -8132,12 +8296,52 @@ mod tests {
             provider,
             SymbolCache::default(),
             &handle,
+            &TaskTracker::new(),
         )
         .await
         else {
             panic!("a failing RPC endpoint must surface as an error");
         };
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Once shutdown closed the detached task tracker, a process-tx request must
+    /// refuse with 503 instead of spawning work the drain already stopped
+    /// waiting for. The mocked RPC would fail the run with a 500, so a 503 also
+    /// proves the workload never started.
+    #[tokio::test]
+    async fn spawn_and_join_process_tx_refuses_after_the_shutdown_drain_closed() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let trading_chain = ctx.chains.primary().clone();
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
+        let detached_tasks = TaskTracker::new();
+        detached_tasks.close();
+
+        let Err((status, Json(body))) = spawn_and_join_process_tx(
+            TxHash::repeat_byte(0x34),
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            SymbolCache::default(),
+            &handle,
+            &detached_tasks,
+        )
+        .await
+        else {
+            panic!("a closed tracker must refuse the request");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{}", body.error);
+        assert!(
+            detached_tasks.is_empty(),
+            "nothing may be spawned after the close"
+        );
     }
 
     /// A domain rejection from the process-tx workload maps to a 400 through the
@@ -8169,106 +8373,29 @@ mod tests {
         .await
         .unwrap();
 
-        // A `TakeOrderV3` fill against the bot's own order, decoding a 1-share
-        // on-chain BUY of AAPL (opposite hedge is a market SELL), mirroring the
-        // cancellation test's fixture.
-        let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let order_owner = get_test_order().owner;
         let tx_hash =
             fixed_bytes!("0x4646464646464646464646464646464646464646464646464646464646464646");
-        let take_order = TakeOrderV3 {
-            sender: address!("0x2222222222222222222222222222222222222222"),
-            config: TakeOrderConfigV4 {
-                order: get_test_order(),
-                inputIOIndex: U256::from(1),
-                outputIOIndex: U256::from(0),
-                signedContext: vec![SignedContextV1 {
-                    signer: Address::ZERO,
-                    signature: Vec::new().into(),
-                    context: Vec::new(),
-                }],
-            },
-            input: Float::from_fixed_decimal_lossy(uint!(150_U256), 0)
-                .unwrap()
-                .0
-                .get_inner(),
-            output: Float::from_fixed_decimal_lossy(uint!(1_U256), 0)
-                .unwrap()
-                .0
-                .get_inner(),
-        };
-        let orderbook_log = Log {
-            inner: alloy::primitives::Log {
-                address: orderbook,
-                data: take_order.to_log_data(),
-            },
-            block_hash: None,
-            block_number: None,
-            block_timestamp: Some(1_700_000_000),
-            transaction_hash: Some(tx_hash),
-            transaction_index: None,
-            log_index: Some(7),
-            removed: false,
-        };
-        let receipt = serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x2a",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": orderbook,
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": format!("0x{}", "0".repeat(512)),
-            "logs": [orderbook_log]
-        });
-        let asserter = Asserter::new();
-        asserter.push_success(&receipt);
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let cache = SymbolCache::default();
-        seed_get_test_order_token_symbols(&cache);
-
-        let mut ctx = create_test_ctx_with_order_owner(order_owner);
-        ctx.chains.primary_mut().orderbook = orderbook;
-        ctx.chains.primary_mut().assets.equities.symbols.insert(
-            symbol.clone(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
+        let (provider, cache, ctx) = aapl_buy_fill_fixture(tx_hash);
         let trading_chain = ctx.chains.primary().clone();
 
         let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
-        let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
-            .await
-            .expect("standalone stores must build");
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
         assert!(
-            !stores.schedule_enabled,
+            !handle.stores.schedule_enabled,
             "this context configures no trading schedule, so the stores must have it disabled"
         );
-        let handle = ProcessTxHandle {
-            order_placer,
-            counter_trade_submission_lock: Arc::new(Mutex::new(())),
-            stores,
-            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
-            poll_interval: TEST_POLL_INTERVAL,
-            providers: std::collections::BTreeMap::new(),
-        };
 
-        let Err((status, Json(body))) =
-            spawn_and_join_process_tx(tx_hash, ctx, pool, trading_chain, provider, cache, &handle)
-                .await
+        let Err((status, Json(body))) = spawn_and_join_process_tx(
+            tx_hash,
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            cache,
+            &handle,
+            &TaskTracker::new(),
+        )
+        .await
         else {
             panic!("a schedule-disabled retained Pending must surface as a rejection");
         };
@@ -8334,102 +8461,27 @@ mod tests {
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(MismatchOrderPlacer);
 
-        // A `TakeOrderV3` fill against the bot's own order decoding a 1-share
-        // on-chain BUY of AAPL, whose opposite hedge is a market SELL. The
-        // placer answers that sell's preflight with a buying power reservation,
-        // the reservation a buy would earn, so the sell fails closed.
-        let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let order_owner = get_test_order().owner;
+        // The fixture's opposite hedge is a market SELL. The placer answers
+        // that sell's preflight with a buying power reservation, the
+        // reservation a buy would earn, so the sell fails closed.
         let tx_hash =
             fixed_bytes!("0x4747474747474747474747474747474747474747474747474747474747474747");
-        let take_order = TakeOrderV3 {
-            sender: address!("0x2222222222222222222222222222222222222222"),
-            config: TakeOrderConfigV4 {
-                order: get_test_order(),
-                inputIOIndex: U256::from(1),
-                outputIOIndex: U256::from(0),
-                signedContext: vec![SignedContextV1 {
-                    signer: Address::ZERO,
-                    signature: Vec::new().into(),
-                    context: Vec::new(),
-                }],
-            },
-            input: Float::from_fixed_decimal_lossy(uint!(150_U256), 0)
-                .unwrap()
-                .0
-                .get_inner(),
-            output: Float::from_fixed_decimal_lossy(uint!(1_U256), 0)
-                .unwrap()
-                .0
-                .get_inner(),
-        };
-        let orderbook_log = Log {
-            inner: alloy::primitives::Log {
-                address: orderbook,
-                data: take_order.to_log_data(),
-            },
-            block_hash: None,
-            block_number: None,
-            block_timestamp: Some(1_700_000_000),
-            transaction_hash: Some(tx_hash),
-            transaction_index: None,
-            log_index: Some(7),
-            removed: false,
-        };
-        let receipt = serde_json::json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x1",
-            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
-            "blockNumber": "0x2a",
-            "from": "0x1234567890123456789012345678901234567890",
-            "to": orderbook,
-            "gasUsed": "0x5208",
-            "effectiveGasPrice": "0x77359400",
-            "cumulativeGasUsed": "0x5208",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": format!("0x{}", "0".repeat(512)),
-            "logs": [orderbook_log]
-        });
-        let asserter = Asserter::new();
-        asserter.push_success(&receipt);
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let cache = SymbolCache::default();
-        seed_get_test_order_token_symbols(&cache);
-
-        let mut ctx = create_test_ctx_with_order_owner(order_owner);
-        ctx.chains.primary_mut().orderbook = orderbook;
-        ctx.chains.primary_mut().assets.equities.symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            ChainEquityAsset {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![],
-                trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
+        let (provider, cache, ctx) = aapl_buy_fill_fixture(tx_hash);
         let trading_chain = ctx.chains.primary().clone();
 
-        let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
-            .await
-            .expect("standalone stores must build");
-        let handle = ProcessTxHandle {
-            order_placer,
-            counter_trade_submission_lock: Arc::new(Mutex::new(())),
-            stores,
-            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
-            poll_interval: TEST_POLL_INTERVAL,
-            providers: std::collections::BTreeMap::new(),
-        };
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
 
-        let Err((status, Json(body))) =
-            spawn_and_join_process_tx(tx_hash, ctx, pool, trading_chain, provider, cache, &handle)
-                .await
+        let Err((status, Json(body))) = spawn_and_join_process_tx(
+            tx_hash,
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            cache,
+            &handle,
+            &TaskTracker::new(),
+        )
+        .await
         else {
             panic!("a sell that received a buying power reservation must fail closed");
         };
@@ -8447,31 +8499,24 @@ mod tests {
         );
     }
 
+    /// A chain that is not configured as a hedged chain is an operator input
+    /// error, rejected with a 400 before any recovery work starts.
     #[tokio::test]
-    async fn process_transaction_resolves_only_configured_hedged_chains() {
-        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let secondary_rpc: url::Url = "http://ethereum.test:8545".parse().unwrap();
-        ctx.chains.insert_secondary(
-            HedgedChain::test()
-                .chain(Chain::Ethereum)
-                .rpc_url(secondary_rpc.clone())
-                .call(),
-        );
-        let state = empty_app_state(ctx).await;
+    async fn process_transaction_rejects_an_unconfigured_chain() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
 
-        let default_chain = resolve_process_tx_chain(&state, None).unwrap();
-        assert_eq!(default_chain.chain, Chain::Base);
+        let (status, Json(body)) = process_transaction(
+            State(state),
+            Path(TxHash::repeat_byte(0x11).to_string()),
+            Query(ProcessTransactionQuery {
+                chain: Some(Chain::Robinhood),
+            }),
+        )
+        .await
+        .unwrap_err();
 
-        let selected_chain = resolve_process_tx_chain(&state, Some(Chain::Ethereum)).unwrap();
-        assert_eq!(selected_chain.chain, Chain::Ethereum);
-        assert_eq!(selected_chain.rpc_url, secondary_rpc);
-
-        let Err((status, Json(body))) = resolve_process_tx_chain(&state, Some(Chain::Robinhood))
-        else {
-            panic!("unconfigured chain must be rejected");
-        };
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.error.contains("robinhood"));
+        assert!(body.error.contains("robinhood"), "got: {}", body.error);
     }
 
     /// Invalid transaction hashes must be rejected before any recovery work starts.

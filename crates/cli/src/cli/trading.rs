@@ -7,7 +7,7 @@ use reqwest::StatusCode;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use st0x_config::{BrokerCtx, Ctx, HedgedChain};
@@ -19,11 +19,13 @@ use st0x_execution::{
     OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 use st0x_float_serde::format_float_with_fallback;
+use st0x_hedge::operator::OperatorError;
 use st0x_hedge::operator::offchain::order::{
     BrokerOrderPlacement, OrderPlacementResult, OrderPlacer,
 };
 use st0x_hedge::operator::process_tx::{
     PlacedHedgeDisposition, ProcessTxChainContext, ProcessTxOutcome, ProcessTxReport,
+    ProcessTxStores, process_tx,
 };
 use st0x_registry::SymbolCache;
 
@@ -672,13 +674,8 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
 ) -> anyhow::Result<()> {
     // The CLI runs outside the bot: no reactors to reach, so standalone stores.
     // Their trading schedule flag is derived from the same config the bot uses.
-    let stores = st0x_hedge::operator::process_tx::ProcessTxStores::standalone(
-        pool,
-        ctx,
-        order_placer.clone(),
-    )
-    .await?;
-    let report = st0x_hedge::operator::process_tx::process_tx(
+    let stores = ProcessTxStores::standalone(pool, ctx, order_placer.clone()).await?;
+    let result = process_tx(
         tx_hash,
         ctx,
         pool,
@@ -688,7 +685,25 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         None,
         None,
     )
-    .await?;
+    .await;
+
+    let report = match result {
+        Ok(report) => report,
+        Err(failure) => {
+            let chain = trading_chain.chain;
+            match &failure {
+                OperatorError::Rejected(reason) => {
+                    warn!(%tx_hash, %chain, %reason, "process-tx rejected");
+                }
+                other => error!(%tx_hash, %chain, error = %other, "process-tx failed"),
+            }
+            writeln!(
+                stdout,
+                "❌ Failed to process transaction {tx_hash}: {failure}"
+            )?;
+            return Err(failure.into());
+        }
+    };
     render_process_tx_report(tx_hash, &report, stdout)
 }
 
@@ -735,7 +750,7 @@ fn render_process_tx_outcome<W: Write>(
         ProcessTxOutcome::AlreadyAccounted => {
             writeln!(
                 stdout,
-                "Fill is already fully accounted. Nothing to do; the normal pipeline will hedge any unhedged position exposure."
+                "Fill is already fully accounted. Nothing to do; the periodic position check hedges any unhedged exposure while trading is enabled for the symbol."
             )?;
         }
         ProcessTxOutcome::PendingHedgeInFlight => {
@@ -747,22 +762,35 @@ fn render_process_tx_outcome<W: Write>(
         ProcessTxOutcome::BelowExecutionThreshold => {
             writeln!(
                 stdout,
-                "Trade accumulated but did not trigger execution yet (waiting to accumulate enough shares for a whole share execution)."
+                "Trade accumulated but the position is not ready for execution yet (below the execution threshold, no price yet for a dollar value threshold, or held by an equity transfer)."
             )?;
         }
-        ProcessTxOutcome::TradingDisabled { symbol } => {
-            writeln!(stdout, "Trading disabled by configuration for {symbol}")?;
+        ProcessTxOutcome::ExcludedFromHedging {
+            symbol,
+            chain,
+            detail,
+        } => {
+            writeln!(
+                stdout,
+                "Trading is disabled for {symbol} on {chain}: the fill is not counter traded and was recorded in skipped_fills: {detail}"
+            )?;
+        }
+        ProcessTxOutcome::AlreadyExcluded { detail } => {
+            writeln!(
+                stdout,
+                "The fill was excluded from hedging while trading was disabled and is recorded in skipped_fills. The pipeline will not hedge it: {detail}"
+            )?;
         }
         ProcessTxOutcome::PlacementRejected { symbol } => {
             writeln!(
                 stdout,
-                "Placement for {symbol} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill."
+                "Placement for {symbol} was rejected by the position's current state (a pending order, an equity transfer, or a changed net). Settled the fill."
             )?;
         }
-        ProcessTxOutcome::PreflightDeferred { symbol } => {
+        ProcessTxOutcome::PreflightDeferred { symbol, reason } => {
             writeln!(
                 stdout,
-                "Trade accumulated but the placement preflight deferred the hedge for {symbol}: buying power could not cover a buy, or the equity reservation blocked a sell. Settled the fill."
+                "Trade accumulated but the placement preflight deferred the hedge for {symbol}: {reason}. Settled the fill."
             )?;
         }
         ProcessTxOutcome::HedgePlaced {
@@ -1016,9 +1044,8 @@ mod tests {
         SupportedExecutor, Usd,
     };
     use st0x_hedge::operator::offchain::order::OffchainOrderId;
-    use st0x_hedge::operator::process_tx::ProcessTxFill;
     use st0x_hedge::operator::test_utils::{
-        mock_alpaca_broker_ctx, try_positive_shares, try_setup_test_db,
+        mock_alpaca_broker_ctx, try_positive_shares, try_process_tx_fill_fixture, try_setup_test_db,
     };
 
     use super::*;
@@ -2848,16 +2875,7 @@ mod tests {
         let tx_hash = TxHash::repeat_byte(0x11);
         let not_found = TxHash::repeat_byte(0x22);
         let symbol = || Symbol::new("MSTR").expect("test symbol must be valid");
-        let fill = || ProcessTxFill {
-            tx_hash,
-            log_index: 7,
-            symbol: symbol(),
-            direction: Direction::Sell,
-            quantity: FractionalShares::new(
-                Float::parse("1.5".to_owned()).expect("test quantity must be valid"),
-            ),
-            price: Float::parse("123.45".to_owned()).expect("test price must be valid"),
-        };
+        let fill = || try_process_tx_fill_fixture(tx_hash, "MSTR").unwrap();
         let fill_summary = format!(
             "✅ Found opposite-side trade opportunity:\n\
              \x20  Transaction: {tx_hash}\n\
@@ -2894,7 +2912,7 @@ mod tests {
                     outcome: ProcessTxOutcome::AlreadyAccounted,
                 },
                 format!(
-                    "{fill_summary}Fill is already fully accounted. Nothing to do; the normal pipeline will hedge any unhedged position exposure.\n"
+                    "{fill_summary}Fill is already fully accounted. Nothing to do; the periodic position check hedges any unhedged exposure while trading is enabled for the symbol.\n"
                 ),
             ),
             (
@@ -2912,17 +2930,32 @@ mod tests {
                     outcome: ProcessTxOutcome::BelowExecutionThreshold,
                 },
                 format!(
-                    "{fill_summary}Trade accumulated but did not trigger execution yet (waiting to accumulate enough shares for a whole share execution).\n"
+                    "{fill_summary}Trade accumulated but the position is not ready for execution yet (below the execution threshold, no price yet for a dollar value threshold, or held by an equity transfer).\n"
                 ),
             ),
             (
                 ProcessTxReport {
                     fill: Some(fill()),
-                    outcome: ProcessTxOutcome::TradingDisabled { symbol: symbol() },
+                    outcome: ProcessTxOutcome::ExcludedFromHedging {
+                        symbol: symbol(),
+                        chain: st0x_evm::Chain::Base,
+                        detail: "cover by SELL".to_string(),
+                    },
                 },
                 format!(
-                    "{fill_summary}Trading disabled by configuration for {}\n",
+                    "{fill_summary}Trading is disabled for {} on base: the fill is not counter traded and was recorded in skipped_fills: cover by SELL\n",
                     symbol()
+                ),
+            ),
+            (
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::AlreadyExcluded {
+                        detail: "cover by SELL".to_string(),
+                    },
+                },
+                format!(
+                    "{fill_summary}The fill was excluded from hedging while trading was disabled and is recorded in skipped_fills. The pipeline will not hedge it: cover by SELL\n"
                 ),
             ),
             (
@@ -2931,7 +2964,7 @@ mod tests {
                     outcome: ProcessTxOutcome::PlacementRejected { symbol: symbol() },
                 },
                 format!(
-                    "{fill_summary}Placement for {} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill.\n",
+                    "{fill_summary}Placement for {} was rejected by the position's current state (a pending order, an equity transfer, or a changed net). Settled the fill.\n",
                     symbol()
                 ),
             ),
@@ -2972,10 +3005,13 @@ mod tests {
         cases.push((
             ProcessTxReport {
                 fill: Some(fill()),
-                outcome: ProcessTxOutcome::PreflightDeferred { symbol: symbol() },
+                outcome: ProcessTxOutcome::PreflightDeferred {
+                    symbol: symbol(),
+                    reason: "fractional order notional is below the $1 minimum".to_owned(),
+                },
             },
             format!(
-                "{fill_summary}Trade accumulated but the placement preflight deferred the hedge for {}: buying power could not cover a buy, or the equity reservation blocked a sell. Settled the fill.\n",
+                "{fill_summary}Trade accumulated but the placement preflight deferred the hedge for {}: fractional order notional is below the $1 minimum. Settled the fill.\n",
                 symbol()
             ),
         ));
