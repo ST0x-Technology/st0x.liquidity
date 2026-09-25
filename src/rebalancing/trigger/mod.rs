@@ -864,6 +864,13 @@ pub(crate) struct RebalancingService {
     pending_timed_out_mint_reservation_releases: Arc<RwLock<HashMap<IssuerRequestId, Symbol>>>,
     pending_timed_out_redemption_reservation_releases:
         Arc<RwLock<HashMap<RedemptionAggregateId, Symbol>>>,
+    /// Reconciled redemptions whose signed vault withdrawal still reserves a
+    /// wallet nonce, for which the resume job enqueue that releases it failed.
+    /// The payload stays here until a later sweep tick enqueues it, so a
+    /// transient queue push failure no longer strands the reservation until a
+    /// restart.
+    pending_reconciled_nonce_release_jobs:
+        Arc<RwLock<HashMap<RedemptionAggregateId, TransferEquityToHedging>>>,
     /// Reservations created by a trigger check that produced no durable job.
     /// The exact reservation ID stays here until Position acknowledges release;
     /// otherwise a transient store failure can permanently block hedging.
@@ -956,7 +963,12 @@ enum RedemptionTimeoutCleanup {
     /// wrote `OperatorReconciled` to the store, but the live reactor never
     /// observed it. The sweep applies the reactor's terminal reconcile cleanup
     /// so the guard, inflight, and reservation clear without a restart.
-    Reconciled { tracking: RedemptionTracking },
+    Reconciled {
+        tracking: RedemptionTracking,
+        /// Whether the reconciled redemption still held a signed vault
+        /// withdrawal whose wallet nonce reservation must be released.
+        held_prepared: bool,
+    },
     /// The transfer genuinely timed out at a non-submission stage and must be
     /// force-resolved.
     TimedOut {
@@ -1057,6 +1069,7 @@ impl RebalancingService {
             pending_timed_out_redemption_reservation_releases: Arc::new(
                 RwLock::new(HashMap::new()),
             ),
+            pending_reconciled_nonce_release_jobs: Arc::new(RwLock::new(HashMap::new())),
             pending_pre_enqueue_reservation_releases: Arc::new(RwLock::new(HashMap::new())),
             pending_equity_transfer_reservation_restores: Arc::new(RwLock::new(HashMap::new())),
             timed_out_usdc_rebalances: Arc::new(RwLock::new(HashMap::new())),
@@ -1427,6 +1440,7 @@ impl RebalancingService {
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
         self.retry_pending_reservation_releases().await;
+        self.retry_pending_reconciled_nonce_releases().await;
         self.retry_pending_equity_transfer_reservation_restores()
             .await?;
         self.prune_timeout_markers(now).await;
@@ -1661,7 +1675,10 @@ impl RebalancingService {
             };
 
             match cleanup {
-                RedemptionTimeoutCleanup::Reconciled { tracking } => {
+                RedemptionTimeoutCleanup::Reconciled {
+                    tracking,
+                    held_prepared,
+                } => {
                     error!(
                         target: "rebalance",
                         aggregate_id = %id,
@@ -1674,6 +1691,29 @@ impl RebalancingService {
                     self.clear_equity_in_progress(&tracking.symbol);
                     self.queue_terminal_redemption_reservation_release(&id, &tracking.symbol)
                         .await;
+                    if held_prepared {
+                        // The reconciled redemption still held a signed vault
+                        // withdrawal, so its wallet nonce is still reserved. The
+                        // sweep holds no wallet, so it enqueues a resume job whose
+                        // terminal branch discards the reservation. Always enqueue:
+                        // the release is ownership checked and idempotent, so a
+                        // redundant row (when a live redrive row also observes the
+                        // durable `Reconciled`) is harmless, whereas skipping on a
+                        // live row could drop the release entirely if that row
+                        // already passed its own terminal check before the
+                        // reconcile. A failed enqueue is retained and retried on
+                        // the next sweep tick.
+                        self.enqueue_reconciled_nonce_release_job(TransferEquityToHedging {
+                            aggregate_id: id.clone(),
+                            symbol: tracking.symbol.clone(),
+                            quantity: tracking.quantity,
+                            generation: GuardGeneration::default(),
+                            chain: tracking.chain,
+                            backpressure_streak: BackpressureStreak::default(),
+                            position_reservation_retry_attempts: 0,
+                        })
+                        .await;
+                    }
                 }
                 RedemptionTimeoutCleanup::TimedOut { tracking, elapsed } => {
                     let elapsed_secs = elapsed.as_secs();
@@ -2154,7 +2194,10 @@ impl RebalancingService {
                 return Ok(None);
             };
             match store.load(id).await {
-                Ok(Some(EquityRedemption::Reconciled { .. })) => {
+                Ok(Some(EquityRedemption::Reconciled {
+                    withdrawal_nonce_hash,
+                    ..
+                })) => {
                     // Cancel the MarketMaking inflight (the shares never left the
                     // vault, per the operator's verified-dead reconcile) and clear
                     // the active redemption, exactly like `on_redemption`'s
@@ -2197,7 +2240,10 @@ impl RebalancingService {
                             timed_out_at: now,
                         },
                     );
-                    return Ok(Some(RedemptionTimeoutCleanup::Reconciled { tracking }));
+                    return Ok(Some(RedemptionTimeoutCleanup::Reconciled {
+                        tracking,
+                        held_prepared: withdrawal_nonce_hash.is_some(),
+                    }));
                 }
                 Ok(Some(_) | None) => return Ok(None),
                 Err(load_error) => {
@@ -6175,6 +6221,55 @@ impl RebalancingService {
         for (id, symbol) in pending_redemptions {
             self.release_timed_out_redemption_reservation(&id, &symbol)
                 .await;
+        }
+    }
+
+    /// Enqueues the resume job that releases a reconciled withdrawal's wallet
+    /// nonce reservation, retaining the payload for a later retry if the queue
+    /// push fails. The enqueued job's terminal branch performs the ownership
+    /// checked, idempotent release.
+    async fn enqueue_reconciled_nonce_release_job(&self, job: TransferEquityToHedging) {
+        let aggregate_id = job.aggregate_id.clone();
+        let symbol = job.symbol.clone();
+        match self
+            .transfer_equity_to_hedging_queue
+            .clone()
+            .push(job.clone())
+            .await
+        {
+            Ok(()) => {
+                self.pending_reconciled_nonce_release_jobs
+                    .write()
+                    .await
+                    .remove(&aggregate_id);
+            }
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    aggregate_id = %aggregate_id,
+                    %symbol,
+                    %error,
+                    "Failed to enqueue a resume job to release the reconciled \
+                     withdrawal's nonce; retrying on the next sweep tick"
+                );
+                self.pending_reconciled_nonce_release_jobs
+                    .write()
+                    .await
+                    .insert(aggregate_id, job);
+            }
+        }
+    }
+
+    /// Retries every resume job enqueue that previously failed, dropping each
+    /// from the pending set once the queue accepts it.
+    async fn retry_pending_reconciled_nonce_releases(&self) {
+        let pending = self
+            .pending_reconciled_nonce_release_jobs
+            .read()
+            .await
+            .clone();
+        for (_id, job) in pending {
+            self.enqueue_reconciled_nonce_release_job(job).await;
         }
     }
 
@@ -21186,26 +21281,35 @@ mod tests {
             .unwrap();
     }
 
-    /// Drives an `EquityRedemption` aggregate to `Failed` state (terminal).
-    ///
-    /// `Redeem`, `RecordWithdrawSubmission`, and `FailTransfer` call no
-    /// services, so they are safe with panicking services.
+    /// Drives an `EquityRedemption` aggregate to the terminal `Failed` state
+    /// entirely through the aggregate command path (never a direct `events`
+    /// insert; see docs/cqrs.md): `Redeem` -> `RecordWithdrawSubmission` ->
+    /// `ConfirmWithdraw` (resolved by a confirming mock chain service) ->
+    /// `FailTransfer`. A broadcast submission can no longer be force failed, so
+    /// the force fail runs from `WithdrawnFromRaindex`, the earliest
+    /// force-failable origin.
     async fn seed_terminal_redemption_aggregate(
         pool: &SqlitePool,
         redemption_id: &RedemptionAggregateId,
     ) {
-        let store =
-            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking());
+        use EquityRedemptionCommand::*;
+
+        let token = Address::ZERO;
+        let amount = U256::from(1_000_000_000_000_000_000_u128);
+        let store = test_store::<EquityRedemption>(
+            pool.clone(),
+            EquityTransferServices::confirming_withdrawal(token, amount),
+        );
         store
             .send(
                 redemption_id,
-                EquityRedemptionCommand::Redeem {
+                Redeem {
                     chain: Chain::Base,
                     symbol: Symbol::new("tAAPL").unwrap(),
                     quantity: float!(1),
-                    token: Address::ZERO,
+                    token,
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: U256::ZERO,
+                    amount,
                     from_block: 0,
                     prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
@@ -21215,16 +21319,17 @@ mod tests {
         store
             .send(
                 redemption_id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
-                    tx_hash: TxHash::ZERO,
+                RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
             .unwrap();
+        store.send(redemption_id, ConfirmWithdraw).await.unwrap();
         store
             .send(
                 redemption_id,
-                EquityRedemptionCommand::FailTransfer {
+                FailTransfer {
                     reason: "test: forced redemption failure".to_string(),
                 },
             )
@@ -22119,6 +22224,81 @@ mod tests {
             available,
             Some(shares(100)),
             "reconcile restores the never-withdrawn shares to available"
+        );
+
+        // The reconciled redemption still held a signed withdrawal, so its wallet
+        // nonce is still reserved and no resume job remains to release it. The
+        // sweep holds no wallet, so it must enqueue a resume job whose terminal
+        // branch discards the reservation, replacing the old restart instruction.
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_all(service.transfer_equity_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the sweep must enqueue exactly one resume job to release the reconciled \
+             withdrawal's nonce"
+        );
+        let enqueued: TransferEquityToHedging = serde_json::from_slice(&payloads[0]).unwrap();
+        assert_eq!(
+            enqueued.aggregate_id, id,
+            "the enqueued resume job must target the reconciled redemption"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_enqueues_a_pending_reconciled_nonce_release_and_drains_it() {
+        // A transient queue push failure while enqueuing the resume job that
+        // releases a reconciled withdrawal's nonce retains the payload; a later
+        // sweep tick must enqueue it and drop it from the pending set, so the
+        // reservation is freed without a restart.
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let id = redemption_aggregate_id("pending-nonce-release-retry");
+        let symbol = Symbol::new("tAAPL").unwrap();
+        service
+            .pending_reconciled_nonce_release_jobs
+            .write()
+            .await
+            .insert(
+                id.clone(),
+                TransferEquityToHedging {
+                    chain: Chain::Base,
+                    aggregate_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(10)),
+                    generation: equity::GuardGeneration::default(),
+                    backpressure_streak: BackpressureStreak::default(),
+                    position_reservation_retry_attempts: 0,
+                },
+            );
+
+        service.retry_pending_reconciled_nonce_releases().await;
+
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_all(service.transfer_equity_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the retry must enqueue the pending resume job"
+        );
+        let enqueued: TransferEquityToHedging = serde_json::from_slice(&payloads[0]).unwrap();
+        assert_eq!(enqueued.aggregate_id, id);
+        assert!(
+            service
+                .pending_reconciled_nonce_release_jobs
+                .read()
+                .await
+                .is_empty(),
+            "a successful retry must drain the pending set"
         );
     }
 

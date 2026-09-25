@@ -545,7 +545,7 @@ mod tests {
             )
         }
 
-        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+        async fn discard_prepared(&self, _tx_hash: TxHash) {
             panic!(
                 "StubWallet::discard_prepared called - use a real wallet in tests that need transactions"
             );
@@ -823,7 +823,7 @@ mod tests {
             Ok(prepared.tx_hash())
         }
 
-        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {}
+        async fn discard_prepared(&self, _tx_hash: TxHash) {}
 
         async fn restore_prepared(&self, _prepared: &PreparedTransaction) {}
 

@@ -7012,23 +7012,31 @@ mod tests {
             .unwrap();
     }
 
-    /// Seeds an `EquityRedemption` into the terminal `Failed` state via
-    /// `Redeem`, `RecordWithdrawSubmission`, then `FailTransfer`.
+    /// Seeds an `EquityRedemption` into the terminal `Failed` state entirely
+    /// through the aggregate command path (never a direct `events` insert; see
+    /// docs/cqrs.md): `Redeem` -> `RecordWithdrawSubmission` -> `ConfirmWithdraw`
+    /// (resolved by a confirming mock chain service) -> `FailTransfer`. A
+    /// broadcast submission can no longer be force failed, so the force fail
+    /// runs from `WithdrawnFromRaindex`, the earliest force-failable origin.
     async fn seed_redemption_failed(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        use EquityRedemptionCommand::*;
+
+        let token = Address::ZERO;
+        let amount = U256::from(10_000_000_000_000_000_000_u128);
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(EquityTransferServices::panicking())
+            .build(EquityTransferServices::confirming_withdrawal(token, amount))
             .await
             .unwrap();
         store
             .send(
                 id,
-                EquityRedemptionCommand::Redeem {
-                    symbol: Symbol::new("AAPL").unwrap(),
+                Redeem {
                     chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
-                    token: Address::ZERO,
+                    token,
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: U256::from(1000u64),
+                    amount,
                     from_block: 0,
                     prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
@@ -7038,16 +7046,17 @@ mod tests {
         store
             .send(
                 id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
+                RecordWithdrawSubmission {
                     tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
             .unwrap();
+        store.send(id, ConfirmWithdraw).await.unwrap();
         store
             .send(
                 id,
-                EquityRedemptionCommand::FailTransfer {
+                FailTransfer {
                     reason: "seed: transfer failed".to_string(),
                 },
             )

@@ -29,8 +29,9 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
+use alloy::primitives::TxHash;
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
 use st0x_evm::Chain;
@@ -268,6 +269,7 @@ where
 
     Ok(false)
 }
+
 impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
     type Output = ();
     type Error = TransferEquityToMarketMakingJobError;
@@ -691,6 +693,23 @@ pub(crate) trait ResumeEquityToHedging: Send + Sync + 'static {
         chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError>;
+
+    /// Release the wallet nonce reservation a prepared vault withdrawal still
+    /// holds after its redemption was reconciled out-of-band. A reconcile is
+    /// pure bookkeeping and never touches the wallet, so without this the
+    /// reservation survives until a restart and later sends from that wallet
+    /// queue behind the freed nonce.
+    ///
+    /// Defaults to a no-op: only the production [`CrossVenueEquityTransfer`]
+    /// holds a wallet, so a resume double without one has no reservation to
+    /// release.
+    async fn discard_reconciled_withdrawal(
+        &self,
+        _chain: Chain,
+        _tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -703,6 +722,14 @@ impl ResumeEquityToHedging for CrossVenueEquityTransfer {
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError> {
         Self::resume_equity_to_hedging(self, aggregate_id, symbol, chain, quantity).await
+    }
+
+    async fn discard_reconciled_withdrawal(
+        &self,
+        chain: Chain,
+        tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        Self::discard_reconciled_withdrawal(self, chain, tx_hash).await
     }
 }
 
@@ -812,13 +839,46 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         // blocks reservation restoration, so the job would otherwise reschedule
         // itself forever). Release the reservation defensively (idempotent; the
         // terminal-event reactor also releases it).
-        if ctx
+        let terminal_state = ctx
             .redemption_store
             .load(&self.aggregate_id)
             .await
             .map_err(|error| Box::new(RedemptionError::from(error)))?
-            .is_some_and(|aggregate| aggregate.is_terminal())
-        {
+            .filter(EquityRedemption::is_terminal);
+        if let Some(aggregate) = terminal_state {
+            // A reconcile is pure bookkeeping and never touches the wallet, so a
+            // redemption reconciled while its vault withdrawal was still signed
+            // leaves the withdrawal's nonce reserved. Release it here, the first
+            // time a resume observes the durable `Reconciled`, so later sends
+            // from this wallet stop queueing behind the freed nonce without a
+            // restart. The release is idempotent, so a redriven observation is
+            // harmless.
+            if let EquityRedemption::Reconciled {
+                withdrawal_nonce_hash: Some(tx_hash),
+                chain,
+                ..
+            } = &aggregate
+            {
+                match ctx
+                    .transfer
+                    .discard_reconciled_withdrawal(*chain, *tx_hash)
+                    .await
+                {
+                    Ok(()) => info!(
+                        target: "rebalance",
+                        symbol = %self.symbol,
+                        aggregate_id = %self.aggregate_id,
+                        "Released the reconciled withdrawal's nonce reservation"
+                    ),
+                    Err(error) => warn!(
+                        target: "rebalance",
+                        symbol = %self.symbol,
+                        aggregate_id = %self.aggregate_id,
+                        %error,
+                        "Failed to release a reconciled withdrawal's nonce reservation"
+                    ),
+                }
+            }
             if let Some((position_store, _)) = &ctx.position_authority {
                 position_store
                     .send(
@@ -975,8 +1035,8 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                     "Equity redemption {} ({}) exhausted its transfer job budget while its \
                      Raindex vault withdrawal is unresolved, and no live job remains to drive \
                      it. Verify the withdrawal onchain; if it can never confirm, reconcile it \
-                     (`stox transfer reconcile --kind redemption --id {}`) and restart the bot \
-                     to clear the stuck wallet nonce.",
+                     (`stox transfer reconcile --kind redemption --id {}`), which releases its \
+                     reservation and frees the stuck wallet nonce.",
                     self.aggregate_id, self.symbol, self.aggregate_id,
                 );
                 if let Err(alert_error) = ctx.notifier.notify(&message).await {
@@ -1681,46 +1741,13 @@ mod tests {
             fail: false,
             captured: Mutex::new(None),
         });
-        let mut ctx = redemption_test_ctx(
+        let (mut ctx, redemption_pool) = redemption_test_ctx_with_pool(
             stub.clone(),
             TransferEquityToHedgingJobQueue::new(&apalis_pool),
         )
         .await;
         let aggregate_id = redemption_aggregate_id("terminal-redemption-no-defer");
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::Redeem {
-                    symbol: symbol.clone(),
-                    chain: Chain::Base,
-                    quantity: float!(1),
-                    token: Address::ZERO,
-                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: U256::from(1_u64),
-                    from_block: 0,
-                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
-                },
-            )
-            .await
-            .unwrap();
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
-                    tx_hash: alloy::primitives::TxHash::ZERO,
-                },
-            )
-            .await
-            .unwrap();
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::FailTransfer {
-                    reason: "test: forced terminal state".to_string(),
-                },
-            )
-            .await
-            .unwrap();
+        seed_redemption_failed(&redemption_pool, &aggregate_id, &symbol).await;
         ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
 
         let job = TransferEquityToHedging {
@@ -3053,6 +3080,16 @@ mod tests {
         transfer: Arc<dyn ResumeEquityToHedging>,
         job_queue: TransferEquityToHedgingJobQueue,
     ) -> TransferEquityToHedgingCtx {
+        redemption_test_ctx_with_pool(transfer, job_queue).await.0
+    }
+
+    /// Variant that also returns the redemption events pool, so a test can seed
+    /// aggregate history no command path reaches without live chain services
+    /// (for example a `WithdrawnFromRaindex` origin).
+    async fn redemption_test_ctx_with_pool(
+        transfer: Arc<dyn ResumeEquityToHedging>,
+        job_queue: TransferEquityToHedgingJobQueue,
+    ) -> (TransferEquityToHedgingCtx, sqlx::SqlitePool) {
         let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
@@ -3071,14 +3108,168 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        TransferEquityToHedgingCtx {
+        let ctx = TransferEquityToHedgingCtx {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
-            redemption_store: Arc::new(test_store(pool, services)),
+            redemption_store: Arc::new(test_store(pool.clone(), services)),
             position_authority: None,
             job_queue,
             notifier: Arc::new(crate::alerts::LogNotifier),
-        }
+        };
+        (ctx, pool)
+    }
+
+    /// Seeds a fresh redemption into the terminal `Failed` state entirely
+    /// through the aggregate command path (never a direct `events` insert; see
+    /// docs/cqrs.md): `Redeem` -> `RecordWithdrawSubmission` -> `ConfirmWithdraw`
+    /// (resolved by a confirming mock chain service) -> `FailTransfer`. A
+    /// broadcast submission can no longer be force failed, so the force fail
+    /// runs from `WithdrawnFromRaindex`, the earliest force-failable origin.
+    async fn seed_redemption_failed(
+        pool: &sqlx::SqlitePool,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+    ) {
+        use EquityRedemptionCommand::*;
+
+        let token = Address::ZERO;
+        let amount = U256::from(1_000_000_000_000_000_000_u128);
+        let store = test_store::<EquityRedemption>(
+            pool.clone(),
+            EquityTransferServices::confirming_withdrawal(token, amount),
+        );
+        store
+            .send(
+                id,
+                Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    token,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store.send(id, ConfirmWithdraw).await.unwrap();
+        store
+            .send(
+                id,
+                FailTransfer {
+                    reason: "test: forced terminal state".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A resume that observes a redemption reconciled while its vault withdrawal
+    /// was still signed must release the wallet nonce reservation the prepared
+    /// withdrawal still holds, so later sends stop queueing behind it without a
+    /// restart. This automated release is the reconcile's replacement for the
+    /// old "restart the bot" alert instruction.
+    #[tokio::test]
+    async fn reconciled_withdrawal_resume_releases_the_nonce_reservation() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let raindex = Arc::new(MockRaindex::new());
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: raindex.clone(),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let transfer =
+            CrossVenueEquityTransfer::new(services.clone(), mint_store, redemption_store.clone());
+
+        // Seed a signed-but-unconfirmed withdrawal, then reconcile it out-of-band
+        // (the operator verified it will never land). `Reconciled` retains the
+        // prepared withdrawal so the resume can release its nonce.
+        let id = redemption_aggregate_id("reconciled-nonce-release");
+        let prepared = crate::equity_redemption::prepared_withdrawal_for_test();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
+                    quantity: float!(10),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: alloy::primitives::U256::from(1_u64),
+                    from_block: 0,
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "withdrawal verified dead onchain".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ctx = TransferEquityToHedgingCtx {
+            transfer: Arc::new(transfer),
+            equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+            redemption_store,
+            position_authority: None,
+            job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
+            notifier: Arc::new(crate::alerts::LogNotifier),
+        };
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: id.clone(),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a reconciled redemption must terminate cleanly");
+
+        assert_eq!(
+            raindex.discard_prepared_withdrawal_calls(),
+            vec![prepared.tx_hash()],
+            "a resume observing the durable Reconciled must release the withdrawal's \
+             nonce reservation exactly once"
+        );
     }
 
     /// Stub for `EquityRedemptionError::BotGasEnqueueFailed` propagated as
@@ -3720,7 +3911,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let generation = GuardGeneration::from_parts(NonZeroU32::new(5).unwrap(), 3);
         let aggregate_id = redemption_aggregate_id("terminal-redemption-terminal-aggregate");
-        let mut ctx = redemption_test_ctx(
+        let (mut ctx, redemption_pool) = redemption_test_ctx_with_pool(
             Arc::new(RecordingRedemptionResume {
                 fail: false,
                 captured: Mutex::new(None),
@@ -3729,42 +3920,10 @@ mod tests {
         )
         .await;
 
-        // Drive the redemption to a terminal Failed state: a terminal aggregate
-        // no longer owns the reservation, so cleanup must release it.
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::Redeem {
-                    symbol: symbol.clone(),
-                    chain: Chain::Base,
-                    quantity: float!(1),
-                    token: Address::ZERO,
-                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: U256::from(1_u64),
-                    from_block: 0,
-                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
-                },
-            )
-            .await
-            .unwrap();
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
-                    tx_hash: alloy::primitives::TxHash::ZERO,
-                },
-            )
-            .await
-            .unwrap();
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::FailTransfer {
-                    reason: "test: forced terminal state".to_string(),
-                },
-            )
-            .await
-            .unwrap();
+        // Drive the redemption to a terminal Failed state via a still allowed
+        // force fail: a terminal aggregate no longer owns the reservation, so
+        // cleanup must release it.
+        seed_redemption_failed(&redemption_pool, &aggregate_id, &symbol).await;
 
         let position_pool = crate::test_utils::setup_test_db().await;
         let (position_store, position_projection) = StoreBuilder::<Position>::new(position_pool)

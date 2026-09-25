@@ -2401,7 +2401,7 @@ async fn durable_withdrawal_recovery_reserves_nonce_before_later_preparation() -
         prepared.nonce().saturating_add(1),
         "a later prepared transaction must not reuse the durable withdrawal nonce"
     );
-    restarted.discard_prepared(&following).await;
+    restarted.discard_prepared(following.tx_hash()).await;
     Ok(())
 }
 

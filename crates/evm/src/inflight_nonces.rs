@@ -4,8 +4,9 @@
 //! [`ResettableNonceManager`](crate::nonce::ResettableNonceManager) owns the
 //! allocator's coherent set of prepared and broadcast-but-unconfirmed nonces.
 //! [`InFlightNonces`] adds transaction hashes to that ownership: a record is
-//! created when a submission is accepted or restored from durable state, and
-//! `await_receipt` resolves it. A mined transaction clears every competing
+//! created when a prepared transaction is signed, when a generic send is
+//! accepted, or when durable state is restored, and `await_receipt` resolves
+//! it. A mined transaction clears every competing
 //! hash recorded at its nonce. A proven-dropped generic transaction clears
 //! only that hash and rewinds allocation when it was the final hash. Durable
 //! prepared transactions instead remain occupied after a drop because their
@@ -216,6 +217,56 @@ impl InFlightNonces {
         }
     }
 
+    /// Ownership-checked release for an explicit operator discard of a durable
+    /// prepared transaction (e.g. reconciling a stuck vault withdrawal). Finds
+    /// the nonce whose recorded hash set still contains `tx_hash`, removes that
+    /// hash regardless of its drop policy, and when it was the nonce's last hash
+    /// releases the reservation and rewinds allocation so the freed nonce is
+    /// reused before any higher one.
+    ///
+    /// Keyed by hash, so it is safe against the two ways a reconcile can be
+    /// observed more than once (a sleeping redrive row and the timeout sweep's
+    /// enqueue, plus apalis retries): once the first release removes the hash, a
+    /// later call finds nothing for `tx_hash` and is a no-op, leaving intact any
+    /// different transaction that has since taken the reallocated nonce. Returns
+    /// whether this call was the owner that released the reservation.
+    ///
+    /// Callers must hold the wallet send lock across this operation.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) async fn release_durable_by_hash(&self, address: Address, tx_hash: TxHash) -> bool {
+        let released_nonce =
+            {
+                let Some(mut record) = self.nonces.get_mut(&address) else {
+                    return false;
+                };
+                let Some(nonce) = record.per_nonce.iter().find_map(|(nonce, tx_hashes)| {
+                    tx_hashes.contains_key(&tx_hash).then_some(*nonce)
+                }) else {
+                    return false;
+                };
+                let Some(tx_hashes) = record.per_nonce.get_mut(&nonce) else {
+                    return false;
+                };
+                tx_hashes.remove(&tx_hash);
+                if tx_hashes.is_empty() {
+                    record.per_nonce.remove(&nonce);
+                    Some(nonce)
+                } else {
+                    None
+                }
+            };
+
+        match released_nonce {
+            Some(nonce) => {
+                self.nonce_manager
+                    .release_nonce_and_rewind(address, nonce)
+                    .await;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether this wallet's own bookkeeping recognizes `nonce` as
     /// currently occupied by a transaction it broadcast itself. See
     /// [`NonceOwnership`] and the module doc for what each answer proves.
@@ -405,6 +456,51 @@ mod tests {
             in_flight.ownership(ADDRESS, OTHER_NONCE),
             NonceOwnership::Ours,
             "confirming one nonce must not disturb a different in-flight nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_durable_by_hash_is_ownership_checked_and_reuse_safe() {
+        // Reconciling a stuck withdrawal is observed more than once (a sleeping
+        // redrive row plus the timeout sweep, plus apalis retries). The first
+        // ownership-checked release frees the nonce; a later release for the same
+        // withdrawal must be a no-op that leaves intact any different transaction
+        // that has since taken the reallocated nonce, so a stale repeat can never
+        // strand an unrelated send.
+        let manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(manager.clone());
+        let stuck_hash = TxHash::repeat_byte(0x91);
+
+        in_flight.record_durable(ADDRESS, NONCE, stuck_hash);
+        assert_eq!(in_flight.ownership(ADDRESS, NONCE), NonceOwnership::Ours);
+
+        assert!(
+            in_flight.release_durable_by_hash(ADDRESS, stuck_hash).await,
+            "the first release still owns the nonce and must free the reservation"
+        );
+        assert_eq!(
+            in_flight.ownership(ADDRESS, NONCE),
+            NonceOwnership::Unknown,
+            "the reconciled withdrawal's nonce record must be gone after release"
+        );
+
+        // A different transaction now takes the freed, rewound nonce.
+        let reused_hash = TxHash::repeat_byte(0x92);
+        in_flight.record_durable(ADDRESS, NONCE, reused_hash);
+
+        assert!(
+            !in_flight.release_durable_by_hash(ADDRESS, stuck_hash).await,
+            "a repeat release for the already-released withdrawal must be a no-op"
+        );
+        assert_eq!(
+            in_flight.ownership(ADDRESS, NONCE),
+            NonceOwnership::Ours,
+            "the stale repeat must not disturb the transaction that reused the nonce"
+        );
+        assert!(
+            manager.release_occupied_nonce(ADDRESS, NONCE),
+            "the stale repeat must leave the reused transaction's allocator hold \
+             intact, not just its in-flight record"
         );
     }
 }
