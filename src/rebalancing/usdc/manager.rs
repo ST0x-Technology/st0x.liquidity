@@ -4396,7 +4396,7 @@ impl<
             // Idempotency comes from CCTP's nonce being authoritative
             // (`receiveMessage` reverts on an already-consumed nonce) plus
             // `recover_already_minted`'s own reconstruction, whose backward
-            // scan is bounded by `RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS` on the
+            // scan is bounded by `RECONSTRUCTION_SCAN_LOOKBACK` on the
             // bridge side.
             Err(CctpError::MintRecoveryInconclusive { recovery_error }) => {
                 let outside_scan = recovery_mint_outside_scan(&recovery_error, initiated_at);

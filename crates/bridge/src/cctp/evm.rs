@@ -14,7 +14,7 @@ use tracing::{debug, info, trace, warn};
 #[cfg(test)]
 use st0x_evm::Evm;
 use st0x_evm::{
-    EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    Chain, EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
     PreparedTransaction, Wallet, wait_for_node_sync,
 };
 
@@ -76,37 +76,52 @@ const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// trusted as a true absence (the burn lands at/after `from_block`).
 const SCAN_FINALITY_MARGIN: u64 = 2;
 
-/// Number of [`CCTP_RECOVERY_LOG_BLOCK_CHUNK`]-sized chunks
-/// [`CctpEndpoint::reconstruct_existing_mint`]'s retry scans backward from
-/// the current head before giving up, bounding a single scan attempt's cost.
-///
-/// This floor is safe specifically because `reconstruct_existing_mint` only
-/// runs after [`CctpEndpoint::recover_already_minted`]'s probe loop has
-/// itself just observed `usedNonces()` flip to consumed, within the current
-/// recovery window (production: ~2 minutes). The matching `MessageReceived`
-/// log is therefore necessarily within the last few chunks of the current
-/// head, not somewhere deep in chain history, so three chunks (60,000
-/// blocks -- many hours even on a fast chain like Base) is a wide margin
-/// over the sub-minute recency this bound relies on, while still cutting a
-/// worst-case scan from thousands of chunks to three.
-///
-/// [`CctpEndpoint::find_existing_mint`] does not rely on this recency
-/// argument: it floors its scan at the destination head captured before the
-/// mint, lowered to at least [`MINT_SCAN_LOOKBACK_CHUNKS`] below the head.
-const RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS: u64 = 3;
+/// How far back [`CctpEndpoint::reconstruct_existing_mint`] scans from the
+/// head. It runs only after [`CctpEndpoint::recover_already_minted`] saw
+/// `usedNonces()` flip to consumed within its ~2 minute window, so the log is
+/// within minutes of the head; this bounds the cost of a lagging node.
+const RECONSTRUCTION_SCAN_LOOKBACK: Duration = Duration::from_secs(33 * 60 * 60 + 20 * 60);
 
-/// Chunks [`CctpEndpoint::find_existing_mint`] always looks back from the
-/// head, below a captured scan floor too: that floor is read after Circle
-/// attests, so a relayer's mint can predate it. A mint older than both is left
-/// to the operator rather than found by a scan to genesis on every resume.
-/// Only a transfer that started before the floor block was mined can have one.
-const MINT_SCAN_LOOKBACK_CHUNKS: u64 = 3;
+/// How far back [`CctpEndpoint::find_existing_mint`] always looks from the
+/// head, below a captured floor too: that floor is read after Circle attests,
+/// so a relayer's mint can predate it. Above the 24 h attestation deadline; a
+/// mint older than both is left to the operator.
+const MINT_SCAN_LOOKBACK: Duration = Duration::from_secs(33 * 60 * 60 + 20 * 60);
 
-/// Blocks [`CctpEndpoint::find_existing_mint`] scans below a captured floor,
-/// for a relayer mint between Circle's attestation and the floor capture.
-/// The bot polls attestations every 5s; 300 blocks is 10 minutes on Base
-/// (~2s blocks), many polls and job retries, and tiny against the lookback.
-const CAPTURED_FLOOR_MARGIN_BLOCKS: u64 = 300;
+/// How far below a captured floor [`CctpEndpoint::find_existing_mint`] scans,
+/// for a relayer mint between Circle's attestation and the floor capture. The
+/// bot polls attestations every 5 s, so this is many polls and job retries.
+const CAPTURED_FLOOR_MARGIN: Duration = Duration::from_secs(10 * 60);
+
+/// The mint scan bounds in one chain's blocks: the time spans above divided
+/// by the chain's fastest block cadence, rounded up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanWindow {
+    pub(crate) floor_margin_blocks: u64,
+    pub(crate) mint_lookback_blocks: u64,
+    pub(crate) reconstruction_lookback_blocks: u64,
+}
+
+impl ScanWindow {
+    pub(crate) const fn for_chain(chain: Chain) -> Self {
+        let interval = whole_millis(chain.min_block_interval());
+
+        Self {
+            floor_margin_blocks: whole_millis(CAPTURED_FLOOR_MARGIN).div_ceil(interval),
+            mint_lookback_blocks: whole_millis(MINT_SCAN_LOOKBACK).div_ceil(interval),
+            reconstruction_lookback_blocks: whole_millis(RECONSTRUCTION_SCAN_LOOKBACK)
+                .div_ceil(interval),
+        }
+    }
+}
+
+/// Whole milliseconds in `duration`, saturating far above any span here.
+const fn whole_millis(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_mul(1000)
+        .saturating_add(duration.subsec_millis() as u64)
+}
 
 /// Delay between the `usedNonces()` probes that
 /// [`CctpEvm::recover_already_minted`] runs after a failed `receiveMessage`.
@@ -283,6 +298,8 @@ pub(crate) struct CctpEndpoint<W: Wallet> {
     message_transmitter_address: Address,
     /// Wallet for submitting write transactions
     wallet: W,
+    /// Mint scan bounds in this chain's blocks.
+    scan_window: ScanWindow,
     /// Poll interval between `eth_blockNumber` calls in [`wait_for_node_sync`].
     ///
     /// Production always uses [`NODE_SYNC_POLL_INTERVAL`]. Tests override it to
@@ -308,6 +325,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// The wallet's provider is used for read-only view calls.
     /// The wallet itself handles signing and submission of write transactions.
     pub(crate) fn new(
+        chain: Chain,
         usdc: Address,
         token_messenger: Address,
         message_transmitter: Address,
@@ -318,6 +336,7 @@ impl<W: Wallet> CctpEndpoint<W> {
             token_messenger_address: token_messenger,
             message_transmitter_address: message_transmitter,
             wallet,
+            scan_window: ScanWindow::for_chain(chain),
             node_sync_poll_interval: NODE_SYNC_POLL_INTERVAL,
             burn_drop_config: BurnDropConfig::defaults(),
             mint_recovery_config: MintRecoveryConfig::defaults(),
@@ -1041,8 +1060,8 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// this directly -- see its own doc for why.
     ///
     /// The log scan for a consumed nonce is floored at the lower of
-    /// `scan_from_block` less [`CAPTURED_FLOOR_MARGIN_BLOCKS`] and
-    /// [`MINT_SCAN_LOOKBACK_CHUNKS`] below the head.
+    /// `scan_from_block` less [`CAPTURED_FLOOR_MARGIN`] and
+    /// [`MINT_SCAN_LOOKBACK`] below the head, both in this chain's blocks.
     /// A log still missing after the lag retries is
     /// [`CctpError::MintNotFoundInScanWindow`], which carries whether the
     /// nonce was used below the floor so the caller can tell index lag from a
@@ -1064,9 +1083,10 @@ impl<W: Wallet> CctpEndpoint<W> {
             return Ok(None);
         }
 
-        let lookback_floor = self.current_block().await?.saturating_sub(
-            CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(MINT_SCAN_LOOKBACK_CHUNKS),
-        );
+        let lookback_floor = self
+            .current_block()
+            .await?
+            .saturating_sub(self.scan_window.mint_lookback_blocks);
 
         // A relayer can mint before the floor was captured (burns name no
         // destination caller), so a captured floor is lowered by a margin and
@@ -1074,7 +1094,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         // a lower floor cannot adopt another mint.
         let from_block = scan_from_block.map_or(lookback_floor, |captured| {
             captured
-                .saturating_sub(CAPTURED_FLOOR_MARGIN_BLOCKS)
+                .saturating_sub(self.scan_window.floor_margin_blocks)
                 .min(lookback_floor)
         });
 
@@ -1194,8 +1214,8 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// [`find_recent_usdc_transfer`](Self::find_recent_usdc_transfer) already
     /// apply to their own `get_logs` scans. This runs at most once per
     /// `recover_already_minted` call (not once per probe). Each retry's scan
-    /// is additionally floored at [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`]
-    /// chunks behind the current head, so `SCAN_ATTEMPTS` retries are genuinely
+    /// is additionally floored at [`RECONSTRUCTION_SCAN_LOOKBACK`] behind the
+    /// current head, so `SCAN_ATTEMPTS` retries are genuinely
     /// a handful of quick attempts instead of each one repeating a full
     /// backward walk to genesis. A failed head read is returned as-is: there is
     /// no floor to scan from, and the caller redrives.
@@ -1210,9 +1230,10 @@ impl<W: Wallet> CctpEndpoint<W> {
         &self,
         received_message: &CctpReceivedMessage<'_>,
     ) -> Result<MintReceipt, CctpError> {
-        let min_block = self.current_block().await?.saturating_sub(
-            CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS),
-        );
+        let min_block = self
+            .current_block()
+            .await?
+            .saturating_sub(self.scan_window.reconstruction_lookback_blocks);
 
         self.locate_mint_in_scan_window::<Registry>(received_message, min_block)
             .await
@@ -1518,7 +1539,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     ///
     /// `min_block` floors how far back the scan walks:
     /// [`find_existing_mint`](Self::find_existing_mint)'s floor, or
-    /// [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`] below the head for
+    /// [`RECONSTRUCTION_SCAN_LOOKBACK`] below the head for
     /// the reconstruction that just saw the nonce become consumed.
     async fn find_received_message_tx(
         &self,
@@ -1830,8 +1851,6 @@ mod tests {
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::primitives::{Bloom, Log as PrimitiveLog};
     use alloy::rpc::types::Log;
-
-    use st0x_evm::Chain;
 
     use super::*;
 

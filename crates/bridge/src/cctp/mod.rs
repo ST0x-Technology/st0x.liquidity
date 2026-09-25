@@ -755,6 +755,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         let message_transmitter = MESSAGE_TRANSMITTER_V2;
 
         let ethereum = CctpEndpoint::new(
+            Chain::Ethereum,
             ctx.corridor.usdc_ethereum,
             token_messenger,
             message_transmitter,
@@ -762,6 +763,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         );
 
         let base = CctpEndpoint::new(
+            Chain::Base,
             ctx.corridor.usdc_base,
             token_messenger,
             message_transmitter,
@@ -2287,6 +2289,7 @@ mod tests {
         let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
         let ethereum = CctpEndpoint::new(
+            Chain::Ethereum,
             usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -2295,6 +2298,7 @@ mod tests {
         .with_node_sync_poll_interval(Duration::ZERO);
 
         let base = CctpEndpoint::new(
+            Chain::Base,
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -2983,6 +2987,7 @@ mod tests {
         let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
         let ethereum = CctpEndpoint::new(
+            Chain::Ethereum,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -2991,6 +2996,7 @@ mod tests {
         .with_node_sync_poll_interval(Duration::ZERO);
 
         let base = CctpEndpoint::new(
+            Chain::Base,
             base_usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -3673,6 +3679,7 @@ mod tests {
             let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
             let ethereum = CctpEndpoint::new(
+                Chain::Ethereum,
                 self.ethereum.usdc,
                 self.ethereum.token_messenger,
                 self.ethereum.message_transmitter,
@@ -3681,6 +3688,7 @@ mod tests {
             .with_node_sync_poll_interval(Duration::ZERO);
 
             let base = CctpEndpoint::new(
+                Chain::Base,
                 self.base.usdc,
                 self.base.token_messenger,
                 self.base.message_transmitter,
@@ -4210,6 +4218,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let recovering_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4314,6 +4323,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let counting_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4407,6 +4417,7 @@ mod tests {
         )
         .with_revert_failures(1);
         let reverting_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4491,6 +4502,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4568,6 +4580,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4666,6 +4679,7 @@ mod tests {
         );
         let remaining_empty_log_scans = flaky_wallet.remaining_empty_log_scans();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4760,6 +4774,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4857,6 +4872,7 @@ mod tests {
         .with_failing_historical_reads();
         let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4986,6 +5002,7 @@ mod tests {
         .with_historical_reads_at(before_burn);
         let requested_historical_block = flaky_wallet.requested_historical_block();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5067,6 +5084,7 @@ mod tests {
         .with_reported_head_offset(1_000_000)
         .with_historical_reads_at(after_mint);
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5195,6 +5213,7 @@ mod tests {
         .with_historical_reads_shifted_by(captured - 1 - after_mint);
         let requested_historical_block = flaky_wallet.requested_historical_block();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5262,6 +5281,7 @@ mod tests {
             .await
             .unwrap();
         let ethereum = CctpEndpoint::new(
+            Chain::Ethereum,
             cctp.ethereum.usdc,
             cctp.ethereum.token_messenger,
             cctp.ethereum.message_transmitter,
@@ -5273,6 +5293,7 @@ mod tests {
             .await
             .unwrap();
         let lagging_base = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5346,6 +5367,7 @@ mod tests {
         .with_failing_head_reads(1);
         let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5427,6 +5449,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
