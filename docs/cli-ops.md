@@ -866,7 +866,7 @@ before the startup token approvals.
   its funds. The bot holds the transfer and its guard: its job ends without a
   retry, and startup and the timeout sweep do not re-arm it. A job for a fresh
   transfer asking for that corridor (nothing recorded yet) dead-letters instead,
-  and its dead-letter alert starts with the same words. `transfer resume` and
+  and its dead-letter alert contains the same text. `transfer resume` and
   `transfer recheck` are refused with messages that start with the same words.
   `transfer reconcile` does not accept the pre-burn states such a transfer is
   usually in; do not try it there. A held transfer in a reconcilable failed
