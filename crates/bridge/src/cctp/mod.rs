@@ -4711,6 +4711,24 @@ mod tests {
         };
         assert_eq!(from_block, head - lookback);
         assert!(lowest_scanned_block.load(Ordering::SeqCst) >= head - lookback);
+
+        // A captured floor below the lookback floor wins: a transfer older than
+        // the lookback can still find its own mint.
+        let old_floor = head - lookback - 10_000;
+        let old_floor_error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(old_floor),
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { from_block, .. } = old_floor_error else {
+            panic!("a consumed nonce outside the window must fail: {old_floor_error:?}");
+        };
+        assert_eq!(from_block, old_floor);
+        assert_eq!(lowest_scanned_block.load(Ordering::SeqCst), old_floor);
     }
 
     /// Burns name no destination caller, so a relayer can mint between Circle
