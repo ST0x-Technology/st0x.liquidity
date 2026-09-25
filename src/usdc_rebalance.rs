@@ -2139,11 +2139,14 @@ pub(crate) async fn deposit_send_recorded_elsewhere(
                 AND json_extract(payload, '$.DepositSendAttached.send_tx') = ?) \
                OR (event_type = 'UsdcRebalanceEvent::DepositInitiated' \
                 AND json_extract(payload, '$.DepositInitiated.deposit_ref.OnchainTx') = ?) \
+               OR (event_type = 'UsdcRebalanceEvent::DepositFailed' \
+                AND json_extract(payload, '$.DepositFailed.deposit_ref.OnchainTx') = ?) \
            ) \
          ORDER BY rowid \
          LIMIT 1",
     )
     .bind(id.to_string())
+    .bind(&send_tx)
     .bind(&send_tx)
     .bind(&send_tx)
     .bind(&send_tx)
