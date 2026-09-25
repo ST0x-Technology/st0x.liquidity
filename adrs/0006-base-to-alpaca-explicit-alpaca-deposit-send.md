@@ -117,8 +117,10 @@ with a `PreparedTransaction`, RAI-2485):
    refused broadcast, an unknown receipt or a drop redrives after 30 s with no
    budget, paging on every redrive once 4 hours have passed since the send was
    persisted (then every 30 minutes). A signed send is never re-signed or
-   fee-bumped, so one that can never confirm (its nonce taken by another tx, or
-   a fee the market outran) is settled by the operator with
+   fee-bumped. One that will not confirm at its current fee can still mine when
+   fees drop, so the operator settles the transfer only once a different tx is
+   mined at its nonce (another send took it, or the operator cancels it with a
+   higher-fee 0-value self-transfer at that nonce), with
    `transfer reconcile --kind usdc`, which accepts a BaseToAlpaca `Bridged` with
    a signed send. A mined revert -> `FailDeposit` for reconciliation, paged.
 4. At startup the bot reserves the nonce of every signed send still on `Bridged`
