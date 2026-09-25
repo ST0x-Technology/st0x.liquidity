@@ -3231,6 +3231,56 @@ mod tests {
         );
     }
 
+    /// Reconciling a Base->Alpaca `Bridged` with a signed deposit send leaves
+    /// that send's nonce reserved in the running bot, so the CLI says a
+    /// restart is required.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_with_a_signed_deposit_send_requires_a_restart() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xD5E1);
+
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridged(&store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::PrepareDepositSend {
+                    prepared: PreparedTransaction::for_test(
+                        alloy::primitives::TxHash::repeat_byte(0xD5),
+                        9,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "Reconciling stuck USDC transfer id: {id}\n\
+                 Reconciled USDC transfer {id} (reason: FundsMovedManually); the in-progress \
+                 guard will clear on the next sweep tick (within transfer_timeout). Restart \
+                 the bot to release the signed deposit send's nonce: until then later sends \
+                 from the Ethereum wallet wait behind it.\n",
+                id = UsdcRebalanceId(id),
+            )
+        );
+    }
+
     #[tokio::test]
     async fn test_transfer_usdc_requires_wallet_config() {
         let mut ctx = create_alpaca_test_ctx();
