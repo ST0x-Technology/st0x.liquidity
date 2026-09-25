@@ -2845,7 +2845,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
     raindex_service: Arc<RaindexService<Signer>>,
     rebalancing_ctx: &RebalancingCtx,
     required_confirmations: u64,
-    ethereum_required_confirmations: u64,
+    ethereum_required_confirmations: Option<u64>,
     reserved_cash: Option<Usd>,
     telemetry: TelemetrySender,
 ) -> anyhow::Result<RebalancerServices<Signer>> {
@@ -3316,7 +3316,11 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             raindex_service,
             &rebalancing_ctx,
             deps.ctx.chains.primary().required_confirmations,
-            deposit_send_required_confirmations(&deps.ctx.chains)?,
+            deposit_send_required_confirmations(&deps.ctx.chains)
+                .inspect_err(|error| {
+                    warn!(target: "rebalance", %error, "Reconcile of a signed Alpaca deposit send is refused until [chains.ethereum] is configured");
+                })
+                .ok(),
             cash.map(|cash| cash.reserved).map(Positive::inner),
             deps.telemetry.clone(),
         )

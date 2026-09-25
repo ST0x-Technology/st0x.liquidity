@@ -99,8 +99,9 @@ pub struct UsdcSettlementParams {
     pub settlement_retry_deadline: Duration,
     pub required_confirmations: u64,
     /// Depth a tx on Ethereum needs before it proves a signed deposit send
-    /// can never mine: Ethereum's own `required_confirmations`.
-    pub ethereum_required_confirmations: u64,
+    /// can never mine: Ethereum's own `required_confirmations`. `None` with
+    /// no `[chains.ethereum]` entry, which refuses that proof.
+    pub ethereum_required_confirmations: Option<u64>,
     pub reserved_cash: Option<Usd>,
     /// Circle attestation/fee API base URL (test-only override; production
     /// builds use the [`st0x_bridge::cctp::CIRCLE_API_BASE`] constant).
@@ -392,7 +393,7 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     attestation_retry_deadline: Duration,
     settlement_retry_deadline: Duration,
     required_confirmations: u64,
-    ethereum_required_confirmations: u64,
+    ethereum_required_confirmations: Option<u64>,
     reserved_cash: Option<Usd>,
     gas_readiness: ConfiguredGasReadiness,
     /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
@@ -6333,6 +6334,8 @@ pub enum DepositSendNotSuperseded {
     /// address it pays cannot be read.
     #[error("deposit send {tx} is not a readable USDC transfer; its deposit address is unknown")]
     UnreadableDepositSend { tx: TxHash },
+    #[error(transparent)]
+    EthereumChainMissing(#[from] EthereumChainMissing),
     /// Reading Ethereum failed -- transient, retry later.
     #[error("could not read superseding tx {superseding} on Ethereum; retry")]
     Read {
@@ -6433,7 +6436,7 @@ fn deposit_send_recipient(prepared: &PreparedTransaction) -> Option<Address> {
 
 /// The configured chains have no Ethereum entry, so there is no depth for
 /// the tx that supersedes a signed deposit send.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("no [chains.ethereum] entry: its required_confirmations gates the deposit send check")]
 pub struct EthereumChainMissing;
 
@@ -6513,12 +6516,16 @@ where
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded> {
+        let required_confirmations = self
+            .ethereum_required_confirmations
+            .ok_or(EthereumChainMissing)?;
+
         verify_deposit_send_superseded(
             &*self.cctp_bridge,
             prepared,
             superseding_tx,
             self.market_maker_wallet,
-            self.ethereum_required_confirmations,
+            required_confirmations,
         )
         .await
     }
@@ -7708,7 +7715,7 @@ mod tests {
             attestation_retry_deadline: TEST_ATTESTATION_RETRY_DEADLINE,
             settlement_retry_deadline: TEST_SETTLEMENT_RETRY_DEADLINE,
             required_confirmations: 3,
-            ethereum_required_confirmations: 3,
+            ethereum_required_confirmations: Some(3),
             reserved_cash: None,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -15851,7 +15858,9 @@ mod tests {
                 .call(),
         );
         let settlement = UsdcSettlementParams {
-            ethereum_required_confirmations: deposit_send_required_confirmations(&chains).unwrap(),
+            ethereum_required_confirmations: Some(
+                deposit_send_required_confirmations(&chains).unwrap(),
+            ),
             ..test_settlement_params()
         };
         let chain = deploy_ethereum_usdc_chain().await;

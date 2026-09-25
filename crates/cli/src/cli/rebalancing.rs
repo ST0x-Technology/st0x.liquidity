@@ -991,7 +991,9 @@ async fn run_usdc_transfer<Writer: Write>(
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations: ctx.chains.primary().required_confirmations,
-            ethereum_required_confirmations: deposit_send_required_confirmations(&ctx.chains)?,
+            ethereum_required_confirmations: Some(deposit_send_required_confirmations(
+                &ctx.chains,
+            )?),
             reserved_cash: ctx
                 .assets
                 .cash
