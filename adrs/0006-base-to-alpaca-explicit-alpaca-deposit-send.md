@@ -127,9 +127,12 @@ with a `PreparedTransaction`, RAI-2485):
    `transfer reconcile --kind usdc`, which accepts a BaseToAlpaca `Bridged` with
    a signed send. A mined revert -> `FailDeposit` for reconciliation, paged.
 4. At startup the bot reserves the nonce of every signed send still on `Bridged`
-   (`restore_prepared`) before any job, startup approval or stale-allowance
-   revoke can send from the wallet. A failure to read them pages and does not
-   stop startup.
+   (`restore_prepared`) and rebroadcasts its exact bytes (`broadcast_prepared`,
+   no confirmation wait) before any job, startup approval or stale-allowance
+   revoke can send from the wallet, so none of them waits behind a send no node
+   holds. A failure to read them pages and does not stop startup. A failed
+   rebroadcast pages and skips the Ethereum startup approvals and revokes on
+   that start.
 5. Resume with no signed send still scans from the mint block (for transfers
    that reached `Bridged` before this change), but a match is never adopted: it
    fails the transfer for reconciliation. An empty scan signs and sends.
