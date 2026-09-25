@@ -2132,6 +2132,7 @@ mod tests {
     use reqwest::StatusCode;
     use uuid::{Uuid, uuid};
 
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_evm::{Chain, EvmError};
     use st0x_execution::{
         AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, DeadlineCancel,
@@ -6520,5 +6521,21 @@ mod tests {
             "alert must name the transfer and the uncomputable credit; got: {:?}",
             messages[0]
         );
+    }
+
+    /// Rows queued by a build that predates corridors carry none; they read
+    /// as Base via CCTP, the only corridor there was.
+    #[test]
+    fn queued_rows_without_a_corridor_read_as_base_via_cctp() {
+        let row = serde_json::json!({
+            "id": UsdcRebalanceId(Uuid::new_v4()),
+            "amount": "100",
+        });
+
+        let hedging: TransferUsdcToHedging = serde_json::from_value(row.clone()).unwrap();
+        let market_making: TransferUsdcToMarketMaking = serde_json::from_value(row).unwrap();
+
+        assert_eq!(hedging.corridor, UsdcCorridor::BASE_CCTP);
+        assert_eq!(market_making.corridor, UsdcCorridor::BASE_CCTP);
     }
 }

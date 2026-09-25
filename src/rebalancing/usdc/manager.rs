@@ -6600,6 +6600,7 @@ mod tests {
         CctpAttestationMock, CctpBridge, CctpCorridor, CctpCtx, TestMintBurnToken,
         deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
     };
+    use st0x_bridge::corridor::HopKind;
     use st0x_config::HedgedChain;
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -25955,6 +25956,182 @@ mod tests {
             ),
             "Aggregate must advance to WithdrawalComplete before the RPC failure so \
              apalis redrives enter the durable re-check path; got: {state:?}"
+        );
+    }
+
+    /// A corridor this service does not serve.
+    const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Robinhood,
+        hop: HopKind::Relay,
+    };
+
+    /// A transfer recorded on another corridor is refused before any call:
+    /// this service's bridge and vault belong to its own corridor.
+    #[tokio::test]
+    async fn resume_alpaca_to_base_on_another_corridor_fails_closed_before_any_send() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let any_request = server.mock(|when, then| {
+            when.any_request();
+            then.status(500);
+        });
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .resume_alpaca_to_base(&id, amount, ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::CorridorMismatch {
+                    recorded: ROBINHOOD_RELAY,
+                    served: UsdcCorridor::BASE_CCTP,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        any_request.assert_calls(0);
+        let state = cqrs.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(state, UsdcRebalance::ConversionComplete { .. }),
+            "the transfer must be left untouched, got {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_base_to_alpaca_on_another_corridor_fails_closed_before_any_send() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let any_request = server.mock(|when, then| {
+            when.any_request();
+            then.status(500);
+        });
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                from_block: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::CorridorMismatch {
+                    recorded: ROBINHOOD_RELAY,
+                    served: UsdcCorridor::BASE_CCTP,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        any_request.assert_calls(0);
+        let state = cqrs.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(state, UsdcRebalance::WithdrawalSubmitting { .. }),
+            "the transfer must be left untouched, got {state:?}"
+        );
+    }
+
+    /// A fresh transfer asking for a corridor this service does not serve
+    /// is refused before anything is recorded or moved.
+    #[tokio::test]
+    async fn fresh_transfer_on_a_corridor_this_service_does_not_serve_is_refused() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let any_request = server.mock(|when, then| {
+            when.any_request();
+            then.status(500);
+        });
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = manager
+            .resume_base_to_alpaca(&id, usdc("100"), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::CorridorNotServed {
+                    requested: ROBINHOOD_RELAY,
+                    served: UsdcCorridor::BASE_CCTP,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        any_request.assert_calls(0);
+        let state = cqrs.load(&id).await.unwrap();
+        assert_eq!(state, None, "nothing may be recorded");
+    }
+
+    #[tokio::test]
+    async fn recheck_of_a_transfer_on_another_corridor_is_refused() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: usdc("100"),
+                from_block: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = manager.recheck_deposit(&id, None).await.unwrap_err();
+
+        let UsdcRecheckError::Transfer(error) = error else {
+            panic!("expected the corridor refusal, got {error:?}");
+        };
+        assert!(
+            matches!(
+                *error,
+                UsdcTransferError::CorridorMismatch {
+                    recorded: ROBINHOOD_RELAY,
+                    served: UsdcCorridor::BASE_CCTP,
+                    ..
+                }
+            ),
+            "got {error:?}"
         );
     }
 }

@@ -7899,7 +7899,7 @@ mod tests {
     use futures_util::poll;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
-    use st0x_bridge::corridor::UsdcCorridor;
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
         ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode,
     };
@@ -34690,5 +34690,33 @@ mod tests {
              later snapshot polls keep healing"
         );
         drop(inventory);
+    }
+
+    /// The dispatched job names the configured corridor, not a default.
+    #[tokio::test]
+    async fn usdc_transfer_job_carries_the_configured_corridor() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let config = RebalancingServiceConfig {
+            usdc: Some(UsdcCorridorCtx {
+                corridor,
+                threshold: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+            }),
+            ..test_config()
+        };
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.corridor, corridor);
     }
 }
