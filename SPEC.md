@@ -703,6 +703,14 @@ discovery, before any signing. The signing-step failure is the last line only
 for a known orchestrator-mode mint without its chain's entry or `MintAuth`
 policy.
 
+Right after it restores each of those signed sends, startup rebroadcasts its
+exact bytes ("already known" is success; it does not wait for a confirmation),
+so no startup approval or revoke waits behind a send no node holds. A chain
+whose restored send could not be rebroadcast gets neither its approvals nor its
+revokes on that start: startup pages and continues, since an approval there
+would wait behind that nonce until its confirmation timeout and fail every
+restart.
+
 The per-symbol equity lock is re-armed at startup from every open mint and
 redemption aggregate, and the transfer job row plus the transfer's first event
 are the durable reservation a restart honours: a restart between a job's push
@@ -6863,7 +6871,11 @@ therefore performs an explicit fund-moving send:
      send from the Ethereum wallet, the bot reserves the nonce of every signed
      send still on `Bridged`, so no other send takes it. A failure to read those
      transfers pages and does not stop startup; the rebroadcast reserves the
-     nonce again when the transfer resumes.
+     nonce again when the transfer resumes. Startup then rebroadcasts each
+     restored send without waiting for a confirmation, so no later send waits
+     behind a send no node holds. A failed startup rebroadcast pages, keeps the
+     nonce reserved, and skips the Ethereum startup approvals and revokes on
+     that start; the transfer's resume broadcasts the send again.
 3. **Resume from `Bridged`.**
    - **Signed send persisted:** broadcast the same bytes and continue as in
      step 2. Other transfers send the same amount to the same deposit address

@@ -719,7 +719,8 @@ The bot signs the Alpaca deposit send and persists the signed tx
 (`DepositSendPrepared`) before it broadcasts it, and records the send tx
 (`PendingDepositRecorded`) right after. Every retry broadcasts those same bytes,
 so it never sends a second time for the same transfer. At startup it reserves
-the nonce of every signed send still on `Bridged`.
+the nonce of every signed send still on `Bridged` and rebroadcasts it, before
+the startup token approvals.
 
 - **"signed deposit send <tx> is not confirmed yet ... It has stayed unconfirmed
   for ..."** (`DepositSendReconciliationPending`, paged every 30 minutes once 4
@@ -781,6 +782,29 @@ the nonce of every signed send still on `Bridged`.
   is past its nonce, it can never mine and nothing moved. If it is pending, or
   its nonce is still free, cancel it at its nonce as in the steps above so it
   cannot move USDC later. Every restart pages again while the row is there.
+- **"Could not rebroadcast a signed Alpaca deposit send at startup"**
+  (`operational_alert`, with `id`, `tx` and `nonce`): the bot keeps the send's
+  nonce reserved and started without the Ethereum startup token approvals and
+  stale-allowance revokes (the **"Startup token approvals skipped"** page below
+  names the chain). The transfer's resume broadcasts the send again. Read the
+  `error`: an RPC fault clears by itself; for a send that will never confirm,
+  follow the not-confirmed page above. Restart after the send confirms or is
+  settled, so startup grants the approvals.
+- **"Startup token approvals skipped"** (`operational_alert`, with `chain`): a
+  signed send restored at startup on that chain (an Alpaca deposit send, or a
+  vault withdrawal) could not be rebroadcast, so a new send from that wallet
+  would wait behind its nonce. The bot runs without that chain's startup
+  approvals and revokes, and wraps or deposits that lack an allowance fail. The
+  rebroadcast page names the send: the deposit send page above, or **"Equity
+  redemption `<id>` has a signed vault withdrawal ... that could not be
+  rebroadcast at startup"**, whose resume job broadcasts the withdrawal again.
+  Clear that send, then restart.
+- **Startup fails with "startup token approvals failed on `<chain>`"** after
+  about 5 minutes, and does so on every restart: an approval waited for its
+  receipt behind a signed send at a lower nonce that does not mine (it reached
+  the node at a fee too low to confirm). Find the lowest pending tx of that
+  chain's bot wallet. If it is an Alpaca deposit send, follow the not-confirmed
+  page above (wait for fees to drop, or cancel it at its nonce), then restart.
 - **"Cannot tell whether a signed Alpaca deposit send was persisted"**
   (`operational_alert`): a `PrepareDepositSend` write failed and the reload that
   checks it failed too. The bot keeps the send's nonce reserved, so later sends
