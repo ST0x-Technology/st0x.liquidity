@@ -719,8 +719,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::BurnSubmitInconclusive { .. }
         | UsdcTransferError::BurnTxDropped { .. }
         | UsdcTransferError::DepositSendUnresolved { .. }
-        | UsdcTransferError::DepositSendTaskPanicked { .. }
-        | UsdcTransferError::PreparedDepositHashMismatch { .. } => false,
+        | UsdcTransferError::DepositSendTaskPanicked { .. } => false,
     }
 }
 
