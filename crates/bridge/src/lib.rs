@@ -187,10 +187,13 @@ pub trait Bridge: Send + Sync + 'static {
     /// `scan_from_block` (the [`Bridge::destination_block`] captured before the
     /// mint) less a small margin and a fixed lookback from the head, since a
     /// relayer can mint before that head is captured. `None`, for a transfer
-    /// that predates it, scans the lookback alone. A consumed nonce whose mint is not found in
-    /// that window is an error carrying the floor block's timestamp, never a
-    /// scan to genesis: a floor mined before the transfer started covers its
-    /// mint, so the log is lagging; a later floor may be above the mint.
+    /// that predates it, scans the lookback alone. A consumed nonce whose mint
+    /// is not found in that window is an error, never a scan to genesis. The
+    /// error carries a `usedNonces` read at the block below the floor: unused
+    /// there means the mint is in the window and the log is lagging; used means
+    /// the mint lies below the floor. Only when that read fails does it carry
+    /// the floor block's timestamp instead: a floor mined before the transfer
+    /// started covers its mint; a later floor may be above it.
     async fn find_attested_mint(
         &self,
         direction: BridgeDirection,
