@@ -1741,46 +1741,19 @@ mod tests {
             fail: false,
             captured: Mutex::new(None),
         });
-        let mut ctx = redemption_test_ctx(
+        let (mut ctx, redemption_pool) = redemption_test_ctx_with_pool(
             stub.clone(),
             TransferEquityToHedgingJobQueue::new(&apalis_pool),
         )
         .await;
         let aggregate_id = redemption_aggregate_id("terminal-redemption-no-defer");
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::Redeem {
-                    symbol: symbol.clone(),
-                    chain: Chain::Base,
-                    quantity: float!(1),
-                    token: Address::ZERO,
-                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: U256::from(1_u64),
-                    from_block: 0,
-                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
-                },
-            )
-            .await
-            .unwrap();
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
-                    tx_hash: alloy::primitives::TxHash::ZERO,
-                },
-            )
-            .await
-            .unwrap();
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::FailTransfer {
-                    reason: "test: forced terminal state".to_string(),
-                },
-            )
-            .await
-            .unwrap();
+        seed_redemption_failed(
+            &redemption_pool,
+            &ctx.redemption_store,
+            &aggregate_id,
+            &symbol,
+        )
+        .await;
         ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
 
         let job = TransferEquityToHedging {
@@ -3113,6 +3086,16 @@ mod tests {
         transfer: Arc<dyn ResumeEquityToHedging>,
         job_queue: TransferEquityToHedgingJobQueue,
     ) -> TransferEquityToHedgingCtx {
+        redemption_test_ctx_with_pool(transfer, job_queue).await.0
+    }
+
+    /// Variant that also returns the redemption events pool, so a test can seed
+    /// aggregate history no command path reaches without live chain services
+    /// (for example a `WithdrawnFromRaindex` origin).
+    async fn redemption_test_ctx_with_pool(
+        transfer: Arc<dyn ResumeEquityToHedging>,
+        job_queue: TransferEquityToHedgingJobQueue,
+    ) -> (TransferEquityToHedgingCtx, sqlx::SqlitePool) {
         let (pool, _apalis_pool) = crate::test_utils::setup_test_pools().await;
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
@@ -3131,14 +3114,51 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        TransferEquityToHedgingCtx {
+        let ctx = TransferEquityToHedgingCtx {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
-            redemption_store: Arc::new(test_store(pool, services)),
+            redemption_store: Arc::new(test_store(pool.clone(), services)),
             position_authority: None,
             job_queue,
             notifier: Arc::new(crate::alerts::LogNotifier),
-        }
+        };
+        (ctx, pool)
+    }
+
+    /// Seeds a fresh redemption into the terminal `Failed` state via a still
+    /// allowed force fail. A broadcast submission can no longer be force failed
+    /// (it may still land, so it must be reconciled), so this inserts a
+    /// `WithdrawnFromRaindex` origin directly (no command reaches it without
+    /// live chain services) and force fails that post confirmation state.
+    async fn seed_redemption_failed(
+        pool: &sqlx::SqlitePool,
+        store: &Store<EquityRedemption>,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+    ) {
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, \
+              event_version, payload, metadata) \
+             VALUES ('EquityRedemption', ?1, 1, \
+              'EquityRedemptionEvent::WithdrawnFromRaindex', '1', ?2, '{}')",
+        )
+        .bind(id.to_string())
+        .bind(format!(
+            r#"{{"WithdrawnFromRaindex":{{"symbol":"{symbol}","quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","raindex_withdraw_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","withdrawn_at":"2026-01-01T00:00:00Z"}}}}"#
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "test: forced terminal state".to_string(),
+                },
+            )
+            .await
+            .unwrap();
     }
 
     /// A resume that observes a redemption reconciled while its vault withdrawal
@@ -3877,7 +3897,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let generation = GuardGeneration::from_parts(NonZeroU32::new(5).unwrap(), 3);
         let aggregate_id = redemption_aggregate_id("terminal-redemption-terminal-aggregate");
-        let mut ctx = redemption_test_ctx(
+        let (mut ctx, redemption_pool) = redemption_test_ctx_with_pool(
             Arc::new(RecordingRedemptionResume {
                 fail: false,
                 captured: Mutex::new(None),
@@ -3886,42 +3906,16 @@ mod tests {
         )
         .await;
 
-        // Drive the redemption to a terminal Failed state: a terminal aggregate
-        // no longer owns the reservation, so cleanup must release it.
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::Redeem {
-                    symbol: symbol.clone(),
-                    chain: Chain::Base,
-                    quantity: float!(1),
-                    token: Address::ZERO,
-                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: U256::from(1_u64),
-                    from_block: 0,
-                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
-                },
-            )
-            .await
-            .unwrap();
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
-                    tx_hash: alloy::primitives::TxHash::ZERO,
-                },
-            )
-            .await
-            .unwrap();
-        ctx.redemption_store
-            .send(
-                &aggregate_id,
-                EquityRedemptionCommand::FailTransfer {
-                    reason: "test: forced terminal state".to_string(),
-                },
-            )
-            .await
-            .unwrap();
+        // Drive the redemption to a terminal Failed state via a still allowed
+        // force fail: a terminal aggregate no longer owns the reservation, so
+        // cleanup must release it.
+        seed_redemption_failed(
+            &redemption_pool,
+            &ctx.redemption_store,
+            &aggregate_id,
+            &symbol,
+        )
+        .await;
 
         let position_pool = crate::test_utils::setup_test_db().await;
         let (position_store, position_projection) = StoreBuilder::<Position>::new(position_pool)

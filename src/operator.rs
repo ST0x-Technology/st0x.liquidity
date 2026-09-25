@@ -357,11 +357,11 @@ pub mod equity_transfer {
         reason: &str,
     ) -> Result<EquityRedemptionCommand, FailTransferError> {
         match entity {
-            EquityRedemption::VaultWithdrawSubmitting { .. } => Err(
+            EquityRedemption::VaultWithdrawSubmitting { .. }
+            | EquityRedemption::VaultWithdrawSubmitted { .. } => Err(
                 FailTransferError::RedemptionSubmissionUnresolved(id.clone()),
             ),
             EquityRedemption::VaultWithdrawPending { .. }
-            | EquityRedemption::VaultWithdrawSubmitted { .. }
             | EquityRedemption::WithdrawnFromRaindex { .. }
             | EquityRedemption::UnwrapPending { .. }
             | EquityRedemption::UnwrapSubmitted { .. }

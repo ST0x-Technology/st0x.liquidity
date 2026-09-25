@@ -7012,36 +7012,31 @@ mod tests {
             .unwrap();
     }
 
-    /// Seeds an `EquityRedemption` into the terminal `Failed` state via
-    /// `Redeem`, `RecordWithdrawSubmission`, then `FailTransfer`.
+    /// Seeds an `EquityRedemption` into the terminal `Failed` state by force
+    /// failing a confirmed withdrawal. A broadcast submission can no longer be
+    /// force failed (it may still land, so operators reconcile it instead), so
+    /// the seed starts from a `WithdrawnFromRaindex` history and force fails
+    /// that post confirmation state. The start event is inserted directly
+    /// because no command reaches `WithdrawnFromRaindex` without live chain
+    /// services.
     async fn seed_redemption_failed(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, \
+              event_version, payload, metadata) \
+             VALUES ('EquityRedemption', ?1, 1, \
+              'EquityRedemptionEvent::WithdrawnFromRaindex', '1', ?2, '{}')",
+        )
+        .bind(id.to_string())
+        .bind(
+            r#"{"WithdrawnFromRaindex":{"symbol":"AAPL","quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","raindex_withdraw_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","withdrawn_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
-            .await
-            .unwrap();
-        store
-            .send(
-                id,
-                EquityRedemptionCommand::Redeem {
-                    symbol: Symbol::new("AAPL").unwrap(),
-                    chain: Chain::Base,
-                    quantity: float!(10),
-                    token: Address::ZERO,
-                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: U256::from(1000u64),
-                    from_block: 0,
-                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .send(
-                id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
-                    tx_hash: alloy::primitives::TxHash::ZERO,
-                },
-            )
             .await
             .unwrap();
         store

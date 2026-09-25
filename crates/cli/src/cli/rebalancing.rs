@@ -5619,6 +5619,43 @@ mod tests {
         );
     }
 
+    /// A redemption whose vault withdrawal is broadcast but unconfirmed (nonce
+    /// reserved, and it may already have landed) must be reconciled, never
+    /// force failed. The `Failed` terminal drops the withdrawal hash and has no
+    /// resume job to observe a later reconcile, so force failing would strand
+    /// the reserved nonce. Mirrors the already refused `VaultWithdrawSubmitting`.
+    #[tokio::test]
+    async fn fail_transfer_redemption_refuses_submitted_withdrawal() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-submitted-withdrawal");
+
+        seed_redemption_to_submitting(&pool, &id).await;
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let result = fail_transfer_fixture_command(
+            &mut stdout,
+            &pool,
+            TransferType::Redemption,
+            &id.to_string(),
+            &"should be refused".parse().unwrap(),
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unresolved vault withdrawal submission"),
+            "failing a submitted withdrawal must refuse and steer to reconcile; got: {err_msg}"
+        );
+    }
+
     /// A typed command rejection (the TOCTOU case: the bot advanced the
     /// aggregate between the CLI's read and its write) gets the operator
     /// re-run hint, with the original error preserved in the chain.

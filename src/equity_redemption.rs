@@ -2559,7 +2559,6 @@ impl EventSourced for EquityRedemption {
 
             FailTransfer { reason } => match self {
                 Self::VaultWithdrawPending { symbol, .. }
-                | Self::VaultWithdrawSubmitted { symbol, .. }
                 | Self::WithdrawnFromRaindex { symbol, .. }
                 | Self::UnwrapPending { symbol, .. }
                 | Self::UnwrapSubmitted { symbol, .. }
@@ -3798,6 +3797,30 @@ mod tests {
             .given(vec![vault_withdraw_submitting_event()])
             .when(EquityRedemptionCommand::FailTransfer {
                 reason: "submission response was lost".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(EquityRedemptionError::AlreadyStarted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn broadcast_withdrawal_cannot_be_failed_away() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![EquityRedemptionEvent::VaultWithdrawSubmitted {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(50.25),
+                token: Address::random(),
+                wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+                tx_hash: TxHash::random(),
+                prepared: Some(prepared_withdrawal_for_test()),
+                submitted_at: Utc::now(),
+            }])
+            .when(EquityRedemptionCommand::FailTransfer {
+                reason: "submission confirmation was lost".to_string(),
             })
             .await
             .then_expect_error();
