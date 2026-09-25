@@ -747,7 +747,7 @@ fn render_process_tx_outcome<W: Write>(
         ProcessTxOutcome::BelowExecutionThreshold => {
             writeln!(
                 stdout,
-                "Trade accumulated but the position is not ready for execution yet (below the execution threshold, held by an equity transfer, or capped by the operational limit)."
+                "Trade accumulated but the position is not ready for execution yet (below the execution threshold, no price yet for a dollar value threshold, or held by an equity transfer)."
             )?;
         }
         ProcessTxOutcome::ExcludedFromHedging {
@@ -2925,7 +2925,7 @@ mod tests {
                     outcome: ProcessTxOutcome::BelowExecutionThreshold,
                 },
                 format!(
-                    "{fill_summary}Trade accumulated but the position is not ready for execution yet (below the execution threshold, held by an equity transfer, or capped by the operational limit).\n"
+                    "{fill_summary}Trade accumulated but the position is not ready for execution yet (below the execution threshold, no price yet for a dollar value threshold, or held by an equity transfer).\n"
                 ),
             ),
             (

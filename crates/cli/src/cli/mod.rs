@@ -395,16 +395,16 @@ pub enum Commands {
     /// opposite side hedge.
     ///
     /// Recovery tool for fills the bot never recorded. A fill already
-    /// acknowledged is reported as already accounted without repeating its
-    /// accounting or hedge; the run may still record a missing source
-    /// attribution and settle a fill a crash left pending. A fill witnessed but
-    /// not yet acknowledged is resumed. Fill accounting and
-    /// broker submission take database file locks shared with the bot, so a
-    /// concurrent run cannot count a fill twice. Run this direct database path
-    /// only while the bot is stopped anyway: its writes reach none of the bot's
-    /// live reactors, and its orders are enrolled for status polling only at
-    /// the next bot startup. Against a running bot, use the process-tx route of
-    /// `st0x-liquidity-client` instead.
+    /// acknowledged is reported as already accounted, or as already excluded
+    /// if it was kept out of hedging, without repeating its accounting or
+    /// hedge; the run may still record a missing source attribution and settle
+    /// a fill a crash left pending. A fill witnessed but not yet acknowledged
+    /// is resumed. Fill accounting and broker submission take database file
+    /// locks shared with the bot, so a concurrent run cannot count a fill
+    /// twice. Run this direct database path only while the bot is stopped
+    /// anyway: its writes reach none of the bot's live reactors, and its placer
+    /// has no admission gate. Against a running bot, call the bot's
+    /// `POST /liquidity-write/transactions/{tx_hash}/process` route instead.
     ProcessTx {
         /// Transaction hash (0x prefixed, 64 hex characters)
         #[arg(long = "tx-hash")]

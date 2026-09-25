@@ -849,7 +849,8 @@ pub(crate) type HttpProvider = FillProvider<
     RootProvider,
 >;
 
-/// Bounds for the primary chain RPC transport.
+/// Bounds for every chain RPC transport: the primary, each hedged secondary,
+/// and the `process-tx` CLI's provider.
 ///
 /// A hung endpoint that accepts the connection and never responds otherwise
 /// parks every await that runs

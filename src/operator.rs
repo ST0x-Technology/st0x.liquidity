@@ -1619,8 +1619,8 @@ pub mod process_tx {
         /// without placing a new hedge.
         PendingHedgeInFlight,
         /// The fill was accounted but the position is not ready for execution:
-        /// net exposure is below the execution threshold, an equity transfer
-        /// holds the symbol, or the operational limit leaves nothing to hedge.
+        /// net exposure is below the execution threshold, a dollar value
+        /// threshold has no price yet, or an equity transfer holds the symbol.
         /// No hedge was placed yet.
         BelowExecutionThreshold,
         /// Trading is disabled for the symbol on the fill's chain, so this run
@@ -2008,10 +2008,13 @@ pub mod process_tx {
     /// failed-order anchor, runs the placement preflight, claims the position,
     /// places the order at the broker, and resolves the post-placement
     /// disposition. An `Ok` outcome settles the fill and a typed rejection
-    /// settles it before surfacing; an operational failure leaves it unsettled
-    /// for a retry. The in-flight success path enrolls the poll job before
-    /// settling so a failed enqueue leaves the fill unsettled too. Runs under
-    /// the caller's still-held submission guards.
+    /// settles it before surfacing. An operational failure from the preflight,
+    /// the admission check before the claim, or the claim itself leaves the
+    /// fill unsettled for a retry; an anchor reconciliation failure, or an
+    /// admission failure or backpressure after the claim, settles the fill
+    /// before the error surfaces. The in-flight success path enrolls the poll
+    /// job before settling so a failed enqueue leaves the fill unsettled too.
+    /// Runs under the caller's still-held submission guards.
     async fn place_ready_hedge(
         ctx: &Ctx,
         pool: &SqlitePool,
