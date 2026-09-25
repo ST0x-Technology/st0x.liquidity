@@ -15,18 +15,18 @@ jobs:
   tf-rekey:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: master
 
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/nix-installer-action@v23
         with:
           extra-conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
         continue-on-error: true
 
       - name: Setup SSH key
