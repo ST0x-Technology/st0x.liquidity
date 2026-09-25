@@ -22,7 +22,7 @@ use apalis_core::error::BoxDynError;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::future::Future;
 use std::num::TryFromIntError;
 use std::pin::Pin;
@@ -73,7 +73,8 @@ use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_sup
 use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::equity_redemption::{
-    EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
+    EquityRedemption, RedemptionAggregateId, interrupted_redemption_ids,
+    symbols_with_stuck_redemptions,
 };
 use crate::inventory::{BroadcastingInventory, Inventory, InventorySnapshot, PollFreshness, Venue};
 use crate::mint_authorization::{
@@ -122,7 +123,7 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
-    RecheckUsdcDeposit, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
+    RecheckUsdcDeposit, RestoredDepositSends, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
     TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
 };
 use crate::rebalancing::{
@@ -996,6 +997,7 @@ impl Conductor {
             resume_tokenization_queue,
             deliver_mint_authorization_queue,
             deliver_mint_authorization_ctx,
+            unbroadcast_restore_chains,
         } = Box::pin(setup_positioning_with_recovery(
             (*ctx.rebalancing).clone(),
             RebalancingDeps {
@@ -1017,10 +1019,11 @@ impl Conductor {
         ))
         .await?;
 
-        // After setup restored the nonces of signed sends persisted before the
-        // restart (deposit sends, vault withdrawals), so an approval cannot
-        // take one; before any worker starts.
-        grant_startup_token_approvals(&ctx).await?;
+        // After setup restored and rebroadcast the signed sends persisted
+        // before the restart (deposit sends, vault withdrawals), so an
+        // approval neither takes their nonce nor waits behind a send no node
+        // holds; before any worker starts.
+        grant_startup_token_approvals(&ctx, &unbroadcast_restore_chains).await?;
 
         let trading_schedule = setup_trading_schedule(&ctx, &pool).await?;
         let startup_policy =
@@ -1495,13 +1498,22 @@ fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
 /// nonce handling match every other on-chain write there.
 ///
 /// Runs before any worker, so wrap/deposit never reverts with
-/// ERC20InsufficientAllowance, and after the startup nonce restores, so an
-/// approval never takes the nonce of a signed send persisted before the
-/// restart. Fails fast -- the bot must not come up healthy with these missing.
+/// ERC20InsufficientAllowance, and after the startup nonce restores and
+/// rebroadcasts, so an approval never takes the nonce of a signed send
+/// persisted before the restart. Fails fast -- the bot must not come up
+/// healthy with these missing.
+///
+/// Skips, with a page, each chain in `unbroadcast_restore_chains`: its wallet
+/// holds a restored nonce whose send startup could not rebroadcast, so an
+/// approval would wait behind it until the confirmation timeout and fail
+/// startup on every restart.
 ///
 /// Skips entirely when no wallet is configured -- without one the bot never
 /// wraps or deposits, so it has no allowances to grant.
-async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
+async fn grant_startup_token_approvals(
+    ctx: &Ctx,
+    unbroadcast_restore_chains: &BTreeSet<Chain>,
+) -> anyhow::Result<()> {
     let wallet_ctx = match ctx.wallet() {
         Ok(wallet_ctx) => wallet_ctx,
         Err(CtxError::WalletNotConfigured) => {
@@ -1515,6 +1527,18 @@ async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
     };
 
     for (chain, targets) in startup_approval_targets(ctx) {
+        if unbroadcast_restore_chains.contains(&chain) {
+            error!(
+                target: "operational_alert",
+                alert = true,
+                %chain,
+                "Startup token approvals skipped: a signed send restored at startup could not be \
+                 rebroadcast, and a new send from this wallet would wait behind its nonce. Wraps \
+                 and deposits that lack an allowance fail until a restart after that send confirms"
+            );
+            continue;
+        }
+
         grant_startup_approvals(chain_wallet(wallet_ctx, chain)?, &targets)
             .await
             .with_context(|| format!("startup token approvals failed on {chain}"))?;
@@ -1759,6 +1783,9 @@ struct RebalancingInfrastructure {
     resume_tokenization_queue: ResumeTokenizationJobQueue,
     deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue,
     deliver_mint_authorization_ctx: Arc<DeliverMintAuthorizationCtx>,
+    /// Chains whose wallet holds a restored nonce that startup could not
+    /// rebroadcast; startup sends from those wallets are skipped.
+    unbroadcast_restore_chains: BTreeSet<Chain>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -1803,6 +1830,9 @@ struct PositionAndRebalancing {
     resume_tokenization_queue: ResumeTokenizationJobQueue,
     deliver_mint_authorization_queue: DeliverMintAuthorizationJobQueue,
     deliver_mint_authorization_ctx: Arc<DeliverMintAuthorizationCtx>,
+    /// Chains whose wallet holds a restored nonce that startup could not
+    /// rebroadcast; startup sends from those wallets are skipped.
+    unbroadcast_restore_chains: BTreeSet<Chain>,
 }
 
 /// Builds one chain's wrapper service on that chain's signer and asset table.
@@ -2015,6 +2045,7 @@ impl PositionAndRebalancing {
             resume_tokenization_queue: infra.resume_tokenization_queue,
             deliver_mint_authorization_queue: infra.deliver_mint_authorization_queue,
             deliver_mint_authorization_ctx: infra.deliver_mint_authorization_ctx,
+            unbroadcast_restore_chains: infra.unbroadcast_restore_chains,
         })
     }
 }
@@ -2569,12 +2600,25 @@ fn stale_allowance_revocations(ctx: &Ctx) -> BTreeMap<Chain, Vec<Address>> {
 /// the bot granted that chain's orderbook directly, through that chain's own
 /// wallet. Deposits now approve the inventory instead, so a leftover orderbook
 /// allowance is dead capital-exposure surface. Idempotent (a no-op once zero)
-/// and non-fatal per token -- a failed revoke must not block startup.
+/// and non-fatal per token -- a failed revoke must not block startup. Skips
+/// each chain in `unbroadcast_restore_chains`, whose revoke would wait behind
+/// a restored send that could not be rebroadcast.
 async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
     ctx: &Ctx,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    unbroadcast_restore_chains: &BTreeSet<Chain>,
 ) {
     for (chain, tokens) in stale_allowance_revocations(ctx) {
+        if unbroadcast_restore_chains.contains(&chain) {
+            warn!(
+                target: "inventory",
+                %chain,
+                "A restored send on this chain could not be rebroadcast; skipping the \
+                 stale-allowance revoke until the next restart (non-fatal)",
+            );
+            continue;
+        }
+
         let (Some(hedged), Some(tokenization)) =
             (ctx.chains.hedged_chain(chain), tokenizations.get(&chain))
         else {
@@ -3245,7 +3289,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let mut resume_tokenization_queue = ResumeTokenizationJobQueue::new(&deps.apalis_pool);
 
-        recover_interrupted_tokenization_aggregates(
+        let mut unbroadcast_restore_chains = recover_interrupted_tokenization_aggregates(
             &deps.pool,
             &rebalancing_service,
             deps.inventory.as_ref(),
@@ -3293,20 +3337,29 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         // Before any job or the startup approvals can send from the Ethereum
         // wallet: a signed deposit send persisted before the restart keeps its
-        // nonce.
-        let restored_deposit_sends = usdc_handles
+        // nonce and is rebroadcast, so a later send never waits behind it.
+        let RestoredDepositSends {
+            restored,
+            unbroadcast,
+        } = usdc_handles
             .restore_deposit_sends
             .restore_prepared_deposit_sends(&deps.pool)
             .await;
         info!(
             target: "rebalance",
-            restored_deposit_sends,
-            "Restored the nonces of signed Alpaca deposit sends"
+            restored,
+            unbroadcast,
+            "Restored and rebroadcast the signed Alpaca deposit sends"
         );
+        if unbroadcast > 0 {
+            unbroadcast_restore_chains.insert(Chain::Ethereum);
+        }
 
-        // After the nonce restores above, so a revoke cannot take the nonce of
-        // a signed send persisted before the restart.
-        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await;
+        // After the nonce restores and rebroadcasts above, so a revoke neither
+        // takes the nonce of a signed send persisted before the restart nor
+        // waits behind one that could not be rebroadcast.
+        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations, &unbroadcast_restore_chains)
+            .await;
 
         let deliver_mint_authorization_ctx = Arc::new(DeliverMintAuthorizationCtx {
             deliverer: mint_authorization.issuance_client,
@@ -3369,6 +3422,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             resume_tokenization_queue,
             deliver_mint_authorization_queue: mint_authorization.queue,
             deliver_mint_authorization_ctx,
+            unbroadcast_restore_chains,
         })
     })
 }
@@ -3537,9 +3591,132 @@ fn is_prepared_withdrawal_absent(error: &st0x_raindex::RaindexError) -> bool {
     )
 }
 
+/// Restores the nonce of an interrupted redemption's submitted vault
+/// withdrawal and rebroadcasts its signed bytes. Returns whether a restored
+/// withdrawal is left unbroadcast.
+async fn restore_redemption_withdrawal(
+    raindex: &dyn st0x_raindex::Raindex,
+    notifier: &dyn Notifier,
+    redemption_id: &RedemptionAggregateId,
+    redemption: &EquityRedemption,
+) -> anyhow::Result<bool> {
+    let (tx_hash, prepared) = match redemption {
+        EquityRedemption::VaultWithdrawSubmitting { prepared, .. } => {
+            (prepared.tx_hash(), Some(prepared))
+        }
+        EquityRedemption::VaultWithdrawSubmitted {
+            tx_hash, prepared, ..
+        } => (*tx_hash, prepared.as_ref()),
+        _ => return Ok(false),
+    };
+
+    match restore_submitted_withdrawal_with_retry(raindex, tx_hash, prepared).await {
+        // The node reports the withdrawal's hash as absent: a dropped, never
+        // mined legacy withdrawal that returns the same on every restart. It
+        // holds no nonce reservation in this fresh process, so skip the
+        // restore, page the operator, and let the resume job drive it to the
+        // reconciliation deadline rather than crash looping the whole bot.
+        Err(error) if is_prepared_withdrawal_absent(&error) => {
+            warn!(
+                target: "rebalance",
+                %redemption_id,
+                %error,
+                "Submitted withdrawal hash is absent at startup; skipping the \
+                 nonce restore and deferring to the resume job"
+            );
+            if let Err(alert_error) = notifier
+                .notify(&format!(
+                    "Equity redemption {redemption_id} has a submitted vault withdrawal whose \
+                     hash the node cannot return at startup ({error}). Monitoring started \
+                     without it; the resume job will drive it to the reconciliation deadline. \
+                     Verify the withdrawal onchain and reconcile if it will never confirm."
+                ))
+                .await
+            {
+                warn!(
+                    target: "rebalance",
+                    %redemption_id,
+                    %alert_error,
+                    "Failed to deliver startup withdrawal restore alert"
+                );
+            }
+            Ok(false)
+        }
+        // A transport failure that outlasted the retries is a real RPC fault,
+        // not a gone hash. Do not skip: the withdrawal may still be pending
+        // and must keep its nonce reserved, or a later generic send collides
+        // with it. Fail startup so a healthy RPC is required before running.
+        Err(error) => Err(error.into()),
+        Ok(()) => Ok(match prepared {
+            Some(prepared) => {
+                !rebroadcast_restored_withdrawal(
+                    raindex,
+                    notifier,
+                    redemption_id,
+                    redemption.chain(),
+                    prepared,
+                )
+                .await
+            }
+            None => false,
+        }),
+    }
+}
+
+/// Rebroadcasts the exact signed bytes of a vault withdrawal whose nonce
+/// startup just restored; "already known" and an already mined withdrawal
+/// count as success. Returns whether it went out. A failure pages and does
+/// not fail startup: the resume job broadcasts the same bytes again.
+async fn rebroadcast_restored_withdrawal(
+    raindex: &dyn st0x_raindex::Raindex,
+    notifier: &dyn Notifier,
+    redemption_id: &RedemptionAggregateId,
+    chain: Chain,
+    prepared: &st0x_evm::PreparedTransaction,
+) -> bool {
+    let Err(error) = raindex.broadcast_prepared_withdraw(prepared).await else {
+        return true;
+    };
+
+    let tx_hash = prepared.tx_hash();
+    let nonce = prepared.nonce();
+    warn!(
+        target: "rebalance",
+        %redemption_id,
+        %chain,
+        %tx_hash,
+        nonce,
+        %error,
+        "Could not rebroadcast a restored vault withdrawal at startup"
+    );
+    if let Err(alert_error) = notifier
+        .notify(&format!(
+            "Equity redemption {redemption_id} has a signed vault withdrawal (tx {tx_hash}, nonce \
+             {nonce}) that could not be rebroadcast at startup ({error}). Its nonce stays \
+             reserved, so startup skips token approvals and allowance revokes on {chain}; the \
+             resume job broadcasts it again. Verify the withdrawal onchain and reconcile if it \
+             will never confirm."
+        ))
+        .await
+    {
+        warn!(
+            target: "rebalance",
+            %redemption_id,
+            %alert_error,
+            "Failed to deliver startup withdrawal rebroadcast alert"
+        );
+    }
+
+    false
+}
+
 /// Queues one resume job per interrupted mint and redemption. A transfer
 /// whose recorded chain lost its equity services refuses startup instead:
 /// queueing a resume that can only fail would strand it silently.
+///
+/// Restores the nonce of each signed vault withdrawal and rebroadcasts its
+/// exact bytes, so no later startup send waits behind a nonce no node holds.
+/// Returns the chains where a rebroadcast failed.
 async fn recover_interrupted_tokenization_aggregates(
     pool: &SqlitePool,
     rebalancing_service: &RebalancingService,
@@ -3548,7 +3725,7 @@ async fn recover_interrupted_tokenization_aggregates(
     redemption_store: Arc<Store<EquityRedemption>>,
     equity_services: &EquityTransferServices,
     resume_queue: &mut ResumeTokenizationJobQueue,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<BTreeSet<Chain>> {
     // First promote any Running/Queued orphans (from a previous process that
     // crashed mid-job) back to Pending. Then discard ALL pending rows.
     // Order matters: if cancel_all_pending ran first, the orphan-reset step
@@ -3595,6 +3772,7 @@ async fn recover_interrupted_tokenization_aggregates(
     let mut transfer_mints = load_transfer_jobs::<TransferEquityToMarketMaking>(pool).await?;
     let mut transfer_redemptions = load_transfer_jobs::<TransferEquityToHedging>(pool).await?;
     let mut rowless_resume_reservations = HashSet::new();
+    let mut unbroadcast_restore_chains = BTreeSet::new();
 
     for generation in transfer_mints
         .iter()
@@ -3676,71 +3854,18 @@ async fn recover_interrupted_tokenization_aggregates(
             .into());
         }
 
-        let restore_outcome = match &redemption {
-            EquityRedemption::VaultWithdrawSubmitting { prepared, .. } => Some(
-                restore_submitted_withdrawal_with_retry(
-                    equity_services
-                        .for_chain(redemption.chain())?
-                        .raindex
-                        .as_ref(),
-                    prepared.tx_hash(),
-                    Some(prepared),
-                )
-                .await,
-            ),
-            EquityRedemption::VaultWithdrawSubmitted {
-                tx_hash, prepared, ..
-            } => Some(
-                restore_submitted_withdrawal_with_retry(
-                    equity_services
-                        .for_chain(redemption.chain())?
-                        .raindex
-                        .as_ref(),
-                    *tx_hash,
-                    prepared.as_ref(),
-                )
-                .await,
-            ),
-            _ => None,
-        };
-        match restore_outcome {
-            // The node reports the withdrawal's hash as absent: a dropped, never
-            // mined legacy withdrawal that returns the same on every restart. It
-            // holds no nonce reservation in this fresh process, so skip the
-            // restore, page the operator, and let the resume job drive it to the
-            // reconciliation deadline rather than crash looping the whole bot.
-            Some(Err(error)) if is_prepared_withdrawal_absent(&error) => {
-                warn!(
-                    target: "rebalance",
-                    %redemption_id,
-                    %error,
-                    "Submitted withdrawal hash is absent at startup; skipping the \
-                     nonce restore and deferring to the resume job"
-                );
-                if let Err(alert_error) = rebalancing_service
-                    .notifier()
-                    .notify(&format!(
-                        "Equity redemption {redemption_id} has a submitted vault withdrawal whose \
-                         hash the node cannot return at startup ({error}). Monitoring started \
-                         without it; the resume job will drive it to the reconciliation deadline. \
-                         Verify the withdrawal onchain and reconcile if it will never confirm."
-                    ))
-                    .await
-                {
-                    warn!(
-                        target: "rebalance",
-                        %redemption_id,
-                        %alert_error,
-                        "Failed to deliver startup withdrawal restore alert"
-                    );
-                }
-            }
-            // A transport failure that outlasted the retries is a real RPC fault,
-            // not a gone hash. Do not skip: the withdrawal may still be pending
-            // and must keep its nonce reserved, or a later generic send collides
-            // with it. Fail startup so a healthy RPC is required before running.
-            Some(Err(error)) => return Err(error.into()),
-            Some(Ok(())) | None => {}
+        if restore_redemption_withdrawal(
+            equity_services
+                .for_chain(redemption.chain())?
+                .raindex
+                .as_ref(),
+            rebalancing_service.notifier().as_ref(),
+            redemption_id,
+            &redemption,
+        )
+        .await?
+        {
+            unbroadcast_restore_chains.insert(redemption.chain());
         }
 
         rebalancing_service
@@ -3800,7 +3925,7 @@ async fn recover_interrupted_tokenization_aggregates(
 
     recover_stuck_redemptions(pool, inventory).await?;
 
-    Ok(())
+    Ok(unbroadcast_restore_chains)
 }
 
 /// Loads every durable row for a transfer-job type, including terminal rows.
@@ -7795,7 +7920,7 @@ mod tests {
             wallet_byte,
             mint_label,
             redemption_label,
-            false,
+            MockRaindex::new(),
         )
         .await
     }
@@ -7804,18 +7929,14 @@ mod tests {
         wallet_byte: u8,
         mint_label: &str,
         redemption_label: &str,
-        fail_restore: bool,
+        raindex: MockRaindex,
     ) -> InterruptedAggregateFixture {
         let (pool, apalis_pool) = setup_test_pools().await;
 
         let mint_id = issuer_request_id(mint_label);
         let redemption_id = redemption_aggregate_id(redemption_label);
 
-        let raindex = Arc::new(if fail_restore {
-            MockRaindex::new().with_failing_restore()
-        } else {
-            MockRaindex::new()
-        });
+        let raindex = Arc::new(raindex);
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let tokenizer = Arc::new(MockTokenizer::new());
 
@@ -8061,6 +8182,102 @@ mod tests {
         );
     }
 
+    /// Startup rebroadcasts the exact signed bytes of a withdrawal whose nonce
+    /// it restored, so the startup approvals never wait behind it.
+    #[tokio::test]
+    async fn startup_rebroadcasts_a_restored_vault_withdrawal() {
+        let InterruptedAggregateFixture {
+            pool,
+            services,
+            raindex,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+            ..
+        } = seed_interrupted_aggregates_and_build_service(
+            4,
+            "rebroadcast-mint",
+            "rebroadcast-redemption",
+        )
+        .await;
+
+        let unbroadcast = recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &services,
+            &mut resume_queue,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            raindex.broadcast_withdrawals(),
+            vec![crate::equity_redemption::prepared_withdrawal_for_test().tx_hash()]
+        );
+        assert!(unbroadcast.is_empty(), "got {unbroadcast:?}");
+    }
+
+    /// A restored withdrawal whose rebroadcast fails pages and names its
+    /// chain, so startup skips that wallet's approvals instead of failing.
+    #[tokio::test]
+    async fn startup_pages_a_failed_withdrawal_rebroadcast_and_returns_its_chain() {
+        let InterruptedAggregateFixture {
+            pool,
+            services,
+            redemption_id,
+            raindex,
+            rebalancing_service,
+            inventory,
+            notifier,
+            mut resume_queue,
+            ..
+        } = seed_interrupted_aggregates_and_build_service_with(
+            5,
+            "unbroadcast-mint",
+            "unbroadcast-redemption",
+            MockRaindex::new().accepting_withdraw_then_losing_response(),
+        )
+        .await;
+
+        let unbroadcast = recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &services,
+            &mut resume_queue,
+        )
+        .await
+        .expect("a failed rebroadcast must not fail startup");
+
+        assert_eq!(unbroadcast, BTreeSet::from([Chain::Base]));
+        assert_eq!(raindex.restored_prepared_withdrawals(), 1);
+        let messages = notifier.messages();
+        assert!(
+            messages.iter().any(|message| {
+                message.contains(&redemption_id.to_string())
+                    && message.contains("could not be rebroadcast at startup")
+            }),
+            "a failed rebroadcast must page about redemption {redemption_id}, got {messages:?}"
+        );
+    }
+
     /// A submitted withdrawal whose restore fails on every restart (a legacy
     /// hash-only record the RPC can no longer return) must not abort startup and
     /// crash-loop the bot. Recovery skips the restore, pages, and keeps going.
@@ -8081,7 +8298,7 @@ mod tests {
             3,
             "resilient-mint",
             "resilient-redemption",
-            true,
+            MockRaindex::new().with_failing_restore(),
         )
         .await;
 
@@ -18755,6 +18972,40 @@ mod tests {
             error.contains("hyperevm") && error.contains("wallet"),
             "expected the unwired chain named, got: {error}"
         );
+    }
+
+    /// A chain whose restored send could not be rebroadcast gets no startup
+    /// approvals, only a page: they would wait behind that nonce and fail
+    /// startup on every restart. The stub wallet reaches no node, so any
+    /// approval startup attempts fails.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn startup_approvals_skip_a_chain_with_an_unbroadcast_restored_send() {
+        let mut ctx = ctx_with_base_and_ethereum_trading();
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        let every_chain: BTreeSet<Chain> = startup_approval_targets(&ctx).into_keys().collect();
+        assert_eq!(every_chain, BTreeSet::from([Chain::Base, Chain::Ethereum]));
+
+        grant_startup_token_approvals(&ctx, &every_chain)
+            .await
+            .expect("skipped chains attempt no approval");
+
+        logs_assert(|lines| {
+            let pages = lines
+                .iter()
+                .filter(|line| {
+                    line.contains("operational_alert")
+                        && line.contains("alert=true")
+                        && line.contains("Startup token approvals skipped")
+                })
+                .count();
+            (pages == 2)
+                .then_some(())
+                .ok_or_else(|| format!("expected one page per chain, got {pages}"))
+        });
+        grant_startup_token_approvals(&ctx, &BTreeSet::from([Chain::Base]))
+            .await
+            .expect_err("an unskipped chain attempts its approvals");
     }
 
     /// Each hedged chain's targets use its own orderbook and USDC. The

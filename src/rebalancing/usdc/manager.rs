@@ -3555,23 +3555,26 @@ impl<
     }
 
     /// Reserves the nonce of every signed deposit send persisted on
-    /// `Bridged`, so no other send from the Ethereum wallet takes it after a
-    /// restart. Returns how many were restored. Never fails startup: a send
-    /// that cannot be restored is paged, and its rebroadcast reserves the
-    /// nonce again when the transfer resumes.
-    pub(crate) async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> usize {
+    /// `Bridged` and rebroadcasts its exact bytes, so no other send from the
+    /// Ethereum wallet takes that nonce or waits behind a send no node holds
+    /// after a restart. Never fails startup: a send that cannot be restored
+    /// or rebroadcast is paged, and the transfer's resume broadcasts it again.
+    pub(crate) async fn restore_prepared_deposit_sends(
+        &self,
+        pool: &SqlitePool,
+    ) -> RestoredDepositSends {
+        let mut outcome = RestoredDepositSends::default();
         let (ids, unparseable) = match prepared_deposit_send_ids(pool).await {
             Ok(found) => found,
             Err(error) => {
                 error!(target: "operational_alert", alert = true, ?error, "Could not list signed Alpaca deposit sends at startup; their nonces are not reserved until each transfer resumes");
-                return 0;
+                return outcome;
             }
         };
         if !unparseable.is_empty() {
             error!(target: "operational_alert", alert = true, ?unparseable, "Signed Alpaca deposit sends with unparseable transfer ids were not restored at startup");
         }
 
-        let mut restored = 0;
         for id in ids {
             match self.cqrs.load(&id).await {
                 Ok(Some(UsdcRebalance::Bridged { deposit_send, .. })) => {
@@ -3581,7 +3584,13 @@ impl<
                     };
                     self.cctp_bridge.restore_usdc_on_ethereum(prepared).await;
                     info!(target: "rebalance", %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), "Reserved the nonce of a signed Alpaca deposit send");
-                    restored += 1;
+                    outcome.restored += 1;
+
+                    if let Err(error) = self.cctp_bridge.broadcast_usdc_on_ethereum(prepared).await
+                    {
+                        error!(target: "operational_alert", alert = true, %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+                        outcome.unbroadcast += 1;
+                    }
                 }
                 Ok(state) => {
                     warn!(target: "rebalance", %id, ?state, "Transfer left Bridged before its signed deposit send was restored");
@@ -3592,7 +3601,7 @@ impl<
             }
         }
 
-        restored
+        outcome
     }
 
     /// Executes the full Base to Alpaca rebalancing workflow.
@@ -6235,11 +6244,21 @@ pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
     ) -> Result<RecheckOutcome, UsdcRecheckError>;
 }
 
+/// What the startup restore of signed Alpaca deposit sends did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RestoredDepositSends {
+    /// Sends whose nonce is reserved again.
+    pub(crate) restored: usize,
+    /// Restored sends whose rebroadcast failed: their nonce stays reserved
+    /// with no transaction any node is known to hold.
+    pub(crate) unbroadcast: usize,
+}
+
 /// Trait-erased startup hook that reserves the nonces of persisted signed
-/// Alpaca deposit sends before the jobs run.
+/// Alpaca deposit sends and rebroadcasts them before the jobs run.
 #[async_trait::async_trait]
 pub(crate) trait RestorePreparedDepositSends: Send + Sync + 'static {
-    async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> usize;
+    async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> RestoredDepositSends;
 }
 
 #[async_trait::async_trait]
@@ -6247,7 +6266,7 @@ impl<Chain> RestorePreparedDepositSends for CrossVenueCashTransfer<Chain>
 where
     Chain: Wallet + Send + Sync + 'static,
 {
-    async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> usize {
+    async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> RestoredDepositSends {
         Self::restore_prepared_deposit_sends(self, pool).await
     }
 }
@@ -15678,8 +15697,9 @@ mod tests {
     }
 
     /// After a restart the wallet's nonce cache is empty. Startup reserves
-    /// the nonce of a signed send that was persisted but not broadcast, so the
-    /// next send takes the nonce after it instead of replacing it.
+    /// the nonce of a signed send that was persisted but not broadcast and
+    /// rebroadcasts it, so the next send takes the nonce after it instead of
+    /// replacing it, and does not wait behind a send no node holds.
     #[tokio::test]
     async fn startup_reserves_the_nonce_of_a_persisted_signed_send() {
         let chain = deploy_ethereum_usdc_chain_head_at_mint().await;
@@ -15712,7 +15732,23 @@ mod tests {
             cqrs.clone(),
         )
         .await;
-        assert_eq!(restarted.restore_prepared_deposit_sends(&pool).await, 1);
+        assert_eq!(
+            restarted.restore_prepared_deposit_sends(&pool).await,
+            RestoredDepositSends {
+                restored: 1,
+                unbroadcast: 0,
+            }
+        );
+
+        assert!(
+            before_restart
+                .provider()
+                .get_transaction_by_hash(signed.tx_hash())
+                .await
+                .unwrap()
+                .is_some(),
+            "startup must rebroadcast the persisted signed send",
+        );
 
         let next = restarted
             .cctp_bridge
@@ -16050,7 +16086,13 @@ mod tests {
         let unsigned = UsdcRebalanceId(Uuid::new_v4());
         stage_bridged_with_mint_tx(&cqrs, &unsigned, usdc("100"), usdc("99"), TxHash::ZERO).await;
 
-        assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 2);
+        assert_eq!(
+            manager.restore_prepared_deposit_sends(&pool).await,
+            RestoredDepositSends {
+                restored: 2,
+                unbroadcast: 0,
+            }
+        );
 
         let mut restored = bridge.usdc_restored();
         restored.sort();
@@ -16090,6 +16132,56 @@ mod tests {
         let mut broadcasts = bridge.usdc_broadcasts();
         broadcasts.sort();
         assert_eq!(broadcasts, signed);
+    }
+
+    /// A restored send whose rebroadcast fails keeps its nonce, pages, and is
+    /// counted so startup skips the Ethereum wallet's approvals.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn startup_restore_pages_a_failed_rebroadcast_and_keeps_the_nonce() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let bridge = Arc::new(
+            MockBridge::new().with_failing_usdc_broadcast(deposit_send_broadcast_timed_out),
+        );
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99"), TxHash::ZERO).await;
+        let signed = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 3);
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::PrepareDepositSend {
+                prepared: signed.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            manager.restore_prepared_deposit_sends(&pool).await,
+            RestoredDepositSends {
+                restored: 1,
+                unbroadcast: 1,
+            }
+        );
+
+        assert_eq!(bridge.usdc_restored(), vec![signed.tx_hash()]);
+        assert!(
+            bridge.usdc_discarded().is_empty(),
+            "the nonce stays reserved"
+        );
+        logs_assert(|lines| {
+            paged(
+                lines,
+                "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays \
+                 reserved, so startup skips Ethereum token approvals and allowance revokes, and \
+                 the transfer's resume broadcasts it again",
+            )
+        });
+        assert!(logs_contain(&format!("id={id}")));
     }
 
     /// Passes when one captured log line is an `operational_alert` page
@@ -16140,7 +16232,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 0);
+        assert_eq!(
+            manager.restore_prepared_deposit_sends(&pool).await,
+            RestoredDepositSends {
+                restored: 0,
+                unbroadcast: 0,
+            }
+        );
 
         assert!(bridge.usdc_restored().is_empty());
         logs_assert(|lines| {
@@ -16186,7 +16284,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 1);
+        assert_eq!(
+            manager.restore_prepared_deposit_sends(&pool).await,
+            RestoredDepositSends {
+                restored: 1,
+                unbroadcast: 0,
+            }
+        );
 
         assert_eq!(bridge.usdc_restored(), vec![signed.tx_hash()]);
         logs_assert(|lines| {
@@ -16230,7 +16334,13 @@ mod tests {
         let (_, loadable_send) = &signed[1];
         corrupt_usdc_rebalance(&pool, broken).await;
 
-        assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 1);
+        assert_eq!(
+            manager.restore_prepared_deposit_sends(&pool).await,
+            RestoredDepositSends {
+                restored: 1,
+                unbroadcast: 0,
+            }
+        );
 
         assert_eq!(bridge.usdc_restored(), vec![loadable_send.tx_hash()]);
         logs_assert(|lines| {

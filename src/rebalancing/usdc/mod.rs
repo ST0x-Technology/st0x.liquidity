@@ -15,7 +15,8 @@ pub(crate) use job::{
 };
 pub use manager::{CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams};
 pub(crate) use manager::{
-    RecheckUsdcDeposit, RestorePreparedDepositSends, UsdcRecheckError, u256_to_usdc,
+    RecheckUsdcDeposit, RestorePreparedDepositSends, RestoredDepositSends, UsdcRecheckError,
+    u256_to_usdc,
 };
 
 use std::time::Duration;
