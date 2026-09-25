@@ -4215,7 +4215,9 @@ mod tests {
     use std::collections::HashSet;
     use uuid::Uuid;
 
+    use st0x_bridge::corridor::HopKind;
     use st0x_event_sorcery::{LifecycleError, Store, TestHarness, replay, test_store};
+    use st0x_evm::Chain;
     use st0x_float_macro::float;
 
     use super::*;
@@ -12694,5 +12696,350 @@ mod tests {
                 event.event_type(),
             );
         }
+    }
+
+    /// A corridor no transfer defaults to, so a test that ends on it proves
+    /// the corridor was carried, not filled in by the legacy default.
+    const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Robinhood,
+        hop: HopKind::Relay,
+    };
+
+    /// Events recorded before corridors existed read as Base via CCTP, the
+    /// only route there was.
+    #[test]
+    fn legacy_originating_events_read_as_base_via_cctp() {
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+        let legacy_events = [
+            json!({"ConversionInitiated": {
+                "direction": "AlpacaToBase",
+                "amount": "1000",
+                "order_id": order_id,
+                "initiated_at": "2026-01-01T00:00:00Z"
+            }}),
+            json!({"WithdrawalSubmitting": {
+                "direction": "BaseToAlpaca",
+                "amount": "1000",
+                "from_block": 42,
+                "submitting_at": "2026-01-01T00:00:00Z"
+            }}),
+            json!({"Initiated": {
+                "direction": "BaseToAlpaca",
+                "amount": "1000",
+                "withdrawal_ref": {"OnchainTx": B256::ZERO},
+                "initiated_at": "2026-01-01T00:00:00Z"
+            }}),
+        ];
+
+        for legacy_event in legacy_events {
+            let event: UsdcRebalanceEvent = from_value(legacy_event.clone())
+                .unwrap_or_else(|error| panic!("{legacy_event} must deserialize: {error}"));
+
+            let corridor = match event {
+                UsdcRebalanceEvent::ConversionInitiated { corridor, .. }
+                | UsdcRebalanceEvent::WithdrawalSubmitting { corridor, .. }
+                | UsdcRebalanceEvent::Initiated { corridor, .. } => corridor,
+                other => panic!("unexpected event {other:?}"),
+            };
+
+            assert_eq!(corridor, UsdcCorridor::BASE_CCTP, "for {legacy_event}");
+        }
+    }
+
+    #[test]
+    fn originating_events_record_the_corridor_on_the_wire() {
+        let events = [
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                from_block: 1,
+                submitting_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                withdrawal_ref: TransferRef::OnchainTx(B256::ZERO),
+                initiated_at: Utc::now(),
+            },
+        ];
+
+        for event in events {
+            let serialized = to_value(&event).unwrap();
+            let payload = serialized.as_object().unwrap().values().next().unwrap();
+
+            assert_eq!(
+                payload["corridor"],
+                json!({"HubRouted": {"chain": "robinhood", "hop": "relay"}}),
+                "for {serialized}"
+            );
+        }
+    }
+
+    /// A snapshot written before corridors existed loads as Base via CCTP.
+    #[test]
+    fn legacy_state_snapshot_reads_as_base_via_cctp() {
+        let mut snapshot = to_value(UsdcRebalance::Withdrawing {
+            direction: RebalanceDirection::AlpacaToBase,
+            corridor: ROBINHOOD_RELAY,
+            amount: Usdc::new(float!(100)),
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            initiated_at: Utc::now(),
+        })
+        .unwrap();
+        snapshot
+            .get_mut("Withdrawing")
+            .and_then(|value| value.as_object_mut())
+            .unwrap()
+            .remove("corridor");
+
+        let state = from_value::<UsdcRebalance>(snapshot).unwrap();
+
+        assert_eq!(state.corridor(), UsdcCorridor::BASE_CCTP);
+    }
+
+    #[test]
+    fn legacy_stream_replays_to_bridged_on_base_via_cctp() {
+        let burn_tx = B256::repeat_byte(0x0b);
+        let mint_tx = B256::repeat_byte(0x0c);
+        let events = [
+            json!({"Initiated": {
+                "direction": "BaseToAlpaca",
+                "amount": "100",
+                "withdrawal_ref": {"OnchainTx": B256::repeat_byte(0x0a)},
+                "initiated_at": "2026-01-01T00:00:00Z"
+            }}),
+            json!({"WithdrawalConfirmed": {"confirmed_at": "2026-01-01T00:01:00Z"}}),
+            json!({"BridgingInitiated": {
+                "burn_tx_hash": burn_tx,
+                "burned_at": "2026-01-01T00:02:00Z"
+            }}),
+            json!({"BridgeAttestationReceived": {
+                "attestation": [1, 2, 3],
+                "cctp_nonce": TEST_CCTP_NONCE,
+                "attested_at": "2026-01-01T00:03:00Z"
+            }}),
+            json!({"Bridged": {
+                "mint_tx_hash": mint_tx,
+                "amount_received": "99.99",
+                "fee_collected": "0.01",
+                "minted_at": "2026-01-01T00:04:00Z"
+            }}),
+        ]
+        .into_iter()
+        .map(|event| from_value::<UsdcRebalanceEvent>(event).unwrap())
+        .collect::<Vec<_>>();
+
+        let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+
+        let UsdcRebalance::Bridged { corridor, .. } = state else {
+            panic!("expected Bridged, got {state:?}");
+        };
+        assert_eq!(corridor, UsdcCorridor::BASE_CCTP);
+    }
+
+    #[test]
+    fn alpaca_to_base_keeps_its_corridor_to_deposit_confirmed() {
+        let burn_tx = B256::repeat_byte(0x0b);
+        let amount = Usdc::new(float!(100));
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                conversion: ConversionAmounts::new(amount, amount),
+                converted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                from_block: 1,
+                submitting_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![1],
+                cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
+                mint_scan_from_block: None,
+                attested_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: B256::repeat_byte(0x0c),
+                amount_received: amount,
+                fee_collected: Usdc::new(float!(0)),
+                minted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositInitiated {
+                deposit_ref: TransferRef::OnchainTx(B256::repeat_byte(0x0d)),
+                deposit_initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                deposit_confirmed_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        let UsdcRebalance::DepositConfirmed { corridor, .. } = state else {
+            panic!("expected DepositConfirmed, got {state:?}");
+        };
+        assert_eq!(corridor, ROBINHOOD_RELAY);
+    }
+
+    fn base_to_alpaca_deposit_confirmed(corridor: UsdcCorridor) -> Vec<UsdcRebalanceEvent> {
+        let amount = Usdc::new(float!(100));
+
+        vec![
+            UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor,
+                amount,
+                from_block: 1,
+                submitting_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor,
+                amount,
+                withdrawal_ref: TransferRef::OnchainTx(B256::repeat_byte(0x0a)),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: B256::repeat_byte(0x0b),
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![1],
+                cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
+                mint_scan_from_block: None,
+                attested_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: B256::repeat_byte(0x0c),
+                amount_received: amount,
+                fee_collected: Usdc::new(float!(0)),
+                minted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositInitiated {
+                deposit_ref: TransferRef::OnchainTx(B256::repeat_byte(0x0d)),
+                deposit_initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_confirmed_at: Utc::now(),
+            },
+        ]
+    }
+
+    /// The post-deposit conversion is not an originating event: it repeats
+    /// the transfer's corridor instead of taking one from the command.
+    #[tokio::test]
+    async fn post_deposit_conversion_keeps_the_transfers_corridor() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(base_to_alpaca_deposit_confirmed(ROBINHOOD_RELAY))
+            .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                amount: Usdc::new(float!(100)),
+            })
+            .await
+            .events();
+
+        let [UsdcRebalanceEvent::ConversionInitiated { corridor, .. }] = events.as_slice() else {
+            panic!("expected one ConversionInitiated, got {events:?}");
+        };
+        assert_eq!(*corridor, ROBINHOOD_RELAY);
+
+        let mut replayed = base_to_alpaca_deposit_confirmed(ROBINHOOD_RELAY);
+        replayed.extend(events);
+        let state = replay::<UsdcRebalance>(replayed).unwrap().unwrap();
+        assert_eq!(state.corridor(), ROBINHOOD_RELAY);
+    }
+
+    /// A started transfer's corridor is fixed: a later command naming another
+    /// one is refused instead of moving funds on the wrong route.
+    #[tokio::test]
+    async fn initiate_on_another_corridor_than_recorded_is_refused() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                from_block: 1,
+                submitting_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: UsdcCorridor::BASE_CCTP,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(B256::repeat_byte(0x0a)),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::CorridorMismatch {
+                    recorded: ROBINHOOD_RELAY,
+                    requested: UsdcCorridor::BASE_CCTP,
+                })
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_withdrawal_records_the_commanded_corridor() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                from_block: 1,
+            })
+            .await
+            .events();
+
+        let [UsdcRebalanceEvent::WithdrawalSubmitting { corridor, .. }] = events.as_slice() else {
+            panic!("expected one WithdrawalSubmitting, got {events:?}");
+        };
+        assert_eq!(*corridor, ROBINHOOD_RELAY);
     }
 }
