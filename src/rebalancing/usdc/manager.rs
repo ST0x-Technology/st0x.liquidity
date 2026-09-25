@@ -4,7 +4,10 @@
 //! `CctpBridge`, `RaindexService`, and the `UsdcRebalance` aggregate to
 //! execute USDC transfers between Alpaca and Base.
 
+use alloy::consensus::{Transaction as _, TxEnvelope};
+use alloy::eips::eip2718::Decodable2718 as _;
 use alloy::primitives::{Address, B256, TxHash, U256};
+use alloy::sol_types::SolCall as _;
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::Float;
@@ -20,7 +23,7 @@ use st0x_bridge::cctp::{
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER};
 use st0x_event_sorcery::Store;
-use st0x_evm::{Chain, PreparedTransaction, USDC_BASE, Wallet};
+use st0x_evm::{Chain, IERC20, PreparedTransaction, USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
@@ -6318,6 +6321,20 @@ pub enum DepositSendNotSuperseded {
         confirmations: u64,
         required: u64,
     },
+    #[error(
+        "superseding tx {superseding} paid {paid} USDC units to the Alpaca deposit address \
+         {deposit_address}, like the deposit send it would replace: the deposit went \
+         through, so do not reconcile. Cancel a send only with a 0-value self-transfer"
+    )]
+    SupersedingTxPaidTheDepositAddress {
+        superseding: TxHash,
+        deposit_address: Address,
+        paid: U256,
+    },
+    /// The persisted send's bytes are not a USDC transfer, so the deposit
+    /// address it pays cannot be read.
+    #[error("deposit send {tx} is not a readable USDC transfer; its deposit address is unknown")]
+    UnreadableDepositSend { tx: TxHash },
     /// Reading Ethereum failed -- transient, retry later.
     #[error("could not read superseding tx {superseding} on Ethereum; retry")]
     Read {
@@ -6330,9 +6347,10 @@ pub enum DepositSendNotSuperseded {
 /// Proves that `prepared` can never mine.
 ///
 /// The operator-named `superseding_tx` must be a different tx from
-/// `bot_wallet` at the send's nonce with `required_confirmations`. Only a tx
-/// the node shows as mined counts, so a node that lags refuses rather than
-/// proves.
+/// `bot_wallet` at the send's nonce with `required_confirmations` that paid
+/// the send's deposit address nothing, so a fee-bumped copy of the send is
+/// refused. Only a tx the node shows as mined counts, so a node that lags
+/// refuses rather than proves.
 pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
     bridge: &Helper,
     prepared: &PreparedTransaction,
@@ -6350,13 +6368,11 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         return Err(DepositSendNotSuperseded::SupersedingTxIsTheSend { tx });
     }
 
-    let mined = bridge
-        .ethereum_mined_tx(superseding)
-        .await
-        .map_err(|source| DepositSendNotSuperseded::Read {
-            superseding,
-            source: Box::new(source),
-        })?;
+    let read = |source| DepositSendNotSuperseded::Read {
+        superseding,
+        source: Box::new(source),
+    };
+    let mined = bridge.ethereum_mined_tx(superseding).await.map_err(read)?;
     let Some(MinedTx {
         from,
         nonce: superseding_nonce,
@@ -6390,7 +6406,31 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         });
     }
 
+    let deposit_address = deposit_send_recipient(prepared)
+        .ok_or(DepositSendNotSuperseded::UnreadableDepositSend { tx })?;
+    let paid = bridge
+        .ethereum_usdc_credit(superseding, deposit_address)
+        .await
+        .map_err(read)?;
+    if !paid.is_zero() {
+        return Err(
+            DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress {
+                superseding,
+                deposit_address,
+                paid,
+            },
+        );
+    }
+
     Ok(())
+}
+
+/// The address a signed deposit send pays: the `to` of its USDC `transfer`.
+fn deposit_send_recipient(prepared: &PreparedTransaction) -> Option<Address> {
+    let envelope = TxEnvelope::decode_2718_exact(prepared.raw().as_ref()).ok()?;
+    IERC20::transferCall::abi_decode(envelope.input())
+        .ok()
+        .map(|call| call.to)
 }
 
 /// Trait-erased entry point for the operator `transfer recheck` of a failed
@@ -15749,10 +15789,22 @@ mod tests {
         bot_provider.anvil_mine(Some(2), None).await.unwrap();
         assert_ne!(fee_bumped, prepared.tx_hash());
 
-        manager
+        let error = manager
             .verify_deposit_send_superseded(&prepared, Some(fee_bumped))
             .await
             .expect_err("a tx that paid the Alpaca deposit address does not supersede the send");
+
+        assert!(
+            matches!(
+                error,
+                DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress {
+                    deposit_address: ALPACA_DEPOSIT_ADDRESS,
+                    paid,
+                    ..
+                } if paid == amount
+            ),
+            "got: {error:?}"
+        );
     }
 
     /// Connects a provider that signs with the bot wallet's key.

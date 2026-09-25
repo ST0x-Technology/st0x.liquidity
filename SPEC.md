@@ -4368,8 +4368,9 @@ enum BridgeStage { Burn, Attestation, Mint }
   post-burn failure" under Failure Handling. For a signed send, the operator
   names the tx that took its nonce, and the API and CLI read it on chain before
   the command: they refuse unless it is mined from the bot's Ethereum wallet at
-  the send's nonce, is not the send itself, and has the required confirmations.
-  A missing receipt for the send is never proof, since a lagging node shows none
+  the send's nonce, is not the send itself, has the required confirmations, and
+  paid the send's deposit address no USDC (a fee-bumped copy of the send did). A
+  missing receipt for the send is never proof, since a lagging node shows none
   for a send that mined.
 
 ##### Integration Points
@@ -6880,7 +6881,8 @@ therefore performs an explicit fund-moving send:
      the send's nonce. Reconcile takes that different tx's hash
      (`--superseding-tx`) and refuses unless the chain shows it mined from the
      bot wallet at the send's nonce, distinct from the send, with the required
-     confirmations.
+     confirmations, and paying the send's deposit address no USDC, so a
+     fee-bumped copy of the send is refused.
    - Mined reverted: it moved no USDC. The bot does not sign another send; it
      emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
      (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job

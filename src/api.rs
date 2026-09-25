@@ -2246,7 +2246,9 @@ fn deposit_send_not_superseded_response(
         | DepositSendNotSuperseded::SupersedingTxNotMined { .. }
         | DepositSendNotSuperseded::SupersedingTxFromAnotherSender { .. }
         | DepositSendNotSuperseded::SupersedingTxAtAnotherNonce { .. }
-        | DepositSendNotSuperseded::SupersedingTxUnconfirmed { .. } => (
+        | DepositSendNotSuperseded::SupersedingTxUnconfirmed { .. }
+        | DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress { .. }
+        | DepositSendNotSuperseded::UnreadableDepositSend { .. } => (
             StatusCode::CONFLICT,
             format!("Transfer {id}: refusing to reconcile: {error}"),
         ),

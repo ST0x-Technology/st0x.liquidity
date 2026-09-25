@@ -748,7 +748,9 @@ the startup token approvals.
     2. From the bot's Ethereum wallet (its signer), send a 0-value ETH transfer
        to the wallet itself at that nonce, with `maxFeePerGas` and
        `maxPriorityFeePerGas` at least 10% above `<tx>`'s and `maxFeePerGas`
-       above the current base fee.
+       above the current base fee. Never fee-bump the send itself (the same USDC
+       transfer at a higher fee): that moves the USDC to Alpaca, and reconcile
+       refuses it.
     3. Wait until the cancel has the required confirmations. If `<tx>` mined
        instead, do nothing: the next redrive continues the deposit.
   - To settle, only once a different tx is mined at the send's nonce: move the
@@ -759,10 +761,12 @@ the startup token approvals.
     nonce so later sends from the wallet proceed. `<cancel>` is the hash of the
     tx that took the send's nonce. Reconcile reads it on the bot's Ethereum node
     and refuses (the API with `409`) unless it is mined from the bot wallet, at
-    the send's nonce, is not `<tx>` itself, and has the required confirmations;
-    each refusal names the failed check. No receipt for `<tx>` is not proof: a
-    lagging node shows none for a send that did mine. "could not read
-    superseding tx" (the API: `502`) is transient; retry.
+    the send's nonce, is not `<tx>` itself, has the required confirmations, and
+    paid the Alpaca deposit address no USDC (a fee-bumped copy of the send did,
+    so the deposit went through); each refusal names the failed check. No
+    receipt for `<tx>` is not proof: a lagging node shows none for a send that
+    did mine. "could not read superseding tx" (the API: `502`) is transient;
+    retry.
 - **"Could not list signed Alpaca deposit sends at startup"** or **"Could not
   load a transfer with a signed Alpaca deposit send at startup"**
   (`operational_alert`): the bot started without reserving that send's nonce, so
