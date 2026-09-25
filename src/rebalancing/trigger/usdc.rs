@@ -1446,6 +1446,7 @@ mod tests {
     use tokio::sync::broadcast;
     use uuid::Uuid;
 
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_dto::Statement;
     use st0x_evm::Chain;
     use st0x_execution::ClientOrderId;
@@ -2299,6 +2300,7 @@ mod tests {
 
     fn initiated_event(direction: RebalanceDirection, amount: Usdc) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Initiated {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             amount,
             withdrawal_ref: TransferRef::OnchainTx(TxHash::ZERO),
@@ -2311,6 +2313,7 @@ mod tests {
         amount: Usdc,
     ) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::ConversionInitiated {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             amount,
             order_id: ClientOrderId::from_uuid(Uuid::nil()),
