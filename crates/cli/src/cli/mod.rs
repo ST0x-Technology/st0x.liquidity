@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use st0x_config::{Ctx, Env};
 use st0x_event_sorcery::Projection;
-use st0x_evm::{Chain, OpenChainErrorRegistry};
+use st0x_evm::{Chain, OpenChainErrorRegistry, PreparedTransaction};
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
@@ -1862,8 +1862,16 @@ async fn run_transfer_command<W: Write>(
             rebalancing::resume_interrupted_transfers_command(stdout, ctx).await
         }
         TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason } => {
-            let result =
-                rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await;
+            let result = rebalancing::reconcile_usdc_transfer_command(
+                stdout,
+                id,
+                reason.into(),
+                pool,
+                async |prepared: &PreparedTransaction| {
+                    rebalancing::verify_deposit_send_superseded_on_chain(ctx, prepared).await
+                },
+            )
+            .await;
             finish_with_log_query_url(stdout, ctx, &id.to_string(), result)
         }
         TransferRecoveryCommand::FailUsdcTransfer { id, reason } => {

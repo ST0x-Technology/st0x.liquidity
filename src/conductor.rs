@@ -6421,7 +6421,7 @@ mod tests {
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
+    use st0x_evm::{PreparedTransaction, USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiMode, AlpacaBrokerAuth, Direction, EquityPosition,
         ExecutorOrderId, HedgeFloor, Inventory as ExecutionInventory, MarketOrder, MockExecutor,
@@ -6461,7 +6461,7 @@ mod tests {
         ResumeTokenizationJobQueue, ResumeTokenizationTarget, TransferEquityToHedging,
         TransferEquityToMarketMaking,
     };
-    use crate::rebalancing::usdc::UsdcRecheckError;
+    use crate::rebalancing::usdc::{DepositSendNotSuperseded, UsdcRecheckError};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService};
     use crate::test_utils::{
         OnchainTradeBuilder, TEST_POLL_INTERVAL, get_test_log, get_test_order,
@@ -18417,6 +18417,13 @@ mod tests {
             _operator_deposit_tx: Option<TxHash>,
         ) -> Result<RecheckOutcome, UsdcRecheckError> {
             Ok(RecheckOutcome::LeftUnchanged)
+        }
+
+        async fn verify_deposit_send_superseded(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<(), DepositSendNotSuperseded> {
+            Ok(())
         }
     }
 

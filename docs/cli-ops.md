@@ -756,7 +756,14 @@ the startup token approvals.
     minted USDC to Alpaca by hand if needed, then
     `stox transfer reconcile --kind usdc --id <id> --reason <reason>` (valid for
     a Base->Alpaca `Bridged` with a signed send), then restart the bot to
-    release the send's nonce so later sends from the wallet proceed.
+    release the send's nonce so later sends from the wallet proceed. Reconcile
+    reads the bot's Ethereum wallet first and refuses (the API with `409`) while
+    the send can still mine: "deposit send <tx> can still mine: its nonce
+    <n> is not taken at the required confirmations" (wait for the send, or for
+    the cancel to reach the required confirmations), or "deposit send <tx> is
+    mined, so the deposit went through: do not reconcile" (the next redrive
+    continues the deposit). "could not read deposit send <tx> or the bot
+    wallet's nonce on Ethereum" (the API: `502`) is transient; retry.
 - **"Could not list signed Alpaca deposit sends at startup"** or **"Could not
   load a transfer with a signed Alpaca deposit send at startup"**
   (`operational_alert`): the bot started without reserving that send's nonce, so

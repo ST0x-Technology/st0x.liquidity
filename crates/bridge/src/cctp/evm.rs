@@ -788,6 +788,21 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(Some(head.saturating_sub(tx_block).saturating_add(1)))
     }
 
+    /// Returns this endpoint wallet's next nonce as of the block that is
+    /// `confirmations` deep (the head counts as confirmation 1): every nonce
+    /// below it is taken by a tx with at least that many confirmations.
+    pub(super) async fn confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
+        let head = self.wallet.provider().get_block_number().await?;
+        let block = head.saturating_sub(confirmations.saturating_sub(1));
+
+        Ok(self
+            .wallet
+            .provider()
+            .get_transaction_count(self.wallet.address())
+            .number(block)
+            .await?)
+    }
+
     /// Sums the USDC `Transfer` logs in `tx_hash`'s receipt that pay `recipient`:
     /// what that transaction credited to `recipient`, exact in base units.
     pub(super) async fn usdc_credited_in_tx(

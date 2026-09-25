@@ -13,7 +13,10 @@ pub(crate) use job::{
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
     TransferUsdcToMarketMakingJobQueue,
 };
-pub use manager::{CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams};
+pub use manager::{
+    CrossVenueCashTransfer, DepositSendNotSuperseded, MarketMakingUsdcEndpoints,
+    UsdcSettlementParams, verify_deposit_send_superseded,
+};
 pub(crate) use manager::{
     RecheckUsdcDeposit, RestorePreparedDepositSends, RestoredDepositSends, UsdcRecheckError,
     u256_to_usdc,

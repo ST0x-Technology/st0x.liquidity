@@ -67,7 +67,7 @@ use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performan
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
 };
-use crate::rebalancing::usdc::{RecheckUsdcDeposit, UsdcRecheckError};
+use crate::rebalancing::usdc::{DepositSendNotSuperseded, RecheckUsdcDeposit, UsdcRecheckError};
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
@@ -2150,7 +2150,9 @@ fn ops_command_error<Entity: EventSourced>(
 ///
 /// Mirrors `stox transfer reconcile --kind usdc`; the precondition matches the
 /// aggregate command's accepted set so the operator gets a clear `400` before
-/// any write.
+/// any write. A Base->Alpaca `Bridged` with a signed deposit send reconciles
+/// only once the bot reads on chain that the send can never mine (`409`
+/// while it still can, `503` before the bot is ready).
 async fn reconcile_usdc_transfer(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2189,6 +2191,29 @@ async fn reconcile_usdc_transfer(
         ));
     }
 
+    // The aggregate command is pure, so the chain proof that the signed send
+    // can never mine is read here, before the command.
+    if let Some(prepared) = rebalance.prepared_deposit_send() {
+        let handle = state.recovery.get().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Recovery not ready yet (conductor still starting)".to_string(),
+                }),
+            )
+        })?;
+
+        handle
+            .usdc_recheck
+            .verify_deposit_send_superseded(prepared)
+            .await
+            .map_err(|error| {
+                warn!(?error, %id, "Refused to reconcile a USDC transfer with a signed deposit send");
+                let (status, message) = deposit_send_not_superseded_response(&id, &error);
+                (status, Json(ErrorResponse { error: message }))
+            })?;
+    }
+
     store
         .send(
             &id,
@@ -2202,6 +2227,25 @@ async fn reconcile_usdc_transfer(
         transfer_id: id.to_string(),
         outcome: "reconciled",
     }))
+}
+
+/// Maps a refused deposit-send chain check to an HTTP status: the send can
+/// still mine, or already did, is a `409` naming why; a failed chain read is
+/// a transient `502`.
+fn deposit_send_not_superseded_response(
+    id: &UsdcRebalanceId,
+    error: &DepositSendNotSuperseded,
+) -> (StatusCode, String) {
+    match error {
+        DepositSendNotSuperseded::NonceFree { .. } | DepositSendNotSuperseded::Mined { .. } => (
+            StatusCode::CONFLICT,
+            format!("Transfer {id}: refusing to reconcile: {error}"),
+        ),
+        DepositSendNotSuperseded::Read { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Ethereum RPC unavailable; retry later".to_string(),
+        ),
+    }
 }
 
 /// Clears a recorded (dropped) pending CCTP burn on a transfer latched at
@@ -6670,6 +6714,43 @@ mod tests {
                 UsdcRebalance::Bridged { .. }
             ),
             "a refused reconcile leaves the transfer Bridged",
+        );
+    }
+
+    #[test]
+    fn deposit_send_not_superseded_response_names_why_or_asks_to_retry() {
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let tx = TxHash::repeat_byte(0x66);
+
+        let mined = DepositSendNotSuperseded::Mined { tx };
+        assert_eq!(
+            deposit_send_not_superseded_response(&id, &mined),
+            (
+                StatusCode::CONFLICT,
+                format!("Transfer {id}: refusing to reconcile: {mined}")
+            ),
+        );
+        let (status, _) = deposit_send_not_superseded_response(
+            &id,
+            &DepositSendNotSuperseded::NonceFree {
+                tx,
+                nonce: 7,
+                confirmed_next_nonce: 7,
+            },
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            deposit_send_not_superseded_response(
+                &id,
+                &DepositSendNotSuperseded::Read {
+                    tx,
+                    source: Box::new(CctpError::TxNotMined { tx_hash: tx }),
+                },
+            ),
+            (
+                StatusCode::BAD_GATEWAY,
+                "Ethereum RPC unavailable; retry later".to_string()
+            ),
         );
     }
 

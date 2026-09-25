@@ -4358,7 +4358,10 @@ enum BridgeStage { Burn, Attestation, Mint }
   WITHOUT crediting `available` (the USDC was already burned via CCTP, so the
   funds genuinely left the source venue; this is NOT a cancel, which would
   wrongly credit `available`). See "Operator reconciliation of a stranded
-  post-burn failure" under Failure Handling.
+  post-burn failure" under Failure Handling. For a signed send, the API and CLI
+  read on chain before the command and refuse unless a different tx took its
+  nonce: the wallet nonce at the required confirmations is past the send's, and
+  the send itself has no receipt.
 
 ##### Integration Points
 
@@ -6865,7 +6868,9 @@ therefore performs an explicit fund-moving send:
      different tx is mined at the send's nonce does the operator settle the
      minted USDC and run `transfer reconcile --kind usdc`, which accepts a
      BaseToAlpaca `Bridged` with a signed send, then restart the bot to release
-     the send's nonce.
+     the send's nonce. Reconcile reads the chain first and refuses while the
+     wallet nonce at the required confirmations is not past the send's nonce, or
+     when the send itself is mined.
    - Mined reverted: it moved no USDC. The bot does not sign another send; it
      emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
      (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job

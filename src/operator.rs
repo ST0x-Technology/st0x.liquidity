@@ -1488,8 +1488,8 @@ pub mod rebalancing {
 
     pub mod usdc {
         pub use crate::rebalancing::usdc::{
-            CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams,
-            UsdcTransferError,
+            CrossVenueCashTransfer, DepositSendNotSuperseded, MarketMakingUsdcEndpoints,
+            UsdcSettlementParams, UsdcTransferError, verify_deposit_send_superseded,
         };
     }
 }

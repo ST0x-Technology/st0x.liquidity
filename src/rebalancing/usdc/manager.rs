@@ -142,6 +142,10 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
     /// Returns the block in which `tx_hash` was mined on Ethereum.
     async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError>;
 
+    /// Returns the bot Ethereum wallet's next nonce as of the block that is
+    /// `confirmations` deep.
+    async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError>;
+
     /// Returns the USDC balance of `holder` on Ethereum.
     async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError>;
 
@@ -208,6 +212,10 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
 
     async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
         self.ethereum_tx_block(tx_hash).await
+    }
+
+    async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
+        self.ethereum_confirmed_nonce(confirmations).await
     }
 
     async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
@@ -6257,10 +6265,81 @@ pub(crate) enum UsdcRecheckError {
     Transfer(#[from] Box<UsdcTransferError>),
 }
 
+/// Why a signed Alpaca deposit send is not proven unable to mine, so its
+/// transfer must not be reconciled.
+#[derive(Debug, thiserror::Error)]
+pub enum DepositSendNotSuperseded {
+    #[error(
+        "deposit send {tx} can still mine: its nonce {nonce} is not taken at the \
+         required confirmations (the bot wallet's confirmed next nonce is \
+         {confirmed_next_nonce}). Wait for it to mine, or cancel it at its nonce and \
+         retry once the cancel has the required confirmations"
+    )]
+    NonceFree {
+        tx: TxHash,
+        nonce: u64,
+        confirmed_next_nonce: u64,
+    },
+    #[error(
+        "deposit send {tx} is mined, so the deposit went through: do not reconcile. \
+         The transfer's redrive continues the deposit; once it is DepositFailed, use \
+         `transfer recheck --kind usdc`"
+    )]
+    Mined { tx: TxHash },
+    /// Reading Ethereum failed -- transient, retry later.
+    #[error("could not read deposit send {tx} or the bot wallet's nonce on Ethereum; retry")]
+    Read {
+        tx: TxHash,
+        #[source]
+        source: Box<CctpError>,
+    },
+}
+
+/// Proves that `prepared` can never mine: a tx with `required_confirmations`
+/// took its nonce, and that tx is not `prepared` itself.
+pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
+    bridge: &Helper,
+    prepared: &PreparedTransaction,
+    required_confirmations: u64,
+) -> Result<(), DepositSendNotSuperseded> {
+    let tx = prepared.tx_hash();
+    let nonce = prepared.nonce();
+    let read = |source| DepositSendNotSuperseded::Read {
+        tx,
+        source: Box::new(source),
+    };
+
+    // The nonce is read before the receipt, so a send that mines between the
+    // reads is seen as mined rather than as another tx at its nonce.
+    let confirmed_next_nonce = bridge
+        .ethereum_confirmed_nonce(required_confirmations)
+        .await
+        .map_err(read)?;
+    if confirmed_next_nonce <= nonce {
+        return Err(DepositSendNotSuperseded::NonceFree {
+            tx,
+            nonce,
+            confirmed_next_nonce,
+        });
+    }
+
+    if bridge
+        .ethereum_tx_confirmations(tx)
+        .await
+        .map_err(read)?
+        .is_some()
+    {
+        return Err(DepositSendNotSuperseded::Mined { tx });
+    }
+
+    Ok(())
+}
+
 /// Trait-erased entry point for the operator `transfer recheck` of a failed
-/// USDC deposit. Erasing the wallet `Chain` generic lets the recovery
-/// handle hold one concrete type regardless of backend (sibling of the
-/// resume traits in `job.rs`).
+/// USDC deposit, and for the chain check before a signed deposit send is
+/// reconciled. Erasing the wallet `Chain` generic lets the recovery handle
+/// hold one concrete type regardless of backend (sibling of the resume
+/// traits in `job.rs`).
 #[async_trait::async_trait]
 pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
     async fn recheck_deposit(
@@ -6268,6 +6347,11 @@ pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
         id: &UsdcRebalanceId,
         operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError>;
+
+    async fn verify_deposit_send_superseded(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<(), DepositSendNotSuperseded>;
 }
 
 /// What the startup restore of signed Alpaca deposit sends did.
@@ -6308,6 +6392,14 @@ where
         operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError> {
         Self::recheck_deposit(self, id, operator_deposit_tx).await
+    }
+
+    async fn verify_deposit_send_superseded(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<(), DepositSendNotSuperseded> {
+        verify_deposit_send_superseded(&*self.cctp_bridge, prepared, self.required_confirmations)
+            .await
     }
 }
 
@@ -6751,6 +6843,10 @@ mod tests {
             unimplemented!("MockBridge: ethereum_tx_block not used in this test")
         }
 
+        async fn ethereum_confirmed_nonce(&self, _confirmations: u64) -> Result<u64, CctpError> {
+            unimplemented!("MockBridge: ethereum_confirmed_nonce not used in this test")
+        }
+
         async fn ethereum_usdc_balance(&self, _holder: Address) -> Result<U256, CctpError> {
             let Some(probe) = &self.ledger_probe else {
                 unimplemented!("MockBridge: ethereum_usdc_balance not used in this test")
@@ -6996,6 +7092,10 @@ mod tests {
             self.inner.ethereum_tx_block(tx_hash).await
         }
 
+        async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
+            self.inner.ethereum_confirmed_nonce(confirmations).await
+        }
+
         async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
             self.inner.ethereum_usdc_balance(holder).await
         }
@@ -7193,6 +7293,10 @@ mod tests {
             self.inner.ethereum_tx_block(tx_hash).await
         }
 
+        async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
+            self.inner.ethereum_confirmed_nonce(confirmations).await
+        }
+
         async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
             self.inner.ethereum_usdc_balance(holder).await
         }
@@ -7387,6 +7491,10 @@ mod tests {
 
         async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
             self.inner.ethereum_tx_block(tx_hash).await
+        }
+
+        async fn ethereum_confirmed_nonce(&self, confirmations: u64) -> Result<u64, CctpError> {
+            self.inner.ethereum_confirmed_nonce(confirmations).await
         }
 
         async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {

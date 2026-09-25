@@ -1072,16 +1072,21 @@ impl UsdcRebalance {
     }
 
     /// A BaseToAlpaca `Bridged` with a signed deposit send. An operator may
-    /// reconcile it once they verified on chain that a different tx was mined
-    /// at its nonce: the send is never re-signed or fee-bumped, and one stuck
-    /// below the market fee can still mine until its nonce is taken.
+    /// reconcile it once a different tx is mined at its nonce: the send is
+    /// never re-signed or fee-bumped, and one stuck below the market fee can
+    /// still mine until its nonce is taken.
     pub fn has_prepared_deposit_send(&self) -> bool {
+        self.prepared_deposit_send().is_some()
+    }
+
+    /// The signed deposit send of a BaseToAlpaca `Bridged`, if there is one.
+    pub fn prepared_deposit_send(&self) -> Option<&PreparedTransaction> {
         match self {
             Self::Bridged {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_send,
                 ..
-            } => deposit_send.prepared().is_some(),
+            } => deposit_send.prepared().map(|(prepared, _)| prepared),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -1101,7 +1106,7 @@ impl UsdcRebalance {
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. }
-            | Self::Reconciled { .. } => false,
+            | Self::Reconciled { .. } => None,
         }
     }
 
