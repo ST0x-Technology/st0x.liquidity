@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,17 @@ impl Chain {
             Self::Ethereum => Some(USDC_ETHEREUM),
             Self::HyperEvm => Some(USDC_HYPEREVM),
             Self::Robinhood => None,
+        }
+    }
+
+    /// The fastest block cadence to expect on this chain. A time span turned
+    /// into blocks with it over-covers the span when blocks come slower.
+    pub const fn min_block_interval(self) -> Duration {
+        match self {
+            Self::Base => Duration::from_secs(2),
+            Self::Ethereum => Duration::from_secs(12),
+            Self::HyperEvm => Duration::from_secs(1),
+            Self::Robinhood => Duration::from_millis(100),
         }
     }
 
@@ -330,19 +342,13 @@ mod tests {
     fn min_block_intervals_are_pinned_literals() {
         assert_eq!(
             Chain::Ethereum.min_block_interval(),
-            std::time::Duration::from_secs(12)
+            Duration::from_secs(12)
         );
-        assert_eq!(
-            Chain::Base.min_block_interval(),
-            std::time::Duration::from_secs(2)
-        );
-        assert_eq!(
-            Chain::HyperEvm.min_block_interval(),
-            std::time::Duration::from_secs(1)
-        );
+        assert_eq!(Chain::Base.min_block_interval(), Duration::from_secs(2));
+        assert_eq!(Chain::HyperEvm.min_block_interval(), Duration::from_secs(1));
         assert_eq!(
             Chain::Robinhood.min_block_interval(),
-            std::time::Duration::from_millis(100)
+            Duration::from_millis(100)
         );
     }
 }
