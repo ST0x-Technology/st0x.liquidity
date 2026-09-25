@@ -664,18 +664,20 @@ checkpoint-driven `eth_getLogs` poll rather than a live subscription, no events
 can be missed across downtime: the order fill monitor always resumes from the
 persisted checkpoint and re-scans any gap.
 
-Before any worker or rebalancer runs, and in both modes whenever a signing
-wallet is configured, startup grants the one-time MAX approvals on every hedged
-chain with that chain's wallet: that chain's settlement stable to its deposit
-spender on every hedged chain, and each wrapped equity's underlying to its
-wrapper vault and wrapped to that same deposit spender -- the chain's orderbook
-in legacy inventory mode, its `RaindexInventory` in managed mode: on the primary
-every equity with trading or rebalancing enabled, on a secondary only the
-equities with rebalancing enabled, the same selection its tokenization preflight
-attests (a hedge-only secondary has no wrapper to approve, so its allowance work
-is the settlement-stable grant alone). Only when rebalancing is configured does
-it also revoke any stale orderbook allowance, per chain in managed inventory
-mode, the same way, and a tokenization preflight then runs per hedged chain,
+Before any worker or rebalancer runs, but after startup has reserved the nonces
+of signed sends persisted before the restart (Alpaca deposit sends, vault
+withdrawals), and in both modes whenever a signing wallet is configured, startup
+grants the one-time MAX approvals on every hedged chain with that chain's
+wallet: that chain's settlement stable to its deposit spender on every hedged
+chain, and each wrapped equity's underlying to its wrapper vault and wrapped to
+that same deposit spender -- the chain's orderbook in legacy inventory mode, its
+`RaindexInventory` in managed mode: on the primary every equity with trading or
+rebalancing enabled, on a secondary only the equities with rebalancing enabled,
+the same selection its tokenization preflight attests (a hedge-only secondary
+has no wrapper to approve, so its allowance work is the settlement-stable grant
+alone). Only when rebalancing is configured does it also revoke any stale
+orderbook allowance, per chain in managed inventory mode, the same way (also
+after those nonce restores), and a tokenization preflight runs per hedged chain,
 read-only: the chain's issuer redemption wallet must be configured, and every
 preflighted equity's configured vault must report the configured underlying as
 its `asset()` (the same attestation a redemption's unwrap step performs). The
@@ -700,6 +702,20 @@ fails closed on its own: a mint whose mode cannot be read stops at mode
 discovery, before any signing. The signing-step failure is the last line only
 for a known orchestrator-mode mint without its chain's entry or `MintAuth`
 policy.
+
+Right after it restores each of those signed sends, startup rebroadcasts its
+exact bytes ("already known" is success; it does not wait for a confirmation),
+so no startup approval or revoke waits behind a send no node holds. It then
+reads each restored send's receipt, without waiting. A chain with a restored
+send that is not mined at that point (its rebroadcast failed, or it is pending,
+possibly at too low a fee to confirm) gets neither its approvals nor its revokes
+on that start: startup logs a warning and continues, since an approval there
+would wait behind that nonce until its confirmation timeout and fail every
+restart. Wraps and deposits there still approve on demand. Only a chain whose
+restored sends are all mined gets its startup approvals. A failure to list or
+load the signed Alpaca deposit sends, or one with an unparseable transfer id,
+defers Ethereum the same way: a send it hides has no reserved nonce, so an
+approval could take that nonce and leave the send unable to mine.
 
 The per-symbol equity lock is re-armed at startup from every open mint and
 redemption aggregate, and the transfer job row plus the transfer's first event
@@ -3817,6 +3833,10 @@ enum UsdcRebalance {
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
+        // BaseToAlpaca deposit send: NotStarted or Prepared (signed and
+        // persisted, maybe broadcast). NotStarted for snapshots taken before
+        // this field existed.
+        deposit_send: DepositSend,
     },
     BridgingFailed {
         direction: RebalanceDirection,
@@ -3884,7 +3904,19 @@ already-submitted action instead of re-issuing it:
   or hidden by a load-balanced RPC backend; it remains unresolved and must never
   trigger another withdrawal.
 - `BridgingSubmitting`: scan for an already-submitted burn (`find_recent_burn`)
-  and adopt it rather than burning twice.
+  and adopt it rather than burning twice. The burn match stays by
+  `(depositor, amount, destinationDomain, mintRecipient)` when transfers of
+  different corridors share the Ethereum wallet: each corridor burns to its own
+  CCTP destination domain, and one cash guard per corridor allows one burn per
+  corridor at a time, so a match is this transfer's burn.
+- `Bridged` (BaseToAlpaca): the deposit send is signed and persisted
+  (`PrepareDepositSend`) before it is broadcast; once it is confirmed,
+  `InitiateDeposit` records its hash, which must equal the signed send's. Resume
+  broadcasts the persisted bytes again and confirms them: the same tx, so it
+  never sends twice and never adopts another send. With no signed send, a
+  same-amount send from the wallet to the deposit address after the mint can
+  belong to another transfer, so resume fails the transfer for reconciliation
+  instead of adopting it (see "BaseToAlpaca deposit send").
 - `Attested`: the CCTP mint is irreversible -- re-calling `receiveMessage`
   reverts on the already-used nonce, which would otherwise turn a successfully
   minted transfer into a terminal `BridgingFailed`. Resume must first ask the
@@ -3962,8 +3994,14 @@ enum UsdcRebalanceCommand {
     FailBridging { reason: String },
 
     // Deposit commands
+    // Persists the signed BaseToAlpaca deposit send on `Bridged`, before its
+    // first broadcast. Refused when a send was already signed.
+    PrepareDepositSend { prepared: PreparedTransaction },
     InitiateDeposit { deposit: TransferRef },
     ConfirmDeposit,
+    // Valid from `DepositInitiated`, and from a BaseToAlpaca `Bridged` whose
+    // deposit send cannot be resolved (the signed send, if any, becomes the
+    // `deposit_ref`).
     FailDeposit { reason: String },
     // Operator `transfer recheck`: un-fail a BaseToAlpaca `DepositFailed`
     // carrying an on-chain deposit ref, after verifying at Alpaca that the
@@ -3971,6 +4009,10 @@ enum UsdcRebalanceCommand {
     // `DepositCompletionRecovered`, returning the aggregate to
     // `DepositConfirmed` so the USDC->USD conversion leg completes.
     RecoverDeposit,
+    // Operator `transfer recheck --deposit-tx`: attach a send the operator
+    // found on chain to a BaseToAlpaca `DepositFailed` with no deposit ref,
+    // after the bot verified it (see "BaseToAlpaca deposit send").
+    AttachDepositSend { send_tx: TxHash },
 
     // Reconcile a stranded post-burn failure to the terminal `Reconciled`
     // state, clearing the rebalancing guard rather than re-driving the failed
@@ -4030,6 +4072,9 @@ enum UsdcRebalanceEvent {
         fee_collected: Usdc,
         minted_at: DateTime<Utc>,
     },
+    // BaseToAlpaca deposit send signed and persisted, before its first
+    // broadcast.
+    DepositSendPrepared { prepared: PreparedTransaction, prepared_at: DateTime<Utc> },
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<B256>,
@@ -4054,6 +4099,9 @@ enum UsdcRebalanceEvent {
     // (carrying the original amount and tx hashes) so the conversion leg
     // completes. Mirrors `BridgingCompletionRecovered`.
     DepositCompletionRecovered { recovered_at: DateTime<Utc> },
+    // The operator-verified deposit send attached to a BaseToAlpaca
+    // `DepositFailed` that had none recorded.
+    DepositSendAttached { send_tx: TxHash, attached_at: DateTime<Utc> },
     // Operator reconciled a stranded post-burn failure. Carries `direction` so
     // the reactor derives the source venue without in-memory tracking (which
     // may be absent after a restart), plus `amount` and `initiated_at` so the
@@ -4300,14 +4348,25 @@ enum BridgeStage { Burn, Attestation, Mint }
   completed, so the funds are off Alpaca even without burn evidence), or a
   `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). The
   `is_reconcilable_failure` predicate is the single source of this eligibility
-  rule. Every other state is rejected: an in-progress transfer must be resumed,
-  and a failure whose funds never left the source venue reconciles to source on
-  its own. `Reconciled` is a clearing terminal -- it carries **post-burn
-  semantics**, meaning the reactor zeroes source-venue inflight WITHOUT
-  crediting `available` (the USDC was already burned via CCTP, so the funds
-  genuinely left the source venue; this is NOT a cancel, which would wrongly
-  credit `available`). See "Operator reconciliation of a stranded post-burn
-  failure" under Failure Handling.
+  rule. The one in-flight exception is a `BaseToAlpaca` `Bridged` with a signed
+  deposit send (`has_prepared_deposit_send`): the send is never re-signed, so
+  one that can never confirm has no other exit; the operator reconciles it once
+  they verified on chain that it will not land (see "BaseToAlpaca deposit
+  send"). Every other state is rejected: an in-progress transfer must be
+  resumed, and a failure whose funds never left the source venue reconciles to
+  source on its own. `Reconciled` is a clearing terminal -- it carries
+  **post-burn semantics**, meaning the reactor zeroes source-venue inflight
+  WITHOUT crediting `available` (the USDC was already burned via CCTP, so the
+  funds genuinely left the source venue; this is NOT a cancel, which would
+  wrongly credit `available`). See "Operator reconciliation of a stranded
+  post-burn failure" under Failure Handling. For a signed send, the operator
+  names the tx that took its nonce, and the API and CLI read it on chain before
+  the command: they refuse unless it is mined from the bot's Ethereum wallet at
+  the send's nonce, is not the send itself, has Ethereum's required
+  confirmations (`[chains.ethereum]`, not the primary chain's), and paid the
+  send's deposit address no USDC (a fee-bumped copy of the send did). A missing
+  receipt for the send is never proof, since a lagging node shows none for a
+  send that mined.
 
 ##### Integration Points
 
@@ -4510,6 +4569,15 @@ Alpaca to Base:
      settles, since the funds left Alpaca). This stops the redrive and pages the
      operator (`WithdrawalTxMissing`); the guard is released when
      `transfer reconcile --kind usdc` settles the transfer.
+   - **One withdrawal tx per transfer:** before `ConfirmWithdrawal` records the
+     hash, the bot reads the event store for another `UsdcRebalance` that
+     already recorded the same `withdrawal_tx`. If one did, the tx cannot be
+     this withdrawal's delivery: the bot confirms the withdrawal with no hash,
+     emits `FailBridging` (a pre-burn `BridgingFailed` that
+     `transfer reconcile --kind usdc` settles) and pages the operator
+     (`WithdrawalTxAlreadyRecorded`, no redrive). Two transfers that confirm the
+     same tx at the same moment can both pass this read; the credit ledger check
+     pages for that case.
    - **Settlement gate (before proceeding):** wait for the withdrawal tx to
      reach the required confirmations on Ethereum. Alpaca marks a withdrawal
      "Complete" before the on-chain tx is settled network-wide on load-balanced
@@ -4593,7 +4661,8 @@ Base to Alpaca:
 10. Send exactly the transfer's credit to Alpaca's deposit address: the amount
     the mint tx paid the bot wallet (`Bridged.amount_received`, from the
     `MintAndWithdraw` event), never the wallet balance (see "BaseToAlpaca
-    deposit send"; fresh sends directly, resume adopts an existing send)
+    deposit send"; the send is signed and persisted before its broadcast, and
+    resume broadcasts those same bytes)
 11. Poll Alpaca API by the send tx until deposit status is COMPLETE
 12. **Convert USDC to USD**: Place market sell order on USDC/USD pair (sell
     USDC)
@@ -4611,22 +4680,27 @@ the receipt before the balance; until then, or if the read fails, it is in
 flight up to the nominal amount). An AlpacaToBase `BridgingSubmitting` with a
 `burn_amount` is in flight: its burn may be unsent, unmined, or broadcast with
 its hash lost (`BurnRecordFailed`, an inconclusive submit), and the state cannot
-tell these apart. In-flight credit never pages a shortfall; it only raises the
-amount above which wallet USDC is reported unattributed. Right before an
-AlpacaToBase burn (including a reburn after a burn reverted, on resume or in
-process after a confirm-time revert; the reverted hash stays recorded during the
-check so a restart there still reburns) or a BaseToAlpaca deposit send, the bot
-reads the wallet's USDC balance and compares it with the held total. The sending
-transfer's own credit is passed to the check, not read from its state. The first
-burn's check runs before `BeginBridging`, while the transfer is still
-`WithdrawalComplete`: a restart there redrives safely, and no awaited work sits
-between `BeginBridging` and the burn. A balance below the held total pages the
-operator (`operational_alert`), naming the transfers that hold credit; a balance
-above held plus in flight is logged as unattributed USDC. If an open aggregate
-cannot be read (unparseable id, failed load), the ledger cannot be derived and
-that pages too, naming the aggregate, because the shortfall check is off until
-it is fixed. A failed wallet balance read only warns. The check never blocks or
-fails a transfer.
+tell these apart. A BaseToAlpaca `Bridged` stops being held once its deposit
+send is signed and persisted: the send may be unsent, unmined or mined, so its
+credit is in flight until `InitiateDeposit`. In-flight credit never pages a
+shortfall; it only raises the amount above which wallet USDC is reported
+unattributed. Right before an AlpacaToBase burn (including a reburn after a burn
+reverted, on resume or in process after a confirm-time revert; the reverted hash
+stays recorded during the check so a restart there still reburns) or a
+BaseToAlpaca deposit send, the bot reads the wallet's USDC balance and compares
+it with the held total. The sending transfer's own credit is passed to the
+check, not read from its state. The first burn's check runs before
+`BeginBridging`, while the transfer is still `WithdrawalComplete`: a restart
+there redrives safely, and no awaited work sits between `BeginBridging` and the
+burn. A balance below the held total pages the operator (`operational_alert`),
+naming the transfers that hold credit; a balance above held plus in flight is
+logged as unattributed USDC. If an open aggregate cannot be read (unparseable
+id, failed load), the ledger cannot be derived and that pages too, naming the
+aggregate, because the shortfall check is off until it is fixed. Two open
+AlpacaToBase transfers that recorded the same withdrawal tx page too ("Open USDC
+transfers share one Alpaca withdrawal tx"), naming them: the tx paid only one of
+them. A failed wallet balance read only warns. The check never blocks or fails a
+transfer.
 
 ###### Fast Transfer Benefits
 
@@ -5778,17 +5852,18 @@ named exemptions defined after the list:**
   redemptions, and BaseToAlpaca USDC deposits (`--kind usdc`, by rebalance id):
   a `DepositFailed` rebalance whose Alpaca deposit settled after the polling
   deadline is verified against the exact transfer (single query by the persisted
-  send tx, no polling deadline), un-failed via `DepositCompletionRecovered` back
-  to `DepositConfirmed`, and driven through the USDC->USD conversion to the
-  normal terminal -- clearing the stranded in-progress guard through the live
-  reactor. A transfer Alpaca still reports pending or failed refuses without
-  touching the aggregate. A send tx that is absent from Alpaca's account-wide
-  transfer list is a separate, INCONCLUSIVE result: the list may be capped, so
-  absence is not proof the deposit never settled. The recheck reports
-  `not_detected_yet`, changes nothing, and the operator retries later. Other
-  USDC states keep their existing paths (`resume` while non-terminal,
-  `reconcile` for funds handled out-of-band rather than settled by the
-  provider).
+  send tx, or by an operator-supplied `--deposit-tx` the bot verifies on chain
+  when no send was recorded; no polling deadline), un-failed via
+  `DepositCompletionRecovered` back to `DepositConfirmed`, and driven through
+  the USDC->USD conversion to the normal terminal -- clearing the stranded
+  in-progress guard through the live reactor. A transfer Alpaca still reports
+  pending or failed refuses without touching the aggregate. A send tx that is
+  absent from Alpaca's account-wide transfer list is a separate, INCONCLUSIVE
+  result: the list may be capped, so absence is not proof the deposit never
+  settled. The recheck reports `not_detected_yet`, changes nothing, and the
+  operator retries later. Other USDC states keep their existing paths (`resume`
+  while non-terminal, `reconcile` for funds handled out-of-band rather than
+  settled by the provider).
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
 - `reconcile` -- declare an already-terminal-failed operation resolved
@@ -6770,28 +6845,90 @@ therefore performs an explicit fund-moving send:
 
 1. **Fetch the deposit address.** `get_wallet_address(USDC, ethereum)` returns
    Alpaca's per-account Ethereum USDC deposit address.
-2. **Send (crash-safe, split fresh vs resume like the CCTP burn).** The fresh
-   path (right after this execution minted) sends the ERC20 transfer of the
-   received amount from the bot wallet to the deposit address DIRECTLY -- no
-   pre-send scan, no finality wait -- since no prior send can exist. The
-   resume-from-`Bridged` path (a crash may have left a prior send) first scans
-   Ethereum for an already-submitted USDC
-   `Transfer(from = bot wallet, to = deposit address, value = amount received)`
-   at or after the mint tx's block (the scan lower bound: the deposit send lands
-   at or after the mint, so no earlier transfer can be this deposit's). If such
-   a transfer exists, it is ADOPTED (no second send); otherwise it sends. A scan
-   failure (an RPC error, or an inconclusive finality-gated scan) returns an
-   error and sends NOTHING -- never a blind re-send -- so a transient fault
-   cannot double-spend.
-3. **Record the send.** The send tx (not the mint tx) is recorded as the deposit
+2. **Sign and persist, then broadcast (like the equity vault withdrawal).** The
+   bot signs the ERC20 transfer of the received amount from the bot wallet to
+   the deposit address without broadcasting it, which reserves its nonce, and
+   persists the signed transaction on `Bridged` with `PrepareDepositSend`
+   (refused if a send was already signed, so one transfer has one send). The
+   sign and persist run on a detached task, so a job timeout cannot stop between
+   them, and under one lock after a reload, so a redrive that overlaps a
+   timed-out attempt takes its persisted send instead of signing a second one.
+   If the write fails and a reload shows no signed send, or another signed send,
+   the nonce is released and nothing is sent; if the reload fails, the nonce
+   stays reserved and the bot pages, since the bytes may be persisted. A failure
+   to sign sends nothing, and the job retries. Then it broadcasts the persisted
+   bytes ("already known" counts as success) and waits for the send to reach the
+   required confirmations; `InitiateDeposit` then records its hash, which must
+   equal the signed send's.
+   - Broadcast refused or failed, receipt not known yet, or the send dropped
+     from the mempool: the outcome is not known yet
+     (`DepositSendReconciliationPending`). The aggregate stays `Bridged` and the
+     job redrives after 30 s, broadcasting the same bytes again, with no retry
+     budget. Once 4 hours have passed since the send was persisted, every
+     redrive pages the operator and the cadence slows to 30 minutes. A signed
+     send is never re-signed or fee-bumped. One whose nonce another tx took
+     never confirms. One that will not confirm at its current fee can still mine
+     when fees drop, so the operator first cancels it: a higher-fee 0-value
+     self-transfer from the bot wallet at the same nonce, mined. Only once a
+     different tx is mined at the send's nonce does the operator settle the
+     minted USDC and run `transfer reconcile --kind usdc`, which accepts a
+     BaseToAlpaca `Bridged` with a signed send, then restart the bot to release
+     the send's nonce. Reconcile takes that different tx's hash
+     (`--superseding-tx`) and refuses unless the chain shows it mined from the
+     bot wallet at the send's nonce, distinct from the send, with the required
+     confirmations, and paying the send's deposit address no USDC, so a
+     fee-bumped copy of the send is refused. A superseding tx on a transfer with
+     no signed send is refused.
+   - Mined reverted: it moved no USDC. The bot does not sign another send; it
+     emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
+     (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job
+     retries and takes the same path.
+   - At startup, before any job, startup approval or stale-allowance revoke can
+     send from the Ethereum wallet, the bot reserves the nonce of every signed
+     send still on `Bridged`, so no other send takes it. A failure to read those
+     transfers pages and does not stop startup, but skips the Ethereum startup
+     approvals and revokes on that start; the rebroadcast reserves the nonce
+     again when the transfer resumes. Startup then rebroadcasts each restored
+     send without waiting for a confirmation, so no later send waits behind a
+     send no node holds. A failed startup rebroadcast pages and keeps the nonce
+     reserved. A restored send that is not mined after the rebroadcast (or whose
+     rebroadcast failed) skips the Ethereum startup approvals and revokes on
+     that start, with a warning; the transfer's resume broadcasts the send
+     again.
+3. **Resume from `Bridged`.**
+   - **Signed send persisted:** broadcast the same bytes and continue as in
+     step 2. Other transfers send the same amount to the same deposit address
+     from the shared wallet, so no other send is adopted.
+   - **No signed send:** scan Ethereum for a USDC
+     `Transfer(from = bot wallet, to = deposit address, value = amount received)`
+     at or after the mint tx's block. This covers transfers that reached
+     `Bridged` on a build that sent without persisting the signed send first, so
+     only a transfer loaded at `Bridged` runs it. A transfer that reaches
+     `Bridged` during the resume (an adopted attested mint, or a post-burn
+     `BridgingFailed` recovery) has no send yet and signs and sends at once.
+     None found: sign and send as in step 2. One found: it may be another
+     corridor's send of the same amount through the shared wallet, so the bot
+     never adopts it: it emits `FailDeposit` with no `deposit_ref` and pages
+     (`DepositSendUnresolved`). A scan failure (an RPC error, or an inconclusive
+     finality-gated scan) returns an error and sends NOTHING.
+4. **Record the send.** The send tx (not the mint tx) is recorded as the deposit
    reference via `InitiateDeposit`, advancing the aggregate to
    `DepositInitiated`.
-4. **Poll by the send tx.** Alpaca is polled for the deposit identified by the
+5. **Poll by the send tx.** Alpaca is polled for the deposit identified by the
    send tx until it is credited, then `ConfirmDeposit` is emitted and the
    USDC-to-USD conversion runs.
 
-The resume-path scan is what makes resuming from `Bridged` safe: a crash between
-a fresh direct send and `InitiateDeposit` re-enters the leg from `Bridged`,
-where the scan finds the already-submitted transfer and adopts it instead of
-forwarding the minted USDC twice. Once `InitiateDeposit` is recorded, resume
-re-polls by the recorded send tx without sending again.
+Once `InitiateDeposit` is recorded, resume re-polls by the recorded send tx
+without sending again. A `DepositFailed` that carries the signed send can be
+settled with `transfer recheck` when Alpaca credited it, or with
+`transfer reconcile --kind usdc`. A `DepositFailed` with no `deposit_ref` can be
+settled with `transfer recheck --kind usdc --deposit-tx <hash>` when the
+operator finds this transfer's own send on chain and Alpaca credited it: the bot
+attaches the tx (`AttachDepositSend`) only if it moved exactly the transfer's
+`amount_received` from the bot wallet to Alpaca's deposit address, has the
+required confirmations, is mined at or after the transfer's mint block (an older
+send, such as a manual one, paid something else), and no other `UsdcRebalance`
+recorded it, then rechecks as for a recorded send. A hash with no receipt is
+refused at once, without the receipt wait, so a wrong hash fails within the
+CLI's request timeout. Otherwise `transfer reconcile --kind usdc`, which does
+not convert the USDC to USD.

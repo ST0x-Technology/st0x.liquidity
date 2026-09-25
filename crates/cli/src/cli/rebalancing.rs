@@ -1,6 +1,6 @@
 //! Transfer equity and USDC rebalancing CLI commands.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::RootProvider;
 use anyhow::Context;
 use sqlx::SqlitePool;
@@ -14,7 +14,9 @@ use uuid::Uuid;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold, HedgedChain, OnchainWalletCtx};
 use st0x_event_sorcery::{Store, StoreBuilder};
-use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
+use st0x_evm::{
+    Chain, Evm, IERC20, OpenChainErrorRegistry, PreparedTransaction, ReadOnlyEvm, Wallet,
+};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Executor,
     FractionalShares, Positive, Symbol, TimeInForce,
@@ -34,6 +36,7 @@ use st0x_hedge::operator::rebalancing::equity::{
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_hedge::operator::rebalancing::usdc::{
     CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams, UsdcTransferError,
+    deposit_send_required_confirmations, verify_deposit_send_superseded,
 };
 use st0x_hedge::operator::telemetry::TelemetrySender;
 use st0x_hedge::operator::telemetry::broker::InstrumentedAlpacaBroker;
@@ -646,11 +649,11 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// delayed-redrive outcomes: `AttestationTimedOut`, the settlement-wait
 /// errors (`WithdrawalTxUnderconfirmed`, `WithdrawalScanTransient`,
 /// `SettlementCheckTransient`), a non-backpressure
-/// `WithdrawalPollInconclusive` (Alpaca unreachable), and
-/// `MintRecoveryInconclusive`. The CLI must NOT keep redriving these itself:
-/// its process would race the bot's worker on the same aggregate (the
-/// CLI-vs-server race), so the first such outcome hands the transfer off to
-/// the running bot instead. Errors outside this set -- including
+/// `WithdrawalPollInconclusive` (Alpaca unreachable),
+/// `MintRecoveryInconclusive`, and `DepositSendReconciliationPending`. The
+/// CLI must NOT keep redriving these itself: its process would race the
+/// bot's worker on the same aggregate (the CLI-vs-server race), so the first
+/// such outcome hands the transfer off to the running bot instead. Errors outside this set -- including
 /// `AttestationRetryDeadlineElapsed` and a previously-failed aggregate --
 /// are terminal for the CLI invocation.
 fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
@@ -659,7 +662,8 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::WithdrawalTxUnderconfirmed { .. }
         | UsdcTransferError::WithdrawalScanTransient { .. }
         | UsdcTransferError::SettlementCheckTransient { .. }
-        | UsdcTransferError::MintRecoveryInconclusive { .. } => true,
+        | UsdcTransferError::MintRecoveryInconclusive { .. }
+        | UsdcTransferError::DepositSendReconciliationPending { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
             source.backpressure().is_none()
         }
@@ -707,11 +711,15 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::WithdrawalTxMissing { .. }
         | UsdcTransferError::WithdrawalCreditMismatch { .. }
         | UsdcTransferError::WithdrawalCreditUnreadable { .. }
+        | UsdcTransferError::WithdrawalTxAlreadyRecorded { .. }
+        | UsdcTransferError::WithdrawalTxLookupFailed { .. }
         | UsdcTransferError::SettlementRetryDeadlineElapsed { .. }
         | UsdcTransferError::BurnRecordTaskFailed { .. }
         | UsdcTransferError::BurnRecordFailed { .. }
         | UsdcTransferError::BurnSubmitInconclusive { .. }
-        | UsdcTransferError::BurnTxDropped { .. } => false,
+        | UsdcTransferError::BurnTxDropped { .. }
+        | UsdcTransferError::DepositSendUnresolved { .. }
+        | UsdcTransferError::DepositSendTaskPanicked { .. } => false,
     }
 }
 
@@ -982,6 +990,9 @@ async fn run_usdc_transfer<Writer: Write>(
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations: ctx.chains.primary().required_confirmations,
+            ethereum_required_confirmations: Some(deposit_send_required_confirmations(
+                &ctx.chains,
+            )?),
             reserved_cash: ctx
                 .assets
                 .cash
@@ -1426,12 +1437,16 @@ pub(super) async fn clear_pending_burn_command<Writer: Write>(
 /// loads and sends. Rejects an unknown id (refusing to act on the wrong
 /// transfer/database) and an aggregate that is not a guard-stranding post-burn
 /// failure (the command itself rejects the latter, but the preflight gives a
-/// clearer operator-facing error first).
+/// clearer operator-facing error first). A Base->Alpaca `Bridged` with a
+/// signed deposit send reconciles only once `verify_deposit_send` proves on
+/// chain that the send can never mine.
 pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
     reason: ReconcileReason,
+    superseding_tx: Option<TxHash>,
     pool: &SqlitePool,
+    verify_deposit_send: impl AsyncFnOnce(&PreparedTransaction, Option<TxHash>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let id = UsdcRebalanceId(id);
     writeln!(stdout, "Reconciling stuck USDC transfer id: {id}")?;
@@ -1448,16 +1463,33 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     };
 
     // Authoritative gate is the aggregate command; this preflight shares its
-    // predicate (`is_reconcilable_failure`, the single source of the
-    // reconcile-eligibility rule) only to give the operator a clearer error
-    // first.
-    if !state.is_reconcilable_failure() {
+    // predicates (`is_reconcilable_failure` and `has_prepared_deposit_send`)
+    // only to give the operator a clearer error first.
+    if !state.is_reconcilable_failure() && !state.has_prepared_deposit_send() {
         anyhow::bail!(
             "transfer reconcile: transfer {id} is in state {state:?}, not a terminal \
              failure that strands the in-progress guard or off-venue funds (DepositFailed, \
              post-burn BridgingFailed, AlpacaToBase BridgingFailed, or a BaseToAlpaca \
-             ConversionFailed). Refusing to act."
+             ConversionFailed), nor a Base->Alpaca Bridged with a signed deposit send. \
+             Refusing to act."
         );
+    }
+
+    // The aggregate command is pure, so the chain proof that the signed send
+    // can never mine is read here, before the command.
+    match (state.prepared_deposit_send(), superseding_tx) {
+        (Some(prepared), _) => {
+            verify_deposit_send(prepared, superseding_tx)
+                .await
+                .with_context(|| {
+                    format!("transfer reconcile: refusing to reconcile USDC transfer {id}")
+                })?;
+        }
+        (None, Some(_)) => anyhow::bail!(
+            "transfer reconcile: --superseding-tx applies only to a transfer with a signed \
+             deposit send; transfer {id} has none. Refusing to act."
+        ),
+        (None, None) => {}
     }
 
     usdc_store
@@ -1467,14 +1499,57 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
         )
         .await?;
 
-    writeln!(
-        stdout,
-        "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will clear \
-         on the next sweep tick (within transfer_timeout) and USDC rebalancing will resume \
-         without a restart."
-    )?;
+    // The running bot keeps a signed send's nonce reserved; only a restart
+    // releases it.
+    if state.has_prepared_deposit_send() {
+        writeln!(
+            stdout,
+            "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will \
+             clear on the next sweep tick (within transfer_timeout). Restart the bot to \
+             release the signed deposit send's nonce: until then later sends from the \
+             Ethereum wallet wait behind it."
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will \
+             clear on the next sweep tick (within transfer_timeout) and USDC rebalancing will \
+             resume without a restart."
+        )?;
+    }
 
     Ok(())
+}
+
+/// Proves on the configured Ethereum wallet that `prepared` can never mine:
+/// `superseding_tx` is the wallet's tx at its nonce, with the confirmation
+/// depth the bot's USDC transfers use.
+pub(super) async fn verify_deposit_send_superseded_on_chain(
+    ctx: &Ctx,
+    prepared: &PreparedTransaction,
+    superseding_tx: Option<TxHash>,
+) -> anyhow::Result<()> {
+    let wallet_ctx = ctx.wallet()?;
+    let bridge = CctpBridge::try_from_ctx(CctpCtx {
+        corridor: ctx.rebalancing.cctp_corridor,
+        ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
+        base_wallet: wallet_ctx.base_wallet().clone(),
+        #[cfg(any(test, feature = "test-support"))]
+        circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+        #[cfg(any(test, feature = "test-support"))]
+        token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+        #[cfg(any(test, feature = "test-support"))]
+        message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+    })?;
+
+    Ok(verify_deposit_send_superseded(
+        &bridge,
+        prepared,
+        superseding_tx,
+        wallet_ctx.ethereum_wallet().address(),
+        deposit_send_required_confirmations(&ctx.chains)?,
+    )
+    .await?)
 }
 
 /// Resolves the tokenized-equity (tStock) address for a tokenization
@@ -2003,8 +2078,13 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
     stdout: &mut W,
     transfer_type: RecheckTransferType,
     id: &str,
+    deposit_tx: Option<TxHash>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    if deposit_tx.is_some() && !matches!(transfer_type, RecheckTransferType::Usdc) {
+        anyhow::bail!("--deposit-tx applies only to `transfer recheck --kind usdc`");
+    }
+
     let transfer_kind = match transfer_type {
         RecheckTransferType::Mint => st0x_hedge::operator::equity_transfer::RecheckKind::Mint,
         RecheckTransferType::Redemption => {
@@ -2012,7 +2092,8 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
         }
         RecheckTransferType::Usdc => st0x_hedge::operator::equity_transfer::RecheckKind::Usdc,
     };
-    let url = st0x_hedge::operator::equity_transfer::recheck_url(ctx, transfer_kind, id);
+    let url =
+        st0x_hedge::operator::equity_transfer::recheck_url(ctx, transfer_kind, id, deposit_tx);
     writeln!(stdout, "Re-checking {transfer_type:?} {id} via {url}")?;
 
     // The outcome name is the operator-facing value documented in
@@ -2124,6 +2205,7 @@ mod tests {
     use st0x_hedge::operator::offchain::order::OffchainOrderId;
     use st0x_hedge::operator::onchain::mock::MockRaindex;
     use st0x_hedge::operator::position::TradeId;
+    use st0x_hedge::operator::rebalancing::usdc::DepositSendNotSuperseded;
     use st0x_hedge::operator::test_utils::try_setup_test_db;
     use st0x_hedge::operator::usdc_rebalance::{
         ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
@@ -2621,7 +2703,7 @@ mod tests {
             ctx.server_port = server.port();
 
             let mut stdout = Vec::new();
-            recheck_transfer_command(&mut stdout, transfer_type, "some-id", &ctx)
+            recheck_transfer_command(&mut stdout, transfer_type, "some-id", None, &ctx)
                 .await
                 .unwrap();
 
@@ -2633,6 +2715,56 @@ mod tests {
                 "unexpected output for {kind}: {output}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn usdc_recheck_passes_the_operator_deposit_tx_to_the_bot() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/transfers/recheck/usdc_bridge/some-id")
+                    .query_param(
+                        "deposit_tx",
+                        "0x00000000000000000000000000000000000000000000000000000000000000cc",
+                    );
+                then.status(200).body(r#"{"outcome":"recovered"}"#);
+            })
+            .await;
+        let mut ctx = create_base_test_ctx();
+        ctx.server_port = server.port();
+
+        recheck_transfer_command(
+            &mut Vec::new(),
+            RecheckTransferType::Usdc,
+            "some-id",
+            Some(TxHash::with_last_byte(0xcc)),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn equity_recheck_refuses_a_deposit_tx() {
+        let ctx = create_base_test_ctx();
+
+        let error = recheck_transfer_command(
+            &mut Vec::new(),
+            RecheckTransferType::Mint,
+            "some-id",
+            Some(TxHash::with_last_byte(0xcc)),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--deposit-tx applies only to `transfer recheck --kind usdc`"
+        );
     }
 
     /// `transfer resume --kind equity` against a mocked bot endpoint: the
@@ -3026,7 +3158,9 @@ mod tests {
             &mut stdout,
             unknown_id,
             ReconcileReason::FundsMovedManually,
+            None,
             &pool,
+            no_deposit_send_to_verify,
         )
         .await;
 
@@ -3068,7 +3202,9 @@ mod tests {
             &mut stdout,
             id,
             ReconcileReason::FundsMovedManually,
+            None,
             &pool,
+            no_deposit_send_to_verify,
         )
         .await;
 
@@ -3086,8 +3222,8 @@ mod tests {
             err_msg.ends_with(
                 ", not a terminal failure that strands the in-progress guard or \
                  off-venue funds (DepositFailed, post-burn BridgingFailed, \
-                 AlpacaToBase BridgingFailed, or a BaseToAlpaca ConversionFailed). \
-                 Refusing to act."
+                 AlpacaToBase BridgingFailed, or a BaseToAlpaca ConversionFailed), nor \
+                 a Base->Alpaca Bridged with a signed deposit send. Refusing to act."
             ),
             "reconcile of an in-progress aggregate must refuse with the exact \
              contract text; got: {err_msg}"
@@ -3142,7 +3278,9 @@ mod tests {
             &mut stdout,
             id,
             ReconcileReason::FundsMovedManually,
+            None,
             &pool,
+            no_deposit_send_to_verify,
         )
         .await
         .unwrap();
@@ -3166,6 +3304,181 @@ mod tests {
             !state.holds_rebalance_guard(),
             "Reconciled must not hold the durable guard, so a restart does \
              not re-latch it"
+        );
+    }
+
+    /// Transfers without a signed deposit send have nothing to check on chain.
+    async fn no_deposit_send_to_verify(
+        prepared: &PreparedTransaction,
+        _superseding_tx: Option<TxHash>,
+    ) -> anyhow::Result<()> {
+        panic!("no signed deposit send to verify, got: {prepared:?}")
+    }
+
+    /// A signed deposit send that can still mine is not reconciled: the CLI
+    /// names the transfer and the chain check's reason, and leaves it `Bridged`.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_refuses_a_signed_deposit_send_that_can_still_mine() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xD5E2);
+
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridged(&store, id).await;
+        let prepared =
+            PreparedTransaction::for_test(alloy::primitives::TxHash::repeat_byte(0xD5), 9);
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::PrepareDepositSend {
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let error = reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            None,
+            &pool,
+            async |checked: &PreparedTransaction, _| {
+                assert_eq!(checked, &prepared, "the chain check reads the signed send");
+                Err(DepositSendNotSuperseded::NoSupersedingTx {
+                    tx: checked.tx_hash(),
+                    nonce: checked.nonce(),
+                }
+                .into())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "transfer reconcile: refusing to reconcile USDC transfer {}: {}",
+                UsdcRebalanceId(id),
+                DepositSendNotSuperseded::NoSupersedingTx {
+                    tx: prepared.tx_hash(),
+                    nonce: 9,
+                },
+            )
+        );
+        let state = store
+            .load(&UsdcRebalanceId(id))
+            .await
+            .unwrap()
+            .expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Bridged { .. }),
+            "a refused reconcile leaves the transfer Bridged, got: {state:?}"
+        );
+    }
+
+    /// A superseding tx names what took a signed send's nonce, so it is refused
+    /// on a transfer with no signed send rather than silently ignored.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_refuses_a_superseding_tx_without_a_signed_deposit_send() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xD5E3);
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_deposit_failed(&store, id).await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            Some(TxHash::repeat_byte(0xCA)),
+            &pool,
+            no_deposit_send_to_verify,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "transfer reconcile: --superseding-tx applies only to a transfer with a signed \
+                 deposit send; transfer {} has none. Refusing to act.",
+                UsdcRebalanceId(id)
+            )
+        );
+        let state = store
+            .load(&UsdcRebalanceId(id))
+            .await
+            .unwrap()
+            .expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::DepositFailed { .. }),
+            "a refused reconcile leaves the transfer as it was, got: {state:?}"
+        );
+    }
+
+    /// Reconciling a Base->Alpaca `Bridged` with a signed deposit send leaves
+    /// that send's nonce reserved in the running bot, so the CLI says a
+    /// restart is required.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_with_a_signed_deposit_send_requires_a_restart() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xD5E1);
+
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        seed_to_bridged(&store, id).await;
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::PrepareDepositSend {
+                    prepared: PreparedTransaction::for_test(
+                        alloy::primitives::TxHash::repeat_byte(0xD5),
+                        9,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            Some(TxHash::repeat_byte(0xCA)),
+            &pool,
+            async |_: &PreparedTransaction, superseding_tx| {
+                assert_eq!(
+                    superseding_tx,
+                    Some(TxHash::repeat_byte(0xCA)),
+                    "the chain check gets the operator's superseding tx"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "Reconciling stuck USDC transfer id: {id}\n\
+                 Reconciled USDC transfer {id} (reason: FundsMovedManually); the in-progress \
+                 guard will clear on the next sweep tick (within transfer_timeout). Restart \
+                 the bot to release the signed deposit send's nonce: until then later sends \
+                 from the Ethereum wallet wait behind it.\n",
+                id = UsdcRebalanceId(id),
+            )
         );
     }
 

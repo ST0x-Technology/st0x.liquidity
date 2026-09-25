@@ -47,13 +47,19 @@ rebalancing enabled; the symbol -> address mapping is resolved through the
 from the EVM config, USDC from the shared `USDC_BASE` constant, and the owner is
 the base bot wallet.
 
-The grant runs inline during conductor startup, after the RPC probe and vault
-registry seeding but **before any worker or rebalancer spawns**, so allowances
-are durably on chain before the first wrap/deposit. It submits through the same
-`Wallet::submit` path every other on-chain write uses, so confirmation depth and
-nonce handling are consistent. A failure to grant fails startup fast with a
-typed error (`StartupApprovalError`): the bot must not come up looking healthy
-while wrap/deposit would revert.
+The grant runs inline during conductor startup, after the RPC probe, vault
+registry seeding and the startup nonce restores and rebroadcasts of persisted
+signed sends (so an approval never takes such a send's nonce, nor waits behind
+one no node holds), but **before any worker or rebalancer spawns**, so
+allowances are durably on chain before the first wrap/deposit. A chain with a
+restored send that is not mined after the rebroadcast (the rebroadcast failed,
+or the send is pending, possibly at too low a fee) is deferred with a warning
+instead: an approval there would wait behind that nonce until its confirmation
+timeout and fail every restart, and wraps and deposits there still approve on
+demand (below). It submits through the same `Wallet::submit` path every other
+on-chain write uses, so confirmation depth and nonce handling are consistent. A
+failure to grant fails startup fast with a typed error (`StartupApprovalError`):
+the bot must not come up looking healthy while wrap/deposit would revert.
 
 ## Idempotency and re-arm
 

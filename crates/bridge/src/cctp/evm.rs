@@ -1,10 +1,11 @@
 //! Single-chain CCTP operations.
 
+use alloy::consensus::Transaction as _;
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
 use alloy::sol;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
@@ -13,13 +14,13 @@ use tracing::{debug, info, trace, warn};
 #[cfg(test)]
 use st0x_evm::Evm;
 use st0x_evm::{
-    EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL, Wallet,
-    wait_for_node_sync,
+    EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    PreparedTransaction, Wallet, wait_for_node_sync,
 };
 
 use super::{
-    CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt,
-    MintScanFloorCheck, TokenMessengerV2, parse_received_message,
+    CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MinedTx,
+    MintReceipt, MintScanFloorCheck, TokenMessengerV2, UsdcTransferStatus, parse_received_message,
 };
 use crate::BridgeDirection;
 
@@ -788,6 +789,43 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(Some(head.saturating_sub(tx_block).saturating_add(1)))
     }
 
+    /// Returns the sender, nonce and confirmations of `tx_hash`, or `None`
+    /// while this endpoint's node shows no receipt or no transaction for it,
+    /// or the receipt's block is not the canonical block at its height.
+    /// Confirmations follow [`tx_confirmations`](Self::tx_confirmations).
+    pub(super) async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+        let provider = self.wallet.provider();
+        let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+            return Ok(None);
+        };
+
+        let (Some(tx_block), Some(receipt_block_hash)) = (receipt.block_number, receipt.block_hash)
+        else {
+            return Ok(None);
+        };
+
+        // Reads are not pinned to one node, so a lagging node can serve a
+        // receipt from a reorged-out block while the head comes from another:
+        // count confirmations only for a receipt in the canonical block.
+        let canonical = provider.get_block_by_number(tx_block.into()).await?;
+        if canonical.is_none_or(|block| block.header.hash != receipt_block_hash) {
+            warn!(target: "bridge", %tx_hash, tx_block, %receipt_block_hash, "Receipt block is not the canonical block at its height; treating the tx as not mined");
+            return Ok(None);
+        }
+
+        let Some(tx) = provider.get_transaction_by_hash(tx_hash).await? else {
+            return Ok(None);
+        };
+
+        let head = provider.get_block_number().await?;
+
+        Ok(Some(MinedTx {
+            from: receipt.from,
+            nonce: tx.nonce(),
+            confirmations: head.saturating_sub(tx_block).saturating_add(1),
+        }))
+    }
+
     /// Sums the USDC `Transfer` logs in `tx_hash`'s receipt that pay `recipient`:
     /// what that transaction credited to `recipient`, exact in base units.
     pub(super) async fn usdc_credited_in_tx(
@@ -797,45 +835,102 @@ impl<W: Wallet> CctpEndpoint<W> {
     ) -> Result<U256, CctpError> {
         let receipt = self.wallet.await_receipt(tx_hash).await?;
 
-        usdc_credit_in_receipt(&receipt, self.usdc_address, recipient)
+        usdc_credit_in_receipt(&receipt, self.usdc_address, None, recipient)
     }
 
-    /// Sends `amount` of this endpoint's USDC from the wallet to `to`, waiting
-    /// for the configured confirmation depth, and returns the transfer tx hash.
+    /// Like [`usdc_credited_in_tx`](Self::usdc_credited_in_tx), counting only
+    /// the `Transfer` logs from `sender`. The hash comes from an operator, so
+    /// one with no receipt yet is refused at once (`TxNotMined`) instead of
+    /// waiting out the receipt wait's drop grace or timeout.
+    pub(super) async fn usdc_sent_in_tx(
+        &self,
+        tx_hash: TxHash,
+        sender: Address,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        if self
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .is_none()
+        {
+            return Err(CctpError::TxNotMined { tx_hash });
+        }
+
+        let receipt = self.wallet.await_receipt(tx_hash).await?;
+
+        usdc_credit_in_receipt(&receipt, self.usdc_address, Some(sender), recipient)
+    }
+
+    /// Signs a transfer of `amount` of this endpoint's USDC from the wallet to
+    /// `to` without broadcasting it, reserving its nonce.
     ///
     /// This is the fund-moving leg of a BaseToAlpaca deposit: the CCTP mint
     /// credits the bot wallet, and this transfer forwards the minted USDC to
-    /// Alpaca's deposit address. Reuses [`Wallet::submit`] so nonce handling and
-    /// confirmation depth match every other write path; a revert is decoded via
-    /// `Registry`.
-    pub(super) async fn send_usdc<Registry: IntoErrorRegistry>(
+    /// Alpaca's deposit address. The caller persists the signed transfer
+    /// before [`broadcast_usdc`](Self::broadcast_usdc) sends it, so every
+    /// retry sends the same bytes and no second transfer can exist.
+    pub(super) async fn prepare_usdc(
         &self,
         to: Address,
         amount: U256,
-    ) -> Result<TxHash, CctpError> {
-        let receipt = self
-            .wallet
-            .submit::<Registry, _>(
+    ) -> Result<PreparedTransaction, EvmError> {
+        self.wallet
+            .prepare_pending(
                 self.usdc_address,
-                IERC20::transferCall { to, amount },
+                Bytes::from(IERC20::transferCall { to, amount }.abi_encode()),
                 "USDC deposit to Alpaca",
             )
-            .await?;
+            .await
+    }
 
-        Ok(receipt.transaction_hash)
+    /// Broadcasts a transfer signed by [`prepare_usdc`](Self::prepare_usdc).
+    /// Idempotent: a repeat sends the same bytes, and "already known" is
+    /// success.
+    pub(super) async fn broadcast_usdc(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, EvmError> {
+        self.wallet
+            .broadcast_prepared(prepared, "USDC deposit to Alpaca")
+            .await
+    }
+
+    pub(super) async fn discard_usdc(&self, prepared: &PreparedTransaction) {
+        self.wallet.discard_prepared(prepared).await;
+    }
+
+    pub(super) async fn restore_usdc(&self, prepared: &PreparedTransaction) {
+        self.wallet.restore_prepared(prepared).await;
+    }
+
+    /// Awaits the receipt of a transfer broadcast by
+    /// [`broadcast_usdc`](Self::broadcast_usdc) to the wallet's confirmation depth.
+    /// A revert (decoded via `Registry`) and a drop are reported as statuses;
+    /// any other error leaves the outcome unknown.
+    pub(super) async fn confirm_usdc<Registry: IntoErrorRegistry>(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<UsdcTransferStatus, CctpError> {
+        match self.wallet.confirm::<Registry>(tx_hash).await {
+            Ok(_) => Ok(UsdcTransferStatus::Confirmed),
+            Err(error) if error.is_revert() => Ok(UsdcTransferStatus::Reverted),
+            Err(error) if error.is_transaction_dropped() => Ok(UsdcTransferStatus::Dropped),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Scans for a USDC `Transfer(from, to, value == amount)` at or after
     /// `from_block`, returning the most recent matching transaction hash.
     ///
-    /// Crash-safe deposit-send recovery: the BaseToAlpaca deposit leg records the
-    /// mint block before sending USDC to Alpaca, so on resume this detects an
-    /// already-submitted send instead of re-sending (which would forward the
-    /// minted USDC twice). The deposit send lands at or after the mint, so the
-    /// match is bounded to `from_block` (the mint's block) onward. Matching on the
-    /// indexed `(from, to)` topics plus the exact `value` -- combined with the
-    /// single-USDC-rebalance-in-flight invariant -- guarantees an adopted transfer
-    /// is this deposit's, not an unrelated same-amount transfer.
+    /// Detects a legacy unrecorded deposit send: a BaseToAlpaca transfer that
+    /// reached `Bridged` without a persisted signed send may already have sent
+    /// the minted USDC, so resume refuses to send again when this finds a match.
+    /// The send lands at or after the mint, so the match is bounded to
+    /// `from_block` (the mint's block) onward. Matching on `(from, to, value)`
+    /// cannot tell this transfer's send from another transfer's same-amount
+    /// send, so a match is never adopted.
     ///
     /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
     /// `from_block` and repeated scans agree the transfer is absent; a node that
@@ -1629,12 +1724,14 @@ fn validate_message_shape(
     Ok(received_message)
 }
 
-/// Sums the `usdc` `Transfer` logs in `receipt` that pay `recipient`. A log
-/// carrying the `Transfer` topic that does not decode fails the read: skipping
-/// it would undercredit the transfer silently.
+/// Sums the `usdc` `Transfer` logs in `receipt` that pay `recipient`, from
+/// `sender` only when one is given. A log carrying the `Transfer` topic that
+/// does not decode fails the read: skipping it would undercredit the
+/// transfer silently.
 fn usdc_credit_in_receipt(
     receipt: &TransactionReceipt,
     usdc: Address,
+    sender: Option<Address>,
     recipient: Address,
 ) -> Result<U256, CctpError> {
     let tx_hash = receipt.transaction_hash;
@@ -1652,7 +1749,7 @@ fn usdc_credit_in_receipt(
         })
         .try_fold(U256::ZERO, |credited, transfer| {
             let transfer = transfer?;
-            if transfer.to != recipient {
+            if transfer.to != recipient || sender.is_some_and(|sender| transfer.from != sender) {
                 return Ok(credited);
             }
 
@@ -1866,7 +1963,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap(),
+            usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
             U256::from(1_000_000u64)
         );
     }
@@ -1883,7 +1980,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap(),
+            usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
             U256::from(1_000_000u64)
         );
     }
@@ -1895,7 +1992,7 @@ mod tests {
             transfer_log(USDC, WALLET, U256::from(1u64)),
         ]);
 
-        let error = usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap_err();
+        let error = usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
 
         assert!(
             matches!(error, CctpError::UsdcCreditOverflow { tx_hash } if tx_hash == TxHash::ZERO),
@@ -1925,7 +2022,7 @@ mod tests {
             malformed,
         ]);
 
-        let error = usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap_err();
+        let error = usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
 
         assert!(
             matches!(error, CctpError::UsdcTransferLogDecode { tx_hash, .. } if tx_hash == TxHash::ZERO),

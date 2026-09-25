@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use st0x_config::{Ctx, Env};
 use st0x_event_sorcery::Projection;
-use st0x_evm::{Chain, OpenChainErrorRegistry};
+use st0x_evm::{Chain, OpenChainErrorRegistry, PreparedTransaction};
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
@@ -917,7 +917,9 @@ pub enum TransferCommand {
     /// `BridgingFailed`, any `AlpacaToBase` `BridgingFailed` -- its
     /// withdrawal completed, so the funds are off Alpaca even without burn
     /// evidence -- or a `BaseToAlpaca` `ConversionFailed`) to the clearing
-    /// terminal `Reconciled` state (the funds were handled out-of-band).
+    /// terminal `Reconciled` state (the funds were handled out-of-band). A
+    /// Base->Alpaca `Bridged` with a signed deposit send also reconciles, once
+    /// `--superseding-tx` names a tx the bot wallet mined at that send's nonce.
     /// `--kind mint` / `--kind redemption` mark an equity transfer stuck in
     /// `Failed` as `Reconciled` once its residue was handled out-of-band (e.g.
     /// via wrap-equity/vault-deposit) -- a pure bookkeeping resolution. Rejects
@@ -937,6 +939,13 @@ pub enum TransferCommand {
         /// `deposit-credited-offline`; for `mint`/`redemption` it is free text.
         #[arg(short = 'r', long = "reason")]
         reason: AuditReason,
+        /// usdc only, required for a transfer with a signed deposit send and
+        /// refused for any other: the tx that took the send's nonce (the
+        /// 0-value self-transfer cancel). The bot checks that it is from the
+        /// bot's Ethereum wallet, at the send's nonce, not the send itself, has
+        /// the required confirmations, and paid the deposit address no USDC.
+        #[arg(long = "superseding-tx")]
+        superseding_tx: Option<TxHash>,
     },
 
     /// Manually fail a stuck mint or redemption transfer.
@@ -972,6 +981,13 @@ pub enum TransferCommand {
         /// redemption, rebalance ID for usdc)
         #[arg(short = 'i', long = "id")]
         id: String,
+        /// usdc only: the Alpaca deposit send found on chain for a deposit
+        /// that failed with no send recorded. The bot checks it (bot wallet
+        /// to the Alpaca deposit address, the transfer's amount, confirmed, at
+        /// or after the transfer's mint, not recorded by another transfer)
+        /// before attaching it.
+        #[arg(long = "deposit-tx")]
+        deposit_tx: Option<TxHash>,
     },
 }
 
@@ -1193,11 +1209,13 @@ enum TransferRecoveryCommand {
     RecheckTransfer {
         transfer_type: RecheckTransferType,
         id: String,
+        deposit_tx: Option<TxHash>,
     },
     ResumeInterruptedTransfers,
     ReconcileUsdcTransfer {
         id: Uuid,
         reason: ReconcileReasonArg,
+        superseding_tx: Option<TxHash>,
     },
     FailUsdcTransfer {
         id: Uuid,
@@ -1566,7 +1584,12 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                 // invoking classify directly must pass clap-parsed input.
                 unreachable!("clap `required_if_eq(\"kind\",\"usdc\")` guarantees id and direction")
             }
-            TransferCommand::Reconcile { kind, id, reason } => match kind {
+            TransferCommand::Reconcile {
+                kind,
+                id,
+                reason,
+                superseding_tx,
+            } => match kind {
                 ReconcileKind::Usdc => {
                     let id = id.parse::<Uuid>().map_err(|error| {
                         let context =
@@ -1577,8 +1600,17 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                     let reason = parse_usdc_reconcile_reason(reason.as_ref())?;
 
                     CommandRoute::Simple(SimpleCommand::Transfer {
-                        command: TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason },
+                        command: TransferRecoveryCommand::ReconcileUsdcTransfer {
+                            id,
+                            reason,
+                            superseding_tx,
+                        },
                     })
+                }
+                ReconcileKind::Mint | ReconcileKind::Redemption if superseding_tx.is_some() => {
+                    anyhow::bail!(
+                        "transfer reconcile: --superseding-tx applies only to --kind usdc"
+                    )
                 }
                 ReconcileKind::Mint => CommandRoute::Simple(SimpleCommand::Transfer {
                     command: TransferRecoveryCommand::ReconcileEquityTransfer {
@@ -1604,14 +1636,17 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                     },
                 })
             }
-            TransferCommand::Recheck { kind, id } => {
-                CommandRoute::Simple(SimpleCommand::Transfer {
-                    command: TransferRecoveryCommand::RecheckTransfer {
-                        transfer_type: kind,
-                        id,
-                    },
-                })
-            }
+            TransferCommand::Recheck {
+                kind,
+                id,
+                deposit_tx,
+            } => CommandRoute::Simple(SimpleCommand::Transfer {
+                command: TransferRecoveryCommand::RecheckTransfer {
+                    transfer_type: kind,
+                    id,
+                    deposit_tx,
+                },
+            }),
         },
         Commands::View { command } => match command {
             ViewCommand::Rebuild { aggregate, id, all } => {
@@ -1838,17 +1873,40 @@ async fn run_transfer_command<W: Write>(
                 rebalancing::fail_transfer_command(stdout, ctx, transfer_type, &id, &reason).await;
             finish_with_log_query_url(stdout, ctx, &id, result)
         }
-        TransferRecoveryCommand::RecheckTransfer { transfer_type, id } => {
+        TransferRecoveryCommand::RecheckTransfer {
+            transfer_type,
+            id,
+            deposit_tx,
+        } => {
             let result =
-                rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await;
+                rebalancing::recheck_transfer_command(stdout, transfer_type, &id, deposit_tx, ctx)
+                    .await;
             finish_with_log_query_url(stdout, ctx, &id, result)
         }
         TransferRecoveryCommand::ResumeInterruptedTransfers => {
             rebalancing::resume_interrupted_transfers_command(stdout, ctx).await
         }
-        TransferRecoveryCommand::ReconcileUsdcTransfer { id, reason } => {
-            let result =
-                rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await;
+        TransferRecoveryCommand::ReconcileUsdcTransfer {
+            id,
+            reason,
+            superseding_tx,
+        } => {
+            let result = rebalancing::reconcile_usdc_transfer_command(
+                stdout,
+                id,
+                reason.into(),
+                superseding_tx,
+                pool,
+                async |prepared: &PreparedTransaction, superseding_tx| {
+                    rebalancing::verify_deposit_send_superseded_on_chain(
+                        ctx,
+                        prepared,
+                        superseding_tx,
+                    )
+                    .await
+                },
+            )
+            .await;
             finish_with_log_query_url(stdout, ctx, &id.to_string(), result)
         }
         TransferRecoveryCommand::FailUsdcTransfer { id, reason } => {
@@ -3797,6 +3855,8 @@ mod tests {
             &id.to_string(),
             "--reason",
             "deposit-credited-offline",
+            "--superseding-tx",
+            &TxHash::repeat_byte(0xcc).to_string(),
         ])
         .unwrap();
 
@@ -3806,10 +3866,12 @@ mod tests {
                     TransferRecoveryCommand::ReconcileUsdcTransfer {
                         id: parsed_id,
                         reason,
+                        superseding_tx,
                     },
             }) => {
                 assert_eq!(parsed_id, id);
                 assert!(matches!(reason, ReconcileReasonArg::DepositCreditedOffline));
+                assert_eq!(superseding_tx, Some(TxHash::repeat_byte(0xcc)));
             }
             _ => panic!("expected reconcile usdc simple command"),
         }
@@ -3845,6 +3907,32 @@ mod tests {
             }
             _ => panic!("expected reconcile equity (mint) simple command"),
         }
+    }
+
+    #[test]
+    fn transfer_reconcile_mint_refuses_a_superseding_tx() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "reconcile",
+            "--kind",
+            "mint",
+            "--id",
+            "ISS001",
+            "--reason",
+            "wrapped manually via wrap-equity",
+            "--superseding-tx",
+            &TxHash::repeat_byte(0xcc).to_string(),
+        ])
+        .unwrap();
+
+        let Err(error) = classify_command(cli.command) else {
+            panic!("a superseding tx on an equity reconcile must be refused");
+        };
+        assert_eq!(
+            error.to_string(),
+            "transfer reconcile: --superseding-tx applies only to --kind usdc"
+        );
     }
 
     #[test]
@@ -3995,6 +4083,30 @@ mod tests {
     }
 
     #[test]
+    fn transfer_recheck_carries_an_operator_deposit_tx() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "recheck",
+            "--kind",
+            "usdc",
+            "--id",
+            "4efa80fb-a9c9-44dd-87bc-a726fee6fa88",
+            "--deposit-tx",
+            "0x00000000000000000000000000000000000000000000000000000000000000cc",
+        ])
+        .unwrap();
+
+        let Ok(SimpleCommand::Transfer {
+            command: TransferRecoveryCommand::RecheckTransfer { deposit_tx, .. },
+        }) = classified_route(cli.command)
+        else {
+            panic!("expected transfer recheck simple command");
+        };
+        assert_eq!(deposit_tx, Some(TxHash::with_last_byte(0xcc)));
+    }
+
+    #[test]
     fn transfer_recheck_parses_and_classifies_as_simple() {
         let cli = Cli::try_parse_from([
             "st0x-cli",
@@ -4009,7 +4121,12 @@ mod tests {
 
         match classified_route(cli.command) {
             Ok(SimpleCommand::Transfer {
-                command: TransferRecoveryCommand::RecheckTransfer { transfer_type, id },
+                command:
+                    TransferRecoveryCommand::RecheckTransfer {
+                        transfer_type,
+                        id,
+                        deposit_tx: None,
+                    },
             }) => {
                 assert!(matches!(transfer_type, RecheckTransferType::Redemption));
                 assert_eq!(id, "redemption-1");
@@ -4335,7 +4452,12 @@ mod tests {
         .unwrap();
         match classified_route(cli.command) {
             Ok(SimpleCommand::Transfer {
-                command: TransferRecoveryCommand::RecheckTransfer { transfer_type, id },
+                command:
+                    TransferRecoveryCommand::RecheckTransfer {
+                        transfer_type,
+                        id,
+                        deposit_tx: None,
+                    },
             }) => {
                 assert!(matches!(transfer_type, RecheckTransferType::Usdc));
                 assert_eq!(id, "4efa80fb-a9c9-44dd-87bc-a726fee6fa88");

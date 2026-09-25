@@ -140,6 +140,25 @@ const WITHDRAWAL_SCAN_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60
 /// held and the idempotent re-scan keeps running.
 const WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
 
+/// Duration after which repeated `DepositSendReconciliationPending` redrives
+/// page the operator, anchored on the persisted `prepared_at` of the signed
+/// Alpaca deposit send so the countdown survives restarts. A signed send is
+/// never re-signed or fee-bumped, so one whose nonce another tx took never
+/// confirms and one signed below the market fee waits until fees drop; before
+/// the deadline the redrive is silent, and the deadline keeps that stall from
+/// becoming a multi-day outage while later sends from the wallet queue behind
+/// its nonce.
+const DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Delay before rebroadcasting a signed deposit send whose outcome is not
+/// known yet. Uncapped: confirmation must not consume a finite retry budget.
+const DEPOSIT_SEND_RECONCILIATION_REDRIVE_DELAY: Duration = Duration::from_secs(30);
+
+/// Redrive delay after `DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE`, slowed
+/// to avoid alert fatigue while the idempotent rebroadcast keeps running.
+const DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY: Duration =
+    Duration::from_secs(30 * 60);
+
 /// Returns the warn-threshold attempt count at which an early operator alert
 /// fires, or `None` when there is no room for a distinct early warning.
 ///
@@ -693,9 +712,11 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             // timeout) and fails closed on ambiguity, so this per-attempt timeout
             // realistically only fires during the post-record confirm/receipt
             // wait, where `pending_burn_tx` is already set -- the resume adopts it
-            // rather than reburning. Count against the shared redrive budget so
-            // repeated timeouts (e.g., a permanently hung RPC) eventually surface
-            // for operator review.
+            // rather than reburning. The Alpaca deposit send is signed and
+            // persisted (`DepositSendPrepared`) before its broadcast, so a
+            // redrive broadcasts those same bytes and never sends twice. Count
+            // against the shared redrive budget so repeated timeouts (e.g., a
+            // permanently hung RPC) eventually surface for operator review.
             return self.handle_hedging_timeout_redrive(ctx).await;
         };
 
@@ -802,6 +823,13 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                 self.handle_mint_recovery_inconclusive(ctx, id, initiated_at, source)
                     .await?;
             }
+            // The signed deposit send is persisted but not confirmed yet. The
+            // redrive broadcasts the same bytes again, so it is unbounded and
+            // pages only past the durable deadline.
+            Err(error @ UsdcTransferError::DepositSendReconciliationPending { .. }) => {
+                self.handle_deposit_send_reconciliation_pending(ctx, error)
+                    .await?;
+            }
             // Revert-class burn failures: safe to redrive because
             // `resume_bridging_submitting` scans for an existing burn before
             // re-burning (the scan lower bound is durably recorded in the
@@ -872,6 +900,21 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                 );
                 if let Err(error) = ctx.notifier.notify(&message).await {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging inconclusive-burn alert");
+                }
+            }
+            // The deposit is already failed for reconciliation: an unrecorded
+            // same-amount send landed, or the signed send reverted.
+            Err(error @ UsdcTransferError::DepositSendUnresolved { .. }) => {
+                error!(
+                    target: "rebalance",
+                    id = %self.id,
+                    %error,
+                    "Base->Alpaca USDC transfer: deposit send unresolved; latched for operator \
+                     reconciliation (no auto-resend)"
+                );
+                let message = format!("{error}.");
+                if let Err(error) = ctx.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging deposit-send alert");
                 }
             }
             // The post-deposit conversion's fate is unknown and the order may
@@ -1259,6 +1302,69 @@ impl TransferUsdcToHedging {
             .await?;
         Ok(())
     }
+
+    /// Redrives a signed deposit send whose outcome is not known yet, paging
+    /// on every redrive once `DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE` has
+    /// passed since the send was persisted.
+    async fn handle_deposit_send_reconciliation_pending(
+        &self,
+        ctx: &TransferUsdcToHedgingCtx,
+        error: UsdcTransferError,
+    ) -> Result<(), TransferUsdcToHedgingJobError> {
+        let UsdcTransferError::DepositSendReconciliationPending {
+            ref id,
+            prepared_at,
+            ..
+        } = error
+        else {
+            return Err(error.into());
+        };
+        // A future `prepared_at` (clock skew) reads as no elapsed time.
+        let elapsed = Utc::now().signed_duration_since(prepared_at).to_std().ok();
+        let alert_deadline_elapsed =
+            deadline_elapsed(elapsed, DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE);
+        let redrive_delay = if alert_deadline_elapsed.is_some() {
+            DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY
+        } else {
+            DEPOSIT_SEND_RECONCILIATION_REDRIVE_DELAY
+        };
+        warn!(
+            target: "rebalance",
+            %error,
+            ?elapsed,
+            delay = ?redrive_delay,
+            "Rescheduling Base->Alpaca USDC transfer to rebroadcast its signed deposit send \
+             (guard held, redrive continues)"
+        );
+
+        if let Some(elapsed) = alert_deadline_elapsed {
+            let message = format!(
+                "{error}. It has stayed unconfirmed for {elapsed:?} \
+                 (>{DEPOSIT_SEND_RECONCILIATION_ALERT_DEADLINE:?}). The send is never re-signed \
+                 or fee-bumped, so later sends from the Ethereum wallet queue behind its nonce. \
+                 Automatic rebroadcast continues at a slower cadence (guard held). A send that \
+                 will not confirm at its current fee can still mine when fees drop: do not move \
+                 the minted USDC or reconcile until a different tx is mined at the send's nonce \
+                 (cancel it with a higher-fee 0-value self-transfer at that nonce from the bot \
+                 wallet, see docs/cli-ops.md). Only then settle the minted USDC, reconcile the \
+                 transfer (`transfer reconcile --kind usdc --id {id} --superseding-tx \
+                 <that tx>`) and restart the bot to release the send's nonce."
+            );
+            if let Err(notify_error) = ctx.notifier.notify(&message).await {
+                warn!(target: "rebalance", ?notify_error, "Failed to deliver deposit-send reconciliation deadline alert");
+            }
+        }
+
+        let redriven = Self {
+            backpressure_streak: BackpressureStreak::default(),
+            ..self.clone()
+        };
+        ctx.job_queue
+            .clone()
+            .push_with_delay(redriven, redrive_delay)
+            .await?;
+        Ok(())
+    }
 }
 
 /// Dependencies the Alpaca->Base job needs. Symmetric to
@@ -1533,6 +1639,23 @@ impl TransferUsdcToMarketMaking {
                      reconciliation required."
                 );
                 deliver_market_making_alert(&ctx.notifier, &message, "withdrawal-credit").await;
+            }
+            // Another transfer recorded this withdrawal tx. The aggregate has
+            // already moved to BridgingFailed via FailBridging.
+            Err(error @ UsdcTransferError::WithdrawalTxAlreadyRecorded { .. }) => {
+                error!(
+                    target: "rebalance",
+                    id = %self.id,
+                    %error,
+                    "Alpaca->Base USDC transfer failed: withdrawal tx already recorded by \
+                     another transfer; bridge marked failed for operator reconciliation"
+                );
+                let message = format!(
+                    "{error}. Bridge marked failed; settle the withdrawn funds with \
+                     `transfer reconcile --kind usdc`."
+                );
+                deliver_market_making_alert(&ctx.notifier, &message, "duplicate-withdrawal-tx")
+                    .await;
             }
             Err(UsdcTransferError::WithdrawalTxMissing { id }) => {
                 error!(
@@ -2018,6 +2141,7 @@ mod tests {
     use super::*;
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::native_gas::GasReadinessFailure;
+    use crate::rebalancing::usdc::{DepositSendPending, UnresolvedDepositSend};
     use crate::test_utils::setup_test_apalis_pool;
 
     /// Builds a `QueuePushError` without touching a pool. The classification
@@ -2284,6 +2408,10 @@ mod tests {
         /// Deterministic across retries -- the converted amount cannot grow --
         /// and the withdrawal it blocks needs an operator, not a retry.
         ConversionBelowWithdrawalMinimum,
+        /// `FailDeposit` is committed; a retry has nothing left to do.
+        DepositSendUnresolved,
+        /// `FailBridging` is committed; the tx belongs to another transfer.
+        WithdrawalTxAlreadyRecorded,
     }
 
     impl TerminalOutcome {
@@ -2348,6 +2476,19 @@ mod tests {
                         id: id.clone(),
                         converted: Usdc::new(float!(20)),
                         minimum: *st0x_config::ALPACA_MINIMUM_WITHDRAWAL,
+                    }
+                }
+                Self::DepositSendUnresolved => UsdcTransferError::DepositSendUnresolved {
+                    id: id.clone(),
+                    cause: UnresolvedDepositSend::UnrecordedSend {
+                        tx: TxHash::from([0xDA; 32]),
+                    },
+                },
+                Self::WithdrawalTxAlreadyRecorded => {
+                    UsdcTransferError::WithdrawalTxAlreadyRecorded {
+                        id: id.clone(),
+                        tx: TxHash::from([0xDC; 32]),
+                        recorded_by: "00000000-0000-0000-0000-000000000001".to_string(),
                     }
                 }
             }
@@ -4202,6 +4343,16 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn hedging_job_fails_closed_on_deposit_send_unresolved() {
+        assert_hedging_fail_closed(
+            TerminalOutcome::DepositSendUnresolved,
+            "DepositSendUnresolved (hedging)",
+            Some(TxHash::from([0xDA; 32])),
+        )
+        .await;
+    }
+
     /// An `InsufficientVaultLiquidity` withdraw revert is atomic (nothing left
     /// the vault) and deterministic: re-issuing the withdraw reverts again until
     /// the vault is refunded. The job must latch the aggregate at
@@ -4253,6 +4404,16 @@ mod tests {
             TerminalOutcome::BurnTxDropped,
             "BurnTxDropped (market-making)",
             Some(TxHash::from([0xAB; 32])),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn market_making_job_fails_closed_on_withdrawal_tx_already_recorded() {
+        assert_market_making_fail_closed(
+            TerminalOutcome::WithdrawalTxAlreadyRecorded,
+            "WithdrawalTxAlreadyRecorded (market-making)",
+            Some(TxHash::from([0xDC; 32])),
         )
         .await;
     }
@@ -4827,6 +4988,124 @@ mod tests {
             "past the deadline the redrive must slow to \
              ~{WITHDRAWAL_SCAN_POST_DEADLINE_REDRIVE_DELAY:?} -- run_at={run_at} \
              before={before} after={after}"
+        );
+    }
+
+    struct DepositSendPendingBaseToAlpaca {
+        prepared_at: DateTime<Utc>,
+    }
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for DepositSendPendingBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::DepositSendReconciliationPending {
+                id: id.clone(),
+                tx: TxHash::from([0xDD; 32]),
+                prepared_at: self.prepared_at,
+                cause: DepositSendPending::Dropped,
+            })
+        }
+    }
+
+    /// Runs one hedging attempt whose signed deposit send is not confirmed
+    /// yet, returning the pages sent, the redrive's delay in seconds and the
+    /// transfer id.
+    async fn run_deposit_send_pending(
+        prepared_at: DateTime<Utc>,
+    ) -> (Vec<String>, i64, UsdcRebalanceId) {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(DepositSendPendingBaseToAlpaca { prepared_at }),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 3,
+            backpressure_streak: BackpressureStreak(2),
+        };
+
+        let before = Utc::now().timestamp();
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert_eq!(pending_job_count::<TransferUsdcToHedging>(&pool).await, 1);
+        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(rescheduled.id, job.id);
+        assert_eq!(
+            rescheduled.revert_redrive_attempts, job.revert_redrive_attempts,
+            "a rebroadcast redrive must not consume the redrive budget"
+        );
+        (notifier.messages(), run_at - before, job.id)
+    }
+
+    /// A signed deposit send not confirmed yet is rebroadcast after a short
+    /// delay, silently, and never fails the transfer.
+    #[tokio::test]
+    async fn hedging_job_redrives_a_pending_deposit_send_silently_before_the_deadline() {
+        let (messages, delay, _) = run_deposit_send_pending(Utc::now()).await;
+
+        assert!(messages.is_empty(), "got: {messages:?}");
+        let expected = i64::try_from(DEPOSIT_SEND_RECONCILIATION_REDRIVE_DELAY.as_secs()).unwrap();
+        assert!(
+            (expected - 5..=expected + 5).contains(&delay),
+            "delay {delay}s, expected ~{expected}s"
+        );
+    }
+
+    /// Past the deadline the operator is paged on every redrive, which slows
+    /// down but never stops: the send may still confirm.
+    #[tokio::test]
+    async fn hedging_job_pages_a_pending_deposit_send_past_the_deadline() {
+        let (messages, delay, id) =
+            run_deposit_send_pending(Utc::now() - chrono::Duration::hours(5)).await;
+
+        let [message] = messages.as_slice() else {
+            panic!("expected one page, got: {messages:?}");
+        };
+        let tx = TxHash::from([0xDD; 32]);
+        // Only the elapsed time between the two parts varies.
+        let (before_elapsed, after_elapsed) = message
+            .split_once(". It has stayed unconfirmed for ")
+            .unwrap_or_else(|| panic!("got: {message}"));
+        assert_eq!(
+            before_elapsed,
+            format!(
+                "USDC rebalance {id}: signed deposit send {tx} is not confirmed yet: it was \
+                 dropped from the mempool"
+            )
+        );
+        let (_, guidance) = after_elapsed
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("got: {message}"));
+        assert_eq!(
+            guidance,
+            format!(
+                "(>14400s). The send is never re-signed or fee-bumped, so later sends from the \
+                 Ethereum wallet queue behind its nonce. Automatic rebroadcast continues at a \
+                 slower cadence (guard held). A send that will not confirm at its current fee \
+                 can still mine when fees drop: do not move the minted USDC or reconcile until \
+                 a different tx is mined at the send's nonce (cancel it with a higher-fee \
+                 0-value self-transfer at that nonce from the bot wallet, see \
+                 docs/cli-ops.md). Only then settle the minted USDC, reconcile the transfer \
+                 (`transfer reconcile --kind usdc --id {id} --superseding-tx <that tx>`) and \
+                 restart the bot to release the send's nonce."
+            )
+        );
+        let expected =
+            i64::try_from(DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY.as_secs())
+                .unwrap();
+        assert!(
+            (expected - 5..=expected + 5).contains(&delay),
+            "delay {delay}s, expected ~{expected}s"
         );
     }
 

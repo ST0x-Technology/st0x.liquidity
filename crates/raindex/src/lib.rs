@@ -276,6 +276,9 @@ pub trait Raindex: Send + Sync {
         from_block: u64,
     ) -> Result<(TxHash, U256), RaindexError>;
 
+    /// Whether `tx_hash` has a receipt now, reverted or not. Does not wait.
+    async fn tx_mined(&self, tx_hash: TxHash) -> Result<bool, RaindexError>;
+
     /// Wait for a previously submitted transaction to be confirmed.
     async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {
         self.confirm_tx_receipt(tx_hash).await.map(|_| ())

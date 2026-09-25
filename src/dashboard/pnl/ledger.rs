@@ -593,6 +593,8 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::BridgingInitiated { .. }
         | UsdcRebalanceEvent::PendingBurnRecorded { .. }
         | UsdcRebalanceEvent::PendingBurnCleared { .. }
+        | UsdcRebalanceEvent::DepositSendPrepared { .. }
+        | UsdcRebalanceEvent::DepositSendAttached { .. }
         | UsdcRebalanceEvent::AttestationTimedOut { .. }
         | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
         | UsdcRebalanceEvent::BridgingFailed { .. }

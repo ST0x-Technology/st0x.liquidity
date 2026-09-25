@@ -80,7 +80,9 @@ use serde::Deserialize;
 use st0x_float_macro::float;
 use tracing::{debug, info, warn};
 
-use st0x_evm::{Chain, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{
+    Chain, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, PreparedTransaction, Wallet,
+};
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
 use crate::BridgeDirection;
@@ -419,6 +421,26 @@ pub enum MintScanFloorCheck {
     Unverified { from_block_timestamp: u64 },
 }
 
+/// What became of a broadcast Ethereum USDC transfer once its receipt was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsdcTransferStatus {
+    /// Mined successfully and confirmed to the wallet's required depth.
+    Confirmed,
+    /// Mined and reverted: it moved no USDC.
+    Reverted,
+    /// Absent from the mempool past the drop grace window, never mined.
+    Dropped,
+}
+
+/// A mined Ethereum transaction: who sent it, at which nonce, and how deep
+/// it is (the inclusion block counts as confirmation 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinedTx {
+    pub from: Address,
+    pub nonce: u64,
+    pub confirmations: u64,
+}
+
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
@@ -461,6 +483,8 @@ pub enum CctpError {
     MintAndWithdrawEventNotFound,
     #[error("transaction {tx_hash} receipt has no block number")]
     TxReceiptMissingBlock { tx_hash: TxHash },
+    #[error("transaction {tx_hash} is not mined: the hash is unknown or the tx is still pending")]
+    TxNotMined { tx_hash: TxHash },
     #[error("USDC credited by transaction {tx_hash} overflows U256")]
     UsdcCreditOverflow { tx_hash: TxHash },
     #[error("USDC Transfer log in transaction {tx_hash} does not decode: {source}")]
@@ -602,6 +626,7 @@ impl CctpError {
             | Self::MessageSentEventNotFound { .. }
             | Self::MintAndWithdrawEventNotFound
             | Self::TxReceiptMissingBlock { .. }
+            | Self::TxNotMined { .. }
             | Self::UsdcCreditOverflow { .. }
             | Self::UsdcTransferLogDecode { .. }
             | Self::MessageTooShort { .. }
@@ -1214,6 +1239,12 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self.ethereum.tx_confirmations(tx_hash).await
     }
 
+    /// Returns the sender, nonce and confirmations of `tx_hash` on Ethereum,
+    /// or `None` while the node shows no receipt for it.
+    pub async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+        self.ethereum.mined_tx(tx_hash).await
+    }
+
     /// Returns the block in which `tx_hash` was mined on Ethereum, the chain
     /// where BaseToEthereum mints land.
     ///
@@ -1236,32 +1267,80 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self.ethereum.usdc_credited_in_tx(tx_hash, recipient).await
     }
 
-    /// Sends `amount` (USDC smallest unit, 6 decimals) of Ethereum USDC from the
-    /// bot wallet to `to`, waiting for confirmation, and returns the tx hash.
+    /// Returns the USDC that `tx_hash` moved from `sender` to `recipient` on
+    /// Ethereum, once the tx has the wallet's required confirmations. A tx
+    /// that is not mined yet is `TxNotMined`, returned without waiting.
+    pub async fn ethereum_usdc_sent(
+        &self,
+        tx_hash: TxHash,
+        sender: Address,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        self.ethereum
+            .usdc_sent_in_tx(tx_hash, sender, recipient)
+            .await
+    }
+
+    /// Signs a transfer of `amount` (USDC smallest unit, 6 decimals) of
+    /// Ethereum USDC from the bot wallet to `to` without broadcasting it, so
+    /// the caller can persist the signed transfer first.
     ///
     /// Used by the BaseToAlpaca deposit leg to forward minted USDC to Alpaca's
     /// deposit address. The CCTP mint credits the bot's own wallet, so an explicit
     /// transfer is required to fund Alpaca -- the mint alone does not deposit.
-    pub async fn send_usdc_on_ethereum(
+    pub async fn prepare_usdc_on_ethereum(
         &self,
         to: Address,
         amount: U256,
+    ) -> Result<PreparedTransaction, CctpError> {
+        Ok(self.ethereum.prepare_usdc(to, amount).await?)
+    }
+
+    /// Broadcasts a transfer signed by
+    /// [`prepare_usdc_on_ethereum`](Self::prepare_usdc_on_ethereum). A repeat
+    /// sends the same bytes.
+    pub async fn broadcast_usdc_on_ethereum(
+        &self,
+        prepared: &PreparedTransaction,
     ) -> Result<TxHash, CctpError> {
+        Ok(self.ethereum.broadcast_usdc(prepared).await?)
+    }
+
+    /// Releases the nonce of a signed transfer that was not persisted and so
+    /// will never be broadcast.
+    pub async fn discard_usdc_on_ethereum(&self, prepared: &PreparedTransaction) {
+        self.ethereum.discard_usdc(prepared).await;
+    }
+
+    /// Reserves the nonce of a persisted signed transfer after a restart,
+    /// before any other send from the wallet can take it.
+    pub async fn restore_usdc_on_ethereum(&self, prepared: &PreparedTransaction) {
+        self.ethereum.restore_usdc(prepared).await;
+    }
+
+    /// Awaits the receipt of a transfer broadcast by
+    /// [`broadcast_usdc_on_ethereum`](Self::broadcast_usdc_on_ethereum) to the
+    /// wallet's required confirmations. A revert or a drop is a status, not an
+    /// error; an error means the outcome is still unknown.
+    pub async fn confirm_usdc_on_ethereum(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<UsdcTransferStatus, CctpError> {
         self.ethereum
-            .send_usdc::<OpenChainErrorRegistry>(to, amount)
+            .confirm_usdc::<OpenChainErrorRegistry>(tx_hash)
             .await
     }
 
     /// Scans Ethereum for a USDC `Transfer(from, to, value == amount)` at or
     /// after `from_block`, returning the most recent matching tx hash.
     ///
-    /// Pre-send idempotency guard for the BaseToAlpaca deposit leg: a crash
-    /// between the deposit send and recording it lands the aggregate back in
-    /// `Bridged`, and this detects the already-submitted send so resume adopts it
-    /// instead of forwarding the minted USDC a second time. Returns a retryable
-    /// [`CctpError::ScanInconclusive`] rather than `Ok(None)` when the queried node
-    /// is not confirmations-deep past `from_block`, so the caller never re-sends
-    /// off a stale empty scan.
+    /// Detects a legacy unrecorded deposit send: a BaseToAlpaca transfer that
+    /// reached `Bridged` without a persisted signed send may already have sent,
+    /// so resume refuses to send again when this finds a match. A match can be
+    /// another transfer's same-amount send, so it is never adopted. Returns a
+    /// retryable [`CctpError::ScanInconclusive`] rather than `Ok(None)` when the
+    /// queried node is not confirmations-deep past `from_block`, so the caller
+    /// never sends off a stale empty scan.
     pub async fn find_recent_usdc_transfer(
         &self,
         from: Address,
@@ -6045,11 +6124,8 @@ mod tests {
         // the mint's block as the scan lower bound.
         let from_block = bridge.ethereum.current_block().await.unwrap();
 
-        let send_tx = bridge
-            .ethereum
-            .send_usdc::<NoOpErrorRegistry>(recipient, amount)
-            .await
-            .unwrap();
+        let send_tx = send_usdc(&bridge, recipient, amount).await;
+        bridge.confirm_usdc_on_ethereum(send_tx).await.unwrap();
 
         // The deposit send (`>= from_block`) lands at `send_block`; the first
         // block strictly above it is the exclusion bound for the below-bound case.
@@ -6059,11 +6135,8 @@ mod tests {
         // a small margin past the bound. Advance the head with unrelated sends so
         // the absence assertions resolve to None, not a retryable ScanInconclusive.
         for _ in 0..4 {
-            bridge
-                .ethereum
-                .send_usdc::<NoOpErrorRegistry>(never_funded, amount)
-                .await
-                .unwrap();
+            let unrelated_tx = send_usdc(&bridge, never_funded, amount).await;
+            bridge.confirm_usdc_on_ethereum(unrelated_tx).await.unwrap();
         }
 
         assert_eq!(
@@ -6103,6 +6176,227 @@ mod tests {
                 .unwrap(),
             None,
             "a transfer below the scan bound must not be adopted",
+        );
+    }
+
+    /// Signs and broadcasts a USDC transfer as the deposit leg does.
+    async fn send_usdc<EthWallet: Wallet, BaseWallet: Wallet>(
+        bridge: &CctpBridge<EthWallet, BaseWallet>,
+        to: Address,
+        amount: U256,
+    ) -> TxHash {
+        let prepared = bridge.prepare_usdc_on_ethereum(to, amount).await.unwrap();
+        bridge.broadcast_usdc_on_ethereum(&prepared).await.unwrap()
+    }
+
+    /// The operator-supplied deposit tx check: only USDC from the given sender
+    /// to the given recipient counts.
+    #[tokio::test]
+    async fn usdc_sent_counts_only_the_given_sender_and_recipient() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let sender = PrivateKeySigner::from_bytes(&private_key)
+            .unwrap()
+            .address();
+        let recipient = address!("0x000000000000000000000000000000000000bEEF");
+        let amount = U256::from(7_000_000u64);
+        let send_tx = send_usdc(&bridge, recipient, amount).await;
+        assert_eq!(
+            bridge.confirm_usdc_on_ethereum(send_tx).await.unwrap(),
+            UsdcTransferStatus::Confirmed,
+            "the operator supplies a mined send",
+        );
+
+        assert_eq!(
+            bridge
+                .ethereum_usdc_sent(send_tx, sender, recipient)
+                .await
+                .unwrap(),
+            amount,
+        );
+        assert_eq!(
+            bridge
+                .ethereum_usdc_sent(send_tx, recipient, recipient)
+                .await
+                .unwrap(),
+            U256::ZERO,
+            "USDC from another sender does not count",
+        );
+    }
+
+    /// An operator-supplied hash that is not mined is refused at once, not
+    /// after the receipt wait's drop grace or timeout.
+    #[tokio::test]
+    async fn usdc_sent_refuses_an_unmined_tx_hash_without_waiting() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let unknown_tx = TxHash::random();
+        let recipient = address!("0x000000000000000000000000000000000000bEEF");
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.ethereum_usdc_sent(unknown_tx, recipient, recipient),
+        )
+        .await
+        .expect("an unmined hash must be refused without waiting for a receipt")
+        .unwrap_err();
+
+        assert!(
+            matches!(error, CctpError::TxNotMined { tx_hash } if tx_hash == unknown_tx),
+            "got: {error:?}"
+        );
+    }
+
+    /// The deposit send is broadcast first and confirmed separately, so the
+    /// caller can record the hash in between. A mined revert is reported as a
+    /// status, since it moved no USDC and the caller decides what follows.
+    #[tokio::test]
+    async fn submitted_usdc_transfer_confirms_and_a_mined_revert_is_reported() {
+        let (ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let recipient = address!("0x000000000000000000000000000000000000bEEF");
+        let amount = U256::from(7_000_000u64);
+
+        let send_tx = send_usdc(&bridge, recipient, amount).await;
+        assert_eq!(
+            bridge.confirm_usdc_on_ethereum(send_tx).await.unwrap(),
+            UsdcTransferStatus::Confirmed,
+        );
+        assert_eq!(
+            bridge
+                .ethereum
+                .usdc_credited_in_tx(send_tx, recipient)
+                .await
+                .unwrap(),
+            amount,
+        );
+
+        // An unfunded sender with a fixed gas limit, so the transfer is mined
+        // and reverts instead of failing gas estimation.
+        let unfunded =
+            PrivateKeySigner::from_bytes(&B256::from_slice(&ethereum_anvil.keys()[1].to_bytes()))
+                .unwrap();
+        let unfunded_provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(unfunded))
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+        let reverted_tx = evm::IERC20::new(usdc_address, &unfunded_provider)
+            .transfer(recipient, amount)
+            .gas(100_000)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        assert!(
+            !reverted_tx.status(),
+            "the unfunded transfer must be mined reverted"
+        );
+
+        assert_eq!(
+            bridge
+                .confirm_usdc_on_ethereum(reverted_tx.transaction_hash)
+                .await
+                .unwrap(),
+            UsdcTransferStatus::Reverted,
+        );
+    }
+
+    /// A crash between broadcast and recording the hash resumes by sending the
+    /// persisted transfer again: the same bytes, so the same hash, and the
+    /// USDC moves once.
+    #[tokio::test]
+    async fn prepared_usdc_transfer_rebroadcast_is_the_same_transfer() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let recipient = address!("0x000000000000000000000000000000000000bEEF");
+        let amount = U256::from(7_000_000u64);
+        let prepared = bridge
+            .prepare_usdc_on_ethereum(recipient, amount)
+            .await
+            .unwrap();
+
+        let first = bridge.broadcast_usdc_on_ethereum(&prepared).await.unwrap();
+        assert_eq!(
+            bridge.confirm_usdc_on_ethereum(first).await.unwrap(),
+            UsdcTransferStatus::Confirmed,
+        );
+        let again = bridge.broadcast_usdc_on_ethereum(&prepared).await.unwrap();
+
+        assert_eq!(first, prepared.tx_hash());
+        assert_eq!(again, prepared.tx_hash());
+        assert_eq!(
+            bridge
+                .ethereum
+                .usdc_credited_in_tx(first, recipient)
+                .await
+                .unwrap(),
+            amount,
+        );
+        let provider = ProviderBuilder::new()
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider
+                .get_transaction_count(bridge.ethereum.owner())
+                .await
+                .unwrap(),
+            prepared.nonce() + 1,
+            "the rebroadcast must not become a second transaction",
         );
     }
 

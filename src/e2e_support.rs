@@ -37,7 +37,7 @@ pub async fn recheck_transfer(
         TransferType::Mint => RecheckKind::Mint,
         TransferType::Redemption => RecheckKind::Redemption,
     };
-    recheck_equity_transfer(ctx, kind, id).await?;
+    recheck_equity_transfer(ctx, kind, id, None).await?;
     Ok(())
 }
 

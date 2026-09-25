@@ -13,8 +13,15 @@ pub(crate) use job::{
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
     TransferUsdcToMarketMakingJobQueue,
 };
-pub use manager::{CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams};
-pub(crate) use manager::{RecheckUsdcDeposit, UsdcRecheckError, u256_to_usdc};
+pub use manager::{
+    CrossVenueCashTransfer, DepositSendNotSuperseded, EthereumChainMissing,
+    MarketMakingUsdcEndpoints, UsdcSettlementParams, deposit_send_required_confirmations,
+    verify_deposit_send_superseded,
+};
+pub(crate) use manager::{
+    RecheckUsdcDeposit, RestorePreparedDepositSends, RestoredDepositSends, UsdcRecheckError,
+    u256_to_usdc,
+};
 
 use std::time::Duration;
 
@@ -341,6 +348,30 @@ pub enum UsdcTransferError {
         credited: U256,
         nominal: Usdc,
     },
+    /// Another `UsdcRebalance` already recorded this withdrawal tx, so it
+    /// cannot be this withdrawal's delivery. The aggregate is moved to
+    /// `BridgingFailed` for operator reconciliation without recording the tx.
+    #[error(
+        "USDC rebalance {id}: withdrawal tx {tx} is already recorded by USDC rebalance \
+         {recorded_by}; failed for operator reconciliation"
+    )]
+    WithdrawalTxAlreadyRecorded {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        /// The other aggregate's id as persisted in the event store.
+        recorded_by: String,
+    },
+    /// The event store could not be read to check that no other transfer
+    /// recorded the withdrawal tx. The aggregate stays `Withdrawing`, so a
+    /// retry re-polls the same Alpaca transfer.
+    #[error(
+        "USDC rebalance {id}: could not check whether another transfer recorded its withdrawal tx"
+    )]
+    WithdrawalTxLookupFailed {
+        id: UsdcRebalanceId,
+        #[source]
+        source: sqlx::Error,
+    },
     /// The withdrawal tx receipt was read, but its USDC credit cannot be
     /// computed (an undecodable Transfer log, or a sum that overflows). A reread
     /// cannot change the receipt, so the aggregate is moved to `BridgingFailed`
@@ -472,6 +503,82 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         burn_tx: TxHash,
     },
+    /// A Base->Alpaca deposit send cannot be resolved automatically, and a
+    /// resend could move the minted USDC twice. `FailDeposit` is already
+    /// committed; the job pages and does not retry.
+    #[error(
+        "USDC rebalance {id}: {cause}; deposit marked failed for operator \
+         reconciliation ({})",
+        .cause.operator_step()
+    )]
+    DepositSendUnresolved {
+        id: UsdcRebalanceId,
+        cause: UnresolvedDepositSend,
+    },
+    /// The signed Base->Alpaca deposit send is persisted but not confirmed
+    /// yet: its broadcast was not accepted, its receipt is not known, or it
+    /// was dropped. The aggregate stays `Bridged` and the job redrives, which
+    /// broadcasts the same signed bytes again; it can never send twice.
+    /// `prepared_at` anchors the durable operator alert deadline.
+    #[error("USDC rebalance {id}: signed deposit send {tx} is not confirmed yet: {cause}")]
+    DepositSendReconciliationPending {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        prepared_at: DateTime<Utc>,
+        cause: DepositSendPending,
+    },
+    /// The task that signs and persists the deposit send panicked. The signed
+    /// send is either persisted, and the retry broadcasts it, or it is not,
+    /// and the retry signs one; nothing was broadcast.
+    #[error("USDC rebalance {id}: the deposit send prepare task panicked; nothing was broadcast")]
+    DepositSendTaskPanicked { id: UsdcRebalanceId },
+}
+
+/// Why a signed Base->Alpaca deposit send is not confirmed yet.
+#[derive(Debug, Error)]
+pub enum DepositSendPending {
+    /// The RPC did not accept the broadcast. The node may not see the tx
+    /// yet, or another tx took its nonce.
+    #[error("its broadcast was not accepted: {0}")]
+    Broadcast(#[source] Box<CctpError>),
+    /// Its receipt could not be read to the required confirmations.
+    #[error("its confirmation is not known: {0}")]
+    Confirmation(#[source] Box<CctpError>),
+    /// Absent from the mempool, never mined.
+    #[error("it was dropped from the mempool")]
+    Dropped,
+}
+
+/// Why a Base->Alpaca deposit send cannot be resolved automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum UnresolvedDepositSend {
+    /// No send was recorded, yet a send of the same amount from the wallet
+    /// to the deposit address landed after the mint. It can be another
+    /// transfer's send through the shared wallet, so it is never adopted.
+    #[error(
+        "no deposit send was recorded, but send {tx} of the same amount to the \
+         Alpaca deposit address landed after the mint and may belong to another transfer"
+    )]
+    UnrecordedSend { tx: TxHash },
+    #[error("the recorded deposit send {tx} was mined reverted")]
+    RecordedSendReverted { tx: TxHash },
+}
+
+impl UnresolvedDepositSend {
+    /// The operator command that settles a deposit failed for this cause.
+    pub(crate) const fn operator_step(self) -> &'static str {
+        match self {
+            // No send is recorded on the transfer: the operator must find
+            // this transfer's own send on chain, if there is one.
+            Self::UnrecordedSend { .. } => {
+                "`transfer recheck --kind usdc --deposit-tx <hash>` with this transfer's own \
+                 send if Alpaca credited it, else `transfer reconcile --kind usdc`"
+            }
+            Self::RecordedSendReverted { .. } => {
+                "the send moved no USDC; settle the minted USDC with `transfer reconcile --kind usdc`"
+            }
+        }
+    }
 }
 
 impl UsdcTransferError {
@@ -517,6 +624,8 @@ impl UsdcTransferError {
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }
             | Self::WithdrawalCreditUnreadable { .. }
+            | Self::WithdrawalTxAlreadyRecorded { .. }
+            | Self::WithdrawalTxLookupFailed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::WithdrawalScanTransient { .. }
             | Self::SettlementCheckTransient { .. }
@@ -524,7 +633,10 @@ impl UsdcTransferError {
             | Self::BurnRecordTaskFailed { .. }
             | Self::BurnRecordFailed { .. }
             | Self::BurnSubmitInconclusive { .. }
-            | Self::BurnTxDropped { .. } => None,
+            | Self::BurnTxDropped { .. }
+            | Self::DepositSendUnresolved { .. }
+            | Self::DepositSendReconciliationPending { .. }
+            | Self::DepositSendTaskPanicked { .. } => None,
         }
     }
 }
@@ -571,6 +683,8 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::WithdrawalTxMissing { .. }
             | Self::WithdrawalCreditMismatch { .. }
             | Self::WithdrawalCreditUnreadable { .. }
+            | Self::WithdrawalTxAlreadyRecorded { .. }
+            | Self::WithdrawalTxLookupFailed { .. }
             | Self::SettlementRetryDeadlineElapsed { .. }
             | Self::WithdrawalTxUnderconfirmed { .. }
             | Self::WithdrawalScanTransient { .. }
@@ -579,7 +693,10 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::BurnRecordTaskFailed { .. }
             | Self::BurnRecordFailed { .. }
             | Self::BurnSubmitInconclusive { .. }
-            | Self::BurnTxDropped { .. } => false,
+            | Self::BurnTxDropped { .. }
+            | Self::DepositSendUnresolved { .. }
+            | Self::DepositSendReconciliationPending { .. }
+            | Self::DepositSendTaskPanicked { .. } => false,
         }
     }
 }
