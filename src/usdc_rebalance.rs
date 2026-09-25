@@ -12498,6 +12498,31 @@ mod tests {
         }
     }
 
+    /// The signed send is the only send this transfer can make, so the
+    /// deposit it initiates must be that send.
+    #[tokio::test]
+    async fn initiate_deposit_refuses_a_tx_other_than_the_prepared_send() {
+        let other_send = TxHash::with_last_byte(0xdd);
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![deposit_send_prepared()]))
+            .when(UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(other_send),
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(UsdcRebalanceError::PreparedDepositHashMismatch {
+            recorded,
+            prepared,
+        }) = error
+        else {
+            panic!("Expected PreparedDepositHashMismatch, got {error:?}");
+        };
+        assert_eq!(recorded, other_send);
+        assert_eq!(prepared, DEPOSIT_SEND_TX);
+    }
+
     #[tokio::test]
     async fn record_pending_deposit_refuses_a_send_that_was_not_started() {
         let error = TestHarness::<UsdcRebalance>::with(())
