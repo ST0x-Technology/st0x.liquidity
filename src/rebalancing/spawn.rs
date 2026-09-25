@@ -363,7 +363,7 @@ mod tests {
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
             allocation: ctx.allocation.clone(),
-            usdc: ctx.usdc,
+            usdc: ctx.usdc.map(|usdc| usdc.threshold),
             transfer_timeout: ctx.transfer_timeout,
             chains: BTreeMap::new(),
         };
@@ -394,7 +394,7 @@ mod tests {
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
             allocation: ctx.allocation.clone(),
-            usdc: ctx.usdc,
+            usdc: ctx.usdc.map(|usdc| usdc.threshold),
             transfer_timeout: ctx.transfer_timeout,
             chains: BTreeMap::new(),
         };

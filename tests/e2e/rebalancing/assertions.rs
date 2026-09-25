@@ -31,7 +31,7 @@ use st0x_execution::{
 };
 use st0x_finance::{Positive, Usd};
 use st0x_float_macro::float;
-pub(crate) use st0x_hedge::UsdcRebalancing;
+pub(crate) use st0x_hedge::ImbalanceThreshold;
 use st0x_hedge::bindings::IRaindexV6;
 pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
@@ -114,7 +114,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     equity_tokens: &[(String, Address, Address)],
     equity_vault_ids: &HashMap<String, B256>,
     cash_vault_id: B256,
-    usdc_rebalancing: UsdcRebalancing,
+    usdc_rebalancing: Option<ImbalanceThreshold>,
     cash_rebalancing: OperationMode,
     wrapped_equity_recovery: OperationMode,
     // Deviation band around Base's 50% equity target. Defaults to 0.1.
@@ -176,7 +176,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
             float!(0.5),
             equity_band,
         )?)
-        .usdc(usdc_rebalancing)
+        .maybe_usdc(usdc_rebalancing)
         .call();
 
     let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(
@@ -285,7 +285,7 @@ where
             float!(0.5),
             float!(100),
         )?)
-        .usdc(UsdcRebalancing::Enabled {
+        .usdc(ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.1),
         })
