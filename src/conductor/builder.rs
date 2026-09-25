@@ -309,6 +309,7 @@ where
 #[bon::builder]
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
+    counter_trade_submission_lock: Arc<tokio::sync::Mutex<()>>,
     job_queue: DexTradeAccountingJobQueue,
     backfill_queues: BackfillQueues,
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
@@ -488,8 +489,6 @@ where
         position: context.frameworks.position.clone(),
     });
 
-    let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
-
     // The broker placement capability, lifted out of the (now pure)
     // `OffchainOrder::Place` handler: both the rebalancing hedge job and the
     // trade-processing path place through it instead of the aggregate.
@@ -601,6 +600,8 @@ where
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
         poll_interval,
+        #[cfg(any(test, feature = "test-support"))]
+        placement_barrier: None,
     };
 
     let maintenance_interval = context.executor.maintenance_interval();

@@ -13,15 +13,27 @@ use st0x_pricing_types::trading_state::{
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use st0x_config::{
-    TradingScheduleConfig, TradingScheduleEnvironment, TradingScheduleMode, TradingScheduleScope,
-};
+use st0x_config::{Ctx, TradingScheduleConfig, TradingScheduleEnvironment, TradingScheduleScope};
 use st0x_execution::{MarketSessionStatus, PostCloseGap, Symbol};
 
 use crate::trading::offchain::close_flatten::CloseFlattenWindow;
 
 mod monitor;
 pub(crate) use monitor::TradingScheduleMonitor;
+
+/// Whether a process running under `ctx` must treat the trading schedule as
+/// enforcing rather than observing.
+///
+/// A pure function of configuration, so every process derives the same answer
+/// from the same config file: the conductor for the live pipeline, and the
+/// standalone process-tx stores the offline CLI builds without ever loading a
+/// [`TradingScheduleStore`].
+pub(crate) fn schedule_enabled(ctx: &Ctx) -> bool {
+    ctx.pricing
+        .as_ref()
+        .and_then(|pricing| pricing.trading_schedule.as_ref())
+        .is_some_and(TradingScheduleConfig::enabled)
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct TradingScheduleStore {
@@ -321,10 +333,7 @@ impl TradingScheduleStore {
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        match self.config.mode {
-            TradingScheduleMode::Observe => false,
-            TradingScheduleMode::Enabled => true,
-        }
+        self.config.enabled()
     }
 
     pub(crate) async fn observe_broker(
@@ -851,6 +860,7 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
+    use st0x_config::TradingScheduleMode;
     use st0x_execution::{
         ClientOrderId, Direction, FractionalShares, MarketOrder, MarketSession, MockExecutor,
         Positive,

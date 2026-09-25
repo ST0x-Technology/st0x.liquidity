@@ -4,7 +4,8 @@
 //! terminal trades straight out of `onchain_trade_view` and
 //! `offchain_order_view` -- the projections the event-sourcing framework keeps
 //! current -- so a request costs a bounded index range per venue side for the
-//! page, plus an index-only count, instead of replaying every aggregate.
+//! page, plus a count that walks the same terminal row index and reads only
+//! stored key columns, never the payload, instead of replaying every aggregate.
 //!
 //! Rows carry the serialized aggregate, not a serialized [`Trade`], and
 //! `try_into_trade` converts only the page being returned. The generated

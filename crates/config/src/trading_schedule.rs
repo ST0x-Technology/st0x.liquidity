@@ -55,6 +55,15 @@ pub struct TradingScheduleConfig {
 }
 
 impl TradingScheduleConfig {
+    /// Whether the schedule enforces its boundaries rather than only observing
+    /// them. The single source of truth for that reading of `mode`.
+    pub fn enabled(&self) -> bool {
+        match self.mode {
+            TradingScheduleMode::Observe => false,
+            TradingScheduleMode::Enabled => true,
+        }
+    }
+
     pub(crate) fn validate(
         &self,
         assets: &HedgingAssets,

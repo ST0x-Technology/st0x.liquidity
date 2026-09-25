@@ -2787,7 +2787,7 @@ pub struct BrokerOrderPlacement {
 /// Type-erased order placement capability.
 ///
 /// Used by the durable placement path
-/// ([`place_offchain_order_at_broker`]) -- the trade-processing context, the
+/// (`place_offchain_order_at_broker`) -- the trade-processing context, the
 /// hedge job, and the CLI each hold one. The `OffchainOrder` aggregate keeps
 /// this as its service type for cancel pre-reconciliation and placement-adjacent
 /// recovery paths, while `Place` itself remains a pure intent-recording command.
@@ -3022,7 +3022,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         };
         counter!("hedge_placement_deferred_total", "reason" => reason.metric_label()).increment(1);
         info!(symbol = %order.symbol, client_order_id = %order.client_order_id,
-            reason = reason.metric_label(), "Retaining hedge intent until broker admission permits placement");
+            reason = reason.metric_label(), "Broker admission deferred hedge placement");
         Ok(PlacementAdmission::Deferred)
     }
     async fn place_market_order(

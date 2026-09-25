@@ -128,3 +128,4 @@ decision.
 | [0016](0016-store-bot-gas-costs-in-the-event-stream.md)                 | Store bot-gas costs in the event stream                                              | Proposed               |
 | [0017](0017-eth-usd-valuation-via-pyth-base-block-pinned.md)            | Value bot-paid gas in USD via Pyth ETH/USD on Base, block-pinned                     | Superseded by ADR 0020 |
 | [0020](0020-chainlink-eth-usd-gas-valuation-on-base.md)                 | Value bot-paid gas via Chainlink ETH/USD on Base                                     | Accepted               |
+| [0022](0022-process-tx-checks-admission-before-claiming.md)             | `process-tx` checks broker admission before claiming the position                    | Proposed               |
